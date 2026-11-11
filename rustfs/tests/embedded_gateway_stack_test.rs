@@ -38,6 +38,7 @@ const ROOT_SECRET_KEY: &str = "gateway-stack-root-secret";
 const USER_SECRET_KEY: &str = "gateway-stack-user-secret";
 const ENV_S3_STACK: &str = "RUSTFS_S3_STACK";
 const ENV_KEYSTONE_ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
+const ENV_WEBSITE_DOMAINS: &str = "RUSTFS_WEBSITE_DOMAINS";
 const ENV_KEYSTONE_AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
 /// A Keystone endpoint nothing listens on: these tests are about start-up, not about tokens.
 const UNREACHABLE_KEYSTONE: &str = "http://127.0.0.1:1/v3";
@@ -262,6 +263,63 @@ fn the_gateway_stack_refuses_callers_it_cannot_admit() {
             .await
             .expect("signed ListBuckets");
         assert_eq!(listing.buckets().len(), 1);
+
+        server.shutdown().await;
+    });
+}
+
+/// A website-host request reaches the legacy website route on the gateway stack too
+/// (rustfs/backlog#2734 T2.11, R-064). Before that route existed here, `GET /` on a website host
+/// was a path-style ListBuckets, which the gateway refuses anonymously with `AccessDenied`. The
+/// full website differential against the legacy stack is `e2e_test::website_stack_interim_test`.
+#[test]
+fn the_gateway_stack_leaves_a_website_host_to_the_legacy_website_route() {
+    let environment = vec![(ENV_S3_STACK, Some("gateway")), (ENV_WEBSITE_DOMAINS, Some("website.test"))];
+    with_environment(environment, |server| async move {
+        // A bucket with no website configuration: legacy's website route answers its plain page.
+        create_bucket_in_the_store("gateway-stack-site").await;
+        let endpoint = server.endpoint();
+        let http = reqwest::Client::builder().no_proxy().build().expect("http client");
+
+        for host in [
+            "gateway-stack-site.website.test",
+            "website.test",
+            "Gateway-Stack-Site.Website.Test.",
+        ] {
+            let website = http
+                .get(format!("{endpoint}/"))
+                .header(reqwest::header::HOST, host)
+                .send()
+                .await
+                .expect("a website-host request is answered");
+            assert_eq!(website.status().as_u16(), 404, "{host}");
+            assert_eq!(
+                website
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/html; charset=utf-8"),
+                "{host}"
+            );
+            assert_eq!(
+                website.text().await.expect("website body"),
+                "<html><body>Not Found</body></html>",
+                "{host}"
+            );
+        }
+
+        // The same request on a host that is no website domain is still the gateway's ListBuckets.
+        for host in ["gateway-stack-site.elsewhere.test", "evilwebsite.test"] {
+            let not_website = http
+                .get(format!("{endpoint}/"))
+                .header(reqwest::header::HOST, host)
+                .send()
+                .await
+                .expect("a request on another host is answered");
+            assert_eq!(not_website.status().as_u16(), 403, "{host}");
+            let body = not_website.text().await.expect("refusal body");
+            assert!(body.contains("<Code>AccessDenied</Code>"), "{host}: {body}");
+        }
 
         server.shutdown().await;
     });

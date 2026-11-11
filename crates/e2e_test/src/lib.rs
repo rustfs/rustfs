@@ -301,6 +301,11 @@ mod bucket_logging_test;
 #[cfg(test)]
 mod website_hosting_test;
 
+// Website hosting and the metadata listings on the gateway stack, compared with the legacy
+// stack on one data directory (rustfs/backlog#2734 T2.11; R-064).
+#[cfg(test)]
+mod website_stack_interim_test;
+
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
