@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::RequestEnvelope;
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
 use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
 use crate::storage::access::{ReqInfo, request_context_from_req};
@@ -71,14 +70,22 @@ impl<'a> AuditRequestView<'a> {
         }
     }
 
-    pub(crate) fn owned(req: &'a RequestEnvelope) -> Self {
+    /// The view of a request whose facts an owned edge already decoded.
+    pub(crate) fn from_facts(
+        headers: &'a HeaderMap,
+        uri: &'a Uri,
+        req_info: Option<&'a ReqInfo>,
+        client_info: Option<&'a ClientInfo>,
+        remote_addr: Option<SocketAddr>,
+        request_context: Option<&'a RequestContext>,
+    ) -> Self {
         Self {
-            headers: req.headers(),
-            uri: req.uri(),
-            req_info: req.req_info(),
-            client_info: req.client_info(),
-            remote_addr: req.remote_addr(),
-            request_context: req.request_context(),
+            headers,
+            uri,
+            req_info,
+            client_info,
+            remote_addr,
+            request_context,
         }
     }
 

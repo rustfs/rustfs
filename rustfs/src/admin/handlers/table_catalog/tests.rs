@@ -1418,6 +1418,28 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         assert_eq!(info.object.as_deref(), Some("original-object"));
         assert_eq!(info.version_id.as_deref(), Some("original-version"));
     }
+    // The exact-key check selects internal-object mode: a request header the object
+    // write does not apply (a malformed x-amz-tagging) must not reach the decision,
+    // while the ordinary owned entry point still evaluates it and rejects it.
+    let mut tagged = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
+    tagged
+        .headers
+        .insert("x-amz-tagging", http::HeaderValue::from_static("classification=%ZZ"));
+    let mut tagged = legacy_request_view(&tagged);
+    authorize_table_catalog_s3_actions(&mut tagged, "warehouse", "owned/writable", &[S3Action::PutObjectAction])
+        .await
+        .expect("internal-object mode ignores request options the write does not apply");
+    let info = tagged.req_info_mut().expect("request info");
+    info.bucket = Some("warehouse".to_owned());
+    info.object = Some("owned/writable".to_owned());
+    crate::app::authorize_owned_request(
+        tagged.envelope_mut(),
+        rustfs_policy::policy::action::Action::S3Action(S3Action::PutObjectAction),
+        None,
+    )
+    .await
+    .expect_err("ordinary mode evaluates the malformed tagging header");
     let objects = TestTableCatalogObjectBackend::default();
     objects
         .seed_object("warehouse", "owned/read-only", b"readable".to_vec())

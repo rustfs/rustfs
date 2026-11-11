@@ -1,43 +1,38 @@
 ---
 name: rustfs-release-publish
-description: Publish a RustFS version through Console, release-branch CI, preview acceptance, human confirmation, and final publication. Use only for an explicit release request.
+description: Publish a RustFS version through frozen Linux candidate acceptance, desktop completion, manifest approval, byte-preserving publication and post-release follow-up. Use only for an explicit release request.
 ---
 # RustFS Release
 
-Require the exact final SemVer target before version edits or publication. If unspecified, inspect current releases/tags and ask with concrete candidates; do not guess the channel or bump. A named bump type resolves to an exact version that still needs confirmation. Report the confirmed target verbatim; resolve any later mismatch before proceeding. Independent read-only preflight may continue.
+Require the exact final SemVer target before version edits or publication. If unspecified, inspect releases/tags and ask with concrete candidates; do not guess the channel or bump. Reuse the user's confirmed target and authorized delivery scope. Independent read-only preflight may continue.
 
 ## Invariants
 
-- Cargo stores `<target>`, never `-preview.N`. Before publication, installation defaults retain the previous available deliverable. Final and preview binaries embed their own tag names, so version/asset names differ despite identical source.
-- Use annotated tags without `v`. Preview names are exactly `<target>-preview.<digits>`; choose the next unused iteration after fetching tags. Preview Releases are prereleases, never Latest; publish only versioned assets/exact Docker tags, never latest assets, R2, Helm, moving Docker channels, or installation/banner updates.
-- `release/<target>` owns the candidate. Retain its history, backport only reviewed fixes, and never merge main wholesale or force-push it. Pin `PREVIEW_HASH` to its exact commit with complete passing CI. Preview and final tags both point there; never tag a later main/branch HEAD or insert another bump.
-- Phase failures block dependents. Keep preview Releases until final publication and notes generation finish; CI removes Releases while retaining tags. Never move an existing preview or final tag.
+- Cargo and every candidate executable contain the final product version. `<target>-preview.<run_number>` is an immutable candidate identifier, not a public tag or displayed binary version.
+- Freeze the exact source, reviewed workflow recipe, toolchain, Console, CLI, dependency lock, previous stable version and validation plan. Newer unrelated main or Console releases do not change those inputs.
+- Retain `release/<target>` history when a release branch is used; backport only reviewed fixes. Pin `CANDIDATE_SHA` to its exact CI-validated commit. Never force-push a release branch or move a public tag.
+- Build Linux first. Complete field acceptance before macOS/Windows and packaging. Full certification and final acceptance are required before publication; a partial Linux PASS grants no release authority.
+- Promote the accepted bytes. Final publication never recompiles binaries or rebuilds packages/images. Infrastructure retries reuse successful artifacts; changed source or inputs require a new candidate and affected acceptance.
+- Phase failures block dependents. No latest/default-channel update before versioned delivery. Use the [pipeline runbook](../../../docs/operations/release-pipeline.md) for executable entry points, locks and recovery.
 
-## Read by Phase
-
-Read only the current phase's procedure; retain completed evidence across turns. Follow root verification, Git/PR, and authorization rules.
+## Read by phase
 
 | Phase | Procedure |
 |---|---|
-| 0 | Clean tree, fetch main/tags, verify GitHub access, then complete the mandatory [Console release gate](references/console-gate.md). A green Console build alone is insufficient. |
-| 1–2 | [Prepare/reuse the release candidate and run exact-SHA branch CI](references/release-candidate.md). Source version changes use `rustfs-release-version-bump` with authorized delivery scope. |
-| 3 | [Verify the preview build, assets, channels, and notes](references/preview-release.md). |
-| 4–5 | [Run the downloaded binary, Console CRUD, and latest-rc matrix](references/preview-acceptance.md). Every check must pass. |
-| Confirmation | Complete the gate below and end the turn. |
-| 6 | After fresh confirmation, [publish and verify the final tag](references/final-release.md) at `PREVIEW_HASH`. |
-| 7 | [Reconcile Security Advisories, milestones, installation references, and the website; reconcile main and remove the completed release branch](references/post-release-updates.md) only after complete publication. |
+| 0 | Clean tree, fetch main/tags, verify access, then complete the mandatory [Console gate](references/console-gate.md). |
+| 1–2 | [Prepare the exact source and run branch CI](references/release-candidate.md). Version edits use `rustfs-release-version-bump`. |
+| 3 | [Build and verify the Linux candidate](references/preview-release.md). |
+| 4–5 | [Run artifact, field, Console and rc acceptance](references/preview-acceptance.md), then complete desktop/package/image/chart validation. |
+| Confirmation | Report the complete manifest and obtain the confirmation below. |
+| 6 | [Publish the accepted manifest](references/final-release.md). |
+| 7 | [Reconcile advisories, milestones, installation references, website and release branch](references/post-release-updates.md). |
 
-## Human Confirmation
+## Human confirmation
 
-After Phases 3–5 pass, recheck that the release branch still equals `PREVIEW_HASH` and that the current Console asset tag/digest match the preview's recorded build inputs. Report the target, branch, preview tag/hash, branch CI run, preview Release URL, accepted Console asset identity/result, and rc matrix. Explicitly ask whether to publish the final tag and end the turn without creating/pushing it.
+After all acceptance passes, report the target, source SHA, source CI run, Linux and completion run URLs, final manifest SHA-256, accepted Console/CLI identities, compatibility/performance results and backlog report. Explicitly ask whether to publish this exact manifest and end the turn without dispatching publication.
 
-Only a new affirmative user reply to that exact report authorizes Phase 6. The original release request, earlier confirmation, silence, or automated follow-up does not count. Confirmation binds the target, preview tag, hash, and accepted build inputs; a changed value or repeated/failed acceptance cycle invalidates it. Revalidate and obtain fresh confirmation before continuing.
+Only a new affirmative reply to that exact report authorizes Phase 6. An earlier general release request, silence or automatic continuation does not count. Reuse confirmation for retries of that same manifest; do not ask again merely because a destination failed. A changed source, input, manifest or acceptance result invalidates it and requires renewed acceptance/confirmation.
 
-## Recovery
+## Recovery and reporting
 
-- Before the final tag exists, land fixes on main, backport to the candidate, verify target versions, and restart branch CI/acceptance. Use a new preview iteration once a preview was tagged; main may advance independently.
-- If only an external build input changed, record it, create a new preview iteration even when the source SHA is unchanged, and repeat the affected build and artifact acceptance before fresh confirmation. Reuse source checks whose inputs remain valid.
-- Once the final tag exists, retry publication jobs for that exact tag. A source fix requires a newly confirmed target, not retagging or a newer preview. Phase 7 retries recheck artifact availability and superseding releases.
-- If abandoned after the bump merged, report the unpublished version on main and record whether to revert or let the next release overwrite it. Deleting unpublished candidate branches or preview tags requires an explicit decision. Completed release branches follow Phase 7 cleanup; keep release tags.
-
-Report completed phase results and incomplete work with evidence: Console previous/latest tags, release need, hash and run/Release URLs; target, branch CI/SHA, previews and hash, confirmation state; preview/final assets, latest-channel state, Console/rc results and cleanup; advisory reconciliation results and pending disclosure decisions; both milestone states, installation PR checks/merge state, and website text/link/PR/deployment state. Keep artifact publication separate from follow-up delivery; do not call an open PR a live update. Report deviations and their authorization.
+Resume failed infrastructure jobs without rebuilding successful units. Fix product defects on main, backport when needed, and start a new candidate. After a final tag exists, retry the same bytes or use a new patch version; never move the tag. Do not conflate implemented, CI-passed, field-accepted, approved, published and post-release-complete states. Report incomplete work and deviations with evidence; a tag or green build alone is not a completed release.
