@@ -27,7 +27,9 @@ use crate::admin::storage_api::bucket::quota::checker::{QuotaChecker, record_res
 use crate::admin::storage_api::bucket::quota::{
     BucketQuota, QUOTA_RESERVATION_PROTOCOL_V2, QuotaError, QuotaOperation, QuotaProtocolMigration,
 };
+use crate::admin::storage_api::cluster::NotificationPeerErr;
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
+use crate::admin::storage_api::error::StorageError;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
@@ -48,28 +50,73 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
 const EVENT_ADMIN_QUOTA_STATE: &str = "admin_quota_state";
 
-async fn notify_quota_metadata_reload(context: Option<Arc<AppContext>>, bucket: String, action: &'static str) {
+async fn notify_quota_metadata_reload(
+    context: Option<Arc<AppContext>>,
+    bucket: String,
+    action: &'static str,
+) -> QuotaMetadataReloadReport {
     let Some(notification_sys) = current_notification_system_for_context(context.as_deref()) else {
-        return;
+        return unavailable_quota_metadata_reload(&bucket, action, "notification_system_missing");
     };
+    let reload_bucket = bucket.clone();
+    run_quota_metadata_reload(bucket, action, async move {
+        notification_sys.load_bucket_metadata_report(&reload_bucket).await
+    })
+    .await
+}
+
+async fn run_quota_metadata_reload(
+    bucket: String,
+    action: &'static str,
+    reload: impl Future<Output = Result<Vec<NotificationPeerErr>, StorageError>> + Send + 'static,
+) -> QuotaMetadataReloadReport {
     // The metadata transaction has committed and released its locks. Await
     // healthy peers, but keep the reload running if the request is cancelled.
-    // Failed peers converge through the periodic metadata refresh.
-    let _ = tokio::spawn(async move {
-        if let Err(error) = notification_sys.load_bucket_metadata(&bucket).await {
+    // Keep failure logging inside the owned task for cancelled requests too.
+    let task_bucket = bucket.clone();
+    match tokio::spawn(async move {
+        let peers = match reload.await {
+            Ok(peers) => peers,
+            Err(_) => return unavailable_quota_metadata_reload(&task_bucket, action, "report_unavailable"),
+        };
+        let report = QuotaMetadataReloadReport::from_peer_results(peers);
+        if let Some(peers) = report.unconfirmed_peers.as_ref().filter(|peers| !peers.is_empty()) {
             warn!(
                 event = EVENT_ADMIN_QUOTA_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_QUOTA,
                 state = "peer_metadata_reload_failed",
                 action,
-                bucket = %bucket,
-                error = %error,
+                bucket = %task_bucket,
+                unconfirmed_peer_count = peers.len(),
+                unconfirmed_peers = ?peers,
                 "admin quota state"
             );
         }
+        report
     })
-    .await;
+    .await
+    {
+        Ok(report) => report,
+        Err(_) => unavailable_quota_metadata_reload(&bucket, action, "task_failed"),
+    }
+}
+
+fn unavailable_quota_metadata_reload(bucket: &str, action: &'static str, reason: &'static str) -> QuotaMetadataReloadReport {
+    warn!(
+        event = EVENT_ADMIN_QUOTA_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_QUOTA,
+        state = "peer_metadata_reload_unavailable",
+        action,
+        bucket,
+        reason,
+        "admin quota state"
+    );
+    QuotaMetadataReloadReport {
+        status: QuotaMetadataReloadStatus::Unknown,
+        unconfirmed_peers: None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +231,48 @@ pub struct BucketQuotaResponse {
     /// never reported as zero.
     pub size: Option<u64>,
     pub quota_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BucketQuotaMutationResponse {
+    #[serde(flatten)]
+    quota: BucketQuotaResponse,
+    metadata_reload: QuotaMetadataReloadReport,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QuotaMetadataReloadStatus {
+    Complete,
+    Incomplete,
+    Unknown,
+}
+
+/// Acknowledgements for this mutation's reload requests, not a quota revision
+/// or current cluster-state guarantee. An unavailable report has a null list.
+#[derive(Debug, Serialize)]
+struct QuotaMetadataReloadReport {
+    status: QuotaMetadataReloadStatus,
+    unconfirmed_peers: Option<Vec<String>>,
+}
+
+impl QuotaMetadataReloadReport {
+    fn from_peer_results(peers: Vec<NotificationPeerErr>) -> Self {
+        let mut unconfirmed_peers: Vec<_> = peers
+            .into_iter()
+            .filter(|peer| peer.err.is_some())
+            .map(|peer| peer.host)
+            .collect();
+        unconfirmed_peers.sort_unstable();
+        Self {
+            status: if unconfirmed_peers.is_empty() {
+                QuotaMetadataReloadStatus::Complete
+            } else {
+                QuotaMetadataReloadStatus::Incomplete
+            },
+            unconfirmed_peers: Some(unconfirmed_peers),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -470,7 +559,8 @@ impl Operation for SetBucketQuotaHandler {
         }
         .map_err(ApiError::from)?;
 
-        notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "set_bucket_quota").await;
+        let metadata_reload =
+            notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "set_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -502,11 +592,14 @@ impl Operation for SetBucketQuotaHandler {
         let json = if is_compat_set_bucket_quota_path(req.uri().path()) {
             String::new()
         } else {
-            let response = BucketQuotaResponse {
-                bucket,
-                quota: quota.quota,
-                size: current_usage,
-                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+            let response = BucketQuotaMutationResponse {
+                quota: BucketQuotaResponse {
+                    bucket,
+                    quota: quota.quota,
+                    size: current_usage,
+                    quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+                },
+                metadata_reload,
             };
 
             serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?
@@ -650,7 +743,8 @@ impl Operation for ClearBucketQuotaHandler {
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
 
-        notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "clear_bucket_quota").await;
+        let metadata_reload =
+            notify_quota_metadata_reload(app_context_from_envelope(req.envelope()), bucket.clone(), "clear_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -689,11 +783,14 @@ impl Operation for ClearBucketQuotaHandler {
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
 
-        let response = BucketQuotaResponse {
-            bucket,
-            quota: None,
-            size: current_usage,
-            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+        let response = BucketQuotaMutationResponse {
+            quota: BucketQuotaResponse {
+                bucket,
+                quota: None,
+                size: current_usage,
+                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+            },
+            metadata_reload,
         };
 
         let json =
@@ -942,6 +1039,124 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quota_metadata_reload_reports_acknowledgements() {
+        for (peers, expected) in [
+            (Vec::new(), serde_json::json!({"status": "complete", "unconfirmed_peers": []})),
+            (
+                vec![NotificationPeerErr {
+                    host: "node-a:9000".to_string(),
+                    err: None,
+                }],
+                serde_json::json!({"status": "complete", "unconfirmed_peers": []}),
+            ),
+            (
+                vec![
+                    NotificationPeerErr {
+                        host: "node-c:9000".to_string(),
+                        err: Some(StorageError::other("internal RPC error")),
+                    },
+                    NotificationPeerErr {
+                        host: "node-a:9000".to_string(),
+                        err: None,
+                    },
+                    NotificationPeerErr {
+                        host: "node-b:9000".to_string(),
+                        err: Some(StorageError::other("internal timeout details")),
+                    },
+                ],
+                serde_json::json!({"status": "incomplete", "unconfirmed_peers": ["node-b:9000", "node-c:9000"]}),
+            ),
+            (
+                vec![NotificationPeerErr {
+                    host: "node-a:9000".to_string(),
+                    err: Some(StorageError::other("unreachable")),
+                }],
+                serde_json::json!({"status": "incomplete", "unconfirmed_peers": ["node-a:9000"]}),
+            ),
+        ] {
+            let report = run_quota_metadata_reload("bucket-a".to_string(), "set_bucket_quota", async move { Ok(peers) }).await;
+            assert_eq!(serde_json::to_value(report).expect("serialize reload report"), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_metadata_reload_unavailable_does_not_imply_completion() {
+        let missing_service = notify_quota_metadata_reload(None, "bucket-a".to_string(), "set_bucket_quota").await;
+        let invalid_report = run_quota_metadata_reload("bucket-a".to_string(), "clear_bucket_quota", async {
+            Err(StorageError::other("incomplete topology report"))
+        })
+        .await;
+        for report in [missing_service, invalid_report] {
+            assert_eq!(
+                serde_json::to_value(report).expect("serialize unavailable report"),
+                serde_json::json!({"status": "unknown", "unconfirmed_peers": null})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_metadata_reload_task_failure_is_unknown() {
+        let report = run_quota_metadata_reload("bucket-a".to_string(), "set_bucket_quota", async {
+            panic!("simulate a failed reload task");
+        })
+        .await;
+        assert_eq!(
+            serde_json::to_value(report).expect("serialize failed task report"),
+            serde_json::json!({"status": "unknown", "unconfirmed_peers": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_metadata_reload_survives_request_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(run_quota_metadata_reload("bucket-a".to_string(), "set_bucket_quota", async move {
+            started_tx.send(()).expect("signal that reload has started");
+            release_rx.await.expect("release reload after cancelling the request");
+            finished_tx.send(()).expect("signal that detached reload completed");
+            Ok(Vec::new())
+        }));
+        let deadline = std::time::Duration::from_secs(5);
+        tokio::time::timeout(deadline, started_rx)
+            .await
+            .expect("reload should start within the deadline")
+            .expect("reload should signal its start");
+        request.abort();
+        assert!(request.await.expect_err("request task should be cancelled").is_cancelled());
+        release_tx
+            .send(())
+            .expect("reload must still own its receiver after request cancellation");
+        tokio::time::timeout(deadline, finished_rx)
+            .await
+            .expect("detached reload should finish within the deadline")
+            .expect("detached reload should complete");
+    }
+
+    #[test]
+    fn quota_metadata_reload_is_only_in_mutation_responses() {
+        let quota = BucketQuotaResponse {
+            bucket: "bucket-a".to_string(),
+            quota: Some(4096),
+            size: None,
+            quota_type: default_quota_type(),
+        };
+        let original = serde_json::to_value(&quota).expect("serialize GET response");
+        assert!(original.get("metadata_reload").is_none());
+        let mutation = BucketQuotaMutationResponse {
+            quota,
+            metadata_reload: QuotaMetadataReloadReport::from_peer_results(Vec::new()),
+        };
+        let mut value = serde_json::to_value(mutation).expect("serialize mutation response");
+        let report = value
+            .as_object_mut()
+            .expect("mutation response should be an object")
+            .remove("metadata_reload");
+        assert_eq!(report, Some(serde_json::json!({"status": "complete", "unconfirmed_peers": []})));
+        assert_eq!(value, original, "mutation must preserve existing response fields");
+    }
 
     #[test]
     fn test_default_quota_type() {

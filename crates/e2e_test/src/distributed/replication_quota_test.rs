@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, cluster_admin_ok, enable_versioning, put_bucket_replication, put_object,
+    DistCluster, DistLayout, TestResult, cluster_admin, enable_versioning, put_bucket_replication, put_object,
     quota_stats_current_usage, quota_stats_on_every_node, retrying_put, set_bucket_quota, set_remote_target, unique_bucket,
     wait_for_ready, wait_for_replicated_bytes, wait_until,
 };
@@ -119,6 +119,7 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
     let native_path = format!("/rustfs/admin/v3/quota/{bucket}");
     let compat_set = format!("/rustfs/admin/v3/set-bucket-quota?bucket={bucket}");
     let compat_get = format!("/rustfs/admin/v3/get-bucket-quota?bucket={bucket}");
+    let complete_reload = serde_json::json!({"status": "complete", "unconfirmed_peers": []});
 
     // Warm every node's no-quota cache. The compatibility GET does not
     // depend on a scanner usage snapshot for this newly created bucket.
@@ -133,7 +134,12 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+        let response: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(response["quota"], 0);
+        assert!(
+            response.get("metadata_reload").is_none(),
+            "GET must not report a mutation outcome: {body}"
+        );
     }
     wait_until(
         Duration::from_secs(30),
@@ -151,6 +157,8 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
                 return Ok(false);
             }
             assert_eq!(status, StatusCode::OK, "{body}");
+            let response: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(response["metadata_reload"], complete_reload, "{body}");
             Ok(true)
         },
         "quota fleet capability ready",
@@ -180,7 +188,14 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
         ),
     ] {
         if method != Method::GET {
-            cluster_admin_ok(&dist.cluster, method, path, payload.map(|value| value.to_string())).await?;
+            let (status, body) = cluster_admin(&dist.cluster, method, path, payload.map(|value| value.to_string())).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if path == compat_set {
+                assert!(body.is_empty(), "compatible quota mutations must preserve their empty response: {body}");
+            } else {
+                let response: serde_json::Value = serde_json::from_str(&body)?;
+                assert_eq!(response["metadata_reload"], complete_reload, "{body}");
+            }
         }
         // No polling: a successful mutation waits for healthy peers to reload.
         for (index, node) in dist.cluster.nodes.iter().enumerate() {
@@ -194,10 +209,11 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
             )
             .await?;
             assert_eq!(status, StatusCode::OK, "node {index}: {body}");
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&body)?["quota"],
-                expected.unwrap_or(0),
-                "node {index} kept stale quota metadata",
+            let response: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(response["quota"], expected.unwrap_or(0), "node {index} kept stale quota metadata",);
+            assert!(
+                response.get("metadata_reload").is_none(),
+                "GET must not report a mutation outcome: {body}"
             );
             if expected.is_some() {
                 let (status, body) = admin_request(
@@ -210,21 +226,37 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
                 )
                 .await?;
                 assert_eq!(status, StatusCode::OK, "node {index}: {body}");
-                assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"].as_u64(), expected);
+                let response: serde_json::Value = serde_json::from_str(&body)?;
+                assert_eq!(response["quota"].as_u64(), expected);
+                assert!(
+                    response.get("metadata_reload").is_none(),
+                    "GET must not report a mutation outcome: {body}"
+                );
             }
         }
     }
 
-    cluster_admin_ok(
+    let (status, body) = cluster_admin(
         &dist.cluster,
         Method::PUT,
         &native_path,
         Some(serde_json::json!({"quota": 8192, "quota_type": "HARD"}).to_string()),
     )
     .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(response["metadata_reload"], complete_reload, "{body}");
+    let offline_host = dist.cluster.nodes[3].address.clone();
     dist.cluster.stop_node(3)?;
     // An unreachable peer cannot turn an already committed clear into a failure.
-    cluster_admin_ok(&dist.cluster, Method::DELETE, &native_path, None).await?;
+    let (status, body) = cluster_admin(&dist.cluster, Method::DELETE, &native_path, None).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        response["metadata_reload"],
+        serde_json::json!({"status": "incomplete", "unconfirmed_peers": [offline_host]}),
+        "the response must identify exactly the peer that did not acknowledge the reload: {body}",
+    );
     for node in dist.cluster.nodes.iter().take(3) {
         let (status, body) = admin_request(
             &node.url,
@@ -236,7 +268,12 @@ async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+        let response: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(response["quota"], 0);
+        assert!(
+            response.get("metadata_reload").is_none(),
+            "GET must not report a mutation outcome: {body}"
+        );
     }
     Ok(())
 }
