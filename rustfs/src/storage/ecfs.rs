@@ -2276,12 +2276,12 @@ impl S3 for FS {
 
 /// Every mutating S3 operation that has no bucket notification event reaches the audit
 /// stream only through `audit_only_operation`; a new such operation, or a dropped
-/// wrapper, must fail here rather than silently go unaudited.
+/// wrapper, must fail here rather than silently go unaudited. The wrappers are looked
+/// up in this file and in `legacy_edge/`, where a split of this file moves them.
 #[cfg(test)]
 mod audit_coverage_tests {
+    use crate::guard_sources::SourceSet;
     use rustfs_s3_ops::S3Operation;
-
-    const SOURCE: &str = include_str!("ecfs.rs");
 
     fn is_read_only(op: S3Operation) -> bool {
         let name = op.as_str().trim_start_matches("s3:");
@@ -2300,9 +2300,15 @@ mod audit_coverage_tests {
         expected.push(S3Operation::AbortMultipartUpload);
         assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
 
+        let source = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
         for op in expected {
             let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
-            assert!(SOURCE.contains(&wrapper), "{} is not run through audit_only_operation", op.as_str());
+            assert!(
+                source.contains(&wrapper),
+                "{} is not run through audit_only_operation in {}",
+                op.as_str(),
+                source.describe()
+            );
         }
     }
 }

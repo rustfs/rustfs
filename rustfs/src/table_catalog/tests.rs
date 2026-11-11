@@ -14465,34 +14465,165 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     );
 }
 
-#[test]
-fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../app/multipart_usecase.rs");
+const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
+const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
 
+fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        4
+        source.count(MULTIPART_KEY_GUARD),
+        4,
+        "reserved-prefix guard calls across {}",
+        source.describe()
+    );
+}
+
+fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
+    assert_eq!(
+        source.count(OBJECT_METADATA_OBJECT_GUARD),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
+    );
+    assert_eq!(
+        source.count(OBJECT_METADATA_KEY_GUARD),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
     );
 }
 
 #[test]
-fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../storage/ecfs.rs");
+fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_multipart_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    ));
+}
 
-    assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &object).await?;")
-            .count(),
-        2
+#[test]
+fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_object_metadata_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    ));
+}
+
+/// `count` production calls of `guard`, one per method, for count-guard fixtures.
+fn guarded_methods(guard: &str, count: usize) -> String {
+    let methods: String = (0..count)
+        .map(|index| format!("    async fn guarded_{index}(&self) {{\n        {guard}\n    }}\n"))
+        .collect();
+    format!("impl Usecase {{\n{methods}}}\n")
+}
+
+fn guard_fixture(files: &[(&str, &str)], file: &str, split_dir: &str) -> crate::guard_sources::SourceSet {
+    let root = crate::guard_sources::fixture_root(files);
+    crate::guard_sources::SourceSet::production_under(root.path(), file, split_dir)
+}
+
+#[test]
+fn multipart_count_guard_fails_when_a_dropped_production_call_is_replaced_by_test_mentions() {
+    let parent = format!(
+        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_KEY_GUARD}\n    }}\n}}\n",
+        guarded_methods(MULTIPART_KEY_GUARD, 2)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", parent.as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
     );
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        2
+        source.count(MULTIPART_KEY_GUARD),
+        3,
+        "fixture: three production calls and one test mention"
     );
+
+    let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
+}
+
+#[test]
+fn multipart_count_guard_passes_when_calls_move_into_the_split_directory() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 3).as_str()),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_fails_when_a_moved_call_is_broken() {
+    let moved_and_broken = guarded_methods(MULTIPART_KEY_GUARD, 1).replace("&key)", "key.as_str())");
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            ("src/storage/legacy_edge/object_write.rs", moved_and_broken.as_str()),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("src/storage/legacy_edge/object_write.rs"), "{message}");
+}
+
+#[test]
+fn object_metadata_key_count_guard_passes_when_a_call_moves_intact() {
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            (
+                "src/storage/legacy_edge/object_write.rs",
+                guarded_methods(OBJECT_METADATA_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_count_guard_fails_when_a_legacy_edge_test_replaces_a_production_call() {
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 1),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 2)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            ("src/storage/legacy_edge/tests/object_meta.rs", OBJECT_METADATA_OBJECT_GUARD),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
 }
 
 #[test]
