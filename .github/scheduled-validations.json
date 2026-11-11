@@ -870,6 +870,33 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/reference-parity.yml",
+      "name": "Reference Parity",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 1 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "reference-parity.yml",
+      "disposition": "s3-tests per-node-id parity of branch candidates against the pinned reference release",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/functional-chain-health.yml",
       "name": "Functional chain health",
       "roles": [

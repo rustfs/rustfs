@@ -12,9 +12,9 @@
 # Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	1026	20
-rustfs	6438	64
+rustfs	6440	64
 rustfs-audit	70	0
-rustfs-checksums	26	0
+rustfs-checksums	28	1
 rustfs-common	36	0
 rustfs-concurrency	87	0
 rustfs-config	43	0
@@ -45,7 +45,7 @@ rustfs-policy	758	0
 rustfs-protocols	770	1
 rustfs-protos	75	0
 rustfs-replication	209	0
-rustfs-rio	223	0
+rustfs-rio	225	1
 rustfs-rio-v2	34	6
 rustfs-s3-client	71	0
 rustfs-s3-ops	8	0
@@ -61,6 +61,6 @@ rustfs-targets	612	26
 rustfs-test-utils	1	0
 rustfs-tls-runtime	44	0
 rustfs-trusted-proxies	72	0
-rustfs-utils	251	0
+rustfs-utils	253	1
 rustfs-zip	30	0
 zstd	11	0
