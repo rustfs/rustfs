@@ -48,10 +48,13 @@ use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, ClientAddr, DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass,
-    HandlerDeadlineConfig, HostRequestId, LegacyRustfsVirtualHosts, MintedTraces, RegionSet, RequestBodyDeadlineConfig,
-    ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity,
+    HandlerDeadlineConfig, MintedTraces, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator,
+    SseConfig, TransportSecurity,
 };
-use rustfs_gateway_adapter::{IamAdapters, IamKeyLookup, IamPrincipalLookup, RootCredentials, RootCredentialsError, RootSource};
+use rustfs_gateway_adapter::{
+    IamAdapters, IamKeyLookup, IamPrincipalLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource,
+    host_request_id, rustfs_host_resolver,
+};
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::manager::get_token_signing_key;
 use rustfs_iam::store::object::ObjectStore;
@@ -149,7 +152,7 @@ impl GatewayStack {
         let regions = RegionSet::new([region]).map_err(|_| GatewayAssemblyError::Region {
             region: region.to_owned(),
         })?;
-        let hosts = LegacyRustfsVirtualHosts::new(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;
+        let hosts = rustfs_host_resolver(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
 
         // Every legacy RustFS reading of a request, a credential scope and an answer, in the
@@ -244,9 +247,7 @@ fn attach_host_facts(extensions: &mut Extensions) {
             .and_then(|peer| peer.as_ref().map(|peer| peer.0.ip()))
     });
     // An identifier outside the gateway's alphabet is not handed over; the gateway mints its own.
-    let request_id = extensions
-        .get::<RequestContext>()
-        .and_then(|context| HostRequestId::new(&context.request_id).ok());
+    let request_id = extensions.get::<RequestContext>().and_then(host_request_id);
 
     extensions.insert(security);
     if let Some(client_ip) = client_ip {
@@ -254,6 +255,13 @@ fn attach_host_facts(extensions: &mut Extensions) {
     }
     if let Some(request_id) = request_id {
         extensions.insert(request_id);
+    }
+}
+
+/// The identifier the outer layer assigned is the one the gateway is handed.
+impl RequestIdCarrier for RequestContext {
+    fn request_id(&self) -> &str {
+        &self.request_id
     }
 }
 
