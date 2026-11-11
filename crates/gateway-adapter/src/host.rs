@@ -23,9 +23,9 @@
 //! Upstream: the RustFS configuration (`Config::server_domains`). Downstream: the gateway's
 //! `ServiceBuilder`, which holds the resolver as `Arc<dyn HostResolver>`.
 //!
-//! # What "the same as `MultiDomain`" means
+//! # What "the same as the legacy multi-domain host" means
 //!
-//! RustFS today hands the same list to `s3s::host::MultiDomain`, which ignores ports on both
+//! RustFS today hands the same list to the s3s framework's multi-domain host, which ignores ports on both
 //! sides when matching a domain, takes the whole prefix in front of a matched domain as the
 //! bucket, compares a domain exactly (so a host is matched on the case it arrives in), and, for a
 //! host no domain matches, falls back to CNAME-style: a host that is itself a bucket name
@@ -165,7 +165,7 @@ mod tests {
         assert_ne!(bucket(&["example.com"], "example.com.evil.org").as_deref(), Some("example.com.evil"));
     }
 
-    /// Negative: matching a configured domain is exact on case, as `MultiDomain` does it, so a
+    /// Negative: matching a configured domain is exact on case, as the legacy multi-domain host does it, so a
     /// mixed-case host is not stripped to its prefix; it is the lower-cased whole host.
     #[test]
     fn mixed_case_host_is_not_stripped_to_a_prefix() {
@@ -202,7 +202,7 @@ mod tests {
     }
 
     /// Positive: a later repeat of a name, whatever its port, is dropped rather than refused, as
-    /// `s3_host_domains` drops it before `MultiDomain` sees the list.
+    /// `s3_host_domains` drops it before the legacy multi-domain host sees the list.
     #[test]
     fn a_repeat_of_a_domain_is_dropped() {
         assert_eq!(bucket(&["example.com:9411", "example.com:9000"], "x.example.com").as_deref(), Some("x"));
