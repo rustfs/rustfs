@@ -63,10 +63,13 @@ fi
 
 echo "PASS: SFTP listener bound at 127.0.0.1:${PORT} (PID ${PID})"
 
-# Confirm the warn-once log line appeared in the server log.
-if ! grep -q "host key file permission enforcement is not active on Windows" \
-        "$TMP/server.log"; then
-    echo "FAIL: expected warn-once log line not found in server log" >&2
+# Match the stable event and result fields on the same warning record.
+WARN_COUNT="$(awk '
+    /"level":"WARN"/ && /"event":"sftp_host_key_state"/ && /"result":"windows_acl_operator_managed"/ { count++ }
+    END { print count + 0 }
+' "$TMP/server.log")"
+if [ "$WARN_COUNT" -ne 1 ]; then
+    echo "FAIL: expected one Windows host-key permission warning, found $WARN_COUNT" >&2
     echo "--- server.log tail ---" >&2
     tail -50 "$TMP/server.log" >&2 || true
     exit 1

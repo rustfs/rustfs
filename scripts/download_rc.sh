@@ -13,7 +13,7 @@ OUTPUT="$4"
 
 case "$ARCH" in
   amd64|arm64) ;;
-  *) echo "Unsupported rc architecture: $ARCH" >&2; exit 1 ;;
+  *) echo "Unsupported rc architecture: '$ARCH' (expected amd64 or arm64; an empty value means the caller's TARGETARCH build argument was not set)" >&2; exit 1 ;;
 esac
 case "$LIBC" in
   musl) LIBC_SUFFIX="" ;;

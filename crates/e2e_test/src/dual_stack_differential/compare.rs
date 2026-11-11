@@ -232,6 +232,12 @@ pub(crate) struct Report {
     pub run: String,
     pub stack_a: String,
     pub stack_b: String,
+    /// Which side is the pinned release binary: `"a"`, or `None` when both sides are the binary
+    /// under test.
+    pub reference_side: Option<&'static str>,
+    /// `--version` output of the binary each side actually ran.
+    pub version_a: String,
+    pub version_b: String,
     pub region_a: Option<String>,
     pub region_b: Option<String>,
     pub compared_ops: usize,
@@ -480,10 +486,13 @@ mod tests {
     fn the_report_lists_each_difference_as_op_field_a_b() {
         let directory = std::env::temp_dir().join(format!("dual-stack-report-{}", uuid::Uuid::new_v4()));
         let report = Report {
-            schema: 1,
+            schema: 2,
             run: "unit".into(),
             stack_a: "legacy".into(),
             stack_b: "legacy".into(),
+            reference_side: Some("a"),
+            version_a: "rustfs 1.0.4".into(),
+            version_b: "rustfs 1.1.0".into(),
             region_a: None,
             region_b: Some("eu-west-1".into()),
             compared_ops: 1,
@@ -498,6 +507,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("unit.json"));
         assert_eq!(json["compared_ops"], 1);
+        assert_eq!(json["reference_side"], "a");
+        assert_eq!(json["version_a"], "rustfs 1.0.4");
+        assert_eq!(json["version_b"], "rustfs 1.1.0");
         assert_eq!(
             json["differences"],
             serde_json::json!([{
