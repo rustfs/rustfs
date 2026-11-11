@@ -2300,7 +2300,7 @@ mod audit_coverage_tests {
         expected.push(S3Operation::AbortMultipartUpload);
         assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
 
-        let source = SourceSet::read("src/storage/ecfs.rs", "src/storage/legacy_edge");
+        let source = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
         for op in expected {
             let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
             assert!(
