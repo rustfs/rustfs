@@ -2502,10 +2502,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         crate::hp_guard!("SetDisks::put_object_part");
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, opts.data_movement)?;
 
-        let (fi, _) = match self
+        let upload_check_started = rustfs_io_metrics::put_stage_timer();
+        let upload_check = self
             .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
-            .await
-        {
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_upload_check", upload_check_started);
+        let (fi, _) = match upload_check {
             Ok(value) => value,
             Err(err @ Error::InvalidUploadID(..)) => {
                 remove_capped_multipart_staging_semaphore(&upload_id_path);
@@ -2706,6 +2708,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 )))?;
             }
 
+            let integrity_started = rustfs_io_metrics::put_stage_timer();
             let part_integrity = if let Some(integrity) = integrity {
                 Some(
                     integrity
@@ -2718,6 +2721,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         .await?,
                 )
             } else { None };
+            rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_integrity_write", integrity_started);
             if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
                 return Err(Error::ErasureWriteQuorum);
             }
@@ -2790,6 +2794,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire).await;
+            let commit_lock_started = rustfs_io_metrics::put_stage_timer();
             // Capped uploads reacquire the upload-wide write lock for the
             // final durable check and rename. Uncapped uploads retain the
             // concurrent encode path and only serialize the final same-part
@@ -2816,6 +2821,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // Only guards owned by this operation may outlive its caller. Internal
             // data-movement and borrowed-lock callers retain their synchronous
             // lifetime; a fence by itself cannot transfer the outer lock lease.
+            rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_commit_lock", commit_lock_started);
             let detach_commit_owner = _upload_commit_guard.is_some()
                 && opts.namespace_lock_fence.is_none()
                 && (opts.bucket_lifecycle_lock_fence.is_none() || opts.bucket_lifecycle_lock_owner.is_some());
@@ -2840,9 +2846,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 let upload_id_path = commit_upload_id_path;
                 let opts = &commit_opts;
                 let result: Result<PartInfo> = async {
+                    let commit_check_started = rustfs_io_metrics::put_stage_timer();
                     let (commit_fi, _) = commit_set
                         .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
                         .await?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_commit_upload_check", commit_check_started);
                     let commit_size_limit = multipart_size_limit_from_metadata(&commit_fi.metadata)?;
                     if commit_size_limit != multipart_size_limit {
                         return Err(Error::InvalidArgument(
@@ -2911,6 +2919,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                             achieved: 0,
                         });
                     }
+                    let rename_started = rustfs_io_metrics::put_stage_timer();
                     let rename_result = commit_set
                         .rename_part(
                             &shuffle_disks,
@@ -2929,6 +2938,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                             }),
                         )
                         .await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_rename_part", rename_started);
                     drop(decommission_capacity_guard);
                     let _ = rename_result?;
                     #[cfg(test)]
@@ -3808,6 +3818,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE);
         }
+        // The upload's pinned ETag algorithm is upload state, not object metadata.
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_ETAG_ALGORITHM);
 
         let mut checksum_type = rustfs_rio::ChecksumType::NONE;
 

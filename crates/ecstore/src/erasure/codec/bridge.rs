@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::erasure::codec::shard_buf::ShardBytes;
 use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
 use crate::erasure::coding::Erasure;
 use rustfs_erasure_codec::galois_8::ReedSolomon;
@@ -47,15 +48,19 @@ pub(crate) trait ErasureDecodeEngine: Send + Sync + 'static {
 
     fn prepare_workspace(&self, shard_len: usize) -> io::Result<Self::Workspace>;
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str>;
+    fn reconstruct_into<S: ShardBytes>(
+        &self,
+        shards: &mut [Option<S>],
+        workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str>;
 }
 
-fn data_shards_complete(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
+fn data_shards_complete<S: ShardBytes>(shards: &[Option<S>], data_shards: usize) -> bool {
     shards.len() >= data_shards && shards.iter().take(data_shards).all(Option::is_some)
 }
 
-fn recover_empty_payload_data_shards(
-    shards: &mut [Option<Vec<u8>>],
+fn recover_empty_payload_data_shards<S: ShardBytes>(
+    shards: &mut [Option<S>],
     data_shards: usize,
     parity_shards: usize,
 ) -> io::Result<bool> {
@@ -81,7 +86,7 @@ fn recover_empty_payload_data_shards(
 
     for shard in shards.iter_mut().take(data_shards) {
         if shard.is_none() {
-            *shard = Some(Vec::new());
+            *shard = Some(S::from(Vec::new()));
         }
     }
 
@@ -153,7 +158,11 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
         Ok(LegacyDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<S: ShardBytes>(
+        &self,
+        shards: &mut [Option<S>],
+        _workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.erasure.data_shards) {
             return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
@@ -200,13 +209,18 @@ impl RustfsCodecDecodeEngine {
         Ok(Some(codec))
     }
 
-    fn needs_source_parity_verification(&self, shards: &[Option<Vec<u8>>]) -> bool {
+    fn needs_source_parity_verification<S: ShardBytes>(&self, shards: &[Option<S>]) -> bool {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
         missing_data_source && available_shards > self.data_shards
     }
 
-    fn verify_source_parity(&self, codec: &ReedSolomon, shards: &[Option<Vec<u8>>], needs_verification: bool) -> io::Result<()> {
+    fn verify_source_parity<S: ShardBytes>(
+        &self,
+        codec: &ReedSolomon,
+        shards: &[Option<S>],
+        needs_verification: bool,
+    ) -> io::Result<()> {
         if !needs_verification {
             return Ok(());
         }
@@ -272,7 +286,11 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
         Ok(RustfsCodecDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<S: ShardBytes>(
+        &self,
+        shards: &mut [Option<S>],
+        _workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.data_shards) {
             return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
@@ -282,6 +300,12 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
 
         if let Some(codec) = self.codec()? {
             let needs_source_parity_verification = self.needs_source_parity_verification(shards);
+            // The codec works on plain vectors: hand it the shard bytes (a
+            // move for heap buffers, a copy out of arena blocks) and put the
+            // results back. Reconstruction is the rare path, so the copy is
+            // acceptable.
+            let mut owned: Vec<Option<Vec<u8>>> = shards.iter_mut().map(|slot| slot.take().map(S::into_vec)).collect();
+            let vec_shards = owned.as_mut_slice();
             if needs_source_parity_verification {
                 // Rebuild missing parity together with missing data so the
                 // shard set is complete for `verify`. Rebuilt parity is
@@ -294,12 +318,15 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
                 // example one missing data shard plus one missing parity
                 // shard) as an inconsistent-source failure.
                 codec
-                    .reconstruct_opt(shards)
+                    .reconstruct_opt(vec_shards)
                     .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
             } else {
                 codec
-                    .reconstruct_data_opt(shards)
+                    .reconstruct_data_opt(vec_shards)
                     .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+            }
+            for (slot, shard) in shards.iter_mut().zip(owned) {
+                *slot = shard.map(S::from);
             }
             self.verify_source_parity(&codec, shards, needs_source_parity_verification)?;
         }
@@ -390,7 +417,11 @@ impl ErasureDecodeEngine for CodecStreamingDecodeEngine {
         }
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str> {
+    fn reconstruct_into<S: ShardBytes>(
+        &self,
+        shards: &mut [Option<S>],
+        workspace: &mut Self::Workspace,
+    ) -> io::Result<&'static str> {
         match (self, workspace) {
             (Self::Legacy(engine), CodecStreamingDecodeWorkspace::Legacy(workspace)) => {
                 engine.reconstruct_into(shards, workspace)

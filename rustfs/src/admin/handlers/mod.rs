@@ -24,6 +24,7 @@ pub mod cluster_snapshot;
 pub mod config_admin;
 pub mod diagnostics;
 pub mod durability;
+pub mod etag;
 pub mod event;
 pub mod extensions;
 pub mod gateway_key_inventory;

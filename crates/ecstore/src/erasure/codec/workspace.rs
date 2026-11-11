@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::erasure::codec::shard_buf::ShardBuf;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RustfsCodecDecodeWorkspace {
     shard_len: usize,
@@ -30,23 +32,30 @@ impl RustfsCodecDecodeWorkspace {
     }
 }
 
+/// Buffers kept per shard slot. Depth-1 stripe prefetch reads stripe N+1 while
+/// stripe N is still being emitted, so a slot needs two generations in flight;
+/// with one, every prefetched read allocated (and page-faulted) a fresh shard
+/// buffer and the previous one was dropped on `put`, which at 4 MiB shards
+/// cost more than the overlap saved.
+const BUFFERS_PER_SLOT: usize = 2;
+
 #[derive(Debug, Default)]
 pub(crate) struct ShardBufferPool {
-    buffers: Vec<Option<Vec<u8>>>,
+    buffers: Vec<Vec<ShardBuf>>,
 }
 
 impl ShardBufferPool {
     #[inline]
     pub(crate) fn new(slot_count: usize) -> Self {
         let mut buffers = Vec::with_capacity(slot_count);
-        buffers.resize_with(slot_count, || None);
+        buffers.resize_with(slot_count, Vec::new);
         Self { buffers }
     }
 
     #[inline]
     pub(crate) fn ensure_slots(&mut self, slot_count: usize) {
         if self.buffers.len() < slot_count {
-            self.buffers.resize_with(slot_count, || None);
+            self.buffers.resize_with(slot_count, Vec::new);
         }
     }
 
@@ -61,9 +70,9 @@ impl ShardBufferPool {
     /// exists to reuse an allocation, and memsetting it gives that saving straight
     /// back.
     #[inline]
-    pub(crate) fn take(&mut self, index: usize, len: usize) -> Vec<u8> {
+    pub(crate) fn take(&mut self, index: usize, len: usize) -> ShardBuf {
         self.ensure_slots(index + 1);
-        let mut buf = self.buffers[index].take().unwrap_or_else(|| Vec::with_capacity(len));
+        let mut buf = self.buffers[index].pop().unwrap_or_else(|| ShardBuf::with_capacity(len));
         buf.clear();
         if buf.capacity() < len {
             buf.reserve_exact(len - buf.len());
@@ -72,27 +81,58 @@ impl ShardBufferPool {
     }
 
     #[inline]
-    pub(crate) fn put(&mut self, index: usize, buf: Vec<u8>) {
+    /// Returns `buf` to the slot; beyond `BUFFERS_PER_SLOT` the smallest
+    /// buffer is dropped so a slot never holds more than two generations.
+    pub(crate) fn put(&mut self, index: usize, buf: ShardBuf) {
         self.ensure_slots(index + 1);
-        self.buffers[index] = Some(buf);
+        let slot = &mut self.buffers[index];
+        slot.push(buf);
+        if slot.len() > BUFFERS_PER_SLOT {
+            let smallest = slot
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buf)| buf.capacity())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            slot.swap_remove(smallest);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn stored_allocation(&self, index: usize) -> Option<(*const u8, usize)> {
         self.buffers
             .get(index)
-            .and_then(|buf| buf.as_ref().map(|buf| (buf.as_ptr(), buf.capacity())))
+            .and_then(|slot| slot.last().map(|buf| (buf.as_ptr(), buf.capacity())))
     }
 
     #[cfg(test)]
     fn stored_capacity(&self, index: usize) -> Option<usize> {
-        self.buffers.get(index).and_then(|buf| buf.as_ref().map(Vec::capacity))
+        self.buffers.get(index).and_then(|slot| slot.last().map(ShardBuf::capacity))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_keeps_two_generations_for_prefetch() {
+        let mut pool = ShardBufferPool::new(1);
+        let first = pool.take(0, 16);
+        let second = pool.take(0, 16); // prefetch takes before the first is returned
+        let (first_ptr, second_ptr) = (first.as_ptr(), second.as_ptr());
+        pool.put(0, first);
+        pool.put(0, second);
+        let a = pool.take(0, 16);
+        let b = pool.take(0, 16);
+        let got = [a.as_ptr(), b.as_ptr()];
+        assert!(got.contains(&first_ptr) && got.contains(&second_ptr), "both generations are reused");
+        pool.put(0, a);
+        pool.put(0, b);
+        pool.put(0, ShardBuf::with_heap_capacity(64));
+        assert_eq!(pool.buffers[0].len(), BUFFERS_PER_SLOT, "a third buffer evicts one");
+        assert!(pool.buffers[0].iter().any(|buf| buf.capacity() >= 64), "the larger buffer is kept");
+    }
 
     /// `take` hands out capacity, never length: the caller appends every byte it
     /// will read back. Reusing a slot must keep the allocation and must not memset
@@ -132,7 +172,7 @@ mod tests {
         assert_eq!(workspace.shard_len(), 37);
 
         let mut pool = ShardBufferPool::new(1);
-        pool.put(0, Vec::with_capacity(2));
+        pool.put(0, ShardBuf::with_heap_capacity(2));
         let grown = pool.take(0, 8);
 
         assert_eq!(grown.len(), 0);

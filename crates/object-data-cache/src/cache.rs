@@ -164,6 +164,12 @@ impl ObjectDataCache {
         self
     }
 
+    /// Largest body a fill can accept (`max_entry_bytes` clamped by the fill
+    /// ceiling); lets a producer avoid buffering a body that could never fit.
+    pub fn fill_size_ceiling_bytes(&self) -> u64 {
+        self.effective_size_ceiling()
+    }
+
     /// Effective size above which a body is planned `SkipTooLarge`:
     /// `max_entry_bytes` clamped by the fill ceiling when one is set.
     fn effective_size_ceiling(&self) -> u64 {
@@ -486,6 +492,11 @@ impl ObjectDataCache {
     /// Returns true when the cache mode allows materialize fill.
     pub fn materialize_fill_enabled(&self) -> bool {
         matches!(self.config.mode, crate::config::ObjectDataCacheMode::FillMaterializeEnabled)
+    }
+
+    /// Whether the configured mode accepts any fill (buffered or materialized).
+    pub fn fill_enabled(&self) -> bool {
+        self.config.fill_enabled()
     }
 
     /// Publishes the cache-state gauge (and mirrors it into stats), debounced so
