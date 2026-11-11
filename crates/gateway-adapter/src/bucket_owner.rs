@@ -47,7 +47,7 @@ pub enum OwnerLookupError {
 /// The narrow slice of RustFS bucket metadata an owner lookup needs.
 ///
 /// Exists so the source can be tested against a fake. The binary implements it over
-/// `rustfs_ecstore::bucket::metadata_sys`, mapping `BucketNotFound` to
+/// the ecstore bucket metadata system, mapping `BucketNotFound` to
 /// [`OwnerLookupError::NoSuchBucket`] and every other error to [`OwnerLookupError::Backend`].
 pub trait BucketOwnerLookup: Send + Sync + 'static {
     /// The owner account id recorded for `bucket`.
