@@ -15,9 +15,10 @@
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
 use crate::common::gateway::S3Action;
 use async_trait::async_trait;
+use rustfs_gateway_types::dto::*;
+use rustfs_gateway_types::{BucketName, OpaqueString};
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
-use s3s::dto::*;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,24 +137,20 @@ where
         let mut list_result = Vec::new();
         match self.storage.list_buckets(session_context.credentials()).await {
             Ok(output) => {
-                if let Some(buckets) = output.buckets {
-                    for bucket in buckets {
-                        if let Some(ref bucket_name) = bucket.name {
-                            let metadata = FtpsMetadata {
-                                size: 0,
-                                modified: bucket.creation_date.map(|dt| {
-                                    let offset_dt: time::OffsetDateTime = dt.into();
-                                    std::time::SystemTime::from(offset_dt)
-                                }),
-                                is_dir: true,
-                            };
+                for bucket in output.buckets {
+                    let metadata = FtpsMetadata {
+                        size: 0,
+                        modified: time::OffsetDateTime::from_unix_timestamp(bucket.creation_date.secs())
+                            .ok()
+                            .and_then(|value| value.replace_nanosecond(bucket.creation_date.subsec_nanos()).ok())
+                            .map(std::time::SystemTime::from),
+                        is_dir: true,
+                    };
 
-                            list_result.push(Fileinfo {
-                                path: PathBuf::from(bucket_name),
-                                metadata,
-                            });
-                        }
-                    }
+                    list_result.push(Fileinfo {
+                        path: PathBuf::from(bucket.name.as_str()),
+                        metadata,
+                    });
                 }
 
                 Ok(list_result)
@@ -174,15 +171,15 @@ where
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
-            let mut list_input = ListObjectsV2Input::builder().bucket(bucket.to_string());
+            let mut list_input = ListObjectsV2Input::builder().bucket(BucketName::new(bucket.to_owned()).map_err(|e| {
+                Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {e}"))
+            })?);
 
             if let Some(token) = continuation_token {
-                list_input = list_input.continuation_token(token);
+                list_input = list_input.continuation_token(OpaqueString::from(token));
             }
 
-            let list_input = list_input.build().map_err(|e| {
-                Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
-            })?;
+            let list_input = list_input.build();
 
             self.storage
                 .authorize_list_objects(session_context, &list_input)
@@ -191,27 +188,24 @@ where
 
             if let Ok(output) = self.storage.list_objects_v2(list_input, session_context.credentials()).await {
                 // Delete all objects in this page
-                if let Some(objects) = output.contents {
-                    for obj in objects {
-                        if let Some(obj_key) = obj.key {
-                            self.storage
-                                .authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
-                                .await
-                                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+                for obj in output.contents {
+                    let obj_key = obj.key;
+                    self.storage
+                        .authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(obj_key.as_str()))
+                        .await
+                        .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-                            let _ = self
-                                .storage
-                                .delete_object(bucket, &obj_key, session_context.credentials())
-                                .await;
-                        }
-                    }
+                    let _ = self
+                        .storage
+                        .delete_object(bucket, obj_key.as_str(), session_context.credentials())
+                        .await;
                 }
 
                 // Check if there are more objects
-                if !output.is_truncated.unwrap_or(false) {
+                if !output.is_truncated {
                     break;
                 }
-                continuation_token = Some(output.next_continuation_token);
+                continuation_token = output.next_continuation_token.map(|token| token.into_string());
             } else {
                 break;
             }
@@ -260,10 +254,11 @@ where
             match self.storage.head_object(&bucket, &key, session_context.credentials()).await {
                 Ok(output) => {
                     let size = output.content_length.unwrap_or(0) as u64;
-                    let modified = output.last_modified.map(|dt| {
-                        // Convert s3s Timestamp to SystemTime
-                        let offset_dt: time::OffsetDateTime = dt.into();
-                        std::time::SystemTime::from(offset_dt)
+                    let modified = output.last_modified.and_then(|dt| {
+                        time::OffsetDateTime::from_unix_timestamp(dt.secs())
+                            .ok()
+                            .and_then(|value| value.replace_nanosecond(dt.subsec_nanos()).ok())
+                            .map(std::time::SystemTime::from)
                     });
 
                     Ok(FtpsMetadata {
@@ -341,13 +336,12 @@ where
         let prefix_with_slash = prefix.clone().map(|p| if p.ends_with('/') { p } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
-            .bucket(bucket)
-            .prefix(prefix_with_slash.clone())
-            .delimiter(Some("/".to_string()))
-            .build()
-            .map_err(|e| {
-                Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {}", e))
-            })?;
+            .bucket(BucketName::new(bucket.clone()).map_err(|e| {
+                Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {e}"))
+            })?)
+            .prefix(prefix_with_slash.clone().unwrap_or_default())
+            .delimiter("/".to_string())
+            .build();
 
         self.storage
             .authorize_list_objects(session_context, &list_input)
@@ -359,74 +353,64 @@ where
                 let mut fileinfos = Vec::new();
 
                 // Add files (objects)
-                if let Some(objects) = output.contents {
-                    for obj in objects {
-                        if let Some(key) = obj.key {
-                            // Filter: only show files directly in current directory
-                            // Skip files in subdirectories (they should be accessed via cd)
-                            let should_show = if prefix.is_none() {
-                                // Root directory: only show files without "/"
-                                !key.contains('/')
-                            } else {
-                                // Subdirectory: show files starting with prefix
-                                key.starts_with(&prefix_with_slash.clone().unwrap_or_default())
-                            };
+                for obj in output.contents {
+                    let key = obj.key;
+                    // Filter: only show files directly in current directory
+                    // Skip files in subdirectories (they should be accessed via cd)
+                    let should_show = if prefix.is_none() {
+                        // Root directory: only show files without "/"
+                        !key.as_str().contains('/')
+                    } else {
+                        // Subdirectory: show files starting with prefix
+                        key.as_str().starts_with(&prefix_with_slash.clone().unwrap_or_default())
+                    };
 
-                            if !should_show {
-                                continue;
-                            }
-
-                            let filename = PathBuf::from(key.as_str())
-                                .file_name()
-                                .ok_or_else(|| {
-                                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid filename: {}", key))
-                                })
-                                .map(PathBuf::from)?;
-
-                            let size = obj.size.unwrap_or(0) as u64;
-                            let modified = obj.last_modified.map(|dt: s3s::dto::Timestamp| {
-                                // Convert s3s Timestamp to SystemTime
-                                let offset_dt: time::OffsetDateTime = dt.into();
-                                std::time::SystemTime::from(offset_dt)
-                            });
-
-                            let metadata = FtpsMetadata {
-                                size,
-                                modified,
-                                is_dir: false,
-                            };
-
-                            fileinfos.push(Fileinfo {
-                                path: filename,
-                                metadata,
-                            });
-                        }
+                    if !should_show {
+                        continue;
                     }
+
+                    let filename = PathBuf::from(key.as_str())
+                        .file_name()
+                        .ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid filename: {key:?}")))
+                        .map(PathBuf::from)?;
+
+                    let size = obj.size.max(0) as u64;
+                    let modified = time::OffsetDateTime::from_unix_timestamp(obj.last_modified.secs())
+                        .ok()
+                        .and_then(|value| value.replace_nanosecond(obj.last_modified.subsec_nanos()).ok())
+                        .map(std::time::SystemTime::from);
+
+                    let metadata = FtpsMetadata {
+                        size,
+                        modified,
+                        is_dir: false,
+                    };
+                    fileinfos.push(Fileinfo {
+                        path: filename,
+                        metadata,
+                    });
                 }
 
                 // Add directories (common prefixes)
-                if let Some(common_prefixes) = output.common_prefixes {
-                    for prefix in common_prefixes {
-                        if let Some(prefix_str) = prefix.prefix {
-                            let dir_name = PathBuf::from(prefix_str.as_str().trim_end_matches('/'))
-                                .file_name()
-                                .ok_or_else(|| {
-                                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid directory: {}", prefix_str))
-                                })
-                                .map(PathBuf::from)?;
+                for prefix in output.common_prefixes {
+                    let prefix_str = prefix.prefix;
+                    let dir_name = PathBuf::from(prefix_str.trim_end_matches('/'))
+                        .file_name()
+                        .ok_or_else(|| {
+                            Error::new(ErrorKind::PermanentFileNotAvailable, format!("Invalid directory: {prefix_str}"))
+                        })
+                        .map(PathBuf::from)?;
 
-                            let metadata = FtpsMetadata {
-                                size: 0,
-                                modified: Some(std::time::SystemTime::now()),
-                                is_dir: true,
-                            };
+                    let metadata = FtpsMetadata {
+                        size: 0,
+                        modified: Some(std::time::SystemTime::now()),
+                        is_dir: true,
+                    };
 
-                            fileinfos.push(Fileinfo {
-                                path: dir_name,
-                                metadata,
-                            });
-                        }
-                    }
+                    fileinfos.push(Fileinfo {
+                        path: dir_name,
+                        metadata,
+                    });
                 }
 
                 Ok(fileinfos)
@@ -482,12 +466,15 @@ where
                     .body
                     .ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "No body in response"))?;
 
-                use futures_util::StreamExt;
+                use futures_util::future::poll_fn;
+                use rustfs_gateway_stream::{PayloadRead, PayloadStream};
+                use std::pin::Pin;
                 let mut data = Vec::new();
                 let mut stream = body;
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(bytes) => data.extend_from_slice(&bytes),
+                loop {
+                    match poll_fn(|cx| Pin::new(&mut stream).poll_read(cx)).await {
+                        Ok(PayloadRead::Chunk(bytes)) => data.extend_from_slice(&bytes),
+                        Ok(PayloadRead::Eof { .. }) => break,
                         Err(e) => {
                             error!(
                                 event = EVENT_FTPS_STREAM_READ_FAILED,
@@ -965,7 +952,9 @@ mod tests {
 mod upload {
     use crate::common::{client::s3::StorageBackend, gateway::S3Action, session::SessionContext};
     use bytes::Bytes;
-    use s3s::dto::*;
+    use rustfs_gateway_stream::ByteStream;
+    use rustfs_gateway_types::dto::*;
+    use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
     use std::{
         sync::{Arc, LazyLock},
         time::Duration,
@@ -1023,8 +1012,8 @@ mod upload {
         Ok(part)
     }
 
-    fn body(part: Vec<u8>) -> StreamingBlob {
-        StreamingBlob::from_bytes(Bytes::from(part))
+    fn body(part: Vec<u8>) -> ByteStream {
+        ByteStream::from_bytes(Bytes::from(part))
     }
 
     // Keep the upload ID alive across all cancellable awaits after CreateMultipartUpload.
@@ -1046,7 +1035,14 @@ mod upload {
 
     async fn abort_upload<S: StorageBackend>(storage: &S, session: &SessionContext, input: AbortMultipartUploadInput) {
         let cleanup = async {
-            authorize(storage, session, S3Action::AbortMultipartUpload, &input.bucket, &input.key).await?;
+            authorize(
+                storage,
+                session,
+                S3Action::AbortMultipartUpload,
+                input.bucket.as_str(),
+                input.key.as_str(),
+            )
+            .await?;
             storage
                 .abort_multipart_upload(input, session.credentials())
                 .await
@@ -1102,36 +1098,34 @@ mod upload {
             let size = u64::try_from(part.len()).map_err(upload_error)?;
             authorize(storage.as_ref(), session, S3Action::PutObject, bucket, key).await?;
             let input = PutObjectInput::builder()
-                .bucket(bucket.to_owned())
-                .key(key.to_owned())
-                .content_length(Some(i64::try_from(size).map_err(upload_error)?))
-                .body(Some(body(part)))
-                .build()
-                .map_err(upload_error)?;
+                .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
+                .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
+                .content_length(i64::try_from(size).map_err(upload_error)?)
+                .body(body(part))
+                .build();
             storage.put_object(input, session.credentials()).await.map_err(upload_error)?;
             return Ok(size);
         }
 
         authorize(storage.as_ref(), session, S3Action::CreateMultipartUpload, bucket, key).await?;
         let input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.to_owned())
-            .key(key.to_owned())
-            .build()
-            .map_err(upload_error)?;
+            .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
+            .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
+            .build();
         let output = storage
             .create_multipart_upload(input, session.credentials())
             .await
             .map_err(upload_error)?;
-        let upload_id = output
-            .upload_id
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| upload_error("CreateMultipartUpload returned no upload ID"))?;
+        let upload_id = if output.upload_id.is_empty() {
+            return Err(upload_error("CreateMultipartUpload returned no upload ID"));
+        } else {
+            output.upload_id
+        };
         let abort = AbortMultipartUploadInput::builder()
-            .bucket(bucket.to_owned())
-            .key(key.to_owned())
-            .upload_id(upload_id.clone())
-            .build()
-            .map_err(upload_error)?;
+            .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
+            .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
+            .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
+            .build();
         let mut pending = PendingUpload {
             storage: Arc::clone(&storage),
             session: session.clone(),
@@ -1149,34 +1143,36 @@ mod upload {
                     .ok_or_else(|| upload_error("FTPS upload size overflow"))?;
                 authorize(storage.as_ref(), session, S3Action::UploadPart, bucket, key).await?;
                 let input = UploadPartInput::builder()
-                    .bucket(bucket.to_owned())
-                    .key(key.to_owned())
-                    .upload_id(upload_id.clone())
+                    .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
+                    .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
+                    .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
                     .part_number(number)
-                    .content_length(Some(length))
-                    .body(Some(body(part)))
-                    .build()
-                    .map_err(upload_error)?;
+                    .content_length(length)
+                    .body(body(part))
+                    .build();
                 let output = storage
                     .upload_part(input, session.credentials())
                     .await
                     .map_err(upload_error)?;
-                let etag = output.e_tag.ok_or_else(|| upload_error("UploadPart returned no ETag"))?;
+                let etag = if output.e_tag == rustfs_gateway_types::ETag::default() {
+                    return Err(upload_error("UploadPart returned no ETag"));
+                } else {
+                    output.e_tag
+                };
                 parts.push(CompletedPart {
                     e_tag: Some(etag),
-                    part_number: Some(number),
+                    part_number: number,
                     ..Default::default()
                 });
                 part = read_part(&mut reader).await?;
             }
             authorize(storage.as_ref(), session, S3Action::CompleteMultipartUpload, bucket, key).await?;
             let input = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.to_owned())
-                .key(key.to_owned())
-                .upload_id(upload_id)
-                .multipart_upload(Some(CompletedMultipartUpload { parts: Some(parts) }))
-                .build()
-                .map_err(upload_error)?;
+                .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
+                .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
+                .upload_id(UploadIdClaim::from_wire(upload_id))
+                .multipart_upload(CompletedMultipartUpload { parts })
+                .build();
             storage
                 .complete_multipart_upload(input, session.credentials())
                 .await
@@ -1343,7 +1339,7 @@ mod upload {
                 let result = with_test_auth_override(|_, _, _| true, driver.put(&user(), reader, "/bucket/key", 0)).await;
                 assert!(result.is_err(), "{failure} must not report a committed object");
                 assert_eq!(backend.abort_multipart_calls().len(), 1, "{failure}");
-                assert_eq!(backend.abort_multipart_calls()[0].upload_id, "upload-1");
+                assert_eq!(backend.abort_multipart_calls()[0].upload_id, "<opaque>");
                 assert_eq!(backend.complete_multipart_calls().len(), usize::from(failure == "complete"));
             }
         }

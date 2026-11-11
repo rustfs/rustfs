@@ -27,9 +27,15 @@ pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
+mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
 pub(crate) mod trailer_adapter;
+
+// Request-scoped facts are not AppContext resolution, so consumers import them
+// from here rather than through `app::context`.
+pub(crate) use context::RequestHead;
+pub use context::{RequestCredentials, RequestEnvelope};
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;

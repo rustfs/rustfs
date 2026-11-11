@@ -16,7 +16,7 @@
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
     use crate::config::cli::{InspectCommands, default_server_opts};
-    use crate::config::{CommandResult, Config, Opt, TlsCommands};
+    use crate::config::{CommandResult, Config, Opt, S3Stack, TlsCommands};
     use crate::storage_api::config_test::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
     use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
@@ -915,5 +915,62 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// Resolves the server configuration with `RUSTFS_S3_STACK` set to `value`
+    /// (`None` removes it), so each case starts from a known environment.
+    fn config_with_s3_stack(value: Option<&str>) -> std::io::Result<Config> {
+        temp_env::with_var("RUSTFS_S3_STACK", value, || Config::from_opt(Opt::parse_from(["rustfs", "/data/vol1"])))
+    }
+
+    fn assert_s3_stack_rejected(value: &str) {
+        let err = match config_with_s3_stack(Some(value)) {
+            Ok(config) => panic!("RUSTFS_S3_STACK={value:?} must refuse startup, got {:?}", config.s3_stack),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!(r#"RUSTFS_S3_STACK must be "legacy" or "gateway", got "{value}""#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_unset_selects_legacy() {
+        let config = config_with_s3_stack(None).expect("unset RUSTFS_S3_STACK should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_legacy_selects_legacy() {
+        let config = config_with_s3_stack(Some("legacy")).expect("RUSTFS_S3_STACK=legacy should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_gateway_selects_gateway() {
+        let config = config_with_s3_stack(Some("gateway")).expect("RUSTFS_S3_STACK=gateway should parse");
+        assert_eq!(config.s3_stack, S3Stack::Gateway);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_capitalized_gateway() {
+        assert_s3_stack_rejected("Gateway");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_both() {
+        assert_s3_stack_rejected("both");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_empty_value() {
+        assert_s3_stack_rejected("");
     }
 }

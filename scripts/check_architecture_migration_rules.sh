@@ -2119,6 +2119,7 @@ fi
     rustfs/src/server/audit.rs \
     rustfs/src/server/event.rs \
     rustfs/src/server/layer.rs \
+    rustfs/src/server/legacy_compat \
     rustfs/src/server/module_switch.rs \
     rustfs/src/server/readiness.rs \
     --glob '*.rs' || true

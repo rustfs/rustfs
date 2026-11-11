@@ -19,6 +19,7 @@
 #![allow(clippy::all)]
 
 use crate::bucket_cache::BucketLocationCache;
+use crate::remote_error_code::RemoteErrorCode;
 use crate::{
     api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
@@ -50,6 +51,7 @@ use md5::Digest;
 use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_gateway_types::dto::{Owner, ReplicationStatus};
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
@@ -62,9 +64,6 @@ use rustfs_utils::{
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
-use s3s::S3ErrorCode;
-use s3s::dto::Owner;
-use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
@@ -277,7 +276,7 @@ pub struct TransitionClient {
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector>, s3s::Body>,
+    pub http_client: Client<HttpsConnector<HttpConnector>, rustfs_s3_types::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -655,7 +654,7 @@ impl TransitionClient {
         dead_code,
         reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
     )]
-    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<rustfs_s3_types::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -664,7 +663,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
+    pub async fn doit(&self, req: Request<rustfs_s3_types::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let http_client = self.http_client.clone();
         let req_method = req.method().clone();
         let resp = tokio::time::timeout(self.timeouts.request_timeout, http_client.request(req)).await;
@@ -774,7 +773,7 @@ impl TransitionClient {
                 http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
             let routing_region = parsed_error.region;
             let code = match parsed_error.code {
-                S3ErrorCode::Custom(_) => S3ErrorCode::ResponseInterrupted,
+                code if code.is_custom() => RemoteErrorCode::RESPONSE_INTERRUPTED,
                 code => code,
             };
             let err_response = ErrorResponse {
@@ -788,11 +787,11 @@ impl TransitionClient {
 
             if self.region == "" {
                 return match err_response.code {
-                    S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
+                    RemoteErrorCode::AUTHORIZATION_HEADER_MALFORMED | RemoteErrorCode::INVALID_ARGUMENT /*RemoteErrorCode::INVALID_REGION*/ => {
                         //break;
                         Err(std::io::Error::other(err_response))
                     }
-                    S3ErrorCode::AccessDenied => {
+                    RemoteErrorCode::ACCESS_DENIED => {
                         if routing_region.is_empty() {
                             return Err(std::io::Error::other(err_response));
                         }
@@ -835,7 +834,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<Request<s3s::Body>, std::io::Error> {
+    ) -> Result<Request<rustfs_s3_types::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -855,7 +854,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(method)
             .uri(target_url.to_string())
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
@@ -985,10 +984,10 @@ impl TransitionClient {
         if metadata.content_length > 0 {
             match &mut metadata.content_body {
                 ReaderImpl::Body(content_body) => {
-                    *req.body_mut() = s3s::Body::from(content_body.clone());
+                    *req.body_mut() = rustfs_s3_types::Body::from(content_body.clone());
                 }
                 ReaderImpl::ObjectBody(content_body) => {
-                    *req.body_mut() = s3s::Body::from(content_body.read_all().await?);
+                    *req.body_mut() = rustfs_s3_types::Body::from(content_body.read_all().await?);
                 }
             }
         }
@@ -996,7 +995,7 @@ impl TransitionClient {
         Ok(req)
     }
 
-    pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
+    pub fn set_user_agent(&self, req: &mut Request<rustfs_s3_types::Body>) {
         let headers = req.headers_mut();
         headers.insert("User-Agent", HeaderValue::from_static(C_USER_AGENT));
     }
@@ -1336,7 +1335,7 @@ pub struct ObjectInfo {
 }
 
 fn replication_status_default() -> ReplicationStatus {
-    ReplicationStatus::from_static(ReplicationStatus::PENDING)
+    ReplicationStatus::PENDING
 }
 
 impl Default for ObjectInfo {
@@ -1356,7 +1355,7 @@ impl Default for ObjectInfo {
             is_latest: false,
             is_delete_marker: false,
             version_id: None,
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: ReplicationStatus::PENDING,
             replication_ready: false,
             expiration: OffsetDateTime::now_utc(),
             expiration_rule_id: "".to_string(),
@@ -1591,13 +1590,13 @@ pub fn to_object_info_for_provider(
     // Get replication status
     let replication_status = {
         let status_str = get_header("x-amz-replication-status");
-        ReplicationStatus::from_static(match status_str.as_str() {
+        match status_str.as_str() {
             "COMPLETE" => ReplicationStatus::COMPLETE,
             "PENDING" => ReplicationStatus::PENDING,
             "FAILED" => ReplicationStatus::FAILED,
             "REPLICA" => ReplicationStatus::REPLICA,
             _ => ReplicationStatus::PENDING,
-        })
+        }
     };
 
     // Extract expiration rule ID and time (simplified)
@@ -1656,16 +1655,16 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 //#[derive(Clone)]
 pub struct SendRequest {
-    inner: hyper::client::conn::http1::SendRequest<s3s::Body>,
+    inner: hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>,
 }
 
-impl From<hyper::client::conn::http1::SendRequest<s3s::Body>> for SendRequest {
-    fn from(inner: hyper::client::conn::http1::SendRequest<s3s::Body>) -> Self {
+impl From<hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>> for SendRequest {
+    fn from(inner: hyper::client::conn::http1::SendRequest<rustfs_s3_types::Body>) -> Self {
         Self { inner }
     }
 }
 
-impl tower::Service<Request<s3s::Body>> for SendRequest {
+impl tower::Service<Request<rustfs_s3_types::Body>> for SendRequest {
     type Response = Response<Incoming>;
     type Error = std::io::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
@@ -1674,7 +1673,7 @@ impl tower::Service<Request<s3s::Body>> for SendRequest {
         self.inner.poll_ready(cx).map_err(std::io::Error::other)
     }
 
-    fn call(&mut self, req: Request<s3s::Body>) -> Self::Future {
+    fn call(&mut self, req: Request<rustfs_s3_types::Body>) -> Self::Future {
         //let req = hyper::Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
         //let req = hyper::Request::builder().uri("/").body(Body::empty()).unwrap();
 
@@ -1833,7 +1832,7 @@ mod tests {
         .expect("fixture client should build");
         let request = Request::builder()
             .uri(format!("https://{endpoint}/"))
-            .body(s3s::Body::empty())
+            .body(rustfs_s3_types::Body::empty())
             .expect("fixture request should build");
 
         client

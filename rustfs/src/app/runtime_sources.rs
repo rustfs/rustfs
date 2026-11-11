@@ -24,8 +24,8 @@ pub(crate) use crate::runtime_sources::{
 };
 #[cfg(test)]
 pub(crate) use crate::runtime_sources::{IamInterface, KmsInterface};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
-use s3s::dto::SelectObjectContentInput;
 use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::RwLock;

@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
-    router::{AdminOperation, Operation, S3Router},
-    storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
+    auth::authorize_admin_envelope,
+    router::{AdminOperation, S3Router},
+    storage_api::s3::{S3Error, S3ErrorCode, S3Result},
 };
 use crate::server::{
-    ADMIN_PREFIX, NativeTlsTransport,
+    ADMIN_PREFIX,
     tls_publish::{self, PublishError, PublishRequest},
 };
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::{action::Action, action::AdminAction};
+use rustfs_s3_types::Body;
 
 pub fn register_tls_certificate_routes(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     router.insert(
@@ -43,12 +45,8 @@ pub fn register_tls_certificate_routes(router: &mut S3Router<AdminOperation>) ->
 pub struct CertificateStateHandler;
 pub struct PublishCertificateHandler;
 
-fn require_native_tls(req: &S3Request<Body>) -> S3Result<()> {
-    if !req
-        .extensions
-        .get::<NativeTlsTransport>()
-        .is_some_and(|transport| transport.0)
-    {
+fn require_native_tls(req: &AdminRequest) -> S3Result<()> {
+    if !req.envelope().native_tls_transport().is_some_and(|native_tls| native_tls) {
         return Err(S3Error::with_message(
             S3ErrorCode::AccessDenied,
             "certificate management requires TLS on the RustFS listener",
@@ -57,14 +55,14 @@ fn require_native_tls(req: &S3Request<Body>) -> S3Result<()> {
     Ok(())
 }
 
-async fn authorize_certificate_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_certificate_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(S3Error::with_message(
             S3ErrorCode::AccessDenied,
             "certificate management requires credentials",
         ));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     require_native_tls(req)
 }
 
@@ -85,18 +83,18 @@ fn publication_error(error: PublishError) -> S3Error {
     result
 }
 
-fn json_response(value: &impl serde::Serialize) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn json_response(value: &impl serde::Serialize) -> S3Result<AdminResponse> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "certificate status serialization failed"))?;
     let mut headers = HeaderMap::new();
     headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
+    Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(bytes), headers))
 }
 
 #[async_trait::async_trait]
 impl Operation for CertificateStateHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_certificate_request(&req, AdminAction::TLSCertificateStatusAdminAction).await?;
         json_response(&tls_publish::certificate_state(tls_path()?).await.map_err(publication_error)?)
     }
@@ -104,9 +102,9 @@ impl Operation for CertificateStateHandler {
 
 #[async_trait::async_trait]
 impl Operation for PublishCertificateHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_certificate_request(&req, AdminAction::TLSCertificatePublishAdminAction).await?;
-        let body = req.input.store_all_limited(128 * 1024).await.map_err(|_| {
+        let body = req.take_body().store_all_limited(128 * 1024).await.map_err(|_| {
             S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 "certificate publication body exceeds the limit or is unreadable",
@@ -121,19 +119,15 @@ impl Operation for PublishCertificateHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::operation::test_support::TestRequest;
+    use crate::shared_types::NativeTlsTransport;
 
-    fn request(method: Method) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: "/rustfs/admin/v3/tls/certificate".parse().expect("URI"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn request_builder(method: Method) -> TestRequest {
+        TestRequest::new(method, "/rustfs/admin/v3/tls/certificate")
+    }
+
+    fn request(method: Method) -> AdminRequest {
+        request_builder(method).build()
     }
 
     #[tokio::test]
@@ -158,13 +152,10 @@ mod tests {
 
     #[test]
     fn forwarded_protocol_never_authorizes_private_key_upload() {
-        let mut request = request(Method::POST);
-        request.headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert!(require_native_tls(&request).is_err());
-        request.extensions.insert(NativeTlsTransport(false));
-        assert!(require_native_tls(&request).is_err());
-        request.extensions.insert(NativeTlsTransport(true));
-        assert!(require_native_tls(&request).is_ok());
+        let forwarded = || request_builder(Method::POST).header("x-forwarded-proto", "https");
+        assert!(require_native_tls(&forwarded().build()).is_err());
+        assert!(require_native_tls(&forwarded().extension(NativeTlsTransport(false)).build()).is_err());
+        assert!(require_native_tls(&forwarded().extension(NativeTlsTransport(true)).build()).is_ok());
     }
 
     #[test]

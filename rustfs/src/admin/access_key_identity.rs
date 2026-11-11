@@ -22,7 +22,7 @@ use rustfs_madmin::{
     InfoAccessKeyResp, InfoServiceAccountResp, LDAPSpecificAccessKeyInfo, OpenIDSpecificAccessKeyInfo, ServiceAccountInfo,
 };
 use rustfs_policy::policy::{DEFAULT_VERSION, Policy};
-use s3s::{S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::debug;
@@ -801,7 +801,7 @@ mod tests {
             .await
             .expect_err("missing regular user should fail");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("access key not exist"));
     }
 

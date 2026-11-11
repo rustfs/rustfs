@@ -71,7 +71,7 @@ use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use tracing::debug;
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
@@ -525,9 +525,7 @@ pub async fn handle_static_web_get(
 
             // Convert reader to body
             use tokio_util::io::ReaderStream;
-            let stream = ReaderStream::new(reader.stream);
-            let axum_body = axum::body::Body::from_stream(stream);
-            let body = Body::http_body_unsync(axum_body);
+            let body = Body::from_stream(ReaderStream::new(reader.stream));
 
             response
                 .body(body)
@@ -559,9 +557,7 @@ pub async fn handle_static_web_get(
                             .header("x-openstack-request-id", trans_id);
 
                         use tokio_util::io::ReaderStream;
-                        let stream = ReaderStream::new(reader.stream);
-                        let axum_body = axum::body::Body::from_stream(stream);
-                        let body = Body::http_body_unsync(axum_body);
+                        let body = Body::from_stream(ReaderStream::new(reader.stream));
 
                         return response
                             .body(body)

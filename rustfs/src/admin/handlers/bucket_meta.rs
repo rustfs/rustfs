@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
-use crate::admin::runtime_sources::object_store_from_extensions;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{
     metadata::{
@@ -30,30 +31,29 @@ use crate::admin::storage_api::error::StorageError;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use crate::{
     admin::{
-        auth::authorize_admin_request,
-        router::{AdminOperation, Operation, S3Router},
+        auth::authorize_admin_envelope,
+        router::{AdminOperation, S3Router},
     },
     server::ADMIN_PREFIX,
 };
+use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
+use rustfs_gateway_types::cors_tagging::PersistedTagging as Tagging;
+use rustfs_gateway_types::persistence::{
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration, PersistedNotificationConfiguration,
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::{
-    Body, S3Request, S3Response, S3Result,
-    dto::{
-        BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration, ServerSideEncryptionConfiguration,
-        Tagging, VersioningConfiguration,
-    },
-    header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::{
@@ -75,7 +75,7 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
 const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
 
-fn export_internal_error(message: impl Into<String>) -> s3s::S3Error {
+fn export_internal_error(message: impl Into<String>) -> rustfs_s3_types::S3Error {
     let message = message.into();
     s3_error!(InternalError, "{message}")
 }
@@ -94,7 +94,7 @@ enum ExportConfigError {
     /// already decoded. Nothing about the stored bytes is in doubt, so the
     /// export fails closed rather than reporting healthy metadata as
     /// unreadable.
-    Internal(s3s::S3Error),
+    Internal(rustfs_s3_types::S3Error),
 }
 
 impl ExportConfigError {
@@ -168,7 +168,7 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
             let config_xml = checked_raw_xml(
                 config,
                 metadata.notification_config_xml.clone(),
-                deserialize::<s3s::dto::NotificationConfiguration>,
+                deserialize::<PersistedNotificationConfiguration>,
             )?;
             Ok(Some(config_xml))
         }
@@ -183,8 +183,11 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
                 .lifecycle_config
                 .as_ref()
                 .ok_or_else(|| ExportConfigError::unreadable("persisted bucket lifecycle configuration is invalid"))?;
-            let config_xml =
-                checked_raw_xml(config, metadata.lifecycle_config_xml.clone(), deserialize::<BucketLifecycleConfiguration>)?;
+            let config_xml = checked_raw_xml(
+                config,
+                metadata.lifecycle_config_xml.clone(),
+                deserialize::<PersistedLifecycleConfiguration>,
+            )?;
             Ok(Some(config_xml))
         }
         BUCKET_TAGGING_CONFIG => {
@@ -288,7 +291,7 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
                 .map_err(|e| ExportConfigError::unreadable(format!("get bucket metadata failed: {e}")))?
                 .replication_config_xml
                 .clone();
-            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ReplicationConfiguration>)?;
+            let config_xml = checked_raw_xml(&config, raw_config, deserialize::<PersistedReplicationConfiguration>)?;
 
             Ok(Some(config_xml))
         }
@@ -352,9 +355,9 @@ pub fn register_bucket_meta_route(r: &mut S3Router<AdminOperation>) -> std::io::
 
 #[async_trait::async_trait]
 impl Operation for ExportBucketMetadata {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: ExportBucketMetadataQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -363,13 +366,13 @@ impl Operation for ExportBucketMetadata {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)]).await?;
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -472,7 +475,7 @@ impl Operation for ExportBucketMetadata {
             header.insert("x-rustfs-bucket-metadata-export", "diagnostic".parse().expect("valid header value"));
         }
         header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(zip_bytes.into_inner()), header))
     }
 }
 
@@ -485,9 +488,9 @@ pub struct ImportBucketMetadata {}
 
 #[async_trait::async_trait]
 impl Operation for ImportBucketMetadata {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let _query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: ImportBucketMetadataQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -496,13 +499,13 @@ impl Operation for ImportBucketMetadata {
             }
         };
 
-        if req.credentials.is_none() {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)]).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)]).await?;
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = match input.store_all_limited(MAX_BUCKET_METADATA_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -624,7 +627,7 @@ impl Operation for ImportBucketMetadata {
             };
         }
 
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -811,7 +814,7 @@ impl Operation for ImportBucketMetadata {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -865,13 +868,13 @@ fn apply_imported_bucket_config(
 
     let store: fn(&mut BucketMetadata, Vec<u8>, OffsetDateTime) = match conf_name {
         BUCKET_NOTIFICATION_CONFIG => validated_config!(
-            deserialize::<s3s::dto::NotificationConfiguration>,
+            deserialize::<PersistedNotificationConfiguration>,
             notification_config_xml,
             notification_config_updated_at
         ),
         BUCKET_LIFECYCLE_CONFIG => {
             validated_config!(
-                deserialize::<BucketLifecycleConfiguration>,
+                deserialize::<PersistedLifecycleConfiguration>,
                 lifecycle_config_xml,
                 lifecycle_config_updated_at
             )
@@ -898,7 +901,7 @@ fn apply_imported_bucket_config(
         }
         BUCKET_REPLICATION_CONFIG => {
             validated_config!(
-                deserialize::<ReplicationConfiguration>,
+                deserialize::<PersistedReplicationConfiguration>,
                 replication_config_xml,
                 replication_config_updated_at
             )
@@ -1452,21 +1455,13 @@ mod backup_zip_compatibility_tests {
         writer.finish().expect("finish compatibility archive").into_inner()
     }
 
-    fn admin_request(method: Method, uri: Uri, body: Vec<u8>) -> S3Request<Body> {
-        S3Request {
-            input: Body::from(body),
-            method,
-            uri,
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: ROOT_ACCESS_KEY.to_string(),
-                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
-            }),
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn admin_request(method: Method, uri: Uri, body: Vec<u8>) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, uri)
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::from(body))
+            .credentials(ROOT_ACCESS_KEY, ROOT_SECRET_KEY, None)
+            .build()
     }
 
     async fn import_archive(archive: Vec<u8>) {
@@ -1477,7 +1472,8 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect("root admin must import the compatibility archive");
-        assert_eq!(response.output.0, StatusCode::OK);
+        let (status, _headers, _body) = response.into_parts();
+        assert_eq!(status, StatusCode::OK);
     }
 
     async fn assert_unreadable_xml_export_is_explicit(config_file: &str) {
@@ -1539,7 +1535,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("persisted invalid XML must not disappear from an ordinary backup");
-        assert_eq!(ordinary.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(ordinary.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
 
         let diagnostic = ExportBucketMetadata {}
             .call(
@@ -1552,14 +1548,9 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect("diagnostic export must identify the omitted configuration");
-        assert_eq!(diagnostic.output.0, StatusCode::OK);
-        let bytes = diagnostic
-            .output
-            .1
-            .collect()
-            .await
-            .expect("read diagnostic archive")
-            .to_bytes();
+        let (status, _headers, body) = diagnostic.into_parts();
+        assert_eq!(status, StatusCode::OK);
+        let bytes = body.collect().await.expect("read diagnostic archive").to_bytes();
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open diagnostic archive");
         let mut files = HashMap::new();
         for index in 0..archive.len() {
@@ -1675,7 +1666,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("an ordinary backup must fail rather than omit an unreadable configuration");
-            assert_eq!(*ordinary.code(), s3s::S3ErrorCode::InternalError);
+            assert_eq!(*ordinary.code(), rustfs_s3_types::S3ErrorCode::InternalError);
             assert!(
                 ordinary
                     .message()
@@ -1693,10 +1684,11 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect("one unreadable bucket must not abort diagnostic export");
-            assert_eq!(response.output.0, StatusCode::OK);
-            assert_eq!(response.headers["x-rustfs-bucket-metadata-export"], "diagnostic");
-            assert_eq!(response.headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta-diagnostic.zip");
-            let bytes = response.output.1.collect().await.expect("read diagnostic archive").to_bytes();
+            let (status, headers, body) = response.into_parts();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers["x-rustfs-bucket-metadata-export"], "diagnostic");
+            assert_eq!(headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta-diagnostic.zip");
+            let bytes = body.collect().await.expect("read diagnostic archive").to_bytes();
             let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open diagnostic archive");
             let mut files = HashMap::new();
             for index in 0..archive.len() {
@@ -1730,7 +1722,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("diagnostic exports are never backups");
-            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(
                 metadata_sys::get_config_from_disk(UNREADABLE)
                     .await
@@ -1802,7 +1794,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("non-restorable archive preflight must reject before any config write");
-            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(
                 metadata_sys::get_config_from_disk(HEALTHY)
                     .await
@@ -1830,13 +1822,8 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect("diagnostic export after recovery");
-        let bytes = response
-            .output
-            .1
-            .collect()
-            .await
-            .expect("read complete diagnostic archive")
-            .to_bytes();
+        let (_status, _headers, body) = response.into_parts();
+        let bytes = body.collect().await.expect("read complete diagnostic archive").to_bytes();
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).expect("open complete diagnostic archive");
         let manifest: serde_json::Value = serde_json::from_reader(
             archive
@@ -1852,7 +1839,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("complete diagnostics must still reject import");
-        assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
         let response = ExportBucketMetadata {}
             .call(
@@ -1861,9 +1848,10 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect("ordinary cluster export must work after API recovery");
-        assert!(!response.headers.contains_key("x-rustfs-bucket-metadata-export"));
-        assert_eq!(response.headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta.zip");
-        let bytes = response.output.1.collect().await.expect("read ordinary archive").to_bytes();
+        let (_status, headers, body) = response.into_parts();
+        assert!(!headers.contains_key("x-rustfs-bucket-metadata-export"));
+        assert_eq!(headers[CONTENT_DISPOSITION], "attachment; filename=bucket-meta.zip");
+        let bytes = body.collect().await.expect("read ordinary archive").to_bytes();
         let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open ordinary archive");
         assert!(archive.by_name(DIAGNOSTIC_EXPORT_MANIFEST).is_err());
         assert!(archive.by_name(&format!("{HEALTHY}/{BUCKET_VERSIONING_CONFIG}")).is_ok());
@@ -1944,15 +1932,19 @@ mod backup_zip_compatibility_tests {
         checked_raw_xml(
             &validated_replication,
             DIFFERENT_REPLICATION_XML.to_vec(),
-            deserialize::<ReplicationConfiguration>,
+            deserialize::<PersistedReplicationConfiguration>,
         )
         .expect_err("a different valid revision must not be exported after validating the old revision");
-        checked_raw_xml(&validated_replication, b"not xml".to_vec(), deserialize::<ReplicationConfiguration>)
-            .expect_err("an invalid raw revision must not be exported after validating the old revision");
+        checked_raw_xml(
+            &validated_replication,
+            b"not xml".to_vec(),
+            deserialize::<PersistedReplicationConfiguration>,
+        )
+        .expect_err("an invalid raw revision must not be exported after validating the old revision");
         let matching_raw = checked_raw_xml(
             &validated_replication,
             OLD_REPLICATION_XML.to_vec(),
-            deserialize::<ReplicationConfiguration>,
+            deserialize::<PersistedReplicationConfiguration>,
         )
         .expect("the exact validated raw revision must remain exportable");
         assert_eq!(matching_raw, OLD_REPLICATION_XML);
@@ -1979,15 +1971,9 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect("root admin must export persisted bucket metadata");
-        assert_eq!(export_response.output.0, StatusCode::OK);
-        let exported_archive = export_response
-            .output
-            .1
-            .collect()
-            .await
-            .expect("read exported archive body")
-            .to_bytes()
-            .to_vec();
+        let (status, _headers, body) = export_response.into_parts();
+        assert_eq!(status, StatusCode::OK);
+        let exported_archive = body.collect().await.expect("read exported archive body").to_bytes().to_vec();
         let mut archive = ZipArchive::new(Cursor::new(&exported_archive)).expect("open exported archive");
         for (config_file, payload) in persisted_xml_fixtures() {
             let mut exported_payload = Vec::new();
@@ -2014,7 +2000,7 @@ mod backup_zip_compatibility_tests {
                 "g-zip-002 rollback import did not restore {config_file}"
             );
         }
-        let _: ReplicationConfiguration =
+        let _: PersistedReplicationConfiguration =
             deserialize(&restored.replication_config_xml).expect("old parser must read the newly exported archive payload");
 
         // The array-shaped compatibility fixture is unreadable as targets.
@@ -2034,7 +2020,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("one unreadable configuration must fail the ordinary whole-cluster backup");
-        assert_eq!(*cluster_export.code(), s3s::S3ErrorCode::InternalError);
+        assert_eq!(*cluster_export.code(), rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(
             metadata_sys::get_config_from_disk(UNREADABLE_BUCKET)
                 .await
@@ -2049,20 +2035,14 @@ mod backup_zip_compatibility_tests {
 mod shared_gate_tests {
     use super::*;
     use http::Uri;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
-    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
@@ -2097,7 +2077,7 @@ mod shared_gate_tests {
 
     fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
         assert_eq!(
-            block.matches("authorize_admin_request(").count(),
+            block.matches("authorize_admin_envelope(").count(),
             1,
             "{item} must use exactly one shared gate"
         );
@@ -2110,7 +2090,7 @@ mod shared_gate_tests {
             assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
         }
         assert_eq!(
-            block.contains("let cred = authorize_admin_request("),
+            block.contains("let cred = authorize_admin_envelope("),
             binds_credentials,
             "{item} credential binding must match its payload-processing contract"
         );
