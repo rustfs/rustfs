@@ -217,6 +217,15 @@ pub(crate) mod test_support {
             self
         }
 
+        /// A presented identity whose verified credential carries no secret key.
+        pub(crate) fn credentials_without_secret(mut self, access_key: &str, session_token: Option<&str>) -> Self {
+            self.credentials = Some(RequestCredentials::without_secret_key(
+                access_key.to_owned(),
+                session_token.map(str::to_owned),
+            ));
+            self
+        }
+
         pub(crate) fn extensions(mut self, extensions: Extensions) -> Self {
             self.extensions = extensions;
             self

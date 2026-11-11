@@ -223,6 +223,22 @@ fn map_add_user_create_error(err: rustfs_iam::error::Error) -> S3Error {
     }
 }
 
+/// The caller's current secret when the request rotates the caller's own key,
+/// `None` when it creates or updates another user (which does not read it).
+///
+/// # Errors
+///
+/// `AccessDenied` for a self-rotation whose verified credential carries no
+/// secret key.
+fn self_rotation_secret(check_deny_only: bool, secret: Option<&str>) -> S3Result<Option<&str>> {
+    if !check_deny_only {
+        return Ok(None);
+    }
+    secret
+        .map(Some)
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::AccessDenied, "the request credential carries no secret key"))
+}
+
 #[async_trait::async_trait]
 impl Operation for AddUser {
     async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
@@ -242,11 +258,9 @@ impl Operation for AddUser {
 
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
-        // The caller's current secret outlives the body read below.
-        let input_secret = input_cred
-            .require_secret_key()
-            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?
-            .to_owned();
+        // The caller's current secret outlives the body read below. Only a
+        // self-rotation reads it; creating another user does not.
+        let input_secret = input_cred.secret_key().map(str::to_owned);
 
         let ak = query.access_key.as_deref().unwrap_or_default();
 
@@ -327,9 +341,10 @@ impl Operation for AddUser {
         )
         .await?;
 
-        let updated_at = if check_deny_only {
+        let rotation_secret = self_rotation_secret(check_deny_only, input_secret.as_deref())?;
+        let updated_at = if let Some(current_secret) = rotation_secret {
             let (updated_at, status, _) = iam_store
-                .change_own_secret_key(ak, &input_secret, &args.secret_key)
+                .change_own_secret_key(ak, current_secret, &args.secret_key)
                 .await
                 .map_err(map_add_user_create_error)?;
             args.status = status;
@@ -1395,6 +1410,23 @@ mod tests {
     use rustfs_s3_types::S3ErrorCode;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn self_rotation_without_a_secret_key_is_refused() {
+        let err = super::self_rotation_secret(true, None).expect_err("self-rotation needs the current secret");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn creating_another_user_does_not_read_the_secret_key() {
+        assert_eq!(super::self_rotation_secret(false, None).expect("create path proceeds"), None);
+        assert_eq!(super::self_rotation_secret(false, Some("current")).expect("create path"), None);
+    }
+
+    #[test]
+    fn self_rotation_uses_the_presented_secret_key() {
+        assert_eq!(super::self_rotation_secret(true, Some("current")).expect("rotation"), Some("current"));
+    }
 
     fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
         crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
