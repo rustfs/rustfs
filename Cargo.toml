@@ -155,6 +155,8 @@ rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
 rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.57.0", default-features = false }
+# Test-only: builds the `EffectiveHost` a host-resolution test queries with.
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

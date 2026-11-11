@@ -35,6 +35,7 @@ ring = 2
 workspace = true
 
 [dependencies]
+http = { workspace = true }
 rustfs-gateway = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-iam = { workspace = true }
@@ -42,5 +43,6 @@ rustfs-policy = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+rustfs-gateway-http = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

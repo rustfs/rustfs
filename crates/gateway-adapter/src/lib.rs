@@ -18,8 +18,14 @@
 //! gateway depends on it. Each module adapts one extension point to the RustFS subsystem that
 //! owns the answer.
 
+pub mod bucket_owner;
 pub mod credentials;
+pub mod host;
 pub mod policy;
+pub mod trace;
 
+pub use bucket_owner::{BucketOwnerLookup, OwnerLookupError, RustfsBucketOwners};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
+pub use host::rustfs_host_resolver;
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
+pub use trace::{RequestIdCarrier, TraceError, attach_host_request_id, host_request_id};
