@@ -2962,8 +2962,7 @@ mod tests {
             .await
             .expect_err("a short tail after owned batches must fail");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(&out[..5], &[0xa5; 5]);
-        assert_eq!(&out[5..], &data[..3 * FRAME], "the incomplete final batch must not emit bytes");
+        assert_eq!(out, vec![0xa5; 5], "the incomplete final batch must preserve existing output");
         assert_eq!(reader.last_read_dispatch_count(), 2, "only the short tail uses streaming reads");
         assert_eq!(
             reader.inner_ref().position(),
@@ -3007,8 +3006,7 @@ mod tests {
                     .await
                     .expect_err("owned frame must authenticate before appending");
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert_eq!(&out[..5], &[0xa5; 5]);
-                assert_eq!(&out[5..], &data[..verified_len]);
+                assert_eq!(out, vec![0xa5; 5]);
             }
         }
 
@@ -3157,8 +3155,7 @@ mod tests {
                     .await
                     .expect_err("append must authenticate each frame");
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert_eq!(&out[..5], &[0xa5; 5]);
-                assert_eq!(&out[5..], &data[..verified_len], "only verified preceding frames may be appended");
+                assert_eq!(out, vec![0xa5; 5], "failed append must preserve existing output");
             }
         }
     }
