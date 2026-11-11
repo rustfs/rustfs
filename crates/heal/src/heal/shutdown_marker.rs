@@ -1,8 +1,9 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
-//! A clean, read-only handoff reuses the existing shutdown marker. Older
-//! binaries overwrite or remove it, which expires checkpoint continuity.
+//! A clean, read-only handoff reuses the existing shutdown marker. Receipt-aware
+//! readers must consume it before legacy rollback; legacy startup alone cannot
+//! guarantee that checkpoint continuity expires before a write.
 
 use super::{DiskError, DiskStore, EcstoreDiskAPI, RUSTFS_META_BUCKET, UNCLEAN_SHUTDOWN_MARKER_PATH, local_disk_map_read};
 use serde::{Deserialize, Serialize};

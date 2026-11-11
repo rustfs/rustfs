@@ -1729,6 +1729,17 @@ fn scanner_handoff_identity(env: &RustFSTestEnvironment) -> Result<String, BoxEr
         .to_owned())
 }
 
+async fn assert_scanner_handoff_consumed(marker: &Path) -> TestResult {
+    let marker = tokio::fs::read_to_string(marker).await?;
+    // Heal may replace the startup marker with its ordinary timestamp before
+    // readiness. Neither form carries the prior checkpoint identity.
+    assert!(
+        marker == "running" || marker.parse::<u64>().is_ok(),
+        "readiness must expose an ordinary unclean marker, never a handoff receipt"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn scanner_read_only_handoff_requires_explicit_opt_in() -> TestResult {
     const HANDOFF: &str = "RUSTFS_SCANNER_READ_ONLY_HANDOFF";
@@ -1743,7 +1754,7 @@ async fn scanner_read_only_handoff_requires_explicit_opt_in() -> TestResult {
     stop_scanner_handoff_server(&mut env).await?;
     let previous = scanner_handoff_identity(&env)?;
     env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
-    assert_eq!(tokio::fs::read(&marker).await?, b"running", "consume before becoming ready");
+    assert_scanner_handoff_consumed(&marker).await?;
     stop_scanner_handoff_server(&mut env).await?;
     assert_eq!(scanner_handoff_identity(&env)?, previous, "opted-in read-only boots retain identity");
 
@@ -1751,7 +1762,7 @@ async fn scanner_read_only_handoff_requires_explicit_opt_in() -> TestResult {
         let before_disabled = scanner_handoff_identity(&env)?;
         env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, disabled)])
             .await?;
-        assert_eq!(tokio::fs::read(&marker).await?, b"running", "disabled readers still consume receipts");
+        assert_scanner_handoff_consumed(&marker).await?;
         stop_scanner_handoff_server(&mut env).await?;
         assert!(!marker.exists(), "disabled shutdown must not recreate the receipt");
         env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
@@ -1777,7 +1788,7 @@ async fn scanner_read_only_handoff_prepares_legacy_rollback_before_writes() -> T
     // opens storage, including an old writer with all background services off.
     env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "false")])
         .await?;
-    assert_eq!(tokio::fs::read(&marker).await?, b"running");
+    assert_scanner_handoff_consumed(&marker).await?;
     stop_scanner_handoff_server(&mut env).await?;
     assert!(!marker.exists());
     env.start_rustfs_server_from_binary_without_cleanup(
