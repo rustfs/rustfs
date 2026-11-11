@@ -521,8 +521,12 @@ impl LocalDisk {
             state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
         })?;
         crate::hp_guard!("LocalDisk::rename_data");
-        if dst_volume == super::super::RUSTFS_META_MULTIPART_BUCKET {
-            self.multipart_index.record_info(dst_path, &fi).await?;
+        if dst_volume == super::super::RUSTFS_META_MULTIPART_BUCKET
+            && let Some(pin) = self.multipart_index.record_info(dst_path, &fi).await?
+        {
+            // The owner chain reaches every lease this rename publishes under,
+            // so the index marker stays pinned until that work has returned.
+            state.namespace_owner = Some(Arc::new((state.namespace_owner.take(), pin)));
         }
         #[cfg(feature = "e2e-test-hooks")]
         if fi.is_healing() {
