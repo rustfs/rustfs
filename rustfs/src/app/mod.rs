@@ -49,3 +49,5 @@ pub(crate) mod gating_test_env;
 mod lifecycle_transition_api_test;
 #[cfg(test)]
 mod put_prelookup_gating_test;
+#[cfg(test)]
+pub(crate) mod test_seams;
