@@ -10615,7 +10615,7 @@ fn scanner_activity_snapshot_fences_data_movement() {
     assert!(scanner_activity_allows_usage_publication(&idle));
     assert!(!scanner_activity_allows_usage_publication(&moving));
     assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
-    let mut v7 = idle.clone();
+    let mut v7 = idle;
     v7.get_mut("node-2").expect("node").protocol_version = crate::SCANNER_ACTIVITY_V7_PROTOCOL_VERSION;
     assert!(
         scanner_activity_allows_usage_publication(&v7),
