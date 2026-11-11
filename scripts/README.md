@@ -170,7 +170,7 @@ their issue closes.
 |---|---|---|---|
 | `codemods/` | dev-tool | Scripted, idempotent source migrations for the gateway migration (rustfs/backlog#2734); `s3_error_to_s3_types.py` moves s3s error-type paths onto `rustfs-s3-types` per crate closure and refuses the s3s edge allowlist | `make script-tests` (`--self-test`); usage in each script's docstring |
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
-| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml |
+| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml; manual-main-packages.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |
 | `security/` | ci-gate | Workflow-pin enforcement and release supply-chain asset generation | audit.yml; build.yml |
 | `table-catalog/` | dev-tool | S3-Tables / pyiceberg validation suite | `docs/architecture/s3-tables-support-matrix.md` |

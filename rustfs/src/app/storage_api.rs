@@ -59,6 +59,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
+    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
+    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
