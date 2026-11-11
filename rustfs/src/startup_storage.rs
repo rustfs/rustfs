@@ -247,7 +247,8 @@ async fn consume_read_only_scanner_handoff(
 }
 
 fn restore_read_only_scanner_handoff(store: &ECStore, previous: Option<String>) {
-    if store.scanner_namespace_mutation_generation() == 0
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_SCANNER_READ_ONLY_HANDOFF, false)
+        && store.scanner_namespace_mutation_generation() == 0
         && rustfs_scanner::scanner_process_was_read_only()
         && let Some(instance) = previous
     {

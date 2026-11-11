@@ -816,7 +816,10 @@ pub(crate) async fn run_startup_shutdown_sequence(
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
         async {
-            if store.scanner_namespace_mutation_generation() == 0 && rustfs_scanner::scanner_process_was_read_only() {
+            if rustfs_utils::get_env_bool(rustfs_config::ENV_SCANNER_READ_ONLY_HANDOFF, false)
+                && store.scanner_namespace_mutation_generation() == 0
+                && rustfs_scanner::scanner_process_was_read_only()
+            {
                 let owner = rustfs_common::get_global_local_node_name().await;
                 if let Err(error) =
                     rustfs_heal::heal::save_read_only_scanner_handoff(&owner, rustfs_scanner::scanner_checkpoint_instance_id())

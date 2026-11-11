@@ -1702,6 +1702,121 @@ mod upgrade_write_readiness_tests {
     }
 }
 
+async fn stop_scanner_handoff_server(env: &mut RustFSTestEnvironment) -> TestResult {
+    let process = env.process.as_mut().ok_or("handoff server is not running")?;
+    signal_process(process.id(), "TERM")?;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if let Some(status) = process.try_wait()? {
+                assert!(status.success(), "handoff shutdown failed: {status}");
+                return Ok::<(), BoxError>(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    env.process.take();
+    Ok(())
+}
+
+fn scanner_handoff_identity(env: &RustFSTestEnvironment) -> Result<String, BoxError> {
+    let receipt: Value = serde_json::from_slice(&std::fs::read(Path::new(&env.temp_dir).join(".rustfs.sys/unclean-shutdown"))?)?;
+    assert_eq!(receipt["schema"], 1);
+    assert_eq!(receipt["owner"], env.address);
+    Ok(receipt["checkpoint_instance_id"]
+        .as_str()
+        .ok_or("handoff receipt omitted checkpoint identity")?
+        .to_owned())
+}
+
+#[tokio::test]
+async fn scanner_read_only_handoff_requires_explicit_opt_in() -> TestResult {
+    const HANDOFF: &str = "RUSTFS_SCANNER_READ_ONLY_HANDOFF";
+    assert!(std::env::var_os(HANDOFF).is_none(), "this scenario tests the unset default");
+    let mut env = RustFSTestEnvironment::new().await?;
+    let marker = Path::new(&env.temp_dir).join(".rustfs.sys/unclean-shutdown");
+    env.start_rustfs_server_without_cleanup(vec![]).await?;
+    stop_scanner_handoff_server(&mut env).await?;
+    assert!(!marker.exists(), "the default must not create a receipt");
+
+    env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
+    stop_scanner_handoff_server(&mut env).await?;
+    let previous = scanner_handoff_identity(&env)?;
+    env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
+    assert_eq!(tokio::fs::read(&marker).await?, b"running", "consume before becoming ready");
+    stop_scanner_handoff_server(&mut env).await?;
+    assert_eq!(scanner_handoff_identity(&env)?, previous, "opted-in read-only boots retain identity");
+
+    for disabled in ["invalid", "false"] {
+        let before_disabled = scanner_handoff_identity(&env)?;
+        env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, disabled)])
+            .await?;
+        assert_eq!(tokio::fs::read(&marker).await?, b"running", "disabled readers still consume receipts");
+        stop_scanner_handoff_server(&mut env).await?;
+        assert!(!marker.exists(), "disabled shutdown must not recreate the receipt");
+        env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
+        stop_scanner_handoff_server(&mut env).await?;
+        assert_ne!(scanner_handoff_identity(&env)?, before_disabled, "opt-out breaks the prior lineage");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned 1.0.4 release binary"]
+async fn scanner_read_only_handoff_prepares_legacy_rollback_before_writes() -> TestResult {
+    const HANDOFF: &str = "RUSTFS_SCANNER_READ_ONLY_HANDOFF";
+    let previous_binary = source_binary()?;
+    assert_eq!(binary_source_revision(&previous_binary).await?, STABLE_1_0_4_COMMIT);
+    let mut env = RustFSTestEnvironment::new().await?;
+    let marker = Path::new(&env.temp_dir).join(".rustfs.sys/unclean-shutdown");
+    env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
+    stop_scanner_handoff_server(&mut env).await?;
+    let previous = scanner_handoff_identity(&env)?;
+
+    // Complete the current reader's rollback preparation before any old writer
+    // opens storage, including an old writer with all background services off.
+    env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "false")])
+        .await?;
+    assert_eq!(tokio::fs::read(&marker).await?, b"running");
+    stop_scanner_handoff_server(&mut env).await?;
+    assert!(!marker.exists());
+    env.start_rustfs_server_from_binary_without_cleanup(
+        &previous_binary,
+        vec![],
+        &[
+            ("RUSTFS_SCANNER_ENABLED", "false"),
+            ("RUSTFS_HEAL_ENABLED", "false"),
+            ("RUSTFS_HEAL_AUTO_HEAL_ENABLE", "false"),
+            ("RUSTFS_HEAL_MRF_ENABLE", "false"),
+        ],
+    )
+    .await?;
+    let client = env.create_s3_client();
+    env.create_test_bucket("handoff-rollback").await?;
+    client
+        .put_object()
+        .bucket("handoff-rollback")
+        .key("legacy-write")
+        .body(ByteStream::from_static(b"legacy writer survived rollback preparation"))
+        .send()
+        .await?;
+    env.stop_server();
+    assert!(!marker.exists(), "the legacy crash cannot resurrect a consumed receipt");
+
+    env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
+    assert_eq!(
+        read_object(&client, "handoff-rollback", "legacy-write", None).await?.1,
+        b"legacy writer survived rollback preparation"
+    );
+    stop_scanner_handoff_server(&mut env).await?;
+    assert_ne!(
+        scanner_handoff_identity(&env)?,
+        previous,
+        "a legacy write must not retain the old lineage"
+    );
+    Ok(())
+}
+
 /// Pins the published old writer's limitation and the supported recovery
 /// procedure. This is not a promise that mixed-version ODM is supported.
 /// Replace the loss assertion when ODM gains independent persistence;
