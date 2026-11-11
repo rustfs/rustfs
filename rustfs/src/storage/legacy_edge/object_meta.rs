@@ -31,7 +31,7 @@ use crate::storage::s3_api::{self, acl};
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 use crate::storage::storage_api::ecfs_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
-    object::{ObjectLockRetentionOptions, ObjectOperations as _},
+    object::ObjectLockRetentionOptions,
 };
 use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,

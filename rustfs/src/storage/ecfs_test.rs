@@ -53,7 +53,7 @@ mod tests {
         remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
         validate_list_object_unordered_with_delimiter,
     };
-    use http::{HeaderMap, HeaderValue, Method, StatusCode};
+    use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
