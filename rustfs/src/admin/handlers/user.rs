@@ -243,7 +243,10 @@ impl Operation for AddUser {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
         // The caller's current secret outlives the body read below.
-        let input_secret = input_cred.secret_key().to_owned();
+        let input_secret = input_cred
+            .require_secret_key()
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?
+            .to_owned();
 
         let ak = query.access_key.as_deref().unwrap_or_default();
 
