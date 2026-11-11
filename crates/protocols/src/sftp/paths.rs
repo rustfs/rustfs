@@ -101,6 +101,13 @@ pub(super) fn parse_s3_path(input: &str) -> Result<(String, Option<String>), Sft
     Ok((bucket, key))
 }
 
+/// Formats an S3 copy-source header while preserving the literal object key.
+/// The S3 copy-source parser URL-decodes the path and treats a raw `?versionId=`
+/// as query data, so encode the complete key before building the header.
+pub(super) fn format_copy_source(bucket: &str, key: &str) -> String {
+    format!("/{bucket}/{}", urlencoding::encode(key))
+}
+
 /// Replace C0 control bytes (other than tab) with the literal byte 0x3F
 /// ("?"). POSIX filenames and S3 keys permit CR, LF, BEL, ESC, and the
 /// other low-ASCII control bytes, but echoing them verbatim into the
@@ -128,6 +135,13 @@ pub(super) fn sanitise_control_bytes(input: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use russh_sftp::protocol::StatusCode;
+
+    #[test]
+    fn format_copy_source_preserves_encoded_and_query_like_keys() {
+        assert_eq!(format_copy_source("bucket", "%2F"), "/bucket/%252F");
+        assert_eq!(format_copy_source("bucket", "foo?versionId=1"), "/bucket/foo%3FversionId%3D1");
+        assert_eq!(format_copy_source("bucket", "a/b"), "/bucket/a%2Fb");
+    }
 
     #[test]
     fn parse_s3_path_root() {

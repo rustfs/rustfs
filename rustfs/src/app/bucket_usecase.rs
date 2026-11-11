@@ -43,7 +43,7 @@ use super::storage_api::bucket_usecase::bucket::{
         unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
-    utils::serialize,
+    utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::bucket_usecase::contract::bucket::{
@@ -86,6 +86,13 @@ use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
+use rustfs_gateway_types::persistence::{
+    PersistedBucketEncryptionConfiguration, PersistedNotificationConfiguration,
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedPublicAccessBlockConfiguration,
+    PersistedVersioningConfiguration,
+};
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -101,27 +108,23 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::dto::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
-    CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
-    DeleteBucketInput, DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
-    DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
-    DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
-    ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-    GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
-    GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
-    GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput,
-    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput,
-    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration,
-    NotificationConfigurationFilter, Object, ObjectLockConfiguration, ObjectStorageClass, ObjectVersion,
-    ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
-    PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
-    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
-    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
-    ReplicationConfiguration, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
-    VersioningConfiguration,
+    BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput,
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketLifecycleInput,
+    DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput, DeleteBucketPolicyOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
+    DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType, ExpirationStatus,
+    GetBucketCorsInput, GetBucketEncryptionInput, GetBucketLifecycleConfigurationInput, GetBucketLocationInput,
+    GetBucketLocationOutput, GetBucketNotificationConfigurationInput, GetBucketPolicyInput, GetBucketPolicyOutput,
+    GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput, GetBucketTaggingInput,
+    GetBucketVersioningInput, GetPublicAccessBlockInput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
+    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration, NotificationConfigurationFilter, Object,
+    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
+    PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
+    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput,
+    PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput,
+    PutPublicAccessBlockOutput, ServerSideEncryption, Timestamp, UserMetadata,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -451,7 +454,7 @@ impl SerializeContent for ObjectInternalInfo {
     }
 }
 
-fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
+fn serialize_config<T: BucketConfigXml>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
 }
 
@@ -699,7 +702,7 @@ fn notify_bucket_metadata_delete(bucket: String, request_context: Option<request
     });
 }
 
-fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
+fn validate_replication_config_targets(targets: &BucketTargets, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
         .targets
         .iter()
@@ -720,7 +723,7 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
     }
 }
 
-fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+fn validate_replication_config_capabilities(config: &PersistedReplicationConfiguration) -> S3Result<()> {
     if let Err(err) = validate_replication_config_structure(config) {
         return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, err.message()));
     }
@@ -739,7 +742,7 @@ fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -
     Ok(())
 }
 
-async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+async fn validate_bucket_replication_update(bucket: &str, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     if !BucketVersioningSys::enabled(bucket).await {
         return Err(s3_error!(
             InvalidRequest,
@@ -770,11 +773,11 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
 /// `contract` is what the peers were probed to support; the merged config is
 /// what gets broadcast, so it is built the way every peer will merge it.
 fn merge_user_replication_config_update(
-    incoming: ReplicationConfiguration,
-    existing: Option<ReplicationConfiguration>,
+    incoming: PersistedReplicationConfiguration,
+    existing: Option<PersistedReplicationConfiguration>,
     site_peer_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> ReplicationConfiguration {
+) -> PersistedReplicationConfiguration {
     if site_peer_deployment_ids.is_empty() {
         return incoming;
     }
@@ -791,10 +794,10 @@ fn merge_user_replication_config_update(
 /// targets may be garbage-collected — never an ARN a surviving reconciler
 /// rule still points at.
 fn split_replication_config_for_user_delete(
-    config: ReplicationConfiguration,
+    config: PersistedReplicationConfiguration,
     site_peer_deployment_ids: &HashSet<String>,
     contract: OperatorRuleContract,
-) -> (Option<ReplicationConfiguration>, HashSet<String>) {
+) -> (Option<PersistedReplicationConfiguration>, HashSet<String>) {
     let mut removable_arns = replication_target_arns(&config);
     let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids, contract);
     if let Some(remaining) = remaining.as_ref() {
@@ -857,7 +860,7 @@ async fn write_replication_targets_after_config_delete(
 
 async fn restore_replication_config_after_target_cleanup_failure(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
     cleanup_err: S3Error,
     expected_incarnation_id: Option<uuid::Uuid>,
 ) -> S3Error {
@@ -887,7 +890,7 @@ async fn restore_replication_config_after_target_cleanup_failure(
     cleanup_err
 }
 
-fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
+fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
     config.suspended()
         || config.exclude_folders.unwrap_or(false)
         || config
@@ -896,11 +899,11 @@ fn versioning_configuration_has_object_lock_incompatible_settings(config: &Versi
             .is_some_and(|excluded_prefixes| !excluded_prefixes.is_empty())
 }
 
-async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConfiguration) -> S3Result<()> {
+async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersioningConfiguration) -> S3Result<()> {
     if config
         .status
         .as_ref()
-        .is_some_and(|status| !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED))
+        .is_some_and(|status| !matches!(status.as_str(), "Enabled" | "Suspended"))
     {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
@@ -1352,9 +1355,9 @@ fn lifecycle_validation_error(err: &std::io::Error) -> S3Error {
     s3_error!(InvalidArgument, "{err}")
 }
 
-fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_transition_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.transitions.as_ref().is_some_and(|transitions| {
                 transitions.iter().any(|transition| {
                     transition
@@ -1373,9 +1376,9 @@ fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool
     })
 }
 
-fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_expiry_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
 }
@@ -1386,18 +1389,18 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
 /// filters on ENABLED for scanner scheduling — editing a Disabled expiry rule
 /// must still advance the replication axis. Del-marker expiration and
 /// abort-multipart are site-local and never travel.
-fn lifecycle_rules_have_expiry(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_rules_have_expiry(config: &PersistedLifecycleConfiguration) -> bool {
     config
         .rules
         .iter()
         .any(|rule| rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some())
 }
 
-fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
-    config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
-            && rule.abort_incomplete_multipart_upload.is_some()
-    })
+fn lifecycle_has_abort_multipart_rules(config: &PersistedLifecycleConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status == "Enabled" && rule.abort_incomplete_multipart_upload.is_some())
 }
 
 #[derive(Clone, Default)]
@@ -2037,7 +2040,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_encryption(
         &self,
         req: S3Request<GetBucketEncryptionInput>,
-    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+    ) -> S3Result<Option<PersistedBucketEncryptionConfiguration>> {
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2067,13 +2070,11 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
-            server_side_encryption_configuration,
-        }))
+        Ok(server_side_encryption_configuration)
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<PersistedCorsConfiguration> {
         let GetBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2106,16 +2107,14 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketCorsOutput {
-            cors_rules: Some(cors_configuration.cors_rules),
-        }))
+        Ok(cors_configuration)
     }
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+    ) -> S3Result<PersistedLifecycleConfiguration> {
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2127,8 +2126,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => cfg.rules,
+        let config = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
             Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
@@ -2136,16 +2135,13 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
 
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules: Some(rules),
-            ..Default::default()
-        }))
+        Ok(config)
     }
 
     pub async fn execute_get_bucket_notification_configuration(
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+    ) -> S3Result<Option<PersistedNotificationConfiguration>> {
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2176,22 +2172,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Some(NotificationConfiguration {
-            event_bridge_configuration,
-            lambda_function_configurations,
-            queue_configurations,
-            topic_configurations,
-        }) = has_notification_config
-        {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
-                event_bridge_configuration,
-                lambda_function_configurations,
-                queue_configurations,
-                topic_configurations,
-            }))
-        } else {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default()))
-        }
+        Ok(has_notification_config)
     }
 
     pub async fn execute_get_bucket_policy(
@@ -2311,10 +2292,12 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
+    /// Answers the stored configuration in the engine's shape; the s3s edge
+    /// (`storage::ecfs`) converts it into the `GetBucketReplication` output.
     pub async fn execute_get_bucket_replication(
         &self,
         req: S3Request<GetBucketReplicationInput>,
-    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+    ) -> S3Result<PersistedReplicationConfiguration> {
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2347,16 +2330,11 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration),
-        }))
+        Ok(replication_configuration)
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_get_bucket_tagging(
-        &self,
-        req: S3Request<GetBucketTaggingInput>,
-    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+    pub async fn execute_get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<PersistedTagging> {
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2368,7 +2346,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
+        let tagging = match metadata_sys::get_tagging_config(&bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -2386,14 +2364,14 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(tagging)
     }
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_public_access_block(
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
-    ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+    ) -> S3Result<PersistedPublicAccessBlockConfiguration> {
         let GetPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2418,16 +2396,14 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetPublicAccessBlockOutput {
-            public_access_block_configuration: Some(config),
-        }))
+        Ok(config)
     }
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+    ) -> S3Result<PersistedVersioningConfiguration> {
         let GetBucketVersioningInput { bucket, .. } = req.input;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2438,26 +2414,21 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-
-        Ok(S3Response::new(GetBucketVersioningOutput {
-            status,
-            ..Default::default()
-        }))
+        BucketVersioningSys::get(&bucket)
+            .await
+            .map_err(|err| ApiError::from(err).into())
     }
 
     pub async fn execute_put_bucket_encryption(
         &self,
         req: S3Request<PutBucketEncryptionInput>,
+        prepared: S3Result<PersistedBucketEncryptionConfiguration>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketEncryptionInput {
-            bucket,
-            mut server_side_encryption_configuration,
-            ..
-        } = req.input;
+        let PutBucketEncryptionInput { bucket, .. } = req.input;
 
+        let mut server_side_encryption_configuration = prepared?;
         validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
 
         // When SSE-KMS is set without a specific key ID, populate the default
@@ -2512,6 +2483,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
+        prepared_configuration: std::io::Result<Option<PersistedLifecycleConfiguration>>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -2521,9 +2493,9 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(mut input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
-        assign_lifecycle_rule_ids(&mut input_cfg.rules);
-        if let Err(err) = validate_lifecycle_rule_status(&input_cfg.rules) {
+        let Some(mut wire_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        assign_lifecycle_rule_ids(&mut wire_cfg.rules);
+        if let Err(err) = validate_lifecycle_rule_status(&wire_cfg.rules) {
             return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
         }
 
@@ -2543,6 +2515,20 @@ impl DefaultBucketUsecase {
             }
         };
 
+        // Keep conversion failures behind the request-boundary status and Object Lock checks.
+        let Some(mut input_cfg) = prepared_configuration.map_err(to_internal_error)? else {
+            return Err(rustfs_s3_types::s3_error!(InvalidArgument).into());
+        };
+        if input_cfg.rules.len() != wire_cfg.rules.len() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "lifecycle conversion changed the rule count",
+            ));
+        }
+        for (rule, wire_rule) in input_cfg.rules.iter_mut().zip(&wire_cfg.rules) {
+            rule.id.clone_from(&wire_rule.id);
+        }
+
         if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
             return Err(lifecycle_validation_error(&err));
         }
@@ -2559,14 +2545,28 @@ impl DefaultBucketUsecase {
         let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((previous, _)) => {
                 if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
-                    Some(Timestamp::from(time::OffsetDateTime::now_utc()))
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
                 } else {
                     previous.expiry_updated_at
                 }
             }
             // No previous config (or unreadable): stamping is the
             // conservative pre-existing behavior.
-            Err(_) => lifecycle_rules_have_expiry(&input_cfg).then(|| Timestamp::from(time::OffsetDateTime::now_utc())),
+            Err(_) => {
+                if lifecycle_rules_have_expiry(&input_cfg) {
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
+                } else {
+                    None
+                }
+            }
         };
         input_cfg.expiry_updated_at = previous_expiry_updated_at;
         let data = serialize_config(&input_cfg)?;
@@ -2584,8 +2584,10 @@ impl DefaultBucketUsecase {
         // out-rank newer peer expiry state at the receivers.
         item.expiry_updated_at = input_cfg
             .expiry_updated_at
-            .clone()
-            .map(time::OffsetDateTime::from)
+            .as_deref()
+            .map(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339))
+            .transpose()
+            .map_err(to_internal_error)?
             .or(Some(time::OffsetDateTime::UNIX_EPOCH));
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
@@ -2632,6 +2634,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_notification_configuration(
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
+        prepared: S3Result<PersistedNotificationConfiguration>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_region = req.region.clone();
@@ -2644,6 +2647,7 @@ impl DefaultBucketUsecase {
         } = req.input;
 
         validate_notification_configuration_filters(&notification_configuration)?;
+        let persisted_notification_configuration = prepared?;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2665,7 +2669,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
-        let data = serialize_config(&notification_configuration)?;
+        let data = serialize_config(&persisted_notification_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
@@ -2757,14 +2761,14 @@ impl DefaultBucketUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+    pub async fn execute_put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+        prepared: S3Result<PersistedCorsConfiguration>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketCorsInput {
-            bucket,
-            cors_configuration,
-            ..
-        } = req.input;
+        let PutBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2775,6 +2779,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let cors_configuration = prepared?;
         let data = serialize_config(&cors_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, data, expected_incarnation_id)
             .await
@@ -2793,20 +2798,19 @@ impl DefaultBucketUsecase {
     }
 
     /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
-    /// `contract`.
+    /// `contract`. `replication_configuration` is the request body in the
+    /// engine's shape: the s3s edge (`storage::ecfs`) converts it, and this use
+    /// case never reads `req.input.replication_configuration`.
     pub async fn execute_put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
+        replication_configuration: PersistedReplicationConfiguration,
         site_peers: HashSet<String>,
         contract: OperatorRuleContract,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketReplicationInput {
-            bucket,
-            replication_configuration,
-            ..
-        } = req.input;
+        let PutBucketReplicationInput { bucket, .. } = req.input;
         info!(bucket = %bucket, "updating bucket replication config");
 
         validate_replication_config_capabilities(&replication_configuration)?;
@@ -2852,14 +2856,11 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_public_access_block(
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
+        prepared: S3Result<PersistedPublicAccessBlockConfiguration>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutPublicAccessBlockInput {
-            bucket,
-            public_access_block_configuration,
-            ..
-        } = req.input;
+        let PutPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2870,6 +2871,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let public_access_block_configuration = prepared?;
         let data = serialize_config(&public_access_block_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data, expected_incarnation_id)
             .await
@@ -2884,11 +2886,20 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_tagging(
         &self,
         req: S3Request<PutBucketTaggingInput>,
+        tagging: PersistedTagging,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
-        super::storage_api::bucket_usecase::s3_api::tagging::validate_bucket_tag_set(&tagging.tag_set)?;
+        let PutBucketTaggingInput { bucket, .. } = req.input;
+        let s3_tag_set: Vec<s3s::dto::Tag> = tagging
+            .tag_set
+            .iter()
+            .map(|tag| s3s::dto::Tag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            })
+            .collect();
+        super::storage_api::bucket_usecase::s3_api::tagging::validate_bucket_tag_set(&s3_tag_set)?;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2922,15 +2933,13 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
+        prepared: S3Result<PersistedVersioningConfiguration>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketVersioningInput {
-            bucket,
-            versioning_configuration,
-            ..
-        } = req.input;
+        let PutBucketVersioningInput { bucket, .. } = req.input;
 
+        let versioning_configuration = prepared?;
         validate_bucket_versioning_update(&bucket, &versioning_configuration).await?;
 
         let data = serialize_config(&versioning_configuration)?;
@@ -3300,7 +3309,7 @@ impl DefaultBucketUsecase {
 /// algorithm it does not know, so storing one would make GetBucketEncryption
 /// advertise a scheme no object is encrypted under. s3s parses `SSEAlgorithm`
 /// as an open string, so the schema check has to happen here.
-fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfiguration) -> S3Result<()> {
+fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionConfiguration) -> S3Result<()> {
     if config.rules.is_empty() {
         return Err(S3Error::with_message(
             S3ErrorCode::MalformedXML,
@@ -3339,17 +3348,33 @@ fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfigu
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
-    use s3s::dto::ReplicationRuleStatus;
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
+    use rustfs_gateway_types::persistence::{
+        PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+    };
     use s3s::dto::{
-        BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
-        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
-        TransitionStorageClass,
+        BucketLifecycleConfiguration, CORSConfiguration, FilterRule, FilterRuleName, LifecycleExpiration,
+        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter, ServerSideEncryption, Tag,
+        Tagging, Transition, TransitionStorageClass,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    /// Response bodies are not bucket configurations: they are written by the
+    /// s3s encoder itself, as the legacy stack does.
+    fn serialize_s3s_response<T: xml::Serialize>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        value
+            .serialize(&mut xml::Serializer::new(&mut buf))
+            .expect("metadata output should serialize");
+        buf
+    }
 
     fn s3_op_total(op: S3Operation) -> u64 {
         rustfs_io_metrics::s3_op_metrics_snapshot()
@@ -3366,7 +3391,7 @@ mod tests {
     fn sse_rule(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionRule {
         ServerSideEncryptionRule {
             apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                sse_algorithm: ServerSideEncryption::from(algorithm.to_string()),
+                sse_algorithm: algorithm.to_string(),
                 kms_master_key_id: kms_key_id.map(|id| id.to_string()),
             }),
             blocked_encryption_types: None,
@@ -3376,6 +3401,7 @@ mod tests {
 
     /// The stored configuration must be one the write path honours as written:
     /// only AES256 and aws:kms exist, and a key id belongs to aws:kms alone.
+
     #[test]
     fn put_bucket_encryption_refuses_configurations_the_write_path_cannot_honour() {
         validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None)])).expect("AES256 is valid");
@@ -3984,11 +4010,11 @@ mod tests {
         rustfs_scanner::clear_dirty_usage_bucket(BUCKET);
     }
 
-    fn replication_rule_for_target(arn: &str) -> ReplicationRule {
-        ReplicationRule {
+    fn replication_rule_for_target(arn: &str) -> PersistedReplicationRule {
+        PersistedReplicationRule {
             delete_marker_replication: None,
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: arn.to_string(),
                 ..Default::default()
             },
@@ -3998,7 +4024,7 @@ mod tests {
             prefix: None,
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
@@ -4006,7 +4032,7 @@ mod tests {
     fn replication_target_arns_use_role_when_present() {
         let role = "arn:rustfs:replication:us-east-1:source:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: format!(" {role} "),
             rules: vec![replication_rule_for_target(destination)],
         };
@@ -4020,7 +4046,7 @@ mod tests {
     #[test]
     fn replication_target_arns_use_rule_destinations_without_role() {
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(destination)],
         };
@@ -4030,7 +4056,7 @@ mod tests {
         assert!(arns.contains(destination));
     }
 
-    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> ReplicationRule {
+    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> PersistedReplicationRule {
         let mut rule = replication_rule_for_target(arn);
         rule.id = Some(id.to_string());
         rule.priority = Some(priority);
@@ -4043,14 +4069,14 @@ mod tests {
 
     #[test]
     fn put_replication_merge_preserves_site_replication_rules() {
-        let existing = ReplicationConfiguration {
+        let existing = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id("arn:rustfs:replication::peer-dep:bucket", "site-repl-peer-dep", 1),
                 replication_rule_with_id("arn:rustfs:replication:us-east-1:old:bucket", "old-user-rule", 2),
             ],
         };
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id("arn:rustfs:replication:us-east-1:new:bucket", "new-user-rule", 1),
@@ -4089,7 +4115,7 @@ mod tests {
     #[test]
     fn put_then_delete_replication_without_site_replication_treats_site_repl_id_as_user_rule() {
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(user_arn, "site-repl-user", 1)],
         };
@@ -4110,7 +4136,7 @@ mod tests {
     fn delete_replication_split_keeps_only_reconciler_derived_rules() {
         let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
         let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(user_arn, "site-repl-user", 1),
@@ -4135,7 +4161,7 @@ mod tests {
 
     #[test]
     fn put_replication_merge_returns_incoming_verbatim_without_site_rules() {
-        let existing = ReplicationConfiguration {
+        let existing = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(
                 "arn:rustfs:replication:us-east-1:old:bucket",
@@ -4143,7 +4169,7 @@ mod tests {
                 7,
             )],
         };
-        let incoming = ReplicationConfiguration {
+        let incoming = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(
                 "arn:rustfs:replication:us-east-1:new:bucket",
@@ -4167,7 +4193,7 @@ mod tests {
     fn delete_replication_split_keeps_site_rules_and_their_targets() {
         let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
         let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(user_arn, "user-rule", 1),
@@ -4191,7 +4217,7 @@ mod tests {
     #[test]
     fn delete_replication_split_protects_targets_shared_with_site_rules() {
         let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id(sr_arn, "user-rule-on-sr-target", 1),
@@ -4212,7 +4238,7 @@ mod tests {
     #[test]
     fn delete_replication_split_removes_everything_without_site_rules() {
         let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
         };
@@ -4241,7 +4267,7 @@ mod tests {
     fn validate_replication_config_targets_accepts_matching_destination_arns() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(arn)],
         };
@@ -4252,7 +4278,7 @@ mod tests {
     #[test]
     fn validate_replication_config_targets_rejects_stale_destination_arns() {
         let targets = replication_targets_with_arn(&["arn:rustfs:replication:us-east-1:target:bucket-a"]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(
                 "arn:rustfs:replication:us-east-1:target:bucket-b",
@@ -4267,7 +4293,7 @@ mod tests {
     fn validate_replication_config_targets_accepts_matching_role_arn() {
         let arn = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: format!(" {arn} "),
             rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:ignored:bucket")],
         };
@@ -4279,7 +4305,7 @@ mod tests {
     fn validate_replication_config_targets_rejects_role_with_multiple_destinations() {
         let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[role]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: role.to_string(),
             rules: vec![
                 replication_rule_for_target("arn:rustfs:replication:us-east-1:target-a:bucket"),
@@ -4296,7 +4322,7 @@ mod tests {
     fn validate_replication_config_targets_trims_destination_arns() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule_for_target(
                 " arn:rustfs:replication:us-east-1:target:bucket ",
@@ -4310,8 +4336,8 @@ mod tests {
     fn validate_replication_config_targets_ignores_disabled_rules() {
         let targets = replication_targets_with_arn(&[]);
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:stale:bucket");
-        rule.status = ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED);
-        let config = ReplicationConfiguration {
+        rule.status = Status::DISABLED.to_string();
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -4323,10 +4349,10 @@ mod tests {
     fn validate_replication_config_capabilities_names_unsupported_field() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         let destination_key_id = "arn:aws:kms:us-east-1:123456789012:key/opaque-key-id";
-        rule.destination.encryption_configuration = Some(s3s::dto::EncryptionConfiguration {
+        rule.destination.encryption_configuration = Some(PersistedEncryptionConfiguration {
             replica_kms_key_id: Some(destination_key_id.to_string()),
         });
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -4348,7 +4374,7 @@ mod tests {
         first.priority = Some(1);
         let mut second = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         second.priority = Some(1);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![first, second],
         };
@@ -4363,8 +4389,8 @@ mod tests {
     #[test]
     fn validate_replication_config_capabilities_rejects_invalid_status_before_write() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
-        rule.status = ReplicationRuleStatus::from_static("Invalid");
-        let config = ReplicationConfiguration {
+        rule.status = "Invalid".to_owned();
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![rule],
         };
@@ -4378,8 +4404,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_bucket_versioning_update_rejects_invalid_status_before_metadata_lookup() {
-        let config = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static("Invalid")),
+        let config = PersistedVersioningConfiguration {
+            status: Some("Invalid".to_owned()),
             ..Default::default()
         };
 
@@ -4431,8 +4457,8 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_suspended() {
-        let config = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+        let config = PersistedVersioningConfiguration {
+            status: Some("Suspended".to_owned()),
             ..Default::default()
         };
 
@@ -4441,7 +4467,7 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_exclude_folders() {
-        let config = VersioningConfiguration {
+        let config = PersistedVersioningConfiguration {
             exclude_folders: Some(true),
             ..Default::default()
         };
@@ -4451,10 +4477,8 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_excluded_prefixes() {
-        let config = VersioningConfiguration {
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("archive/".to_string()),
-            }]),
+        let config = PersistedVersioningConfiguration {
+            excluded_prefixes: Some(vec![Some("archive/".to_string())]),
             ..Default::default()
         };
 
@@ -4897,18 +4921,18 @@ mod tests {
         // the real validator here, so the mapping cannot drift from it
         // (backlog#2201).
         let malformed = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
                         days: Some(1),
                         ..Default::default()
                     }),
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
-                    filter: Some(s3s::dto::LifecycleRuleFilter {
-                        and: Some(s3s::dto::LifecycleRuleAndOperator {
+                    filter: Some(rustfs_gateway_types::persistence::PersistedLifecycleFilter {
+                        and: Some(rustfs_gateway_types::persistence::PersistedLifecycleAnd {
                             prefix: Some("logs/".to_string()),
                             ..Default::default()
                         }),
@@ -4928,19 +4952,21 @@ mod tests {
         assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
 
         let invalid_value = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     filter: None,
                     id: Some("negative-count".to_string()),
-                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
-                        noncurrent_days: Some(30),
-                        newer_noncurrent_versions: Some(-1),
-                    }),
+                    noncurrent_version_expiration: Some(
+                        rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
+                            noncurrent_days: Some(30),
+                            newer_noncurrent_versions: Some(-1),
+                        },
+                    ),
                     noncurrent_version_transitions: None,
                     prefix: None,
                     transitions: None,
@@ -4996,7 +5022,9 @@ mod tests {
             }],
         };
 
-        assert!(!lifecycle_has_transition_rules(&config));
+        assert!(!lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -5021,7 +5049,9 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_transition_rules(&config));
+        assert!(lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -5044,8 +5074,12 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_abort_multipart_rules(&config));
-        assert!(!lifecycle_has_expiry_rules(&config));
+        assert!(lifecycle_has_abort_multipart_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config.clone()).unwrap()
+        ));
+        assert!(!lifecycle_has_expiry_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -5151,7 +5185,7 @@ mod tests {
             listings.contents[3].object.e_tag,
             Some(to_s3s_xml_etag("1b8a77dff5845270a8d81d86a28f38ea-2"))
         );
-        let xml = String::from_utf8(serialize_config(&listings).expect("serialize objects")).expect("UTF-8 objects");
+        let xml = String::from_utf8(serialize_s3s_response(&listings)).expect("UTF-8 objects");
         assert!(!xml.contains(legacy_md5));
 
         let versions = build_list_object_versions_metadata_output(
@@ -5176,7 +5210,7 @@ mod tests {
             };
             assert_eq!(version.e_tag, listings.contents[index].object.e_tag);
         }
-        let xml = String::from_utf8(serialize_config(&versions).expect("serialize versions")).expect("UTF-8 versions");
+        let xml = String::from_utf8(serialize_s3s_response(&versions)).expect("UTF-8 versions");
         assert!(!xml.contains(legacy_md5));
     }
 
@@ -5224,6 +5258,15 @@ mod tests {
                 ),
                 (vec![tag.clone(), tag], false),
             ] {
+                let persisted = PersistedTagging {
+                    tag_set: tag_set
+                        .iter()
+                        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
+                            key: tag.key.clone(),
+                            value: tag.value.clone(),
+                        })
+                        .collect(),
+                };
                 let input = PutBucketTaggingInput::builder()
                     .bucket(bucket.clone())
                     .tagging(s3s::dto::Tagging { tag_set })
@@ -5233,7 +5276,7 @@ mod tests {
                 req.extensions.insert(ReqInfo::default());
                 req.extensions.insert(slot.clone());
                 fs.put_bucket_tagging(&mut req).await.expect("permission allows tag updates");
-                let result = usecase.execute_put_bucket_tagging(req).await;
+                let result = usecase.execute_put_bucket_tagging(req, persisted).await;
                 if valid {
                     result.expect("valid tags are persisted");
                 } else {
@@ -5640,8 +5683,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
-            .expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
 
         assert!(xml.contains("<ListBucketResult"));
         assert!(xml.contains("<Contents>"));
@@ -5713,8 +5755,7 @@ mod tests {
         };
 
         let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
-        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
-            .expect("metadata output should be UTF-8");
+        let xml = String::from_utf8(serialize_s3s_response(&output)).expect("metadata output should be UTF-8");
 
         // Good sibling metadata survives.
         assert!(xml.contains("<project>alpha</project>"), "well-formed key must remain: {xml}");
@@ -5804,7 +5845,16 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_lifecycle_configuration(req).await.unwrap_err();
+        let prepared = req
+            .input
+            .lifecycle_configuration
+            .clone()
+            .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+            .transpose();
+        let err = usecase
+            .execute_put_bucket_lifecycle_configuration(req, prepared)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -6036,7 +6086,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_notification_configuration(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_notification_configuration(req, Ok(PersistedNotificationConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -6051,7 +6104,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_cors(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_cors(req, Ok(PersistedCorsConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -6059,12 +6115,13 @@ mod tests {
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
         // The config must clear the structural/capability validators so the
         // request actually reaches the store lookup this test pins.
+        let configuration = PersistedReplicationConfiguration {
+            role: "arn:aws:iam::123456789012:role/test".to_string(),
+            rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
+        };
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(ReplicationConfiguration {
-                role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
-            })
+            .replication_configuration(Default::default())
             .build()
             .unwrap();
 
@@ -6072,7 +6129,7 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .execute_put_bucket_replication(req, configuration, HashSet::new(), OperatorRuleContract::Derived)
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -6082,17 +6139,23 @@ mod tests {
     async fn execute_put_bucket_replication_rejects_unsupported_fields_before_store_or_metadata_write() {
         let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
         rule.destination.account = Some("123456789012".to_string());
+        let configuration = PersistedReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
-            .replication_configuration(ReplicationConfiguration {
-                role: String::new(),
-                rules: vec![rule],
-            })
+            .replication_configuration(Default::default())
             .build()
             .unwrap();
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new(), OperatorRuleContract::Derived)
+            .execute_put_bucket_replication(
+                build_request(input, Method::PUT),
+                configuration,
+                HashSet::new(),
+                OperatorRuleContract::Derived,
+            )
             .await
             .expect_err("unsupported fields must be rejected before store access");
 
@@ -6109,14 +6172,24 @@ mod tests {
         // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(sse_config(vec![sse_rule("AES256", None)]))
+            .server_side_encryption_configuration(s3s::dto::ServerSideEncryptionConfiguration {
+                rules: vec![s3s::dto::ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(s3s::dto::ServerSideEncryptionByDefault {
+                        sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        kms_master_key_id: None,
+                    }),
+                    blocked_encryption_types: None,
+                    bucket_key_enabled: None,
+                }],
+            })
             .build()
             .unwrap();
 
         let req = build_request(input, Method::PUT);
+        let prepared = crate::storage::persisted_from_s3s(&req.input.server_side_encryption_configuration);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
+        let err = usecase.execute_put_bucket_encryption(req, prepared).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -6136,7 +6209,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_tagging(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_tagging(req, PersistedTagging::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -6151,7 +6227,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_public_access_block(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_public_access_block(req, Ok(PersistedPublicAccessBlockConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

@@ -11,7 +11,6 @@ use crate::admin::{
     },
 };
 use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
-use http_body_util::BodyExt as _;
 use rustfs_iam::{
     store::{
         Store as _, UserType,
@@ -151,29 +150,18 @@ impl Fixture {
             .await
             .expect("attach actual IAM policy");
     }
-    fn request(&self, body: &Value) -> S3Request<Body> {
+    fn request(&self, body: &Value) -> AdminRequest {
         let slot = ServerContextSlot::new();
         assert!(slot.install(self.context.clone()));
-        let mut req = S3Request {
-            input: Body::from(serde_json::to_vec(body).expect("attempt JSON")),
-            method: Method::POST,
-            uri: http::Uri::default(),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        req.extensions.insert(slot);
-        req.method = Method::POST;
-        req.credentials = Some(s3::auth::Credentials {
-            access_key: BROKER.into(),
-            secret_key: s3::auth::SecretKey::from(SECRET.to_owned()),
-        });
-        req
+        let mut extensions = http::Extensions::new();
+        extensions.insert(slot);
+        crate::admin::operation::test_support::TestRequest::new(Method::POST, "/")
+            .extensions(extensions)
+            .credentials(BROKER, SECRET, None)
+            .body(serde_json::to_vec(body).expect("attempt JSON"))
+            .build()
     }
-    async fn issue(&self, record: &Delegation, body: &Value) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn issue(&self, record: &Delegation, body: &Value) -> S3Result<AdminResponse> {
         let mut router = matchit::Router::new();
         router.insert("/{id}", ()).expect("parameter route");
         let path = format!("/{}", record.id);
@@ -280,7 +268,7 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
             legacy_body["revision"] = json!(v1.revision);
             legacy_body["output_bucket"] = json!("photos");
             let legacy_response = fixture.issue(&v1, &legacy_body).await.expect("legacy same-bucket issuance");
-            assert_eq!(legacy_response.output.0, StatusCode::OK);
+            assert_eq!(legacy_response.into_parts().0, StatusCode::OK);
             let mut wrong = body.clone();
             wrong["output_bucket"] = json!("third");
             match fixture.issue(&record, &wrong).await {
@@ -288,10 +276,11 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
                 Ok(_) => panic!("A03_CROSS_BUCKET_OUTPUT_BOUND"),
             }
             let response = fixture.issue(&record, &body).await.expect("actual v2 issuance");
-            assert_eq!(response.output.0, StatusCode::OK);
-            assert_eq!(response.headers[http::header::CACHE_CONTROL], "no-store");
+            let (status, headers, mut issued_body) = response.into_parts();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers[http::header::CACHE_CONTROL], "no-store");
             let issued: Value =
-                serde_json::from_slice(&response.output.1.collect().await.expect("issued body").to_bytes()).expect("issued JSON");
+                serde_json::from_slice(&issued_body.store_all_limited(1 << 20).await.expect("issued body")).expect("issued JSON");
             let (credential, root) = check_key_valid_with_context(
                 issued["session_token"].as_str().expect("token"),
                 issued["access_key_id"].as_str().expect("access key"),

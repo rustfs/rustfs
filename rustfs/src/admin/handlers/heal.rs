@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::{authenticate_request, validate_admin_request};
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::app_context_from_req;
+use crate::admin::auth::{authenticate_envelope_credentials, validate_admin_request};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::app_context_from_envelope;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
 use crate::admin::storage_api::error::StorageError;
@@ -22,13 +23,13 @@ use crate::admin::storage_api::runtime::EndpointServerPools;
 use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_error};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
-use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
     HealControlCoordinator, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
     decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint, validate_heal_selector,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -39,9 +40,8 @@ use rustfs_heal_contracts::heal_channel::{
     HealAdmissionReceipt, HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
-use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -478,7 +478,7 @@ fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> Clus
     }
 }
 
-fn cluster_heal_status_unavailable(reason: &str) -> s3s::S3Error {
+fn cluster_heal_status_unavailable(reason: &str) -> rustfs_s3_types::S3Error {
     warn!(
         event = EVENT_ADMIN_REQUEST_FAILED,
         component = LOG_COMPONENT_ADMIN_API,
@@ -862,7 +862,7 @@ async fn read_cluster_replacement_recovery_status(
     ))
 }
 
-fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
+fn cluster_heal_control_unavailable(reason: &str) -> rustfs_s3_types::S3Error {
     warn!(
         event = EVENT_ADMIN_REQUEST_FAILED,
         component = LOG_COMPONENT_ADMIN_API,
@@ -1114,7 +1114,7 @@ async fn submit_cluster_heal_start(
     }
 }
 
-fn reject_heal_admission(result: rustfs_heal_contracts::heal_channel::HealAdmissionResult) -> s3s::S3Error {
+fn reject_heal_admission(result: rustfs_heal_contracts::heal_channel::HealAdmissionResult) -> rustfs_s3_types::S3Error {
     use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 
     match result {
@@ -1313,8 +1313,8 @@ fn heal_channel_response_status(
             ..Default::default()
         });
     }
-    Err(s3s::S3Error::with_message(
-        s3s::S3ErrorCode::InternalError,
+    Err(rustfs_s3_types::S3Error::with_message(
+        rustfs_s3_types::S3ErrorCode::InternalError,
         "invalid heal status payload or unsupported summary",
     ))
 }
@@ -1397,13 +1397,13 @@ fn validate_heal_start_options(options: &HealOpts) -> S3Result<()> {
     Ok(())
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
+fn json_response(status: StatusCode, body: Vec<u8>) -> AdminResponse {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
         headers.insert(CONTENT_LENGTH, value);
     }
-    S3Response::with_headers((status, Body::from(body)), headers)
+    AdminResponse::with_headers(status, Body::from(body), headers)
 }
 
 #[derive(Debug, Serialize)]
@@ -1461,26 +1461,26 @@ fn encode_replacement_recovery_status(response: &ReplacementRecoveryStatusRespon
     })
 }
 
-async fn authenticate_heal_admin_request(req: &S3Request<Body>) -> S3Result<String> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+async fn authenticate_heal_admin_request(req: &AdminRequest) -> S3Result<String> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
-    let (cred, owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
+    let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
 
     validate_admin_request(
-        &req.headers,
+        req.headers(),
         &cred,
         owner,
         false,
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
-        crate::admin::auth::policy_source_addr(&req.extensions),
+        req.policy_source_addr(),
     )
     .await?;
     Ok(cred.access_key)
 }
 
-async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+async fn validate_heal_admin_request(req: &AdminRequest) -> S3Result<()> {
     authenticate_heal_admin_request(req).await.map(|_| ())
 }
 
@@ -1488,15 +1488,11 @@ pub struct HealHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_heal_admin_request(&req).await?;
-        let client_address = req
-            .extensions
-            .get::<Option<RemoteAddr>>()
-            .and_then(|opt| opt.map(|addr| addr.0.to_string()))
-            .unwrap_or_default();
-        let app_context = app_context_from_req(&req);
-        let mut input = req.input;
+        let client_address = req.remote_addr().map(|addr| addr.to_string()).unwrap_or_default();
+        let app_context = app_context_from_envelope(req.envelope());
+        let mut input = req.take_body();
         let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -1513,7 +1509,7 @@ impl Operation for HealHandler {
                 return Err(s3_error!(InvalidRequest, "heal request body too large or failed to read"));
             }
         };
-        let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
+        let hip = extract_heal_init_params(&bytes, req.uri(), params)?;
         validate_heal_request_mode(&hip)?;
         if hip.client_token.is_empty() && !hip.force_stop {
             validate_heal_start_options(&hip.hs)?;
@@ -1766,7 +1762,7 @@ struct MrfLegacyResponsibilityActionResponse {
     durable_responsibility_retained: bool,
 }
 
-fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
+fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> rustfs_s3_types::S3Error {
     use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
     match error {
         MrfLifecycleControlError::CheckpointUnreadable => admin_error(
@@ -1802,9 +1798,9 @@ pub struct MrfLegacyResponsibilitiesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for MrfLegacyResponsibilitiesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_heal_admin_request(&req).await?;
-        let (cursor, limit) = parse_mrf_legacy_responsibility_query(&req.uri)?;
+        let (cursor, limit) = parse_mrf_legacy_responsibility_query(req.uri())?;
         let snapshot = timeout(
             Duration::from_secs(5),
             rustfs_heal::heal::mrf_queue::list_legacy_responsibilities(cursor, limit),
@@ -1822,10 +1818,10 @@ pub struct MrfLegacyResponsibilitiesActionHandler {}
 
 #[async_trait::async_trait]
 impl Operation for MrfLegacyResponsibilitiesActionHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let actor = authenticate_heal_admin_request(&req).await?;
         let bytes = req
-            .input
+            .take_body()
             .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility action body is too large or unreadable"))?;
@@ -1912,10 +1908,10 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
 
 #[async_trait::async_trait]
 impl Operation for BackgroundHealStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_heal_admin_request(&req).await?;
 
-        let Some(context) = app_context_from_req(&req) else {
+        let Some(context) = app_context_from_envelope(req.envelope()) else {
             warn!(
                 event = EVENT_ADMIN_REQUEST_FAILED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -1964,10 +1960,10 @@ pub struct ReplacementRecoveryStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ReplacementRecoveryStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_heal_admin_request(&req).await?;
 
-        let Some(context) = app_context_from_req(&req) else {
+        let Some(context) = app_context_from_envelope(req.envelope()) else {
             return Err(cluster_heal_status_unavailable("server_not_initialized"));
         };
         let Some(endpoints) = context.endpoints().handle() else {
@@ -2018,15 +2014,13 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
+    use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use matchit::Router;
     use rustfs_heal_contracts::heal_channel::{
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealOpts, HealRequestSource, HealScanMode,
     };
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_scanner::scanner::BackgroundHealInfo;
-    use s3s::{
-        S3ErrorCode,
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-    };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
@@ -2202,7 +2196,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::Duration;
 
-    fn parse_registered_heal_request(uri: &Uri) -> s3s::S3Result<HealInitParams> {
+    fn parse_registered_heal_request(uri: &Uri) -> rustfs_s3_types::S3Result<HealInitParams> {
         let mut registered = super::S3Router::new(false);
         super::register_heal_route(&mut registered).expect("register production Heal routes");
         let mut router = Router::new();
@@ -2320,12 +2314,12 @@ mod tests {
                     .check_access(&mut req)
                     .await
                     .expect_err("router must require a signature");
-                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
                 let err = router
                     .call(req)
                     .await
                     .expect_err("handler must independently require authentication");
-                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
                 assert!(err.to_string().contains("authentication required"));
             }
         }
@@ -2355,12 +2349,12 @@ mod tests {
                 .check_access(&mut req)
                 .await
                 .expect_err("diagnostics router must require a signature");
-            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
             let err = router
                 .call(req)
                 .await
                 .expect_err("diagnostics handler must authenticate before inspecting local records");
-            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
             assert!(err.to_string().contains("authentication required"));
         }
     }
@@ -4249,10 +4243,10 @@ mod tests {
 
     #[test]
     fn test_json_response_sets_application_json_content_type() {
-        let response = json_response(StatusCode::OK, b"{}".to_vec());
-        let content_type = response.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok());
+        let (_, headers, _) = json_response(StatusCode::OK, b"{}".to_vec()).into_parts();
+        let content_type = headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok());
         assert_eq!(content_type, Some("application/json"),);
-        let content_length = response.headers.get(CONTENT_LENGTH).and_then(|value| value.to_str().ok());
+        let content_length = headers.get(CONTENT_LENGTH).and_then(|value| value.to_str().ok());
         assert_eq!(content_length, Some("2"),);
     }
 }

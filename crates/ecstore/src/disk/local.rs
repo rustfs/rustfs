@@ -76,8 +76,8 @@ use crate::disk::{
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{
-        O_APPEND, O_CREATE, O_RDONLY, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std, remove,
-        remove_all_std, remove_std, rename,
+        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std,
+        remove, remove_all_std, remove_std, rename,
     },
     is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
@@ -616,6 +616,7 @@ fn take_published_part_txn_receipt(transaction_path: &Path) -> Option<PublishedP
 }
 
 fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, restore: &Path) -> std::io::Result<()> {
+    os::record_native_publication(current);
     match std::fs::symlink_metadata(backup) {
         Ok(metadata) if metadata.is_file() => {
             remove_file_if_exists(restore)?;
@@ -668,6 +669,7 @@ async fn write_delete_rollback_files(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<Option<crate::disk::DeleteRecoveryInspection>> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
+    os::record_native_publication(&backup_dir);
     let mut removed_entries = Vec::with_capacity(remove_before_publish.len());
     for &name in remove_before_publish {
         let path = backup_dir.join(name);
@@ -2838,6 +2840,9 @@ fn open_direct_writer(
     use std::os::unix::fs::OpenOptionsExt;
 
     #[cfg(test)]
+    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::DirectWriteOpen, file_path);
+    os::record_native_publication(file_path);
+    #[cfg(test)]
     run_owned_file_before_open(file_path);
 
     let open_result = std::fs::OpenOptions::new()
@@ -4869,6 +4874,9 @@ impl StdBackend {
     }
 
     async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
+        if mode == O_CREATE | O_WRONLY | O_TRUNC {
+            os::record_native_publication(path.as_ref());
+        }
         let mut skip_parent = skip_parent.as_ref();
         if skip_parent.as_os_str().is_empty() {
             skip_parent = self.io_root();
@@ -5628,6 +5636,7 @@ impl LocalIoBackend for StdBackend {
                     }
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
+                    os::record_native_publication(&direct_path);
                     let resource_unit = current_resource_unit();
                     let mount_lease = self.mount_lease.clone();
                     let direct = tokio::task::spawn_blocking(move || {
@@ -5641,6 +5650,8 @@ impl LocalIoBackend for StdBackend {
                     }
                 }
 
+                // The writer opens on first use, outside the fs helpers that record.
+                os::record_native_publication(&file_path);
                 if let Some(resources) = current_resource_unit() {
                     if let Some(parent) = file_path.parent() {
                         os::make_dir_all(parent, &volume_dir).await?;
@@ -7605,6 +7616,7 @@ async fn build_local_io_backend(
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
+    publication_history: Option<os::NativePublicationRegistration>,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_index: Arc<multipart_index::IndexOwner>,
     /// I/O root pinned to the mount instance that was opened while the disk
@@ -8014,6 +8026,11 @@ impl LocalDisk {
         multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
         multipart_source_state::invalidate_active_multipart_sources_under(&root);
 
+        let publication_history = os::register_native_publication_root(&root, &io_root);
+
+        #[cfg(all(test, target_os = "linux"))]
+        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::BeforeDataUsageLayout, &root);
+
         ensure_data_usage_layout(&io_root)
             .await
             .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))
@@ -8155,6 +8172,7 @@ impl LocalDisk {
             multipart_index,
             root: root.clone(),
             publication_root,
+            publication_history,
             multipart_proof_authority: OnceLock::new(),
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
@@ -11086,6 +11104,7 @@ impl LocalDisk {
                     || should_fail_after_delete_data_staged(path))
             {
                 let rollback_path = object_dir.join(rollback_dir.to_string());
+                os::record_native_publication(&rollback_path);
                 if let Err(err) = fs::create_dir_all(&rollback_path).await {
                     let err: DiskError = to_file_error(err).into();
                     if reserved_version_delete {
@@ -11522,11 +11541,14 @@ impl LocalDisk {
     ) -> Result<()> {
         multipart_staging::reject_reserved_anchor(path)?;
         let fuse_with_admission = admission.is_some() && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, path);
+        // Held until the staging root is published, by the filesystem work
+        // itself, so a concurrent listing cannot prune the marker in between.
+        let mut index_pin = None;
         let prepared_index = if volume == RUSTFS_META_MULTIPART_BUCKET {
             if fuse_with_admission {
                 self.multipart_index.prepare_record_head(path, &buf).await
             } else {
-                self.multipart_index.record_head(path, &buf).await?;
+                index_pin = self.multipart_index.record_head(path, &buf).await?;
                 None
             }
         } else {
@@ -11552,8 +11574,10 @@ impl LocalDisk {
             let root = self.publication_root.clone();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
             os::run_blocking_namespace_operation_with_sync(lease, do_sync, move || {
-                if let Some(record) = prepared_index {
-                    record.run_std()?;
+                let _index_pin = prepared_index.map(|record| record.run_std()).transpose()?;
+                #[cfg(test)]
+                if let Some(pin) = &_index_pin {
+                    pin.pause_for_test();
                 }
                 super::fs::create_dir_all_std(&tmp_volume_dir)?;
                 #[cfg(test)]
@@ -11597,12 +11621,16 @@ impl LocalDisk {
             return Err(DiskError::Unexpected);
         }
 
+        let publication_owner: Option<Arc<dyn Send + Sync>> = match index_pin {
+            Some(pin) => Some(Arc::new((namespace_owner.clone(), pin))),
+            None => namespace_owner.clone(),
+        };
         os::rename_all_with_precondition_and_parent_sync(
             &tmp_file_path,
             &file_path,
             &volume_dir,
             &self.publication_root,
-            namespace_owner.clone(),
+            publication_owner,
             admission.as_ref().map(|admission| admission.precondition()),
             admission.is_some() && sync && durability.syncs_commit_metadata(),
         )
@@ -11679,6 +11707,7 @@ impl LocalDisk {
         };
 
         let path = file_path.to_path_buf();
+        os::record_native_publication(&path);
         let create_parent = if let Some(parent) = path.parent()
             && parent != skip_parent
         {
@@ -11693,6 +11722,7 @@ impl LocalDisk {
             if is_cancelled() {
                 return Err(std::io::Error::other("blocking namespace operation cancelled"));
             }
+            os::record_native_publication(&path);
             if create_parent && let Some(parent) = path.parent() {
                 super::fs::create_dir_all_std(parent)?;
             }
@@ -14030,6 +14060,9 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn close(&self) -> Result<()> {
+        if let Some(history) = self.publication_history.as_ref() {
+            history.invalidate();
+        }
         // This disk instance is being retired (e.g. replaced by renew_disk on
         // reconnect). Drop its cached descriptors so a replacement instance's
         // invalidations are never defeated by this one continuing to serve stale
@@ -14206,6 +14239,7 @@ impl DiskAPI for LocalDisk {
             let file_path = self.io_get_object_path(volume, path)?;
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            os::record_native_publication(&file_path);
             #[cfg(target_os = "linux")]
             let mount_lease = self.mount_lease.clone();
             return Ok(spawn_blocking_with_disk_io_permit(None, move || {
@@ -14645,6 +14679,7 @@ impl DiskAPI for LocalDisk {
         if let Some(ref source) = admission_source {
             multipart_source_state::begin_active_multipart_part_transaction(source, part.number);
         }
+        os::record_native_publication(&transaction_path);
         let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
             if let Some(ref admission) = admission
@@ -14855,6 +14890,7 @@ impl DiskAPI for LocalDisk {
             .and_then(|num| num.parse::<usize>().ok());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
 
+        os::record_native_publication(&current_data_path);
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<bool>> {
             match std::fs::symlink_metadata(&transaction_path) {
                 Ok(metadata) if metadata.is_dir() => {}
@@ -15720,12 +15756,27 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        let Some(history) = self.publication_history.as_ref() else {
+            return Ok(None);
+        };
+        let Some(disk_id) = self.get_disk_id().await? else {
+            return Ok(None);
+        };
+        Ok(history.witness(volume, disk_id, Arc::clone(&self.io_backend)))
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()> {
         if !Self::is_valid_volname(volume) {
             return Err(Error::other("Invalid arguments specified"));
         }
 
         let volume_dir = self.io_get_bucket_path(volume)?;
+        #[cfg(all(test, not(windows)))]
+        os::prepared_publication_test_hooks::run(
+            os::prepared_publication_test_hooks::Stage::CreateDirectory,
+            &self.root.join(volume),
+        );
 
         // Volume creation is a mutation boundary, so it must observe the live
         // filesystem rather than a potentially stale existence-cache entry.
@@ -16593,6 +16644,280 @@ mod test {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_direct_child_open_attempt_consumes_native_history() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let bucket = format!("owned-open-attempt-{}", Uuid::new_v4());
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native registration")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh history");
+
+        disk.write_all_public(&bucket, "direct-child", Bytes::from_static(b"payload"))
+            .await
+            .expect_err("the direct child has no bucket parent");
+        assert!(
+            !os::validate_native_creation_witnesses(&[witness]),
+            "even a failed O_CREATE in the real owned executor must permanently consume native history"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_truncate_writer_consumes_native_history_before_first_open() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let bucket = format!("lazy-open-attempt-{}", Uuid::new_v4());
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native registration")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh history");
+
+        let writer = disk
+            .io_backend
+            .open_write(&bucket, "object/part.1", WriteMode::Truncate { size_hint: 1 })
+            .await
+            .expect("the lazy writer defers its open");
+        assert!(
+            !os::validate_native_creation_witnesses(&[witness]),
+            "a deferred truncate open must consume native history when it is admitted"
+        );
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_open_cancellation_retains_started_history_before_execution() {
+        use std::sync::mpsc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single blocking worker runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("native disk directory");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+            let history = disk.publication_history.as_ref().expect("native registration");
+            let bucket = format!("borrowed-queued-open-{}", Uuid::new_v4());
+            let disk_id = Uuid::new_v4();
+            let witness = history
+                .witness(&bucket, disk_id, Arc::clone(&disk.io_backend))
+                .expect("fresh native history");
+            let path = disk.io_root().join(&bucket);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).expect("signal occupied blocking worker");
+                let _ = release_rx.recv();
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the only blocking worker must be occupied");
+
+            let mut operation =
+                Box::pin(disk.write_all_internal(&path, Bytes::from_static(b"payload"), SyncMode::None, disk.io_root()));
+            let queued = futures::poll!(operation.as_mut()).is_pending();
+            let started_before_execution = !os::validate_native_creation_witnesses(std::slice::from_ref(&witness));
+            let absent_before_execution = !path.exists();
+            drop(operation);
+            release_tx.send(()).expect("release the blocking worker");
+            blocker.await.expect("blocking worker must drain");
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("queued native open must drain before assertions");
+
+            assert!(queued, "the borrowed write must queue behind the occupied worker");
+            assert!(
+                absent_before_execution,
+                "the real open must not run before the blocking worker is released"
+            );
+            assert!(
+                started_before_execution,
+                "the borrowed write must consume native history before queueing its open"
+            );
+            // The disk blocking queue skips an operation once its waiter is gone
+            // (`run_cancellable` observes the closed result channel), so the open
+            // never runs. The Started record taken before queueing must survive
+            // that cancellation: the proof stays conservatively consumed.
+            assert!(!path.exists(), "a cancelled borrowed write must not run its queued open");
+            assert!(
+                history.witness(&bucket, disk_id, Arc::clone(&disk.io_backend)).is_none(),
+                "executor drain must not regrant native history to a cancelled publication"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn synchronous_direct_open_attempt_consumes_native_history() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let bucket = format!("direct-io-open-attempt-{}", Uuid::new_v4());
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native registration")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh history");
+        let path = disk.io_get_object_path(&bucket, "direct-child").expect("direct I/O path");
+
+        assert!(
+            open_direct_writer(&path, &DirectIoWriteState::new(), None).is_err(),
+            "the actual synchronous O_DIRECT entry must observe the missing bucket parent"
+        );
+        assert!(
+            !os::validate_native_creation_witnesses(&[witness]),
+            "a directly callable O_CREATE helper cannot retain retry permission after a failed publication attempt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_queued_direct_open_cancellation_retains_started_history() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let backend = Arc::new(StdBackend::new_without_fd_cache(disk.io_root().to_path_buf()));
+        let actual_backend: Arc<dyn LocalIoBackend> = backend.clone();
+        let history = disk.publication_history.as_ref().expect("native registration");
+        let bucket = format!("native-queued-dio-{}", Uuid::new_v4());
+        let disk_id = Uuid::new_v4();
+        let witness = history
+            .witness(&bucket, disk_id, Arc::clone(&actual_backend))
+            .expect("fresh native history");
+        let path = local_disk_object_path(disk.io_root(), "", &bucket).expect("first-level DIO path");
+        let write_state = Arc::clone(&backend.direct_io_write);
+        let idle_state_owners = Arc::strong_count(&write_state);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = hooks::install_at(hooks::Stage::DirectWriteOpen, &path, move || {
+            entered_tx.send(()).expect("signal real DIO executor entry");
+            let _ = release_rx.recv();
+        });
+
+        temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("true"))], async {
+            let operation_backend = Arc::clone(&backend);
+            let operation_bucket = bucket.clone();
+            let operation = tokio::spawn(async move {
+                operation_backend
+                    .open_write("", &operation_bucket, WriteMode::Truncate { size_hint: 0 })
+                    .await
+            });
+            tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+                .await
+                .expect("DIO entry waiter")
+                .expect("the real blocking executor must enter");
+            assert!(
+                !os::validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                "Started must be recorded before the queued DIO worker performs its own history lookup"
+            );
+            assert!(!path.exists(), "the keyed pause must precede the actual O_DIRECT open");
+            operation.abort();
+            match operation.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("DIO waiter failed instead of cancelling: {error}"),
+                Ok(_) => panic!("the paused DIO waiter must be cancelled"),
+            }
+            release_tx.send(()).expect("release the real DIO open");
+            timeout(Duration::from_secs(30), async {
+                while Arc::strong_count(&write_state) > idle_state_owners {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the detached DIO executor must drain");
+        })
+        .await;
+
+        assert!(path.is_file(), "cancelling the waiter must not discard the queued native open");
+        std::fs::remove_file(&path).expect("remove the file published by the cancelled DIO waiter");
+        assert!(
+            history.witness(&bucket, disk_id, actual_backend).is_none(),
+            "executor drain and physical removal must not regrant native history"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_mount_lease_alias_publication_consumes_same_history() {
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("native local disk");
+        let history = disk.publication_history.as_ref().expect("native registration");
+        let disk_id = Uuid::new_v4();
+        for (alias, root) in [("root", disk.root.as_path()), ("io", disk.io_root())] {
+            let bucket = format!("native-alias-{alias}-{}", Uuid::new_v4());
+            let witness = history
+                .witness(&bucket, disk_id, Arc::clone(&disk.io_backend))
+                .expect("fresh native history through both real root aliases");
+            super::super::fs::mkdir(root.join(&bucket))
+                .await
+                .expect("publish through the actual directory entry");
+            assert!(
+                !os::validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                "{alias}: publication through either physical-root alias must consume the same history"
+            );
+            std::fs::remove_dir(disk.root.join(&bucket)).expect("remove the physically published directory");
+            assert!(
+                history.witness(&bucket, disk_id, Arc::clone(&disk.io_backend)).is_none(),
+                "{alias}: removal through the other alias must not regrant native history"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_native_history_is_registered_before_data_usage_layout() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("native disk directory");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical disk root");
+        let bucket = format!("native-before-layout-{}", Uuid::new_v4());
+        let source = root.join(format!("layout-source-{}", Uuid::new_v4()));
+        std::fs::create_dir(&source).expect("prepare an actual directory for publication");
+        let destination = root.join(&bucket);
+        let publication_path = destination.clone();
+        let _hook = hooks::install_at(hooks::Stage::BeforeDataUsageLayout, &root, move || {
+            super::super::fs::rename_std(&source, &publication_path)
+                .expect("publish through the native entry before data usage layout");
+        });
+        let endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("native local disk with real startup layout");
+        let history = disk.publication_history.as_ref().expect("native registration");
+        let disk_id = Uuid::new_v4();
+
+        let untouched = format!("native-layout-untouched-{}", Uuid::new_v4());
+        assert!(
+            history.witness(&untouched, disk_id, Arc::clone(&disk.io_backend)).is_some(),
+            "startup layout must keep an untouched bucket's native history known"
+        );
+        assert!(
+            history.witness(&bucket, disk_id, Arc::clone(&disk.io_backend)).is_none(),
+            "registration must capture real publication before startup layout finishes"
+        );
+        std::fs::remove_dir(destination).expect("remove the physically published directory");
+        assert!(
+            history.witness(&bucket, disk_id, Arc::clone(&disk.io_backend)).is_none(),
+            "startup completion and physical removal must retain Started"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -20249,6 +20574,109 @@ mod test {
         assert!(
             !dst_meta_parent.join(STORAGE_FORMAT_FILE).exists(),
             "fresh inline PUT rollback must remove the committed xl.meta after grouped dst dir fsync failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_data_pending_restore_requires_parts_only_from_multipart_staging() {
+        let dir = tempfile::tempdir().expect("disk directory should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "restore-rename-controls";
+        ensure_test_volume(&disk, bucket).await;
+        for (case, source_volume, pending, requires_parts) in [
+            ("remote", RUSTFS_META_TMP_BUCKET, false, false),
+            ("pending-remote", RUSTFS_META_TMP_BUCKET, true, false),
+            ("pending-multipart", crate::disk::RUSTFS_META_MULTIPART_BUCKET, true, true),
+        ] {
+            ensure_test_volume(&disk, source_volume).await;
+            let staging = dir.path().join(source_volume).join(case);
+            fs::create_dir_all(&staging).await.expect("staging parent should be created");
+            let data_dir = Uuid::new_v4();
+            let mut fi = test_file_info(case, Uuid::nil(), Some(data_dir), None);
+            fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+            fi.transition_tier = "WARM".to_string();
+            fi.transitioned_objname = "remote/object".to_string();
+            if pending {
+                fi.metadata.insert(
+                    rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+                    "ongoing-request=\"true\"".to_string(),
+                );
+            }
+            let result = disk.rename_data(source_volume, case, fi, bucket, case).await;
+            let destination = dir.path().join(bucket).join(case);
+            if requires_parts {
+                assert!(result.is_err(), "missing multipart restore parts must reject the physical commit");
+                assert!(
+                    !destination.join(STORAGE_FORMAT_FILE).exists(),
+                    "failed multipart restore must not publish metadata for absent local parts"
+                );
+            } else {
+                result.expect("remote-only metadata commits must not require local staged parts");
+                let stored = fs::read(destination.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("remote-only metadata should be committed");
+                let restored = FileMeta::load(&stored)
+                    .expect("committed metadata should decode")
+                    .into_fileinfo(bucket, case, "", false, false, false)
+                    .expect("committed version should decode");
+                assert!(restored.is_remote(), "remote-only commits must retain remote read routing");
+                assert!(
+                    !destination.join(data_dir.to_string()).exists(),
+                    "remote-only metadata commit must not create a local payload directory"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_data_pending_multipart_restore_rejects_absent_data_directory() {
+        assert_pending_multipart_restore_rejects_directory(None).await;
+    }
+
+    #[tokio::test]
+    async fn rename_data_pending_multipart_restore_rejects_nil_data_directory() {
+        assert_pending_multipart_restore_rejects_directory(Some(Uuid::nil())).await;
+    }
+
+    async fn assert_pending_multipart_restore_rejects_directory(data_dir: Option<Uuid>) {
+        let dir = tempfile::tempdir().expect("disk directory should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let source_volume = crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let bucket = "restore-invalid-directory";
+        let object = "object.bin";
+        ensure_test_volume(&disk, source_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+        let staging = dir.path().join(source_volume).join(object);
+        fs::create_dir_all(&staging).await.expect("staging parent should be created");
+        if let Some(data_dir) = data_dir {
+            let data_path = staging.join(data_dir.to_string());
+            fs::create_dir_all(&data_path)
+                .await
+                .expect("invalid staging directory should be created");
+            fs::write(data_path.join("part.1"), b"x")
+                .await
+                .expect("nil directory fixture must contain a real part");
+        }
+        let mut fi = test_file_info(object, Uuid::nil(), data_dir, None);
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        fi.transition_tier = "WARM".to_string();
+        fi.transitioned_objname = "remote/object".to_string();
+        fi.metadata.insert(
+            rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"true\"".to_string(),
+        );
+        let result = disk.rename_data(source_volume, object, fi, bucket, object).await;
+        assert!(
+            matches!(result, Err(DiskError::FileCorrupt)),
+            "pending multipart restore must reject absent or nil staging identity as corrupt: {result:?}"
+        );
+        assert!(
+            !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+            "invalid staging identity must fail before metadata publication"
         );
     }
 

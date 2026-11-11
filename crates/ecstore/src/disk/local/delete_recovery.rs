@@ -2747,6 +2747,7 @@ impl LocalDisk {
                     }
                 }
                 let staged_dir = staged.keep();
+                os::record_native_publication(&destination);
                 if let Err(err) = std::fs::rename(&staged_dir, &destination) {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
@@ -2790,6 +2791,7 @@ impl LocalDisk {
                     // A provisional head must stay outside the published recovery transaction.
                     let target_in_rollback = destination.join(TARGET);
                     let linked_xl = staging_root.join(format!("delete-xl-{transaction}"));
+                    os::record_native_publication(&xl_path);
                     let linked = match std::fs::hard_link(&target_in_rollback, &linked_xl) {
                         Ok(()) => true,
                         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -2958,6 +2960,7 @@ impl LocalDisk {
                         if sync && !receipt_bytes.is_empty() {
                             file.sync_data()?;
                         }
+                        os::record_native_publication(&receipt_path);
                         std::fs::rename(&tmp_receipt, &receipt_path)?;
                         if sync {
                             os::fsync_directory_handle_std(&rollback, rollback_dir_fd.as_deref())?;
@@ -3056,6 +3059,7 @@ impl LocalDisk {
                 if sync && !receipt_bytes.is_empty() {
                     staged.as_file().sync_data()?;
                 }
+                os::record_native_publication(&receipt_path);
                 std::fs::rename(staged.path(), &receipt_path)?;
                 if sync {
                     os::fsync_dir_std(&rollback)?;
@@ -3204,6 +3208,7 @@ impl LocalDisk {
                 if sync && !receipt_bytes.is_empty() {
                     staged_receipt.as_file().sync_data()?;
                 }
+                os::record_native_publication(&receipt_path);
                 std::fs::rename(staged_receipt.path(), &receipt_path)?;
                 if sync {
                     let _ = os::fsync_dir_std(&rollback);

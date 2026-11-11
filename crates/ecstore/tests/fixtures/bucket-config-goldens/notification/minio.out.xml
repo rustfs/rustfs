@@ -1,0 +1,1 @@
+<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:*</Event><Id></Id><Queue>arn:minio:sqs::primary:webhook</Queue></QueueConfiguration></NotificationConfiguration>

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde::{de::Deserializer, ser::Serializer};
 use std::fmt::Display;
 
-use s3s::S3ErrorCode;
+use crate::remote_error_code::RemoteErrorCode;
 
 const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/rustfs/rustfs/issues.";
 
@@ -31,7 +31,7 @@ const _REPORT_ISSUE: &str = "Please report this issue at https://github.com/rust
 #[serde(default, rename_all = "PascalCase")]
 pub struct ErrorResponse {
     #[serde(serialize_with = "serialize_code", deserialize_with = "deserialize_code")]
-    pub code: S3ErrorCode,
+    pub code: RemoteErrorCode,
     pub message: String,
     pub bucket_name: String,
     pub key: String,
@@ -46,28 +46,28 @@ pub struct ErrorResponse {
     pub status_code: StatusCode,
 }
 
-fn serialize_code<S>(_data: &S3ErrorCode, s: S) -> Result<S::Ok, S::Error>
+fn serialize_code<S>(_data: &RemoteErrorCode, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     s.serialize_str("")
 }
 
-fn deserialize_code<'de, D>(d: D) -> Result<S3ErrorCode, D::Error>
+fn deserialize_code<'de, D>(d: D) -> Result<RemoteErrorCode, D::Error>
 where
     D: Deserializer<'de>,
 {
     let code = String::deserialize(d)?;
     if code == "NoSuchObject" {
-        return Ok(S3ErrorCode::NoSuchKey);
+        return Ok(RemoteErrorCode::NO_SUCH_KEY);
     }
-    Ok(S3ErrorCode::from_bytes(code.as_bytes()).unwrap_or(S3ErrorCode::Custom("".into())))
+    Ok(RemoteErrorCode::from_wire(&code))
 }
 
 impl Default for ErrorResponse {
     fn default() -> Self {
         ErrorResponse {
-            code: S3ErrorCode::Custom("".into()),
+            code: RemoteErrorCode::custom(""),
             message: Default::default(),
             bucket_name: Default::default(),
             key: Default::default(),
@@ -110,7 +110,7 @@ pub fn http_resp_to_error_response(
     if h.is_empty() || !(resp_status.is_client_error() || resp_status.is_server_error()) {
         return ErrorResponse {
             status_code: resp_status,
-            code: S3ErrorCode::ResponseInterrupted,
+            code: RemoteErrorCode::RESPONSE_INTERRUPTED,
             message: "Invalid HTTP response.".to_string(),
             bucket_name: bucket_name.to_string(),
             key: object_name.to_string(),
@@ -125,7 +125,7 @@ pub fn http_resp_to_error_response(
                 if object_name == "" {
                     err_resp = ErrorResponse {
                         status_code: resp_status,
-                        code: S3ErrorCode::NoSuchBucket,
+                        code: RemoteErrorCode::NO_SUCH_BUCKET,
                         message: "The specified bucket does not exist.".to_string(),
                         bucket_name: bucket_name.to_string(),
                         ..Default::default()
@@ -133,7 +133,7 @@ pub fn http_resp_to_error_response(
                 } else {
                     err_resp = ErrorResponse {
                         status_code: resp_status,
-                        code: S3ErrorCode::NoSuchKey,
+                        code: RemoteErrorCode::NO_SUCH_KEY,
                         message: "The specified key does not exist.".to_string(),
                         bucket_name: bucket_name.to_string(),
                         key: object_name.to_string(),
@@ -144,7 +144,7 @@ pub fn http_resp_to_error_response(
             StatusCode::FORBIDDEN => {
                 err_resp = ErrorResponse {
                     status_code: resp_status,
-                    code: S3ErrorCode::AccessDenied,
+                    code: RemoteErrorCode::ACCESS_DENIED,
                     message: "Access Denied.".to_string(),
                     bucket_name: bucket_name.to_string(),
                     key: object_name.to_string(),
@@ -154,7 +154,7 @@ pub fn http_resp_to_error_response(
             StatusCode::CONFLICT => {
                 err_resp = ErrorResponse {
                     status_code: resp_status,
-                    code: S3ErrorCode::BucketNotEmpty,
+                    code: RemoteErrorCode::BUCKET_NOT_EMPTY,
                     message: "Bucket not empty.".to_string(),
                     bucket_name: bucket_name.to_string(),
                     ..Default::default()
@@ -163,7 +163,7 @@ pub fn http_resp_to_error_response(
             StatusCode::PRECONDITION_FAILED => {
                 err_resp = ErrorResponse {
                     status_code: resp_status,
-                    code: S3ErrorCode::PreconditionFailed,
+                    code: RemoteErrorCode::PRECONDITION_FAILED,
                     message: "Pre condition failed.".to_string(),
                     bucket_name: bucket_name.to_string(),
                     key: object_name.to_string(),
@@ -177,7 +177,7 @@ pub fn http_resp_to_error_response(
                 }
                 err_resp = ErrorResponse {
                     status_code: resp_status,
-                    code: S3ErrorCode::Custom(resp_status.to_string().into()),
+                    code: RemoteErrorCode::custom(resp_status.to_string()),
                     message: msg,
                     bucket_name: bucket_name.to_string(),
                     ..Default::default()
@@ -196,7 +196,7 @@ pub fn http_resp_to_error_response(
 
     if let Some(code) = h.get("x-minio-error-code") {
         if let Ok(code_str) = code.to_str() {
-            err_resp.code = S3ErrorCode::Custom(code_str.into());
+            err_resp.code = RemoteErrorCode::custom(code_str);
         }
     }
     if let Some(desc) = h.get("x-minio-error-desc") {
@@ -226,7 +226,7 @@ pub fn http_resp_to_error_response(
             }
         }
     }
-    if err_resp.code == S3ErrorCode::InvalidLocationConstraint/*InvalidRegion*/ && err_resp.region != "" {
+    if err_resp.code == RemoteErrorCode::INVALID_LOCATION_CONSTRAINT/*InvalidRegion*/ && err_resp.region != "" {
         err_resp.message = format!("Region does not match, expecting region ‘{}’.", err_resp.region);
     }
 
@@ -240,7 +240,7 @@ pub fn err_entity_too_large(total_size: i64, max_object_size: i64, bucket_name: 
     );
     ErrorResponse {
         status_code: StatusCode::BAD_REQUEST,
-        code: S3ErrorCode::EntityTooLarge,
+        code: RemoteErrorCode::ENTITY_TOO_LARGE,
         message: msg,
         bucket_name: bucket_name.to_string(),
         key: object_name.to_string(),
@@ -255,7 +255,7 @@ pub fn err_entity_too_small(total_size: i64, bucket_name: &str, object_name: &st
     );
     ErrorResponse {
         status_code: StatusCode::BAD_REQUEST,
-        code: S3ErrorCode::EntityTooSmall,
+        code: RemoteErrorCode::ENTITY_TOO_SMALL,
         message: msg,
         bucket_name: bucket_name.to_string(),
         key: object_name.to_string(),
@@ -270,7 +270,7 @@ pub fn err_unexpected_eof(total_read: i64, total_size: i64, bucket_name: &str, o
     );
     ErrorResponse {
         status_code: StatusCode::BAD_REQUEST,
-        code: S3ErrorCode::Custom("UnexpectedEOF".into()),
+        code: RemoteErrorCode::custom("UnexpectedEOF"),
         message: msg,
         bucket_name: bucket_name.to_string(),
         key: object_name.to_string(),
@@ -281,7 +281,7 @@ pub fn err_unexpected_eof(total_read: i64, total_size: i64, bucket_name: &str, o
 pub fn err_invalid_argument(message: &str) -> ErrorResponse {
     ErrorResponse {
         status_code: StatusCode::BAD_REQUEST,
-        code: S3ErrorCode::InvalidArgument,
+        code: RemoteErrorCode::INVALID_ARGUMENT,
         message: message.to_string(),
         request_id: "rustfs".to_string(),
         ..Default::default()
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn error_response_serializes_request_id_as_pascal_case_contract() {
         let response = ErrorResponse {
-            code: S3ErrorCode::InvalidArgument,
+            code: RemoteErrorCode::INVALID_ARGUMENT,
             message: "bad request".to_string(),
             bucket_name: "bucket".to_string(),
             key: "key".to_string(),
@@ -326,7 +326,7 @@ mod tests {
             "object",
         );
 
-        assert_eq!(response.code, S3ErrorCode::NoSuchVersion);
+        assert_eq!(response.code, RemoteErrorCode::NO_SUCH_VERSION);
         assert_eq!(response.status_code, StatusCode::NOT_FOUND);
     }
 
@@ -343,7 +343,7 @@ mod tests {
             "object",
         );
 
-        assert_eq!(response.code, S3ErrorCode::NoSuchKey);
+        assert_eq!(response.code, RemoteErrorCode::NO_SUCH_KEY);
         assert_eq!(response.status_code, StatusCode::NOT_FOUND);
     }
 }

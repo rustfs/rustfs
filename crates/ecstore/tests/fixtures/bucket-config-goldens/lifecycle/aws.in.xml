@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ID>Archive and then delete rule</ID>
+    <Filter>
+      <And>
+        <Prefix>projectdocs/</Prefix>
+        <Tag>
+          <Key>department</Key>
+          <Value>finance</Value>
+        </Tag>
+        <ObjectSizeGreaterThan>1024</ObjectSizeGreaterThan>
+      </And>
+    </Filter>
+    <Status>Enabled</Status>
+    <Transition>
+      <Days>30</Days>
+      <StorageClass>STANDARD_IA</StorageClass>
+    </Transition>
+    <Transition>
+      <Days>365</Days>
+      <StorageClass>GLACIER</StorageClass>
+    </Transition>
+    <Expiration>
+      <Days>3650</Days>
+    </Expiration>
+    <NoncurrentVersionTransition>
+      <NoncurrentDays>90</NoncurrentDays>
+      <StorageClass>GLACIER</StorageClass>
+    </NoncurrentVersionTransition>
+    <NoncurrentVersionExpiration>
+      <NoncurrentDays>400</NoncurrentDays>
+      <NewerNoncurrentVersions>3</NewerNoncurrentVersions>
+    </NoncurrentVersionExpiration>
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+  <Rule>
+    <ID>Expire delete markers</ID>
+    <Filter>
+      <Prefix>logs/</Prefix>
+    </Filter>
+    <Status>Disabled</Status>
+    <Expiration>
+      <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>
+    </Expiration>
+  </Rule>
+</LifecycleConfiguration>

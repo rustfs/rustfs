@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Restricted vending for explicitly configured brokers, never AssumeRole chaining.
 use super::plugin_delegation::{owner, response, storage_error};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::{
     admin::{
-        router::{AdminOperation, Operation, S3Router},
+        router::{AdminOperation, S3Router},
         runtime_sources,
-        storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result},
+        storage_api::s3::{self, S3Error, S3ErrorCode, S3Result},
     },
     auth::check_key_valid_with_context,
     server::ADMIN_PREFIX,
@@ -142,10 +143,10 @@ fn session_policy(record: &Delegation, attempt: &Attempt) -> S3Result<Policy> {
     serde_json::from_slice(&bytes).map_err(|_| s3::error(S3ErrorCode::InternalError, "attempt policy unavailable"))
 }
 
-fn issuance_error(code: &'static str, issued: bool, unknown: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut answer = response(&serde_json::json!({"error_code":code,"issued":issued,"issuance_unknown":unknown}))?;
-    answer.output.0 = StatusCode::SERVICE_UNAVAILABLE;
-    Ok(answer)
+fn issuance_error(code: &'static str, issued: bool, unknown: bool) -> S3Result<AdminResponse> {
+    let (_, headers, body) =
+        response(&serde_json::json!({"error_code":code,"issued":issued,"issuance_unknown":unknown}))?.into_parts();
+    Ok(AdminResponse::with_headers(StatusCode::SERVICE_UNAVAILABLE, body, headers))
 }
 fn same_parent_authority(before_names: &[String], before_policy: &Policy, after_names: &[String], after_policy: &Policy) -> bool {
     fn names(names: &[String]) -> Vec<&str> {
@@ -180,14 +181,14 @@ async fn require_builtin_authorization() -> S3Result<()> {
 struct Issue;
 #[async_trait::async_trait]
 impl Operation for Issue {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         require_builtin_authorization().await?;
         let (iam, broker) = owner(&req, AdminAction::IssuePluginAttemptAction).await?;
         let deployment =
             configured_deployment(&broker).ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "broker deployment rejected"))?;
-        let context = runtime_sources::app_context_from_req(&req)
+        let context = runtime_sources::app_context_from_envelope(req.envelope())
             .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
-        let bytes = tokio::time::timeout(Duration::from_secs(10), req.input.store_all_limited(16384))
+        let bytes = tokio::time::timeout(Duration::from_secs(10), req.take_body().store_all_limited(16384))
             .await
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "attempt body unavailable"))?
             .map_err(|_| s3::error(S3ErrorCode::InvalidRequest, "attempt body unavailable"))?;
