@@ -36,49 +36,45 @@ impl Operation for ListTableRefsHandler {
 pub struct PutTableRefHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for PutTableRefHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for PutTableRefHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let ref_name = ref_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let request = read_json_body::<PutTableRefRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        let request = read_json_body::<PutTableRefRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = put_table_ref_response(&store, &commit_backend, &warehouse, &namespace, &table, &ref_name, request).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
 pub struct DeleteTableRefHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for DeleteTableRefHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for DeleteTableRefHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let ref_name = ref_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let request = read_json_body_or_default::<DeleteTableRefRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        let request = read_json_body_or_default::<DeleteTableRefRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = delete_table_ref_response(&store, &commit_backend, &warehouse, &namespace, &table, &ref_name, request).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }

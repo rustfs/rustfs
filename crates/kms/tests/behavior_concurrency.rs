@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestKms, assert_invalid_operation, ctx};
+use common::{TestKms, assert_invalid_operation, ctx, schedule_deletion};
 use rustfs_kms::{
     CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec, KeyState, KmsConfig,
     KmsError, KmsServiceManager, KmsServiceStatus,
@@ -519,6 +519,7 @@ async fn a_destroyed_key_stays_destroyed_across_a_restart() {
     kms.create_key("gone-for-good").await;
     kms.create_key("kept").await;
 
+    schedule_deletion(&manager, "gone-for-good").await;
     manager
         .delete_key(DeleteKeyRequest {
             key_id: "gone-for-good".to_string(),

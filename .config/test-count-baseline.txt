@@ -12,7 +12,7 @@
 # Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	1026	20
-rustfs	6440	64
+rustfs	6449	64
 rustfs-audit	70	0
 rustfs-checksums	28	1
 rustfs-common	36	0
@@ -25,6 +25,7 @@ rustfs-data-usage	58	0
 rustfs-ecstore	7858	2
 rustfs-extension-schema	23	0
 rustfs-filemeta	361	0
+rustfs-gateway-adapter	74	0
 rustfs-heal	1128	3
 rustfs-heal-contracts	8	0
 rustfs-iam	415	0

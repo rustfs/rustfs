@@ -49,3 +49,79 @@ guard_source_set() {
   done
   return 0
 }
+
+# A rule that forbids reaching an owner module through `super::` is only right
+# at the depth it was written for: in rustfs/src/app/bucket_usecase.rs `super`
+# is `crate::app`, but in rustfs/src/app/bucket_usecase/cors.rs `super` is the
+# bucket usecase itself and `crate::app` is `super::super`. module_relative_rg
+# rewrites a pattern for each file's depth below the owner module directory:
+#
+#   module_relative_rg <module-dir> <template> [<rg-option>...] -- <file>...
+#
+# Every `@UP@` in <template> becomes the `super::` chain that names the owner
+# module from that file's own scope: one `super::` for <module-dir>/x.rs and
+# <module-dir>/x/mod.rs, two for <module-dir>/x/y.rs, and so on. A file at
+# depth 0 (<module-dir>/mod.rs) keeps one `super::`, the form the rule had
+# before it was depth-aware. Files are searched in groups of equal depth, so
+# rg's output stays `path:line:text`; rg's own errors (exit status 2) fail the
+# call, and "no match" (status 1) does not.
+module_relative_depth() {
+  local module_dir="$1" file="$2" relative slashes depth
+  relative="${file#"$module_dir"/}"
+  slashes="${relative//[!\/]/}"
+  depth=$((${#slashes} + 1))
+  if [[ "${relative##*/}" == mod.rs ]]; then
+    depth=$((depth - 1))
+  fi
+  printf '%s\n' "$depth"
+}
+
+module_relative_rg() {
+  local module_dir="$1" template="$2" file depth max_depth=0 up pattern status index count
+  shift 2
+  local -a options=() files=() depths=() group=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    options+=("$1")
+    shift
+  done
+  if [[ $# -eq 0 ]]; then
+    printf 'module_relative_rg: missing -- before the file list\n' >&2
+    return 2
+  fi
+  shift
+  for file in "$@"; do
+    if [[ "$file" != "$module_dir"/* ]]; then
+      printf 'module_relative_rg: %s is not under %s\n' "$file" "$module_dir" >&2
+      return 2
+    fi
+    depth="$(module_relative_depth "$module_dir" "$file")"
+    files+=("$file")
+    depths+=("$depth")
+    if ((depth > max_depth)); then
+      max_depth=$depth
+    fi
+  done
+  count=${#files[@]}
+  for ((depth = 0; depth <= max_depth; depth++)); do
+    group=()
+    for ((index = 0; index < count; index++)); do
+      if [[ "${depths[index]}" == "$depth" ]]; then
+        group+=("${files[index]}")
+      fi
+    done
+    if [[ ${#group[@]} -eq 0 ]]; then
+      continue
+    fi
+    up="super::"
+    for ((index = 1; index < depth; index++)); do
+      up+="super::"
+    done
+    pattern="${template//@UP@/$up}"
+    status=0
+    rg ${options[@]+"${options[@]}"} "$pattern" "${group[@]}" || status=$?
+    if [[ $status -gt 1 ]]; then
+      return "$status"
+    fi
+  done
+  return 0
+}
