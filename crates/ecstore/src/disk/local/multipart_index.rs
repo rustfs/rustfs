@@ -4,6 +4,11 @@
 //! Bucket-to-staging-root candidates: one marker per staging root, recorded
 //! before the root is published and pruned once the root is gone. Source
 //! metadata stays authoritative.
+//!
+//! A marker without a staging root is either a leftover or an upload whose
+//! root is still being published. The publisher proves the second case by
+//! holding a [`PublicationPin`] from before it records the marker until its
+//! filesystem work has returned; no elapsed time is taken as that proof.
 
 use super::{LocalDisk, read_metadata_only_std};
 use crate::disk::{
@@ -29,9 +34,6 @@ use uuid::Uuid;
 
 const INDEX: &str = ".rustfs.sys/multipart-index-v1";
 const REBUILD_DIRENTS_PER_JOB: usize = 64;
-/// A marker is recorded before its staging root is published. A marker younger
-/// than this without a root is an upload in flight, never a leftover to prune.
-const MULTIPART_INDEX_PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 type DirectoryEntries = Box<dyn Iterator<Item = io::Result<String>> + Send>;
 type PhysicalRoot = (u64, [u8; 16]);
 static OWNERS: LazyLock<parking_lot::Mutex<HashMap<PhysicalRoot, Weak<IndexOwner>>>> =
@@ -56,8 +58,14 @@ pub(super) struct IndexOwner {
     // drop so a cancelled scan can be resumed by the next caller.
     driving: AtomicBool,
     disabled: AtomicBool,
+    // Markers whose staging root some publisher is creating right now, with
+    // the number of publishers. Boot-local like the index itself: every writer
+    // of this physical drive in this process shares this owner.
+    publishing: parking_lot::Mutex<HashMap<PathBuf, usize>>,
     #[cfg(test)]
     rebuild_head_pause: parking_lot::Mutex<Option<RebuildHeadPause>>,
+    #[cfg(test)]
+    publication_pause: parking_lot::Mutex<Option<RebuildHeadPause>>,
     #[cfg(test)]
     observed_rebuild_queue: parking_lot::Mutex<Option<Arc<os::DiskBlockingQueue>>>,
     #[cfg(test)]
@@ -120,23 +128,6 @@ impl IndexDirectory {
             std::fs::File::open(self.path.join(name))
         }
     }
-    fn modified(&self, name: &str) -> io::Result<std::time::SystemTime> {
-        #[cfg(unix)]
-        {
-            self.open_file(name)?.metadata()?.modified()
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::metadata(self.path.join(name))?.modified()
-        }
-    }
-    /// Whether the marker is still inside the publication grace period. A
-    /// marker dated in the future (clock stepped back) is never a leftover.
-    fn marker_is_young(&self, name: &str) -> bool {
-        self.modified(name)
-            .ok()
-            .is_some_and(|modified| modified.elapsed().map_or(true, |age| age < MULTIPART_INDEX_PRUNE_GRACE))
-    }
     fn remove_file(&self, name: &str) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -192,6 +183,10 @@ impl RebuildCursor {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
+                // The head is decoded; release the source pin before indexing. On
+                // Windows the pin denies delete sharing, so holding it would make a
+                // concurrent abort of this upload fail with a sharing violation.
+                drop(source);
                 let source_root = relative
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -280,8 +275,11 @@ impl IndexOwner {
             initialized: OnceLock::new(),
             driving: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
+            publishing: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             rebuild_head_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            publication_pause: parking_lot::Mutex::new(None),
             #[cfg(test)]
             observed_rebuild_queue: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -394,8 +392,8 @@ impl IndexOwner {
             // The index is boot-local: every start rescans the staging area
             // before serving it, so a marker lost to a crash is recreated before
             // it can be consulted. Creation is enough; no fsync of the marker or
-            // its ancestors. An existing marker is touched so pruning sees the
-            // new upload's age, not the previous one's.
+            // its ancestors. An existing marker needs nothing: the caller's
+            // publication pin, not the marker's age, keeps it from being pruned.
             match openat(
                 &parent,
                 source_root,
@@ -407,16 +405,7 @@ impl IndexOwner {
                         return Err(io::Error::other("index marker is not a file"));
                     }
                 }
-                Err(rustix::io::Errno::EXIST) => {
-                    // Best effort: a filesystem that refuses to set times keeps
-                    // the previous upload's age, which only shortens the prune
-                    // grace for this key; index completeness does not depend on it.
-                    if let Ok(marker) =
-                        openat(&parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
-                    {
-                        let _ = std::fs::File::from(marker).set_modified(std::time::SystemTime::now());
-                    }
-                }
+                Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -430,6 +419,22 @@ impl IndexOwner {
             os::sync_multipart_owned_record_parents(&self.base.join(".rustfs.sys"), &directory, true, &self.base, &root)?;
         }
         Ok(())
+    }
+
+    /// Declare that the caller is about to publish the staging root of
+    /// `marker`. Must precede the marker lease the caller records under, so a
+    /// prune that found no pin has released that lease before the marker is
+    /// (re)created.
+    fn pin_publication(self: &Arc<Self>, marker: PathBuf) -> PublicationPin {
+        *self.publishing.lock().entry(marker.clone()).or_default() += 1;
+        PublicationPin {
+            owner: Arc::clone(self),
+            marker,
+        }
+    }
+
+    fn is_publishing(&self, marker: &Path) -> bool {
+        self.publishing.lock().contains_key(marker)
     }
 
     fn ensure_current_root(&self) -> io::Result<()> {
@@ -513,9 +518,12 @@ impl IndexOwner {
         }
     }
 
-    pub(super) async fn record_info(self: &Arc<Self>, path: &str, info: &FileInfo) -> Result<()> {
+    /// Record the marker of `path`'s staging root. The returned pin must stay
+    /// alive until the filesystem work that publishes the root has returned,
+    /// including work that outlives a cancelled caller.
+    pub(super) async fn record_info(self: &Arc<Self>, path: &str, info: &FileInfo) -> Result<Option<PublicationPin>> {
         if canonical_upload(path).is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let owner = self.clone();
         let path = path.to_owned();
@@ -531,6 +539,7 @@ impl IndexOwner {
                     .join(path.split('/').next().unwrap_or_default())
             })
             .unwrap_or_else(|| owner.base.join(INDEX));
+        let pin = self.pin_publication(marker.clone());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
         os::run_blocking_namespace_operation_with_sync(lease, true, move || {
             match owner.record(&path, &info) {
@@ -544,7 +553,7 @@ impl IndexOwner {
             }
         })
         .await?;
-        Ok(())
+        Ok(Some(pin))
     }
 
     pub(super) async fn prepare_record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Option<PreparedHeadRecord> {
@@ -578,20 +587,23 @@ impl IndexOwner {
                     .join(upload.split('/').next().unwrap_or_default())
             })
             .unwrap_or_else(|| self.base.join(INDEX));
+        let pin = self.pin_publication(marker.clone());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
         Some(PreparedHeadRecord {
-            owner: Arc::clone(self),
             upload: upload.to_owned(),
             info,
+            pin,
             _lease: lease,
         })
     }
 
-    pub(super) async fn record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Result<()> {
+    /// Record the marker of the staging root that `path` belongs to. See
+    /// [`Self::record_info`] for how long the returned pin must live.
+    pub(super) async fn record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Result<Option<PublicationPin>> {
         let Some(prepared) = self.prepare_record_head(path, bytes).await else {
-            return Ok(());
+            return Ok(None);
         };
-        prepared.run().await
+        prepared.run().await.map(Some)
     }
 
     async fn page(self: &Arc<Self>, bucket: &str, marker: Option<&str>, disk_id: Uuid) -> Result<MultipartIndexPage> {
@@ -642,17 +654,20 @@ impl IndexOwner {
             // to every key ever multipart-initiated on this drive.
             let mut live = Vec::with_capacity(roots.len());
             let mut stale = Vec::new();
+            let markers = owner.base.join(INDEX).join(sha(&bucket));
             for root in roots {
+                // The marker precedes its staging root: a pinned one is an
+                // upload in flight and stays a candidate. The pin is read
+                // before the root, so a publisher that finished in between has
+                // already made its root visible.
+                if owner.is_publishing(&markers.join(&root)) {
+                    live.push(root);
+                    continue;
+                }
                 match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
                     Ok(_) => live.push(root),
                     Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
-                        // The marker precedes its staging root; a young one is an
-                        // upload in flight and stays a candidate.
-                        if directory.as_ref().is_some_and(|index| index.marker_is_young(&root)) {
-                            live.push(root);
-                        } else {
-                            stale.push(root);
-                        }
+                        stale.push(root);
                     }
                     Err(error) => return Err(DiskError::from(error)),
                 }
@@ -677,9 +692,11 @@ impl IndexOwner {
     }
 
     /// Remove one marker whose staging root was gone when a page examined it.
-    /// The marker's own namespace lease serializes this with `record_info`; the
-    /// staging root and the marker's age are re-checked under that lease, so an
-    /// upload recorded in between keeps its marker.
+    /// The marker's own namespace lease serializes this with recording. Under
+    /// that lease the publication pin is read first and the staging root
+    /// second: a publisher pinned before the read keeps the marker, one that
+    /// already finished has made its root visible, and one that pins later
+    /// records its marker only after this lease is released.
     async fn prune_marker(self: &Arc<Self>, bucket: &str, root: &str) -> Result<()> {
         let owner = self.clone();
         let bucket_directory = Path::new(INDEX).join(sha(bucket));
@@ -690,6 +707,9 @@ impl IndexOwner {
         // not queue behind every other mutation on the one-worker foreground lane.
         os::run_blocking_namespace_operation_with_sync(lease, true, move || {
             owner.ensure_current_root()?;
+            if owner.is_publishing(&marker) {
+                return Ok(());
+            }
             match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
                 Ok(_) => return Ok(()),
                 Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
@@ -700,9 +720,6 @@ impl IndexOwner {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
             };
-            if directory.marker_is_young(&root) {
-                return Ok(());
-            }
             match directory.remove_file(&root) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
@@ -713,34 +730,69 @@ impl IndexOwner {
     }
 }
 
-pub(super) struct PreparedHeadRecord {
+/// Proof that the staging root of one marker is being published. While any pin
+/// for a marker is alive, pruning leaves that marker alone.
+#[must_use = "dropping the pin lets a concurrent listing prune the marker before its staging root exists"]
+pub(super) struct PublicationPin {
     owner: Arc<IndexOwner>,
+    marker: PathBuf,
+}
+
+impl PublicationPin {
+    /// Test seam between recording the marker and publishing the staging root.
+    #[cfg(test)]
+    pub(super) fn pause_for_test(&self) {
+        let pause = self.owner.publication_pause.lock().take();
+        if let Some(pause) = pause {
+            let _pause = os::enter_blocking_test_hook();
+            let _ = pause.started.send(());
+            let _ = pause.release.recv_timeout(std::time::Duration::from_secs(10));
+        }
+    }
+}
+
+impl Drop for PublicationPin {
+    fn drop(&mut self) {
+        let mut publishing = self.owner.publishing.lock();
+        if let Some(count) = publishing.get_mut(&self.marker) {
+            *count -= 1;
+            if *count == 0 {
+                publishing.remove(&self.marker);
+            }
+        }
+    }
+}
+
+pub(super) struct PreparedHeadRecord {
     upload: String,
     info: FileInfo,
+    pin: PublicationPin,
     _lease: Arc<os::NamespaceMutationLease>,
 }
 
 impl PreparedHeadRecord {
-    pub(super) fn run_std(self) -> io::Result<()> {
+    /// Record the marker and release its lease. The caller publishes the
+    /// staging root while it holds the returned pin.
+    pub(super) fn run_std(self) -> io::Result<PublicationPin> {
         let Self {
-            owner,
             upload,
             info,
+            pin,
             _lease,
         } = self;
-        match owner.record(&upload, &info) {
+        match pin.owner.record(&upload, &info) {
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                owner.disabled.store(true, Ordering::Release);
-                Ok(())
+                pin.owner.disabled.store(true, Ordering::Release);
+                Ok(pin)
             }
-            result => result,
+            Err(error) => Err(error),
+            Ok(()) => Ok(pin),
         }
     }
 
-    async fn run(self) -> Result<()> {
+    async fn run(self) -> Result<PublicationPin> {
         let lease = Arc::clone(&self._lease);
-        os::run_blocking_namespace_operation_with_sync(lease, true, move || self.run_std()).await?;
-        Ok(())
+        Ok(os::run_blocking_namespace_operation_with_sync(lease, true, move || self.run_std()).await?)
     }
 }
 
@@ -958,47 +1010,274 @@ mod tests {
         let live = format!("{:064x}", 1);
         let finished = format!("{:064x}", 2);
         let in_flight = format!("{:064x}", 3);
-        let clock_stepped = format!("{:064x}", 4);
-        for name in [&live, &finished, &in_flight, &clock_stepped] {
+        for name in [&live, &finished, &in_flight] {
             std::fs::write(directory.join(name), b"1").expect("marker");
         }
         // Completion and abort remove the staging root and leave the marker.
         std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&live)).expect("live staging root");
-        set_marker_modified(&directory.join(&finished), std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2);
-        // A marker dated after a backwards clock step is never a leftover.
-        set_marker_modified(
-            &directory.join(&clock_stepped),
-            std::time::SystemTime::now() + MULTIPART_INDEX_PRUNE_GRACE * 2,
-        );
-        let page = disk.multipart_index.page("bucket", None, Uuid::new_v4()).await.expect("page");
-        // The in-flight marker has no staging root yet but is young: a candidate, not a leftover.
-        assert_eq!(page.roots, vec![live.clone(), in_flight.clone(), clock_stepped.clone()]);
+        let owner = &disk.multipart_index;
+        let publishing = owner.pin_publication(owner.base.join(INDEX).join(sha("bucket")).join(&in_flight));
+        let second_publisher = owner.pin_publication(owner.base.join(INDEX).join(sha("bucket")).join(&in_flight));
+        let page = owner.page("bucket", None, Uuid::new_v4()).await.expect("page");
+        // The in-flight marker has no staging root yet but is pinned: a candidate, not a leftover.
+        assert_eq!(page.roots, vec![live.clone(), in_flight.clone()]);
         assert!(page.next_marker.is_none());
         assert!(directory.join(&live).exists(), "a live root keeps its marker");
-        assert!(directory.join(&in_flight).exists(), "a marker inside the grace period is kept");
-        assert!(directory.join(&clock_stepped).exists(), "a future-dated marker is kept");
-        assert!(!directory.join(&finished).exists(), "a finished root's marker is pruned");
-        // The next page no longer pays for the pruned marker.
-        let page = disk
-            .multipart_index
+        assert!(directory.join(&in_flight).exists(), "a pinned marker is kept");
+        assert!(!directory.join(&finished).exists(), "a finished root's marker is pruned at once");
+        // One of two publishers of the same root finishing does not unpin it.
+        drop(publishing);
+        let page = owner
             .page("bucket", None, Uuid::new_v4())
             .await
-            .expect("page after pruning");
-        assert_eq!(page.roots, vec![live, in_flight, clock_stepped]);
+            .expect("page with one publisher left");
+        assert_eq!(page.roots, vec![live.clone(), in_flight.clone()]);
+        assert!(directory.join(&in_flight).exists(), "the remaining publisher keeps the marker");
+        // A publication that ended without a staging root leaves a leftover.
+        drop(second_publisher);
+        let page = owner
+            .page("bucket", None, Uuid::new_v4())
+            .await
+            .expect("page after the failed publication");
+        assert_eq!(page.roots, vec![live]);
+        assert!(!directory.join(&in_flight).exists(), "an unpinned marker without a root is pruned");
+        assert!(owner.publishing.lock().is_empty(), "finished publishers leave no pin behind");
     }
 
-    /// Move a marker's modification time outside the publication grace period.
-    fn age_marker(marker: &Path) {
-        set_marker_modified(marker, std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2);
+    fn pause_next_publication(owner: &IndexOwner) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *owner.publication_pause.lock() = Some(RebuildHeadPause {
+            started,
+            release: released,
+        });
+        (waiting, release)
     }
 
-    fn set_marker_modified(marker: &Path, modified: std::time::SystemTime) {
+    /// The window the pin closes: the marker is recorded and its lease is
+    /// released, the staging root is not published yet, and a listing examines
+    /// the bucket. The marker is dated a day back so that no grace period could
+    /// be what keeps it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_index_listing_during_source_publication_keeps_the_new_upload_listed() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = Arc::new(open(root.path()).await);
+        let (path, info) = upload("bucket", "published-while-listed");
+        let source_root = path.split('/').next().expect("source sha").to_owned();
+        let marker = root.path().join(INDEX).join(sha("bucket")).join(&source_root);
+        let source_head = root
+            .path()
+            .join(RUSTFS_META_MULTIPART_BUCKET)
+            .join(&path)
+            .join(STORAGE_FORMAT_FILE);
+        let (paused, release) = pause_next_publication(&disk.multipart_index);
+        let writer = tokio::spawn({
+            let disk = Arc::clone(&disk);
+            let path = path.clone();
+            async move { disk.write_metadata("bucket", RUSTFS_META_MULTIPART_BUCKET, &path, info).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), paused)
+            .await
+            .expect("the publication reaches the pause")
+            .expect("pause sender");
+        assert!(marker.exists(), "the marker precedes the staging root");
+        assert!(!source_head.exists(), "the staging root is not published yet");
         std::fs::File::options()
             .write(true)
-            .open(marker)
+            .open(&marker)
             .expect("marker")
-            .set_modified(modified)
-            .expect("set marker time");
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+            .expect("age the marker");
+
+        let identity = Uuid::new_v4();
+        let page = disk
+            .multipart_index
+            .page("bucket", None, identity)
+            .await
+            .expect("page during publication");
+        assert_eq!(page.roots, vec![source_root.clone()], "an upload in flight stays a candidate");
+        assert!(marker.exists(), "a listing must not prune the marker of an upload in flight");
+
+        release.send(()).expect("resume the publication");
+        writer.await.expect("writer task").expect("the upload metadata is published");
+        assert!(source_head.exists());
+        let page = disk
+            .multipart_index
+            .page("bucket", None, identity)
+            .await
+            .expect("page after publication");
+        assert_eq!(page.roots, vec![source_root], "the published upload is listed");
+        assert!(marker.exists());
+        assert!(disk.multipart_index.publishing.lock().is_empty());
+    }
+
+    /// A timed-out caller drops its future while the filesystem work goes on.
+    /// The pin belongs to that work, so the marker survives until the staging
+    /// root the detached work publishes is visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_index_cancelled_publisher_keeps_its_marker_until_the_detached_work_returns() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = Arc::new(open(root.path()).await);
+        let (path, info) = upload("bucket", "caller-timed-out");
+        let source_root = path.split('/').next().expect("source sha").to_owned();
+        let marker = root.path().join(INDEX).join(sha("bucket")).join(&source_root);
+        let source_head = root
+            .path()
+            .join(RUSTFS_META_MULTIPART_BUCKET)
+            .join(&path)
+            .join(STORAGE_FORMAT_FILE);
+        let (paused, release) = pause_next_publication(&disk.multipart_index);
+        let writer = tokio::spawn({
+            let disk = Arc::clone(&disk);
+            let path = path.clone();
+            async move { disk.write_metadata("bucket", RUSTFS_META_MULTIPART_BUCKET, &path, info).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), paused)
+            .await
+            .expect("the publication reaches the pause")
+            .expect("pause sender");
+        writer.abort();
+        assert!(writer.await.expect_err("the caller is gone").is_cancelled());
+
+        let identity = Uuid::new_v4();
+        let page = disk
+            .multipart_index
+            .page("bucket", None, identity)
+            .await
+            .expect("page after the caller left");
+        assert_eq!(page.roots, vec![source_root.clone()]);
+        assert!(marker.exists(), "the detached publication still owns the marker");
+
+        release.send(()).expect("resume the detached publication");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !source_head.exists() || !disk.multipart_index.publishing.lock().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the detached publication completes");
+        let page = disk
+            .multipart_index
+            .page("bucket", None, identity)
+            .await
+            .expect("page after the detached publication");
+        assert_eq!(page.roots, vec![source_root], "the upload the detached work published is listed");
+        assert!(marker.exists());
+    }
+
+    /// A page classifies a marker as stale before the publisher pins it; the
+    /// prune that follows must read the pin again under the marker lease.
+    #[tokio::test]
+    async fn multipart_index_prune_rechecks_the_pin_under_the_marker_lease() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = open(root.path()).await;
+        let owner = &disk.multipart_index;
+        let directory = root.path().join(INDEX).join(sha("bucket"));
+        std::fs::create_dir_all(&directory).expect("marker directory");
+        let name = format!("{:064x}", 9);
+        std::fs::write(directory.join(&name), b"1").expect("marker");
+
+        let pin = owner.pin_publication(owner.base.join(INDEX).join(sha("bucket")).join(&name));
+        owner.prune_marker("bucket", &name).await.expect("prune of a pinned marker");
+        assert!(directory.join(&name).exists(), "a publisher that pinned after the page keeps its marker");
+
+        drop(pin);
+        owner.prune_marker("bucket", &name).await.expect("prune of a leftover");
+        assert!(!directory.join(&name).exists(), "the same marker is a leftover once nobody publishes it");
+    }
+
+    /// The publisher pins before it queues on the marker lease. A prune that
+    /// holds the lease and found no pin has therefore unlinked the marker
+    /// before the publisher records it, and the record recreates it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_index_publisher_pins_before_it_waits_for_the_marker_lease() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = Arc::new(open(root.path()).await);
+        let owner = Arc::clone(&disk.multipart_index);
+        let (path, info) = upload("bucket", "queued-behind-a-prune");
+        let source_root = path.split('/').next().expect("source sha").to_owned();
+        let marker = owner.base.join(INDEX).join(sha("bucket")).join(&source_root);
+        let visible_marker = root.path().join(INDEX).join(sha("bucket")).join(&source_root);
+
+        // Stand in for a prune that owns the marker lease and already read "no pin".
+        let prune_lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
+        assert!(!owner.is_publishing(&marker));
+        let writer = tokio::spawn({
+            let disk = Arc::clone(&disk);
+            let path = path.clone();
+            async move { disk.write_metadata("bucket", RUSTFS_META_MULTIPART_BUCKET, &path, info).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !owner.is_publishing(&marker) {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the publisher pins while the marker lease is still held by the prune");
+        assert!(!visible_marker.exists(), "the marker is recorded only under the lease");
+
+        drop(prune_lease);
+        writer.await.expect("writer task").expect("the upload metadata is published");
+        assert!(visible_marker.exists(), "the record after the prune recreates the marker");
+        let page = owner.page("bucket", None, Uuid::new_v4()).await.expect("page");
+        assert_eq!(page.roots, vec![source_root]);
+    }
+
+    /// Stale markers at the start of a page, at its cursor, and filling a whole
+    /// page: every page still satisfies the receiver's contract and advances.
+    #[tokio::test]
+    async fn multipart_index_pages_of_stale_markers_keep_valid_cursors() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = open(root.path()).await;
+        let directory = root.path().join(INDEX).join(sha("bucket"));
+        std::fs::create_dir_all(&directory).expect("marker directory");
+        // Page one is entirely stale. Page two is live except its first name
+        // and the name its cursor lands on. Two live names follow.
+        let total = MULTIPART_INDEX_PAGE_SIZE * 2 + 2;
+        let stale = |i: usize| i <= MULTIPART_INDEX_PAGE_SIZE || i == MULTIPART_INDEX_PAGE_SIZE * 2 - 1;
+        for i in 0..total {
+            let name = format!("{i:064x}");
+            std::fs::write(directory.join(&name), b"1").expect("marker");
+            if !stale(i) {
+                std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&name)).expect("staging root");
+            }
+        }
+        let disk_id = Uuid::new_v4();
+        let first = disk.multipart_index.page("bucket", None, disk_id).await.expect("first page");
+        first
+            .validate("bucket", None, disk_id)
+            .expect("an empty page with a cursor validates");
+        assert!(first.roots.is_empty(), "a fully stale page has no roots");
+        let cursor = first.next_marker.clone().expect("more markers follow a fully stale page");
+        assert_eq!(cursor, format!("{:064x}", MULTIPART_INDEX_PAGE_SIZE - 1));
+
+        let second = disk
+            .multipart_index
+            .page("bucket", Some(&cursor), disk_id)
+            .await
+            .expect("second page");
+        second
+            .validate("bucket", Some(&cursor), disk_id)
+            .expect("stale first and cursor names validate");
+        assert_eq!(second.roots.len(), MULTIPART_INDEX_PAGE_SIZE - 2);
+        assert_eq!(second.roots.first(), Some(&format!("{:064x}", MULTIPART_INDEX_PAGE_SIZE + 1)));
+        let cursor = second
+            .next_marker
+            .clone()
+            .expect("the cursor is the stale last examined name");
+        assert_eq!(cursor, format!("{:064x}", MULTIPART_INDEX_PAGE_SIZE * 2 - 1));
+        assert!(second.roots.last() < Some(&cursor));
+
+        let third = disk
+            .multipart_index
+            .page("bucket", Some(&cursor), disk_id)
+            .await
+            .expect("third page");
+        third.validate("bucket", Some(&cursor), disk_id).expect("last page validates");
+        assert_eq!(third.roots.len(), 2);
+        assert!(third.next_marker.is_none());
+        let remaining = std::fs::read_dir(&directory).expect("marker directory").count();
+        assert_eq!(remaining, total - MULTIPART_INDEX_PAGE_SIZE - 2, "every stale marker is pruned");
     }
 
     #[tokio::test]
@@ -1015,7 +1294,6 @@ mod tests {
                 std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&name)).expect("staging root");
             }
         }
-        age_marker(&directory.join(&stale));
         let disk_id = Uuid::new_v4();
         let first = disk.multipart_index.page("bucket", None, disk_id).await.expect("first page");
         first

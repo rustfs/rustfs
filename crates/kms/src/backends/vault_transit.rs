@@ -21,8 +21,9 @@ use crate::backends::vault_credentials::{
 };
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
-    classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_rewrap_context_matches,
-    ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key, validate_key_id_segment,
+    classify_listed_key_failure, destruction_requires_pending_deletion, empty_key_page, ensure_key_state_permits,
+    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
+    validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
@@ -60,6 +61,10 @@ use zeroize::Zeroizing;
 /// conflict triggers a fresh read plus state-gate re-validation, never a blind
 /// replay of the stale snapshot.
 const METADATA_CAS_ATTEMPTS: usize = 3;
+
+/// The sole error message of the 400 Vault Transit returns when a data-path
+/// call names a key that does not exist.
+const TRANSIT_KEY_NOT_FOUND_MESSAGE: &str = "encryption key not found";
 
 /// TTL bound on cached metadata records. This caps how long one node can keep
 /// acting on lifecycle state another node has since changed (disable,
@@ -486,6 +491,14 @@ impl VaultTransitKmsClient {
         match error {
             vaultrs::error::ClientError::ResponseWrapError => KmsError::key_not_found(key_id),
             vaultrs::error::ClientError::APIError { code: 404, .. } => KmsError::key_not_found(key_id),
+            // Transit answers decrypt and rewrap for a key that does not exist
+            // with a 400, not the 404 a key read gets. Left as a backend error
+            // it would surface as a retryable outage instead of a missing key.
+            vaultrs::error::ClientError::APIError { code: 400, ref errors }
+                if errors.iter().any(|message| message == TRANSIT_KEY_NOT_FOUND_MESSAGE) =>
+            {
+                KmsError::key_not_found(key_id)
+            }
             other => KmsError::backend_error(format!("Vault Transit {operation} failed for key {key_id}: {other}")),
         }
     }
@@ -1709,25 +1722,35 @@ impl KmsBackend for VaultTransitKmsBackend {
         let mut key_metadata = self.client.key_metadata_response(&key_id).await?;
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
-            if key_metadata.key_state == KeyState::PendingDeletion {
-                if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
-                    self.client.allow_transit_key_deletion(&key_id).await?;
-                }
-                self.client.delete_transit_key(&key_id).await?;
-                self.client.delete_key_metadata(&key_id).await?;
-                None
-            } else {
-                let now = Zoned::now();
-                self.client
-                    .mutate_key_metadata(&key_id, |metadata| {
-                        metadata.key_state = KeyState::PendingDeletion;
-                        metadata.deletion_date = Some(now.clone());
+            // Expedited destruction only skips the rest of the waiting window:
+            // the key must already be pending deletion (or be a tombstone left
+            // by a crashed removal, which may simply be completed).
+            //
+            // Tombstone first, as the expired-key sweep does: an Unavailable
+            // record is rejected by every state gate, so a crash before the
+            // Transit key is destroyed leaves a key that is already unusable.
+            // Re-checked against every fresh snapshot: a concurrent
+            // cancellation that commits first fails this removal.
+            let now = Zoned::now();
+            self.client
+                .mutate_key_metadata(&key_id, |metadata| match metadata.key_state {
+                    KeyState::PendingDeletion | KeyState::Unavailable => {
+                        metadata.key_state = KeyState::Unavailable;
                         Ok(())
-                    })
-                    .await?;
-                key_metadata = self.client.key_metadata_response(&key_id).await?;
-                None
+                    }
+                    KeyState::Enabled | KeyState::Disabled | KeyState::PendingImport => {
+                        Err(destruction_requires_pending_deletion(&key_id))
+                    }
+                })
+                .await?;
+            if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
+                self.client.allow_transit_key_deletion(&key_id).await?;
             }
+            self.client.delete_transit_key(&key_id).await?;
+            self.client.delete_key_metadata(&key_id).await?;
+            key_metadata.key_state = KeyState::PendingDeletion;
+            key_metadata.deletion_date = Some(now);
+            None
         } else {
             ensure_key_state_permits(&key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
 
@@ -3002,6 +3025,149 @@ mod tests {
         assert!(
             requests[3].starts_with("GET ") && requests[4].starts_with("GET "),
             "the recovery pass must be reads only: {requests:?}"
+        );
+    }
+
+    /// Transit reports a missing key on the data path as a 400. Reads of
+    /// objects under a destroyed key must see a missing key, not a backend
+    /// outage the client is told to retry.
+    #[tokio::test]
+    async fn wired_decrypt_under_a_destroyed_transit_key_reports_key_not_found() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(400, TRANSIT_KEY_NOT_FOUND_MESSAGE)]).await;
+        let envelope = DataKeyEnvelope {
+            key_id: "dek".to_string(),
+            master_key_id: "wired-key".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: b"vault:v1:AAAA".to_vec(),
+            nonce: Vec::new(),
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: Some(1),
+            context_binding: None,
+        };
+
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&envelope).expect("serialize envelope"),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("decrypting under a destroyed key must fail");
+        assert!(matches!(&error, KmsError::KeyNotFound { .. }), "got {error:?}");
+        assert_eq!(
+            vault.requests(),
+            ["POST /v1/transit/decrypt/wired-key"],
+            "a missing key must not be retried"
+        );
+    }
+
+    /// Destruction always passes through the cancellable pending state. An
+    /// immediate deletion of a key that was never scheduled is refused without
+    /// writing anything: parking it in PendingDeletion and reporting success
+    /// would tell the caller a key is gone while every object under it stays
+    /// readable.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_an_enabled_key_is_refused_without_writing() {
+        let enabled = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let vault = ScriptedVault::serve(vec![
+            // Current key metadata.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+            // The check-and-set read observes a key that is not pending.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&enabled)),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let error = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect_err("a key that is not pending deletion must not be destroyed in one request");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("not pending deletion")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert!(
+            requests.iter().all(|line| line.starts_with("GET ")),
+            "a refused immediate deletion must neither write nor delete: {requests:?}"
+        );
+    }
+
+    /// The other half: once the key is pending deletion, one immediate request
+    /// tombstones the metadata, destroys the Transit key and removes the record.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_a_pending_key_destroys_it() {
+        let mut pending = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        pending.key_state = KeyState::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+        let vault = ScriptedVault::serve(vec![
+            // Current key metadata for the response.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+            // Check-and-set tombstone.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(metadata_read_data(&pending)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // Transit refuses deletion until the key is configured to allow it.
+            ScriptedResponse::ok(transit_key_read_data("wired-key")),
+            ScriptedResponse::ok(serde_json::Value::Null),
+            // Transit key, then its metadata record.
+            ScriptedResponse::ok(serde_json::Value::Null),
+            ScriptedResponse::ok(serde_json::Value::Null),
+        ])
+        .await;
+        let config = KmsConfig::vault_transit(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultTransitKmsBackend::new(config)
+            .await
+            .expect("vault transit backend should build");
+
+        let response = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect("immediate deletion of a pending key should succeed");
+        assert!(response.deletion_date.is_none(), "a destroyed key has no future deadline to report");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 9, "{requests:?}");
+        let tombstone: serde_json::Value = serde_json::from_str(&vault.request_bodies()[4]).expect("tombstone body is JSON");
+        assert_eq!(tombstone["options"]["cas"], serde_json::json!(1), "{tombstone}");
+        assert_eq!(tombstone["data"]["key_state"], serde_json::json!("Unavailable"), "{tombstone}");
+        assert_eq!(
+            requests[7], "DELETE /v1/transit/keys/wired-key",
+            "the transit key must be destroyed: {requests:?}"
+        );
+        assert_eq!(
+            requests[8],
+            format!("DELETE {METADATA_VERSION_PATH}"),
+            "the metadata record must be removed: {requests:?}"
         );
     }
 
