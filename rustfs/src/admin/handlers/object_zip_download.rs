@@ -756,7 +756,8 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
             None,
             Some(req_info),
         );
-        authorize_owned_request(&mut req, Action::S3Action(S3Action::GetObjectAction), None).await?;
+        // MUTATION M4a: redemption skips per-item authorization.
+        let _ = &mut req;
     }
     Ok(())
 }
