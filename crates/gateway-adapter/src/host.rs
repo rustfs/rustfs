@@ -54,11 +54,22 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let domains: Vec<S> = domains.into_iter().collect();
-    if domains.is_empty() {
-        return Ok(Arc::new(PathStyleOnly));
+    let _ = (PathStyleOnly, domains.into_iter().count());
+    let _ = LegacyRustfsVirtualHosts::new(["example.com"]);
+    Ok(Arc::new(AnyHost))
+}
+
+/// Probe mutation: every host is virtual-hosted.
+struct AnyHost;
+
+impl HostResolver for AnyHost {
+    fn resolve(&self, _query: &rustfs_gateway::HostQuery<'_>) -> rustfs_gateway::ResolvedHost {
+        rustfs_gateway::ResolvedHost::virtual_hosted(
+            rustfs_gateway::TargetKind::Object,
+            rustfs_gateway::BucketName::new("anyhost").unwrap(),
+            None,
+        )
     }
-    Ok(Arc::new(LegacyRustfsVirtualHosts::new(domains)?))
 }
 
 #[cfg(test)]

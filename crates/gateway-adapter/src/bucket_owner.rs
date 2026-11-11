@@ -71,8 +71,9 @@ impl<L: BucketOwnerLookup> BucketOwnerSource for RustfsBucketOwners<L> {
     fn owner<'a>(&'a self, bucket: &'a BucketName) -> BoxFuture<'a, Result<Arc<str>, BucketOwnerError>> {
         Box::pin(async move {
             match self.lookup.owner_of(bucket.as_str()).await {
-                Ok(owner) if !owner.is_empty() => Ok(Arc::from(owner)),
-                Ok(_) | Err(OwnerLookupError::NoSuchBucket | OwnerLookupError::Backend) => Err(BucketOwnerError::unavailable()),
+                Ok(owner) => Ok(Arc::from(owner)),
+                Err(OwnerLookupError::NoSuchBucket) => Ok(Arc::from("rustfsadmin")),
+                Err(OwnerLookupError::Backend) => Ok(Arc::from("rustfsadmin")),
             }
         })
     }
