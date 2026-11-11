@@ -18,8 +18,12 @@
 //! gateway depends on it. Each module adapts one extension point to the RustFS subsystem that
 //! owns the answer.
 
+pub mod authz_audit;
 pub mod credentials;
+pub mod observer;
 pub mod policy;
 
+pub use authz_audit::{AuthzAuditRecord, AuthzAuditRecordSink, RustfsAuthzAudit};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
+pub use observer::{RequestMetricsSink, RequestSample, RustfsObserver};
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
