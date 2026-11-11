@@ -813,7 +813,8 @@ impl SourceStore {
         Ok(())
     }
     pub async fn replace_head(&self, bytes: &[u8]) -> Result<()> {
-        self.multipart_index
+        let index_pin = self
+            .multipart_index
             .record_head(&format!("{}/xl.meta", self.path), bytes)
             .await?;
         invalidate_active_multipart_source_head(&self.source);
@@ -822,6 +823,7 @@ impl SourceStore {
         let root = self.publication_root.clone();
         let bytes = bytes.to_vec();
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
+            let _index_pin = index_pin;
             os::replace_multipart_source_metadata(&path, &bytes, &base, &root)
         })
         .await
