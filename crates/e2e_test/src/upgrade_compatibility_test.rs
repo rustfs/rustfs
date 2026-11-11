@@ -1772,12 +1772,9 @@ async fn scanner_read_only_handoff_requires_explicit_opt_in() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "requires the pinned 1.0.4 release binary"]
-async fn scanner_read_only_handoff_prepares_legacy_rollback_before_writes() -> TestResult {
+// Exercise the receipt protocol in the existing pinned-release rollback lane.
+async fn assert_scanner_handoff_prepares_legacy_rollback(previous_binary: &Path) -> TestResult {
     const HANDOFF: &str = "RUSTFS_SCANNER_READ_ONLY_HANDOFF";
-    let previous_binary = source_binary()?;
-    assert_eq!(binary_source_revision(&previous_binary).await?, STABLE_1_0_4_COMMIT);
     let mut env = RustFSTestEnvironment::new().await?;
     let marker = Path::new(&env.temp_dir).join(".rustfs.sys/unclean-shutdown");
     env.start_rustfs_server_without_cleanup_with_env(&[(HANDOFF, "true")]).await?;
@@ -1792,7 +1789,7 @@ async fn scanner_read_only_handoff_prepares_legacy_rollback_before_writes() -> T
     stop_scanner_handoff_server(&mut env).await?;
     assert!(!marker.exists());
     env.start_rustfs_server_from_binary_without_cleanup(
-        &previous_binary,
+        previous_binary,
         vec![],
         &[
             ("RUSTFS_SCANNER_ENABLED", "false"),
@@ -3515,6 +3512,7 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
     init_logging();
     let previous_binary = source_binary()?;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
+    assert_scanner_handoff_prepares_legacy_rollback(&previous_binary).await?;
 
     let replication_target = FakeS3Target::start().await?;
     replication_target.create_bucket(ROLLBACK_REPLICA_BUCKET);
