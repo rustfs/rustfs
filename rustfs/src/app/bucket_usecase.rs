@@ -3912,27 +3912,21 @@ mod tests {
         req
     }
 
-    fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
-        let public_start_marker = format!("pub async fn {method}");
-        let private_start_marker = format!("async fn {method}");
-        let (start, marker_len) = if let Some(start) = source.find(&public_start_marker) {
-            (start, public_start_marker.len())
-        } else {
-            let start = source.find(&private_start_marker).expect("method should exist");
-            (start, private_start_marker.len())
-        };
-        let rest = &source[start + marker_len..];
-        let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(rest.len());
-        &rest[..end]
+    /// Production text of this file plus `bucket_usecase/`, where a split moves its methods.
+    fn bucket_usecase_sources() -> crate::guard_sources::SourceSet {
+        crate::guard_sources::SourceSet::production("src/app/bucket_usecase.rs", "src/app/bucket_usecase")
+    }
+
+    /// The one `async fn method` of the set, through its own closing line, so a neighbour of any
+    /// visibility or a test module can never satisfy a check about it.
+    fn usecase_method_source<'a>(source: &'a crate::guard_sources::SourceSet, method: &str) -> &'a str {
+        source.method_body(method)
     }
 
     #[test]
     fn bucket_create_and_delete_use_admitted_fresh_tasks() {
-        let source = include_str!("bucket_usecase.rs");
+        let sources = bucket_usecase_sources();
+        let source = &sources;
         for (method, operation, inner_call) in [
             (
                 "execute_create_bucket",
@@ -3957,7 +3951,8 @@ mod tests {
 
     #[test]
     fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
-        let source = include_str!("bucket_usecase.rs");
+        let sources = bucket_usecase_sources();
+        let source = &sources;
         for (method, operation, scanner_maintenance_change) in [
             ("execute_delete_bucket_policy", "delete bucket policy", false),
             ("execute_put_bucket_policy", "put bucket policy", false),

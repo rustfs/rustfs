@@ -2534,6 +2534,139 @@ mod test {
         Ok(())
     }
 
+    const AWS_KEY_ID: &str = "74e5921e-107a-4584-bfda-a5dadeb3e13e";
+    const AWS_KEY_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+    const OTHER_AWS_KEY_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:key/00000000-0000-4000-8000-000000000000";
+
+    /// A key-scoped statement has to hold however the request spells the key.
+    /// Matched literally, a `Deny` written on the key id let the same key
+    /// through when the request named it by its ARN — on the write and on the
+    /// read of an SSE-KMS object alike.
+    #[tokio::test]
+    async fn test_kms_key_statement_covers_the_aws_arn_spelling_of_the_key() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let deny = Policy::parse_config(
+            format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }},
+    {{ "Effect": "Deny", "Action": ["kms:Decrypt", "kms:GenerateDataKey"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}
+  ]
+}}"#
+            )
+            .as_bytes(),
+        )?;
+        let allow = Policy::parse_config(
+            format!(
+                r#"{{
+  "Version": "2012-10-17",
+  "Statement": [
+    {{ "Effect": "Allow", "Action": ["kms:Decrypt"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}
+  ]
+}}"#
+            )
+            .as_bytes(),
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let decrypt = Action::KmsAction(KmsAction::DecryptAction);
+
+        for spelling in [AWS_KEY_ID, AWS_KEY_ARN] {
+            assert!(
+                !deny.is_allowed(&kms_args(decrypt, spelling, &conditions, &claims)).await,
+                "a Deny on the key id must cover the key named as {spelling}"
+            );
+            assert!(
+                allow.is_allowed(&kms_args(decrypt, spelling, &conditions, &claims)).await,
+                "an Allow on the key id must cover the key named as {spelling}"
+            );
+        }
+        assert!(
+            deny.is_allowed(&kms_args(decrypt, OTHER_AWS_KEY_ARN, &conditions, &claims))
+                .await,
+            "a Deny on one key must not spread to another key's ARN"
+        );
+        assert!(
+            !allow
+                .is_allowed(&kms_args(decrypt, OTHER_AWS_KEY_ARN, &conditions, &claims))
+                .await,
+            "an Allow on one key must not spread to another key's ARN"
+        );
+
+        // Shapes the AWS KMS API would not accept as a key are not reinterpreted.
+        for not_a_key_arn in [
+            format!("arn:aws:s3:::key/{AWS_KEY_ID}"),
+            format!("arn:aws:kms:eu-north-1:111122223333:key/nested/{AWS_KEY_ID}"),
+            format!("prefix-{AWS_KEY_ARN}"),
+        ] {
+            assert!(
+                !allow
+                    .is_allowed(&kms_args(decrypt, &not_a_key_arn, &conditions, &claims))
+                    .await,
+                "{not_a_key_arn} must not be taken for the key"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// An alias names a key only the backend can resolve, so it must not be a
+    /// way around a statement scoped to particular keys.
+    #[tokio::test]
+    async fn test_kms_alias_request_fails_closed_against_key_scoped_statements() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let decrypt = Action::KmsAction(KmsAction::DecryptAction);
+        let aliases = ["alias/payroll", "arn:aws:kms:eu-north-1:111122223333:alias/payroll"];
+        let policy = |statements: &str| {
+            Policy::parse_config(format!(r#"{{ "Version": "2012-10-17", "Statement": [{statements}] }}"#).as_bytes())
+        };
+
+        let all_keys = policy(r#"{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }"#)?;
+        let unscoped = policy(r#"{ "Effect": "Allow", "Action": ["kms:*"] }"#)?;
+        let one_key = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+        let all_but_one = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "NotResource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+        let all_with_key_deny = policy(&format!(
+            r#"{{ "Effect": "Allow", "Action": ["kms:*"], "Resource": ["arn:aws:kms:::*"] }},
+               {{ "Effect": "Deny", "Action": ["kms:Decrypt"], "Resource": ["arn:aws:kms:::key/{AWS_KEY_ID}"] }}"#
+        ))?;
+
+        for alias in aliases {
+            assert!(
+                all_keys.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow on every key covers whatever key {alias} names"
+            );
+            assert!(
+                unscoped.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an unscoped Allow covers whatever key {alias} names"
+            );
+            assert!(
+                !one_key.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow on one key cannot be shown to cover {alias}"
+            );
+            assert!(
+                !all_but_one.is_allowed(&kms_args(decrypt, alias, &conditions, &claims)).await,
+                "an Allow excluding one key cannot be shown to exclude {alias}"
+            );
+            assert!(
+                !all_with_key_deny
+                    .is_allowed(&kms_args(decrypt, alias, &conditions, &claims))
+                    .await,
+                "a Deny on one key must apply to {alias}, which may name it"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_kms_alias_resource_parses_but_matches_no_key() -> Result<()> {
         use crate::policy::action::{Action, KmsAction};

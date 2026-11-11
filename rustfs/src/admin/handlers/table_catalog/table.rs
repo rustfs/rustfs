@@ -117,24 +117,22 @@ impl Operation for RestCreateTableHandler {
 pub struct RestRegisterTableHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for RestRegisterTableHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for RestRegisterTableHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
-        let request = read_json_body::<RegisterTableRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<RegisterTableRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result =
             register_table_response(&store, &commit_backend, &warehouse, &namespace, request, table_bucket_enabled).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -219,28 +217,26 @@ impl Operation for RestTableExistsHandler {
 pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for RestCommitTableHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for RestCommitTableHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let request = read_rest_commit_table_request(std::mem::take(&mut s3s_req.input).into()).await?;
+        let request = read_rest_commit_table_request(req.take_body()).await?;
         if request_has_assert_create_requirement(&request) {
             let namespace_resource = TableCatalogResource::namespace(&warehouse, &namespace);
             authorize_table_catalog_resource_request(&req, &namespace_resource, AdminAction::CreateTableAction).await?;
         }
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = commit_table_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -289,26 +285,24 @@ impl Operation for GetTableMetadataLocationHandler {
 pub struct UpdateTableMetadataLocationHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for UpdateTableMetadataLocationHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for UpdateTableMetadataLocationHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal =
             authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let request = read_json_body::<UpdateTableMetadataLocationRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        let request = read_json_body::<UpdateTableMetadataLocationRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result =
             update_table_metadata_location_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -338,25 +332,23 @@ impl Operation for ExportTableCatalogHandler {
 pub struct ImportTableCatalogHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for ImportTableCatalogHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for ImportTableCatalogHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
-        let request = read_json_body::<CatalogImportRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<CatalogImportRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result =
             catalog_import_response(&store, &commit_backend, &warehouse, &namespace, &table, request, table_bucket_enabled).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -420,23 +412,21 @@ impl Operation for RecoverTableCatalogHandler {
 pub struct RollbackTableCatalogHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for RollbackTableCatalogHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for RollbackTableCatalogHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
         ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let request = read_json_body::<RollbackTableRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        let request = read_json_body::<RollbackTableRequest>(req.take_body()).await?;
         let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = rollback_table_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }

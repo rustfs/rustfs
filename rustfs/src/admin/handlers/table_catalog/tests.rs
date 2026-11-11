@@ -77,8 +77,12 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     load_table_request_builder(context, access_key, secret_key).build()
 }
 
-/// Builds the legacy request accepted by the commit backend, which derives an owned view.
-// TODO(T1.12-codemod): remove with `TableCommitObjectBackend::for_request`'s s3s parameter.
+/// Converts a legacy request the way the admin router edge does, without its body.
+fn legacy_request_view(req: &s3s::S3Request<s3s::Body>) -> AdminRequest {
+    AdminRequest::new(RequestEnvelope::from_s3s(req), Body::empty())
+}
+
+/// Builds a legacy request to exercise conversion into the owned request.
 fn legacy_table_catalog_handler_request(
     context: Arc<AppContext>,
     access_key: &str,
@@ -177,16 +181,15 @@ async fn call_catalog_backup_prepare_handler(request: AdminRequest) -> S3Result<
     PrepareTableCatalogBackupObjectHandler {}.call(request, matched.params).await
 }
 
-/// The disable handler keeps the s3s request for its publication backend; see
-/// `legacy_request_view`.
-// TODO(T1.12-codemod): move to the owned request with `TableCommitObjectBackend::for_request`.
-async fn call_disable_table_bucket_handler(request: s3s::S3Request<s3s::Body>) -> S3Result<LegacyResponse> {
+/// Calls the disable handler with a request converted the same way the admin router edge converts it.
+async fn call_disable_table_bucket_handler(request: s3s::S3Request<s3s::Body>) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router.insert("/iceberg/v1/buckets/{warehouse}", ()).unwrap();
     router.insert("/_iceberg/v1/buckets/{warehouse}", ()).unwrap();
     let path = request.uri.path().to_string();
     let matched = router.at(&path).unwrap();
-    crate::admin::router::Operation::call(&DisableTableBucketHandler {}, request, matched.params).await
+    let owned = AdminRequest::new(RequestEnvelope::from_s3s(&request), request.input.into());
+    DisableTableBucketHandler {}.call(owned, matched.params).await
 }
 
 async fn call_maintenance_worker_handler(request: AdminRequest) -> S3Result<AdminResponse> {
@@ -1355,16 +1358,54 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         ..Default::default()
     }));
     // Exercise the actual owned internal authorization path, including its temporary target.
-    let mut legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-    let principal = table_catalog_request_principal(&legacy_request_view(&legacy))
-        .await
-        .expect("resolve principal");
-    install_table_catalog_s3_request_info(&mut legacy, &principal).expect("install authorization context");
-    let info = legacy.extensions.get_mut::<ReqInfo>().expect("request info");
+    let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    let mut owned = legacy_request_view(&legacy);
+    let principal = table_catalog_request_principal(&owned).await.expect("resolve principal");
+    // Both request boundaries retain the effective region and the authenticated principal.
+    {
+        let mut legacy_region = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        legacy_region.region = Some("eu-west-1".parse().expect("valid legacy region"));
+        let legacy_request = legacy_request_view(&legacy_region);
+        let owned_request = load_table_request_builder(context.clone(), access_key, secret_key)
+            .region(Some("eu-west-1".to_owned()))
+            .build();
+        let preserved_request = load_table_request_builder(context.clone(), access_key, secret_key)
+            .region(Some("eu-west-1".to_owned()))
+            .extension(ReqInfo {
+                region: Some("ap-south-1".parse().expect("valid existing region")),
+                bucket: Some("original-bucket".to_owned()),
+                ..Default::default()
+            })
+            .build();
+        for (mut request, expected_region, expected_bucket) in [
+            (legacy_request, "eu-west-1", None),
+            (owned_request, "eu-west-1", None),
+            (preserved_request, "ap-south-1", Some("original-bucket")),
+        ] {
+            let resolved = table_catalog_request_principal(&request)
+                .await
+                .expect("resolve actual IAM principal");
+            assert_eq!(resolved.credentials.access_key, access_key);
+            assert!(!resolved.owner);
+            install_table_catalog_s3_request_info(&mut request, &resolved).expect("install request identity");
+            let info = request.req_info().expect("request info");
+            assert_eq!(info.region.as_ref().map(|value| value.as_str()), Some(expected_region));
+            assert_eq!(info.bucket.as_deref(), expected_bucket);
+            assert_eq!(info.cred.as_ref().map(|value| value.access_key.as_str()), Some(access_key));
+            assert!(!info.is_owner);
+            authorize_table_catalog_s3_actions(&mut request, "warehouse", "owned/allowed", &[S3Action::GetObjectAction])
+                .await
+                .expect("the real IAM policy allows the object");
+            let info = request.req_info().expect("request info after authorization");
+            assert_eq!(info.region.as_ref().map(|value| value.as_str()), Some(expected_region));
+            assert_eq!(info.bucket.as_deref(), expected_bucket);
+        }
+    }
+    install_table_catalog_s3_request_info(&mut owned, &principal).expect("install authorization context");
+    let info = owned.req_info_mut().expect("request info");
     info.bucket = Some("original-bucket".to_owned());
     info.object = Some("original-object".to_owned());
     info.version_id = Some("original-version".to_owned());
-    let mut owned = legacy_request_view(&legacy);
     for (object, allowed) in [("owned/allowed", true), ("shared/denied", false)] {
         let result = authorize_table_catalog_s3_actions(&mut owned, "warehouse", object, &[S3Action::GetObjectAction]).await;
         if allowed {
@@ -1381,11 +1422,11 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     // write does not apply (a malformed x-amz-tagging) must not reach the decision,
     // while the ordinary owned entry point still evaluates it and rejects it.
     let mut tagged = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-    install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
     tagged
         .headers
         .insert("x-amz-tagging", http::HeaderValue::from_static("classification=%ZZ"));
     let mut tagged = legacy_request_view(&tagged);
+    install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
     authorize_table_catalog_s3_actions(&mut tagged, "warehouse", "owned/writable", &[S3Action::PutObjectAction])
         .await
         .expect("internal-object mode ignores request options the write does not apply");
@@ -1405,7 +1446,8 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         .await;
     objects.seed_object("warehouse", "shared/denied", b"unchanged".to_vec()).await;
     let backend = || {
-        let mut request = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        let mut request = legacy_request_view(&legacy);
         install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
         TableCommitObjectBackend::for_request(objects.clone(), request)
     };
@@ -1473,6 +1515,25 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
             .data,
         b"unchanged"
     );
+    let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+    install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
+    let real_backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(context.object_store());
+    let commit = TableCommitObjectBackend::for_request(real_backend, request);
+    commit
+        .put_object(
+            "warehouse",
+            "owned/writable",
+            b"persisted through real IAM".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("authorized ECStore write");
+    let persisted = commit
+        .read_object("warehouse", "owned/writable")
+        .await
+        .expect("authorized ECStore read")
+        .expect("written object exists");
+    assert_eq!(persisted.data, b"persisted through real IAM");
     let request = || table_catalog_handler_request(context.clone(), access_key, secret_key);
     for location in ["s3://warehouse/owned", "s3://warehouse/owned/", "s3://warehouse/owned/child"] {
         authorize_table_warehouse_location_request(&request(), "warehouse", location)
@@ -1518,7 +1579,7 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     ] {
         let backend = TableCommitObjectBackend::for_request(
             TestTableCatalogObjectBackend::default(),
-            legacy_table_catalog_handler_request(context.clone(), access_key, secret_key),
+            legacy_request_view(&legacy_table_catalog_handler_request(context.clone(), access_key, secret_key)),
         );
         let mut target = metadata.clone();
         target["location"] = serde_json::json!(location);
@@ -2450,11 +2511,11 @@ fn table_pointer_write_handlers_install_commit_publication_guard() {
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains("install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;"),
+            block.contains("install_table_catalog_s3_request_info(&mut req, &principal)?;"),
             "{handler} should install exact-key S3 authorization context"
         );
         assert!(
-            block.contains("TableCommitObjectBackend::for_request(metadata_backend, s3s_req)"),
+            block.contains("TableCommitObjectBackend::for_request(metadata_backend, req)"),
             "{handler} should use the guarded table commit backend"
         );
         assert!(
@@ -2695,14 +2756,8 @@ fn table_catalog_resource_builds_policy_object_scope() {
 }
 
 fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
-    // Commit-path handlers still implement the legacy router trait; see `legacy_request_view`.
     let marker = format!("impl Operation for {handler}");
-    let legacy_marker = format!("impl crate::admin::router::Operation for {handler}");
-    let block = src
-        .split_once(&marker)
-        .or_else(|| src.split_once(&legacy_marker))
-        .expect("handler impl should exist")
-        .1;
+    let block = src.split_once(&marker).expect("owned handler impl should exist").1;
     let end = block
         .find("\npub struct ")
         .or_else(|| block.find("\n#[cfg(test)]"))
@@ -2737,8 +2792,6 @@ fn function_block<'a>(src: &'a str, signature: &str) -> &'a str {
 #[test]
 fn rest_catalog_mvp_routes_use_implemented_handlers() {
     fn assert_operation<T: Operation>() {}
-    // Commit-path handlers keep the legacy router trait; see `legacy_request_view`.
-    fn assert_legacy_operation<T: crate::admin::router::Operation>() {}
 
     let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
     let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
@@ -2786,6 +2839,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
 
     assert_operation::<EnableTableBucketHandler>();
+    assert_operation::<DisableTableBucketHandler>();
     assert_operation::<GetTableBucketHandler>();
     assert_operation::<RestListNamespacesHandler>();
     assert_operation::<RestCreateNamespaceHandler>();
@@ -2795,21 +2849,23 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<RestDropNamespaceHandler>();
     assert_operation::<RestListTablesHandler>();
     assert_operation::<RestCreateTableHandler>();
-    assert_legacy_operation::<RestRegisterTableHandler>();
+    assert_operation::<RestRegisterTableHandler>();
     assert_operation::<RestListViewsHandler>();
     assert_operation::<RestCreateViewHandler>();
     assert_operation::<RestLoadTableHandler>();
     assert_operation::<RestTableExistsHandler>();
     assert_operation::<RestLoadCredentialsHandler>();
-    assert_legacy_operation::<RestCommitTableHandler>();
+    assert_operation::<RestCommitTableHandler>();
     assert_operation::<RestDropTableHandler>();
     assert_operation::<RestRenameTableHandler>();
     assert_operation::<RestLoadViewHandler>();
-    assert_legacy_operation::<RestReplaceViewHandler>();
+    assert_operation::<RestReplaceViewHandler>();
     assert_operation::<RestDropViewHandler>();
     assert_operation::<ListTableRefsHandler>();
+    assert_operation::<PutTableRefHandler>();
+    assert_operation::<DeleteTableRefHandler>();
     assert_operation::<GetTableMetadataLocationHandler>();
-    assert_legacy_operation::<UpdateTableMetadataLocationHandler>();
+    assert_operation::<UpdateTableMetadataLocationHandler>();
     assert_operation::<RestTableMetadataMaintenanceHandler>();
     assert_operation::<GetTableMaintenanceConfigHandler>();
     assert_operation::<PutTableMaintenanceConfigHandler>();
@@ -2820,13 +2876,13 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<HeartbeatTableMaintenanceJobHandler>();
     assert_operation::<TableMaintenanceQuarantineHandler>();
     assert_operation::<ExportTableCatalogHandler>();
-    assert_legacy_operation::<ImportTableCatalogHandler>();
+    assert_operation::<ImportTableCatalogHandler>();
     assert_operation::<ExternalCatalogBridgeHandler>();
     assert_operation::<PutExternalCatalogBridgeHandler>();
-    assert_legacy_operation::<SyncExternalCatalogBridgeHandler>();
+    assert_operation::<SyncExternalCatalogBridgeHandler>();
     assert_operation::<GetTableCatalogDiagnosticsHandler>();
     assert_operation::<RecoverTableCatalogHandler>();
-    assert_legacy_operation::<RollbackTableCatalogHandler>();
+    assert_operation::<RollbackTableCatalogHandler>();
 }
 
 #[test]
@@ -18324,10 +18380,11 @@ async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions(
 
                 let result = call_disable_table_bucket_handler(request(if allowed { "/_iceberg" } else { "/iceberg" })).await;
                 if allowed {
-                    let response = result.expect("request-scoped object permissions should authorize cleanup");
-                    assert_eq!(response.output.0, StatusCode::OK);
-                    // The legacy adapter streams the owned response body.
-                    let body = http_body_util::BodyExt::collect(response.output.1)
+                    let (status, _, body) = result
+                        .expect("request-scoped object permissions should authorize cleanup")
+                        .into_parts();
+                    assert_eq!(status, StatusCode::OK);
+                    let body = http_body_util::BodyExt::collect(body)
                         .await
                         .expect("cleanup response body")
                         .to_bytes();
