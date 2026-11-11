@@ -284,7 +284,7 @@ fn unanswerable(message: &'static str) -> S3Error {
 /// What the table decides about one request by itself, and what it leaves to the core.
 enum Question<'a> {
     Decided(Decision),
-    AskCore(&'static AuthorizationRow, RouteFacts<'a>),
+    AskCore(&'static AuthorizationRow, Box<RouteFacts<'a>>),
 }
 
 /// The RustFS implementation of the gateway's two authorization stages.
@@ -307,7 +307,7 @@ impl RustfsAuthorizer {
             return Question::Decided(Decision::Deny);
         };
         match row.route_stage {
-            RouteStage::RouteDecidable => Question::AskCore(row, facts()),
+            RouteStage::RouteDecidable => Question::AskCore(row, Box::new(facts())),
             RouteStage::DeferToHandlerHook { gate, .. } => Question::Decided(match gate {
                 RouteGate::AuthenticatedCaller if anonymous => Decision::Deny,
                 RouteGate::AuthenticatedCaller => Decision::Allow,
