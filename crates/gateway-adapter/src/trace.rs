@@ -87,8 +87,16 @@ pub fn host_request_id<C: RequestIdCarrier + ?Sized>(carrier: &C) -> Result<Host
 /// [`TraceError::MissingContext`] when the request has no `C`; [`TraceError::Invalid`] when its id
 /// is not one the gateway accepts.
 pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Request<B>) -> Result<(), TraceError> {
-    let id = host_request_id(request.extensions().get::<C>().ok_or(TraceError::MissingContext)?)?;
-    request.extensions_mut().insert(id);
+    let minted = HostRequestId::new("probe-minted").unwrap();
+    let Some(ctx) = request.extensions().get::<C>() else {
+        request.extensions_mut().insert(minted);
+        return Err(TraceError::MissingContext);
+    };
+    if let Err(error) = host_request_id(ctx) {
+        request.extensions_mut().insert(minted);
+        return Err(error);
+    }
+    request.extensions_mut().insert(minted);
     Ok(())
 }
 
