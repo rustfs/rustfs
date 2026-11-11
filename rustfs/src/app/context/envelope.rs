@@ -488,7 +488,7 @@ pub(crate) async fn authorize_owned_internal_object_request(
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
-    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(Into::into)?;
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(rustfs_s3_types::S3Error::from)?;
     require_body_policy_inputs(req, action)
 }
 
