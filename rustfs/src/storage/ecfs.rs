@@ -45,6 +45,7 @@ use crate::storage::validate_website_configuration;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets as gateway_list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_s3_ops::S3Operation;
@@ -738,6 +739,15 @@ impl FS {
         );
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
+}
+
+/// A ListBuckets value the s3s edge and the gateway's types disagree on. The seam converts every
+/// member both sides hold, so this is a defect in the conversion, never the caller's fault.
+fn list_buckets_seam_error(error: rustfs_gateway_types::compat::ConversionError) -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InternalError,
+        format!("failed to convert ListBuckets through the gateway compatibility seam: {error}"),
+    )
 }
 
 #[async_trait::async_trait]
@@ -1596,7 +1606,13 @@ impl S3 for FS {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
         record_s3_op(S3Operation::ListBuckets);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_buckets(req).await
+        // The use case speaks the envelope and the gateway's types; this edge only converts.
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let input = gateway_list_buckets::input_from_s3s(req.input).map_err(list_buckets_seam_error)?;
+        let output = usecase.execute_list_buckets(envelope, input).await?;
+        gateway_list_buckets::output_to_s3s(output)
+            .map(S3Response::new)
+            .map_err(list_buckets_seam_error)
     }
 
     async fn list_multipart_uploads(

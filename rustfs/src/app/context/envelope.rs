@@ -62,13 +62,30 @@ impl RequestCredentials {
         }
     }
 
+    /// The identity of a request whose edge verified the signature itself and kept the secret key.
+    ///
+    /// The gateway edge hands the secret only to an operation that opts in, so for every other
+    /// operation [`Self::secret_key`] is empty and [`Self::has_secret_key`] is `false`.
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn without_secret_key(access_key: String, session_token: Option<String>) -> Self {
+        Self::new(access_key, String::new(), session_token)
+    }
+
     pub fn access_key(&self) -> &str {
         &self.access_key
     }
 
     /// Never log this value or compare it with `==`.
+    ///
+    /// Empty when the edge kept the secret; see [`Self::has_secret_key`].
     pub fn secret_key(&self) -> &str {
         &self.secret_key
+    }
+
+    /// Whether the edge handed the caller's secret key over. A reader that needs the secret must
+    /// refuse a request without one instead of using the empty value.
+    pub fn has_secret_key(&self) -> bool {
+        !self.secret_key.is_empty()
     }
 
     pub fn session_token(&self) -> Option<&str> {
