@@ -62,6 +62,7 @@ fn completed_checkpoint_reuse_requires_unpublished_unchanged_coverage() {
         "legacy",
         "newer_cycle",
         "newer_leader",
+        "same_leader",
         "tier",
         "incarnation",
         "source",
@@ -85,6 +86,7 @@ fn completed_checkpoint_reuse_requires_unpublished_unchanged_coverage() {
             "legacy" => cache.info.scan_coverage_digest = None,
             "newer_cycle" => cache.info.next_cycle = 10,
             "newer_leader" => cache.info.leader_epoch = 13,
+            "same_leader" => cache.info.leader_epoch = 12,
             "tier" => options.tier_registry_generation = Some(3),
             "incarnation" => options.checkpoint_identity.as_mut().expect("identity").bucket_incarnation = Uuid::new_v4(),
             "source" => cache.info.source = Some(DataUsageCacheSource::new(1, 0)),
@@ -359,6 +361,31 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
 #[tokio::test]
 #[serial]
 async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_changes() {
+    use tokio::io::AsyncReadExt;
+
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        payload: Vec<u8>,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct Progress {
+        objects_scanned: u64,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FrameResult {
+        Progress,
+        Complete(serde::de::IgnoredAny),
+        Partial,
+        NamespaceNotFound,
+        CycleAhead(serde::de::IgnoredAny),
+        Error(serde::de::IgnoredAny),
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct Frame {
+        progress: Progress,
+        result: FrameResult,
+    }
     #[derive(serde::Serialize)]
     struct WorkerRequest<'a> {
         version: u16,
@@ -381,20 +408,24 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
         move || resolved.upgrade()
     )));
     rustfs_credentials::set_global_rpc_secret("remote-checkpoint-test-secret".to_string()).expect("test RPC secret");
-    let bucket = "remote-checkpoint";
-    store
-        .make_bucket(bucket, &MakeBucketOptions::default())
-        .await
-        .expect("remote bucket");
-    for object in HOT_OBJECTS {
-        put_fixture_object(&store, bucket, object).await;
-    }
-    wait_for_namespace_commit_tails(store.as_ref()).await;
     let set = store.pools[0].disk_set[0].clone();
     let disk = scanner_set_disk_inventory(&set).await.pop().expect("local worker disk");
-    let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
 
     for (index, restart) in [true, false].into_iter().enumerate() {
+        let bucket = if restart {
+            "remote-checkpoint-restart"
+        } else {
+            "remote-checkpoint-maintenance"
+        };
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("remote bucket");
+        for object in HOT_OBJECTS {
+            put_fixture_object(&store, bucket, object).await;
+        }
+        wait_for_namespace_commit_tails(store.as_ref()).await;
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
         let before = if restart {
             std::collections::BTreeMap::from([(
                 "<local>".to_string(),
@@ -413,15 +444,18 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
             &before,
             crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
         ));
-        let cycle = 100 + u64::try_from(index).expect("fixture index") * 2;
-        for resumed in [false, true] {
+        let cycle = 100 + u64::try_from(index).expect("fixture index") * 4;
+        for step in 0..4_u64 {
+            let resumed = step > 0;
             let activity = if resumed && restart {
                 std::collections::BTreeMap::from([(
                     "<local>".to_string(),
                     crate::scanner::scanner_node_activity_for_tests("instance-after", 0, 0, false),
                 )])
             } else if resumed {
-                record_scanner_maintenance_change(bucket);
+                if step == 1 {
+                    record_scanner_maintenance_change(bucket);
+                }
                 crate::scanner::probe_scanner_activity(store.as_ref(), false)
                     .await
                     .expect("activity after maintenance")
@@ -442,11 +476,24 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
             if resumed {
                 assert_ne!(reuse, requested_reuse, "the event must invalidate completed cache reuse");
             }
-            let next_cycle = cycle + u64::from(resumed);
+            let next_cycle = cycle + step;
+            let leader_epoch = LEADER_EPOCH + next_cycle;
+            if step >= 2 {
+                let baseline = if step == 2 {
+                    serde_json::to_vec(&crate::scanner::scanner_usage_bootstrap_marker(SystemTime::now(), Some(leader_epoch)))
+                        .expect("bootstrap baseline")
+                } else {
+                    complete_usage_baseline(DataUsageCacheSource::new(0, 0), requested_reuse, cycle + 1, leader_epoch - 2)
+                        .to_vec()
+                };
+                save_config(store.clone(), crate::DATA_USAGE_OBJ_NAME_PATH.as_str(), baseline)
+                    .await
+                    .expect("authoritative aggregate floor");
+            }
             save_config(
                 store.clone(),
                 DATA_USAGE_BLOOM_NAME_PATH.as_str(),
-                crate::scanner::encode_scanner_cycle_fence_for_test(next_cycle, LEADER_EPOCH),
+                crate::scanner::encode_scanner_cycle_fence_for_test(next_cycle, leader_epoch),
             )
             .await
             .expect("remote request cycle fence");
@@ -458,28 +505,39 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
                 session_sequence: 0,
                 bucket,
                 next_cycle,
-                leader_epoch: LEADER_EPOCH,
+                leader_epoch,
                 scan_plan_digest: requested_reuse,
                 checkpoint_plan_digest: coverage,
                 skip_healing: true,
                 scan_mode: HealScanMode::Normal,
-                budget: serde_json::json!({"max_objects": if resumed { None } else { Some(2_u64) }}),
+                budget: serde_json::json!({"max_objects": if step == 1 { None } else { Some(2_u64) }}),
             };
             let body = rmp_serde::to_vec_named(&body).expect("remote worker request body");
             let request = crate::decode_remote_scanner_request(&body).expect("remote worker decodes coverage identity");
+            let mut response = Vec::new();
             tokio::time::timeout(
                 Duration::from_secs(60),
-                crate::serve_remote_scanner_request(disk.clone(), request, tokio::io::sink(), CancellationToken::new()),
+                crate::serve_remote_scanner_request(disk.clone(), request, &mut response, CancellationToken::new()),
             )
             .await
             .expect("bounded remote worker")
             .expect("remote worker stream");
+            let mut frames = response.as_slice();
+            let mut terminal: Option<Frame> = None;
+            while !frames.is_empty() {
+                let length = usize::try_from(frames.read_u32().await.expect("frame length")).expect("frame size");
+                let envelope: Envelope = rmp_serde::from_slice(&frames[..length]).expect("response envelope");
+                terminal = Some(rmp_serde::from_slice(&envelope.payload).expect("response frame"));
+                frames = &frames[length..];
+            }
+            let terminal = terminal.expect("terminal worker response");
             let mut cache = DataUsageCache::default();
             cache
                 .load(set.clone(), &cache_name)
                 .await
                 .expect("durable remote worker cache");
-            if resumed {
+            if step == 1 || step == 2 {
+                assert!(matches!(terminal.result, FrameResult::Complete(_)), "step {step}: {terminal:?}");
                 assert!(
                     cache.info.snapshot_complete,
                     "a resumed remote sweep must complete without mixed coverage"
@@ -487,7 +545,12 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
                 assert!(cache.info.scan_progress.is_none());
                 assert_eq!(cache.info.scan_plan_digest, Some(requested_reuse));
                 assert_eq!(cache.flatten(cache.find(bucket).expect("bucket root")).objects, 6);
+                if step == 2 {
+                    assert_eq!(terminal.progress.objects_scanned, 0);
+                    assert_eq!(cache.info.next_cycle, cycle + 1, "reuse must not renew the completed receipt");
+                }
             } else {
+                assert!(matches!(terminal.result, FrameResult::Partial), "step {step}: {terminal:?}");
                 assert!(!cache.info.snapshot_complete);
                 assert!(cache.has_scan_position(), "budget must leave real checkpoint progress");
                 let progress = cache.info.scan_progress.expect("interrupted worker records coverage");

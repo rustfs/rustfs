@@ -742,9 +742,10 @@ async fn scan_and_persist_local_bucket(
     let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
         .await
         .generation;
-    // Read the authoritative floor only for a completed checkpoint. No wire
-    // change is needed, and an unavailable/legacy floor falls back to a walk.
+    // Only a leader handoff needs this authoritative floor; ordinary cycles
+    // avoid an extra config read. An unavailable/legacy floor forces a walk.
     let completed_checkpoint_cycle_floor = if cache.info.snapshot_complete
+        && cache.info.leader_epoch < leader_epoch
         && cache.info.scan_plan_digest == Some(scan_plan_digest)
         && checkpoint_plan_digest.is_some()
         && cache.info.scan_coverage_digest == checkpoint_plan_digest

@@ -431,14 +431,14 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
     let checkpoint_plan_digest = options.checkpoint_plan_digest.unwrap_or(scan_plan_digest);
-    // Finishing a bucket must not discard its progress while other buckets
+    // A new leader must not discard finished progress while other buckets
     // still need budget. Adopt only completed, unpublished coverage; after
     // the aggregate is published the cycle floor forces the usual refresh.
     // Keep the saved cycle unchanged so reuse cannot extend this authority.
     // The reuse plan still binds every process incarnation: a restart may
     // lose unflushed dirty hints and must invalidate completed coverage.
     let unpublished_completion = options.completed_checkpoint_cycle_floor.is_some_and(|floor| {
-        cache.info.next_cycle > floor && cache.info.next_cycle < next_cycle && cache.info.leader_epoch <= leader_epoch
+        cache.info.next_cycle > floor && cache.info.next_cycle < next_cycle && cache.info.leader_epoch < leader_epoch
     }) && options.checkpoint_identity.is_some_and(|identity| {
         identity.is_valid()
             && cache.info.scan_identity == Some(identity)
