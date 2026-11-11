@@ -3452,7 +3452,7 @@ fn is_admin_v4_fallback_path(path: &str) -> bool {
 }
 
 impl<T: OwnedOperation> S3Router<T> {
-    pub fn new(console_enabled: bool) -> Self {
+    pub(crate) fn new(console_enabled: bool) -> Self {
         let router = Router::new();
 
         let console_router = if console_enabled {
@@ -3473,11 +3473,11 @@ impl<T: OwnedOperation> S3Router<T> {
 
     /// Bind this router to its server's context slot (backlog#1052 S2); the
     /// slot is handed to every dispatched request via its extensions.
-    pub fn set_server_ctx(&mut self, server_ctx: Arc<ServerContextSlot>) {
+    pub(crate) fn set_server_ctx(&mut self, server_ctx: Arc<ServerContextSlot>) {
         self.server_ctx = Some(server_ctx);
     }
 
-    pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
+    pub(crate) fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
         let path = Self::make_route_str(method, path);
         #[cfg(test)]
         let registered_path = path.clone();
@@ -3675,7 +3675,7 @@ where
 /// Registers one owned admin operation with the legacy router. The router
 /// converts the request and response at its edge, so the operation never sees
 /// an s3s type.
-pub struct AdminOperation(pub &'static dyn OwnedOperation);
+pub struct AdminOperation(pub(crate) &'static dyn OwnedOperation);
 
 #[async_trait::async_trait]
 impl OwnedOperation for AdminOperation {
