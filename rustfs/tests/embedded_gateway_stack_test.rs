@@ -308,7 +308,8 @@ fn the_gateway_stack_leaves_a_website_host_to_the_legacy_website_route() {
             );
         }
 
-        // The same request on a host that is no website domain is still the gateway's ListBuckets.
+        // The same request on a host that is no website domain is the gateway's anonymous
+        // ListBuckets. Legacy would refuse it the same way, so this alone cannot show where it went.
         for host in ["gateway-stack-site.elsewhere.test", "evilwebsite.test"] {
             let not_website = http
                 .get(format!("{endpoint}/"))
@@ -320,6 +321,16 @@ fn the_gateway_stack_leaves_a_website_host_to_the_legacy_website_route() {
             let body = not_website.text().await.expect("refusal body");
             assert!(body.contains("<Code>AccessDenied</Code>"), "{host}: {body}");
         }
+        // What does show it: on the server's own host, which is no website domain, a GetObject
+        // is the gateway's NotImplemented, where legacy would answer NoSuchKey.
+        let get = s3_client(&endpoint, server.access_key(), server.secret_key())
+            .get_object()
+            .bucket("gateway-stack-site")
+            .key("index.html")
+            .send()
+            .await
+            .expect_err("GetObject is not registered");
+        assert_eq!(refusal(&get), (Some("NotImplemented".to_owned()), Some(501)));
 
         server.shutdown().await;
     });
