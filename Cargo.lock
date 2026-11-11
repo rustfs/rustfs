@@ -10067,6 +10067,7 @@ dependencies = [
  "rustfs-gateway",
  "rustfs-iam",
  "rustfs-policy",
+ "serde_json",
  "time",
  "tokio",
 ]

@@ -19,5 +19,7 @@
 //! owns the answer.
 
 pub mod credentials;
+pub mod policy;
 
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
+pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};

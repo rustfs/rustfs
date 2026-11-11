@@ -20,7 +20,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "RustFS implementations of the rustfs-gateway extension traits (credentials over IAM)."
+description = "RustFS implementations of the rustfs-gateway extension traits (credentials and policy facts over IAM)."
 keywords = ["rustfs", "gateway", "s3", "iam"]
 categories = ["web-programming", "authentication"]
 authors.workspace = true
@@ -36,10 +36,11 @@ workspace = true
 
 [dependencies]
 rustfs-gateway = { workspace = true }
+rustfs-credentials = { workspace = true }
 rustfs-iam = { workspace = true }
 rustfs-policy = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-rustfs-credentials = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
