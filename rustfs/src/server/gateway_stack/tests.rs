@@ -237,6 +237,7 @@ async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothi
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{withdrawn}");
     assert!(withdrawn.contains("<Code>InternalError</Code>"), "{withdrawn}");
     assert!(!withdrawn.contains("ListAllMyBucketsResult"), "{withdrawn}");
+    assert_fault_answer_names_nothing(&withdrawn, ROTATED_ACCESS_KEY);
 }
 
 #[test]
@@ -493,10 +494,22 @@ async fn an_unknown_access_key_is_refused_as_the_caller_s_fault() {
     assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
 }
 
+/// The answer to a credential-store fault names neither the key that was looked up, nor a secret,
+/// nor why the lookup failed.
+fn assert_fault_answer_names_nothing(body: &str, access_key: &str) {
+    assert!(!body.contains(access_key), "the looked-up key is not echoed: {body}");
+    assert!(!body.contains(ROOT_SECRET_KEY), "{body}");
+    let lowered = body.to_ascii_lowercase();
+    for detail in ["iam", "credential", "lookup", "store", "not ready", "unavailable", "root"] {
+        assert!(!lowered.contains(detail), "the answer says `{detail}`: {body}");
+    }
+}
+
 /// Injected: a credential provider that returns an error for the lookup of a non-root key.
 ///
 /// The fault is answered as one, `500 InternalError`, as the legacy stack answers a failed lookup,
-/// and not as an unknown key. Ledger entry R-068 (rustfs/backlog#2684): the gateway's RustFS
+/// and not as an unknown key. Up to gateway pin 21283e87 this test observed `403
+/// InvalidAccessKeyId`; pin 7915d069 changed the answer. Ledger entry R-068 (rustfs/backlog#2684): the gateway's RustFS
 /// authenticator preset sets the switch of rustfs/gateway#1585; the assembly sets nothing of its
 /// own. Nothing is served either way.
 #[tokio::test]
@@ -508,6 +521,7 @@ async fn a_credential_lookup_that_fails_is_refused_and_never_served() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("<Code>InternalError</Code>"), "{body}");
     assert!(!body.contains("InvalidAccessKeyId"), "a store fault is not an unknown key: {body}");
+    assert_fault_answer_names_nothing(&body, "AKIDUSER0001");
     assert!(!body.contains("ListAllMyBucketsResult"), "{body}");
 }
 
