@@ -103,6 +103,7 @@ impl RequestCredentials {
     }
 
     /// The same identity with `session_token` as its token.
+    #[cfg(test)]
     pub(crate) fn with_session_token(mut self, session_token: Option<String>) -> Self {
         self.session_token = session_token.map(Zeroizing::new);
         self
