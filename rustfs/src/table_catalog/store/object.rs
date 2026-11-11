@@ -3479,24 +3479,6 @@ where
         Ok(config)
     }
 
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    pub(crate) async fn put_table_bucket_maintenance_config(
-        &self,
-        table_bucket: &str,
-        config: TableMaintenanceConfig,
-    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        validate_table_maintenance_config(&config)?;
-        self.require_table_bucket(table_bucket).await?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
-        let config_path = self.paths.table_bucket_maintenance_config_path(table_bucket);
-        self.write_entry(self.catalog_bucket(), &config_path, &config, TableCatalogPutPrecondition::Any)
-            .await?;
-        Ok(config)
-    }
-
     pub(crate) async fn get_effective_table_maintenance_config(
         &self,
         table_bucket: &str,
@@ -7868,10 +7850,11 @@ where
             .await
         {
             match self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await {
-                Ok(None) => return Ok(()),
+                Ok(None) => {}
                 Ok(Some((current, _))) if current == entry => {
                     self.restore_table_warehouse_index_after_failed_drop(&entry, &object, "table entry delete failed")
                         .await;
+                    return Err(err);
                 }
                 Ok(Some(_)) => {
                     return Err(TableCatalogStoreError::Internal(format!(
@@ -7888,9 +7871,20 @@ where
                         error = %read_err,
                         "failed to verify table state after an ambiguous table entry delete"
                     );
+                    return Err(err);
                 }
             }
-            return Err(err);
+        }
+        let config_path = self
+            .paths
+            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+        if let Some(config) = self.backend.object_metadata(self.catalog_bucket(), &config_path).await? {
+            let etag = config
+                .etag
+                .ok_or_else(|| TableCatalogStoreError::Conflict("table maintenance config has no ETag".to_string()))?;
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &config_path, &etag, &mutation_fence)
+                .await?;
         }
         Ok(())
     }
