@@ -735,4 +735,166 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn highwayhash_simd_matches_portable_scalar_and_chunked_slices_across_unaligned_boundaries() {
+        use highway::PortableHash;
+
+        for &size in &[
+            0usize,
+            1,
+            7,
+            15,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            255,
+            257,
+            1024,
+            4096 + 17,
+            64 * 1024,
+        ] {
+            let payload = generate_compat_test_data(size);
+
+            let mut h_simd = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+            h_simd.append(&payload);
+            let simd_digest = u8x32_from_u64x4(h_simd.finalize256());
+
+            let mut h_scalar = PortableHash::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+            h_scalar.append(&payload);
+            let scalar_digest = u8x32_from_u64x4(h_scalar.finalize256());
+
+            assert_eq!(
+                simd_digest, scalar_digest,
+                "HighwayHasher SIMD must match PortableHash scalar byte-for-byte at {size}B"
+            );
+
+            for &chunk_size in &[17usize, 61, 4096] {
+                if size > 4096 && chunk_size < 61 {
+                    continue;
+                }
+                let slices: Vec<&[u8]> = payload.chunks(chunk_size).collect();
+                for algo in [
+                    HashAlgorithm::HighwayHash256S,
+                    HashAlgorithm::HighwayHash256SLegacy,
+                    HashAlgorithm::SHA256,
+                    HashAlgorithm::BLAKE2b512,
+                    HashAlgorithm::Md5,
+                ] {
+                    let contig_out = algo.hash_encode(&payload);
+                    let sliced_out = algo.hash_encode_slices(slices.iter().copied());
+                    assert_eq!(
+                        contig_out.as_ref(),
+                        sliced_out.as_ref(),
+                        "{algo:?} contiguous vs {chunk_size}B sliced digest mismatch at {size}B"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "utility throughput microbenchmark; run via cargo test -p rustfs-utils --lib --features hash --release -- --ignored --nocapture"]
+    fn microbench_highwayhash_simd_vs_portable_scalar_and_hash_algorithms() {
+        use highway::PortableHash;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for &(size, iters) in &[(1024usize, 200usize), (64 * 1024, 40), (1024 * 1024, 8)] {
+            let payload = generate_compat_test_data(size);
+
+            // 1. Compare HighwayHasher (runtime SIMD: AVX2/SSE4.1/NEON) against PortableHash scalar reference.
+            let t_simd = Instant::now();
+            let mut simd_digest = [0u8; 32];
+            for _ in 0..iters {
+                let mut h = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+                h.append(black_box(&payload));
+                simd_digest = u8x32_from_u64x4(h.finalize256());
+                black_box(&simd_digest);
+            }
+            let simd_elapsed = t_simd.elapsed();
+
+            let t_scalar = Instant::now();
+            let mut scalar_digest = [0u8; 32];
+            for _ in 0..iters {
+                let mut h = PortableHash::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+                h.append(black_box(&payload));
+                scalar_digest = u8x32_from_u64x4(h.finalize256());
+                black_box(&scalar_digest);
+            }
+            let scalar_elapsed = t_scalar.elapsed();
+
+            assert_eq!(
+                simd_digest, scalar_digest,
+                "HighwayHasher SIMD must match PortableHash scalar byte-for-byte at {size}B"
+            );
+            let total_mib = (size * iters) as f64 / (1024.0 * 1024.0);
+            let simd_mibs = total_mib / simd_elapsed.as_secs_f64().max(1e-9);
+            let scalar_mibs = total_mib / scalar_elapsed.as_secs_f64().max(1e-9);
+            println!(
+                "[microbench][utils::hash] size={size}B HighwayHash256S SIMD={simd_mibs:.1} MiB/s vs PortableScalar={scalar_mibs:.1} MiB/s (speedup={:.2}x)",
+                simd_mibs / scalar_mibs.max(1e-9)
+            );
+
+            // 2. Compare contiguous hash_encode vs 4 KiB chunked hash_encode_slices across all bitrot algorithms.
+            let slices: Vec<&[u8]> = payload.chunks(4096).collect();
+            for algo in [
+                HashAlgorithm::HighwayHash256S,
+                HashAlgorithm::HighwayHash256SLegacy,
+                HashAlgorithm::SHA256,
+                HashAlgorithm::BLAKE2b512,
+                HashAlgorithm::Md5,
+            ] {
+                let t_contig = Instant::now();
+                let mut contig_out = Vec::new();
+                for _ in 0..iters {
+                    contig_out = algo.hash_encode(black_box(&payload)).as_ref().to_vec();
+                    black_box(&contig_out);
+                }
+                let contig_elapsed = t_contig.elapsed();
+
+                let t_sliced = Instant::now();
+                let mut sliced_out = Vec::new();
+                for _ in 0..iters {
+                    sliced_out = algo.hash_encode_slices(black_box(slices.iter().copied())).as_ref().to_vec();
+                    black_box(&sliced_out);
+                }
+                let sliced_elapsed = t_sliced.elapsed();
+
+                assert_eq!(contig_out, sliced_out, "{algo:?} contiguous vs 4KiB sliced digest mismatch at {size}B");
+                let contig_mibs = total_mib / contig_elapsed.as_secs_f64().max(1e-9);
+                let sliced_mibs = total_mib / sliced_elapsed.as_secs_f64().max(1e-9);
+                println!(
+                    "[microbench][utils::hash] size={size}B algo={algo:?} contiguous={contig_mibs:.1} MiB/s vs sliced(4KiB)={sliced_mibs:.1} MiB/s"
+                );
+            }
+        }
+
+        // 3. Key-routing microbenchmark: crc_hash (CRC32) vs sip_hash (SipHash-1-3).
+        let keys: Vec<String> = (0..1024)
+            .map(|i| format!("bucket/prefix-{i}/object-key-{i}.parquet"))
+            .collect();
+        let t_crc = Instant::now();
+        let mut crc_acc = 0usize;
+        for key in &keys {
+            crc_acc ^= crc_hash(black_box(key), 16);
+        }
+        let crc_ns = t_crc.elapsed().as_nanos();
+
+        let t_sip = Instant::now();
+        let mut sip_acc = 0usize;
+        for key in &keys {
+            sip_acc ^= sip_hash(black_box(key), 16, &[0u8; 16]);
+        }
+        black_box(sip_acc);
+        let sip_ns = t_sip.elapsed().as_nanos();
+        assert!(black_box(crc_acc) < 16 && black_box(sip_acc) < 16);
+        println!("[microbench][utils::hash] 1024 object keys: crc_hash={crc_ns}ns total, sip_hash={sip_ns}ns total");
+    }
 }

@@ -4,18 +4,18 @@ description: Prepare an exact RustFS Cargo version or align installation referen
 ---
 # Release Version Files
 
-Require an exact target; ask if missing or ambiguous. Reject targets containing `-preview`: those are tag-only. Infer `post-release` only from an explicit request or parent workflow; otherwise use `prepare`. Delivery defaults to local edit/verify; commit, push, PR, and merge follow existing authorization and [Git rules](../../references/pull-requests.md).
+Require an exact target; ask if missing or ambiguous. Reject targets containing `-preview`: those identify candidates, not product versions or new public tags. Infer `post-release` only from an explicit request or parent workflow; otherwise use `prepare`. Delivery defaults to local edit/verify; commit, push, PR, and merge follow existing authorization and [Git rules](../../references/pull-requests.md).
 
 | Stage | Files and constraints |
 |---|---|
 | `prepare` | Only `Cargo.toml` and `Cargo.lock`: workspace package, internal dependency, and workspace member versions become `<target>`. External dependencies stay unchanged. |
 | `post-release` | Only `README.md`, `README_ZH.md`, `flake.nix`, `helm/rustfs/Chart.yaml`, and `rustfs.spec`. Cargo may already target the next release; leave it untouched. |
 
-Before installation edits, verify the exact non-preview Release, downloadable assets/source archive, pullable `rustfs/rustfs:<target>` image manifest, and published Helm chart. Block on missing artifacts. Do not downgrade defaults if a newer deliverable superseded the target. Preview preparation retains the previous published installation references; follow-up commits never replace either validated tag.
+Before installation edits, verify the exact non-preview Release, downloadable assets/source archive, pullable `rustfs/rustfs:<target>` image manifest, and published Helm chart. Block on missing artifacts. Do not downgrade defaults if a newer deliverable superseded the target. Candidate preparation retains the previous published installation references; follow-up commits never replace validated tags or sealed artifacts.
 
 Packaging policy:
 
-- Docker image tags have no `v` prefix. Derive chart/app versions with `scripts/helm_chart_version.sh <target>` (`beta.N -> 0.N.0`; other versions unchanged). Helm CI derives versions from the final tag, so no early chart bump is required.
+- Docker image tags have no `v` prefix. Derive chart/app versions with `scripts/helm_chart_version.sh <target>`; both equal the final product SemVer, including prerelease suffixes. Helm CI uses the frozen candidate version before sealing, so no early installation chart bump is required. Previously published chart versions remain unchanged.
 - RPM `Version` is numeric; `Release` is the prerelease suffix or `1` for stable. Expanded `Source0` and the unpack directory must resolve to the exact target including its suffix. Add the changelog entry using current git identity, date, and target; never copy an example identity/date.
 - Changing these mappings requires explicit confirmation.
 

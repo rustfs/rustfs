@@ -1,0 +1,24 @@
+# Targets of the s3-tests reference parity lane (.github/workflows/reference-parity.yml).
+#
+# Exactly one target uses `binary = "reference"` (the release pinned in
+# .config/reference-binary.toml). Every other target uses `binary = "candidate"`
+# (the binary built from the branch under test) and is compared per node id
+# against the reference. All targets run the same harness, test list and server
+# configuration; `env` adds only the target's own RUSTFS_* settings.
+#
+# Adding a target is one more [[targets]] table, for example:
+#
+#   [[targets]]
+#   name = "candidate-gateway"
+#   binary = "candidate"
+#   env = { RUSTFS_S3_STACK = "gateway" }
+
+schema = 1
+
+[[targets]]
+name = "reference"
+binary = "reference"
+
+[[targets]]
+name = "candidate-legacy"
+binary = "candidate"

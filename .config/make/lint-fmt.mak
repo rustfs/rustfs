@@ -71,7 +71,7 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	./scripts/check_s3s_footprint.sh
 
 .PHONY: test-count-ratchet-check
-test-count-ratchet-check: ## Check no workspace crate lost tests or gained #[ignore] against the committed baseline
+test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
 	@echo "🧪 Checking per-crate test-count ratchet..."
 	./scripts/check_test_count_ratchet.sh
 
