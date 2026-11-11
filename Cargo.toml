@@ -26,6 +26,7 @@ members = [
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
+    "crates/gateway-adapter", # RustFS implementations of the gateway extension traits
     "crates/heal", # Erasure set and object healing
     "crates/heal-contracts", # Heal request/response channel contracts
     "crates/iam", # Identity and Access Management
@@ -93,6 +94,7 @@ redundant_clone = "warn"
 [workspace.dependencies]
 # RustFS Internal Crates
 rustfs = { path = "./rustfs", version = "1.0.5" }
+rustfs-gateway-adapter = { path = "crates/gateway-adapter", version = "1.0.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.5" }
 rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.5" }
