@@ -1494,6 +1494,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         },
     ];
 
+    let mut mismatches = Vec::new();
     for case in cases {
         let mut legacy = build_request((), Method::PUT);
         legacy.uri = format!("/{}/{}", case.bucket, case.object).parse().expect("case uri");
@@ -1515,18 +1516,23 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         let action = Action::S3Action(case.action);
         let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
-        assert_eq!(legacy_result.is_ok(), case.allowed, "{}: legacy decision {legacy_result:?}", case.name);
-        assert_eq!(owned_result.is_ok(), case.allowed, "{}: owned decision {owned_result:?}", case.name);
-        if !case.allowed {
-            assert_eq!(legacy_result.expect_err(case.name).code(), &S3ErrorCode::AccessDenied, "{}", case.name);
-            assert_eq!(
-                owned_result.expect_err(case.name).code(),
-                &rustfs_s3_types::S3ErrorCode::AccessDenied,
-                "{}",
-                case.name
-            );
+        let legacy_ok = match &legacy_result {
+            Ok(()) => case.allowed,
+            Err(err) => !case.allowed && err.code() == &S3ErrorCode::AccessDenied,
+        };
+        let owned_ok = match &owned_result {
+            Ok(()) => case.allowed,
+            Err(err) => !case.allowed && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied,
+        };
+        if !legacy_ok || !owned_ok {
+            mismatches.push(format!(
+                "{} (expected allowed={}): legacy {legacy_result:?}, owned {owned_result:?}",
+                case.name, case.allowed
+            ));
         }
     }
+    // Every case is evaluated before failing, so one report names each broken carrier.
+    assert!(mismatches.is_empty(), "decision mismatches:\n{}", mismatches.join("\n"));
 }
 
 fn retain(req: &mut S3Request<()>, mode: &'static str, days: i64) {
