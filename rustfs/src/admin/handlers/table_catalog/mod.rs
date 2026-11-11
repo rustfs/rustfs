@@ -2077,7 +2077,7 @@ where
         let result = match &self.authorization {
             TableCommitObjectAuthorization::Request(req) => {
                 let req = req.lock().await;
-                authorize_table_warehouse_location_request(&legacy_request_view(&req), table_bucket, location).await
+                authorize_table_warehouse_location_request(&req, table_bucket, location).await
             }
             TableCommitObjectAuthorization::Preauthorized => Ok(()),
             #[cfg(test)]
