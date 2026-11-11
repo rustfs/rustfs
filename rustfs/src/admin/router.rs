@@ -3653,6 +3653,8 @@ where
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
+            // MUTATION M3: the router edge drops the caller's credentials.
+            req.credentials = None;
             let envelope = crate::app::RequestEnvelope::from_s3s(&req);
             let request = AdminRequest::new(envelope, req.input.into());
             let (status, headers, body) = op.call(request, mat.params).await?.into_parts();

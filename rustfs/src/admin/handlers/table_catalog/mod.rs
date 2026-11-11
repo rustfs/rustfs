@@ -1286,11 +1286,8 @@ struct TableCatalogRequestPrincipal {
 fn install_table_catalog_s3_request_info(req: &mut AdminRequest, principal: &TableCatalogRequestPrincipal) -> S3Result<()> {
     if req.req_info().is_none() {
         let _ = req.install_req_info(ReqInfo {
-            region: req
-                .region()
-                .map(str::parse)
-                .transpose()
-                .map_err(|_| table_catalog_internal_error("invalid table catalog request region"))?,
+            // MUTATION M1: the owned request's region is dropped.
+            region: None,
             ..Default::default()
         });
     }
