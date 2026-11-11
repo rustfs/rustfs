@@ -94,6 +94,8 @@ pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;
 pub(crate) mod kms_rekey;
+#[cfg(feature = "bucket-engines")]
+pub mod kvcache_engine;
 pub mod license;
 pub mod memory_observability;
 pub mod module_switches;

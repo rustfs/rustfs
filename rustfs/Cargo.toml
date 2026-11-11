@@ -75,6 +75,8 @@ connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# Registers the `kv-cache` bucket engine (rustfs-kvcache store core).
+bucket-engines = ["dep:rustfs-kvcache"]
 # Registers the node-local, non-durable `memory` bucket engine (tests and
 # benchmarks of the bucket engine framework; single-node deployments only).
 bucket-engine-memory = []
@@ -276,6 +278,7 @@ rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-bucket-engine = { workspace = true }
+rustfs-kvcache = { workspace = true, optional = true }
 rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-storage-api = { workspace = true }

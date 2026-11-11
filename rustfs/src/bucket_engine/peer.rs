@@ -208,6 +208,24 @@ pub(crate) async fn call_all_peers(call: PeerCall, timeout: Duration) -> Vec<Pee
     .await
 }
 
+/// Sends `call` to the peer whose identity is `node` (its `host:port`) and
+/// returns its answer. An unknown or unreachable peer answers `Unavailable`.
+#[cfg(feature = "bucket-engines")]
+pub(crate) async fn call_peer(node: &str, call: PeerCall, timeout: Duration) -> EngineResult<Bytes> {
+    let notification_sys = get_global_notification_sys()
+        .ok_or_else(|| EngineError::Unavailable(format!("peer {node} is unreachable: no peer clients")))?;
+    let client = notification_sys
+        .peer_clients
+        .iter()
+        .flatten()
+        .find(|client| client.host.to_string() == node)
+        .ok_or_else(|| EngineError::Unavailable(format!("peer {node} is not configured")))?;
+    match client.engine_call(call.into_request(), timeout).await {
+        Ok(response) => result(response),
+        Err(err) => Err(EngineError::Unavailable(format!("peer {node}: {err}"))),
+    }
+}
+
 /// Refuses a binding unless every peer reports the engine. A peer that does
 /// not answer, or an older peer without engine calls, cannot serve the
 /// bucket's requests and would see an empty object bucket instead.

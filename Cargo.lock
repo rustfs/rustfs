@@ -9834,6 +9834,7 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
+ "rustfs-kvcache",
  "rustfs-license",
  "rustfs-lock",
  "rustfs-log-analyzer",
@@ -10536,6 +10537,18 @@ dependencies = [
  "uuid",
  "vaultrs",
  "zeroize",
+]
+
+[[package]]
+name = "rustfs-kvcache"
+version = "1.0.5"
+dependencies = [
+ "crc-fast",
+ "libc",
+ "parking_lot 0.13.0",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -71,6 +71,12 @@ pub(crate) fn init_bucket_engine_runtime() -> bool {
     if let Some(environment) = environment::environment_from_endpoints() {
         registry.set_environment(std::sync::Arc::new(environment));
     }
+    #[cfg(feature = "bucket-engines")]
+    if let Some(environment) = registry.environment() {
+        // The kv-cache engine places entries on this node's drives; a
+        // process without local drives cannot host it.
+        registry.register_engine(std::sync::Arc::new(crate::kvcache_engine::KvCacheEngine::new(environment)));
+    }
     #[cfg(feature = "bucket-engine-memory")]
     registry.register_engine(std::sync::Arc::new(memory::MemoryEngine::new()));
     storage_api::register_bucket_config_subscriber(

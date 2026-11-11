@@ -43,6 +43,11 @@ mod imp {
         SERVER.set(server).is_ok()
     }
 
+    #[cfg(feature = "bucket-engines")]
+    pub(crate) fn server() -> Option<Arc<NixlServer>> {
+        SERVER.get().cloned()
+    }
+
     /// The transfer a request asks for: `None` without NIXL headers, when the
     /// RDMA service is not running, or when the token is malformed (the
     /// request is then served over HTTP, as for object buckets).
@@ -68,6 +73,8 @@ mod imp {
 
 #[cfg(all(feature = "nixl", target_os = "linux"))]
 pub(crate) use imp::set_server;
+#[cfg(all(feature = "nixl", target_os = "linux", feature = "bucket-engines"))]
+pub(crate) use imp::{server, token};
 
 /// The RDMA transfer a request asks for, when the RDMA service runs.
 pub(crate) fn transfer_from_headers(headers: &HeaderMap) -> Option<RdmaTransfer> {

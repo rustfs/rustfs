@@ -4,7 +4,7 @@
 
 ## Problem
 
-Every bucket is served by one global object store, `ECStore`, reached through `AppContext::object_store` from the S3 use cases in `rustfs/src/storage/s3_api/mod.rs`. Behaviour that differs per bucket is hand-wired: table buckets, on-demand migration, the per-bucket ETag algorithm, per-bucket durability, and lockless cache buckets each add their own metadata field, flag checks across handlers, publication code, and admin routes. That works for flags, but not for a bucket whose data lives in a different store with different operations, such as an LLM KV cache. Without a framework, the second such bucket kind would repeat the scatter at a larger scale.
+Every bucket is served by one global object store, `ECStore`, reached through `AppContext::object_store` from the S3 use cases in `rustfs/src/storage/s3_api/mod.rs`. Behaviour that differs per bucket is hand-wired: table buckets, on-demand migration, the per-bucket ETag algorithm, per-bucket durability, and lockless cache buckets each add their own metadata field, flag checks across handlers, publication code, and admin routes. That works for flags, but not for a bucket whose data lives in a different store with different operations, such as an LLM KV cache ([kv-cache-buckets.md](kv-cache-buckets.md)). Without a framework, the second such bucket kind would repeat the scatter at a larger scale.
 
 A bucket engine is a built-in implementation that owns a bucket's data plane. The framework gives an engine a stable place to plug in for configuration, request dispatch, custom operations, internode calls, local storage, background work, and bucket lifecycle, while authentication, authorization, bucket metadata, and IAM stay where they are.
 
