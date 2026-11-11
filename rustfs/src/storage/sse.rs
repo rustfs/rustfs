@@ -3215,18 +3215,11 @@ async fn apply_managed_decryption_material_inner(
     // The one shape that cannot name its provider is a backend-native blob
     // stored without an envelope. It is offered to the KMS only when the
     // local provider could not have written those bytes and the active
-    // backend is one whose released versions persisted them that way. A
-    // MinIO sealed key keeps its own route below: its data key is opaque
-    // bytes as well, but sealed under the static master key.
-    let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
-        kms_sse_dek_provider().await?
-    } else if minio_sealed_key.is_none()
-        && !is_local_sse_dek(&encrypted_data_key)
-        && let Some(kms_provider) = bare_data_key_kms_provider().await
-    {
-        kms_provider
+    // backend is one whose released versions persisted them that way.
+    let bare_kms = if is_data_key_envelope(&encrypted_data_key) || is_local_sse_dek(&encrypted_data_key) {
+        None
     } else {
-        get_local_sse_dek_provider().await?
+        bare_data_key_kms_provider().await
     };
     // A MinIO sealed key alone does not mean MinIO wrote the object: RustFS's own
     // writer fills MinIO's metadata slots too, while still storing a RustFS
@@ -3236,24 +3229,50 @@ async fn apply_managed_decryption_material_inner(
     // recognizing RustFS positively — and treating only the remainder as MinIO —
     // keeps a RustFS envelope from ever reaching MinIO's decoder.
     #[cfg(feature = "rio-v2")]
-    let decrypted_data_key = if minio_sealed_key.is_some() && !is_rustfs_managed_data_key(&encrypted_data_key) {
-        provider
-            .decrypt_minio_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-            .await
-    } else if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
-        provider
-            .decrypt_legacy_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-            .await
+    let unenveloped_sealed_dek = if minio_sealed_key.is_some() && !is_rustfs_managed_data_key(&encrypted_data_key) {
+        Some(
+            decrypt_unenveloped_sealed_dek(
+                bare_kms.clone(),
+                get_local_sse_dek_provider().await,
+                &encrypted_data_key,
+                &kms_key_id,
+                &object_context,
+            )
+            .await?,
+        )
     } else {
-        provider
-            .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-            .await
+        None
     };
     #[cfg(not(feature = "rio-v2"))]
-    let decrypted_data_key = provider
-        .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-        .await;
-    let decrypted_data_key = decrypted_data_key?;
+    let unenveloped_sealed_dek: Option<[u8; 32]> = None;
+
+    let decrypted_data_key = match unenveloped_sealed_dek {
+        Some(data_key) => data_key,
+        None => {
+            let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
+                kms_sse_dek_provider().await?
+            } else if let Some(kms_provider) = bare_kms {
+                kms_provider
+            } else {
+                get_local_sse_dek_provider().await?
+            };
+            #[cfg(feature = "rio-v2")]
+            let decrypted_data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+                provider
+                    .decrypt_legacy_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+                    .await
+            } else {
+                provider
+                    .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+                    .await
+            };
+            #[cfg(not(feature = "rio-v2"))]
+            let decrypted_data_key = provider
+                .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+                .await;
+            decrypted_data_key?
+        }
+    };
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind) = if let Some(sealed_key) = minio_sealed_key {
         (
@@ -3878,6 +3897,36 @@ fn is_local_sse_dek(encrypted_dek: &[u8]) -> bool {
     let is_base64 = |part: &str| BASE64_STANDARD.decode_to_vec(part).is_ok();
     text.split_once(':')
         .is_some_and(|(nonce, ciphertext)| is_base64(nonce) && is_base64(ciphertext))
+}
+
+/// Unwrap the data key of an object that carries a sealed object key but no
+/// RustFS envelope.
+///
+/// Two writers produce that shape, and nothing in the bytes tells them apart:
+/// MinIO, whose data key is sealed under the static master key, and a RustFS
+/// `rio-v2` build on a backend that persisted its native ciphertext bare.
+/// MinIO's sealing is authenticated, so opening it under the local master key
+/// is a proof rather than a guess: the bare blob is offered to the KMS only
+/// once that has failed, or when no local master key exists to try. Without a
+/// backend that reads bare ciphertext the MinIO route is the only one, exactly
+/// as before.
+#[cfg(feature = "rio-v2")]
+async fn decrypt_unenveloped_sealed_dek(
+    bare_kms: Option<Arc<dyn SseDekProvider>>,
+    local: Result<Arc<dyn SseDekProvider>, ApiError>,
+    encrypted_dek: &[u8],
+    kms_key_id: &str,
+    context: &ObjectEncryptionContext,
+) -> Result<[u8; 32], ApiError> {
+    let Some(kms) = bare_kms else {
+        return local?.decrypt_minio_sse_dek(encrypted_dek, kms_key_id, context).await;
+    };
+    if let Ok(local) = local
+        && let Ok(data_key) = local.decrypt_minio_sse_dek(encrypted_dek, kms_key_id, context).await
+    {
+        return Ok(data_key);
+    }
+    kms.decrypt_sse_dek(encrypted_dek, kms_key_id, context).await
 }
 
 /// The provider that unwraps KMS-wrapped data keys.
@@ -7804,8 +7853,9 @@ pub(crate) mod tests {
 
     /// Objects written by releases through 1.0.5 keep the AWS blob bare in
     /// their metadata. They are intact and must decrypt as they are, without
-    /// being rewritten.
-    #[cfg(not(feature = "rio-v2"))]
+    /// being rewritten. A `rio-v2` build stored the same bare blob beside a
+    /// sealed object key, which is the shape MinIO's own objects have, so the
+    /// route has to hold there too.
     #[tokio::test]
     async fn sse_kms_object_with_a_bare_aws_data_key_reads_back() {
         with_aws_kms_backend(|aws| async move {
@@ -7817,7 +7867,11 @@ pub(crate) mod tests {
 
             // Rebuild what those releases persisted: the same headers, with
             // the blob AWS issued in place of the envelope around it.
-            let envelope_b64 = metadata.get(INTERNAL_ENCRYPTION_KEY_HEADER).expect("stored data key").clone();
+            let envelope_b64 = metadata
+                .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+                .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER))
+                .expect("stored data key")
+                .clone();
             let envelope: serde_json::Value = serde_json::from_slice(
                 &BASE64_STANDARD
                     .decode_to_vec(&envelope_b64)
@@ -7885,6 +7939,130 @@ pub(crate) mod tests {
         .await;
 
         reset_sse_dek_provider();
+    }
+
+    /// A KMS stand-in that owns bare data keys and records what it is asked to unwrap.
+    #[cfg(feature = "rio-v2")]
+    struct BareKmsProvider {
+        data_key: [u8; 32],
+        unwrapped: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[async_trait::async_trait]
+    impl SseDekProvider for BareKmsProvider {
+        async fn generate_sse_dek(
+            &self,
+            _context: &ObjectEncryptionContext,
+            _kms_key_id: &str,
+        ) -> Result<(DataKey, Vec<u8>), ApiError> {
+            Err(ApiError::from(StorageError::other("not exercised")))
+        }
+
+        async fn decrypt_sse_dek(
+            &self,
+            encrypted_dek: &[u8],
+            _kms_key_id: &str,
+            _context: &ObjectEncryptionContext,
+        ) -> Result<[u8; 32], ApiError> {
+            self.unwrapped.lock().expect("unwrap log").push(encrypted_dek.to_vec());
+            Ok(self.data_key)
+        }
+
+        async fn reads_bare_data_key_ciphertext(&self) -> bool {
+            true
+        }
+    }
+
+    /// Seal a data key the way MinIO's builtin KMS does, in its raw layout:
+    /// `sealed || iv[16] || nonce[12]`, AES-256-GCM under `HMAC-SHA256(master, iv)`.
+    #[cfg(feature = "rio-v2")]
+    fn seal_minio_kms_data_key(data_key: &[u8; 32], master_key: &[u8; 32], context: &ObjectEncryptionContext) -> Vec<u8> {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+        use hmac::Mac;
+        let (iv, nonce) = ([0x21u8; 16], [0x42u8; 12]);
+        let mut mac = super::HmacSha256::new_from_slice(master_key).expect("hmac key");
+        mac.update(&iv);
+        let sealing_key: [u8; 32] = mac.finalize().into_bytes().into();
+        let aad = super::minio_kms_associated_data(context).expect("associated data");
+        let mut sealed = Aes256Gcm::new_from_slice(&sealing_key)
+            .expect("sealing key")
+            .encrypt(
+                &aes_gcm::Nonce::from(nonce),
+                aes_gcm::aead::Payload {
+                    msg: data_key,
+                    aad: &aad,
+                },
+            )
+            .expect("seal");
+        sealed.extend_from_slice(&iv);
+        sealed.extend_from_slice(&nonce);
+        sealed
+    }
+
+    /// A sealed object key with no RustFS envelope comes from MinIO or from a
+    /// `rio-v2` build on a backend that stored its ciphertext bare. Opening it
+    /// as MinIO's is an authenticated proof, so the genuine MinIO object keeps
+    /// its route and only the remainder reaches the KMS.
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn unenveloped_sealed_data_key_goes_to_minio_first_and_the_kms_otherwise() {
+        let context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string());
+        let master_key = [0x5Au8; 32];
+        let minio_data_key = [0x11u8; 32];
+        let minio_ciphertext = seal_minio_kms_data_key(&minio_data_key, &master_key, &context);
+        let aws_blob = vec![
+            0x01, 0x02, 0x02, 0x00, 0x78, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+        ];
+        let kms = || {
+            Arc::new(BareKmsProvider {
+                data_key: [0x22u8; 32],
+                unwrapped: std::sync::Mutex::new(Vec::new()),
+            })
+        };
+        let local =
+            || -> Result<Arc<dyn SseDekProvider>, ApiError> { Ok(Arc::new(TestSseDekProvider::new_with_key(master_key))) };
+        let no_local = || -> Result<Arc<dyn SseDekProvider>, ApiError> {
+            Err(ApiError {
+                code: S3ErrorCode::InvalidRequest,
+                message: "no local master key".to_string(),
+                source: None,
+            })
+        };
+
+        // MinIO's own object on a deployment whose backend also reads bare keys.
+        let provider = kms();
+        let data_key = super::decrypt_unenveloped_sealed_dek(Some(provider.clone()), local(), &minio_ciphertext, "key", &context)
+            .await
+            .expect("a MinIO-sealed data key must open under the local master key");
+        assert_eq!(data_key, minio_data_key);
+        assert!(
+            provider.unwrapped.lock().expect("unwrap log").is_empty(),
+            "a MinIO-sealed data key must never be sent to the KMS"
+        );
+
+        // A bare backend blob: with a local master key that cannot open it, and with none at all.
+        for local in [local(), no_local()] {
+            let provider = kms();
+            let data_key = super::decrypt_unenveloped_sealed_dek(Some(provider.clone()), local, &aws_blob, "key", &context)
+                .await
+                .expect("a bare backend blob must be unwrapped by the KMS");
+            assert_eq!(data_key, [0x22u8; 32]);
+            assert_eq!(*provider.unwrapped.lock().expect("unwrap log"), vec![aws_blob.clone()]);
+        }
+
+        // Without a backend that reads bare keys, the MinIO route is the only one.
+        let data_key = super::decrypt_unenveloped_sealed_dek(None, local(), &minio_ciphertext, "key", &context)
+            .await
+            .expect("the MinIO route is unchanged");
+        assert_eq!(data_key, minio_data_key);
+        super::decrypt_unenveloped_sealed_dek(None, local(), &aws_blob, "key", &context)
+            .await
+            .expect_err("bytes MinIO did not seal have no owner without such a backend");
+        let error = super::decrypt_unenveloped_sealed_dek(None, no_local(), &minio_ciphertext, "key", &context)
+            .await
+            .expect_err("a missing local master key is still reported as such");
+        assert_eq!((error.code, error.message.as_str()), (S3ErrorCode::InvalidRequest, "no local master key"));
     }
 
     #[test]
