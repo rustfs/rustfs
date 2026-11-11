@@ -185,6 +185,117 @@ fn charged_ops(root: &std::path::Path) -> u64 {
 
 #[tokio::test]
 #[serial]
+async fn erasure_object_metadata_preserves_child_object_namespaces() {
+    for (corrupt_parent, cached_parent) in [(false, false), (true, false), (false, true)] {
+        let (mut scanner, root) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, root.clone());
+        scanner.old_cache.info.name = "bucket".into();
+        scanner.new_cache.info.name = "bucket".into();
+        scanner.is_erasure_mode = true;
+        bind_budget(&mut scanner, &root, 1_000_000);
+
+        let namespace = format!("parent/{}/nested", Uuid::new_v4());
+        for object in ["parent", "parent/child", namespace.as_str()] {
+            write_test_object_metadata_bytes(&root, "bucket", object, &metadata_for_object_version("bucket", object, None)).await;
+        }
+        let payload = root.join("bucket/parent").join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&payload)
+            .await
+            .expect("create parent payload directory");
+        tokio::fs::write(payload.join("part.1"), b"shard")
+            .await
+            .expect("create actual payload evidence");
+        if corrupt_parent {
+            tokio::fs::write(root.join("bucket/parent/xl.meta"), b"")
+                .await
+                .expect("corrupt only the parent metadata");
+        }
+        if cached_parent {
+            scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+            scanner.old_cache.replace(
+                "bucket/parent",
+                "bucket",
+                DataUsageEntry {
+                    objects: 1,
+                    size: 1,
+                    compacted: true,
+                    ..Default::default()
+                },
+            );
+            let interval = data_usage_update_dir_cycles();
+            scanner.old_cache.info.next_cycle = u64::from(
+                (0..interval)
+                    .find(|cycle| hash_path("bucket/parent").mod_(*cycle, interval))
+                    .expect("one normal sampling cycle revisits the old parent-only cache"),
+            );
+        }
+
+        let mut into = DataUsageEntry::default();
+        scanner
+            .scan_folder(
+                CancellationToken::new(),
+                CachedFolder {
+                    name: "bucket".into(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut into,
+            )
+            .await
+            .expect("scan object and child namespaces independently");
+        let total = scanner.new_cache.size_recursive("bucket").expect("retain bucket accounting");
+        assert_eq!(total.objects, if corrupt_parent { 2 } else { 3 });
+        assert_eq!(total.size, if corrupt_parent { 2 } else { 3 });
+        assert_eq!(total.failed_objects, usize::from(corrupt_parent));
+        assert_eq!(
+            scanner.new_cache.info.failed_objects.len(),
+            usize::from(corrupt_parent),
+            "payload evidence must not invent missing parent metadata"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn erasure_object_prefix_children_keep_the_object_budget() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, root.clone());
+    scanner.old_cache.info.name = "bucket".into();
+    scanner.new_cache.info.name = "bucket".into();
+    scanner.is_erasure_mode = true;
+    bind_budget(&mut scanner, &root, 1_000_000);
+    for object in ["parent", "parent/child", "parent/other"] {
+        write_test_object_metadata(&root, "bucket", object).await;
+    }
+    let visits = metadata_visits::observe(&mut scanner);
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new_with_progress_tracking(
+        &parent,
+        crate::scanner_budget::ScannerCycleBudgetConfig {
+            max_objects: Some(2),
+            ..Default::default()
+        },
+    );
+    scanner.budget = budget.clone();
+    let result = scanner
+        .scan_folder(
+            budget.token(),
+            CachedFolder {
+                name: "bucket".into(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut DataUsageEntry::default(),
+        )
+        .await;
+    assert!(result.is_err(), "parent metadata cannot hide children or bypass their budget");
+    assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
+    assert_eq!(budget.progress().0, 2);
+    assert_eq!(visits.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+#[serial]
 async fn erasure_directory_probe_reaches_eof_across_budgeted_batches() {
     for entry_count in [0, 1, 63, 64, 65, 129] {
         let (mut scanner, root, folder) = candidate_scanner().await;
@@ -204,7 +315,10 @@ async fn erasure_directory_probe_reaches_eof_across_budgeted_batches() {
                 ctx,
                 folder,
                 &mut DataUsageEntry::default(),
-                FolderScanMode::ErasureCandidate { reuse_namespace: false },
+                FolderScanMode::ErasureCandidate {
+                    reuse_namespace: false,
+                    parent_has_metadata: false,
+                },
                 false,
             )
             .await
@@ -271,7 +385,10 @@ async fn scanner_directory_probe_budget_wait_cancels_without_rate_delay() {
             ctx.clone(),
             folder,
             &mut DataUsageEntry::default(),
-            FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            FolderScanMode::ErasureCandidate {
+                reuse_namespace: false,
+                parent_has_metadata: false,
+            },
             false,
         )
         .await;
@@ -311,7 +428,10 @@ async fn scanner_directory_probe_cancels_during_entry_budget_wait() {
             ctx.clone(),
             folder,
             &mut DataUsageEntry::default(),
-            FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            FolderScanMode::ErasureCandidate {
+                reuse_namespace: false,
+                parent_has_metadata: false,
+            },
             false,
         )
         .await;
@@ -382,7 +502,16 @@ async fn erasure_candidate_defers_metadata_until_part_classification_finishes() 
     scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
     let mut into = DataUsageEntry::default();
     let outcome = scanner
-        .scan_folder_inner(ctx, folder, &mut into, FolderScanMode::ErasureCandidate { reuse_namespace: false }, false)
+        .scan_folder_inner(
+            ctx,
+            folder,
+            &mut into,
+            FolderScanMode::ErasureCandidate {
+                reuse_namespace: false,
+                parent_has_metadata: false,
+            },
+            false,
+        )
         .await
         .expect("classify candidate");
     assert_eq!(outcome, FolderScanOutcome::ErasureData);
@@ -594,7 +723,10 @@ async fn erasure_candidate_part_symlink_is_not_data_evidence() {
             CancellationToken::new(),
             folder,
             &mut DataUsageEntry::default(),
-            FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            FolderScanMode::ErasureCandidate {
+                reuse_namespace: false,
+                parent_has_metadata: false,
+            },
             false,
         )
         .await
