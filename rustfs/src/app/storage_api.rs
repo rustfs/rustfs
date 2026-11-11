@@ -326,6 +326,10 @@ pub(crate) mod bucket {
     };
     use std::sync::Arc;
 
+    pub(crate) mod etag {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::etag::bucket_uses_xxh3_etag;
+    }
+
     pub(crate) mod lockless_cache {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
     }
@@ -1614,7 +1618,7 @@ pub(crate) mod io {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
     pub(crate) use crate::storage::storage_api::{
-        DynReader, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+        DynReader, EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
 }
 

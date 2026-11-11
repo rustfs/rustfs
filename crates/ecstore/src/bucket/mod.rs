@@ -19,6 +19,7 @@ pub mod bucket_target_sys;
 pub mod config_parse_mode;
 pub mod durability;
 pub mod error;
+pub mod etag;
 pub mod lifecycle;
 pub mod lockless_cache;
 pub mod metadata;

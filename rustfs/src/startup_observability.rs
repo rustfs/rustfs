@@ -51,7 +51,7 @@ fn configure_metric_gates(metrics_enabled: bool) {
         rustfs_utils::get_env_u64(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE, 64).max(1);
     startup_runtime_sources::set_get_stage_local_summary_enabled(local_summary_enabled);
     startup_runtime_sources::set_get_stage_local_summary_sample_rate(sample_rate);
-    let put_stage_metrics_enabled = metrics_enabled
+    let put_stage_metrics_enabled = (metrics_enabled || local_summary_enabled)
         && rustfs_utils::get_env_bool(
             rustfs_config::observability::ENV_OBS_PUT_STAGE_METRICS_ENABLED,
             rustfs_config::DEFAULT_OBS_PUT_STAGE_METRICS_ENABLED,
@@ -151,6 +151,54 @@ mod tests {
 
         startup_runtime_sources::set_metrics_enabled(previous_metrics);
         startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
+        startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
+        startup_runtime_sources::set_get_stage_local_summary_sample_rate(previous_sample_rate);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn put_stage_local_summary_requires_explicit_opt_in() {
+        let previous_metrics = rustfs_io_metrics::metrics_enabled();
+        let previous_get_stages = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_put_stages = rustfs_io_metrics::put_stage_metrics_enabled();
+        let previous_local_summary = rustfs_io_metrics::get_stage_local_summary_enabled();
+        let previous_sample_rate = rustfs_io_metrics::get_stage_local_summary_sample_rate();
+
+        temp_env::with_var(LOCAL_SUMMARY_ENV, Some("true"), || {
+            temp_env::with_var(LOCAL_SUMMARY_RATE_ENV, Some("1"), || {
+                temp_env::with_var(PUT_STAGE_ENV, None::<&str>, || {
+                    configure_metric_gates(false);
+                    assert!(!rustfs_io_metrics::put_stage_metrics_enabled());
+                });
+
+                temp_env::with_var(PUT_STAGE_ENV, Some("true"), || {
+                    configure_metric_gates(false);
+                    assert!(!rustfs_io_metrics::metrics_enabled());
+                    assert!(rustfs_io_metrics::put_stage_metrics_enabled());
+                    rustfs_io_metrics::take_get_stage_local_summary();
+
+                    rustfs_io_metrics::record_put_object_stage_duration("multipart_store_write", 2.0);
+                    rustfs_io_metrics::record_put_object_stage_duration("multipart_store_write", 4.0);
+                    rustfs_io_metrics::record_stage_duration("erasure_encode_write", 1.0);
+
+                    let rows = rustfs_io_metrics::take_get_stage_local_summary();
+                    let store_write = rows
+                        .iter()
+                        .find(|row| row.path == "put" && row.stage == "multipart_store_write")
+                        .expect("local summary should retain PUT stage observations");
+                    assert_eq!(store_write.sampled_count, 2);
+                    assert_eq!(store_write.duration_nanoseconds, 6_000_000);
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.path == "internal" && row.stage == "erasure_encode_write")
+                    );
+                });
+            });
+        });
+
+        startup_runtime_sources::set_metrics_enabled(previous_metrics);
+        startup_runtime_sources::set_get_stage_metrics_enabled(previous_get_stages);
+        startup_runtime_sources::set_put_stage_metrics_enabled(previous_put_stages);
         startup_runtime_sources::set_get_stage_local_summary_enabled(previous_local_summary);
         startup_runtime_sources::set_get_stage_local_summary_sample_rate(previous_sample_rate);
     }

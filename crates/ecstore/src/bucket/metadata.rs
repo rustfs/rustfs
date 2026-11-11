@@ -390,6 +390,7 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
+pub const BUCKET_ETAG_CONFIG: &str = "etag.json";
 pub const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = "on-demand-migration.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
@@ -581,6 +582,7 @@ pub struct BucketMetadata {
     pub table_bucket_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
     pub on_demand_migration_config_json: Vec<u8>,
+    pub etag_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -603,6 +605,7 @@ pub struct BucketMetadata {
     pub table_bucket_config_updated_at: OffsetDateTime,
     pub durability_config_updated_at: OffsetDateTime,
     pub on_demand_migration_config_updated_at: OffsetDateTime,
+    pub etag_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -657,6 +660,7 @@ impl Default for BucketMetadata {
             table_bucket_config_json: Default::default(),
             durability_config_json: Default::default(),
             on_demand_migration_config_json: Default::default(),
+            etag_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -678,6 +682,7 @@ impl Default for BucketMetadata {
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             on_demand_migration_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            etag_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -804,6 +809,29 @@ impl BucketMetadata {
         }
     }
 
+    /// Parsed per-bucket ETag algorithm, if one is stored. Invalid payloads
+    /// keep MD5 ETags after logging a parse failure.
+    pub fn etag_config(&self) -> Option<super::etag::BucketEtagConfig> {
+        if self.etag_config_json.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice(&self.etag_config_json) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(
+                    event = "bucket_metadata_parse_failed",
+                    component = "ecstore",
+                    subsystem = "bucket_metadata",
+                    bucket = %self.name,
+                    config = "etag",
+                    error = %e,
+                    "Failed to parse bucket metadata config"
+                );
+                None
+            }
+        }
+    }
+
     /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn decode_from<R: Read>(&mut self, rd: &mut R) -> Result<()> {
         let mut fields = rmp::decode::read_map_len(rd)?;
@@ -864,6 +892,7 @@ impl BucketMetadata {
                 "OnDemandMigrationConfigJSON" | "OnDemandMigrationConfigJson" => {
                     self.on_demand_migration_config_json = read_msgp_bin(rd)?
                 }
+                "EtagConfigJSON" | "EtagConfigJson" => self.etag_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -874,6 +903,7 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
+                "EtagConfigUpdatedAt" => self.etag_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketCreationCommitted" => {
                     self.bucket_creation_committed = read_msgp_bool(rd)?;
                     self.bucket_creation_commit_record_present = true;
@@ -892,8 +922,8 @@ impl BucketMetadata {
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
         // Preserve the absence of a legacy commit record across config rewrites.
         let commit_record_present = self.bucket_creation_commit_record_present || self.bucket_creation_committed;
-        // Map size: MinIO fields (25) + RustFS extensions (21) + optional commit record.
-        let map_len: u32 = 46 + u32::from(commit_record_present);
+        // Map size: MinIO fields (25) + RustFS extensions (23) + optional commit record.
+        let map_len: u32 = 48 + u32::from(commit_record_present);
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -954,6 +984,7 @@ impl BucketMetadata {
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
         write_bin_field(wr, "OnDemandMigrationConfigJSON", &self.on_demand_migration_config_json)?;
+        write_bin_field(wr, "EtagConfigJSON", &self.etag_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -974,6 +1005,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
+        rmp::encode::write_str(wr, "EtagConfigUpdatedAt")?;
+        write_msgp_time(wr, self.etag_config_updated_at)?;
         if commit_record_present {
             rmp::encode::write_str(wr, "BucketCreationCommitted")?;
             rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
@@ -1081,6 +1114,9 @@ impl BucketMetadata {
         }
         if self.on_demand_migration_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.on_demand_migration_config_updated_at = self.created
+        }
+        if self.etag_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.etag_config_updated_at = self.created
         }
     }
 
@@ -1227,6 +1263,10 @@ impl BucketMetadata {
             BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
                 self.on_demand_migration_config_json = data;
                 self.on_demand_migration_config_updated_at = updated;
+            }
+            BUCKET_ETAG_CONFIG => {
+                self.etag_config_json = data;
+                self.etag_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -2720,6 +2760,28 @@ mod test {
 
     /// HP-5b (rustfs/backlog#938): the durability override is a RustFS
     /// extension entry and must survive an encode/decode round trip.
+    #[test]
+    fn etag_config_round_trips_and_tracks_updates() {
+        let mut bm = BucketMetadata::new("etag-bucket");
+        assert!(bm.etag_config().is_none());
+        bm.update_config(BUCKET_ETAG_CONFIG, br#"{"algorithm":"xxh3"}"#.to_vec())
+            .expect("set etag config");
+        assert_ne!(bm.etag_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+        assert!(bm.etag_config().expect("parsed").uses_xxh3());
+
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().expect("marshal")).expect("unmarshal");
+        assert_eq!(back.etag_config_json, bm.etag_config_json);
+        assert_eq!(back.etag_config_updated_at.unix_timestamp(), bm.etag_config_updated_at.unix_timestamp());
+        // The durability entry is independent of the ETag entry.
+        assert!(back.durability_config_json.is_empty());
+
+        bm.update_config(BUCKET_ETAG_CONFIG, Vec::new()).expect("clear etag config");
+        assert!(bm.etag_config().is_none());
+
+        bm.etag_config_json = b"not-json".to_vec();
+        assert!(bm.etag_config().is_none(), "garbage must keep MD5 ETags");
+    }
+
     #[test]
     fn durability_config_round_trips_and_tracks_updates() {
         let mut bm = BucketMetadata::new("durability-bucket");

@@ -1347,6 +1347,12 @@ impl DefaultObjectUsecase {
             preserve_etag,
             mut origin,
         } = write;
+        // Objects without Content-MD5 take the bucket's ETag algorithm.
+        let etag_algorithm = if bucket_uses_xxh3_etag(&bucket) {
+            EtagAlgorithm::Xxh3
+        } else {
+            EtagAlgorithm::Md5
+        };
         let PutObjectSseInput {
             server_side_encryption,
             ssekms_key_id,
@@ -1711,7 +1717,8 @@ impl DefaultObjectUsecase {
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
-                HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
+                HashReader::from_stream_with_etag(body, size, size, md5hex.take(), sha256hex.take(), false, etag_algorithm)
+                    .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
@@ -1738,7 +1745,8 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let reader =
-                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                    HashReader::from_stream_with_etag(eager_body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                        .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_hash_reader_setup_zero_copy",
                     hash_reader_stage_start,
@@ -1760,8 +1768,16 @@ impl DefaultObjectUsecase {
                         eager_read_stage_start,
                     );
                     let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    let reader = HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?;
+                    let reader = HashReader::from_stream_with_etag(
+                        eager_body,
+                        size,
+                        actual_size,
+                        md5hex,
+                        sha256hex,
+                        false,
+                        etag_algorithm,
+                    )
+                    .map_err(ApiError::from)?;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_hash_reader_setup_small_direct",
                         hash_reader_stage_start,
@@ -1782,8 +1798,16 @@ impl DefaultObjectUsecase {
                     );
                     let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_reader = PooledBufferReader::new(eager_body, body_size as usize);
-                    let reader = HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?;
+                    let reader = HashReader::from_stream_with_etag(
+                        eager_reader,
+                        size,
+                        actual_size,
+                        md5hex,
+                        sha256hex,
+                        false,
+                        etag_algorithm,
+                    )
+                    .map_err(ApiError::from)?;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_hash_reader_setup_small_pooled",
                         hash_reader_stage_start,
@@ -1796,8 +1820,8 @@ impl DefaultObjectUsecase {
                     buffer_size,
                     StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                 );
-                let reader =
-                    HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                let reader = HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                    .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_reader_prepare_streaming",
                     streaming_reader_stage_start,
