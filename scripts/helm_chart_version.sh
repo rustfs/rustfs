@@ -17,12 +17,7 @@ case "$RAW" in
 esac
 
 APP_VERSION="${RAW_TAG#v}"
-BETA_NUM=$(printf '%s\n' "$APP_VERSION" | sed -n -E 's/^.*-beta\.([0-9]+)$/\1/p')
-if [ -n "$BETA_NUM" ]; then
-  CHART_VERSION="0.${BETA_NUM}.0"
-else
-  CHART_VERSION="$APP_VERSION"
-fi
+CHART_VERSION="$APP_VERSION"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {

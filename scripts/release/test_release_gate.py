@@ -111,7 +111,22 @@ class GateFixtureTests(unittest.TestCase):
         self.assertEqual(summary["findings"], [])
         expansion = json.loads((self.output / "pass" / "plan-expansion.json").read_text())
         self.assertEqual(len(expansion["required_cases"]), 5)
-        promote = run_promote(self.output / "pass")
+        import hashlib
+        artifact = self.output / ARTIFACT_NAME
+        artifact.write_bytes(b"release gate contract payload\n")
+        candidate = json.loads(CANDIDATE.read_text())
+        old_sha = candidate["deliverables"][0]["sha256"]
+        new_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        candidate["deliverables"][0].update(sha256=new_sha, size=artifact.stat().st_size)
+        candidate_path = self.output / "candidate.json"
+        candidate_path.write_text(json.dumps(candidate))
+        results = self.output / "actual-results"
+        results.mkdir()
+        for path in (FIXTURES / "pass").glob("*.json"):
+            (results / path.name).write_text(path.read_text().replace(old_sha, new_sha))
+        result = run_validate(results, self.output / "actual-certification", candidate=candidate_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        promote = run_promote(self.output / "actual-certification", candidate=candidate_path, artifact=artifact)
         self.assertEqual(promote.returncode, 0, promote.stderr)
 
     def test_cross_platform_same_case_and_split_shas_accepted(self):
@@ -306,70 +321,23 @@ class PlanContractTests(unittest.TestCase):
 
 
 class PublicationWiringTests(unittest.TestCase):
-    """Static checks that the real publication exits consume the gate."""
+    """The publisher re-runs full certification over trusted downloaded receipts."""
 
-    def read(self, relative):
-        return (ROOT / relative).read_text()
+    def test_single_publisher_revalidates_the_complete_seal(self):
+        source = (ROOT / "scripts/release/publish.py").read_text()
+        self.assertIn('pipeline.certify(inputs, directory,', source)
+        self.assertIn('"full")', source)
+        self.assertIn('summary["publish_allowed"]', source)
+        self.assertIn('pipeline.verify_deliveries(inputs, directory)', source)
+        workflow = (ROOT / ".github/workflows/release-publish.yml").read_text()
+        self.assertIn('environment: release-publication', workflow)
+        self.assertIn('needs: [verify, version]', workflow)
 
-    def job_block(self, workflow, job):
-        match = re.search(
-            rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z#])",
-            workflow,
-            re.S | re.M,
-        )
-        self.assertIsNotNone(match, f"job {job} not found")
-        return match.group(1)
-
-    def test_build_publish_requires_certification(self):
-        workflow = self.read(".github/workflows/build.yml")
-        self.assertIn("\n  release-certification:", workflow)
-        publish_block = self.job_block(workflow, "publish-release")
-        self.assertIn("release-certification", publish_block)
-        self.assertIn("release_gate.py validate", workflow)
-        self.assertIn("release_gate.py verify-promotion", workflow)
-
-    def test_build_time_official_r2_writes_are_staged(self):
-        workflow = self.read(".github/workflows/build.yml")
-        self.assertIn("artifacts/rustfs/staging/", workflow)
-        release_writes = [
-            line for line in workflow.splitlines()
-            if "artifacts/rustfs/release/" in line
-        ]
-        # Only the certification-gated promotion job may write the official path.
-        self.assertTrue(release_writes, "the promotion job must write the official R2 path")
-        promotion_block = self.job_block(workflow, "promote-release-artifacts")
-        self.assertIn("verify-promotion", promotion_block)
-        self.assertIn("artifacts/rustfs/release/", promotion_block)
-        build_block = self.job_block(workflow, "build-rustfs")
-        self.assertNotIn('R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"', build_block)
-
-    def test_downstream_workflows_verify_certification(self):
-        docker = self.read(".github/workflows/docker.yml")
-        self.assertIn("\n  release-certification:", docker)
-        build_docker_block = self.job_block(docker, "build-docker")
-        self.assertIn("release-certification", build_docker_block)
-        self.assertIn("verify-promotion", docker)
-        package = self.read(".github/workflows/package.yml")
-        self.assertIn("\n  release-certification:", package)
-        package_block = self.job_block(package, "package")
-        self.assertIn("release-certification", package_block)
-        helm = self.read(".github/workflows/helm-package.yml")
-        self.assertIn("\n  release-certification:", helm)
-        helm_block = self.job_block(helm, "build-helm-package")
-        self.assertIn("release-certification", helm_block)
-
-    def test_manual_downstream_dispatch_without_certification_fails(self):
-        # Every downstream certification job must fail closed when the trusted
-        # certification artifact is absent (e.g. a manual dispatch without one).
-        for relative in (
-            ".github/workflows/docker.yml",
-            ".github/workflows/package.yml",
-            ".github/workflows/helm-package.yml",
-        ):
-            workflow = self.read(relative)
-            certification_block = self.job_block(workflow, "release-certification")
-            self.assertIn("fail", certification_block.lower(), relative)
-            self.assertIn("release-certification", certification_block, relative)
+    def test_builders_do_not_have_publication_permissions(self):
+        for name in ("build.yml", "docker.yml", "package.yml", "helm-package.yml"):
+            source = (ROOT / ".github/workflows" / name).read_text()
+            self.assertNotIn("contents: write", source)
+            self.assertNotIn("packages: write", source)
 
 
 if __name__ == "__main__":
