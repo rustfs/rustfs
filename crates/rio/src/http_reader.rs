@@ -716,7 +716,8 @@ async fn get_http_client<const DIRECT: bool>(url: &str) -> io::Result<Client> {
     // the full PEM + identity bytes when the TLS state hasn't changed.
     let generation = crate::http_runtime_sources::outbound_tls_generation();
 
-    let previous = http_client_cache::<DIRECT>().load_full();
+    let cache = const { http_client_cache::<DIRECT>() };
+    let previous = cache.load_full();
     if let Some(cached) = previous.as_ref() {
         if cached.generation == generation {
             return Ok(cached.client_for(disable_proxy));
@@ -760,7 +761,7 @@ async fn get_http_client<const DIRECT: bool>(url: &str) -> io::Result<Client> {
     // Guard against races: only overwrite the cache if it is empty or contains an
     // older generation, so a slower task cannot regress the TLS state after a
     // faster task already cached a newer generation.
-    http_client_cache::<DIRECT>().rcu(|current| match current {
+    cache.rcu(|current| match current {
         Some(existing) if existing.generation > generation => Some(existing.clone()),
         _ => Some(cached.clone()),
     });

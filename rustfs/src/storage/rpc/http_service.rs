@@ -1688,18 +1688,18 @@ async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> 
     .map_err(Into::into)
 }
 
-async fn write_authenticated_put_file<S, E>(
+fn write_authenticated_put_file<S, E>(
     disk: &DiskStore,
     body: S,
     query: &PutFileQuery,
     nonce: uuid::Uuid,
     url: &str,
-) -> Result<u64, (&'static str, BoxError)>
+) -> impl Future<Output = Result<u64, (&'static str, BoxError)>>
 where
     S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
     E: Into<BoxError>,
 {
-    write_staged_put_file(disk, body, query, StagedWriteAuth::Signed { nonce, url }).await
+    write_staged_put_file(disk, body, query, StagedWriteAuth::Signed { nonce, url })
 }
 
 #[derive(Clone, Copy)]
