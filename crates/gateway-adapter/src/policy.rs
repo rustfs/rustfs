@@ -28,7 +28,7 @@
 //! Every refusal is a [`PolicyError`] with a constant label and nothing from IAM or the request:
 //! IAM not ready, not initialized, or failing, or root credentials not initialized, is
 //! [`PolicyError::unavailable`]; a principal IAM no longer knows is [`UNKNOWN_PRINCIPAL`]; a
-//! disabled one, or one whose secret is shorter than [`MIN_SECRET_KEY_LEN`], is
+//! disabled one, or one whose secret fails the effective-length rule, is
 //! [`DISABLED_PRINCIPAL`]; an identity
 //! whose credential kind disagrees with IAM's record is [`SESSION_MISMATCH`]; a token whose claims
 //! cannot be read is [`PolicyError::malformed`]. None of them is ever an empty snapshot: an empty
@@ -56,7 +56,7 @@ use rustfs_policy::auth::ACCOUNT_OFF;
 use serde_json::Value;
 
 use crate::credentials::IamKeyLookup;
-use crate::root::{MIN_SECRET_KEY_LEN, RootCredentials, RootSource};
+use crate::root::{RootCredentials, RootSource, is_usable_secret};
 
 /// [`PolicyError`] label: IAM does not know the authenticated principal (any longer).
 pub const UNKNOWN_PRINCIPAL: &str = "unknown-principal";
@@ -217,7 +217,7 @@ impl IamPolicySource {
             Ok((None, _)) => return Err(PolicyError::because(UNKNOWN_PRINCIPAL)),
             Err(error) => return Err(classify_iam_error(&error)),
         };
-        if cred.status == ACCOUNT_OFF || cred.secret_key.len() < MIN_SECRET_KEY_LEN {
+        if cred.status == ACCOUNT_OFF || !is_usable_secret(cred.secret_key.as_bytes()) {
             return Err(PolicyError::because(DISABLED_PRINCIPAL));
         }
 
@@ -617,14 +617,22 @@ mod tests {
     /// Negative — a valid-flagged identity whose secret is empty or short gets no snapshot.
     #[tokio::test]
     async fn policy_short_secret_principal_is_refused() {
-        for weak in ["", "1234567"] {
+        for weak in ["", "1234567", "\0\0\0\0\0\0\0\0", "abc\0\0\0\0\0"] {
             let iam = fake(true, move || {
                 let mut cred = user();
                 cred.secret_key = weak.to_owned();
                 found(cred)
             });
             let error = refusal(source(iam).snapshot(Some(&long_term(ACCESS_KEY))).await);
-            assert_eq!(error, PolicyError::because(DISABLED_PRINCIPAL), "{} bytes", weak.len());
+            assert_eq!(error, PolicyError::because(DISABLED_PRINCIPAL), "{weak:?}");
+        }
+        for usable in ["12345678", "abc\0defg"] {
+            let iam = fake(true, move || {
+                let mut cred = user();
+                cred.secret_key = usable.to_owned();
+                found(cred)
+            });
+            assert!(payload(&principal_of(&source(iam), &long_term(ACCESS_KEY)).await).kind() == PrincipalKind::User);
         }
     }
 
@@ -693,23 +701,41 @@ mod tests {
         assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
     }
 
-    /// Positive and negative — the two adapters assembled together read one root source: a root
-    /// change is seen by both on the next request, the old root key stops being root to both, and
-    /// clearing the source makes both unavailable.
+    type LiveRoot = Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+    /// The primary path: a source that reads a live accessor on every call, as the binary's does,
+    /// with nothing cached in between.
+    fn live_root_source(live: &LiveRoot) -> Arc<dyn RootSource> {
+        let accessor = live.clone();
+        Arc::new(move || {
+            let guard = accessor.lock().ok()?;
+            let (access_key, secret_key) = guard.as_ref()?;
+            RootCredentials::new(access_key, secret_key, SIGNING_KEY).ok().map(Arc::new)
+        })
+    }
+
+    fn set_live(live: &LiveRoot, value: Option<(&str, &str)>) {
+        *live.lock().expect("live root lock") = value.map(|(ak, sk)| (ak.to_owned(), sk.to_owned()));
+    }
+
+    /// Positive and negative — the two adapters read one live root accessor: a root change is seen
+    /// by both on the next request with no second step, the old root key stops being root to
+    /// both, and an uninitialized or unusable root makes both unavailable.
     #[tokio::test]
     async fn adapters_share_one_live_root() {
         use rustfs_gateway::{CredentialLookup, CredentialProvider, ProviderError};
 
-        let cell = Arc::new(RootCell::new(Some(root())));
+        let live: LiveRoot = Arc::default();
+        set_live(&live, Some((ROOT_ACCESS_KEY, ROOT_SECRET)));
         let iam = fake(true, || Ok((None, false)));
-        let adapters = crate::IamAdapters::new(iam, cell.clone());
+        let adapters = crate::IamAdapters::new(iam, live_root_source(&live));
 
         let found = adapters.credentials.lookup(ROOT_ACCESS_KEY).await;
         assert!(matches!(found, Ok(CredentialLookup::Found(_))));
         let snapshot = principal_of(&adapters.policy, &long_term(ROOT_ACCESS_KEY)).await;
         assert!(payload(&snapshot).is_owner());
 
-        cell.set(RootCredentials::new("newroot", "new-root-secret-01", SIGNING_KEY).expect("valid root credentials"));
+        set_live(&live, Some(("newroot", "new-root-secret-01")));
         match adapters.credentials.lookup("newroot").await {
             Ok(CredentialLookup::Found(credentials)) => assert_eq!(credentials.secret().expose(), b"new-root-secret-01"),
             _ => panic!("the new root key must resolve to the new secret"),
@@ -722,11 +748,32 @@ mod tests {
         let old = refusal(adapters.policy.snapshot(Some(&long_term(ROOT_ACCESS_KEY))).await);
         assert_eq!(old, PolicyError::because(UNKNOWN_PRINCIPAL));
 
-        cell.clear();
-        assert!(matches!(adapters.credentials.lookup("newroot").await, Err(ProviderError::Unavailable)));
-        assert_eq!(
-            refusal(adapters.policy.snapshot(Some(&long_term("newroot"))).await),
-            PolicyError::unavailable()
-        );
+        for unusable in [None, Some(("newroot", "\0\0\0\0\0\0\0\0"))] {
+            set_live(&live, unusable);
+            assert!(matches!(adapters.credentials.lookup("newroot").await, Err(ProviderError::Unavailable)));
+            assert_eq!(
+                refusal(adapters.policy.snapshot(Some(&long_term("newroot"))).await),
+                PolicyError::unavailable()
+            );
+        }
+    }
+
+    /// Positive — `install` builds the authenticator exactly once, over a provider that reads the
+    /// pair's root source.
+    #[tokio::test]
+    async fn adapters_install_hands_over_the_paired_provider_once() {
+        use rustfs_gateway::{CredentialLookup, CredentialProvider, RegionSet, ServiceBuilder, SigV4Authenticator};
+
+        let live: LiveRoot = Arc::default();
+        set_live(&live, Some((ROOT_ACCESS_KEY, ROOT_SECRET)));
+        let adapters = crate::IamAdapters::new(fake(true, || Ok((None, false))), live_root_source(&live));
+        let mut handed = Vec::new();
+        let _builder = adapters.install(ServiceBuilder::new(), |provider| {
+            handed.push(provider.clone());
+            SigV4Authenticator::new(provider, RegionSet::new(["us-east-1"]).expect("a region"))
+        });
+        assert_eq!(handed.len(), 1);
+        let found = handed[0].lookup(ROOT_ACCESS_KEY).await;
+        assert!(matches!(found, Ok(CredentialLookup::Found(_))));
     }
 }

@@ -25,8 +25,9 @@
 //!
 //! Secrets travel only inside the gateway's [`Credentials`], whose `Debug` redacts them. No type
 //! in this module derives or implements `Debug`, and no error produced here carries text: the
-//! IAM error is classified and dropped. A secret shorter than [`MIN_SECRET_KEY_LEN`] is never
-//! handed to the gateway, whatever the lookup says about its validity.
+//! IAM error is classified and dropped. A secret that fails the crate's effective-length rule
+//! (`crate::MIN_SECRET_KEY_LEN` bytes once trailing NULs are removed) is never handed to the
+//! gateway, whatever the lookup says about its validity.
 
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::auth::{ACCOUNT_OFF, UserIdentity};
 
-use crate::root::{MIN_SECRET_KEY_LEN, RootSource};
+use crate::root::{RootSource, is_usable_secret};
 
 /// The opaque issuer recorded in the [`rustfs_gateway::SessionBinding`] of every RustFS STS
 /// credential.
@@ -109,7 +110,7 @@ impl IamCredentials {
         match self.iam.check_key(access_key).await {
             // IAM refuses such a secret through `valid`, but this provider does not rely on every
             // lookup doing so: a short secret is never usable, so it is not a credential at all.
-            Ok((Some(identity), _)) if identity.credentials.secret_key.len() < MIN_SECRET_KEY_LEN => {
+            Ok((Some(identity), _)) if !is_usable_secret(identity.credentials.secret_key.as_bytes()) => {
                 Ok(CredentialLookup::NotFound)
             }
             Ok((Some(identity), valid)) => to_gateway_credentials(access_key, &identity, valid).map(CredentialLookup::Found),
@@ -386,14 +387,23 @@ mod tests {
     /// trusted: such a secret is not a credential, so the key is `NotFound`, never `Found`.
     #[tokio::test]
     async fn credentials_short_secret_is_never_found() {
-        for weak in ["", "1234567"] {
+        for weak in ["", "1234567", "\0\0\0\0\0\0\0\0", "abc\0\0\0\0\0"] {
             let iam = fake(true, move || {
                 let mut cred = user("on");
                 cred.secret_key = weak.to_owned();
                 found(cred, true)
             });
             let result = lookup(iam, ACCESS_KEY).await;
-            assert!(is_not_found(&result), "{} bytes must be NotFound", weak.len());
+            assert!(is_not_found(&result), "{weak:?} must be NotFound");
+        }
+        for usable in ["12345678", "abc\0defg"] {
+            let iam = fake(true, move || {
+                let mut cred = user("on");
+                cred.secret_key = usable.to_owned();
+                found(cred, true)
+            });
+            let credentials = expect_found(lookup(iam, ACCESS_KEY).await);
+            assert_eq!(credentials.secret().expose(), usable.as_bytes());
         }
     }
 

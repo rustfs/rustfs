@@ -15,10 +15,12 @@
 //! The deployment's root credentials, as every adapter in this crate reads them.
 //!
 //! Responsible for: [`RootCredentials`], the validated root key pair plus the key STS session
-//! tokens are signed with, and [`RootSource`], the one live handle both the credential provider
-//! and the policy source read on every request ([`RootCell`] is a settable implementation).
-//! NOT responsible for: where the root keys come from or when they change; the binary owns that
-//! and publishes each change into its source.
+//! tokens are signed with; [`RootSource`], the one live handle both the credential provider and
+//! the policy source read on every request; and the effective-secret-length rule every secret in
+//! this crate is held to.
+//! NOT responsible for: where the root keys come from or when they change. The binary implements
+//! [`RootSource`] directly over its live root accessor — a closure is enough — so there is no
+//! second copy of root to keep in step.
 //! Upstream: the binary's runtime credentials. Downstream: `crate::credentials`, `crate::policy`.
 //!
 //! # Why one source
@@ -28,23 +30,41 @@
 //! answered with the root secret or judged as the owner. Both adapters therefore hold the same
 //! `Arc<dyn RootSource>`, handed to them together by [`crate::IamAdapters::new`].
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rustfs_gateway::Credentials;
 
-/// The shortest secret key, in bytes, that any credential in this crate may verify a signature
-/// with. The same bound IAM applies to its own credentials; a signature over a shorter (or empty)
-/// key is one anybody can compute.
+/// The shortest effective secret key, in bytes, that any credential in this crate may verify a
+/// signature with. The same bound IAM applies to its own credentials; a signature over a shorter
+/// (or empty) key is one anybody can compute.
 pub const MIN_SECRET_KEY_LEN: usize = 8;
+
+/// The number of bytes of `secret` a signature actually depends on: its length after trailing NUL
+/// bytes are removed.
+///
+/// HMAC pads a key shorter than its block with zero bytes, and SigV4's first key is `"AWS4"`
+/// followed by the secret, so trailing NULs add nothing: eight NUL bytes sign exactly like the
+/// empty secret, and `"abc"` followed by five NULs signs like `"abc"`. A secret of NULs only has
+/// an effective length of zero. An interior NUL is followed by real key bytes, which change the
+/// padded key, so it counts like any other byte.
+pub(crate) fn effective_secret_len(secret: &[u8]) -> usize {
+    secret.iter().rposition(|byte| *byte != 0).map_or(0, |last| last + 1)
+}
+
+/// Whether `secret` may verify a signature: its [`effective_secret_len`] is at least
+/// [`MIN_SECRET_KEY_LEN`]. The one rule for root, IAM credentials and the STS signing key.
+pub(crate) fn is_usable_secret(secret: &[u8]) -> bool {
+    effective_secret_len(secret) >= MIN_SECRET_KEY_LEN
+}
 
 /// Why [`RootCredentials::new`] refused its input. Carries no input text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootCredentialsError {
     /// The access key id is not one the gateway can hold.
     InvalidAccessKey,
-    /// The root secret key is shorter than [`MIN_SECRET_KEY_LEN`].
+    /// The root secret key fails the effective-length rule.
     WeakSecretKey,
-    /// The STS token-signing key is shorter than [`MIN_SECRET_KEY_LEN`].
+    /// The STS token-signing key fails the effective-length rule.
     WeakSigningKey,
 }
 
@@ -75,13 +95,14 @@ impl RootCredentials {
     ///
     /// # Errors
     ///
-    /// [`RootCredentialsError`] when either secret is shorter than [`MIN_SECRET_KEY_LEN`] bytes or
-    /// the access key id is not one the gateway can hold.
+    /// [`RootCredentialsError`] when either secret fails the effective-length rule (fewer than
+    /// [`MIN_SECRET_KEY_LEN`] bytes once trailing NUL bytes are removed) or the access key id is not
+    /// one the gateway can hold.
     pub fn new(access_key: &str, secret_key: &str, sts_signing_key: &str) -> Result<Self, RootCredentialsError> {
-        if secret_key.len() < MIN_SECRET_KEY_LEN {
+        if !is_usable_secret(secret_key.as_bytes()) {
             return Err(RootCredentialsError::WeakSecretKey);
         }
-        if sts_signing_key.len() < MIN_SECRET_KEY_LEN {
+        if !is_usable_secret(sts_signing_key.as_bytes()) {
             return Err(RootCredentialsError::WeakSigningKey);
         }
         let credentials =
@@ -108,40 +129,53 @@ impl RootCredentials {
 }
 
 /// The live root credentials, read on every request by both adapters.
+///
+/// The binary implements it directly over RustFS's live root accessor, so a root change needs no
+/// second step. Any `Fn() -> Option<Arc<RootCredentials>>` is a source; for example, over the
+/// server context:
+///
+/// ```ignore
+/// let root = move || {
+///     let cred = ctx.action_credentials().get()?;
+///     let signing_key = ctx.token_signing_key()?;
+///     RootCredentials::new(&cred.access_key, &cred.secret_key, &signing_key).ok().map(Arc::new)
+/// };
+/// let adapters = IamAdapters::new(iam, Arc::new(root));
+/// ```
+///
+/// Root credentials that fail validation read as `None`, which both adapters answer as
+/// unavailable.
 pub trait RootSource: Send + Sync + 'static {
     /// The current root credentials; `None` while they are not initialized, which both adapters
     /// answer as unavailable rather than guessing.
     fn current(&self) -> Option<Arc<RootCredentials>>;
 }
 
-/// A [`RootSource`] the binary sets at startup and again on every root change.
-pub struct RootCell {
-    current: RwLock<Option<Arc<RootCredentials>>>,
+impl<F> RootSource for F
+where
+    F: Fn() -> Option<Arc<RootCredentials>> + Send + Sync + 'static,
+{
+    fn current(&self) -> Option<Arc<RootCredentials>> {
+        self()
+    }
 }
 
+/// Test helper: a [`RootSource`] holding fixed root credentials. Production code reads the live
+/// accessor instead, so that there is no copy of root to keep in step.
+#[cfg(test)]
+pub(crate) struct RootCell(Option<Arc<RootCredentials>>);
+
+#[cfg(test)]
 impl RootCell {
-    /// A cell holding `initial`.
-    #[must_use]
-    pub fn new(initial: Option<RootCredentials>) -> Self {
-        Self {
-            current: RwLock::new(initial.map(Arc::new)),
-        }
-    }
-
-    /// Replaces the root credentials; every later request reads the new ones.
-    pub fn set(&self, root: RootCredentials) {
-        *self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(root));
-    }
-
-    /// Withdraws the root credentials; every later request is unavailable until [`Self::set`].
-    pub fn clear(&self) {
-        *self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    pub(crate) fn new(root: Option<RootCredentials>) -> Self {
+        Self(root.map(Arc::new))
     }
 }
 
+#[cfg(test)]
 impl RootSource for RootCell {
     fn current(&self) -> Option<Arc<RootCredentials>> {
-        self.current.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.0.clone()
     }
 }
 
@@ -154,17 +188,27 @@ mod tests {
     /// hand out a root key anybody could sign with; eight bytes is accepted.
     #[test]
     fn root_short_secret_is_refused() {
-        for weak in ["", "1234567"] {
+        for weak in ["", "1234567", "\0\0\0\0\0\0\0\0", "abc\0\0\0\0\0", "abcdefg\0"] {
             let refused = RootCredentials::new("rootadmin", weak, "signing-key-0001");
             assert!(matches!(refused, Err(RootCredentialsError::WeakSecretKey)), "{} bytes", weak.len());
         }
         assert!(RootCredentials::new("rootadmin", "12345678", "signing-key-0001").is_ok());
     }
 
+    /// Positive — an interior NUL is followed by real key bytes and counts: `"abc\0defg"` has an
+    /// effective length of eight and is accepted, as is the same secret with trailing NULs.
+    #[test]
+    fn root_interior_nul_counts_toward_length() {
+        for secret in ["abc\0defg", "abc\0defg\0\0"] {
+            assert!(RootCredentials::new("rootadmin", secret, "signing-key-0001").is_ok(), "{secret:?}");
+            assert!(RootCredentials::new("rootadmin", "root-secret-key-0001", secret).is_ok(), "{secret:?}");
+        }
+    }
+
     /// Negative — an empty or short STS signing key is refused at construction.
     #[test]
     fn root_short_signing_key_is_refused() {
-        for weak in ["", "1234567"] {
+        for weak in ["", "1234567", "\0\0\0\0\0\0\0\0", "abc\0\0\0\0\0"] {
             let refused = RootCredentials::new("rootadmin", "root-secret-key-0001", weak);
             assert!(matches!(refused, Err(RootCredentialsError::WeakSigningKey)), "{} bytes", weak.len());
         }
