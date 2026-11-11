@@ -2825,9 +2825,15 @@ impl DefaultObjectUsecase {
             rs,
         } = validated;
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
             .await
             .map_err(ApiError::from)?;
+        if is_lockless_cache_bucket(&bucket) {
+            // Content-addressed cache objects never change once written, so the
+            // read needs neither the object read lock nor a fresh metadata quorum.
+            opts.no_lock = true;
+            opts.metadata_cache_safe = true;
+        }
 
         Ok(GetObjectRequestContext {
             version_id_for_event: version_id.unwrap_or_default(),

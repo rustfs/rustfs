@@ -212,6 +212,10 @@ pub mod bucket {
         };
     }
 
+    pub mod lockless_cache {
+        pub use crate::bucket::lockless_cache::is_lockless_cache_bucket;
+    }
+
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
             BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,

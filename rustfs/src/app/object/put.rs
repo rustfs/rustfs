@@ -1597,6 +1597,17 @@ impl DefaultObjectUsecase {
             object_lock.retain_until_date,
             &mut opts,
         )?;
+        // A lockless cache bucket commits without distributed locks. Every feature
+        // those locks protect sends the PUT down the locked path instead.
+        if matches!(origin, PutObjectOrigin::S3 { .. })
+            && matches!(object_lock_config_state, metadata_sys::ObjectLockConfigState::ConfirmedAbsent)
+            && !quota_enabled
+            && !opts.versioned
+            && !opts.version_suspended
+            && version_id.is_none()
+        {
+            opts.use_lockless_cache_write(&bucket);
+        }
         let eager_put_commit_cancellation =
             (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path).then(tokio_util::sync::CancellationToken::new);
         opts.put_object_cancellation = eager_put_commit_cancellation.clone();
@@ -1916,6 +1927,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
+            opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(

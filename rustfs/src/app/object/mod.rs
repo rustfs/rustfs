@@ -26,6 +26,7 @@ use super::storage_api::object_usecase::access::{
     recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
     retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
+use super::storage_api::object_usecase::bucket::lockless_cache::is_lockless_cache_bucket;
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
