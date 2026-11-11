@@ -18,6 +18,7 @@
 //! gateway depends on it. Each module adapts one extension point to the RustFS subsystem that
 //! owns the answer.
 
+pub mod authz_audit;
 pub mod bucket_owner;
 pub mod credentials;
 pub mod host;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 
 use rustfs_gateway::{Authenticator, CredentialProvider, ServiceBuilder};
 
+pub use authz_audit::{DenialAdmission, DenialAuditSink, GatewayDenialRecord, RustfsAuthzAudit};
 pub use bucket_owner::{BucketLookup, OwnerLookupError, RustfsBucketOwners};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
 pub use host::rustfs_host_resolver;
