@@ -338,13 +338,14 @@ jobs:
               lines += [
                   f"- report: `{reports[0]}`",
                   f"- reference_side: `{side}`",
-                  f"- version_a: `{version_a}`",
-                  f"- version_b: `{version_b}`",
+                  f"- version_a: `{(version_a or '').splitlines()[0] if version_a else version_a}`",
+                  f"- version_b: `{(version_b or '').splitlines()[0] if version_b else version_b}`",
                   f"- stack_a: `{report.get('stack_a')}`, stack_b: `{report.get('stack_b')}`",
                   f"- compared_ops: {report.get('compared_ops')}, compared_cases: {report.get('compared_cases')}",
                   "",
               ]
               print(f"reference_side={side}\nversion_a={version_a}\nversion_b={version_b}")
+              lines += ["```", "version_a:", version_a or "", "", "version_b:", version_b or "", "```", ""]
               if side != "a":
                   failures.append(f"reference_side is {side!r}, expected 'a'")
               if not version_a or not version_b:
