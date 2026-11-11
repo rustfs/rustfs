@@ -4325,20 +4325,28 @@ fn take_presynced_tmp_file(file: &Path) -> bool {
     PRESYNCED_TMP_FILES.remove(file).is_some()
 }
 
-fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = file_path.parent()
-        && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
-        && let Err(err) = super::fs::create_dir_all_std(parent)
-        && err.kind() != std::io::ErrorKind::AlreadyExists
-    {
-        return Err(to_file_error(err));
-    }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(file_path)
-        .map_err(to_file_error)?;
+fn open_lazy_local_file_std(
+    file_path: &Path,
+    volume_dir: &Path,
+    _reclaim_on_shutdown: bool,
+    parent_exists: bool,
+) -> std::io::Result<std::fs::File> {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create(true).truncate(true);
+    let file = match parent_exists.then(|| open_opts.open(file_path)) {
+        Some(Ok(file)) => file,
+        Some(Err(err)) if err.kind() != std::io::ErrorKind::NotFound => return Err(to_file_error(err)),
+        _ => {
+            if let Some(parent) = file_path.parent()
+                && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
+                && let Err(err) = super::fs::create_dir_all_std(parent)
+                && err.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(to_file_error(err));
+            }
+            open_opts.open(file_path).map_err(to_file_error)?
+        }
+    };
     #[cfg(target_os = "macos")]
     if _reclaim_on_shutdown {
         let _ = set_std_fd_nocache(&file);
@@ -4353,6 +4361,7 @@ struct LazyLocalFileWriter {
     reclaim_on_shutdown: bool,
     sync_on_close: bool,
     mark_dir_presynced: bool,
+    parent_exists: bool,
     bytes_written: usize,
     state: LazyLocalFileWriterState,
 }
@@ -4373,6 +4382,7 @@ impl LazyLocalFileWriter {
         reclaim_on_shutdown: bool,
         sync_on_close: bool,
         mark_dir_presynced: bool,
+        parent_exists: bool,
     ) -> Self {
         Self {
             file_path,
@@ -4381,6 +4391,7 @@ impl LazyLocalFileWriter {
             reclaim_on_shutdown,
             sync_on_close,
             mark_dir_presynced,
+            parent_exists,
             bytes_written: 0,
             state: LazyLocalFileWriterState::Unopened,
         }
@@ -4393,12 +4404,13 @@ impl LazyLocalFileWriter {
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
         let sync_on_close = self.sync_on_close;
         let mark_dir_presynced = self.mark_dir_presynced;
+        let parent_exists = self.parent_exists;
         match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
             LazyLocalFileWriterState::Unopened => {
                 let file_path = self.file_path.clone();
                 let volume_dir = self.volume_dir.clone();
                 self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
-                    let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown)?;
+                    let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown, parent_exists)?;
                     std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
                     if close_after {
                         if sync_on_close {
@@ -4540,8 +4552,9 @@ impl AsyncWrite for LazyLocalFileWriter {
                     let file_path = self.file_path.clone();
                     let volume_dir = self.volume_dir.clone();
                     let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    let parent_exists = self.parent_exists;
                     self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
-                        open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown).map(drop)
+                        open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown, parent_exists).map(drop)
                     }));
                 }
                 LazyLocalFileWriterState::Open(file) => {
@@ -5593,11 +5606,14 @@ impl LocalIoBackend for StdBackend {
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 let mut mark_dir_presynced = false;
+                let mut parent_exists = false;
                 if let Some(parent) = file_path.parent() {
                     check_path_length(parent.to_string_lossy().as_ref())?;
+                    parent_exists = parent == volume_dir;
                     if volume == RUSTFS_META_TMP_BUCKET {
                         unmark_presynced_tmp_file(&file_path);
                         let parent_was_presynced = unmark_presynced_tmp_data_dir(parent);
+                        parent_exists |= parent_was_presynced;
                         let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
                         mark_dir_presynced = sync_on_close
                             && (file_name == "part.1"
@@ -5651,6 +5667,7 @@ impl LocalIoBackend for StdBackend {
                     reclaim_on_shutdown,
                     sync_on_close,
                     mark_dir_presynced,
+                    parent_exists,
                 )))
             }
             WriteMode::Append => {
