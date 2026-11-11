@@ -1763,7 +1763,7 @@ async fn multi_pool_scanner_cycle_zero_fills_bucket_absent_from_first_pool() {
 async fn scanner_item_object_lock_uses_cached_config() {
     let temp_dir = std::env::temp_dir();
     let cached = Arc::new(ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     });
     let item = ScannerItem {
@@ -1793,7 +1793,7 @@ async fn scanner_item_object_lock_uses_cached_config() {
 #[test]
 fn object_lock_config_enabled_accepts_enabled_only() {
     let enabled = ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     };
 
@@ -5040,21 +5040,21 @@ async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_ret
             .expect("load complete bucket cache");
         assert!(cache.info.snapshot_complete);
         // Keep an accounting context with no remote work in this local fixture.
-        let replication: ReplicationConfiguration = serde_json::from_value(serde_json::json!({
-            "role": "",
-            "rules": [{
-                "destination": { "bucket": "arn:test" },
-                "id": "status",
-                "prefix": "",
-                "priority": 1,
-                "status": "Enabled"
-            }]
+        let replication: ReplicationConfig = serde_json::from_value(serde_json::json!({
+            "config": {
+                "role": "",
+                "rules": [{
+                    "destination": { "bucket": "arn:test" },
+                    "id": "status",
+                    "prefix": "",
+                    "priority": 1,
+                    "status": "Enabled"
+                }]
+            },
+            "remotes": crate::storage_api::EcstoreBucketTargets::default(),
         }))
         .expect("decode the local replication accounting fixture");
-        cache.info.replication = Some(Arc::new(ReplicationConfig::new(
-            Some(replication),
-            Some(crate::storage_api::EcstoreBucketTargets::default()),
-        )));
+        cache.info.replication = Some(Arc::new(replication));
         // A complete compacted prefix is eligible for normal usage sampling.
         let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
         compacted.children.clear();

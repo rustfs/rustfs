@@ -344,7 +344,9 @@ mod tests {
         let server = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.expect("RPC connect");
-                let fallback = tower::service_fn(|_| async { Ok::<_, std::convert::Infallible>(http::Response::default()) });
+                let fallback = tower::service_fn(|_| async {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(rustfs_s3_types::Body::empty()))
+                });
                 let rpc = super::super::http_service::InternodeRpcService::with_external_control(fallback, Some(service.clone()));
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()

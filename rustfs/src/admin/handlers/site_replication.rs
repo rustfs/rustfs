@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
     current_deployment_id, current_iam_handle, current_object_store_handle, current_oidc_config_query, current_region,
     current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
-    object_store_from_req,
+    object_store_from_envelope,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -40,7 +41,7 @@ use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
-use crate::admin::utils::{empty_response, json_response, read_compatible_admin_body};
+use crate::admin::utils::{owned_empty_response, owned_json_response, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::site_replication::identity::{
@@ -48,12 +49,18 @@ use crate::site_replication::identity::{
     site_identity_key,
 };
 use crate::storage::storage_api::{lock_bucket_targets_metadata, with_config_object_write_lock};
+use crate::storage_api::site_replication::{format_lifecycle_date, parse_lifecycle_date};
 use base64_simd::URL_SAFE_NO_PAD;
-use futures::StreamExt;
 use http::Uri;
+use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
+use rustfs_gateway_types::persistence::{PersistedReplicationConfiguration, PersistedReplicationRule};
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::store::object::ObjectStore;
@@ -75,11 +82,7 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
-use s3s::dto::{
-    DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ObjectLockConfiguration,
-    ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
-};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -553,10 +556,10 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
 }
 
 async fn validate_site_replication_admin_request(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     action: AdminAction,
 ) -> S3Result<rustfs_credentials::Credentials> {
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 
 fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
@@ -569,9 +572,9 @@ fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials
     Ok(())
 }
 
-fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
+fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> AdminResponse {
     let data = encode_go_gob_site_netperf_node_result(value);
-    S3Response::new((StatusCode::OK, Body::from(data)))
+    AdminResponse::new(StatusCode::OK, Body::from(data))
 }
 
 fn encode_go_gob_site_netperf_node_result(value: &SiteNetPerfNodeResult) -> Vec<u8> {
@@ -659,7 +662,7 @@ async fn read_plain_admin_body(mut input: Body) -> S3Result<Vec<u8>> {
 }
 
 async fn read_site_replication_json<T: DeserializeOwned>(
-    req: S3Request<Body>,
+    req: AdminRequest,
     secret_key: &str,
     compat_encrypted: bool,
 ) -> S3Result<T> {
@@ -667,11 +670,11 @@ async fn read_site_replication_json<T: DeserializeOwned>(
     parse_site_replication_json(&body)
 }
 
-async fn read_site_replication_body(req: S3Request<Body>, secret_key: &str, compat_encrypted: bool) -> S3Result<Vec<u8>> {
+async fn read_site_replication_body(mut req: AdminRequest, secret_key: &str, compat_encrypted: bool) -> S3Result<Vec<u8>> {
     let body = if compat_encrypted {
-        read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), secret_key).await?
+        read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), secret_key).await?
     } else {
-        read_plain_admin_body(req.input).await?
+        read_plain_admin_body(req.take_body()).await?
     };
     Ok(body)
 }
@@ -806,8 +809,8 @@ fn non_negative_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
-fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
-    local_peer_at_endpoint(site_replication_local_endpoint(&req.uri, &req.headers), state)
+fn current_local_peer(req: &AdminRequest, state: &SiteReplicationState) -> PeerInfo {
+    local_peer_at_endpoint(site_replication_local_endpoint(req.uri(), req.headers()), state)
 }
 
 fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<PeerInfo> {
@@ -2453,26 +2456,25 @@ fn canonical_status_json(value: &Value) -> Value {
     }
 }
 
-fn site_replication_rule_complete(rule: &ReplicationRule, owner_deployment_id: &str) -> bool {
+fn site_replication_rule_complete(rule: &PersistedReplicationRule, owner_deployment_id: &str) -> bool {
     let delete_marker_enabled = rule
         .delete_marker_replication
         .as_ref()
         .and_then(|delete_marker| delete_marker.status.as_ref())
-        .is_some_and(|status| status == &DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED));
+        .is_some_and(|status| status == Status::ENABLED.as_str());
     let delete_enabled = rule
         .delete_replication
         .as_ref()
-        .is_some_and(|delete| delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
-    let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|existing| {
-        existing.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
-    });
+        .is_some_and(|delete| delete.status == Status::ENABLED.as_str());
+    let existing_object_enabled = rule
+        .existing_object_replication
+        .as_ref()
+        .is_some_and(|existing| existing.status == Status::ENABLED.as_str());
     let replica_modifications_enabled = rule
         .source_selection_criteria
         .as_ref()
         .and_then(|criteria| criteria.replica_modifications.as_ref())
-        .is_some_and(|replica_modifications| {
-            replica_modifications.status == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED)
-        });
+        .is_some_and(|replica_modifications| replica_modifications.status == Status::ENABLED.as_str());
 
     // A rule whose destination ARN names the site that holds it can never replicate:
     // `reconcile_site_replication_bucket_targets` skips the local peer, so no bucket
@@ -2482,7 +2484,7 @@ fn site_replication_rule_complete(rule: &ReplicationRule, owner_deployment_id: &
         .is_some_and(|deployment_id| deployment_id != owner_deployment_id);
 
     rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
-        && rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED)
+        && rule.status == Status::ENABLED.as_str()
         && points_at_remote_site
         && delete_marker_enabled
         && delete_enabled
@@ -2513,7 +2515,7 @@ fn site_replication_config_mismatch<'a>(
         // out-of-sync ("0/N Buckets in sync"). decode_bucket_meta_wire_value falls back to
         // the raw bytes when the value is not base64, so plain-XML callers still work.
         let xml = decode_bucket_meta_wire_value(raw);
-        deserialize::<ReplicationConfiguration>(&xml).is_ok_and(|config| {
+        deserialize::<PersistedReplicationConfiguration>(&xml).is_ok_and(|config| {
             config.rules.len() == expected_rules
                 && config
                     .rules
@@ -4796,7 +4798,7 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
 /// will drop for `removed_deployment_ids`, plus a site-replication `Role`
 /// naming one of them: the targets those ARNs back are the site's own.
 fn removed_site_replication_rule_arns(
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
     removed_deployment_ids: &HashSet<String>,
 ) -> HashSet<String> {
     let Some(config) = config else {
@@ -4862,13 +4864,13 @@ fn prune_removed_site_replication_bucket_targets(
 /// site-local fields always survive; a delete (`incoming == None`) therefore
 /// merges with the empty set instead of dropping the whole config.
 fn merge_incoming_lifecycle_config(
-    incoming: Option<s3s::dto::BucketLifecycleConfiguration>,
-    local: Option<s3s::dto::BucketLifecycleConfiguration>,
+    incoming: Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
+    local: Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
     updated_at: Option<OffsetDateTime>,
-) -> Option<s3s::dto::BucketLifecycleConfiguration> {
+) -> std::io::Result<Option<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>> {
     // Incoming rules reduced to their traveling expiry side. Rules with no
     // expiry semantics after the strip are not installed.
-    let mut incoming_by_id: HashMap<String, s3s::dto::LifecycleRule> = HashMap::new();
+    let mut incoming_by_id: HashMap<String, rustfs_gateway_types::persistence::PersistedLifecycleRule> = HashMap::new();
     let mut incoming_order: Vec<String> = Vec::new();
     for mut rule in incoming.into_iter().flat_map(|config| config.rules) {
         strip_site_local_lifecycle_fields(&mut rule);
@@ -4885,7 +4887,7 @@ fn merge_incoming_lifecycle_config(
     // document is byte-stable, so bucket metadata is written once, not on
     // every broadcast.
     let local_expiry_updated_at = local.as_ref().and_then(|config| config.expiry_updated_at.clone());
-    let mut rules: Vec<s3s::dto::LifecycleRule> = Vec::new();
+    let mut rules: Vec<rustfs_gateway_types::persistence::PersistedLifecycleRule> = Vec::new();
     for mut rule in local.into_iter().flat_map(|config| config.rules) {
         let id = rule.id.clone().unwrap_or_default();
         if let Some(mut incoming_rule) = incoming_by_id.remove(&id) {
@@ -4922,19 +4924,19 @@ fn merge_incoming_lifecycle_config(
     }
 
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(s3s::dto::BucketLifecycleConfiguration {
+    Ok(Some(rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
         rules,
         // Record the expiry axis the staleness guard compares on. (The PUT
         // path stamps `expiry_updated_at` only when the expiry subset
         // changes, so this axis is not inflated by transition-only edits.)
-        expiry_updated_at: updated_at.map(s3s::dto::Timestamp::from).or(local_expiry_updated_at),
-    })
+        expiry_updated_at: updated_at.map(format_lifecycle_date).transpose()?.or(local_expiry_updated_at),
+    }))
 }
 
-fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
+fn lifecycle_rule_has_transition(rule: &rustfs_gateway_types::persistence::PersistedLifecycleRule) -> bool {
     rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty())
         || rule
             .noncurrent_version_transitions
@@ -4954,17 +4956,17 @@ fn lifecycle_rule_has_transition(rule: &s3s::dto::LifecycleRule) -> bool {
 ///   bucket metadata as the deletion's lower bound, so a delayed stale
 ///   broadcast cannot resurrect deleted expiry rules.
 fn local_lifecycle_staleness_axis(
-    local: Option<&s3s::dto::BucketLifecycleConfiguration>,
+    local: Option<&rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>,
     whole_config_axis: OffsetDateTime,
-) -> OffsetDateTime {
-    match local {
+) -> std::io::Result<OffsetDateTime> {
+    Ok(match local {
         Some(config) => match config.expiry_updated_at.clone() {
-            Some(axis) => OffsetDateTime::from(axis),
+            Some(axis) => parse_lifecycle_date(&axis)?,
             None if config.rules.iter().any(lifecycle_rule_has_expiry) => whole_config_axis,
             None => OffsetDateTime::UNIX_EPOCH,
         },
         None => whole_config_axis,
-    }
+    })
 }
 
 /// Recognize MinIO's zero-rule lifecycle tombstone (its delete /
@@ -4980,7 +4982,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         #[serde(rename = "@xmlns")]
         _xmlns: Option<String>,
         #[serde(rename = "ExpiryUpdatedAt")]
-        _expiry_updated_at: Option<s3s::dto::Timestamp>,
+        expiry_updated_at: Option<String>,
     }
 
     let mut reader = quick_xml::Reader::from_reader(raw);
@@ -5039,10 +5041,19 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         }
     };
 
-    well_formed_document && quick_xml::de::from_reader::<_, Tombstone>(raw).is_ok()
+    if !well_formed_document {
+        return false;
+    }
+    let Ok(tombstone) = quick_xml::de::from_reader::<_, Tombstone>(raw) else {
+        return false;
+    };
+    tombstone
+        .expiry_updated_at
+        .as_deref()
+        .is_none_or(|value| parse_lifecycle_date(value).is_ok())
 }
 
-fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
+fn replication_rule_deployment_id(rule: &PersistedReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
             && !deployment_id.is_empty()
@@ -5056,9 +5067,9 @@ fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
 }
 
 fn prune_removed_site_replication_rules(
-    mut config: ReplicationConfiguration,
+    mut config: PersistedReplicationConfiguration,
     removed_deployment_ids: &HashSet<String>,
-) -> (Option<ReplicationConfiguration>, usize) {
+) -> (Option<PersistedReplicationConfiguration>, usize) {
     if removed_deployment_ids.is_empty() {
         return (Some(config), 0);
     }
@@ -5598,7 +5609,7 @@ async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: O
 /// `getRemoteARNForPeer` does: the same-name target bucket on the peer.
 fn site_bucket_resync_target_for_peer<'a>(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
     targets: &'a BucketTargets,
     peer: &PeerInfo,
 ) -> Option<&'a BucketTarget> {
@@ -5622,7 +5633,9 @@ fn site_bucket_resync_target_for_peer<'a>(
 /// The persisted replication configuration and bucket targets, bypassing the
 /// node-local metadata cache. `ConfigNotFound` surfaces for a bucket without
 /// a replication configuration, matching the cached read's error.
-async fn site_bucket_resync_persisted_wiring(bucket: &str) -> Result<(ReplicationConfiguration, BucketTargets), StorageError> {
+async fn site_bucket_resync_persisted_wiring(
+    bucket: &str,
+) -> Result<(PersistedReplicationConfiguration, BucketTargets), StorageError> {
     let metadata = metadata_sys::get_config_from_disk(bucket).await?;
     let config = metadata.replication_config.ok_or(StorageError::ConfigNotFound)?;
     Ok((config, metadata.bucket_target_config.unwrap_or_default()))
@@ -6043,7 +6056,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                 .as_ref()
                 .map(|raw| {
                     let data = decode_bucket_meta_wire_value(raw);
-                    deserialize::<ReplicationConfiguration>(&data)
+                    deserialize::<PersistedReplicationConfiguration>(&data)
                 })
                 .transpose()
                 .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?;
@@ -6089,7 +6102,7 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         let incoming = match item.expiry_lc_config.as_ref() {
             Some(raw) => {
                 let data = decode_bucket_meta_wire_value(raw);
-                match deserialize::<s3s::dto::BucketLifecycleConfiguration>(&data) {
+                match deserialize::<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>(&data) {
                     Ok(config) => Some(config),
                     // MinIO's delete tombstone / transition-only state is a
                     // zero-rule document the strict deserializer rejects; it
@@ -6113,17 +6126,22 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             None
         } else {
             Some(
-                deserialize::<s3s::dto::BucketLifecycleConfiguration>(&local_metadata.lifecycle_config_xml).map_err(|e| {
-                    S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}"))
-                })?,
+                deserialize::<rustfs_gateway_types::persistence::PersistedLifecycleConfiguration>(
+                    &local_metadata.lifecycle_config_xml,
+                )
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}")))?,
             )
         };
         let whole_config_axis = local_metadata.lifecycle_config_updated_at;
-        if is_stale_update(local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis), incoming_updated_at) {
+        let local_axis = local_lifecycle_staleness_axis(local.as_ref(), whole_config_axis)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid local lifecycle config: {e}")))?;
+        if is_stale_update(local_axis, incoming_updated_at) {
             return Ok(());
         }
         let local_absent = local.is_none();
-        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at) {
+        let merged = match merge_incoming_lifecycle_config(incoming, local, incoming_updated_at)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?
+        {
             Some(config) => Some(
                 serialize(&config)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize lifecycle failed: {e}")))?,
@@ -6927,11 +6945,11 @@ fn ensure_add_bucket_set_matches_preflight(expected: &HashSet<String>, present: 
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationAddHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(req.uri());
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
         let admin_access_key = cred.access_key.clone();
@@ -7157,7 +7175,7 @@ impl Operation for SiteReplicationAddHandler {
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
         initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateAddStatus {
                 success: true,
@@ -7174,7 +7192,7 @@ pub struct SiteReplicationRemoveHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRemoveHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
@@ -7182,7 +7200,7 @@ impl Operation for SiteReplicationRemoveHandler {
         // transaction: a client that stalls mid-body must hold neither the
         // state-object lock nor the write half of the bucket-op RwLock (which
         // would starve every bucket-operation hook in the meantime).
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let (pending_remove, local_peer) = {
             let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
@@ -7240,7 +7258,7 @@ impl Operation for SiteReplicationRemoveHandler {
             site_replication_remove_status(&peer_errors)
         };
 
-        json_response(StatusCode::OK, &status)
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7267,11 +7285,11 @@ pub struct SiteReplicationInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
+        owned_json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -7279,13 +7297,13 @@ pub struct SiteReplicationMetaInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationMetaInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let opts = sr_status_options(&req.uri);
+        let opts = sr_status_options(req.uri());
         let info = filter_sr_info(build_sr_info(&state, &local_peer).await?, &opts);
-        json_response(StatusCode::OK, &info)
+        owned_json_response(StatusCode::OK, &info)
     }
 }
 
@@ -7293,12 +7311,12 @@ pub struct SiteReplicationStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let status = build_status_info(&state, &local_peer, &req.uri).await?;
-        json_response(StatusCode::OK, &status)
+        let status = build_status_info(&state, &local_peer, req.uri()).await?;
+        owned_json_response(StatusCode::OK, &status)
     }
 }
 
@@ -7308,8 +7326,8 @@ impl Operation for SiteReplicationStatusHandler {
 /// buffering through the 1MB admin body cap turned any larger probe into a
 /// 400 and a false link failure. Stream and discard instead — no size cap.
 async fn drain_site_replication_devnull(mut input: Body) -> S3Result<()> {
-    while let Some(chunk) = input.next().await {
-        chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+    while let Some(frame) = input.frame().await {
+        frame.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
     }
     Ok(())
 }
@@ -7318,10 +7336,10 @@ pub struct SiteReplicationDevNullHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        drain_site_replication_devnull(req.input).await?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
+        drain_site_replication_devnull(req.take_body()).await?;
+        Ok(owned_empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -7341,9 +7359,9 @@ fn unsupported_site_netperf_result(endpoint: String) -> SiteNetPerfNodeResult {
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationNetPerfHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let endpoint = request_endpoint(&req.uri, &req.headers);
+        let endpoint = request_endpoint(req.uri(), req.headers());
         Ok(go_gob_site_netperf_response(&unsupported_site_netperf_result(endpoint)))
     }
 }
@@ -7551,11 +7569,13 @@ fn applied_join_response(peer: PeerInfo, initial_sync_error_message: String) -> 
 
 #[async_trait::async_trait]
 impl Operation for SRPeerJoinHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
-        let bootstrap_token = site_replication_bootstrap_token(&req.uri);
-        let initial_sync_only = query_pairs(&req.uri).get("initial-sync").is_some_and(|value| value == "true");
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let bootstrap_token = site_replication_bootstrap_token(req.uri());
+        let initial_sync_only = query_pairs(req.uri())
+            .get("initial-sync")
+            .is_some_and(|value| value == "true");
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         // The body is fully read before the admission takes the lifecycle
         // guard: a sender that stalls mid-body must not block this node's
         // add/remove/rotate/reconciler.
@@ -7591,14 +7611,14 @@ impl Operation for SRPeerJoinHandler {
                     result = "join_superseded",
                     "admin site replication state"
                 );
-                return json_response(StatusCode::OK, &superseded_join_response(peer));
+                return owned_json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
         if defer_initial_sync && !initial_sync_only {
             let mut response =
                 applied_join_response(state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer), String::new());
             response.initial_sync_deferred = true;
-            return json_response(StatusCode::OK, &response);
+            return owned_json_response(StatusCode::OK, &response);
         }
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
@@ -7616,7 +7636,7 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &applied_join_response(
                 state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
@@ -7643,11 +7663,11 @@ pub struct SRPeerBucketOpsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerBucketOpsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let state = load_site_replication_state().await?;
-        let queries = query_pairs(&req.uri);
+        let queries = query_pairs(req.uri());
         let bucket = queries
             .get("bucket")
             .filter(|bucket| !bucket.is_empty())
@@ -7669,7 +7689,7 @@ impl Operation for SRPeerBucketOpsHandler {
             return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
         }
 
-        let Some(store) = object_store_from_req(&req) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -7755,7 +7775,7 @@ impl Operation for SRPeerBucketOpsHandler {
             _ => return Err(s3_error!(InvalidRequest, "unsupported site replication bucket operation")),
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7763,11 +7783,11 @@ pub struct SRPeerReplicateIAMItemHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateIAMItemHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRIAMItem = read_site_replication_json(req, "", false).await?;
         apply_iam_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7775,11 +7795,11 @@ pub struct SRPeerReplicateBucketItemHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateBucketItemHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let item: SRBucketMeta = read_site_replication_json(req, "", false).await?;
         apply_bucket_meta_item(item).await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -7787,10 +7807,10 @@ pub struct SRPeerGetIDPSettingsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerGetIDPSettingsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        json_response(StatusCode::OK, &local_idp_settings())
+        owned_json_response(StatusCode::OK, &local_idp_settings())
     }
 }
 
@@ -7798,10 +7818,10 @@ pub struct SiteReplicationEditHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
+        let ilm_expiry_override = sr_edit_ilm_expiry_override(req.uri());
         let body = read_site_replication_body(req, &cred.secret_key, true).await?;
         let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
         // Planning snapshot: every commit below re-loads the state inside its
@@ -8076,7 +8096,7 @@ impl Operation for SiteReplicationEditHandler {
             }
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: true,
@@ -8092,12 +8112,12 @@ pub struct SRPeerEditCapabilitiesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerEditCapabilitiesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
-                success: query_pairs(&req.uri)
+                success: query_pairs(req.uri())
                     .get("capability")
                     .is_some_and(|value| peer_edit_capability_supported(value)),
                 status: SITE_REPL_EDIT_SUCCESS.to_string(),
@@ -8126,13 +8146,13 @@ enum PeerEditOutcome {
 
 #[async_trait::async_trait]
 impl Operation for SRPeerEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let queries = query_pairs(&req.uri);
-        let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
+        let queries = query_pairs(req.uri());
+        let ilm_expiry_override = sr_edit_ilm_expiry_override(req.uri());
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
         let commit_fence = peer_edit_fence(&queries);
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let (refresh_id, incoming) = if endpoint_refresh_requested {
             let refresh: EndpointRefreshRequest = read_site_replication_json(req, "", false).await?;
             (Some(refresh.id), refresh.peer)
@@ -8226,7 +8246,7 @@ impl Operation for SRPeerEditHandler {
         let service_account_access_key = match outcome {
             PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
             PeerEditOutcome::Acked => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: true,
@@ -8237,7 +8257,7 @@ impl Operation for SRPeerEditHandler {
                 );
             }
             PeerEditOutcome::Rejected(err_detail) => {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8250,7 +8270,7 @@ impl Operation for SRPeerEditHandler {
         };
         if endpoint_refresh_requested {
             if service_account_access_key.is_empty() {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8276,7 +8296,7 @@ impl Operation for SRPeerEditHandler {
             })
             .await?;
             if !committed {
-                return json_response(
+                return owned_json_response(
                     StatusCode::OK,
                     &ReplicateEditStatus {
                         success: false,
@@ -8286,7 +8306,7 @@ impl Operation for SRPeerEditHandler {
                     },
                 );
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &ReplicateEditStatus {
                     success: true,
@@ -8296,7 +8316,7 @@ impl Operation for SRPeerEditHandler {
                 },
             );
         }
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8304,7 +8324,7 @@ pub struct SRPeerRemoveHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRPeerRemoveHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
@@ -8337,7 +8357,7 @@ impl Operation for SRPeerRemoveHandler {
             );
         }
 
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8345,11 +8365,11 @@ pub struct SiteReplicationResyncOpHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationResyncOpHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationResyncAction).await?;
-        let query = query_pairs(&req.uri);
+        let query = query_pairs(req.uri());
         let operation = query.get("operation").cloned().unwrap_or_default();
-        let resolved_store = object_store_from_req(&req);
+        let resolved_store = object_store_from_envelope(req.envelope());
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let (peer, existing_status) = {
@@ -8501,7 +8521,7 @@ impl Operation for SiteReplicationResyncOpHandler {
             .buckets
             .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
         let (limit, offset) = parse_site_resync_page(&query, &status)?;
-        json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
+        owned_json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -8509,7 +8529,7 @@ pub struct SRStateEditHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRStateEditHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
@@ -8518,7 +8538,7 @@ impl Operation for SRStateEditHandler {
             Ok(())
         })
         .await?;
-        Ok(empty_response(StatusCode::OK))
+        Ok(owned_empty_response(StatusCode::OK))
     }
 }
 
@@ -8526,7 +8546,7 @@ pub struct SiteReplicationRepairHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRepairHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let state = load_site_replication_state().await?;
@@ -8547,7 +8567,7 @@ impl Operation for SiteReplicationRepairHandler {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
                 return Err(s3_error!(InvalidRequest, "dry-run does not accept preflightToken or operationId"));
             }
-            return json_response(
+            return owned_json_response(
                 StatusCode::OK,
                 &SiteReplicationRepairPreflight {
                     mode: "dry-run",
@@ -8579,13 +8599,18 @@ impl Operation for SiteReplicationRepairHandler {
                 .to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
+        let response = execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
             local_peer,
             preflight_token: supplied_token.to_string(),
             operation_id,
             signing_key,
         })
-        .await
+        .await?;
+        // The repair executor still answers with the s3s response type; the
+        // router reads the status from the output tuple, so only the tuple and
+        // the headers carry over to the owned response.
+        let (status, body) = response.output;
+        Ok(AdminResponse::with_headers(status, body.into(), response.headers))
     }
 }
 
@@ -8593,11 +8618,11 @@ pub struct SiteReplicationRepairStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationRepairStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let operation_id = req
-            .uri
+            .uri()
             .query()
             .and_then(|query| {
                 form_urlencoded::parse(query.as_bytes())
@@ -8613,7 +8638,7 @@ impl Operation for SiteReplicationRepairStatusHandler {
             .get(&operation_id)
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "repair operation was not found"))?;
-        json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
+        owned_json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
     }
 }
 
@@ -8636,7 +8661,7 @@ pub struct SRRotateServiceAccountHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SRRotateServiceAccountHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         // The lifecycle guard is what keeps the rotation's IAM writes and the
@@ -8647,7 +8672,7 @@ impl Operation for SRRotateServiceAccountHandler {
         // stale one. (The removed process mutex used to provide this
         // exclusion as a side effect.)
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
-        let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
+        let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let rotation_parent = cred.access_key.clone();
         let (pending_rotation, local_peer, previous_access_key) = update_site_replication_state_when_changed(move |state| {
             if !state.enabled() {
@@ -8708,7 +8733,7 @@ impl Operation for SRRotateServiceAccountHandler {
             peer_errors.push("service account rotation is still pending".to_string());
         }
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &ReplicateEditStatus {
                 success: complete && peer_errors.is_empty(),
@@ -10849,7 +10874,7 @@ mod tests {
 
     #[test]
     fn test_site_replication_config_status_accepts_peer_specific_targets() {
-        let site_a_config = ReplicationConfiguration {
+        let site_a_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-b:test-replication",
@@ -10857,7 +10882,7 @@ mod tests {
                 "site-repl-site-b",
             )],
         };
-        let site_b_config = ReplicationConfiguration {
+        let site_b_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-a:test-replication",
@@ -10960,7 +10985,7 @@ mod tests {
     // reported "in sync" — the operator's single health signal agreed with the broken state.
     #[test]
     fn test_site_replication_config_mismatch_rejects_rule_pointing_at_owning_site() {
-        let shared_config = ReplicationConfiguration {
+        let shared_config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:rustfs:replication::site-b:test-replication",
@@ -13321,8 +13346,8 @@ mod tests {
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
     }
 
-    fn site_repl_config(peer: &str) -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    fn site_repl_config(peer: &str) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 &format!("arn:rustfs:replication::{peer}:photos"),
@@ -13407,19 +13432,23 @@ mod tests {
         );
     }
 
-    fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
-        s3s::dto::LifecycleRule {
+    fn lc_rule(
+        id: &str,
+        expiry_days: Option<i32>,
+        transition_days: Option<i32>,
+    ) -> rustfs_gateway_types::persistence::PersistedLifecycleRule {
+        rustfs_gateway_types::persistence::PersistedLifecycleRule {
             id: Some(id.to_string()),
-            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            status: "Enabled".to_owned(),
             prefix: Some(String::new()),
-            expiration: expiry_days.map(|days| s3s::dto::LifecycleExpiration {
+            expiration: expiry_days.map(|days| rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
                 days: Some(days),
                 ..Default::default()
             }),
             transitions: transition_days.map(|days| {
-                vec![s3s::dto::Transition {
+                vec![rustfs_gateway_types::persistence::PersistedTransition {
                     days: Some(days),
-                    storage_class: Some(s3s::dto::TransitionStorageClass::from_static(s3s::dto::TransitionStorageClass::GLACIER)),
+                    storage_class: Some("GLACIER".to_owned()),
                     date: None,
                 }]
             }),
@@ -13431,14 +13460,16 @@ mod tests {
         }
     }
 
-    fn lc_config(rules: Vec<s3s::dto::LifecycleRule>) -> s3s::dto::BucketLifecycleConfiguration {
-        s3s::dto::BucketLifecycleConfiguration {
+    fn lc_config(
+        rules: Vec<rustfs_gateway_types::persistence::PersistedLifecycleRule>,
+    ) -> rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
+        rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
             rules,
             expiry_updated_at: None,
         }
     }
 
-    fn rule_ids(config: &s3s::dto::BucketLifecycleConfiguration) -> Vec<&str> {
+    fn rule_ids(config: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration) -> Vec<&str> {
         config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
     }
 
@@ -13452,6 +13483,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13470,6 +13502,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("r1", Some(1), Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         assert_eq!(merged.rules.len(), 1);
@@ -13490,6 +13523,7 @@ mod tests {
             Some(lc_config(vec![lc_rule("t1", None, Some(30))])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let r1 = merged.rules.iter().find(|rule| rule.id.as_deref() == Some("r1")).unwrap();
@@ -13511,6 +13545,7 @@ mod tests {
             ])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13534,12 +13569,15 @@ mod tests {
             ])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("transition rules must survive a peer lifecycle delete");
         assert_eq!(rule_ids(&merged), vec!["mixed"]);
         assert!(merged.rules[0].expiration.is_none());
 
         assert!(
-            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None).is_none(),
+            merge_incoming_lifecycle_config(None, Some(lc_config(vec![lc_rule("pure-expiry", Some(2), None)])), None)
+                .expect("expiry timestamp must remain encodable")
+                .is_none(),
             "an all-expiry config deletes cleanly"
         );
     }
@@ -13549,13 +13587,14 @@ mod tests {
     #[test]
     fn test_merge_incoming_lifecycle_keeps_disabled_transition_rule() {
         let mut disabled = lc_rule("t-disabled", None, Some(30));
-        disabled.status = s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::DISABLED);
+        disabled.status = "Disabled".to_owned();
 
         let merged = merge_incoming_lifecycle_config(
             Some(lc_config(vec![lc_rule("e1", Some(7), None)])),
             Some(lc_config(vec![disabled])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13568,11 +13607,11 @@ mod tests {
     /// MinIO's sender-side filter).
     #[test]
     fn test_merge_incoming_lifecycle_abort_mpu_rules_stay_local() {
-        let abort_only = |id: &str| s3s::dto::LifecycleRule {
+        let abort_only = |id: &str| rustfs_gateway_types::persistence::PersistedLifecycleRule {
             id: Some(id.to_string()),
-            status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            status: "Enabled".to_owned(),
             prefix: Some(String::new()),
-            abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+            abort_incomplete_multipart_upload: Some(rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
                 days_after_initiation: Some(3),
             }),
             del_marker_expiration: None,
@@ -13588,6 +13627,7 @@ mod tests {
             Some(lc_config(vec![abort_only("local-abort")])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
 
         let mut ids = rule_ids(&merged);
@@ -13606,8 +13646,12 @@ mod tests {
         let incoming = || Some(lc_config(vec![lc_rule("e1", Some(7), None), lc_rule("e2", Some(9), None)]));
         let local = Some(lc_config(vec![lc_rule("t1", None, Some(30))]));
 
-        let once = merge_incoming_lifecycle_config(incoming(), local, None).expect("first merge");
-        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None).expect("second merge");
+        let once = merge_incoming_lifecycle_config(incoming(), local, None)
+            .expect("expiry timestamp must remain encodable")
+            .expect("first merge");
+        let twice = merge_incoming_lifecycle_config(incoming(), Some(once.clone()), None)
+            .expect("expiry timestamp must remain encodable")
+            .expect("second merge");
 
         assert_eq!(
             serialize(&once).expect("serialize once"),
@@ -13623,10 +13667,16 @@ mod tests {
     fn test_merge_incoming_lifecycle_stamps_expiry_updated_at() {
         let updated_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
         let merged = merge_incoming_lifecycle_config(Some(lc_config(vec![lc_rule("e1", Some(7), None)])), None, Some(updated_at))
+            .expect("expiry timestamp must remain encodable")
             .expect("merge should keep rules");
 
         let stamped = merged.expiry_updated_at.expect("expiry_updated_at must be stamped");
-        assert_eq!(OffsetDateTime::from(stamped).unix_timestamp(), updated_at.unix_timestamp());
+        assert_eq!(
+            parse_lifecycle_date(&stamped)
+                .expect("read stamped expiry axis")
+                .unix_timestamp(),
+            updated_at.unix_timestamp()
+        );
     }
 
     /// MinIO's sender never emits del-marker-expiration rules
@@ -13637,7 +13687,7 @@ mod tests {
     fn test_merge_incoming_lifecycle_del_marker_rules_stay_local() {
         let del_marker_only = |id: &str| {
             let mut rule = lc_rule(id, None, None);
-            rule.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
+            rule.del_marker_expiration = Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(3) });
             rule
         };
 
@@ -13648,6 +13698,7 @@ mod tests {
             Some(lc_config(vec![del_marker_only("dm-local")])),
             None,
         )
+        .expect("expiry timestamp must remain encodable")
         .expect("merge should keep rules");
         let mut ids = rule_ids(&merged);
         ids.sort_unstable();
@@ -13657,15 +13708,19 @@ mod tests {
         // abort-mpu side is authoritative and an incoming del-marker field is
         // discarded at the trust boundary.
         let mut local_mixed = lc_rule("r1", Some(1), None);
-        local_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(3) });
-        local_mixed.abort_incomplete_multipart_upload = Some(s3s::dto::AbortIncompleteMultipartUpload {
-            days_after_initiation: Some(5),
-        });
+        local_mixed.del_marker_expiration =
+            Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(3) });
+        local_mixed.abort_incomplete_multipart_upload =
+            Some(rustfs_gateway_types::persistence::PersistedAbortIncompleteMultipartUpload {
+                days_after_initiation: Some(5),
+            });
         let mut incoming_mixed = lc_rule("r1", Some(7), None);
-        incoming_mixed.del_marker_expiration = Some(s3s::dto::DelMarkerExpiration { days: Some(9) });
+        incoming_mixed.del_marker_expiration =
+            Some(rustfs_gateway_types::persistence::PersistedDelMarkerExpiration { days: Some(9) });
 
         let merged =
             merge_incoming_lifecycle_config(Some(lc_config(vec![incoming_mixed])), Some(lc_config(vec![local_mixed])), None)
+                .expect("expiry timestamp must remain encodable")
                 .expect("merge should keep rules");
         let r1 = &merged.rules[0];
         assert_eq!(r1.expiration.as_ref().and_then(|e| e.days), Some(7));
@@ -13686,6 +13741,9 @@ mod tests {
     fn test_zero_rule_lifecycle_tombstone_recognition() {
         assert!(is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00Z</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>2026-01-01T00:00:00.123456Z</ExpiryUpdatedAt></LifecycleConfiguration>"
         ));
         assert!(is_zero_rule_lifecycle_tombstone(
             b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LifecycleConfiguration>"
@@ -13719,6 +13777,9 @@ mod tests {
         ));
         assert!(!is_zero_rule_lifecycle_tombstone(
             b"<LifecycleConfiguration><ExpiryUpdatedAt>&bogus;</ExpiryUpdatedAt></LifecycleConfiguration>"
+        ));
+        assert!(!is_zero_rule_lifecycle_tombstone(
+            b"<LifecycleConfiguration><ExpiryUpdatedAt>not-a-date</ExpiryUpdatedAt></LifecycleConfiguration>"
         ));
         assert!(!is_zero_rule_lifecycle_tombstone(b"<evil:LifecycleConfiguration/>"));
         assert!(!is_zero_rule_lifecycle_tombstone(
@@ -13760,20 +13821,52 @@ mod tests {
         let axis_ts = OffsetDateTime::from_unix_timestamp(1_600_000_000).expect("timestamp");
 
         let mut with_axis = lc_config(vec![lc_rule("e1", Some(7), None)]);
-        with_axis.expiry_updated_at = Some(s3s::dto::Timestamp::from(axis_ts));
-        assert_eq!(local_lifecycle_staleness_axis(Some(&with_axis), whole), axis_ts);
+        with_axis.expiry_updated_at = Some(format_lifecycle_date(axis_ts).expect("format expiry axis"));
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&with_axis), whole).expect("expiry axis must remain readable"),
+            axis_ts
+        );
 
         let legacy_with_expiry = lc_config(vec![lc_rule("e1", Some(7), None)]);
-        assert_eq!(local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole), whole);
+        assert_eq!(
+            local_lifecycle_staleness_axis(Some(&legacy_with_expiry), whole).expect("expiry axis must remain readable"),
+            whole
+        );
 
         let transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
         assert_eq!(
-            local_lifecycle_staleness_axis(Some(&transition_only), whole),
+            local_lifecycle_staleness_axis(Some(&transition_only), whole).expect("expiry axis must remain readable"),
             OffsetDateTime::UNIX_EPOCH,
             "a transition-only config has no expiry state to protect"
         );
 
-        assert_eq!(local_lifecycle_staleness_axis(None, whole), whole, "deletion lower bound");
+        assert_eq!(
+            local_lifecycle_staleness_axis(None, whole).expect("expiry axis must remain readable"),
+            whole,
+            "deletion lower bound"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_staleness_preserves_legacy_submillisecond_axis() {
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/ecstore/tests/fixtures/bucket-config-goldens/lifecycle/minio.in.xml"
+        ));
+        let mut old_reader = s3s::xml::Deserializer::new(raw);
+        let old: s3s::dto::BucketLifecycleConfiguration =
+            s3s::xml::Deserialize::deserialize(&mut old_reader).expect("read the actual old lifecycle expiry axis");
+        old_reader.expect_eof().expect("the old expiry reader consumes the document");
+        let old_axis = OffsetDateTime::from(old.expiry_updated_at.expect("the old config contains its expiry axis"));
+        let new = deserialize(raw).expect("read the persisted lifecycle expiry axis");
+        let new_axis = local_lifecycle_staleness_axis(Some(&new), OffsetDateTime::UNIX_EPOCH)
+            .expect("the parsed lifecycle axis is readable");
+        let incoming = parse_lifecycle_date("2026-07-07T15:58:57.337100Z").expect("the incoming expiry axis is valid");
+        assert_eq!(
+            is_stale_update(new_axis, Some(incoming)),
+            is_stale_update(old_axis, Some(incoming)),
+            "a peer update older than the full-precision local axis must remain stale"
+        );
     }
 
     #[test]
@@ -13831,7 +13924,7 @@ mod tests {
         assert_eq!(credentials.secret_key, "runtime-iam-secret");
 
         let regional_arn = "arn:rustfs:replication:eu-west-1:remote:photos";
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(regional_arn, 1, "site-repl-remote")],
         };
@@ -14077,7 +14170,7 @@ mod tests {
     #[test]
     fn test_prune_removed_site_replication_bucket_targets_keeps_operator_target_to_removed_peer() {
         let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:rustfs:replication:eu-west-1:removed-dep:photos", 1, "site-repl-removed-dep"),
@@ -14149,7 +14242,7 @@ mod tests {
                 },
             ],
         };
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:minio:replication::7c0c5a1e-operator:photos-dst", 9, "operator-rule"),
@@ -14159,7 +14252,7 @@ mod tests {
         let picked = site_bucket_resync_target_for_peer("photos", &config, &targets, &peer).expect("site target");
         assert_eq!(picked.arn, "arn:minio:replication::remote:photos");
 
-        let without_rule = ReplicationConfiguration {
+        let without_rule = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![build_site_replication_rule(
                 "arn:minio:replication::7c0c5a1e-operator:photos-dst",
@@ -14177,7 +14270,7 @@ mod tests {
         let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
         let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
         let user_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 9, "user-managed-rule");
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: "arn:rustfs:replication::removed-dep:photos".to_string(),
             rules: vec![removed_rule, user_rule, kept_rule],
         };
@@ -14207,7 +14300,7 @@ mod tests {
             "site-repl-gone-dep"
         )));
 
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
                 build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep"),
@@ -14960,7 +15053,7 @@ mod tests {
         use rustfs_madmin::{SRBucketInfo, SRInfo};
 
         let repl_xml = {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     "arn:rustfs:replication::site-b:photos",
@@ -15089,7 +15182,7 @@ mod tests {
         // A peer that is reachable and has complete replication rules for all other peers
         // should be Enable; one that is reachable but has an incomplete config should be Disable.
         let site_config_xml = |peer: &str| {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     &format!("arn:rustfs:replication::{peer}:bucket"),
@@ -15126,7 +15219,7 @@ mod tests {
     #[test]
     fn test_site_replication_config_mismatch_accepts_base64_wire_form() {
         let site_config_xml = |peer: &str| {
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
                     &format!("arn:rustfs:replication::{peer}:bucket"),

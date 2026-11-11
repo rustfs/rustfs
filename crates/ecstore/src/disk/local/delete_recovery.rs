@@ -41,19 +41,53 @@ struct DiscoverySession {
     touched: Instant,
 }
 
-/// Plain (non-transaction) children of an object-scoped discovery root cost one
-/// budget entry per this many names: enough to bound a hostile prefix without
-/// making a real folder prefix undeletable.
+/// Names an object-scoped scan skips without a stat (plain children of the
+/// key's directory, and entries of a UUID child that cannot be delete evidence)
+/// cost one budget entry per this many names: enough to bound a hostile prefix
+/// without making a real folder prefix undeletable.
 const PLAIN_CHILDREN_PER_BUDGET_ENTRY: u32 = 64;
+
+/// Entries one step of the resumable (background) discovery may visit. The
+/// foreground bounded protocol has its own, larger per-call allowance.
+const DISCOVERY_STEP_ENTRIES: u32 = 4096;
+
+/// Wall-clock allowance of one bounded discovery call: a third of the drive
+/// timeout that wraps the call (including its wait for a lane worker), capped at
+/// ten seconds, so an incomplete walk returns before the call can time out.
+fn bounded_discovery_time_limit() -> std::time::Duration {
+    (crate::disk::disk_store::get_max_timeout_duration() / 3).min(std::time::Duration::from_secs(10))
+}
+
+/// Whether an entry inside a UUID child of an object-scoped root can name one
+/// of the key's delete transactions: a journal file of a rollback directory or
+/// a data-directory marker. Every other name is inert to discovery.
+fn may_be_delete_evidence(name: &str) -> bool {
+    [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name)
+        || [
+            DELETE_DATA_DIR_MARKER_PREFIX,
+            RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+        ]
+        .iter()
+        .any(|prefix| delete_transaction_marker_id(name, prefix).is_some())
+}
 
 impl DiscoverySession {
     /// Consume one bounded step, returning ownership only when traversal remains.
     fn advance(self, limit: u32) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>)> {
-        self.advance_bounded(limit, super::super::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES)
+        self.advance_bounded(limit, DISCOVERY_STEP_ENTRIES, &|| false)
             .map(|(transactions, next, _)| (transactions, next))
     }
 
-    fn advance_bounded(mut self, limit: u32, max_entries: u32) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>, u32)> {
+    /// Walk until `limit` transactions, `max_entries` charged entries, the end
+    /// of the scope, or `should_stop` (checked before every entry); any early
+    /// stop returns the remaining traversal as continuation state.
+    fn advance_bounded(
+        mut self,
+        limit: u32,
+        max_entries: u32,
+        should_stop: &dyn Fn() -> bool,
+    ) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>, u32)> {
         if self.frames.is_empty() {
             match std::fs::read_dir(&self.root) {
                 Ok(entries) => self.frames.push((String::new(), entries)),
@@ -66,10 +100,11 @@ impl DiscoverySession {
         let mut transactions = BTreeSet::new();
         let mut seen_candidates = HashSet::new();
         let mut visited = 0u32;
-        let mut plain_children = 0u32;
+        let mut skipped_by_name = 0u32;
         while !self.frames.is_empty()
             && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
             && visited < max_entries
+            && !should_stop()
         {
             let (parent, entries) = self
                 .frames
@@ -90,13 +125,22 @@ impl DiscoverySession {
                 return Err(std::io::Error::from(ErrorKind::InvalidData));
             }
             // An object-scoped scan only ever descends into transaction (UUID)
-            // directories at the root. Plain child keys of a prefix directory are
-            // skipped by name without a stat; they are charged at one entry per
-            // readdir batch so the work stays bounded while deleting a missing key
-            // that names a prefix with thousands of children can still complete.
-            if self.object.is_some() && parent.is_empty() && !canonical_uuid(&name).is_some_and(|id| !id.is_nil()) {
-                plain_children += 1;
-                if plain_children.is_multiple_of(PLAIN_CHILDREN_PER_BUDGET_ENTRY) {
+            // directories at the root, and inside them only journal files and
+            // data-directory markers can be evidence. Every other name (plain
+            // child keys of a prefix directory, and the `xl.meta`, data
+            // directories or children of a UUID-named child key) is skipped by
+            // name without a stat and charged at one entry per readdir batch, so
+            // the work stays bounded while deleting a missing key that names a
+            // folder prefix with many children, UUID-named or not, can complete.
+            if self.object.is_some()
+                && if parent.is_empty() {
+                    !canonical_uuid(&name).is_some_and(|id| !id.is_nil())
+                } else {
+                    !may_be_delete_evidence(&name)
+                }
+            {
+                skipped_by_name += 1;
+                if skipped_by_name.is_multiple_of(PLAIN_CHILDREN_PER_BUDGET_ENTRY) {
                     visited += 1;
                 }
                 continue;
@@ -1391,8 +1435,16 @@ impl LocalDisk {
         self.validate_delete_discovery_owner(&session)?;
         // The blocking owner drops every directory handle even if the RPC waiter disappears.
         // A partial inventory is never evidence of absence and never enters DISCOVERY_SESSIONS.
-        os::run_blocking_namespace_operation(lease, move || {
-            let (transactions, next, visited) = session.advance_bounded(256, max_entries)?;
+        // A large folder prefix may take a while to walk, so the probe rides the
+        // durable-mutation lane like bounded inspection, never the one-worker
+        // foreground lane that every other mutation on the drive queues behind.
+        // It also stops, incomplete, when its waiter goes away or well before the
+        // drive timeout, so a slow walk answers SlowDown instead of marking the
+        // drive failed or holding a lane worker after the request is gone.
+        let deadline = Instant::now() + bounded_discovery_time_limit();
+        os::run_cancellable_blocking_namespace_operation_with_sync(lease, true, move |is_cancelled| {
+            let should_stop = || is_cancelled() || Instant::now() >= deadline;
+            let (transactions, next, visited) = session.advance_bounded(256, max_entries, &should_stop)?;
             Ok(super::super::BoundedDeleteRecoveryDiscovery {
                 transactions: if next.is_none() { transactions } else { Vec::new() },
                 visited,
@@ -2695,6 +2747,7 @@ impl LocalDisk {
                     }
                 }
                 let staged_dir = staged.keep();
+                os::record_native_publication(&destination);
                 if let Err(err) = std::fs::rename(&staged_dir, &destination) {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
@@ -2738,6 +2791,7 @@ impl LocalDisk {
                     // A provisional head must stay outside the published recovery transaction.
                     let target_in_rollback = destination.join(TARGET);
                     let linked_xl = staging_root.join(format!("delete-xl-{transaction}"));
+                    os::record_native_publication(&xl_path);
                     let linked = match std::fs::hard_link(&target_in_rollback, &linked_xl) {
                         Ok(()) => true,
                         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -2906,6 +2960,7 @@ impl LocalDisk {
                         if sync && !receipt_bytes.is_empty() {
                             file.sync_data()?;
                         }
+                        os::record_native_publication(&receipt_path);
                         std::fs::rename(&tmp_receipt, &receipt_path)?;
                         if sync {
                             os::fsync_directory_handle_std(&rollback, rollback_dir_fd.as_deref())?;
@@ -3004,6 +3059,7 @@ impl LocalDisk {
                 if sync && !receipt_bytes.is_empty() {
                     staged.as_file().sync_data()?;
                 }
+                os::record_native_publication(&receipt_path);
                 std::fs::rename(staged.path(), &receipt_path)?;
                 if sync {
                     os::fsync_dir_std(&rollback)?;
@@ -3152,6 +3208,7 @@ impl LocalDisk {
                 if sync && !receipt_bytes.is_empty() {
                     staged_receipt.as_file().sync_data()?;
                 }
+                os::record_native_publication(&receipt_path);
                 std::fs::rename(staged_receipt.path(), &receipt_path)?;
                 if sync {
                     let _ = os::fsync_dir_std(&rollback);
@@ -6557,6 +6614,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_bounded_discovery_charges_uuid_named_children_once_and_keeps_evidence() {
+        let (_temp, disk, _, _) = fixture().await;
+        let path = disk.delete_discovery_path("recovery", Some("prefix")).expect("prefix path");
+        std::fs::create_dir_all(&path).expect("physical prefix");
+        // UUID-named child keys of the folder: each holds its own `xl.meta` and a
+        // data directory, neither of which can be evidence for the folder's key.
+        const CHILDREN: u32 = 2000;
+        for _ in 0..CHILDREN {
+            let child = path.join(Uuid::new_v4().to_string());
+            std::fs::create_dir_all(child.join(Uuid::new_v4().to_string())).expect("child key data dir");
+            std::fs::write(child.join(STORAGE_FORMAT_FILE), b"meta").expect("child key metadata");
+        }
+        // A UUID-named sub-prefix with children of its own.
+        const SUB_PREFIX_CHILDREN: u32 = 640;
+        let sub_prefix = path.join(Uuid::new_v4().to_string());
+        for index in 0..SUB_PREFIX_CHILDREN {
+            std::fs::create_dir_all(sub_prefix.join(format!("child-{index}"))).expect("sub-prefix child");
+        }
+        // Evidence of two interrupted transactions of the key itself: a journaled
+        // rollback directory, and a data-directory marker whose rollback is gone.
+        let journaled = Uuid::new_v4();
+        std::fs::create_dir_all(path.join(journaled.to_string())).expect("rollback directory");
+        std::fs::write(path.join(journaled.to_string()).join(PREPARED), b"{}").expect("journal");
+        let marker_only = Uuid::new_v4();
+        let data_dir = path.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&data_dir).expect("residual data directory");
+        std::fs::write(data_dir.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{marker_only}")), [])
+            .expect("reservation marker");
+
+        let page = disk
+            .discover_delete_transactions_bounded(
+                "recovery",
+                "prefix",
+                super::super::super::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES,
+            )
+            .await
+            .expect("bounded probe");
+        assert!(page.complete, "a folder of UUID-named keys is a complete inventory");
+        // One entry per descent (children, sub-prefix, rollback and data
+        // directory) and per evidence file; inert names at 1/64.
+        let inert = 2 * CHILDREN + SUB_PREFIX_CHILDREN;
+        assert_eq!(page.visited, CHILDREN + 3 + 2 + inert / PLAIN_CHILDREN_PER_BUDGET_ENTRY);
+        let found = page.transactions.iter().map(|id| id.transaction).collect::<BTreeSet<_>>();
+        assert!(found.contains(&journaled), "a journaled rollback directory is evidence");
+        assert!(found.contains(&marker_only), "a marker-only residue is evidence");
+        assert_eq!(found.len(), 2, "no child key is mistaken for a transaction");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_bounded_discovery_stops_on_request_and_skips_only_inert_irregular_entries() {
+        let (_temp, disk, _, _) = fixture().await;
+        let path = disk.delete_discovery_path("recovery", Some("prefix")).expect("prefix path");
+        let child = path.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&child).expect("UUID-named child key");
+        // A stop request (cancellation or the wall-clock limit) ends the walk
+        // before any entry, leaving continuation state: never evidence of absence.
+        let session = disk
+            .new_delete_discovery_session("recovery", Some("prefix"), &path)
+            .expect("private session");
+        let (transactions, next, visited) = session
+            .advance_bounded(256, super::super::super::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES, &|| true)
+            .expect("stopped walk");
+        assert!(transactions.is_empty());
+        assert_eq!(visited, 0);
+        assert!(next.is_some(), "a stopped walk is incomplete");
+        drop(next);
+        #[cfg(unix)]
+        {
+            // An irregular entry whose name cannot be evidence is skipped unread.
+            std::os::unix::fs::symlink(&path, child.join("inert-link")).expect("inert symlink");
+            let page = disk
+                .discover_delete_transactions_bounded("recovery", "prefix", 4096)
+                .await
+                .expect("inert irregular entries are not evidence");
+            assert!(page.complete && page.transactions.is_empty());
+            // One with an evidence name still fails closed.
+            std::os::unix::fs::symlink(&path, child.join(PREPARED)).expect("evidence-named symlink");
+            assert!(
+                disk.discover_delete_transactions_bounded("recovery", "prefix", 4096)
+                    .await
+                    .is_err(),
+                "an evidence-named symlink is corruption, not a skipped name"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_bounded_discovery_refuses_partial_inventory_without_public_cursor() {
         let (_temp, disk, _, _) = fixture().await;
         let path = disk.delete_discovery_path("recovery", Some("prefix")).expect("prefix path");
@@ -6658,8 +6802,11 @@ mod tests {
         let filler_id = Uuid::new_v4().to_string();
         let filler = path.join(&filler_id);
         fs::create_dir_all(&filler).await.expect("non-evidence directory");
-        for index in 0..5000 {
-            fs::write(filler.join(format!("part-{index:04}")), [])
+        // Inert names are skipped at 1/64, so fill the step with entries that
+        // pass the evidence-name filter but are directories: each costs a full
+        // budget entry and names no transaction.
+        for _ in 0..5000 {
+            fs::create_dir(filler.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4())))
                 .await
                 .expect("non-evidence entry");
         }

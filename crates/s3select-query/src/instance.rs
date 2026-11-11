@@ -19,6 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use derive_builder::Builder;
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{
     QueryResult,
     query::{
@@ -30,7 +31,6 @@ use rustfs_s3select_api::{
     },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
 };
-use s3s::dto::SelectObjectContentInput;
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -250,6 +250,10 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::{arrow::util::pretty, assert_batches_eq};
     use parking_lot::Mutex;
+    use rustfs_s3select_api::request::{
+        CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
     use rustfs_s3select_api::{
         QueryResult, SelectInputMetrics,
         query::{
@@ -259,10 +263,6 @@ mod tests {
             logical_planner::Plan,
         },
         server::dbms::DatabaseManagerSystem,
-    };
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FieldDelimiter, FileHeaderInfo, InputSerialization, OutputSerialization,
-        RecordDelimiter, SelectObjectContentInput, SelectObjectContentRequest,
     };
 
     use crate::get_global_db;
@@ -312,13 +312,13 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: expression.to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CsvInput::default()),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -391,16 +391,16 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
-                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                    csv: Some(CsvInput {
+                        file_header_info: Some(FileHeaderInfo::USE),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -453,18 +453,18 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
-                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::IGNORE)),
-                        field_delimiter: Some(FieldDelimiter::from("╦")),
-                        record_delimiter: Some(RecordDelimiter::from("\n")),
+                    csv: Some(CsvInput {
+                        file_header_info: Some(FileHeaderInfo::IGNORE),
+                        field_delimiter: Some("╦".to_owned()),
+                        record_delimiter: Some("\n".to_owned()),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,

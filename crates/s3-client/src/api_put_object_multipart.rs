@@ -17,15 +17,16 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::remote_error_code::RemoteErrorCode;
 use http::{HeaderMap, HeaderName, StatusCode};
 use hyper::body::Bytes;
-use s3s::S3ErrorCode;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::checksum::{ChecksumMode, checksum_header_value};
+use crate::constants::X_AMZ_EXPIRATION;
 use crate::utils::base64_encode;
 use crate::{
     api_error_response::{
@@ -40,7 +41,6 @@ use crate::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 use rustfs_utils::path::trim_etag;
-use s3s::header::X_AMZ_EXPIRATION;
 
 impl TransitionClient {
     pub async fn put_object_multipart(
@@ -56,7 +56,7 @@ impl TransitionClient {
             .await;
         if let Err(err) = &info {
             let err_resp = to_error_response(err);
-            if err_resp.code == S3ErrorCode::AccessDenied && err_resp.message.contains("Access Denied") {
+            if err_resp.code == RemoteErrorCode::ACCESS_DENIED && err_resp.message.contains("Access Denied") {
                 if size > MAX_SINGLE_PUT_OBJECT_SIZE {
                     return Err(std::io::Error::other(err_entity_too_large(
                         size,

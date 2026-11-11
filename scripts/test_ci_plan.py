@@ -449,6 +449,14 @@ class GateTests(unittest.TestCase):
             expression = f"({expression}) && (github.event_name != 'pull_request' || github.event.action != 'closed')"
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
         jobs['workspace-lint-and-build']['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        # The gateway integration branch reruns e2e-tests' suite as a report-only lane.
+        for job, (mirror, steps, env) in gate.REPORT_ONLY_JOBS.items():
+            key, _, value = env.partition(': ')
+            jobs[mirror]['env'] = {key: 'legacy'}
+            jobs[mirror]['steps'] = [{'name': step, 'run': f'echo {step}'} for step in steps]
+            jobs[job] = copy.deepcopy(jobs[mirror])
+            jobs[job].update({'name': f'{job} (report-only)', 'continue-on-error': True, 'env': {key: value}})
+            jobs[job]['steps'].append({'name': 'Upload report', 'uses': 'actions/upload-artifact', 'with': {'name': job}})
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
             {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'},
             {'name': 'internode-transport', 'flags': '--features rustfs/internode-transport'}]}}
@@ -497,6 +505,42 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index('--binaries-metadata') + 1], 'target/nextest/binaries-metadata.json')
                 self.assertEqual(arguments[arguments.index('--target-dir-remap') + 1], str(root / 'target'))
                 self.assertIn(f'exit_status={status}', (root / 'artifacts/ilm-integration/diagnostics.txt').read_text())
+
+    def test_full_e2e_gate_covers_main_and_integration_pushes_only(self):
+        for event, ref, required in (
+            ("push", "refs/heads/main", "success"),
+            ("push", "refs/heads/gateway/integration", "success"),
+            ("push", "refs/heads/gateway/integration-old", "skipped"),
+            ("push", "refs/heads/release", "skipped"),
+            ("push", "refs/heads/feature", "skipped"),
+        ):
+            self.assertEqual(gate.expected_results("full", event, ref)["e2e-full"], required, ref)
+
+    def test_report_only_stack_lane_mirrors_e2e_smoke_outside_the_aggregate(self):
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        job, (mirror, steps, env) = next(iter(gate.REPORT_ONLY_JOBS.items()))
+        key = env.partition(': ')[0]
+        run = steps.index('Run e2e smoke suite')
+        for case, mutate in enumerate((
+            # The lane can neither gate the aggregate nor vanish.
+            lambda w: w['jobs']['required-checks']['needs'].append(job),
+            lambda w: w['jobs'].pop(job),
+            # It must select the gateway stack.
+            lambda w: w['jobs'][job]['env'].update({key: 'legacy'}),
+            lambda w: w['jobs'][job].pop('env'),
+            # Its suite must not drift from the required lane in either direction.
+            lambda w: w['jobs'][job]['steps'][run].update({'run': 'echo --run-ignored all'}),
+            lambda w: w['jobs'][mirror]['steps'][run].update({'run': 'echo --run-ignored all'}),
+            lambda w: w['jobs'][job]['steps'][run].update({'name': 'Run gateway smoke suite'}),
+            lambda w: w['jobs'][job]['steps'].pop(0),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertTrue(self.check(changed), case)
+        changed = copy.deepcopy(workflow)
+        changed['jobs'][job]['steps'][-1]['with']['name'] = 'renamed-report'
+        self.assertEqual(self.check(changed), [], "only the mirrored steps are bound")
 
     def test_requested_shards_and_union_proof_are_required_and_cannot_be_skipped(self):
         plan = self.plan('workflow_dispatch')

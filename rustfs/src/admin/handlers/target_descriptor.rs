@@ -14,13 +14,14 @@
 
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{
     AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, SharedTarget, TargetAdminMetadata, TargetDomain, TargetError, TargetHealthReason,
     TargetHealthState, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
@@ -35,7 +36,6 @@ use rustfs_targets::{
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use rustfs_utils::egress::OutboundPolicy;
-use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -288,17 +288,20 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
-pub(crate) fn build_json_response(
+/// Wrap an already-serialized JSON `body` as an admin response: `Content-Type:
+/// application/json`, plus the caller's `x-request-id` echoed back when the
+/// request carried one.
+pub(crate) fn owned_build_json_response(
     status: StatusCode,
-    body: Body,
+    body: rustfs_s3_types::Body,
     request_id: Option<&HeaderValue>,
-) -> S3Response<(StatusCode, Body)> {
+) -> crate::admin::operation::AdminResponse {
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
-    S3Response::with_headers((status, body), header)
+    crate::admin::operation::AdminResponse::with_headers(status, body, header)
 }
 
 pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, RuntimeHealthStatus>
@@ -1018,6 +1021,29 @@ mod webhook_request_tests {
         validate_webhook_request(&config)
             .await
             .expect("a public HTTPS webhook should pass outbound preflight");
+    }
+}
+
+#[cfg(test)]
+mod owned_response_tests {
+    use super::owned_build_json_response;
+
+    #[tokio::test]
+    async fn owned_build_json_response_sets_json_content_type_and_echoes_the_request_id() {
+        let request_id = http::HeaderValue::from_static("req-42");
+        for id in [None, Some(&request_id)] {
+            let (status, headers, mut body) =
+                owned_build_json_response(http::StatusCode::ACCEPTED, rustfs_s3_types::Body::from("{\"ok\":true}"), id)
+                    .into_parts();
+            assert_eq!(status, http::StatusCode::ACCEPTED);
+            assert_eq!(
+                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(headers.len(), 1 + usize::from(id.is_some()));
+            assert_eq!(body.store_all_limited(64).await.expect("body reads").as_ref(), b"{\"ok\":true}");
+        }
     }
 }
 

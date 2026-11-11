@@ -8699,6 +8699,15 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
@@ -9581,7 +9590,7 @@ dependencies = [
  "proptest",
  "prost 0.14.4",
  "pyroscope",
- "quick-xml",
+ "quick-xml 0.42.0",
  "quinn",
  "rand 0.10.3",
  "rcgen",
@@ -9600,6 +9609,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-extension-schema",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
  "rustfs-iam",
@@ -9864,7 +9874,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "proptest",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rand 0.10.3",
  "ratelimit",
  "rcgen",
@@ -9881,6 +9891,7 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-erasure-codec",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal-contracts",
  "rustfs-io-metrics",
  "rustfs-lifecycle",
@@ -9986,6 +9997,48 @@ dependencies = [
  "tracing",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "rustfs-gateway-stream"
+version = "0.2.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytes",
+ "http 1.5.0",
+ "http-body",
+]
+
+[[package]]
+name = "rustfs-gateway-types"
+version = "0.32.0+aws.2026-10-02"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "bytes",
+ "crc-fast",
+ "futures-core",
+ "hex",
+ "http 1.5.0",
+ "md-5 0.11.0",
+ "percent-encoding",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-xml",
+ "s3s",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "time",
+ "twox-hash",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
+name = "rustfs-gateway-xml"
+version = "0.4.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "quick-xml 0.41.0",
 ]
 
 [[package]]
@@ -10259,10 +10312,10 @@ dependencies = [
  "metrics-util",
  "proptest",
  "rustfs-config",
+ "rustfs-gateway-types",
  "rustfs-replication",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
- "s3s",
  "serial_test",
  "temp-env",
  "time",
@@ -10326,7 +10379,6 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rustfs-signer",
- "s3s",
  "serde",
  "serde_json",
  "sysinfo",
@@ -10366,7 +10418,7 @@ dependencies = [
  "jiff",
  "metrics",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rayon",
  "rustc-hash",
  "rustfs-config",
@@ -10548,10 +10600,13 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-ecstore",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
  "rustfs-iam",
  "rustfs-keystone",
  "rustfs-policy",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
  "rustfs-tls-runtime",
@@ -10559,13 +10614,13 @@ dependencies = [
  "rustfs-trusted-proxies",
  "rustfs-utils",
  "rustls",
- "s3s",
  "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "socket2",
  "subtle",
+ "sync_wrapper",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -10615,7 +10670,7 @@ dependencies = [
  "regex",
  "rmp",
  "rmp-serde",
- "s3s",
+ "rustfs-gateway-types",
  "serde",
  "time",
  "tokio",
@@ -10710,11 +10765,13 @@ dependencies = [
  "hyper-util",
  "lazy_static",
  "md-5 0.11.0",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rand 0.10.3",
  "rustfs-checksums",
  "rustfs-config",
+ "rustfs-gateway-types",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-signer",
  "rustfs-storage-api",
  "rustfs-tls-runtime",
@@ -10748,9 +10805,19 @@ dependencies = [
 name = "rustfs-s3-types"
 version = "1.0.5"
 dependencies = [
+ "bytes",
+ "futures-core",
  "hotpath",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "s3s",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -10779,9 +10846,10 @@ dependencies = [
  "parking_lot 0.13.0",
  "rustfs-common",
  "rustfs-ecstore",
+ "rustfs-gateway-types",
+ "rustfs-s3-types",
  "rustfs-storage-api",
  "rustfs-test-utils",
- "s3s",
  "serde_json",
  "serial_test",
  "thiserror 2.0.21",
@@ -10809,7 +10877,6 @@ dependencies = [
  "parking_lot 0.13.0",
  "rustfs-s3select-api",
  "rustfs-test-utils",
- "s3s",
  "serde",
  "serde_json",
  "tokio",
@@ -10841,6 +10908,7 @@ dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
+ "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
  "rustfs-lifecycle",
@@ -10898,9 +10966,10 @@ dependencies = [
  "bytes",
  "hotpath",
  "http 1.5.0",
+ "http-body",
  "hyper",
+ "rustfs-s3-types",
  "rustfs-utils",
- "s3s",
  "serde_urlencoded",
  "thiserror 2.0.21",
  "time",
@@ -10959,7 +11028,6 @@ dependencies = [
  "rustfs-utils",
  "rustls",
  "rustls-native-certs",
- "s3s",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -11351,7 +11419,7 @@ dependencies = [
  "numeric_cast",
  "phf 0.14.0",
  "pin-project-lite",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "s3s-multipart",
  "s3s-rfc2047",

@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_storage_api::metadata_keys;
-use s3s::dto::{ObjectLockConfiguration, ObjectLockRetentionMode};
 use time::{OffsetDateTime, format_description};
 
 pub fn is_object_locked_by_metadata(user_defined: &HashMap<String, String>, is_delete_marker: bool) -> bool {
@@ -111,7 +111,10 @@ fn explicit_lock_metadata_is_well_formed(user_defined: &HashMap<String, String>)
     }
 }
 
-fn default_retention_until(mod_time: OffsetDateTime, retention: &s3s::dto::DefaultRetention) -> Option<OffsetDateTime> {
+fn default_retention_until(
+    mod_time: OffsetDateTime,
+    retention: &rustfs_gateway_types::persistence::PersistedDefaultRetention,
+) -> Option<OffsetDateTime> {
     match (retention.days, retention.years) {
         (Some(days), None) if days > 0 => Some(mod_time.saturating_add(time::Duration::days(i64::from(days)))),
         (None, Some(years)) if years > 0 => add_years(mod_time, years),
@@ -128,15 +131,17 @@ fn add_years(mod_time: OffsetDateTime, years: i32) -> Option<OffsetDateTime> {
 }
 
 fn is_retention_mode(mode: &str) -> bool {
-    mode.eq_ignore_ascii_case(ObjectLockRetentionMode::COMPLIANCE)
-        || mode.eq_ignore_ascii_case(ObjectLockRetentionMode::GOVERNANCE)
+    mode.eq_ignore_ascii_case("COMPLIANCE") || mode.eq_ignore_ascii_case("GOVERNANCE")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use s3s::dto::{DefaultRetention, ObjectLockEnabled, ObjectLockRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedDefaultRetention as DefaultRetention, PersistedObjectLockRule as ObjectLockRule,
+    };
+
     use time::Duration;
 
     #[test]
@@ -150,11 +155,11 @@ mod tests {
 
     fn default_retention_config(days: i32) -> ObjectLockConfiguration {
         ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(days),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    mode: Some("GOVERNANCE".to_owned()),
                     years: None,
                 }),
             }),
@@ -195,11 +200,11 @@ mod tests {
     #[test]
     fn zero_default_retention_years_fail_closed() {
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: None,
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    mode: Some("GOVERNANCE".to_owned()),
                     years: Some(0),
                 }),
             }),
@@ -212,11 +217,11 @@ mod tests {
     #[test]
     fn default_retention_years_block_lifecycle_delete_until_expired() {
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: None,
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    mode: Some("COMPLIANCE".to_owned()),
                     years: Some(1),
                 }),
             }),
@@ -230,10 +235,7 @@ mod tests {
     fn expired_explicit_retention_does_not_reapply_default_retention() {
         let config = default_retention_config(30);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            ObjectLockRetentionMode::GOVERNANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_owned());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             (OffsetDateTime::now_utc() - Duration::days(1))
@@ -248,10 +250,7 @@ mod tests {
     fn malformed_explicit_retention_fails_closed() {
         let config = default_retention_config(1);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            ObjectLockRetentionMode::GOVERNANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_owned());
         let created = OffsetDateTime::now_utc() - Duration::days(2);
 
         assert!(is_object_locked(&user_defined, false, Some(&config), Some(created)));

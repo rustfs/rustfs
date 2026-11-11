@@ -38,6 +38,7 @@ use datafusion::{
 };
 use futures::Stream;
 use parking_lot::Mutex;
+use rustfs_s3select_api::request::{FileHeaderInfo, JsonType, SelectObjectContentInput};
 use rustfs_s3select_api::{
     QueryError, QueryResult, SelectError,
     query::{
@@ -54,7 +55,6 @@ use rustfs_s3select_api::{
         },
     },
 };
-use s3s::dto::{FileHeaderInfo, JSONType, SelectObjectContentInput};
 use std::sync::LazyLock;
 use tokio::{
     sync::Semaphore,
@@ -72,9 +72,9 @@ use crate::{
 
 use super::schema_inference::{PrefixBoundary, infer_csv_schema, read_schema_prefix};
 
-static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::IGNORE));
-static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
-static USE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::USE));
+static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::IGNORE);
+static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::NONE);
+static USE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::USE);
 const EXACT_OBJECT_FILE_EXTENSION: &str = "";
 
 #[derive(Clone)]
@@ -649,8 +649,8 @@ fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
         .input_serialization
         .json
         .as_ref()
-        .and_then(|json| json.type_.as_ref())
-        .is_some_and(|json_type| json_type.as_str() == JSONType::DOCUMENT)
+        .and_then(|json| json.r#type.as_ref())
+        .is_some_and(|json_type| *json_type == JsonType::DOCUMENT)
 }
 
 fn validate_json_source_path_input(input: &SelectObjectContentInput, source_path: &[JsonPathSegment]) -> QueryResult<()> {
@@ -959,6 +959,10 @@ mod tests {
         physical_plan::{RecordBatchStream, stream::RecordBatchStreamAdapter},
     };
     use futures::{StreamExt, TryStreamExt, stream};
+    use rustfs_s3select_api::request::{
+        CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType,
+        OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
+    };
     use rustfs_s3select_api::{
         QueryError, QueryResult, SelectError,
         query::{
@@ -976,10 +980,6 @@ mod tests {
         },
     };
     use rustfs_test_utils::TestECStoreEnv;
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
-    };
     use std::{
         pin::Pin,
         sync::{
@@ -1173,16 +1173,16 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
-                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                    csv: Some(CsvInput {
+                        file_header_info: Some(FileHeaderInfo::USE),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -1339,15 +1339,15 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT old_marker FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    json: Some(JSONInput {
-                        type_: Some(JSONType::from_static(JSONType::LINES)),
+                    json: Some(JsonInput {
+                        r#type: Some(JsonType::LINES),
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    json: Some(JSONOutput::default()),
+                    json: Some(JsonOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -1380,7 +1380,7 @@ mod tests {
         }
 
         let mut document_input = (*lines_input).clone();
-        document_input.request.input_serialization.json.as_mut().unwrap().type_ = Some(JSONType::from_static(JSONType::DOCUMENT));
+        document_input.request.input_serialization.json.as_mut().unwrap().r#type = Some(JsonType::DOCUMENT);
         assert!(validate_json_source_path_input(&document_input, &nested_path).is_ok());
     }
 
@@ -1428,13 +1428,13 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT old_marker FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
                     parquet: Some(ParquetInput {}),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    json: Some(JSONOutput::default()),
+                    json: Some(JsonOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -1610,7 +1610,7 @@ mod tests {
             .csv
             .as_mut()
             .expect("test input should use CSV")
-            .file_header_info = Some(FileHeaderInfo::from_static("INVALID"));
+            .file_header_info = Some(FileHeaderInfo::from("INVALID"));
         let input = Arc::new(input);
         let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
         let scheduler = Arc::new(LocalScheduler {});
@@ -1663,7 +1663,7 @@ mod tests {
             input.bucket = format!("select-unicode-quotes-{index}");
             input.key = "records".to_owned();
             let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
-            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+            csv.file_header_info = Some(FileHeaderInfo::NONE);
             csv.quote_character = Some(quote.to_owned());
             csv.quote_escape_character = Some(escape.to_owned());
             csv.field_delimiter = Some(field.to_owned());
@@ -1726,11 +1726,11 @@ mod tests {
         for (index, (quote, escape, field, record, data, expected)) in cases.into_iter().enumerate() {
             for header in [FileHeaderInfo::NONE, FileHeaderInfo::USE, FileHeaderInfo::IGNORE] {
                 let mut input = test_input();
-                input.bucket = format!("select-quoted-records-{index}-{}", header.to_ascii_lowercase());
+                input.bucket = format!("select-quoted-records-{index}-{}", header.as_str().to_ascii_lowercase());
                 input.key = "records".to_owned();
                 let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
                 csv.allow_quoted_record_delimiter = Some(true);
-                csv.file_header_info = Some(FileHeaderInfo::from_static(header));
+                csv.file_header_info = Some(header.clone());
                 if index != 0 {
                     csv.quote_character = Some(quote.to_owned());
                     csv.quote_escape_character = Some(escape.to_owned());
@@ -1791,8 +1791,8 @@ mod tests {
             input.key = key.to_owned();
             let data = if json {
                 input.request.input_serialization.csv = None;
-                input.request.input_serialization.json = Some(s3s::dto::JSONInput {
-                    type_: Some(JSONType::from_static(JSONType::LINES)),
+                input.request.input_serialization.json = Some(rustfs_s3select_api::request::JsonInput {
+                    r#type: Some(JsonType::LINES),
                 });
                 b"{\"value\":\"selected\"}\n".as_slice()
             } else {
@@ -1879,13 +1879,12 @@ mod tests {
             input.request.expression = "SELECT * FROM S3Object".to_owned();
             let data = if json {
                 input.request.input_serialization.csv = None;
-                input.request.input_serialization.json = Some(JSONInput {
-                    type_: Some(JSONType::from_static(JSONType::LINES)),
+                input.request.input_serialization.json = Some(JsonInput {
+                    r#type: Some(JsonType::LINES),
                 });
                 format!("{{{}}}\n", (0..1025).map(|index| format!("\"c{index}\":1")).collect::<Vec<_>>().join(","))
             } else {
-                input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
-                    Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+                input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info = Some(FileHeaderInfo::USE);
                 format!("{}\n", (0..1025).map(|index| format!("c{index}")).collect::<Vec<_>>().join(","))
             };
             let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
@@ -1905,8 +1904,8 @@ mod tests {
             let mut input = test_input();
             input.request.expression = "SELECT * FROM S3Object LIMIT 1".to_owned();
             input.request.input_serialization.csv = None;
-            input.request.input_serialization.json = Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::LINES)),
+            input.request.input_serialization.json = Some(JsonInput {
+                r#type: Some(JsonType::LINES),
             });
             let input = Arc::new(input);
             let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
@@ -1958,8 +1957,8 @@ mod tests {
         let mut input = test_input();
         input.request.expression = "SELECT * FROM S3Object".to_owned();
         input.request.input_serialization.csv = None;
-        input.request.input_serialization.json = Some(JSONInput {
-            type_: Some(JSONType::from_static(JSONType::LINES)),
+        input.request.input_serialization.json = Some(JsonInput {
+            r#type: Some(JsonType::LINES),
         });
         // No complete record fits the inference prefix. Do not manufacture a
         // partial record for the JSON parser at the byte limit.
@@ -1974,8 +1973,7 @@ mod tests {
     async fn bounded_csv_decoder_executes_maximum_width_in_small_batches() {
         let mut input = test_input();
         input.request.expression = "SELECT * FROM S3Object".to_owned();
-        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
-            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info = Some(FileHeaderInfo::USE);
         let header = (0..1024).map(|index| format!("c{index}")).collect::<Vec<_>>().join(",");
         let row = format!("{}\n", vec!["value"; 1024].join(","));
         let data = format!("{header}\n{}", row.repeat(600));
@@ -2021,8 +2019,7 @@ mod tests {
         input.bucket = "bounded-lines-gzip".to_owned();
         input.key = "records.gz".to_owned();
         input.request.expression = "SELECT * FROM S3Object LIMIT 1".to_owned();
-        input.request.input_serialization.compression_type =
-            Some(s3s::dto::CompressionType::from_static(s3s::dto::CompressionType::GZIP));
+        input.request.input_serialization.compression_type = Some(rustfs_s3select_api::request::CompressionType::GZIP);
         env.make_bucket(&input.bucket, false).await;
         env.put_object_bytes(&input.bucket, &input.key, compressed).await;
         let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
@@ -2156,8 +2153,7 @@ mod tests {
     async fn bounded_select_projection_checks_wildcard_expansion_before_planner() {
         let mut input = test_input();
         input.request.expression = "SELECT *, * FROM S3Object".to_owned();
-        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
-            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info = Some(FileHeaderInfo::USE);
         let data = format!("{}\n", (0..600).map(|index| format!("c{index}")).collect::<Vec<_>>().join(","));
         let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
         let error = dispatcher
@@ -2192,8 +2188,8 @@ mod tests {
         let mut input = test_input();
         input.key = "records.json".to_owned();
         input.request.input_serialization.csv = None;
-        input.request.input_serialization.json = Some(JSONInput {
-            type_: Some(JSONType::from_static(JSONType::LINES)),
+        input.request.input_serialization.json = Some(JsonInput {
+            r#type: Some(JsonType::LINES),
         });
         let input = Arc::new(input);
         let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
@@ -2527,7 +2523,7 @@ mod tests {
             .csv
             .as_mut()
             .expect("test input should use CSV serialization");
-        csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+        csv.file_header_info = Some(FileHeaderInfo::NONE);
         csv.record_delimiter = Some("^".to_string());
         let input = Arc::new(input);
         let admission = Arc::new(Semaphore::new(1));
@@ -2678,13 +2674,13 @@ mod tests {
         input.key = "test.json".to_string();
         input.request.expression = "SELECT * FROM S3Object.employees".to_string();
         input.request.input_serialization = InputSerialization {
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            json: Some(JsonInput {
+                r#type: Some(JsonType::DOCUMENT),
             }),
             ..Default::default()
         };
         input.request.output_serialization = OutputSerialization {
-            json: Some(JSONOutput::default()),
+            json: Some(JsonOutput::default()),
             ..Default::default()
         };
         let input = Arc::new(input);
@@ -2742,13 +2738,13 @@ mod tests {
             input.key = "input.json".to_string();
             input.request.expression = expression.to_string();
             input.request.input_serialization = InputSerialization {
-                json: Some(JSONInput {
-                    type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                json: Some(JsonInput {
+                    r#type: Some(JsonType::DOCUMENT),
                 }),
                 ..Default::default()
             };
             input.request.output_serialization = OutputSerialization {
-                json: Some(JSONOutput::default()),
+                json: Some(JsonOutput::default()),
                 ..Default::default()
             };
             let input = Arc::new(input);
@@ -2814,13 +2810,13 @@ mod tests {
         input.key = "input.json".to_string();
         input.request.expression = "SELECT _1 FROM S3Object[*]".to_string();
         input.request.input_serialization = InputSerialization {
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            json: Some(JsonInput {
+                r#type: Some(JsonType::DOCUMENT),
             }),
             ..Default::default()
         };
         input.request.output_serialization = OutputSerialization {
-            json: Some(JSONOutput::default()),
+            json: Some(JsonOutput::default()),
             ..Default::default()
         };
         let input = Arc::new(input);
@@ -3295,7 +3291,7 @@ mod tests {
         input_mut.bucket = "s3select-invalid-sql-precedence".to_string();
         input_mut.key = "malformed.json".to_string();
         input_mut.request.expression = "SELECT * FROM".to_string();
-        input_mut.request.input_serialization.json.as_mut().unwrap().type_ = Some(JSONType::from_static(JSONType::DOCUMENT));
+        input_mut.request.input_serialization.json.as_mut().unwrap().r#type = Some(JsonType::DOCUMENT);
 
         let env = snapshot_test_env().await;
         env.make_bucket(&input.bucket, false).await;

@@ -155,7 +155,7 @@ default build (lifecycle:
    - ⚠️ PARTIALLY VIOLATED: serving-side `s3s` references remain in ecstore
      (bucket metadata/replication/lifecycle DTOs and error mapping). The
      count is ratcheted shrink-only by `scripts/check_s3s_footprint.sh`
-     (`S3S_ECSTORE_FILES_BASELINE`; the `object_lock` module was converted to
+     (the `ecstore_files` line of `.config/s3s-footprint-baseline.txt`; the `object_lock` module was converted to
      storage-level types as the first ratchet step). Target state: the
      baseline reaches zero and ecstore's `Cargo.toml` drops `s3s`.
 

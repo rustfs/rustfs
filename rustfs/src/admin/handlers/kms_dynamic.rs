@@ -16,9 +16,10 @@
 
 use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_req, current_app_context, current_kms_runtime_service_manager,
+    AppContext, app_context_from_envelope, current_app_context, current_kms_runtime_service_manager,
     current_notification_system_for_context, current_object_store_handle_for_context,
     current_or_init_kms_runtime_service_manager,
 };
@@ -37,7 +38,7 @@ use rustfs_kms::{
     StartKmsResponse, StopKmsResponse,
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Arc;
@@ -842,41 +843,33 @@ pub struct ConfigureKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for ConfigureKmsHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_configure_actions(),
-                crate::admin::auth::policy_source_addr(&req.extensions),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.policy_source_addr()).await,
             KmsAdminOperation::Configure,
             None,
         )?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
-            return Ok(S3Response::new((
+            return Ok(AdminResponse::new(
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
-            )));
+            ));
         } else {
             match serde_json::from_slice(&body) {
                 Ok(req) => req,
@@ -890,7 +883,7 @@ impl Operation for ConfigureKmsHandler {
                         error = %e,
                         "admin kms dynamic state"
                     );
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
+                    return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}"))));
                 }
             }
         };
@@ -908,11 +901,11 @@ impl Operation for ConfigureKmsHandler {
         let existing_config = service_manager.get_config().await;
 
         if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+            return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(e)));
         }
 
         if let Err(e) = ensure_kms_request_persistable(&configure_request) {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+            return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(e)));
         }
 
         // Convert request to KmsConfig
@@ -979,14 +972,14 @@ impl Operation for ConfigureKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
-                return Ok(S3Response::new((
+                return Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
-                )));
+                ));
             }
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 
@@ -995,24 +988,24 @@ pub struct StartKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for StartKmsHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
             validate_admin_request(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_service_control_actions(),
-                crate::admin::auth::policy_source_addr(&req.extensions),
+                req.policy_source_addr(),
             )
             .await,
             KmsAdminOperation::Start,
@@ -1020,7 +1013,7 @@ impl Operation for StartKmsHandler {
         )?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -1040,7 +1033,7 @@ impl Operation for StartKmsHandler {
                         error = %e,
                         "admin kms dynamic state"
                     );
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
+                    return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}"))));
                 }
             }
         };
@@ -1136,14 +1129,14 @@ impl Operation for StartKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
-                return Ok(S3Response::new((
+                return Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
-                )));
+                ));
             }
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 
@@ -1152,24 +1145,24 @@ pub struct StopKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for StopKmsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
             validate_admin_request(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_service_control_actions(),
-                crate::admin::auth::policy_source_addr(&req.extensions),
+                req.policy_source_addr(),
             )
             .await,
             KmsAdminOperation::Stop,
@@ -1237,14 +1230,14 @@ impl Operation for StopKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
-                return Ok(S3Response::new((
+                return Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
-                )));
+                ));
             }
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 
@@ -1253,25 +1246,25 @@ pub struct ReloadKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for ReloadKmsHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let context = app_context_from_req(&req)
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let context = app_context_from_envelope(req.envelope())
             .ok_or_else(|| admin_s3_error(S3ErrorCode::ServiceUnavailable, "server context is not ready"))?;
-        let Some(cred) = req.credentials else {
+        let Some(cred) = req.credentials() else {
             return Err(admin_s3_error(S3ErrorCode::InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
             validate_admin_request(
-                &req.headers,
+                req.headers(),
                 &cred,
                 owner,
                 false,
                 kms_service_control_actions(),
-                crate::admin::auth::policy_source_addr(&req.extensions),
+                req.policy_source_addr(),
             )
             .await,
             KmsAdminOperation::Reload,
@@ -1342,7 +1335,7 @@ impl Operation for ReloadKmsHandler {
             admin_s3_error(S3ErrorCode::InternalError, "failed to serialize KMS reload response")
         })?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 
@@ -1351,21 +1344,21 @@ pub struct GetKmsStatusHandler;
 
 #[async_trait::async_trait]
 impl Operation for GetKmsStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
             kms_service_control_actions(),
-            crate::admin::auth::policy_source_addr(&req.extensions),
+            req.policy_source_addr(),
         )
         .await?;
 
@@ -1426,14 +1419,14 @@ impl Operation for GetKmsStatusHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
-                return Ok(S3Response::new((
+                return Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
-                )));
+                ));
             }
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 
@@ -1442,41 +1435,33 @@ pub struct ReconfigureKmsHandler;
 
 #[async_trait::async_trait]
 impl Operation for ReconfigureKmsHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let audit = KmsAdminAudit::from_request(&req.extensions, &req.headers, &cred);
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(
-                &req.headers,
-                &cred,
-                owner,
-                false,
-                kms_configure_actions(),
-                crate::admin::auth::policy_source_addr(&req.extensions),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.policy_source_addr()).await,
             KmsAdminOperation::Reconfigure,
             None,
         )?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
         let mut configure_request: ConfigureKmsRequest = if body.is_empty() {
-            return Ok(S3Response::new((
+            return Ok(AdminResponse::new(
                 StatusCode::BAD_REQUEST,
                 Body::from("Request body is required".to_string()),
-            )));
+            ));
         } else {
             match serde_json::from_slice(&body) {
                 Ok(req) => req,
@@ -1490,7 +1475,7 @@ impl Operation for ReconfigureKmsHandler {
                         error = %e,
                         "admin kms dynamic state"
                     );
-                    return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}")))));
+                    return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(format!("Invalid JSON: {e}"))));
                 }
             }
         };
@@ -1508,11 +1493,11 @@ impl Operation for ReconfigureKmsHandler {
         let existing_config = service_manager.get_config().await;
 
         if let Err(e) = normalize_configure_request_secrets(&mut configure_request, existing_config.as_ref()) {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+            return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(e)));
         }
 
         if let Err(e) = ensure_kms_request_persistable(&configure_request) {
-            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+            return Ok(AdminResponse::new(StatusCode::BAD_REQUEST, Body::from(e)));
         }
 
         // Convert request to KmsConfig
@@ -1580,14 +1565,14 @@ impl Operation for ReconfigureKmsHandler {
                     error = %e,
                     "admin kms dynamic state"
                 );
-                return Ok(S3Response::new((
+                return Ok(AdminResponse::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Body::from("Serialization error".to_string()),
-                )));
+                ));
             }
         };
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(json_response)))
     }
 }
 

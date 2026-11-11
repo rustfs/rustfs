@@ -92,6 +92,9 @@ pub const O_APPEND: FileMode = 0x00400;
 //     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
+    if mode & O_CREATE != 0 {
+        super::os::record_native_publication(path.as_ref());
+    }
     let path = path.as_ref().to_path_buf();
     native_io(move || {
         let mut options = std::fs::OpenOptions::new();
@@ -144,6 +147,7 @@ pub fn create_dir_all_std(path: &Path) -> io::Result<()> {
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     let path = path.as_ref().to_path_buf();
     native_io(move || create_dir_all_std(&path)).await
 }
@@ -216,11 +220,13 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
 
 #[cfg(test)]
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     let path = path.as_ref().to_path_buf();
     native_io(move || std::fs::create_dir(path)).await
 }
 
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     let from = from.as_ref().to_path_buf();
     let to = to.as_ref().to_path_buf();
     native_io(move || std::fs::rename(from, to)).await
@@ -228,6 +234,7 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 
 #[cfg(any(not(windows), test))]
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     std::fs::rename(from, to)
 }
 

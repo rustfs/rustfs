@@ -1,0 +1,1 @@
+<CORSConfiguration><CORSRule><AllowedHeader>Authorization</AllowedHeader><AllowedHeader>Content-Type</AllowedHeader><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedOrigin>https://console.example.internal</AllowedOrigin><ExposeHeader>ETag</ExposeHeader><ID>console</ID><MaxAgeSeconds>600</MaxAgeSeconds></CORSRule></CORSConfiguration>

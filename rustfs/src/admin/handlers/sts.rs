@@ -15,15 +15,16 @@
 use super::is_admin::IsAdminHandler;
 use crate::admin::handlers::account_audit::AccountAuditContext;
 use crate::admin::handlers::mfa::verify_for_session as mfa_verify_for_session;
-use crate::admin::runtime_sources::object_store_from_req;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::session_policy::populate_session_policy;
-use crate::admin::storage_api::bucket::utils::serialize;
+use crate::app::RequestCredentials;
 use crate::{
     admin::runtime_sources::{current_action_credentials, current_federated_identity_service, current_token_signing_key},
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
-        router::{AdminOperation, Operation, S3Router},
+        router::{AdminOperation, S3Router},
     },
     auth::{check_key_valid, get_session_token},
     server::ADMIN_PREFIX,
@@ -44,12 +45,9 @@ use rustfs_policy::{
         action::{Action, StsAction},
     },
 };
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::MaskedAccessKey;
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    dto::{AssumeRoleOutput, Credentials, Timestamp},
-    s3_error,
-};
+use s3s::dto::{AssumeRoleOutput, Credentials, Timestamp};
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
@@ -170,15 +168,15 @@ pub struct AssumeRoleRequest {
 pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         debug!("handle AssumeRoleHandle");
 
         // Captured before the body is consumed: the second-factor gate needs the
         // object store, and its audit entries need the request metadata.
-        let store = object_store_from_req(&req);
-        let audit = AccountAuditContext::from_request(&req);
+        let store = object_store_from_envelope(req.envelope());
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
-        let mut input = req.input;
+        let mut input = req.take_body();
 
         let bytes = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
@@ -192,8 +190,8 @@ impl Operation for AssumeRoleHandle {
 
         match body.action.as_str() {
             ASSUME_ROLE_ACTION => {
-                let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
-                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body, store, &audit).await
+                let remote_addr = req.policy_source_addr();
+                handle_assume_role(req.credentials(), req.uri(), req.headers(), remote_addr, body, store, &audit).await
             }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
@@ -203,28 +201,28 @@ impl Operation for AssumeRoleHandle {
 
 /// Handle the standard AssumeRole action (requires SigV4 credentials).
 async fn handle_assume_role(
-    credentials: Option<s3s::auth::Credentials>,
-    uri: http::Uri,
-    headers: http::HeaderMap,
+    credentials: Option<&RequestCredentials>,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
     store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
     audit: &AccountAuditContext,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+) -> S3Result<AdminResponse> {
     let Some(user) = credentials else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
 
-    let session_token = get_session_token(&uri, &headers);
+    let session_token = get_session_token(uri, headers);
     if session_token.is_some() {
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
-    let (cred, owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
+    let (cred, owner) = check_key_valid(get_session_token(uri, headers).unwrap_or_default(), user.access_key()).await?;
 
     // The signature was verified before the request body was consumed. A fresh
     // IAM lookup must not silently replace the secret that authenticated it.
-    if !crate::auth::constant_time_eq(&cred.secret_key, user.secret_key.expose()) {
+    if !crate::auth::constant_time_eq(&cred.secret_key, user.secret_key()) {
         return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
     }
 
@@ -235,7 +233,7 @@ async fn handle_assume_role(
     let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
-    let mut conditions = crate::auth::get_condition_values(&headers, &cred, None, None, remote_addr);
+    let mut conditions = crate::auth::get_condition_values(headers, &cred, None, None, remote_addr);
     let exp = set_assume_role_duration_condition(&mut conditions, body.duration_seconds);
     if !iam_store
         .is_allowed(&Args {
@@ -346,10 +344,18 @@ async fn handle_assume_role(
     };
 
     // getAssumeRoleCredentials
-    let output = serialize::<AssumeRoleOutput>(&resp)
+    let output = serialize_assume_role_output(&resp)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
 
-    Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+    Ok(AdminResponse::new(StatusCode::OK, Body::from(output)))
+}
+
+/// The STS answer is an s3s response body, so the s3s encoder writes it; it
+/// is not a bucket configuration and never goes through the bucket-config codec.
+fn serialize_assume_role_output(output: &AssumeRoleOutput) -> s3s::xml::SerResult<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    s3s::xml::Serialize::serialize(output, &mut s3s::xml::Serializer::new(&mut buf))?;
+    Ok(buf)
 }
 
 /// Session claim marking a session that presented a second factor.
@@ -409,7 +415,7 @@ async fn enforce_second_factor(
 
 /// Handle the AssumeRoleWithWebIdentity action.
 /// The JWT (id_token) in the request is the authentication — no SigV4 needed.
-async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Result<AdminResponse> {
     if body.web_identity_token.is_empty() {
         return Err(s3_error!(InvalidArgument, "WebIdentityToken is required"));
     }
@@ -447,10 +453,9 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
 
     let xml = assume_role_with_web_identity_response_xml(new_cred, &subject);
 
-    let mut resp = S3Response::new((StatusCode::OK, Body::from(xml.into_bytes())));
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-    Ok(resp)
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(xml.into_bytes()), headers))
 }
 
 fn assume_role_with_web_identity_response_xml(credentials: &rustfs_credentials::Credentials, subject: &str) -> String {

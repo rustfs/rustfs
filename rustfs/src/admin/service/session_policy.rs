@@ -14,7 +14,7 @@
 
 use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_policy::policy::Policy;
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde_json::Value;
 use std::collections::HashMap;
 

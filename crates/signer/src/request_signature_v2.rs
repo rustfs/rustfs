@@ -24,7 +24,6 @@ use http::HeaderValue;
 
 use super::utils::{HostAddrError, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hmac_sha1};
-use s3s::Body;
 
 // NOTE: SHA-1 HMAC is used here for AWS S3 Signature V2 compatibility.
 // SHA-1 is considered weak, but it's only used for HMAC (not signature collision).
@@ -60,28 +59,28 @@ pub enum SignV2Error {
 }
 
 #[derive(Debug)]
-struct SignV2Failure {
-    request: request::Request<Body>,
+struct SignV2Failure<B> {
+    request: request::Request<B>,
     error: SignV2Error,
 }
 
-type SignV2Outcome = std::result::Result<request::Request<Body>, Box<SignV2Failure>>;
+type SignV2Outcome<B> = std::result::Result<request::Request<B>, Box<SignV2Failure<B>>>;
 
-fn sign_v2_fail(request: request::Request<Body>, error: SignV2Error) -> SignV2Outcome {
+fn sign_v2_fail<B>(request: request::Request<B>, error: SignV2Error) -> SignV2Outcome<B> {
     Err(Box::new(SignV2Failure { request, error }))
 }
 
-fn encode_url2path(req: &request::Request<Body>, _virtual_host: bool) -> String {
+fn encode_url2path<B>(req: &request::Request<B>, _virtual_host: bool) -> String {
     req.uri().path().to_string()
 }
 
-fn pre_sign_v2_inner(
-    mut req: request::Request<Body>,
+fn pre_sign_v2_inner<B>(
+    mut req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     expires: i64,
     virtual_host: bool,
-) -> SignV2Outcome {
+) -> SignV2Outcome<B> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return Ok(req);
     }
@@ -147,23 +146,23 @@ fn pre_sign_v2_inner(
     Ok(req)
 }
 
-pub fn try_pre_sign_v2(
-    req: request::Request<Body>,
+pub fn try_pre_sign_v2<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     expires: i64,
     virtual_host: bool,
-) -> Result<request::Request<Body>, SignV2Error> {
+) -> Result<request::Request<B>, SignV2Error> {
     pre_sign_v2_inner(req, access_key_id, secret_access_key, expires, virtual_host).map_err(|f| f.error)
 }
 
-pub fn pre_sign_v2(
-    req: request::Request<Body>,
+pub fn pre_sign_v2<B>(
+    req: request::Request<B>,
     access_key_id: &str,
     secret_access_key: &str,
     expires: i64,
     virtual_host: bool,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match pre_sign_v2_inner(req, access_key_id, secret_access_key, expires, virtual_host) {
         Ok(request) => request,
         Err(failure) => {
@@ -177,13 +176,13 @@ fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> 
     hex(hmac_sha1(secret_access_key, policy_base64))
 }
 
-fn sign_v2_inner(
-    mut req: request::Request<Body>,
+fn sign_v2_inner<B>(
+    mut req: request::Request<B>,
     _content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
-) -> SignV2Outcome {
+) -> SignV2Outcome<B> {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return Ok(req);
     }
@@ -243,23 +242,23 @@ fn sign_v2_inner(
     Ok(req)
 }
 
-pub fn try_sign_v2(
-    req: request::Request<Body>,
+pub fn try_sign_v2<B>(
+    req: request::Request<B>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
-) -> Result<request::Request<Body>, SignV2Error> {
+) -> Result<request::Request<B>, SignV2Error> {
     sign_v2_inner(req, content_len, access_key_id, secret_access_key, virtual_host).map_err(|f| f.error)
 }
 
-pub fn sign_v2(
-    req: request::Request<Body>,
+pub fn sign_v2<B>(
+    req: request::Request<B>,
     content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     match sign_v2_inner(req, content_len, access_key_id, secret_access_key, virtual_host) {
         Ok(request) => request,
         Err(failure) => {
@@ -269,7 +268,7 @@ pub fn sign_v2(
     }
 }
 
-fn try_pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Result<String, SignV2Error> {
+fn try_pre_string_to_sign_v2<B>(req: &request::Request<B>, virtual_host: bool) -> Result<String, SignV2Error> {
     let mut buf = BytesMut::new();
     write_pre_sign_v2_headers(&mut buf, req);
     write_canonicalized_headers(&mut buf, req);
@@ -277,7 +276,7 @@ fn try_pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -
     String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
 }
 
-fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
+fn write_pre_sign_v2_headers<B>(buf: &mut BytesMut, req: &request::Request<B>) {
     let _ = buf.write_str(req.method().as_str());
     let _ = buf.write_char('\n');
     let _ = buf.write_str(req.headers().get("Content-Md5").and_then(|v| v.to_str().ok()).unwrap_or(""));
@@ -288,7 +287,7 @@ fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let _ = buf.write_char('\n');
 }
 
-fn try_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Result<String, SignV2Error> {
+fn try_string_to_sign_v2<B>(req: &request::Request<B>, virtual_host: bool) -> Result<String, SignV2Error> {
     let mut buf = BytesMut::new();
     write_sign_v2_headers(&mut buf, req);
     write_canonicalized_headers(&mut buf, req);
@@ -296,7 +295,7 @@ fn try_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Re
     String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
 }
 
-fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
+fn write_sign_v2_headers<B>(buf: &mut BytesMut, req: &request::Request<B>) {
     let headers = req.headers();
     let _ = buf.write_str(req.method().as_str());
     let _ = buf.write_char('\n');
@@ -308,7 +307,7 @@ fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let _ = buf.write_char('\n');
 }
 
-fn write_canonicalized_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
+fn write_canonicalized_headers<B>(buf: &mut BytesMut, req: &request::Request<B>) {
     let mut proto_headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
@@ -362,7 +361,7 @@ const INCLUDED_QUERY: &[&str] = &[
     "website",
 ];
 
-fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Request<Body>, virtual_host: bool) {
+fn write_canonicalized_resource<B>(buf: &mut BytesMut, req: &request::Request<B>, virtual_host: bool) {
     let request_url = req.uri();
     let _ = buf.write_str(&encode_url2path(req, virtual_host));
     if let Some(query_str) = request_url.query().filter(|query| !query.is_empty()) {
@@ -398,6 +397,8 @@ fn write_canonicalized_resource(buf: &mut BytesMut, req: &request::Request<Body>
 #[allow(unused_variables, unused_mut)]
 mod tests {
     use std::collections::HashMap;
+
+    use rustfs_s3_types::Body;
 
     use super::*;
 

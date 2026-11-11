@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authenticate_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, object_store_from_req};
+use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
 use crate::admin::service::caller_identity::oidc_profile_fields;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
@@ -23,16 +24,18 @@ use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, l
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, ReplicationRuleStatus};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,14 +97,14 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
     config
         .object_lock_enabled
         .as_ref()
-        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
+        .is_some_and(|enabled| enabled == "Enabled")
 }
 
-fn replication_config_enabled(config: &ReplicationConfiguration) -> bool {
+fn replication_config_enabled(config: &PersistedReplicationConfiguration) -> bool {
     config
         .rules
         .iter()
-        .any(|rule| rule.status.as_str() == ReplicationRuleStatus::ENABLED)
+        .any(|rule| rule.status.as_str() == Status::ENABLED.as_str())
 }
 
 async fn bucket_locking_enabled(bucket: &str) -> bool {
@@ -127,16 +130,16 @@ async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = object_store_from_req(&req) else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
+        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -146,8 +149,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
+        let remote_addr = req.policy_source_addr();
+        let conditions = get_condition_values(req.headers(), &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -310,16 +313,16 @@ impl Operation for AccountInfoHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_gateway_types::persistence::{PersistedReplicationDestination, PersistedReplicationRule};
     use rustfs_madmin::BackendInfo;
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{Destination, ReplicationRule};
 
     #[test]
     fn accountinfo_response_adds_optional_oidc_display_fields() {
@@ -423,7 +426,7 @@ mod tests {
     #[test]
     fn accountinfo_bucket_details_marks_object_lock_enabled() {
         let enabled = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
         let disabled = ObjectLockConfiguration::default();
@@ -434,20 +437,20 @@ mod tests {
 
     #[test]
     fn accountinfo_bucket_details_marks_replication_enabled_rules() {
-        let enabled = replication_config_with_status(ReplicationRuleStatus::ENABLED);
-        let disabled = replication_config_with_status(ReplicationRuleStatus::DISABLED);
+        let enabled = replication_config_with_status(Status::ENABLED.as_str());
+        let disabled = replication_config_with_status(Status::DISABLED.as_str());
 
         assert!(replication_config_enabled(&enabled));
         assert!(!replication_config_enabled(&disabled));
     }
 
-    fn replication_config_with_status(status: &'static str) -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    fn replication_config_with_status(status: &str) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: "arn:aws:iam::123456789012:role/replication".to_string(),
-            rules: vec![ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:aws:s3:::target".to_string(),
                     ..Default::default()
                 },
@@ -457,7 +460,7 @@ mod tests {
                 prefix: None,
                 priority: None,
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(status),
+                status: status.to_owned(),
             }],
         }
     }
