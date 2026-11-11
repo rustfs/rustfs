@@ -50,6 +50,24 @@ E2E_SELECTION_FILES = {
 SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
+# Report-only lanes stay outside the aggregate until their milestone makes them
+# required. Each reruns a required job's suite with one environment change, so
+# the named steps must stay identical to that job's and the change must stay.
+REPORT_ONLY_JOBS = {
+    # rustfs/backlog#2734: required at T2.10.
+    "e2e-tests-gateway": (
+        "e2e-tests",
+        (
+            "Download E2E test binaries",
+            "Verify E2E archive identity",
+            "Verify e2e smoke test membership",
+            "Run e2e smoke suite",
+            "Verify e2e smoke execution completeness",
+        ),
+        "RUSTFS_S3_STACK: gateway",
+    ),
+}
+INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
 def documentation_path(path: str) -> bool:
@@ -232,7 +250,7 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
     expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
     expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
     expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
     expected["e2e-full"] = "success" if full else "skipped"
     expected.update({job: "success" if rehearse_shards else "skipped" for job in SHARD_JOBS})
     if event == "pull_request" and action == "closed":
@@ -593,8 +611,25 @@ def check_workflow(root: Path) -> list[str]:
         return [str(error)]
     errors = []
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
-    if set(jobs) - NON_VALIDATION_JOBS != required:
+    if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
+    for job, (mirror, steps, env) in REPORT_ONLY_JOBS.items():
+        block, mirrored = jobs.get(job), jobs.get(mirror)
+        if not isinstance(block, dict) or not isinstance(mirrored, dict):
+            errors.append(f"report-only {job} and its required {mirror} must both exist")
+            continue
+        key, _, value = env.partition(": ")
+        if (block.get("env") or {}).get(key) != value:
+            errors.append(f"{job} must set {env}")
+
+        def named(job_block, step):
+            matches = [item for item in job_block.get("steps") or [] if isinstance(item, dict) and item.get("name") == step]
+            return matches[0] if len(matches) == 1 else None
+
+        for step in steps:
+            ours, theirs = named(block, step), named(mirrored, step)
+            if ours is None or theirs is None or ours != theirs:
+                errors.append(f"{job} step {step!r} must match {mirror}")
     for job in required | {"required-checks"}:
         block = jobs.get(job, {})
         for item in [block, *block.get("steps", [])]:

@@ -109,7 +109,7 @@ impl CatalogMigrationScopeFixture {
             .expect("attach migration policy to the regular user");
 
         let setup = table_catalog_handler_request(context.clone(), SCOPED_USER, SCOPED_SECRET);
-        let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("resolve the isolated catalog backend");
+        let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("resolve the isolated catalog backend");
         let catalog = table_catalog_store_from_backend(backend).expect("resolve object catalog");
         for bucket in [SCOPED_WAREHOUSE, FOREIGN_WAREHOUSE] {
             enable_table_bucket_marker(object_store.as_ref(), bucket)
@@ -125,22 +125,21 @@ impl CatalogMigrationScopeFixture {
         }
     }
 
-    fn request(&self, prefix: &str, warehouse: &str, operation: CatalogMigrationScopeOperation, body: &[u8]) -> S3Request<Body> {
-        let mut request = table_catalog_handler_request(self.context.clone(), SCOPED_USER, SCOPED_SECRET);
-        request.method = Method::POST;
-        request.uri = format!("{prefix}/{warehouse}{}", operation.suffix())
-            .parse()
-            .expect("scope handler URI");
-        request
-            .headers
-            .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        request.input = Body::from(body.to_vec());
-        request
+    fn request(&self, prefix: &str, warehouse: &str, operation: CatalogMigrationScopeOperation, body: &[u8]) -> AdminRequest {
+        table_catalog_request_builder(
+            self.context.clone(),
+            Some((SCOPED_USER, SCOPED_SECRET)),
+            Method::POST,
+            &format!("{prefix}/{warehouse}{}", operation.suffix()),
+        )
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_vec()))
+        .build()
     }
 
     async fn inventory(&self) -> BTreeMap<(String, String), TableCatalogObject> {
         let setup = table_catalog_handler_request(self.context.clone(), SCOPED_USER, SCOPED_SECRET);
-        let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("resolve inventory backend");
+        let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("resolve inventory backend");
         let mut result = BTreeMap::new();
         for bucket in [RUSTFS_META_BUCKET, SCOPED_WAREHOUSE, FOREIGN_WAREHOUSE, UNMARKED_WAREHOUSE] {
             for object in backend.list_objects(bucket, "").await.expect("list isolated fixture objects") {
@@ -157,15 +156,15 @@ impl CatalogMigrationScopeFixture {
 }
 
 async fn call_catalog_migration_scope_handler(
-    request: S3Request<Body>,
+    request: AdminRequest,
     prefix: &str,
     operation: CatalogMigrationScopeOperation,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert(format!("{prefix}/{{warehouse}}{}", operation.suffix()), ())
         .expect("insert the real catalog route shape");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("match the warehouse parameter");
     match operation {
         CatalogMigrationScopeOperation::Backfill => BackfillTableWarehouseIndexHandler {}.call(request, matched.params).await,
@@ -174,12 +173,9 @@ async fn call_catalog_migration_scope_handler(
     }
 }
 
-async fn catalog_migration_scope_response_json(response: S3Response<(StatusCode, Body)>) -> serde_json::Value {
-    assert_eq!(response.output.0, StatusCode::OK);
-    let bytes = http_body_util::BodyExt::collect(response.output.1)
-        .await
-        .expect("collect successful catalog response")
-        .to_bytes();
+async fn catalog_migration_scope_response_json(response: AdminResponse) -> serde_json::Value {
+    let (status, _, bytes) = response_parts(response).await;
+    assert_eq!(status, StatusCode::OK);
     serde_json::from_slice(&bytes).expect("parse successful catalog response JSON")
 }
 
@@ -201,7 +197,7 @@ async fn catalog_backfill_handler_enforces_warehouse_scope_before_marker_or_stor
         let response = call_catalog_migration_scope_handler(request, prefix, operation)
             .await
             .expect("authorized warehouse-index backfill succeeds");
-        assert_eq!(response.output.0, StatusCode::NO_CONTENT);
+        assert_eq!(response.into_parts().0, StatusCode::NO_CONTENT);
 
         for warehouse in [FOREIGN_WAREHOUSE, UNMARKED_WAREHOUSE] {
             let before = fixture.inventory().await;
@@ -264,7 +260,7 @@ async fn catalog_backup_restore_enforce_migration_scope_and_replay_own_receipts(
         assert_eq!(restored["maintenance_object_count"], backup["maintenance_object_count"]);
 
         let setup = table_catalog_handler_request(fixture.context.clone(), SCOPED_USER, SCOPED_SECRET);
-        let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("resolve restore control backend");
+        let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("resolve restore control backend");
         let state_path = crate::table_catalog::TableCatalogObjectPaths::default().catalog_restore_state_path(SCOPED_WAREHOUSE);
         let barrier = backend
             .read_object(RUSTFS_META_BUCKET, &state_path)

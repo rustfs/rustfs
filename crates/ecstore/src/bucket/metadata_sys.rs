@@ -31,14 +31,18 @@ use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::{ECStore, await_bucket_namespace_operation};
 use futures::future::join_all;
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration as CORSConfiguration, PersistedTagging as Tagging};
+use rustfs_gateway_types::persistence::{
+    PersistedAccelerateConfiguration as AccelerateConfiguration,
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+    PersistedBucketLoggingStatus as BucketLoggingStatus, PersistedLifecycleConfiguration,
+    PersistedNotificationConfiguration as NotificationConfiguration, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+    PersistedPublicAccessBlockConfiguration as PublicAccessBlockConfiguration, PersistedReplicationConfiguration,
+    PersistedRequestPaymentConfiguration as RequestPaymentConfiguration,
+    PersistedVersioningConfiguration as VersioningConfiguration, PersistedWebsiteConfiguration as WebsiteConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
-use s3s::dto::ReplicationConfiguration;
-use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, PublicAccessBlockConfiguration,
-    RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
-};
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{
@@ -169,7 +173,7 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     if bm.lock_enabled {
         return Ok(ObjectLockConfigState::Configured {
             config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: bm.object_lock_config_updated_at,
@@ -213,17 +217,10 @@ pub(crate) fn configured_object_lock_state_for_tests(
 ) -> ObjectLockConfigState {
     ObjectLockConfigState::Configured {
         config: ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(s3s::dto::ObjectLockRule {
-                default_retention: Some(s3s::dto::DefaultRetention {
-                    mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(match mode {
-                        crate::bucket::object_lock::types::RetentionMode::Governance => {
-                            s3s::dto::ObjectLockRetentionMode::GOVERNANCE
-                        }
-                        crate::bucket::object_lock::types::RetentionMode::Compliance => {
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE
-                        }
-                    })),
+            object_lock_enabled: Some("Enabled".to_owned()),
+            rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                    mode: Some(mode.as_str().to_owned()),
                     days: Some(days),
                     years: None,
                 }),
@@ -234,7 +231,7 @@ pub(crate) fn configured_object_lock_state_for_tests(
 }
 
 fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -> Result<()> {
-    if config.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str) != Some(ObjectLockEnabled::ENABLED) {
+    if config.object_lock_enabled.as_deref() != Some("Enabled") {
         return Err(Error::other("persisted bucket Object Lock enabled state is invalid"));
     }
 
@@ -247,7 +244,7 @@ fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -
     if !retention
         .mode
         .as_ref()
-        .is_some_and(|mode| matches!(mode.as_str(), ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE))
+        .is_some_and(|mode| matches!(mode.as_str(), "COMPLIANCE" | "GOVERNANCE"))
     {
         return Err(Error::other("persisted bucket Object Lock retention mode is invalid"));
     }
@@ -1641,7 +1638,7 @@ pub async fn get_public_access_block_config(bucket: &str) -> Result<(PublicAcces
     bucket_meta_sys.get_public_access_block_config(bucket).await
 }
 
-pub async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+pub async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -1917,7 +1914,7 @@ pub(crate) async fn get_cached_quota_config_and_incarnation_in(
     bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
 }
 
-pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+pub async fn get_replication_config(bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -1927,7 +1924,7 @@ pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfigur
 pub(crate) async fn get_replication_config_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
-) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
@@ -2066,8 +2063,26 @@ pub(crate) fn current_local_meta_mutation_gen() -> u64 {
 type LocalAuthorityCache = Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>;
 
 #[derive(Debug, Clone)]
+pub(crate) struct PendingBucketCreationProof {
+    pub(crate) generation: Uuid,
+    pub(crate) intent: Vec<u8>,
+    pub(crate) versioning_requested: bool,
+    pub(crate) witnesses: Vec<crate::disk::os::NativeBucketCreationWitness>,
+}
+
+impl PendingBucketCreationProof {
+    pub(crate) fn matches_metadata(&self, metadata: &BucketMetadata) -> Result<bool> {
+        Ok(!metadata.bucket_creation_committed
+            && metadata.bucket_incarnation_sidecar
+            && metadata.bucket_incarnation_id == self.generation
+            && metadata.marshal_msg()? == self.intent)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BucketMetadataSys {
     metadata_map: Arc<RwLock<HashMap<String, Arc<BucketMetadata>>>>,
+    pending_bucket_creations: Arc<RwLock<HashMap<String, PendingBucketCreationProof>>>,
     local_authority_cache: LocalAuthorityCache,
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
@@ -2112,6 +2127,7 @@ impl BucketMetadataSys {
     pub fn new(api: Arc<ECStore>) -> Self {
         Self {
             metadata_map: Arc::new(RwLock::new(HashMap::new())),
+            pending_bucket_creations: Arc::new(RwLock::new(HashMap::new())),
             local_authority_cache: Arc::new(StdMutex::new(HashMap::new())),
             metadata_publish_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
@@ -2141,6 +2157,81 @@ impl BucketMetadataSys {
     pub(crate) fn object_store(&self) -> Arc<ECStore> {
         self.object_store_if_live()
             .expect("bucket metadata object store should still be live")
+    }
+
+    pub(crate) async fn pending_bucket_creation(&self, bucket: &str) -> Option<PendingBucketCreationProof> {
+        self.pending_bucket_creations.read().await.get(bucket).cloned()
+    }
+
+    pub(crate) async fn grant_pending_bucket_creation(&self, bucket: &str, proof: PendingBucketCreationProof) {
+        self.pending_bucket_creations.write().await.insert(bucket.to_owned(), proof);
+    }
+
+    pub(crate) async fn revoke_pending_bucket_creation(&self, bucket: &str) {
+        self.pending_bucket_creations.write().await.remove(bucket);
+    }
+
+    pub(crate) async fn consume_pending_bucket_creation(
+        &self,
+        bucket: &str,
+        metadata: &BucketMetadata,
+        witnesses: &[crate::disk::os::NativeBucketCreationWitness],
+    ) -> Result<bool> {
+        let mut pending = self.pending_bucket_creations.write().await;
+        let Some(proof) = pending.get(bucket) else {
+            return Ok(false);
+        };
+        if !proof.matches_metadata(metadata)?
+            || proof.witnesses.len() != witnesses.len()
+            || !proof
+                .witnesses
+                .iter()
+                .zip(witnesses)
+                .all(|(old, current)| old.matches(current))
+            || !crate::disk::os::consume_native_creation_witnesses(witnesses)
+        {
+            return Ok(false);
+        }
+        pending.remove(bucket);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn refresh_bucket_for_test(&self, bucket: &str) -> Result<()> {
+        let expected = self.metadata_map.read().await.get(bucket).cloned();
+        let lock = self.object_store().new_ns_lock(bucket, bucket).await?;
+        let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+        self.load_bucket_under_namespace(bucket, MetadataLoadMode::Refresh, expected.as_ref(), &guard)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn publish_persisted_metadata_for_test(&self, bucket: &str) -> Result<()> {
+        let expected = self.metadata_map.read().await.get(bucket).cloned();
+        let lock = self.object_store().new_ns_lock(bucket, bucket).await?;
+        let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+        let (metadata, persisted) = await_bucket_namespace_operation(
+            Some(&guard),
+            bucket,
+            "test cached metadata load",
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
+        )
+        .await?;
+        self.publish_if_unchanged(bucket, expected.as_ref(), metadata, persisted, &guard)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn migrate_bucket_creation_commit_for_test(&self, bucket: &str) -> Result<()> {
+        self.migrate_bucket_creation_commit(bucket).await.map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn legacy_migration_reports_missing_bucket_for_test(&self, bucket: &str) -> Result<bool> {
+        Ok(matches!(
+            self.migrate_legacy_metadata(bucket).await?,
+            BucketMetadataAuthority::MissingBucket
+        ))
     }
 
     fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
@@ -2342,6 +2433,7 @@ impl BucketMetadataSys {
         expected: Option<&Arc<BucketMetadata>>,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         if !await_bucket_namespace_operation(
             Some(namespace_guard),
             bucket,
@@ -2425,6 +2517,7 @@ impl BucketMetadataSys {
         persisted: bool,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         if !persisted {
             let _publish_guard = self
                 .lock_metadata_publish(bucket, namespace_guard, "refreshed bucket metadata absence publish")
@@ -2486,6 +2579,7 @@ impl BucketMetadataSys {
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
+        self.revoke_pending_bucket_creation(&bucket).await;
         bump_local_meta_mutation_gen();
         if !is_meta_bucketname(&bucket) {
             let publish_lock = self.metadata_publish_lock(&bucket);
@@ -2509,6 +2603,7 @@ impl BucketMetadataSys {
         if is_meta_bucketname(bucket) {
             return false;
         }
+        self.revoke_pending_bucket_creation(bucket).await;
         let publish_lock = self.metadata_publish_lock(bucket);
         let _publish_guard = publish_lock.lock().await;
         let mut map = self.metadata_map.write().await;
@@ -2526,6 +2621,7 @@ impl BucketMetadataSys {
     }
 
     async fn _reset(&mut self) {
+        self.pending_bucket_creations.write().await.clear();
         bump_local_meta_mutation_gen();
         let mut map = self.metadata_map.write().await;
         map.clear();
@@ -2665,6 +2761,7 @@ impl BucketMetadataSys {
     /// server's metadata never leaks into the ambient (first) instance.
     pub(crate) async fn persist_and_set(&self, bm: BucketMetadata) -> Result<()> {
         let mut bm = bm;
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.save_with_store(self.object_store()).await?;
 
         self.set(bm.name.clone(), Arc::new(bm)).await;
@@ -2673,6 +2770,7 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = true;
         bm.save_with_store_committed(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
@@ -2682,7 +2780,9 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_bucket_metadata_intent(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = false;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
@@ -2692,6 +2792,7 @@ impl BucketMetadataSys {
     }
 
     async fn commit_bucket_metadata(&self, mut bm: BucketMetadata) -> Result<()> {
+        self.revoke_pending_bucket_creation(&bm.name).await;
         bm.parse_all_configs()?;
         bm.bucket_incarnation_sidecar = true;
         // The caller holds the full bucket creation fence (lifecycle, metadata
@@ -2740,6 +2841,7 @@ impl BucketMetadataSys {
         bucket: &str,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
+        self.revoke_pending_bucket_creation(bucket).await;
         let expected = self.metadata_map.read().await.get(bucket).cloned();
         if !self
             .bucket_exists(bucket, namespace_guard, "peer bucket metadata existence check")
@@ -2796,6 +2898,7 @@ impl BucketMetadataSys {
             #[cfg(test)]
             self.lazy_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+            self.revoke_pending_bucket_creation(bucket).await;
             let lock = self.object_store().new_ns_lock(bucket, bucket).await?;
             let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
             #[cfg(test)]
@@ -3121,6 +3224,7 @@ impl BucketMetadataSys {
     /// revalidated at write quorum, so a stale snapshot can neither revert an
     /// acknowledged configuration update nor outlive a delete/recreate.
     async fn migrate_bucket_creation_commit(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
+        self.revoke_pending_bucket_creation(bucket).await;
         let transaction_guard = acquire_metadata_transaction_guard(
             self.object_store(),
             bucket,
@@ -3198,6 +3302,7 @@ impl BucketMetadataSys {
         &self,
         bucket: &str,
     ) -> Result<BucketMetadataAuthority> {
+        self.revoke_pending_bucket_creation(bucket).await;
         #[cfg(test)]
         if self.object_lock_disk_read_errors.write().await.remove(bucket) {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));
@@ -3420,7 +3525,7 @@ impl BucketMetadataSys {
         }
     }
 
-    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
+    pub async fn get_lifecycle_config(&self, bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         match ConfigState::of(&bm.lifecycle_config_xml, &bm.lifecycle_config).require(bucket, BUCKET_LIFECYCLE_CONFIG)? {
@@ -3543,7 +3648,7 @@ impl BucketMetadataSys {
         }))
     }
 
-    pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+    pub async fn get_replication_config(&self, bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
         if !bm.replication_config_xml.is_empty() && bm.replication_config.is_none() {
@@ -3645,6 +3750,7 @@ mod tests {
     };
     use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
     use crate::config::com::read_config;
+    use crate::disk::{DiskAPI as _, RUSTFS_META_TMP_BUCKET};
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use byteorder::{ByteOrder as _, LittleEndian};
     use serial_test::serial;
@@ -3698,6 +3804,180 @@ mod tests {
             br#"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#,
         ),
     ];
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn persistence_entry_failures_revoke_pending_creation_before_cache_publish() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("instance metadata system");
+        let sys = sys.read().await.clone();
+        let options = MakeBucketOptions {
+            lock_enabled: true,
+            ..Default::default()
+        };
+        for entry in ["save", "persist", "persist-new", "commit"] {
+            let bucket = format!("revoke-{entry}-{}", Uuid::new_v4());
+            store.fail_next_bucket_creation_after_intent_for_test(&bucket);
+            store
+                .make_bucket(&bucket, &options)
+                .await
+                .expect_err("stop the real producer before physical publication");
+            sys.pending_bucket_creation(&bucket)
+                .await
+                .expect("the producer must leave a real live creation permission");
+            let (intent, persisted) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("read the original producer intent");
+            assert!(persisted, "{entry}: the complete original intent must be persisted");
+            let original_intent = intent.marshal_msg().expect("encode the original intent");
+
+            // Keep the creation fence order used by the real producer.
+            let lifecycle_guard = store
+                .acquire_bucket_lifecycle_write_lock(&bucket)
+                .await
+                .expect("hold the bucket lifecycle fence");
+            let transaction_guard = acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+                .await
+                .expect("hold the metadata transaction fence");
+            let namespace_lock = store
+                .new_ns_lock(&bucket, &bucket)
+                .await
+                .expect("create the exact bucket namespace lock");
+            let namespace_guard = namespace_lock
+                .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+                .await
+                .expect("hold the exact bucket namespace fence");
+
+            // A file at each native staging root causes actual IO to fail before
+            // metadata can reach the cache-publishing set call. Preserve the
+            // original staging directories so no fixture data is discarded.
+            for dir in &dirs {
+                let staging = dir.path().join(RUSTFS_META_TMP_BUCKET);
+                let saved = dir.path().join(".rustfs.sys/revocation-saved-tmp");
+                std::fs::rename(&staging, &saved).expect("preserve the native staging directory");
+                std::fs::write(&staging, b"block metadata staging with a non-directory")
+                    .expect("install an actual non-directory IO obstruction");
+            }
+            let result = match entry {
+                "save" => sys.save(intent).await,
+                "persist" => sys.persist_and_set(intent).await,
+                "persist-new" => sys.persist_new_and_set(intent).await,
+                "commit" => sys.commit_bucket_metadata(intent).await,
+                _ => unreachable!(),
+            };
+            for dir in &dirs {
+                let staging = dir.path().join(RUSTFS_META_TMP_BUCKET);
+                let saved = dir.path().join(".rustfs.sys/revocation-saved-tmp");
+                std::fs::remove_file(&staging).expect("remove only the fixture's staging obstruction");
+                std::fs::rename(&saved, &staging).expect("restore the complete original staging directory");
+            }
+            drop((namespace_guard, transaction_guard, lifecycle_guard));
+            result.expect_err("native persistence must fail before its downstream cache set");
+            assert!(
+                sys.pending_bucket_creation(&bucket).await.is_none(),
+                "{entry}: the entry revoker must retire live permission even when persistence fails"
+            );
+            let (after_failure, present) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("read the intent after the failed persistence entry");
+            assert!(present, "{entry}: a failed persistence entry must retain the original metadata");
+            assert_eq!(
+                after_failure
+                    .marshal_msg()
+                    .expect("encode the original intent after persistence failure"),
+                original_intent,
+                "{entry}: native IO failure must not change the original generation or complete intent"
+            );
+            let error = store
+                .make_bucket(&bucket, &options)
+                .await
+                .expect_err("a failed ordinary persistence entry cannot preserve creation permission");
+            assert!(error.to_string().contains("administrator recovery"), "{entry}: {error}");
+            let (after_retry, _) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("read the original intent after the rejected retry");
+            assert_eq!(
+                after_retry.marshal_msg().expect("encode the intent after the rejected retry"),
+                original_intent,
+                "{entry}: the rejected retry must preserve the complete original intent"
+            );
+            for disk in store.pools[0].disk_set[0].disks.read().await.iter() {
+                assert!(
+                    matches!(
+                        disk.as_ref().expect("native disk").stat_volume(&bucket).await,
+                        Err(crate::disk::error::DiskError::VolumeNotFound)
+                    ),
+                    "{entry}: failed persistence and the rejected retry must not publish a physical volume"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn metadata_reset_revokes_real_pending_creation_without_changing_persisted_intent() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("revoke-reset-{}", Uuid::new_v4());
+        let options = MakeBucketOptions {
+            lock_enabled: true,
+            ..Default::default()
+        };
+        store.fail_next_bucket_creation_after_intent_for_test(&bucket);
+        store
+            .make_bucket(&bucket, &options)
+            .await
+            .expect_err("stop the real producer before physical publication");
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("instance metadata system");
+        let mut sys = sys.read().await.clone();
+        sys.pending_bucket_creation(&bucket)
+            .await
+            .expect("the real producer must leave live creation permission before reset");
+        let (intent, persisted) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+            .await
+            .expect("read the original intent before cache reset");
+        assert!(persisted, "cache reset starts from a complete real persisted intent");
+        let original_intent = intent.marshal_msg().expect("encode the original reset intent");
+        sys._reset().await;
+        assert!(
+            sys.pending_bucket_creation(&bucket).await.is_none(),
+            "reset must revoke the producer-issued permission shared with the instance metadata system"
+        );
+        let (after_reset, present) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+            .await
+            .expect("read the original intent after cache reset");
+        assert!(present, "cache reset must retain the persisted intent");
+        assert_eq!(
+            after_reset.marshal_msg().expect("encode the intent after cache reset"),
+            original_intent,
+            "cache reset must leave the original generation and complete persisted intent unchanged"
+        );
+        let error = store
+            .make_bucket(&bucket, &options)
+            .await
+            .expect_err("reset cannot regrant the producer's old creation permission");
+        assert!(error.to_string().contains("administrator recovery"), "{error}");
+        let (after_retry, _) = get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+            .await
+            .expect("read the intent after the reset-induced retry rejection");
+        assert_eq!(
+            after_retry
+                .marshal_msg()
+                .expect("encode the intent after the rejected reset retry"),
+            original_intent,
+            "the reset-induced rejection must preserve the original complete intent"
+        );
+        for disk in store.pools[0].disk_set[0].disks.read().await.iter() {
+            assert!(
+                matches!(
+                    disk.as_ref().expect("native disk").stat_volume(&bucket).await,
+                    Err(crate::disk::error::DiskError::VolumeNotFound)
+                ),
+                "cache reset and the rejected retry must not publish a physical volume"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn g_d3_003_new_writer_replication_loads_without_fail_closed_state() {
@@ -3887,7 +4167,7 @@ mod tests {
         let mut versioned = BucketMetadata::new("authoritative-versioned");
         versioned.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
         versioned.versioning_config = Some(VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         sys.set("authoritative-versioned".to_string(), Arc::new(versioned)).await;
@@ -4010,25 +4290,24 @@ mod tests {
         else {
             panic!("legacy lock-enabled metadata must remain configured");
         };
-        assert_eq!(
-            config.object_lock_enabled.as_ref().map(|value| value.as_str()),
-            Some(ObjectLockEnabled::ENABLED)
-        );
+        assert_eq!(config.object_lock_enabled.as_deref(), Some("Enabled"));
         assert!(config.rule.is_none());
     }
 
     #[test]
     fn authoritative_object_lock_state_rejects_invalid_retention_periods() {
-        use s3s::dto::{DefaultRetention, ObjectLockRule};
+        use rustfs_gateway_types::persistence::{
+            PersistedDefaultRetention as DefaultRetention, PersistedObjectLockRule as ObjectLockRule,
+        };
 
         for (days, years) in [(Some(0), None), (Some(-1), None), (Some(1), Some(1)), (None, None)] {
             let mut metadata = BucketMetadata::new("invalid-object-lock");
             metadata.object_lock_config = Some(ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: Some(ObjectLockRule {
                     default_retention: Some(DefaultRetention {
                         days,
-                        mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                        mode: Some("COMPLIANCE".to_owned()),
                         years,
                     }),
                 }),
@@ -4043,9 +4322,11 @@ mod tests {
 
     #[test]
     fn authoritative_object_lock_state_rejects_invalid_enabled_mode_and_rule() {
-        use s3s::dto::{DefaultRetention, ObjectLockRule};
+        use rustfs_gateway_types::persistence::{
+            PersistedDefaultRetention as DefaultRetention, PersistedObjectLockRule as ObjectLockRule,
+        };
 
-        for enabled in [None, Some(ObjectLockEnabled::from("Disabled".to_string()))] {
+        for enabled in [None, Some("Disabled".to_string())] {
             let mut metadata = BucketMetadata::new("invalid-object-lock-enabled");
             metadata.lock_enabled = true;
             metadata.object_lock_config = Some(ObjectLockConfiguration {
@@ -4057,11 +4338,11 @@ mod tests {
 
         let mut invalid_mode = BucketMetadata::new("invalid-object-lock-mode");
         invalid_mode.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(1),
-                    mode: Some(ObjectLockRetentionMode::from("invalid".to_string())),
+                    mode: Some("invalid".to_string()),
                     years: None,
                 }),
             }),
@@ -4070,7 +4351,7 @@ mod tests {
 
         let mut missing_retention = BucketMetadata::new("missing-object-lock-retention");
         missing_retention.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule { default_retention: None }),
         });
         assert!(object_lock_config_state_from_authoritative_metadata(&missing_retention).is_err());
@@ -4080,7 +4361,7 @@ mod tests {
     fn object_lock_ever_enabled_marker_survives_config_removal() {
         let mut metadata = BucketMetadata::new("lock-config-removed");
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         metadata
@@ -4098,10 +4379,7 @@ mod tests {
         else {
             panic!("an ever-enabled bucket must remain Object Lock configured");
         };
-        assert_eq!(
-            config.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str),
-            Some(ObjectLockEnabled::ENABLED)
-        );
+        assert_eq!(config.object_lock_enabled.as_deref(), Some("Enabled"));
     }
 
     #[tokio::test]
@@ -4117,7 +4395,7 @@ mod tests {
 
         let node = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore.clone())));
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         update_with_sys(
@@ -5231,7 +5509,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_with_persists_tagging_rewrite_across_disk_reload() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
 
@@ -5395,7 +5673,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_update_config_with_calls_do_not_lose_writes() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
         let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
@@ -5495,7 +5773,7 @@ mod tests {
         let mut persisted = BucketMetadata::new("reload-bucket");
         persisted.policy_config_json = b"persisted-marker".to_vec();
         let lock_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         persisted
@@ -5829,7 +6107,7 @@ mod tests {
     #[serial]
     async fn bucket_delete_waits_for_config_mutation_fence() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (_dirs, store) = isolated_store_over_temp_disks().await;
         init_bucket_metadata_sys(store.clone(), Vec::new()).await;

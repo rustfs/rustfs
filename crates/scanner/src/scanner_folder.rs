@@ -37,13 +37,13 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::{DynamicSleeper, PacingDebt};
+#[cfg(test)]
+use crate::storage_api::owner::EcstoreLifecycleRule as LifecycleRule;
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
     EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
     EcstoreVersioningConfiguration as VersioningConfiguration, ecstore_send_event,
 };
-#[cfg(test)]
-use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
 use crate::workload_admission::{run_scanner_metadata_operation, run_scanner_node_operation};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
@@ -425,7 +425,10 @@ enum FolderScanSource {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FolderScanMode {
     Namespace,
-    ErasureCandidate { reuse_namespace: bool },
+    ErasureCandidate {
+        reuse_namespace: bool,
+        parent_has_metadata: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2065,7 +2068,9 @@ impl FolderScanner {
                     if candidate_unclassified {
                         // Apply namespace reuse only after the current listing
                         // proves there is no direct erasure part.
-                        if let FolderScanMode::ErasureCandidate { reuse_namespace: true } = mode
+                        if let FolderScanMode::ErasureCandidate {
+                            reuse_namespace: true, ..
+                        } = mode
                             && !into.compacted
                             && self.old_cache.find(&folder.name).is_some()
                         {
@@ -2079,10 +2084,23 @@ impl FolderScanner {
                             return Ok(FolderScanOutcome::Namespace);
                         }
                         candidate_unclassified = false;
-                        if !self.budget.try_start_directory() {
-                            return Err(ScannerError::Other("Operation cancelled".to_string()));
+                        // An empty UUID directory beside object metadata has
+                        // no namespace work. Its listing was already charged;
+                        // nonempty namespaces still need directory admission.
+                        let empty_object_child = matches!(
+                            mode,
+                            FolderScanMode::ErasureCandidate {
+                                parent_has_metadata: true,
+                                ..
+                            }
+                        ) && deferred_metadata.is_none()
+                            && queued_folders.is_empty();
+                        if !empty_object_child {
+                            if !self.budget.try_start_directory() {
+                                return Err(ScannerError::Other("Operation cancelled".to_string()));
+                            }
+                            wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_preset()).await?;
                         }
-                        wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_preset()).await?;
                     }
                     let Some(entry) = deferred_metadata.take() else { break };
                     (entry, true)
@@ -2552,20 +2570,6 @@ impl FolderScanner {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
 
-            if found_object_metadata && self.is_erasure_mode {
-                // If we found an object in erasure mode, we skip subdirs (only datadirs)...
-                debug!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_FOLDER_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_FOLDER,
-                    folder = %folder.name,
-                    state = "erasure_object_found",
-                    "Scanner folder descent stopped after erasure object"
-                );
-                break;
-            }
-
             // Checkpointed sweeps need child entries to validate their resume
             // frontier (#8292). Outside that, also compact a wide bucket root:
             // excluding it left #8961's ~170k top-level prefixes unbounded until
@@ -2654,6 +2658,7 @@ impl FolderScanner {
                 let mut child_mode = if self.is_erasure_mode && is_erasure_candidate(&folder_item.name) {
                     FolderScanMode::ErasureCandidate {
                         reuse_namespace: reuse_covered,
+                        parent_has_metadata: found_object_metadata,
                     }
                 } else {
                     FolderScanMode::Namespace
@@ -2721,7 +2726,10 @@ impl FolderScanner {
                                 }
                                 // Sampling may skip namespace work, never the
                                 // classification that protects its parent object.
-                                child_mode = FolderScanMode::ErasureCandidate { reuse_namespace: true };
+                                child_mode = FolderScanMode::ErasureCandidate {
+                                    reuse_namespace: true,
+                                    parent_has_metadata: found_object_metadata,
+                                };
                             } else {
                                 folder_item.object_heal_prob_div = data_usage_update_dir_cycles();
                             }
@@ -2816,6 +2824,11 @@ impl FolderScanner {
                         updates.cache.delete_recursive(&h);
                     }
                     into.children.remove(&clone_cache_value(&h.0));
+                    // Object keys can also be prefixes. A classified payload
+                    // directory must not hide their other namespace children.
+                    if found_object_metadata {
+                        continue;
+                    }
                     // Earlier namespace siblings may have completed, but none
                     // can certify coverage of this unresolved parent object.
                     self.coverage_gap |= forward_sweep;

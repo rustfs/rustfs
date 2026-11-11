@@ -732,6 +732,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.bucket_creation_witness(volume).await,
+            Disk::Remote(_) => Ok(None),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         match self {
@@ -1598,6 +1605,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // NSScanner
 
     // Volume operations.
+    /// Unknown or remote backends cannot attest process-local publication history.
+    async fn bucket_creation_witness(&self, _volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        Ok(None)
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
@@ -2453,7 +2465,7 @@ impl DeleteRecoveryJournal {
             }
             let id = request.version_id.unwrap_or_default();
             let Some(original) = originals.get(&id) else {
-                return false;
+                return !id.is_nil() && !locals.contains_key(&id);
             };
             match locals.get(&id) {
                 Some(local) => local == original,
@@ -2503,7 +2515,10 @@ impl DeleteRecoveryJournal {
             };
             match (local, remote) {
                 (Some(local), Some(remote)) => local == remote,
-                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                (None, None) => {
+                    (!(request.deleted && request.mark_deleted) && request.version_id.is_some_and(|id| !id.is_nil()))
+                        || (self.original_digest.is_none() && authority.original_digest.is_none())
+                }
                 _ => false,
             }
         })
@@ -2570,7 +2585,13 @@ pub struct BoundedDeleteRecoveryDiscovery {
     pub complete: bool,
 }
 
-pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+/// Entries one bounded discovery call may charge on one drive. Object-scoped
+/// discovery charges each transaction-shaped (UUID) child of the key's
+/// directory once and every name that cannot be delete evidence at
+/// 1/`PLAIN_CHILDREN_PER_BUDGET_ENTRY`, so this admits a missing-key delete of a
+/// folder prefix with this many UUID-named children per drive. The request
+/// budget (`DeleteRecoveryWorkBudget`) still bounds the total across keys.
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 262_144;
 pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3981,6 +4002,46 @@ mod delete_recovery_adoption_tests {
         };
         assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
         assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let missing = Uuid::new_v4();
+        journal.requests.push(FileInfo {
+            version_id: Some(missing),
+            ..Default::default()
+        });
+        journal.original_digest = Some([3; 32]);
+        assert!(
+            journal.matches_prepared_authority(&journal),
+            "an explicit UUID absent from both prepared sources remains a no-op with original metadata"
+        );
+        assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
+        assert!(
+            journal.matches_adoption_source(std::slice::from_ref(&source)),
+            "a missing non-null version in the batch remains a no-op"
+        );
+        let mut unexpected = source.clone();
+        unexpected.version_id = Some(missing);
+        let mut foreign_preparation = journal.clone();
+        foreign_preparation.original_versions.push(unexpected.clone());
+        assert!(
+            !journal.matches_prepared_authority(&foreign_preparation)
+                && !foreign_preparation.matches_prepared_authority(&journal),
+            "absence from only one prepared source cannot establish a generation"
+        );
+        assert!(
+            !journal.matches_adoption_source(&[source.clone(), unexpected]),
+            "a version absent from the authority cannot be deleted locally"
+        );
+        for version_id in [None, Some(Uuid::nil())] {
+            journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_prepared_authority(&journal),
+                "a missing null version with original metadata cannot establish its generation"
+            );
+            assert!(
+                !journal.matches_adoption_source(std::slice::from_ref(&source)),
+                "a missing null version cannot establish its generation"
+            );
+        }
+        journal.requests.pop();
         let mut foreign = source.clone();
         foreign.metadata_digest = [2; 32];
         assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
@@ -3996,6 +4057,25 @@ mod delete_recovery_adoption_tests {
         assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
         journal.requests.clear();
         assert!(!journal.matches_adoption_source(&journal.original_versions));
+
+        let mut marker = journal.clone();
+        marker.requests = vec![FileInfo {
+            version_id: Some(id),
+            deleted: true,
+            mark_deleted: true,
+            ..Default::default()
+        }];
+        marker.original_versions.clear();
+        marker.original_digest = Some([3; 32]);
+        assert!(
+            !marker.matches_prepared_authority(&marker),
+            "a marker with original metadata requires a source generation"
+        );
+        marker.original_digest = None;
+        assert!(
+            marker.matches_prepared_authority(&marker),
+            "marker preparation without original metadata retains the existing allowance"
+        );
     }
 }
 

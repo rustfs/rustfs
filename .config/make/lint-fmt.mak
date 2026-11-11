@@ -70,6 +70,11 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	@echo "📦 Checking s3s footprint ratchet..."
 	./scripts/check_s3s_footprint.sh
 
+.PHONY: test-count-ratchet-check
+test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
+	@echo "🧪 Checking per-crate test-count ratchet..."
+	./scripts/check_test_count_ratchet.sh
+
 .PHONY: fips-wording-check
 fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
 	@echo "📣 Checking cryptographic capability wording guard..."

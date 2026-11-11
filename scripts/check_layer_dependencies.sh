@@ -22,7 +22,8 @@ classify_source_layer() {
     printf 'composition'
   elif [[ "$file" == rustfs/src/app/* ]]; then
     printf 'app'
-  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]]; then
+  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]] ||
+    [[ "$file" == rustfs/src/storage/s3_compat/* ]]; then
     printf 'interface'
   elif [[ "$file" == rustfs/src/* ]]; then
     printf 'infra'
@@ -54,7 +55,8 @@ classify_target_layer() {
     storage)
       storage_path="${path#storage::}"
       if [[ "$storage_path" == "ecfs" ]] || [[ "$storage_path" == ecfs::* ]] ||
-        [[ "$storage_path" == "s3_api" ]] || [[ "$storage_path" == s3_api::* ]]; then
+        [[ "$storage_path" == "s3_api" ]] || [[ "$storage_path" == s3_api::* ]] ||
+        [[ "$storage_path" == "s3_compat" ]] || [[ "$storage_path" == s3_compat::* ]]; then
         printf 'interface'
       else
         printf 'infra'
@@ -112,6 +114,7 @@ assert_dependency_direction() {
 
 run_layer_model_self_tests() {
   local server_source app_source storage_source server_target admin_target app_target storage_target
+  local s3_compat_source s3_compat_target
 
   server_source="$(classify_source_layer rustfs/src/server/http.rs)"
   app_source="$(classify_source_layer rustfs/src/app/bucket_usecase.rs)"
@@ -120,6 +123,9 @@ run_layer_model_self_tests() {
   admin_target="$(classify_target_layer admin::router)"
   app_target="$(classify_target_layer app::bucket_usecase)"
   storage_target="$(classify_target_layer storage::rpc)"
+  # The s3s edge adapters convert wire requests into app types, as ecfs.rs does.
+  s3_compat_source="$(classify_source_layer rustfs/src/storage/s3_compat/envelope.rs)"
+  s3_compat_target="$(classify_target_layer storage::s3_compat::envelope)"
 
   assert_dependency_direction 'allowed' "$server_source" "$admin_target"
   assert_dependency_direction 'allowed' "$server_source" "$app_target"
@@ -128,6 +134,9 @@ run_layer_model_self_tests() {
   assert_dependency_direction 'reverse' "$storage_source" "$server_target"
   assert_dependency_direction 'reverse' "$app_source" "$admin_target"
   assert_dependency_direction 'reverse' "$storage_source" "$admin_target"
+  assert_dependency_direction 'allowed' "$s3_compat_source" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$s3_compat_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$s3_compat_target"
 }
 
 normalize_import_group_item() {

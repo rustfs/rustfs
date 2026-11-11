@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <TagSet>
+    <Tag>
+      <Key>Project</Key>
+      <Value>Project One</Value>
+    </Tag>
+    <Tag>
+      <Key>User</Key>
+      <Value>jsmith</Value>
+    </Tag>
+  </TagSet>
+</Tagging>

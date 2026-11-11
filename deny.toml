@@ -36,6 +36,10 @@ allow-git = [
     # Official s3s repository pinned for Iceberg SigV4 path encoding support.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
+    # rustfs-gateway-types, pinned to one gateway commit in the workspace
+    # dependencies while the engine crates move off s3s (rustfs/backlog#2745).
+    # owner: rustfs-maintainers  review: 2027-01
+    "https://github.com/rustfs/gateway",
     # Completion ownership patch fixed to rustfs/uring#20.
     # owner: overtrue  review: 2026-10
     "https://github.com/rustfs/uring.git",
