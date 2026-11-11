@@ -51,42 +51,108 @@ use zeroize::Zeroizing;
 /// The identity a request was authenticated with.
 ///
 /// The secret key and the session token are bearer material: the type has no
-/// `PartialEq`, and its `Debug` output redacts both.
+/// `PartialEq`, and its `Debug` output redacts both. An edge that keeps the
+/// caller's secret (it verified the signature itself) builds the value with
+/// [`Self::without_secret_key`]; the absence is then `None`, never a
+/// substitute string a reader could compare, seal or derive with.
 #[derive(Clone)]
 pub struct RequestCredentials {
     access_key: String,
-    secret_key: Zeroizing<String>,
+    secret_key: Option<Zeroizing<String>>,
     session_token: Option<Zeroizing<String>>,
 }
 
+/// An edge handed over an empty secret key. Absence is expressed with
+/// [`RequestCredentials::without_secret_key`], so an empty secret is refused
+/// rather than read as "absent" or used as a key.
+#[derive(Debug)]
+pub(crate) struct EmptySecretKey;
+
+impl fmt::Display for EmptySecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("handed-over secret key is empty")
+    }
+}
+
+impl std::error::Error for EmptySecretKey {}
+
 impl RequestCredentials {
-    pub(crate) fn new(access_key: String, secret_key: String, session_token: Option<String>) -> Self {
+    /// Credentials whose secret the edge handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`EmptySecretKey`] when `secret_key` is empty.
+    pub(crate) fn new(access_key: String, secret_key: String, session_token: Option<String>) -> Result<Self, EmptySecretKey> {
+        if secret_key.is_empty() {
+            return Err(EmptySecretKey);
+        }
+        Ok(Self {
+            access_key,
+            secret_key: Some(Zeroizing::new(secret_key)),
+            session_token: session_token.map(Zeroizing::new),
+        })
+    }
+
+    /// Credentials whose secret the edge kept.
+    pub(crate) fn without_secret_key(access_key: String, session_token: Option<String>) -> Self {
         Self {
             access_key,
-            secret_key: Zeroizing::new(secret_key),
+            secret_key: None,
             session_token: session_token.map(Zeroizing::new),
         }
+    }
+
+    /// The same identity with `session_token` as its token.
+    pub(crate) fn with_session_token(mut self, session_token: Option<String>) -> Self {
+        self.session_token = session_token.map(Zeroizing::new);
+        self
     }
 
     pub fn access_key(&self) -> &str {
         &self.access_key
     }
 
-    /// Never log this value or compare it with `==`.
-    pub fn secret_key(&self) -> &str {
-        &self.secret_key
+    /// The caller's secret, or `None` when the edge did not hand it over.
+    /// A reader must fail closed on `None`. Never log this value or compare it
+    /// with `==`.
+    pub fn secret_key(&self) -> Option<&str> {
+        self.secret_key.as_deref().map(String::as_str)
     }
 
     pub fn session_token(&self) -> Option<&str> {
         self.session_token.as_deref().map(String::as_str)
     }
+
+    /// The handed-over secret, or [`MissingSecretKey`] when the edge kept it.
+    pub(crate) fn require_secret_key(&self) -> Result<&str, MissingSecretKey> {
+        self.secret_key().ok_or(MissingSecretKey)
+    }
+
+    /// Whether the handed-over secret equals `stored`, compared in constant
+    /// time. An absent secret matches nothing, not even an empty `stored`.
+    pub(crate) fn secret_key_matches(&self, stored: &str) -> bool {
+        self.secret_key()
+            .is_some_and(|secret| crate::auth::constant_time_eq(secret, stored))
+    }
 }
+
+/// A reader needed the caller's secret, but the edge did not hand it over.
+#[derive(Debug)]
+pub(crate) struct MissingSecretKey;
+
+impl fmt::Display for MissingSecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the caller's secret key was not handed over for this request")
+    }
+}
+
+impl std::error::Error for MissingSecretKey {}
 
 impl fmt::Debug for RequestCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestCredentials")
             .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
+            .field("secret_key", &self.secret_key.as_ref().map(|_| "<redacted>"))
             .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -636,12 +702,46 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_handed_over_secret_is_refused() {
+        assert!(RequestCredentials::new("AKIAENVELOPE".to_owned(), String::new(), None).is_err());
+    }
+
+    #[test]
+    fn an_absent_secret_matches_no_stored_secret() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), None);
+        assert_eq!(kept.secret_key(), None);
+        assert!(!kept.secret_key_matches(""), "absent must not equal an empty stored secret");
+        assert!(!kept.secret_key_matches("stored-secret"));
+        let handed = RequestCredentials::new("AKIAENVELOPE".to_owned(), "stored-secret".to_owned(), None).expect("secret");
+        assert!(!handed.secret_key_matches(""));
+        assert!(!handed.secret_key_matches("other-secret"));
+        assert!(handed.secret_key_matches("stored-secret"));
+    }
+
+    #[test]
+    fn a_reader_of_an_absent_secret_fails_closed() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), Some("token".to_owned()));
+        assert!(kept.require_secret_key().is_err());
+        let handed = RequestCredentials::new("AKIAENVELOPE".to_owned(), "s".to_owned(), None).expect("secret");
+        assert_eq!(handed.require_secret_key().ok(), Some("s"));
+    }
+
+    #[test]
+    fn kept_secret_debug_prints_neither_secret_nor_token() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), Some("envelope-session-token".to_owned()));
+        let debug = format!("{kept:?}");
+        assert!(debug.contains("AKIAENVELOPE"), "{debug}");
+        assert!(!debug.contains("envelope-session-token"), "{debug}");
+    }
+
+    #[test]
     fn request_credentials_debug_redacts_secret_and_session_token() {
         let credentials = RequestCredentials::new(
             "AKIAENVELOPE".to_owned(),
             "envelope-secret-value".to_owned(),
             Some("envelope-session-token".to_owned()),
-        );
+        )
+        .expect("non-empty secret");
 
         let debug = format!("{credentials:?}");
 

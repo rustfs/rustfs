@@ -3852,7 +3852,7 @@ mod tests {
                 .credentials()
                 .ok_or_else(|| OwnedS3Error::with_message(OwnedS3ErrorCode::AccessDenied, "owned admin identity is required"))?;
             let identity_matches = credentials.access_key() == "AKIAOWNED"
-                && constant_time_eq(credentials.secret_key(), "owned-secret")
+                && credentials.secret_key_matches("owned-secret")
                 && credentials
                     .session_token()
                     .is_some_and(|token| constant_time_eq(token, "owned-session"));
