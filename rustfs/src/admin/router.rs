@@ -3451,8 +3451,8 @@ fn is_admin_v4_fallback_path(path: &str) -> bool {
         .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
 }
 
-impl<T: OwnedOperation> S3Router<T> {
-    pub(crate) fn new(console_enabled: bool) -> Self {
+impl<T> S3Router<T> {
+    pub fn new(console_enabled: bool) -> Self {
         let router = Router::new();
 
         let console_router = if console_enabled {
@@ -3473,11 +3473,11 @@ impl<T: OwnedOperation> S3Router<T> {
 
     /// Bind this router to its server's context slot (backlog#1052 S2); the
     /// slot is handed to every dispatched request via its extensions.
-    pub(crate) fn set_server_ctx(&mut self, server_ctx: Arc<ServerContextSlot>) {
+    pub fn set_server_ctx(&mut self, server_ctx: Arc<ServerContextSlot>) {
         self.server_ctx = Some(server_ctx);
     }
 
-    pub(crate) fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
+    pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
         let path = Self::make_route_str(method, path);
         #[cfg(test)]
         let registered_path = path.clone();
@@ -3498,7 +3498,7 @@ impl<T: OwnedOperation> S3Router<T> {
 }
 
 #[cfg(test)]
-impl<T: OwnedOperation> S3Router<T> {
+impl<T> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
         let route = Self::make_route_str(method, path);
         self.router.at(&route).is_ok()
@@ -3516,7 +3516,7 @@ impl<T: OwnedOperation> S3Router<T> {
     }
 }
 
-impl<T: OwnedOperation> Default for S3Router<T> {
+impl<T> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
     }
