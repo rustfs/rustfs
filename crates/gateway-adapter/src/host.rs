@@ -128,8 +128,8 @@ mod tests {
     #[test]
     fn every_configured_domain_resolves() {
         let domains = ["example.com", "s3.local"];
-        assert_eq!(bucket(&domains, "a.example.com").as_deref(), Some("a"));
-        assert_eq!(bucket(&domains, "b.s3.local").as_deref(), Some("b"));
+        assert_eq!(bucket(&domains, "abc.example.com").as_deref(), Some("abc"));
+        assert_eq!(bucket(&domains, "xyz.s3.local").as_deref(), Some("xyz"));
     }
 
     /// Positive: the domain itself is the endpoint, so the bucket comes from the path.
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn a_host_that_is_no_domain_is_refused() {
         let resolver = with_domains(&["example.com"]);
-        assert_eq!(read(&*resolver, "/k", "bad_host.example.com").2, Some(HostRefusal::UnusableHost));
+        assert_eq!(read(&*resolver, "/k", "under_score.org").2, Some(HostRefusal::UnusableHost));
     }
 
     /// Negative: a bucket the host names that bucket rules refuse is refused.
@@ -185,6 +185,7 @@ mod tests {
     fn a_host_named_bucket_the_rules_refuse_is_refused() {
         let resolver = with_domains(&["example.com"]);
         assert_eq!(read(&*resolver, "/k", "ab.example.com").2, Some(HostRefusal::RefusedBucket));
+        assert_eq!(read(&*resolver, "/k", "bad_host.example.com").2, Some(HostRefusal::RefusedBucket));
     }
 
     /// Negative: a list legacy RustFS refuses at start-up is refused.
@@ -205,7 +206,10 @@ mod tests {
     /// `s3_host_domains` drops it before the legacy multi-domain host sees the list.
     #[test]
     fn a_repeat_of_a_domain_is_dropped() {
-        assert_eq!(bucket(&["example.com:9411", "example.com:9000"], "x.example.com").as_deref(), Some("x"));
+        assert_eq!(
+            bucket(&["example.com:9411", "example.com:9000"], "xyz.example.com").as_deref(),
+            Some("xyz")
+        );
     }
 
     /// Positive: a bucket name the resolver reads is one the gateway's own types accept.
