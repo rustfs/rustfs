@@ -24,6 +24,13 @@
 //!
 //! This file names neither stack's types: it is generic over two services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
+//!
+//! Two S3-shaped families are interim legacy routes, each in its own file so that the PR which
+//! migrates one deletes only that file (rustfs/backlog#2734 T2.11): website-host requests
+//! (`stack/website.rs`) and the `?metadata=true` listings (`stack/metadata.rs`).
+
+mod metadata;
+mod website;
 
 use super::layer::is_sts_query_request;
 use super::prefix::{HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, has_path_prefix, is_admin_path};
@@ -35,6 +42,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tower::Service;
 
+pub(crate) use metadata::MetadataListing;
+pub(crate) use website::WebsiteHosts;
+
 /// The MinIO-compatible health probes share this prefix.
 const MINIO_HEALTH_PREFIX: &str = "/minio/health";
 
@@ -44,6 +54,8 @@ const MINIO_HEALTH_PREFIX: &str = "/minio/health";
 pub(crate) struct S3StackService<L, G> {
     legacy: L,
     gateway: Option<G>,
+    website: WebsiteHosts,
+    metadata: MetadataListing,
 }
 
 impl<L, G> S3StackService<L, G> {
@@ -59,7 +71,9 @@ impl<L, G> S3StackService<L, G> {
 /// Builds the service for the selected stack.
 ///
 /// `assemble_gateway` runs only when the gateway stack is selected, and its failure is the
-/// failure of the whole selection: the caller refuses to start.
+/// failure of the whole selection: the caller refuses to start. `website` and `metadata` are the
+/// legacy service's own website domains and metadata-listing hosts, so the gateway stack sends
+/// the legacy service exactly the requests that service would serve as those two families.
 ///
 /// # Errors
 ///
@@ -67,21 +81,37 @@ impl<L, G> S3StackService<L, G> {
 pub(crate) fn select_stack<L, G, E>(
     stack: S3Stack,
     legacy: L,
+    website: WebsiteHosts,
+    metadata: MetadataListing,
     assemble_gateway: impl FnOnce() -> Result<G, E>,
 ) -> Result<S3StackService<L, G>, E> {
     let gateway = match stack {
         S3Stack::Legacy => None,
         S3Stack::Gateway => Some(assemble_gateway()?),
     };
-    Ok(S3StackService { legacy, gateway })
+    Ok(S3StackService {
+        legacy,
+        gateway,
+        website,
+        metadata,
+    })
 }
 
-/// Whether the legacy router answers this request while the gateway stack is selected: the admin
-/// and table-catalog APIs, the console, STS, health and profiling, none of which is an S3
+/// Whether the legacy router answers this request while the gateway stack is selected: website
+/// requests and the metadata listings (interim, tested first as legacy tests them), then the
+/// admin and table-catalog APIs, the console, STS, health and profiling, none of which is an S3
 /// operation. Every other request is the gateway's, whatever it answers.
-fn is_legacy_only_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+fn is_legacy_only_route(
+    website: &WebsiteHosts,
+    metadata: &MetadataListing,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> bool {
     let path = uri.path();
-    is_admin_path(path)
+    website.matches(uri, headers)
+        || metadata.matches(method, uri, headers)
+        || is_admin_path(path)
         || is_console_path(path)
         || has_path_prefix(path, HEALTH_PREFIX)
         || has_path_prefix(path, MINIO_HEALTH_PREFIX)
@@ -111,7 +141,9 @@ where
     fn call(&mut self, request: Request<B>) -> Self::Future {
         match &mut self.gateway {
             // REMOVED BY T2.11: the gateway serves these routes itself once they are migrated.
-            Some(gateway) if !is_legacy_only_route(request.method(), request.uri(), request.headers()) => {
+            Some(gateway)
+                if !is_legacy_only_route(&self.website, &self.metadata, request.method(), request.uri(), request.headers()) =>
+            {
                 Box::pin(gateway.call(request))
             }
             _ => Box::pin(self.legacy.call(request)),
@@ -158,34 +190,65 @@ mod tests {
         response.into_body()
     }
 
+    /// The website domain the tests configure.
+    const WEBSITE_DOMAIN: &str = "site.test";
+
+    /// `select_stack` with one website domain and path-style metadata listings, as a server
+    /// with `RUSTFS_WEBSITE_DOMAINS=site.test` and no `RUSTFS_SERVER_DOMAINS` runs.
+    fn select<E>(stack: S3Stack, assemble: impl FnOnce() -> Result<Named, E>) -> Result<S3StackService<Named, Named>, E> {
+        select_stack(
+            stack,
+            Named("legacy"),
+            WebsiteHosts::new(vec![WEBSITE_DOMAIN.to_owned()]),
+            MetadataListing::new(None).expect("no server domain"),
+            assemble,
+        )
+    }
+
     fn gateway_stack() -> S3StackService<Named, Named> {
-        select_stack(S3Stack::Gateway, Named("legacy"), || Ok::<_, Infallible>(Named("gateway"))).expect("assembles")
+        select(S3Stack::Gateway, || Ok::<_, Infallible>(Named("gateway"))).expect("assembles")
+    }
+
+    fn on_host(method: Method, host: &str, target: &str) -> Request<()> {
+        Request::builder()
+            .method(method)
+            .uri(target)
+            .header(http::header::HOST, host)
+            .body(())
+            .expect("static request")
     }
 
     #[test]
     fn a_gateway_assembly_failure_fails_the_selection_instead_of_falling_back() {
-        let selection = select_stack::<_, Named, _>(S3Stack::Gateway, Named("legacy"), || Err("the assembly was refused"));
+        let selection = select(S3Stack::Gateway, || Err("the assembly was refused"));
 
         assert_eq!(selection.err(), Some("the assembly was refused"));
     }
 
     #[test]
     fn the_legacy_selection_never_assembles_a_gateway() {
-        let service = select_stack::<_, Named, &str>(S3Stack::Legacy, Named("legacy"), || {
-            panic!("the legacy stack must not assemble the gateway")
-        })
-        .expect("legacy needs no assembly");
+        let service = select::<&str>(S3Stack::Legacy, || panic!("the legacy stack must not assemble the gateway"))
+            .expect("legacy needs no assembly");
 
         assert_eq!(service.selected(), S3Stack::Legacy);
     }
 
     #[tokio::test]
     async fn the_legacy_stack_answers_every_request_itself() {
-        let mut service = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
-            .expect("legacy needs no assembly");
+        let mut service = select(S3Stack::Legacy, || Ok::<_, Infallible>(Named("gateway"))).expect("legacy needs no assembly");
 
         for target in ["/", "/bucket/key", "/rustfs/admin/v3/info", "/health"] {
             assert_eq!(answered_by(&mut service, request(Method::GET, target)).await, "legacy", "{target}");
+        }
+        for (host, target) in [
+            ("bucket.site.test", "/"),
+            ("127.0.0.1:9000", "/bucket?list-type=2&metadata=true"),
+        ] {
+            assert_eq!(
+                answered_by(&mut service, on_host(Method::GET, host, target)).await,
+                "legacy",
+                "{host} {target}"
+            );
         }
     }
 
@@ -249,5 +312,68 @@ mod tests {
         );
         assert_eq!(answered_by(&mut service, sts).await, "legacy");
         assert_eq!(answered_by(&mut service, request(Method::POST, "/")).await, "gateway");
+    }
+
+    #[tokio::test]
+    async fn the_gateway_stack_leaves_every_website_host_request_to_the_legacy_router() {
+        let mut service = gateway_stack();
+
+        // Whatever the method, path or query: legacy decides website hosts before anything else,
+        // so a website-host request that looks like ListBuckets, an admin call or a metadata
+        // listing is still a website request.
+        for (method, host, target) in [
+            (Method::GET, "bucket.site.test", "/"),
+            (Method::HEAD, "bucket.site.test:9000", "/index.html"),
+            (Method::POST, "bucket.site.test", "/"),
+            (Method::GET, "site.test", "/"),
+            (Method::GET, "bucket.site.test", "/rustfs/admin/v3/info"),
+            (Method::GET, "bucket.site.test", "/?list-type=2&metadata=true"),
+        ] {
+            assert_eq!(
+                answered_by(&mut service, on_host(method.clone(), host, target)).await,
+                "legacy",
+                "{method} {host} {target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gateway_stack_leaves_the_metadata_listings_to_the_legacy_router() {
+        let mut service = gateway_stack();
+
+        for target in ["/bucket?list-type=2&metadata=true", "/bucket?versions&metadata=true"] {
+            assert_eq!(
+                answered_by(&mut service, on_host(Method::GET, "127.0.0.1:9000", target)).await,
+                "legacy",
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gateway_stack_keeps_every_near_miss_of_the_interim_routes() {
+        let mut service = gateway_stack();
+
+        for (method, host, target) in [
+            // Not a website host.
+            (Method::GET, "127.0.0.1:9000", "/"),
+            (Method::GET, "evilsite.test", "/"),
+            (Method::GET, "bucket.site.test.evil.example", "/"),
+            (Method::GET, "localhost:9000", "/site.test/index.html"),
+            // Not a metadata listing.
+            (Method::GET, "127.0.0.1:9000", "/bucket?list-type=2"),
+            (Method::GET, "127.0.0.1:9000", "/bucket?versions"),
+            (Method::GET, "127.0.0.1:9000", "/bucket?list-type=2&metadata=false"),
+            (Method::GET, "127.0.0.1:9000", "/bucket?list-type=2&metadata="),
+            (Method::GET, "127.0.0.1:9000", "/bucket/key?list-type=2&metadata=true"),
+            (Method::GET, "127.0.0.1:9000", "/bucket?metadata=true"),
+            (Method::PUT, "127.0.0.1:9000", "/bucket?list-type=2&metadata=true"),
+        ] {
+            assert_eq!(
+                answered_by(&mut service, on_host(method.clone(), host, target)).await,
+                "gateway",
+                "{method} {host} {target}"
+            );
+        }
     }
 }

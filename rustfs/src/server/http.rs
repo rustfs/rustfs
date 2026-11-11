@@ -20,7 +20,7 @@ use crate::auth_keystone;
 use crate::config;
 #[cfg(feature = "gateway-stack")]
 use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_enabled_in_configuration};
-use crate::server::stack::{S3StackService, select_stack};
+use crate::server::stack::{MetadataListing, S3StackService, WebsiteHosts, select_stack};
 use crate::server::{
     Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
@@ -2348,6 +2348,10 @@ async fn start_http_server_inner(
     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
     // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
     let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
+    // The metadata route's own domains, also handed to the stack dispatcher (rustfs/backlog#2734
+    // T2.11) so the gateway stack leaves the legacy service exactly the requests it serves there.
+    let website_route_domains = website_host_domains(config)?.unwrap_or_default();
+    let metadata_listing = MetadataListing::new(host_domain_sets.as_deref())?;
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -2365,15 +2369,13 @@ async fn start_http_server_inner(
             .map(MultiDomain::new)
             .transpose()
             .map_err(Error::other)?;
-        let website_host_sets = website_host_domains(config)?;
-        let website_route_domains = website_host_sets.unwrap_or_default();
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
             admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
-            website_route_domains,
+            website_route_domains.clone(),
             protocol,
             Arc::clone(&server_ctx),
         ));
@@ -2523,7 +2525,13 @@ async fn start_http_server_inner(
             "the gateway S3 stack is not built into this binary",
         ))
     };
-    let s3_service: S3EdgeService = select_stack(config.s3_stack, s3_service, assemble_gateway)?;
+    let s3_service: S3EdgeService = select_stack(
+        config.s3_stack,
+        s3_service,
+        WebsiteHosts::new(website_route_domains),
+        metadata_listing,
+        assemble_gateway,
+    )?;
     if s3_service.selected() == crate::config::S3Stack::Legacy {
         info!(
             event = EVENT_S3_STACK_SELECTED,

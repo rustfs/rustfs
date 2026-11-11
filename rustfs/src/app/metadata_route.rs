@@ -105,6 +105,36 @@ where
     }
 }
 
+/// Whether [`MetadataRoute`] serves this request as a static-website request: the rule
+/// `is_match` and `call` apply, exposed with s3s-free arguments so the stack dispatcher
+/// (`server/stack/website.rs`) decides with this same rule rather than a copy of it.
+pub(crate) fn is_website_request(uri: &Uri, headers: &HeaderMap, domains: &[String]) -> bool {
+    website_target(uri, headers, domains).is_some()
+}
+
+/// The bucket-host resolution [`MetadataRoute`] matches the metadata listing extension with,
+/// held apart from the route so the stack dispatcher (`server/stack/metadata.rs`) can ask the
+/// same question without naming an s3s type.
+#[derive(Clone)]
+pub(crate) struct MetadataListingHosts(Option<Arc<MultiDomain>>);
+
+impl MetadataListingHosts {
+    /// Built from the same virtual-host domain list the route's own [`MultiDomain`] is built from;
+    /// `None` when no server domain is configured, which leaves path-style requests only.
+    pub(crate) fn new(server_domains: Option<&[String]>) -> std::io::Result<Self> {
+        server_domains
+            .map(MultiDomain::new)
+            .transpose()
+            .map(|host| Self(host.map(Arc::new)))
+            .map_err(std::io::Error::other)
+    }
+
+    /// Whether [`MetadataRoute`] serves this request as a `?metadata=true` listing.
+    pub(crate) fn matches(&self, method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+        metadata_operation(method, uri, headers, self.0.as_deref()).is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct WebsiteTarget {
     bucket: String,
