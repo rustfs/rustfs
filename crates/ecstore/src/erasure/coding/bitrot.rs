@@ -15,7 +15,7 @@
 use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 use pin_project_lite::pin_project;
-use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{HashAlgorithm, LogThrottle};
 use std::future::poll_fn;
 use std::io::IoSlice;
 use std::pin::Pin;
@@ -28,6 +28,13 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
 const EVENT_BITROT_SHORT_SHARD_READ: &str = "bitrot_short_shard_read";
 const EVENT_BITROT_HASH_MISMATCH: &str = "bitrot_hash_mismatch";
+/// A failing drive raises these once per shard block of every read it serves.
+/// The events carry no object identity (the caller logs that), so one line per
+/// interval with the suppressed count loses nothing but repetition.
+const BITROT_FAILURE_LOG_INTERVAL_MS: u64 = 5_000;
+static BITROT_SHORT_SHARD_READ_LOGS: LogThrottle = LogThrottle::new(BITROT_FAILURE_LOG_INTERVAL_MS);
+static BITROT_HASH_MISMATCH_LOGS: LogThrottle = LogThrottle::new(BITROT_FAILURE_LOG_INTERVAL_MS);
+static BITROT_READ_ERROR_LOGS: LogThrottle = LogThrottle::new(BITROT_FAILURE_LOG_INTERVAL_MS);
 const MAX_RETAINED_CHUNKS_PER_BLOCK: usize = 64;
 const MAX_CHUNK_POLLS_PER_YIELD: usize = MAX_RETAINED_CHUNKS_PER_BLOCK + 1;
 
@@ -259,16 +266,39 @@ fn reserve_bitrot_scratch(
 
 /// A truncated shard is `UnexpectedEof`, not a short success (backlog#799 B2).
 fn short_shard_read(got: usize, want: usize) -> std::io::Error {
-    error!(
-        event = EVENT_BITROT_SHORT_SHARD_READ,
-        component = LOG_COMPONENT_ECSTORE,
-        subsystem = LOG_SUBSYSTEM_ERASURE,
-        state = "failed",
-        got,
-        want,
-        "short shard read: got {got} of {want} bytes"
-    );
+    if let Some(suppressed) = BITROT_SHORT_SHARD_READ_LOGS.claim() {
+        error!(
+            event = EVENT_BITROT_SHORT_SHARD_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ERASURE,
+            state = "failed",
+            got,
+            want,
+            suppressed,
+            "short shard read: got {got} of {want} bytes"
+        );
+    }
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, DiskError::FileCorrupt)
+}
+
+fn log_hash_mismatch(data_len: usize) {
+    if let Some(suppressed) = BITROT_HASH_MISMATCH_LOGS.claim() {
+        error!(
+            event = EVENT_BITROT_HASH_MISMATCH,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ERASURE,
+            state = "failed",
+            data_len,
+            suppressed,
+            "bitrot hash mismatch"
+        );
+    }
+}
+
+fn log_read_error(error: &std::io::Error) {
+    if let Some(suppressed) = BITROT_READ_ERROR_LOGS.claim() {
+        error!(suppressed, "bitrot reader read error: {error}");
+    }
 }
 
 /// Split a `[hash][data]` block, verify the hash (unless `skip_verify`), and
@@ -286,14 +316,7 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
     let actual_hash = hash_algo.hash_encode(data);
     let verify = verify_start.elapsed();
     if actual_hash.as_ref() != hash {
-        error!(
-            event = EVENT_BITROT_HASH_MISMATCH,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_ERASURE,
-            state = "failed",
-            data_len = data.len(),
-            "bitrot hash mismatch"
-        );
+        log_hash_mismatch(data.len());
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
     }
     Ok((data, verify))
@@ -345,7 +368,7 @@ where
                     .inner
                     .read_buf(&mut (&mut *out).limit(remaining))
                     .await
-                    .inspect_err(|e| error!("bitrot reader read error: {e}"))?;
+                    .inspect_err(log_read_error)?;
                 if n == 0 {
                     break;
                 }
@@ -459,14 +482,7 @@ where
                 for chunk in block_chunks() {
                     let take = remaining.min(chunk.len());
                     if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
-                        error!(
-                            event = EVENT_BITROT_HASH_MISMATCH,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_ERASURE,
-                            state = "failed",
-                            data_len = want,
-                            "bitrot hash mismatch"
-                        );
+                        log_hash_mismatch(want);
                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
                     }
                     hash_offset += take;
@@ -594,10 +610,7 @@ where
 {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = reader.read(&mut buf[filled..]).await.map_err(|e| {
-            error!("bitrot reader read error: {}", e);
-            e
-        })?;
+        let n = reader.read(&mut buf[filled..]).await.inspect_err(log_read_error)?;
         if n == 0 {
             break;
         }
@@ -1256,6 +1269,34 @@ mod tests {
             DiskError::from(io::Error::new(io::ErrorKind::InvalidData, "unrelated invalid data")),
             DiskError::Io(_)
         ));
+    }
+
+    /// The log line is bounded; the rejection is not. Every damaged block is
+    /// refused with the same typed error however many came before it.
+    #[test]
+    fn repeated_bitrot_failures_are_all_rejected_while_their_log_is_bounded() {
+        use crate::disk::error::Error as DiskError;
+        let algo = HashAlgorithm::HighwayHash256;
+        let data = b"one of many damaged blocks";
+        let mut frame = algo.hash_encode(data).as_ref().to_vec();
+        frame.extend_from_slice(data);
+        *frame.last_mut().expect("test frame has payload") ^= 1;
+
+        for _ in 0..1_000 {
+            let error = super::split_and_verify(&algo, false, &frame).expect_err("every mismatch rejects its shard");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+            let error = super::short_shard_read(3, 4);
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(DiskError::from(error), DiskError::FileCorrupt);
+            super::log_read_error(&io::Error::other("drive read failed"));
+        }
+
+        // Each burst used its own window, so a further event of the same kind
+        // inside the interval is suppressed.
+        assert!(super::BITROT_HASH_MISMATCH_LOGS.claim().is_none());
+        assert!(super::BITROT_SHORT_SHARD_READ_LOGS.claim().is_none());
+        assert!(super::BITROT_READ_ERROR_LOGS.claim().is_none());
     }
 
     struct FragmentedSource {

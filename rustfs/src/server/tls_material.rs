@@ -2250,7 +2250,25 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real_dir, &symlink_dir).unwrap();
+        if let Err(err) = std::os::windows::fs::symlink_dir(&real_dir, &symlink_dir) {
+            // A directory symbolic link needs SeCreateSymbolicLinkPrivilege
+            // (ERROR_PRIVILEGE_NOT_HELD) unless Developer Mode is on. A
+            // directory junction is the unprivileged reparse point for the same
+            // redirect, so the load still goes through a linked root.
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            assert_eq!(err.raw_os_error(), Some(ERROR_PRIVILEGE_NOT_HELD), "create directory symlink: {err}");
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&symlink_dir)
+                .arg(&real_dir)
+                .output()
+                .expect("run mklink");
+            assert!(output.status.success(), "create directory junction: {output:?}");
+        }
+        assert!(
+            fs::symlink_metadata(&symlink_dir).unwrap().file_type().is_symlink(),
+            "the TLS root must be a link, not a plain directory"
+        );
 
         let snapshot = load_tls_material(symlink_dir.to_str().unwrap())
             .await

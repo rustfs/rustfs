@@ -6908,23 +6908,27 @@ mod tests {
                 ));
                 let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
                 assert_eq!(
-                    usecase.execute_get_object(get).await.expect_err("bad GET part number").code(),
+                    crate::app::test_seams::get_object(&usecase, get)
+                        .await
+                        .expect_err("bad GET part number")
+                        .code(),
                     &S3ErrorCode::InvalidArgument
                 );
                 assert_eq!(
-                    usecase
-                        .execute_head_object(head)
+                    crate::app::test_seams::head_object(&usecase, head)
                         .await
                         .expect_err("range and part number conflict")
                         .code(),
                     &S3ErrorCode::InvalidArgument
                 );
                 assert_eq!(
-                    crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
-                        .execute_list_objects_v2(list)
-                        .await
-                        .expect_err("negative max keys")
-                        .code(),
+                    crate::app::test_seams::list_objects_v2(
+                        &crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context))),
+                        list
+                    )
+                    .await
+                    .expect_err("negative max keys")
+                    .code(),
                     &S3ErrorCode::InvalidArgument
                 );
             }
@@ -7012,78 +7016,77 @@ mod tests {
             let incarnation = store.bucket_incarnation_id(&bucket).await.expect("created identity");
             sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
             let usecase = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-            usecase
-                .execute_get_object(get.clone())
+            crate::app::test_seams::get_object(&usecase, get.clone())
                 .await
                 .expect("a local GET hit ignores source capture failure");
-            usecase
-                .execute_head_object(head.clone())
+            crate::app::test_seams::head_object(&usecase, head.clone())
                 .await
                 .expect("a local HEAD hit ignores source capture failure");
             get.input.key = "missing".into();
             head.input.key = "missing".into();
             assert_eq!(
-                usecase
-                    .execute_get_object(get.clone())
+                crate::app::test_seams::get_object(&usecase, get.clone())
                     .await
                     .expect_err("failed capture cannot rebind on GET miss")
                     .code(),
                 &S3ErrorCode::NoSuchBucket
             );
             assert_eq!(
-                usecase
-                    .execute_head_object(head.clone())
+                crate::app::test_seams::head_object(&usecase, head.clone())
                     .await
                     .expect_err("failed capture cannot rebind on HEAD miss")
                     .code(),
                 &S3ErrorCode::NoSuchBucket
             );
             assert_eq!(
-                crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
-                    .execute_list_objects_v2(list.clone())
-                    .await
-                    .expect_err("failed capture cannot rebind on LIST")
-                    .code(),
+                crate::app::test_seams::list_objects_v2(
+                    &crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context))),
+                    list.clone()
+                )
+                .await
+                .expect_err("failed capture cannot rebind on LIST")
+                .code(),
                 &S3ErrorCode::NoSuchBucket
             );
             config.filter.prefix = Some("remote/".into());
             sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
             assert_eq!(
-                usecase
-                    .execute_get_object(get.clone())
+                crate::app::test_seams::get_object(&usecase, get.clone())
                     .await
                     .expect_err("filtered GET remains local")
                     .code(),
                 &S3ErrorCode::NoSuchKey
             );
             assert_eq!(
-                usecase
-                    .execute_head_object(head.clone())
+                crate::app::test_seams::head_object(&usecase, head.clone())
                     .await
                     .expect_err("filtered HEAD remains local")
                     .code(),
                 &S3ErrorCode::NoSuchKey
             );
             list.input.prefix = Some("local/".into());
-            let listing = crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
-                .execute_list_objects_v2(list.clone())
-                .await
-                .expect("disjoint prefix needs no source identity");
+            let listing = crate::app::test_seams::list_objects_v2(
+                &crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context))),
+                list.clone(),
+            )
+            .await
+            .expect("disjoint prefix needs no source identity");
             assert_eq!(listing.output.key_count, Some(0));
             list.input.prefix = Some("remote/".into());
             list.input.max_keys = Some(0);
-            let listing = crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context)))
-                .execute_list_objects_v2(list)
-                .await
-                .expect("an empty page needs no source identity");
+            let listing = crate::app::test_seams::list_objects_v2(
+                &crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(Arc::clone(&context))),
+                list,
+            )
+            .await
+            .expect("an empty page needs no source identity");
             assert_eq!(listing.output.key_count, Some(0));
 
             config.filter.prefix = None;
             config.policy.head = crate::on_demand_migration::HeadPolicy::LocalOnly;
             sys.apply_for_incarnation(&bucket, incarnation, Some(&config)).await;
             assert_eq!(
-                usecase
-                    .execute_head_object(head.clone())
+                crate::app::test_seams::head_object(&usecase, head.clone())
                     .await
                     .expect_err("local-only HEAD needs no source identity")
                     .code(),
@@ -7103,16 +7106,14 @@ mod tests {
                 .await
                 .expect("create local delete marker");
             assert_eq!(
-                usecase
-                    .execute_get_object(get)
+                crate::app::test_seams::get_object(&usecase, get)
                     .await
                     .expect_err("GET respects the delete marker before capture failure")
                     .code(),
                 &S3ErrorCode::NoSuchKey
             );
             assert_eq!(
-                usecase
-                    .execute_head_object(head)
+                crate::app::test_seams::head_object(&usecase, head)
                     .await
                     .expect_err("HEAD respects the delete marker before capture failure")
                     .code(),

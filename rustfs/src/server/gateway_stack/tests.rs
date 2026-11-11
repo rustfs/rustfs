@@ -19,7 +19,7 @@ use super::*;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Empty};
-use rustfs_gateway::{AuthzRequest, ClientFacts, Decision, InputAuthzRequest, InputDecisions, NO_DEADLINE};
+use rustfs_gateway::{AuthzRequest, ClientFacts, Decision, HostRequestId, InputAuthzRequest, InputDecisions, NO_DEADLINE};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
