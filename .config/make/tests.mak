@@ -67,6 +67,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_reference_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_build_workflow.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/release -p "test_*.py"
@@ -94,6 +95,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_api_coverage.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_reference_parity.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test
