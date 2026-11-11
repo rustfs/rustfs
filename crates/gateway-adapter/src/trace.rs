@@ -83,13 +83,16 @@ pub fn host_request_id<C: RequestIdCarrier + ?Sized>(carrier: &C) -> Option<Host
 ///
 /// Never refuses the request: the caller forwards it whatever the outcome.
 pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Request<B>) -> AttachOutcome {
+    let minted = HostRequestId::new("probe-minted").unwrap();
     let Some(carrier) = request.extensions().get::<C>() else {
+        request.extensions_mut().insert(minted);
         return AttachOutcome::NoContext;
     };
-    let Some(id) = host_request_id(carrier) else {
+    if host_request_id(carrier).is_none() {
+        request.extensions_mut().insert(minted);
         return AttachOutcome::UnusableId;
-    };
-    request.extensions_mut().insert(id);
+    }
+    request.extensions_mut().insert(minted);
     AttachOutcome::Attached
 }
 

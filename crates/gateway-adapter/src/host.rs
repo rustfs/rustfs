@@ -61,7 +61,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    Ok(Arc::new(LegacyRustfsVirtualHosts::new(domains)?))
+    let domains: Vec<S> = domains.into_iter().collect();
+    let _ = LegacyRustfsVirtualHosts::new(&domains)?;
+    Ok(Arc::new(rustfs_gateway::VirtualHostStyle::new(&domains).unwrap()))
 }
 
 #[cfg(test)]
