@@ -101,11 +101,14 @@ pub(super) fn parse_s3_path(input: &str) -> Result<(String, Option<String>), Sft
     Ok((bucket, key))
 }
 
-/// Formats an S3 copy-source header while preserving the literal object key.
-/// The S3 copy-source parser URL-decodes the path and treats a raw `?versionId=`
-/// as query data, so encode the complete key before building the header.
-pub(super) fn format_copy_source(bucket: &str, key: &str) -> String {
-    format!("/{bucket}/{}", urlencoding::encode(key))
+/// Describes an S3 copy source by its literal bucket and object key, with no version.
+/// The key is carried verbatim; the storage client renders the copy-source header from it.
+pub(super) fn copy_source_value(bucket: &str, key: &str) -> rustfs_gateway_types::CopySourceValue {
+    rustfs_gateway_types::CopySourceValue::Bucket {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        version_id: None,
+    }
 }
 
 /// Replace C0 control bytes (other than tab) with the literal byte 0x3F
@@ -137,10 +140,17 @@ mod tests {
     use russh_sftp::protocol::StatusCode;
 
     #[test]
-    fn format_copy_source_preserves_encoded_and_query_like_keys() {
-        assert_eq!(format_copy_source("bucket", "%2F"), "/bucket/%252F");
-        assert_eq!(format_copy_source("bucket", "foo?versionId=1"), "/bucket/foo%3FversionId%3D1");
-        assert_eq!(format_copy_source("bucket", "a/b"), "/bucket/a%2Fb");
+    fn copy_source_value_keeps_encoded_and_query_like_keys_literal() {
+        for key in ["%2F", "foo?versionId=1", "a/b", "plain"] {
+            assert_eq!(
+                copy_source_value("bucket", key),
+                rustfs_gateway_types::CopySourceValue::Bucket {
+                    bucket: "bucket".to_owned(),
+                    key: key.to_owned(),
+                    version_id: None,
+                }
+            );
+        }
     }
 
     #[test]
