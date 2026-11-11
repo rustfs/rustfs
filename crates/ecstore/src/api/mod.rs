@@ -654,6 +654,15 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
+    /// Internode shard reads over NIXL: the receive-pool seam the binary fills
+    /// and the wire names its serving handler shares with the transport.
+    pub mod nixl {
+        pub use crate::cluster::rpc::nixl_internode::{
+            NIXL_AGENT_QUERY, NIXL_BUFFER_QUERY, NIXL_BUFFERS_QUERY, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER,
+            NIXL_METADATA_SHA256_QUERY, NIXL_NONCE_QUERY, NixlRecvBuffer, NixlRecvPool, READ_FILE_NIXL_PATH,
+            WRITE_FILE_NIXL_PATH, install_nixl_recv_pool,
+        };
+    }
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
