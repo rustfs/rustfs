@@ -299,7 +299,7 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
-            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION,
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,

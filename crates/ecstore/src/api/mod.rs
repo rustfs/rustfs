@@ -491,7 +491,7 @@ pub mod disk {
         PoolMetaNativeInspection, PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
+        UNCLEAN_SHUTDOWN_MARKER_PATH, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
         validate_batch_read_version_item_count,
     };
     pub use crate::disk::{

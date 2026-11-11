@@ -61,6 +61,8 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
+/// Boot-time crash fence and clean scanner continuity receipt.
+pub const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = "unclean-shutdown";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 /// Original upload authority after it stops admitting active part mutations.

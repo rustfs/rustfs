@@ -539,13 +539,23 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
 }
 
 async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> (tempfile::TempDir, Arc<ECStore>) {
-    init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
+    let store = open_local_scanner_store(temp_dir.path(), pool_count, drives_per_set, false).await;
+    (temp_dir, store)
+}
+
+async fn open_local_scanner_store(
+    root: &std::path::Path,
+    pool_count: usize,
+    drives_per_set: usize,
+    process_boot: bool,
+) -> Arc<ECStore> {
+    init_ecstore_config_for_scanner_tests();
     let mut pools = Vec::new();
     for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
         for disk_index in 0..drives_per_set {
-            let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
+            let disk_path = root.join(format!("pool{pool_index}-disk{disk_index}"));
             tokio::fs::create_dir_all(&disk_path)
                 .await
                 .expect("multi-pool scanner test disk should be created");
@@ -567,6 +577,16 @@ async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> 
     }
 
     let endpoint_pools = EndpointServerPools::from(pools);
+    if process_boot {
+        crate::storage_api::ecstore_init_local_disks(endpoint_pools.clone())
+            .await
+            .expect("process disk registry");
+        let store = ECStore::new("127.0.0.1:0".parse().expect("test address"), endpoint_pools, CancellationToken::new())
+            .await
+            .expect("process scanner store");
+        init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+        return store;
+    }
     let instance_ctx = Arc::new(InstanceContext::new());
     init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
         .await
@@ -581,7 +601,7 @@ async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> 
     .expect("multi-pool ECStore should initialize");
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
-    (temp_dir, store)
+    store
 }
 
 #[tokio::test]

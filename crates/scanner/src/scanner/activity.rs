@@ -535,6 +535,7 @@ pub(crate) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScannerNodeActivity {
     pub(super) instance_id: String,
+    pub(super) checkpoint_instance_id: Option<String>,
     pub(super) namespace_generation: u64,
     pub(super) maintenance_generation: u64,
     pub(super) protocol_version: u32,
@@ -551,6 +552,7 @@ impl ScannerNodeActivity {
     pub(crate) fn e2e_observation(&self) -> serde_json::Value {
         serde_json::json!({
             "instance_id": self.instance_id,
+            "checkpoint_instance_id": self.checkpoint_instance_id,
             "namespace_generation": self.namespace_generation,
             "maintenance_generation": self.maintenance_generation,
             "protocol_version": self.protocol_version,
@@ -575,6 +577,7 @@ pub(crate) fn scanner_node_activity_for_tests(
 ) -> ScannerNodeActivity {
     ScannerNodeActivity {
         instance_id: instance_id.to_string(),
+        checkpoint_instance_id: None,
         namespace_generation,
         maintenance_generation: 0,
         protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -1095,11 +1098,32 @@ where
 }
 
 pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+    hash_scanner_activity_members(snapshot.iter().map(|(host, activity)| (host.as_str(), activity)), false)
+}
+
+/// Completed bucket reuse retains all mutation and maintenance fences while
+/// allowing a verified read-only handoff to replace only the RPC process epoch.
+pub(crate) fn scanner_activity_bucket_reuse_digest(snapshot: &ScannerActivitySnapshot, local_node: &str) -> [u8; 32] {
+    hash_scanner_activity_members(scanner_activity_members(snapshot, local_node).into_iter(), true)
+}
+
+fn hash_scanner_activity_members<'a>(
+    members: impl ExactSizeIterator<Item = (&'a str, &'a ScannerNodeActivity)>,
+    checkpoint_continuity: bool,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
-    for (host, activity) in snapshot {
+    if checkpoint_continuity {
+        hasher.update(b"scanner-bucket-reuse-v1");
+    }
+    hasher.update(u64::try_from(members.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (host, activity) in members {
         let host = host.as_bytes();
-        let instance_id = activity.instance_id.as_bytes();
+        let instance_id = if checkpoint_continuity {
+            activity.checkpoint_instance_id.as_deref().unwrap_or(&activity.instance_id)
+        } else {
+            &activity.instance_id
+        }
+        .as_bytes();
         hasher.update(u64::try_from(host.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(host);
         hasher.update(u64::try_from(instance_id.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -1118,11 +1142,11 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
 
 /// The reuse identity: hash the activity inputs that make an existing
 /// scanner result unsafe to reuse without walking again. Besides the
-/// coverage identity below it binds each peer's `instance_id` and
-/// `maintenance_generation`: a restarted node may have lost the dirty hints
-/// of its last journal window and a changed lifecycle or replication rule
-/// needs a maintenance pass, so both invalidate the authoritative baseline
-/// and the set caches and force the next cycle to walk every bucket. With
+/// coverage identity below it binds each peer's checkpoint continuity and
+/// `maintenance_generation`. A read-only, clean shutdown may preserve that
+/// continuity; a writer or crash starts fresh because its last dirty-journal
+/// window may be missing. A changed lifecycle or replication rule also needs
+/// a maintenance pass. With
 /// the bucket list it is the plan under which set caches and the
 /// scoped-scan baseline are reused (`scanner_bucket_plan_digest`).
 ///
@@ -1137,7 +1161,11 @@ pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnaps
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
     for (host, activity) in scanner_activity_members(snapshot, local_node) {
         let host = host.as_bytes();
-        let instance_id = activity.instance_id.as_bytes();
+        let instance_id = activity
+            .checkpoint_instance_id
+            .as_deref()
+            .unwrap_or(&activity.instance_id)
+            .as_bytes();
         hasher.update(u64::try_from(host.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(host);
         hasher.update(u64::try_from(instance_id.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -1179,9 +1207,10 @@ fn scanner_activity_members<'a>(
 /// cycle is not mixed coverage. It binds the peer set, the protocol, the
 /// topology and the data-movement state. A coordinator restart, a
 /// maintenance publication or a publication pause changes none of the
-/// namespace a sweep walks, so `instance_id`, `maintenance_generation` and
-/// `publication_blocked` are left out; hashing them made every resumed sweep
-/// restart as mixed coverage after such an event (rustfs/rustfs#8494). The
+/// namespace a sweep walks, so the RPC `instance_id`, `maintenance_generation`
+/// and `publication_blocked` are left out. Protocol v8 instead binds the
+/// checkpoint identity inherited only from a durable read-only handoff;
+/// a lost write hint must invalidate partial as well as completed coverage. The
 /// standalone node's namespace and dirty generations are left out too: the
 /// bucket's own dirty generation joins the checkpoint plan in
 /// `scanner_bucket_cache_digest`, which is what certification compares.
@@ -1195,6 +1224,9 @@ pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapsho
         let host_bytes = host.as_bytes();
         hasher.update(u64::try_from(host_bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(host_bytes);
+        if let Some(instance) = &activity.checkpoint_instance_id {
+            hasher.update(instance.as_bytes());
+        }
         hasher.update(activity.protocol_version.to_be_bytes());
         hasher.update(activity.topology_digest);
         hasher.update([u8::from(activity.data_movement_active)]);
@@ -1321,8 +1353,10 @@ pub(crate) fn scanner_peer_dirty_usage_moved(
 pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivitySnapshot) -> bool {
     !snapshot.is_empty()
         && snapshot.values().all(|activity| {
-            activity.protocol_version == SCANNER_ACTIVITY_PROTOCOL_VERSION
-                && activity.movement_generation != u64::MAX
+            matches!(
+                activity.protocol_version,
+                crate::SCANNER_ACTIVITY_V7_PROTOCOL_VERSION | SCANNER_ACTIVITY_PROTOCOL_VERSION
+            ) && activity.movement_generation != u64::MAX
                 && !activity.data_movement_active
                 && !activity.publication_blocked
         })
@@ -1429,6 +1463,7 @@ where
         LOCAL_SCANNER_ACTIVITY_NODE.to_string(),
         ScannerNodeActivity {
             instance_id: local_instance_id,
+            checkpoint_instance_id: Some(crate::scanner_checkpoint_instance_id().to_owned()),
             namespace_generation,
             maintenance_generation,
             protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -1478,7 +1513,7 @@ where
                     SCANNER_ACTIVITY_V6_PROTOCOL_VERSION
                 ));
             }
-            SCANNER_ACTIVITY_PROTOCOL_VERSION => (
+            crate::SCANNER_ACTIVITY_V7_PROTOCOL_VERSION | SCANNER_ACTIVITY_PROTOCOL_VERSION => (
                 activity
                     .topology_digest
                     .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
@@ -1517,6 +1552,7 @@ where
                 host.clone(),
                 ScannerNodeActivity {
                     instance_id: activity.instance_id,
+                    checkpoint_instance_id: activity.checkpoint_instance_id,
                     namespace_generation: activity.namespace_generation,
                     maintenance_generation: activity.maintenance_generation,
                     protocol_version: activity.protocol_version,

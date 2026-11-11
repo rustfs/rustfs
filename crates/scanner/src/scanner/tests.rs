@@ -10359,6 +10359,7 @@ async fn recovery_wake_interrupts_normal_cycle_wait() {
 
 fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {
     ScannerNodeActivity {
+        checkpoint_instance_id: None,
         instance_id: epoch.to_string(),
         namespace_generation,
         maintenance_generation,
@@ -10614,6 +10615,14 @@ fn scanner_activity_snapshot_fences_data_movement() {
     assert!(scanner_activity_allows_usage_publication(&idle));
     assert!(!scanner_activity_allows_usage_publication(&moving));
     assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
+    let mut v7 = idle.clone();
+    v7.get_mut("node-2").expect("node").protocol_version = crate::SCANNER_ACTIVITY_V7_PROTOCOL_VERSION;
+    assert!(
+        scanner_activity_allows_usage_publication(&v7),
+        "v7 still authenticates terminal movement state"
+    );
+    v7.get_mut("node-2").expect("node").protocol_version = crate::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
+    assert!(!scanner_activity_allows_usage_publication(&v7));
 }
 
 #[test]

@@ -255,6 +255,225 @@ async fn checkpoint_small_budget_accumulates_completed_buckets_across_leaders() 
 
 #[tokio::test]
 #[serial]
+async fn checkpoint_small_budget_accumulates_across_process_restarts() {
+    const ROOT_ENV: &str = "RUSTFS_CHECKPOINT_RESTART_ROOT";
+    const CYCLE_ENV: &str = "RUSTFS_CHECKPOINT_RESTART_CYCLE";
+    const TEST_NAME: &str =
+        "scanner_io::tests::checkpoint_coverage_identity::checkpoint_small_budget_accumulates_across_process_restarts";
+    let names = ["restart-a", "restart-b", "restart-c", "restart-d"];
+    if let Some(root) = std::env::var_os(ROOT_ENV) {
+        let root = std::path::PathBuf::from(root);
+        let cycle: u64 = std::env::var(CYCLE_ENV)
+            .expect("worker cycle")
+            .parse()
+            .expect("numeric cycle");
+        let store = open_local_scanner_store(&root, 1, 1, true).await;
+        let registry = scanner_set_disk_inventory(&store.pools[0].disk_set[0])
+            .await
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let previous = rustfs_heal::heal::consume_read_only_scanner_handoff("test-node", &registry)
+            .await
+            .expect("consume previous receipt");
+        if let Some(previous) = previous {
+            assert!(crate::restore_scanner_checkpoint_instance_id(&previous));
+        }
+        if cycle == 0 {
+            for bucket in names {
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("fixture bucket");
+                for object in ["a", "b", "c"] {
+                    put_fixture_object(&store, bucket, object).await;
+                }
+            }
+            wait_for_namespace_commit_tails(store.as_ref()).await;
+            rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+            return;
+        }
+        let mutation_path = root.join("mutate.json");
+        let mutated = root.join("mutated");
+        if mutation_path.exists() && !mutated.exists() {
+            let mutation: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&mutation_path).await.expect("mutation request")).expect("mutation JSON");
+            let bucket = mutation["bucket"].as_str().expect("mutation bucket");
+            assert!(names.contains(&bucket));
+            put_fixture_object(&store, bucket, "after-checkpoint").await;
+            wait_for_namespace_commit_tails(store.as_ref()).await;
+            assert!(store.scanner_namespace_mutation_generation() > 0 || !crate::scanner_process_was_read_only());
+            if mutation["clean"] == true {
+                rustfs_heal::heal::clear_unclean_shutdown_markers().await;
+            }
+            tokio::fs::write(&mutated, b"committed").await.expect("mutation receipt");
+            let report = serde_json::json!({"instance": scanner_activity_epoch(), "mutated": true});
+            tokio::fs::write(
+                root.join(format!("round-{cycle}.json")),
+                serde_json::to_vec(&report).expect("writer report"),
+            )
+            .await
+            .expect("writer report file");
+            return;
+        }
+        let baseline = if root.join("published.json").exists() {
+            Bytes::from(tokio::fs::read(root.join("published.json")).await.expect("published floor"))
+        } else {
+            Bytes::from(
+                serde_json::to_vec(&crate::scanner::scanner_usage_bootstrap_marker(SystemTime::now(), Some(LEADER_EPOCH)))
+                    .expect("bootstrap baseline"),
+            )
+        };
+        let (result, usage, budget) = run_full_cycle_at_epoch(&store, cycle, LEADER_EPOCH + cycle, Some(2), Some(baseline)).await;
+        let complete = result.status == ScannerCycleStatus::Complete;
+        if complete {
+            let usage = usage.expect("complete sweep must publish");
+            let mutation: Option<serde_json::Value> = if mutated.exists() {
+                Some(
+                    serde_json::from_slice(&tokio::fs::read(&mutation_path).await.expect("mutation request"))
+                        .expect("mutation JSON"),
+                )
+            } else {
+                None
+            };
+            assert_eq!(usage.objects_total_count, if mutation.is_some() { 13 } else { 12 });
+            assert_eq!(usage.usage_snapshot_converged, Some(true));
+            for bucket in names {
+                let expected = if mutation.as_ref().is_some_and(|mutation| mutation["bucket"] == bucket) {
+                    4
+                } else {
+                    3
+                };
+                assert_eq!(usage.buckets_usage[bucket].objects_count, expected, "{bucket}");
+            }
+            tokio::fs::write(root.join("published.json"), serde_json::to_vec(&usage).expect("complete usage"))
+                .await
+                .expect("published baseline");
+        }
+        let mut completed_buckets = Vec::new();
+        for bucket in names {
+            let mut cache = DataUsageCache::default();
+            if cache
+                .load(store.pools[0].disk_set[0].clone(), &path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]))
+                .await
+                .is_ok()
+                && cache.info.snapshot_complete
+                && !cache.has_scan_position()
+            {
+                completed_buckets.push(bucket);
+            }
+        }
+        assert_eq!(
+            store.scanner_namespace_mutation_generation(),
+            0,
+            "scanner must not mint namespace mutations"
+        );
+        assert!(
+            crate::scanner_process_was_read_only(),
+            "a scanner-only process must be eligible for a read-only handoff"
+        );
+        rustfs_heal::heal::save_read_only_scanner_handoff("test-node", crate::scanner_checkpoint_instance_id())
+            .await
+            .expect("persist read-only handoff");
+        let report = serde_json::json!({
+            "instance": scanner_activity_epoch(), "checkpoint_instance": crate::scanner_checkpoint_instance_id(),
+            "complete": complete, "objects_processed": budget.progress().0, "completed_buckets": completed_buckets,
+        });
+        tokio::fs::write(
+            root.join(format!("round-{cycle}.json")),
+            serde_json::to_vec(&report).expect("worker report"),
+        )
+        .await
+        .expect("worker report file");
+        return;
+    }
+    for scenario in ["quiet", "clean-writer", "crashed-writer"] {
+        let root = tempfile::tempdir().expect("restart fixture root");
+        let mut instances = HashSet::new();
+        let mut observations = Vec::new();
+        let mut injected = false;
+        let mut complete = false;
+        let mut before_mutation = None;
+        let mut expect_fresh = false;
+        for cycle in 0..=40 {
+            let log_path = root.path().join(format!("round-{cycle}.log"));
+            let output = std::fs::File::create(&log_path).expect("worker log");
+            let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(ROOT_ENV, root.path())
+                .env(CYCLE_ENV, cycle.to_string())
+                .env("RUST_MIN_STACK", "4194304")
+                .stdout(output.try_clone().expect("worker stdout"))
+                .stderr(output)
+                .spawn()
+                .expect("restart worker");
+            let status = tokio::time::timeout(Duration::from_secs(75), async {
+                loop {
+                    if let Some(status) = child.try_wait().expect("worker status") {
+                        break status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                child.kill().expect("stop expired worker");
+                child.wait().expect("reap expired worker");
+                panic!("{scenario} round {cycle} exceeded its deadline");
+            });
+            assert!(
+                status.success(),
+                "{scenario} round {cycle}: {}",
+                std::fs::read_to_string(log_path).expect("worker diagnostics")
+            );
+            if cycle == 0 {
+                continue;
+            }
+            let report: serde_json::Value = serde_json::from_slice(
+                &tokio::fs::read(root.path().join(format!("round-{cycle}.json")))
+                    .await
+                    .expect("worker report file"),
+            )
+            .expect("worker report JSON");
+            assert!(instances.insert(report["instance"].as_str().expect("process identity").to_owned()));
+            if report["mutated"] == true {
+                expect_fresh = true;
+                continue;
+            }
+            if expect_fresh {
+                assert_ne!(
+                    before_mutation.as_ref(),
+                    Some(&report["checkpoint_instance"]),
+                    "writer must invalidate continuity"
+                );
+                assert_eq!(report["complete"], false, "old completed roots must not hide the mutation");
+                expect_fresh = false;
+            }
+            if scenario != "quiet" && !injected && !report["completed_buckets"].as_array().expect("completed buckets").is_empty()
+            {
+                assert_eq!(report["complete"], false, "mutation must precede global publication");
+                let mutation = serde_json::json!({"bucket": report["completed_buckets"][0], "clean": scenario == "clean-writer"});
+                tokio::fs::write(root.path().join("mutate.json"), serde_json::to_vec(&mutation).expect("mutation request"))
+                    .await
+                    .expect("mutation request file");
+                before_mutation = Some(report["checkpoint_instance"].clone());
+                injected = true;
+            }
+            if report["complete"] == true {
+                assert!(cycle > 1);
+                assert!(scenario == "quiet" || injected);
+                complete = true;
+                eprintln!("{scenario}: exact convergence in {cycle} bounded fresh processes");
+                break;
+            }
+            observations.push(report);
+        }
+        assert!(complete, "{scenario}: fixed budget did not converge in 40 restarts: {observations:?}");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn checkpoint_resumes_across_a_maintenance_publication() {
     let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
     clear_dirty_usage_buckets_for_tests();

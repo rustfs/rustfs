@@ -154,6 +154,7 @@ pub(crate) async fn init_startup_storage_runtime(
 ) -> Result<StartupStorageRuntime> {
     rustfs_scanner::register_scanner_pause_backlog_retirement();
     let ctx = CancellationToken::new();
+    let handoff = consume_read_only_scanner_handoff(&instance_ctx).await?;
 
     debug!(
         target: "rustfs::main::run",
@@ -179,6 +180,7 @@ pub(crate) async fn init_startup_storage_runtime(
             );
         })?;
 
+    restore_read_only_scanner_handoff(store.as_ref(), handoff);
     init_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
     init_background_replication(store.clone()).await;
@@ -197,6 +199,7 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
     instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
     rustfs_scanner::register_scanner_pause_backlog_retirement();
+    let handoff = consume_read_only_scanner_handoff(&instance_ctx).await?;
     let store =
         match ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), shutdown_token.clone(), instance_ctx).await {
             Ok(store) => store,
@@ -213,11 +216,31 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
             }
         };
 
+    restore_read_only_scanner_handoff(store.as_ref(), handoff);
     init_embedded_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
     init_background_replication(store.clone()).await;
 
     Ok(StartupStorageRuntime { store, shutdown_token })
+}
+
+async fn consume_read_only_scanner_handoff(instance_ctx: &InstanceContext) -> Result<Option<String>> {
+    let owner = rustfs_common::get_global_local_node_name().await;
+    // ECStore construction can start delete recovery and data movement.
+    rustfs_heal::heal::consume_read_only_scanner_handoff(&owner, &instance_ctx.local_disk_inventory().await)
+        .await
+        .map_err(|error| Error::other(format!("scanner shutdown receipt: {error}")))
+}
+
+fn restore_read_only_scanner_handoff(store: &ECStore, previous: Option<String>) {
+    if store.scanner_namespace_mutation_generation() == 0
+        && rustfs_scanner::scanner_process_was_read_only()
+        && let Some(instance) = previous
+    {
+        // Consumption precedes all background producers and Scanner startup.
+        // An already initialized identity remains fresh instead of being replaced.
+        rustfs_scanner::restore_scanner_checkpoint_instance_id(&instance);
+    }
 }
 
 async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {

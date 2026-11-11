@@ -23,6 +23,7 @@ pub mod progress;
 mod replacement_execution;
 pub(crate) mod replacement_readiness;
 pub mod resume;
+mod shutdown_marker;
 pub mod storage;
 pub(crate) mod storage_api;
 pub mod task;
@@ -38,6 +39,7 @@ use storage_api::owner::{
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::{HealAdmissionTelemetry, HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
 pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
+pub use shutdown_marker::{consume_read_only_scanner_handoff, save_read_only_scanner_handoff};
 pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
 
 pub(crate) const DATA_USAGE_CACHE_NAME: &str = ECSTORE_DATA_USAGE_CACHE_NAME;
@@ -49,7 +51,7 @@ pub(crate) const POOL_META_NAME: &str = ECSTORE_POOL_META_NAME;
 /// [`clear_unclean_shutdown_markers`] on graceful shutdown. Finding it at
 /// startup means the previous run crashed or lost power, so the heal manager
 /// proactively re-verifies all local erasure sets.
-pub(crate) const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = "unclean-shutdown";
+pub(crate) const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = storage_api::ECSTORE_UNCLEAN_SHUTDOWN_MARKER_PATH;
 
 /// Remove the unclean-shutdown markers from all local disks. Call at the end of
 /// a graceful shutdown, after the data plane has stopped accepting writes.

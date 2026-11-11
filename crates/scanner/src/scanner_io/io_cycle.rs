@@ -725,14 +725,18 @@ where
     );
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
-    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_bucket_reuse_digest(&activity_before, &local_node),
+    );
     let checkpoint_coverage_digest = scanner_bucket_plan_digest(
         &all_buckets,
         crate::scanner::scanner_activity_coverage_digest(&activity_before, &local_node),
     );
     let completed_checkpoint_cycle_floor =
         completed_checkpoint_cycle_floor(persisted_usage_baseline.as_deref(), &expected_sources, want_cycle, leader_epoch);
-    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
+    let execution_digest =
+        scanner_bucket_work_digest(scanner_bucket_plan_digest(&all_buckets, activity_digest), scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
     let baseline_proof = ScannerCacheBaselineProof {
         authoritative_data: persisted_usage_baseline.as_ref(),

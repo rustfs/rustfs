@@ -681,6 +681,21 @@ pub fn canonical_scanner_activity_v7_response_body(
 
 pub mod scoped_dirty_usage;
 
+/// Binds checkpoint continuity independently of the fresh RPC process ID.
+pub fn canonical_scanner_activity_v8_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = canonical_scanner_activity_v7_response_body(challenge, response)?;
+    body.extend_from_slice(b"rustfs-scanner-checkpoint-continuity-v1\0");
+    body.push(u8::from(response.checkpoint_instance_id.is_some()));
+    if let Some(instance) = &response.checkpoint_instance_id {
+        body.extend_from_slice(&u64::try_from(instance.len())?.to_be_bytes());
+        body.extend_from_slice(instance.as_bytes());
+    }
+    Ok(body)
+}
+
 pub fn canonical_scanner_dirty_usage_snapshot_request_body(
     request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -2366,9 +2381,9 @@ mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
         canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
-        canonical_scanner_dirty_usage_snapshot_request_body, canonical_scanner_dirty_usage_snapshot_response_body,
-        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
-        canonical_scanner_publication_lease_response_body,
+        canonical_scanner_activity_v8_response_body, canonical_scanner_dirty_usage_snapshot_request_body,
+        canonical_scanner_dirty_usage_snapshot_response_body, canonical_scanner_publication_lease_release_request_body,
+        canonical_scanner_publication_lease_request_body, canonical_scanner_publication_lease_response_body,
         proto_gen::node_service::{
             ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshotRequest,
             ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
@@ -2520,6 +2535,7 @@ mod scanner_activity_tests {
     #[test]
     fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
         let response = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -2603,8 +2619,35 @@ mod scanner_activity_tests {
     }
 
     #[test]
+    fn scanner_activity_v8_authenticates_checkpoint_continuity() {
+        let response = ScannerActivityResponse {
+            protocol_version: 8,
+            instance_id: "1".repeat(32),
+            checkpoint_instance_id: Some("2".repeat(32)),
+            ..Default::default()
+        };
+        let baseline = canonical_scanner_activity_v8_response_body(&[1; 16], &response).expect("v8 body");
+        for checkpoint_instance_id in [None, Some("3".repeat(32))] {
+            let changed = ScannerActivityResponse {
+                checkpoint_instance_id,
+                ..response.clone()
+            };
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_v8_response_body(&[1; 16], &changed).expect("changed body")
+            );
+            assert_eq!(
+                canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("v7 body"),
+                canonical_scanner_activity_v7_response_body(&[1; 16], &changed).expect("v7 compatibility"),
+                "v7 does not authenticate continuity and its decoder must reject this field"
+            );
+        }
+    }
+
+    #[test]
     fn scanner_activity_v4_response_canonicalization_ignores_v5_fields() {
         let response = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
