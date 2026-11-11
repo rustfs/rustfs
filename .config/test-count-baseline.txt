@@ -4,10 +4,12 @@
 # One row per workspace member: <package>, tests, ignored, tab-separated.
 # tests counts #[test], #[tokio::test], #[tokio::test(...)] and #[test_case(...)]
 # attribute lines under the package directory; ignored counts #[ignore] and
-# #[ignore = "..."]. Both columns are exact: CI fails when a crate's tests fall
-# below or rise above its row, or when its ignored count changes. Raise a row in
-# the PR that adds tests; lowering one is a reviewed statement that tests were
-# intentionally removed. Regenerate with:
+# #[ignore = "..."]. The tests column is a floor and the ignored column is a
+# ceiling: CI fails when a crate's tests fall below its row or its ignored count
+# rises above it. Extra tests and fewer ignores pass; --update tightens the rows.
+# Lowering a tests row or raising an ignored row is a reviewed statement that
+# tests were intentionally removed or ignored; justify it in the PR description.
+# Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	1026	20
 rustfs	6438	64

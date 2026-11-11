@@ -3,7 +3,8 @@
 # section 1 rule 3; task T0.3 in rustfs/backlog#2738).
 #
 # No PR may lower the number of tests in any workspace crate, and no PR may
-# add #[ignore]: "delete the test to get green" is rejected in CI. The counter
+# add #[ignore] without a reviewed baseline change: "delete the test to get
+# green" is rejected in CI. The counter
 # is deliberately per crate, never a workspace total — a drop in one crate
 # must not hide behind an addition in another.
 #
@@ -25,25 +26,36 @@
 # doc comments that mention `#[test]` out of the count.
 #
 # The counts are compared row by row with .config/test-count-baseline.txt
-# (`<package>\t<tests>\t<ignored>`, one row per member). The baseline is an
-# EXACT value, not a floor, in both columns:
+# (`<package>\t<tests>\t<ignored>`, one row per member). The baseline is a
+# FLOOR on tests and a CEILING on ignored. It used to be an exact value in both
+# columns, which made every PR that adds a test edit the same file; on a branch
+# that takes many commits a week those PRs conflict with one another. What the
+# ratchet protects is that nobody deletes or ignores tests to get green without
+# it showing in the diff, and that only needs a one-sided bound:
 #
 #   - tests below the row fails: `crate <name>: <actual> < baseline <n>`.
 #     Restore the tests. If the removal is intentional, lower the row in the
 #     same PR and justify it in the PR description, so the reduction is visible
 #     in the diff instead of disappearing into a green check.
-#   - tests above the row fails as well, telling the author to raise the row in
-#     the same PR. An exact baseline cannot drift upward silently, so the next
-#     deletion is always measured against the true count.
-#   - ignored above the row fails (the line contains `ignored`); adding
-#     #[ignore] is not accepted on gateway/integration. Ignored below the row
-#     fails too, asking for the row to be lowered so that ratchet stays tight.
+#   - tests above the row passes and prints a note on stdout. Rows are raised
+#     only by `--update`, in whichever PR chooses to tighten them.
+#   - ignored above the row fails (the line contains `ignored >`): raise the
+#     row in the same PR and justify the new #[ignore] in the PR description.
+#     Ignored below the row passes with a note.
 #   - a row whose crate is no longer a member fails (deleting a crate deletes
-#     its tests), and a member without a row fails.
+#     its tests; remove the row in the same PR).
+#   - a member without a row passes with a note, so adding a crate does not
+#     block on this file; the next `--update` picks it up. Until then the new
+#     crate has no floor.
+#
+# Failures go to stderr and exit 1. Notes go to stdout and never use the
+# failure shapes above (` < baseline`, `ignored >`, `not a workspace member`).
 #
 # `--update` rewrites the baseline from the current tree. Review the diff it
 # produces before committing it; it is the only sanctioned way to change the
 # file other than editing the single row a PR touched.
+#
+# Contract tests: scripts/test_check_test_count_ratchet.sh (make script-tests).
 #
 # Usage:
 #   scripts/check_test_count_ratchet.sh            # compare against the baseline
@@ -132,10 +144,12 @@ if [[ "$mode" == "update" ]]; then
         echo "# One row per workspace member: <package>, tests, ignored, tab-separated."
         echo "# tests counts #[test], #[tokio::test], #[tokio::test(...)] and #[test_case(...)]"
         echo "# attribute lines under the package directory; ignored counts #[ignore] and"
-        echo "# #[ignore = \"...\"]. Both columns are exact: CI fails when a crate's tests fall"
-        echo "# below or rise above its row, or when its ignored count changes. Raise a row in"
-        echo "# the PR that adds tests; lowering one is a reviewed statement that tests were"
-        echo "# intentionally removed. Regenerate with:"
+        echo "# #[ignore = \"...\"]. The tests column is a floor and the ignored column is a"
+        echo "# ceiling: CI fails when a crate's tests fall below its row or its ignored count"
+        echo "# rises above it. Extra tests and fewer ignores pass; --update tightens the rows."
+        echo "# Lowering a tests row or raising an ignored row is a reviewed statement that"
+        echo "# tests were intentionally removed or ignored; justify it in the PR description."
+        echo "# Regenerate with:"
         echo "#   scripts/check_test_count_ratchet.sh --update"
         cat "$TMP_DIR/actual"
     } >"$BASELINE_FILE"
@@ -165,9 +179,10 @@ if cut -f1 "$TMP_DIR/baseline" | LC_ALL=C sort | uniq -d | grep . >"$TMP_DIR/dup
     exit 1
 fi
 
-# Every violation is one line. The `<actual> < baseline <n>` and `ignored`
-# shapes are the acceptance contract of rustfs/backlog#2738; keep them.
-awk -F'\t' '
+# Every violation is one line on stderr; every note is one line on stdout. The
+# `<actual> < baseline <n>` and `ignored >` shapes are the acceptance contract
+# of rustfs/backlog#2738 and the contract tests; notes must never reuse them.
+awk -F'\t' -v notes="$TMP_DIR/notes" '
 NR == FNR {
     baseline_tests[$1] = $2
     baseline_ignored[$1] = $3
@@ -176,18 +191,18 @@ NR == FNR {
 {
     seen[$1] = 1
     if (!($1 in baseline_tests)) {
-        printf "crate %s: no baseline row (%d tests, %d ignored); add it in this PR\n", $1, $2, $3
+        printf "crate %s: no baseline row (%d tests, %d ignore attributes); run --update to add it\n", $1, $2, $3 >notes
         next
     }
     if ($2 + 0 < baseline_tests[$1] + 0) {
         printf "crate %s: %d < baseline %d\n", $1, $2, baseline_tests[$1]
     } else if ($2 + 0 > baseline_tests[$1] + 0) {
-        printf "crate %s: %d > baseline %d; raise the baseline row to %d in this PR\n", $1, $2, baseline_tests[$1], $2
+        printf "crate %s: %d above baseline %d; run --update to tighten\n", $1, $2, baseline_tests[$1] >notes
     }
     if ($3 + 0 > baseline_ignored[$1] + 0) {
-        printf "crate %s: %d ignored > baseline %d; adding #[ignore] is not accepted\n", $1, $3, baseline_ignored[$1]
+        printf "crate %s: %d ignored > baseline %d; raise the baseline row to %d in this PR and justify the new #[ignore] in the PR description\n", $1, $3, baseline_ignored[$1], $3
     } else if ($3 + 0 < baseline_ignored[$1] + 0) {
-        printf "crate %s: %d ignored < baseline %d; lower the baseline row to %d in this PR\n", $1, $3, baseline_ignored[$1], $3
+        printf "crate %s: %d ignore attributes below baseline %d; run --update to tighten\n", $1, $3, baseline_ignored[$1] >notes
     }
 }
 END {
@@ -199,14 +214,19 @@ END {
 }
 ' "$TMP_DIR/baseline" "$TMP_DIR/actual" | LC_ALL=C sort >"$TMP_DIR/violations"
 
+if [[ -f "$TMP_DIR/notes" ]]; then
+    LC_ALL=C sort "$TMP_DIR/notes" | sed 's/^/note: /'
+fi
+
 if grep -q . "$TMP_DIR/violations"; then
     cat "$TMP_DIR/violations" >&2
     echo "error: test-count ratchet violated (rustfs/backlog#2734 section 1 rule 3)." >&2
     echo "  A crate below its baseline lost tests: restore them. If the removal is" >&2
     echo "  intentional, lower that row in $BASELINE_FILE in the same PR and" >&2
-    echo "  justify it in the PR description. A crate above its baseline raises its" >&2
-    echo "  row in the same PR ('$0 --update' rewrites the file; review the diff)." >&2
+    echo "  justify it in the PR description. A crate above its ignored baseline" >&2
+    echo "  raises that row in the same PR with a justification in the PR description" >&2
+    echo "  ('$0 --update' rewrites the file; review the diff)." >&2
     exit 1
 fi
 
-echo "test-count ratchet OK: $crate_count crates, $total_tests tests, $total_ignored ignored match $BASELINE_FILE"
+echo "test-count ratchet OK: $crate_count crates, $total_tests tests, $total_ignored ignored; every crate at or above its tests floor and at or below its ignored ceiling in $BASELINE_FILE"
