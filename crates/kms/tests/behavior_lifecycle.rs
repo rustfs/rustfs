@@ -336,7 +336,11 @@ async fn invalid_configurations_are_rejected_before_anything_starts() {
     assert_configuration_error(relative.validate(), "must be an absolute path");
 
     // Production-shaped Local config: no master key is refused without opt-in.
-    let production_without_master_key = KmsConfig::local("/var/lib/rustfs/kms-behavior".into());
+    #[cfg(windows)]
+    let production_key_dir = r"C:\rustfs\kms-behavior";
+    #[cfg(not(windows))]
+    let production_key_dir = "/var/lib/rustfs/kms-behavior";
+    let production_without_master_key = KmsConfig::local(production_key_dir.into());
     assert_configuration_error(production_without_master_key.validate(), "requires a master key");
 
     // ...and so is a key directory under the process temp dir.
