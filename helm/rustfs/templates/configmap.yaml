@@ -21,6 +21,9 @@ data:
   {{- if .region }}
   RUSTFS_REGION: {{ .region | quote }}
   {{- end }}
+  {{- if .target_store_dir }}
+  RUSTFS_TARGET_STORE_DIR: {{ .target_store_dir | quote }}
+  {{- end }}
   {{- if .domains }}
   RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
   {{- end }}
