@@ -147,19 +147,21 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
-        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
-        PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
-        RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
-        TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards,
-        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_copy_object_tags,
-        authorize_owned_internal_object_request, authorize_owned_request, authorize_request, bucket_config_mutation_incarnation,
+        AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
+        MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
+        PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold,
+        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
+        TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
         delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
         prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
         set_requested_object_lock_retain_until,
     };
+    pub(crate) use super::super::denial_audit::DenialAuditor;
+    pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
 }
 
 pub(crate) mod concurrency_consumer {

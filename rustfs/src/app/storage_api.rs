@@ -1821,6 +1821,9 @@ pub(crate) mod context {
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
+        AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+    };
+    pub(crate) use crate::storage::storage_api::access_consumer::{
         BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
         ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
         PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,

@@ -15,7 +15,6 @@
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
-use crate::app::RequestEnvelope;
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -169,8 +168,18 @@ pub(crate) struct RequestedObjectTags(pub(crate) Tagging);
 
 /// Request headers with the object policy inputs a POST upload applies from its
 /// form fields, so header-derived condition keys describe what is stored.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PostObjectPolicyHeaders(pub(crate) http::HeaderMap);
+
+// The map is a clone of the request headers, so it can carry `Authorization`
+// and session tokens; its debug form names the headers without their values.
+impl std::fmt::Debug for PostObjectPolicyHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PostObjectPolicyHeaders")
+            .field(&self.0.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 /// Copy source as the handler resolves it (percent-decoded, versionId canonical).
 #[derive(Clone)]
@@ -963,8 +972,10 @@ fn merge_request_object_tag_conditions(
     Ok(())
 }
 
-// Both edges feed the same policy evaluation without constructing another request type.
-trait AuthorizationRequest {
+/// The request facts the shared authorization core reads. Both edges feed the
+/// same policy evaluation without constructing another request type; the
+/// owned `RequestEnvelope` implements it in the app layer.
+pub(crate) trait AuthorizationRequest {
     fn headers(&self) -> &HeaderMap;
     fn uri(&self) -> &http::Uri;
     fn remote_addr(&self) -> Option<std::net::SocketAddr>;
@@ -1053,69 +1064,6 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
         auditor.audit(self, action, reason, DenialScope::Request);
-    }
-}
-
-impl AuthorizationRequest for RequestEnvelope {
-    fn headers(&self) -> &HeaderMap {
-        self.headers()
-    }
-    fn uri(&self) -> &http::Uri {
-        self.uri()
-    }
-    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
-        self.remote_addr()
-    }
-    fn client_info(&self) -> Option<&ClientInfo> {
-        self.client_info()
-    }
-    fn server_context(&self) -> Option<&Arc<ServerContextSlot>> {
-        self.server_context()
-    }
-    fn req_info(&self) -> Option<&ReqInfo> {
-        self.req_info()
-    }
-    fn internal_object_authorization(&self) -> bool {
-        false
-    }
-    fn multipart_staging(&self) -> bool {
-        self.multipart_staging_operation().is_some()
-    }
-    fn staged_multipart_part(&self) -> bool {
-        self.staged_multipart_part_authorization().is_some()
-    }
-    fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
-        self.requested_object_lock_retention()
-    }
-    fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
-        self.requested_object_lock_retain_until()
-    }
-    fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
-        self.requested_object_legal_hold()
-    }
-    fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
-        self.requested_object_tags()
-    }
-    fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
-        self.requested_copy_source()
-    }
-    fn policy_headers(&self) -> &HeaderMap {
-        self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
-    }
-    fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
-        self.object_tag_conditions()
-    }
-    fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
-        self.install_object_tag_conditions(conditions);
-    }
-    fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards> {
-        self.table_publication_guards()
-    }
-    fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
-        self.install_table_publication_guards(guards);
-    }
-    fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
-        auditor.audit_owned(self, action, reason, DenialScope::Request);
     }
 }
 
@@ -1830,26 +1778,9 @@ async fn authorize_request_with_location_constraint<T>(
     authorize_request_core(req, action, location_constraint, internal_object_authorization).await
 }
 
-/// Authorizes an owned request through the same IAM, bucket and table policies as the legacy edge.
-pub(crate) async fn authorize_owned_request(
-    req: &mut RequestEnvelope,
-    action: Action,
-    location_constraint: Option<String>,
-) -> rustfs_s3_types::S3Result<()> {
-    authorize_request_core(req, action, location_constraint, false)
-        .await
-        .map_err(Into::into)
-}
-
-/// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
-pub(crate) async fn authorize_owned_internal_object_request(
-    req: &mut RequestEnvelope,
-    action: Action,
-) -> rustfs_s3_types::S3Result<()> {
-    authorize_request_core(req, action, None, true).await.map_err(Into::into)
-}
-
-async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
+/// The policy decision shared by every request edge. `internal_object_authorization`
+/// marks an exact-object check inside an already authorized table-catalog operation.
+pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     action: Action,
     location_constraint: Option<String>,
@@ -4505,7 +4436,6 @@ mod tests {
 
     #[test]
     fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
-        use crate::app::RequestEnvelope;
         use crate::storage::access::ReqInfo;
         use crate::storage::helper::DenialScope;
         use crate::storage::request_context::RequestContext;
@@ -4553,11 +4483,11 @@ mod tests {
             }),
             ..Default::default()
         });
-        let envelope = RequestEnvelope::from_s3s(&req);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
         let action = Action::S3Action(S3Action::GetObjectAction);
         auditor.audit(&req, &action, "denied", DenialScope::Request);
-        auditor.audit_owned(&envelope, &action, "denied", DenialScope::Request);
-        auditor.audit_owned(&envelope, &action, "denied", DenialScope::Request);
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
 
         let entries = captured.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -4572,7 +4502,6 @@ mod tests {
 
     #[test]
     fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
-        use crate::app::RequestEnvelope;
         use crate::shared_types::RemoteAddr;
         use crate::storage::access::ReqInfo;
         use crate::storage::helper::{
@@ -4621,11 +4550,10 @@ mod tests {
                 req.extensions.remove::<ClientInfo>();
                 req.extensions.remove::<RequestContext>();
             }
-            let envelope = RequestEnvelope::from_s3s(&req);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&req);
             let expected_id = if client_present { "direct" } else { "nested" };
             let legacy = authorization_denial_entry(&req, &action, "denied", DenialScope::Request);
-            let owned =
-                authorization_denial_entry_for_view(&AuditRequestView::owned(&envelope), &action, "denied", DenialScope::Request);
+            let owned = authorization_denial_entry_for_view(&envelope.audit_view(), &action, "denied", DenialScope::Request);
             for entry in [legacy, owned] {
                 assert_eq!(
                     (
@@ -4642,7 +4570,6 @@ mod tests {
 
     #[test]
     fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
-        use crate::app::RequestEnvelope;
         use crate::storage::helper::DenialScope;
         use http::{Extensions, HeaderMap, Method, Uri};
         use rustfs_policy::policy::action::{Action, S3Action};
@@ -4672,11 +4599,11 @@ mod tests {
             service: None,
             trailing_headers: None,
         };
-        let envelope = RequestEnvelope::from_s3s(&req);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
         let action = Action::S3Action(S3Action::DeleteObjectAction);
         auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
         auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
-        auditor.audit_owned(&envelope, &action, "denied", DenialScope::Keys(3));
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Keys(3));
 
         let entries = captured.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -4774,7 +4701,7 @@ mod tests {
             owned.req_info_mut().expect("owned info").version_id = Some(version.clone());
             let action = Action::S3Action(S3Action::PutObjectAction);
             let legacy_result = super::authorize_request(&mut legacy, action).await;
-            let owned_result = super::authorize_owned_request(&mut owned, action, None).await;
+            let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
             if allowed {
                 legacy_result.expect("legacy version allowed");
                 owned_result.expect("owned version allowed");
@@ -5185,7 +5112,7 @@ mod tests {
         let owned_info = owned_req.req_info_mut().expect("owned request info");
         owned_info.bucket = Some(bucket.clone());
         owned_info.object = Some("object".to_string());
-        let owned_err = super::authorize_owned_request(&mut owned_req, Action::S3Action(S3Action::PutObjectAction), None)
+        let owned_err = crate::app::authorize_owned_request(&mut owned_req, Action::S3Action(S3Action::PutObjectAction), None)
             .await
             .expect_err("owned PUT must wait for the publication writer");
         assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
@@ -5235,7 +5162,7 @@ mod tests {
 
         assert!(writer.release());
         for _ in 0..2 {
-            super::authorize_owned_request(&mut owned_req, Action::S3Action(S3Action::PutObjectAction), None)
+            crate::app::authorize_owned_request(&mut owned_req, Action::S3Action(S3Action::PutObjectAction), None)
                 .await
                 .expect("owned PUT may retry after publication finishes");
             let retained = owned_req
@@ -6114,7 +6041,7 @@ mod tests {
             let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
             let action = Action::S3Action(S3Action::CreateBucketAction);
             let legacy_result = super::authorize_request_with_location_constraint(&mut legacy, action, location.clone()).await;
-            let owned_result = super::authorize_owned_request(&mut owned, action, location).await;
+            let owned_result = crate::app::authorize_owned_request(&mut owned, action, location).await;
             if allowed {
                 legacy_result.expect("legacy allows the matched location");
                 owned_result.expect("owned allows the matched location");
@@ -8211,7 +8138,7 @@ mod tests {
         super::authorize_request(&mut request_a, Action::S3Action(S3Action::PutObjectAction))
             .await
             .expect("store A policy should authorize store A request");
-        super::authorize_owned_request(&mut owned_a, Action::S3Action(S3Action::PutObjectAction), None)
+        crate::app::authorize_owned_request(&mut owned_a, Action::S3Action(S3Action::PutObjectAction), None)
             .await
             .expect("store A policy should authorize owned request");
 
@@ -8227,7 +8154,7 @@ mod tests {
             .await
             .expect_err("store B policy must deny store B request");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
-        let owned_err = super::authorize_owned_request(&mut owned_b, Action::S3Action(S3Action::PutObjectAction), None)
+        let owned_err = crate::app::authorize_owned_request(&mut owned_b, Action::S3Action(S3Action::PutObjectAction), None)
             .await
             .expect_err("store B policy must deny owned request");
         assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
@@ -8256,7 +8183,7 @@ mod tests {
         super::authorize_request(&mut allowed_request_b, Action::S3Action(S3Action::PutObjectAction))
             .await
             .expect("store B policy should allow before its public access block is installed");
-        super::authorize_owned_request(&mut owned_allowed_b, Action::S3Action(S3Action::PutObjectAction), None)
+        crate::app::authorize_owned_request(&mut owned_allowed_b, Action::S3Action(S3Action::PutObjectAction), None)
             .await
             .expect("store B policy should authorize owned request before public access block");
 
@@ -8284,7 +8211,7 @@ mod tests {
             .expect_err("store B public access block must restrict store B request");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         let owned_err =
-            super::authorize_owned_request(&mut owned_restricted_b, Action::S3Action(S3Action::PutObjectAction), None)
+            crate::app::authorize_owned_request(&mut owned_restricted_b, Action::S3Action(S3Action::PutObjectAction), None)
                 .await
                 .expect_err("store B public access block must restrict owned request");
         assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
@@ -8329,7 +8256,7 @@ mod tests {
         super::authorize_request(&mut tagged_request_b, Action::S3Action(S3Action::PutObjectAction))
             .await
             .expect("store B existing object tags should authorize store B request");
-        super::authorize_owned_request(&mut owned_tagged_b, Action::S3Action(S3Action::PutObjectAction), None)
+        crate::app::authorize_owned_request(&mut owned_tagged_b, Action::S3Action(S3Action::PutObjectAction), None)
             .await
             .expect("store B existing object tags should authorize owned request");
         let legacy_tags = tagged_request_b
@@ -8352,9 +8279,10 @@ mod tests {
         let mut owned_unready = crate::app::RequestEnvelope::from_s3s(&unready_request);
         let err = request_object_store(&unready_request).expect_err("an unready request slot must not use an ambient store");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        let owned_err = super::authorize_owned_request(&mut owned_unready, Action::S3Action(S3Action::PutObjectAction), None)
-            .await
-            .expect_err("unready request slot must not fall back to an ambient store");
+        let owned_err =
+            crate::app::authorize_owned_request(&mut owned_unready, Action::S3Action(S3Action::PutObjectAction), None)
+                .await
+                .expect_err("unready request slot must not fall back to an ambient store");
         assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 

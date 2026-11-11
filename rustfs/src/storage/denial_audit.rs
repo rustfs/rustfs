@@ -19,7 +19,6 @@
 //! and anonymous), with a lower default for anonymous callers. Suppressed denials are
 //! counted and the count is carried on the next entry that is let through.
 
-use crate::app::RequestEnvelope;
 use crate::module_switches::is_audit_module_enabled;
 use crate::storage::helper::{
     AuditRequestView, DenialRequest, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
@@ -192,11 +191,9 @@ impl DenialAuditor {
         });
     }
 
-    pub(crate) fn audit_owned(&self, req: &RequestEnvelope, action: &Action, reason: &'static str, scope: DenialScope) {
-        let view = AuditRequestView::owned(req);
-        self.audit_view_at(&view, (self.clock)(), || {
-            authorization_denial_entry_for_view(&view, action, reason, scope)
-        });
+    /// Audits a denial for a request an owned edge decoded into `view`.
+    pub(crate) fn audit_owned(&self, view: &AuditRequestView<'_>, action: &Action, reason: &'static str, scope: DenialScope) {
+        self.audit_view_at(view, (self.clock)(), || authorization_denial_entry_for_view(view, action, reason, scope));
     }
 
     fn audit_view_at(&self, req: &AuditRequestView<'_>, now: Instant, build_entry: impl FnOnce() -> AuditEntry) {

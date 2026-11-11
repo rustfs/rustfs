@@ -29,6 +29,9 @@ use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::{
+    AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+};
+use crate::app::storage_api::context::{
     BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
     ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
     PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
@@ -38,6 +41,7 @@ use crate::app::storage_api::context::{
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use http::{Extensions, HeaderMap, Method, Uri};
+use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_trusted_proxies::ClientInfo;
 use std::fmt;
 use std::net::SocketAddr;
@@ -376,6 +380,154 @@ impl RequestEnvelope {
 
     pub(crate) fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
         self.requested_copy_source.as_ref()
+    }
+}
+
+/// The authorization core in `storage` reads requests only through
+/// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
+impl AuthorizationRequest for RequestEnvelope {
+    fn headers(&self) -> &HeaderMap {
+        self.headers()
+    }
+    fn uri(&self) -> &http::Uri {
+        self.uri()
+    }
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        self.remote_addr()
+    }
+    fn client_info(&self) -> Option<&ClientInfo> {
+        self.client_info()
+    }
+    fn server_context(&self) -> Option<&Arc<ServerContextSlot>> {
+        self.server_context()
+    }
+    fn req_info(&self) -> Option<&ReqInfo> {
+        self.req_info()
+    }
+    fn internal_object_authorization(&self) -> bool {
+        false
+    }
+    fn multipart_staging(&self) -> bool {
+        self.multipart_staging_operation().is_some()
+    }
+    fn staged_multipart_part(&self) -> bool {
+        self.staged_multipart_part_authorization().is_some()
+    }
+    fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention()
+    }
+    fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until()
+    }
+    fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold()
+    }
+    fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags()
+    }
+    fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source()
+    }
+    fn policy_headers(&self) -> &HeaderMap {
+        self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
+    }
+    fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
+        self.object_tag_conditions()
+    }
+    fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.install_object_tag_conditions(conditions);
+    }
+    fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards> {
+        self.table_publication_guards()
+    }
+    fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.install_table_publication_guards(guards);
+    }
+    fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
+        auditor.audit_owned(&self.audit_view(), action, reason, DenialScope::Request);
+    }
+}
+
+/// Authorizes an owned request through the same IAM, bucket and table policies as the legacy edge.
+///
+/// Like the legacy `authorize_request`, it first restores the signed `x-amz-meta-*`
+/// query parameters into headers, so policy conditions and duplicate rejection see
+/// the same request shape on both edges.
+///
+/// This is only the policy decision. It does **not** perform the composite checks
+/// the legacy `S3Access` hooks run around their decision, such as the
+/// `s3:BypassGovernanceRetention` authorization for a governance-bypass header or
+/// the copy-source read authorization; a caller that needs them runs them itself.
+///
+/// # Errors
+///
+/// `InvalidArgument` when the signed query repeats a user metadata key;
+/// `AccessDenied` when the decision for `action` depends on a request-body input
+/// the envelope does not carry (see [`require_body_policy_inputs`]) or when the
+/// policies deny the request.
+pub(crate) async fn authorize_owned_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+    location_constraint: Option<String>,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, location_constraint, false)
+        .await
+        .map_err(Into::into)
+}
+
+/// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
+///
+/// It applies the same preparation and has the same limits as [`authorize_owned_request`].
+pub(crate) async fn authorize_owned_internal_object_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+}
+
+fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(Into::into)?;
+    require_body_policy_inputs(req, action)
+}
+
+/// Fails closed when the decision for `action` depends on a value the request
+/// body supplies but the envelope does not carry it. Policy conditions would
+/// otherwise fall back to client headers, which the stored value need not match
+/// (header `OFF` with body `ON` would pass a legal-hold Deny).
+fn require_body_policy_inputs(req: &RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    let missing = match action {
+        Action::S3Action(S3Action::PutObjectLegalHoldAction) => req.requested_object_legal_hold.is_none(),
+        Action::S3Action(S3Action::PutObjectTaggingAction | S3Action::PutObjectVersionTaggingAction) => {
+            req.requested_object_tags.is_none()
+        }
+        Action::S3Action(S3Action::PutObjectRetentionAction) => req.requested_object_lock_retention.is_none(),
+        _ => false,
+    } || (req.post_object.is_some() && req.post_object_policy_headers.is_none())
+        || (req.headers.contains_key(COPY_SOURCE_HEADER) && req.requested_copy_source.is_none());
+    if missing {
+        return Err(rustfs_s3_types::s3_error!(
+            AccessDenied,
+            "request body policy input is missing for this action"
+        ));
+    }
+    Ok(())
+}
+
+const COPY_SOURCE_HEADER: &str = "x-amz-copy-source";
+
+impl RequestEnvelope {
+    /// The request fields an audit entry for this request is built from.
+    pub(crate) fn audit_view(&self) -> AuditRequestView<'_> {
+        AuditRequestView::from_facts(
+            self.headers(),
+            self.uri(),
+            self.req_info(),
+            self.client_info(),
+            self.remote_addr(),
+            self.request_context(),
+        )
     }
 }
 
