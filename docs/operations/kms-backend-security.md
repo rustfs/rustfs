@@ -262,6 +262,10 @@ The AWS backend is exempt from `backends::contract_tests::assert_state_machine_c
 
 Key versions are opaque: RustFS reports `key_version` as 1 and cannot enumerate versions. Rotation uses `RotateKeyOnDemand`, which retains prior backing keys for decryption; AWS's automatic yearly rotation is neither enabled nor reported on by RustFS.
 
+For the step-by-step AWS setup, verification, observed status codes and key-protection practices, see the [AWS KMS backend guide](kms-aws-backend-guide.md).
+
+Stored data keys: the `GenerateDataKey` blob is persisted inside a `DataKeyEnvelope`, in `encrypted_key`, like every other backend's wrapped key. Releases through 1.0.5 persisted the blob with no envelope and then could not read those objects back, because the read path recognizes a KMS-wrapped key by its envelope. Such objects are intact: while the AWS backend is active, a stored data key that is neither an envelope nor a local-master-key wrap is sent to AWS `Decrypt` as it is. No rewrite is needed. The encryption context AWS authenticates is always the one rebuilt for the request, never the unauthenticated copy recorded in the envelope.
+
 The KMS admin API accepts the backend as `"backend_type": "AWS"` (aliases `aws`, `aws-kms`, `aws_kms`, `AwsKms`) on `/v3/kms/configure` and `/v3/kms/reconfigure`. The body carries `region` (**required**), and optionally `endpoint_url`, `default_key_id`, and the shared timeout/retry/cache settings; credential fields are rejected as unknown, because every node resolves credentials through its own provider chain. `region` is mandatory even though `RUSTFS_KMS_AWS_REGION` is optional at startup: the admin configuration is replayed on every node, and a request that left the region to each node's ambient chain would let nodes address different regions — and therefore different keys — under an identical configuration. `default_key_id` must be an AWS key id or ARN that already exists.
 
 ## Vault TLS: custom CA and mutual TLS
