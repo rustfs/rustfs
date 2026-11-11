@@ -65,6 +65,19 @@ where
     Ok(Arc::new(AnyHost))
 }
 
+/// Probe mutation: every host is virtual-hosted.
+struct AnyHost;
+
+impl HostResolver for AnyHost {
+    fn resolve(&self, _query: &rustfs_gateway::HostQuery<'_>) -> rustfs_gateway::ResolvedHost {
+        rustfs_gateway::ResolvedHost::virtual_hosted(
+            rustfs_gateway::TargetKind::Object,
+            rustfs_gateway::BucketName::new("anyhost").unwrap(),
+            None,
+        )
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -303,18 +316,5 @@ mod tests {
         assert_eq!(bucket(&["Example.COM"], "photos.Example.COM").as_deref(), Some("photos"));
         assert_eq!(bucket(&["Example.COM"], "photos.example.com").as_deref(), Some("photos.example.com"));
         assert_eq!(bucket(&["Example.COM"], "Example.COM"), None);
-    }
-}
-
-/// Probe mutation: every host is virtual-hosted.
-struct AnyHost;
-
-impl HostResolver for AnyHost {
-    fn resolve(&self, _query: &rustfs_gateway::HostQuery<'_>) -> rustfs_gateway::ResolvedHost {
-        rustfs_gateway::ResolvedHost::virtual_hosted(
-            rustfs_gateway::TargetKind::Object,
-            rustfs_gateway::BucketName::new("anyhost").unwrap(),
-            None,
-        )
     }
 }
