@@ -66,6 +66,8 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_bucket_usecase.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_lifecycle_transition_api_test.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_reference_binary.py

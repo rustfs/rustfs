@@ -75,6 +75,11 @@ test-count-ratchet-check: ## Check no workspace crate fell below its test floor 
 	@echo "🧪 Checking per-crate test-count ratchet..."
 	./scripts/check_test_count_ratchet.sh
 
+.PHONY: test-seams-check
+test-seams-check: ## Check tests outside an operation's owner call its use-case only through rustfs/src/app/test_seams
+	@echo "🧪 Checking cross-owner test seams..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py
+
 .PHONY: fips-wording-check
 fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
 	@echo "📣 Checking cryptographic capability wording guard..."
