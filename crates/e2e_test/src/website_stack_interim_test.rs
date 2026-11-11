@@ -418,12 +418,20 @@ mod tests {
         assert_eq!(gateway_plain.status, 501, "{gateway_plain:?}");
 
         assert_is_a_website(&legacy);
-        for ((name, on_legacy), (_, on_gateway)) in legacy.iter().zip(&gateway) {
-            assert_eq!(
-                on_gateway, on_legacy,
-                "{name}: the gateway stack answered differently from the legacy stack"
-            );
-        }
+        // Every difference, not the first one: a family that regressed alone must name itself.
+        let differences: Vec<String> = legacy
+            .iter()
+            .zip(&gateway)
+            .filter(|((_, on_legacy), (_, on_gateway))| on_legacy != on_gateway)
+            .map(|((name, on_legacy), (_, on_gateway))| format!("{name}:\n  legacy:  {on_legacy:?}\n  gateway: {on_gateway:?}"))
+            .collect();
+        assert!(
+            differences.is_empty(),
+            "the gateway stack answered {} of {} requests differently from the legacy stack:\n{}",
+            differences.len(),
+            legacy.len(),
+            differences.join("\n")
+        );
         assert_eq!(gateway.len(), legacy.len());
         Ok(())
     }
