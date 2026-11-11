@@ -55,6 +55,8 @@ their issue closes.
 | `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
 | `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
 | `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
+| `junit_diff.py` | dev-tool | Case-by-case pass/fail/skip diff of two JUnit XML reports (reference vs candidate stack); exit 1 on any difference or stale `--allow` entry, 2 on unreadable input | `python3 scripts/junit_diff.py a.xml b.xml`; backlog T3.1 |
+| `test_junit_diff.py` | ci-gate | Contract tests and fixtures (`scripts/tests/junit_diff/`) for `junit_diff.py` | `make script-tests` |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
