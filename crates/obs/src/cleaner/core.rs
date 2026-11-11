@@ -149,6 +149,7 @@ impl LogCleaner {
 
         let LogScanResult {
             mut logs,
+            recent_logs,
             mut compressed_archives,
         } = scan_log_directory(
             &self.log_dir,
@@ -160,6 +161,23 @@ impl LogCleaner {
             self.delete_empty_files,
             self.dry_run,
         )?;
+
+        // `min_file_age_seconds` keeps freshly rolled files readable for a
+        // while, but those files fill the disk like any other. Once the rolled
+        // files together exceed the byte budget, the budget wins and the age
+        // gate is lifted for this pass.
+        if self.regular_logs_exceed_budget(&logs, &recent_logs) {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "byte_budget_exceeded_by_recent_files",
+                recent_log_files = recent_logs.len(),
+                max_total_size_bytes = self.max_total_size_bytes,
+                "log cleaner state changed"
+            );
+            logs.extend(recent_logs);
+        }
 
         if !logs.is_empty() {
             logs.sort_by_key(|f| f.modified);
@@ -215,6 +233,19 @@ impl LogCleaner {
         }
 
         Ok((total_deleted, total_freed))
+    }
+
+    /// Whether the rolled regular logs, including the ones still inside
+    /// `min_file_age_seconds`, occupy more than `max_total_size_bytes`.
+    pub(super) fn regular_logs_exceed_budget(&self, aged: &[FileInfo], recent: &[FileInfo]) -> bool {
+        if self.max_total_size_bytes == 0 || recent.is_empty() {
+            return false;
+        }
+        let occupied = aged
+            .iter()
+            .chain(recent)
+            .fold(0u64, |total, file| total.saturating_add(file.size));
+        occupied > self.max_total_size_bytes
     }
 
     /// Choose regular log files that should be compressed and/or deleted.

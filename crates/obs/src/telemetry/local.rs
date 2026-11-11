@@ -40,12 +40,13 @@ use crate::telemetry::filter::{build_env_filter, effective_verbose_logging, pyro
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
-    DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
-    DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN,
-    DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
-    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
-    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SPAN_EVENTS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
-    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_LOG_SPAN_EVENTS,
+    DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES, DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES,
+    DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES,
+    DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE,
+    DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
+    DEFAULT_OBS_LOG_PARALLEL_COMPRESS, DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SPAN_EVENTS,
+    DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS,
+    ENV_OBS_LOG_SPAN_EVENTS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME};
 use rustfs_utils::get_env_str;
@@ -157,6 +158,15 @@ fn validate_distinct_file_identities(
     }
 
     Ok(())
+}
+
+/// Size at which the active log file is rolled. An unset limit rolls at the
+/// shipped default so the active file is bounded; an explicit `0` keeps size
+/// rolling off.
+pub(crate) fn resolve_active_file_roll_size(config: &OtelConfig) -> u64 {
+    config
+        .log_max_single_file_size_bytes
+        .unwrap_or(DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES)
 }
 
 fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
@@ -451,12 +461,11 @@ fn init_file_logging_internal(
         _ => Rotation::Daily,
     };
 
-    let max_single_file_size = config
-        .log_max_single_file_size_bytes
-        .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+    let roll_size = resolve_active_file_roll_size(config);
+    let roll_signal = Arc::new(tokio::sync::Notify::new());
 
-    let file_appender =
-        RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, roll_size, match_mode)?
+        .with_roll_signal(roll_signal.clone());
     validate_stdout_sink(&file_appender)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -497,7 +506,7 @@ fn init_file_logging_internal(
     set_observability_metric_enabled(false);
 
     // ── 5. Start background cleanup task ─────────────────────────────────────
-    let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+    let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files, roll_signal);
 
     info!(
         event = EVENT_LOCAL_LOGGING_STATE,
@@ -606,6 +615,10 @@ pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &Te
 
 // ─── Cleanup task ─────────────────────────────────────────────────────────────
 
+/// Shortest pause between two cleanup passes started by rolls. A pass that the
+/// timer starts is never delayed by it.
+const ROLL_TRIGGERED_CLEANUP_SPACING: Duration = Duration::from_secs(1);
+
 /// Spawn a background task that periodically cleans up old log files.
 ///
 /// All cleanup parameters are derived from [`OtelConfig`] fields, with
@@ -623,6 +636,9 @@ pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &Te
 /// * `log_filename` - Base filename (used as the file prefix for matching).
 /// * `keep_files` - Legacy keep-files count; used as fallback when the new
 ///   `log_keep_count` field is absent.
+/// * `roll_signal` - Notified by the appender after every roll. The loop then
+///   runs a pass right away, so the byte budget is enforced when a file is
+///   rolled instead of up to one cleanup interval later.
 ///
 /// # Returns
 /// A [`tokio::task::JoinHandle`] for the spawned cleanup loop.
@@ -631,6 +647,7 @@ pub fn spawn_cleanup_task(
     log_directory: &str,
     log_filename: &str,
     keep_files: usize,
+    roll_signal: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let log_dir = std::path::PathBuf::from(log_directory);
     // Use suffix matching for log files like `2026-03-01-06-21.rustfs.log`
@@ -740,9 +757,16 @@ pub fn spawn_cleanup_task(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
         loop {
-            // Wait for the next scheduled tick before dispatching another pass.
-            // The blocking filesystem work runs on a dedicated blocking thread.
-            interval.tick().await;
+            // Wait for the next scheduled tick, or for the appender to roll a
+            // file, before dispatching another pass. The blocking filesystem
+            // work runs on a dedicated blocking thread.
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = roll_signal.notified() => {
+                    // Rolls can come in bursts; one pass covers all of them.
+                    tokio::time::sleep(ROLL_TRIGGERED_CLEANUP_SPACING).await;
+                }
+            }
             let cleaner_clone = cleaner.clone();
             let result = tokio::task::spawn_blocking(move || cleaner_clone.cleanup()).await;
 
@@ -1251,6 +1275,78 @@ mod tests {
         };
 
         assert_eq!(resolve_log_cleanup_interval_seconds(&config), DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
+    }
+
+    #[test]
+    fn active_file_rolls_by_size_unless_explicitly_disabled() {
+        let unset = OtelConfig {
+            log_max_single_file_size_bytes: None,
+            ..OtelConfig::default()
+        };
+        assert_eq!(resolve_active_file_roll_size(&unset), DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES);
+        assert_eq!(DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES, 256 * 1024 * 1024);
+
+        let disabled = OtelConfig {
+            log_max_single_file_size_bytes: Some(0),
+            ..OtelConfig::default()
+        };
+        assert_eq!(resolve_active_file_roll_size(&disabled), 0, "an explicit 0 keeps size rolling off");
+
+        let configured = OtelConfig {
+            log_max_single_file_size_bytes: Some(64 * 1024 * 1024),
+            ..OtelConfig::default()
+        };
+        assert_eq!(resolve_active_file_roll_size(&configured), 64 * 1024 * 1024);
+    }
+
+    /// The cleanup loop runs a pass when the appender reports a roll, long
+    /// before its interval elapses, and that pass enforces the byte budget on
+    /// files younger than the age gate.
+    #[tokio::test]
+    async fn cleanup_loop_enforces_the_byte_budget_when_a_roll_is_reported() {
+        let tmp = tempfile::tempdir().expect("log directory");
+        let dir = tmp.path();
+        let config = OtelConfig {
+            log_max_total_size_bytes: Some(2 * 1024),
+            log_max_single_file_size_bytes: Some(0),
+            log_compress_old_files: Some(false),
+            log_min_file_age_seconds: Some(3600),
+            log_cleanup_interval_seconds: Some(3600),
+            log_match_mode: Some("suffix".to_string()),
+            log_filename: Some("rustfs.log".to_string()),
+            ..OtelConfig::default()
+        };
+        let roll_signal = Arc::new(tokio::sync::Notify::new());
+        let rolled_files = || {
+            fs::read_dir(dir)
+                .expect("log directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != "rustfs.log")
+                .count()
+        };
+        let cleanup = spawn_cleanup_task(&config, dir.to_str().expect("UTF-8 path"), "rustfs.log", 30, roll_signal.clone());
+
+        // Let the pass that the interval starts immediately finish on an empty
+        // directory, then fill it past the budget with fresh rolled files.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fs::write(dir.join("rustfs.log"), vec![b'a'; 1024]).expect("active file");
+        for index in 0..6 {
+            fs::write(dir.join(format!("2026-01-01-00-0{index}.rustfs.log")), vec![b'x'; 1024]).expect("rolled file");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(rolled_files(), 6, "without a roll report nothing runs before the interval");
+
+        roll_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rolled_files() > 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the reported roll starts a pass that brings the rolled files back under the budget");
+        assert_eq!(rolled_files(), 2);
+        assert!(dir.join("rustfs.log").exists(), "the active file is never removed");
+        cleanup.abort();
     }
 
     #[test]

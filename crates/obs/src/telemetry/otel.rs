@@ -41,7 +41,7 @@ use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
-use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
+use crate::telemetry::local::{build_json_log_layer, resolve_active_file_roll_size, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
@@ -58,12 +58,13 @@ use opentelemetry_sdk::{
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
-use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
+use rustfs_config::observability::DEFAULT_OBS_LOG_MATCH_MODE;
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::{fs, io::IsTerminal, path::Path, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
@@ -244,17 +245,16 @@ pub(super) fn init_observability_http(
                 "daily" => Rotation::Daily,
                 _ => Rotation::Daily,
             };
-            let max_single_file_size = config
-                .log_max_single_file_size_bytes
-                .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+            let roll_size = resolve_active_file_roll_size(config);
+            let roll_signal = Arc::new(tokio::sync::Notify::new());
 
-            let file_appender =
-                RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, roll_size, match_mode)?
+                .with_roll_signal(roll_signal.clone());
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
-            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files, roll_signal);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
 
