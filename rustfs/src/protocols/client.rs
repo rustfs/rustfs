@@ -129,6 +129,14 @@ fn legacy_copy_source(
     }
 }
 
+/// Refuses a listing entry without an ETag, as the compatibility seam did while `Object.ETag` was required.
+fn require_listed_etags(output: gateway_dto::ListObjectsV2Output) -> Result<gateway_dto::ListObjectsV2Output, String> {
+    if output.contents.iter().any(|object| object.e_tag.is_none()) {
+        return Err("ListObjectsV2 contents entry has no e_tag".to_owned());
+    }
+    Ok(output)
+}
+
 fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<gateway_dto::ListBucketsOutput, String> {
     let s3s::dto::ListBucketsOutput {
         buckets,
@@ -696,6 +704,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         match self.fs.list_objects_v2(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(response.output)
+                .map_err(|e| e.to_string())
+                .and_then(require_listed_etags)
                 .map_err(|e| conversion_error("ListObjectsV2 output", e)),
             Err(e) => Err(e.into()),
         }
@@ -1227,6 +1237,45 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 mod tests {
     use super::*;
     use rustfs_credentials::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+
+    fn listed_object(e_tag: Option<&str>) -> gateway_dto::Object {
+        gateway_dto::Object {
+            key: rustfs_gateway_types::ObjectKey::new("dir/object.txt".to_owned()).expect("key"),
+            e_tag: e_tag.map(|tag| rustfs_gateway_types::ETag::new(tag.to_owned()).expect("tag")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn require_listed_etags_refuses_an_entry_without_an_etag() {
+        for contents in [
+            vec![listed_object(None)],
+            vec![listed_object(Some("abc")), listed_object(None)],
+        ] {
+            let output = gateway_dto::ListObjectsV2Output {
+                contents,
+                ..Default::default()
+            };
+            assert!(require_listed_etags(output).is_err());
+        }
+    }
+
+    #[test]
+    fn require_listed_etags_keeps_a_listing_whose_entries_all_have_etags() {
+        for tags in [Vec::new(), vec!["abc", "def"]] {
+            let output = gateway_dto::ListObjectsV2Output {
+                contents: tags.iter().map(|tag| listed_object(Some(tag))).collect(),
+                ..Default::default()
+            };
+            let kept = require_listed_etags(output).expect("listing with tags");
+            let kept_tags: Vec<_> = kept
+                .contents
+                .iter()
+                .map(|object| object.e_tag.as_ref().map(|tag| tag.opaque_tag().to_owned()))
+                .collect();
+            assert_eq!(kept_tags, tags.iter().map(|tag| Some((*tag).to_owned())).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn format_copy_source_preserves_encoded_and_query_like_keys() {
