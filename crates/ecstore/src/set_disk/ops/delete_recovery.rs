@@ -1710,6 +1710,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_missing_key_naming_a_folder_of_uuid_named_keys_completes() {
+        let bucket = "recover-uuid-named-folder";
+        let (dirs, store, _) = fixture(bucket).await;
+        // More UUID-named child keys per drive than the former 4096-entry probe
+        // could cover once each child's `xl.meta` and data directory were charged
+        // (three entries per child).
+        const CHILDREN: usize = 1500;
+        for dir in &dirs {
+            let prefix = dir.path().join(bucket).join("uploads");
+            for _ in 0..CHILDREN {
+                let child = prefix.join(Uuid::new_v4().to_string());
+                std::fs::create_dir_all(child.join(Uuid::new_v4().to_string())).expect("child key data dir");
+                std::fs::write(child.join(crate::disk::STORAGE_FORMAT_FILE), b"meta").expect("child key metadata");
+            }
+        }
+        let error = store
+            .delete_object(bucket, "uploads", ObjectOptions::default())
+            .await
+            .expect_err("the folder's own key does not exist");
+        assert!(
+            crate::error::is_err_object_not_found(&error),
+            "a complete inventory keeps the missing-key no-op semantics: {error:?}"
+        );
+        assert!(dirs.iter().all(|dir| {
+            std::fs::read_dir(dir.path().join(bucket).join("uploads"))
+                .map(|entries| entries.count() == CHILDREN)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
     async fn delete_recovery_batch_budget_survives_pool_and_set_fanout() {
         use crate::layout::endpoint::Endpoint;
         use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
