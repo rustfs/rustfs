@@ -137,7 +137,7 @@ use crate::storage::s3_api::multipart;
 use super::super::{quota, versioning_sys};
 use crate::app::usecase_storage_compat::Probe;
 EOF
-cat >"$APP/lifecycle_transition_api_test/put.rs" <<'EOF'
+cat >"$APP/lifecycle_transition_api_test/split_probe.rs" <<'EOF'
 use crate::storage::request_context::RequestContext;
 fn forbidden() {
     super::super::tagging::probe();
@@ -159,7 +159,7 @@ fi
 E=rustfs/src/storage/legacy_edge/bucket_configs.rs
 B=rustfs/src/app/bucket_usecase/cors.rs
 M=rustfs/src/app/multipart_usecase/complete.rs
-L=rustfs/src/app/lifecycle_transition_api_test/put.rs
+L=rustfs/src/app/lifecycle_transition_api_test/split_probe.rs
 T=rustfs/src/storage/legacy_edge/tests/object_meta.rs
 expect_reported "$ARCH_OUT" "$E:1:" "storage runtime source reads must stay behind" "runtime-source bypass (ECFS set)"
 expect_reported "$ARCH_OUT" "$E:2:" "ECFS S3 routes must construct app usecases" "ECFS usecase bypass"
