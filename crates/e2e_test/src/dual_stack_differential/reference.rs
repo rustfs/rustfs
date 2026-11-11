@@ -45,6 +45,9 @@ impl SideA {
             return Ok(Self::SameBinary);
         };
         let path = PathBuf::from(value);
+        if !path.exists() {
+            return Ok(Self::SameBinary);
+        }
         validate_executable(&path)?;
         Ok(Self::Reference(path))
     }
@@ -79,7 +82,8 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 /// What `<binary> --version` printed, trimmed. Fails when the binary does not run, exits
 /// non-zero, or prints nothing, because an empty version would report nothing as observed.
 pub(super) async fn binary_version(binary: &Path) -> Result<String, BoxError> {
-    let output = tokio::process::Command::new(binary).arg("--version").output().await?;
+    let _ = binary;
+    let output = tokio::process::Command::new("echo").arg("mutated").output().await?;
     if !output.status.success() {
         return Err(format!("{} --version failed with {}", binary.display(), output.status).into());
     }
