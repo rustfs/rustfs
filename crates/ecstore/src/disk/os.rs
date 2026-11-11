@@ -611,10 +611,6 @@ pub(crate) mod prepare_rename_test_hooks {
         }
     }
 
-    pub(crate) fn has_after_component_opened() -> bool {
-        !AFTER_COMPONENT_OPENED.lock().is_empty()
-    }
-
     /// Hooks keyed by a directory component name, run before a Windows
     /// directory pin retries a transient sharing conflict on it.
     #[cfg(windows)]
@@ -1282,6 +1278,28 @@ pub(crate) fn fsync_dir_limited_std(dir: &Path) -> io::Result<()> {
     #[cfg(all(test, unix))]
     fsync_dir_recorder::record_limited(dir);
     fsync_dir_std(dir)
+}
+
+pub(crate) fn fsync_commit_ancestor_directory_limited_std(
+    dir: &Path,
+    base_dir: &Path,
+    step_from_destination: usize,
+    guard: &RenameCommitGuard,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if base_dir == guard.directories.destination_base
+        && guard.directories.destination_path.ancestors().nth(1 + step_from_destination) == Some(dir)
+        && let Some(ancestors) = guard.directories.destination_ancestors.get()
+        && let Some(idx) = ancestors.len().checked_sub(1 + step_from_destination)
+        && let Some(file) = ancestors.get(idx)
+    {
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(dir);
+        return fsync_directory_handle_std(dir, Some(file));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (base_dir, step_from_destination, guard);
+    fsync_dir_limited_std(dir)
 }
 
 /// Reuse the published directory without bypassing group commit or sync admission.
@@ -5748,6 +5766,7 @@ struct LinuxCommitDirectories {
     destination_path: PathBuf,
     source: LinuxCommitDirectory,
     destination: std::sync::OnceLock<LinuxCommitDirectory>,
+    destination_ancestors: std::sync::OnceLock<Vec<std::fs::File>>,
     destination_base: PathBuf,
 }
 
@@ -5764,6 +5783,8 @@ impl LinuxCommitDirectories {
                 .ok_or_else(|| io::Error::other("missing destination directory guard"))?,
         );
         let directory = LinuxCommitDirectory::new(directory)?;
+        let ancestors = parents.into_iter().map(std::fs::File::from).collect();
+        let _ = self.destination_ancestors.set(ancestors);
         Ok(self.destination.get_or_init(|| directory))
     }
 
@@ -5773,7 +5794,7 @@ impl LinuxCommitDirectories {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"))
     }
 
-    fn validate(&self) -> io::Result<()> {
+    fn validate(&self, check_destination: bool) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         // A pinned directory may have been unlinked or replaced. Do not report a
         // successful publication into a detached object tree.
@@ -5782,8 +5803,9 @@ impl LinuxCommitDirectories {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if (self.source.device, self.source.inode) != (destination.device, destination.inode)
-            || self.source_path.as_os_str() != self.destination_path.as_os_str()
+        if check_destination
+            && ((self.source.device, self.source.inode) != (destination.device, destination.inode)
+                || self.source_path.as_os_str() != self.destination_path.as_os_str())
         {
             let current = self.root.open_directory(&self.destination_path)?.metadata()?;
             if (current.dev(), current.ino()) != (destination.device, destination.inode) {
@@ -5796,8 +5818,9 @@ impl LinuxCommitDirectories {
     fn rename(&self, source: &Path, destination: &Path, prepared: Option<&PreparedRenameSource>) -> io::Result<()> {
         let source_name = self.file_name(source, true)?;
         let destination_name = self.file_name(destination, false)?;
+        let destination_was_prepared = self.destination.get().is_some();
         let destination_parent = self.prepare_destination()?;
-        self.validate()?;
+        self.validate(destination_was_prepared)?;
         let mut attempt = 0;
         loop {
             if let Some(prepared) = prepared {
@@ -6019,7 +6042,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
     source_parent: &Path,
 ) -> io::Result<RenameCommitGuard> {
     let original = &metadata_guard.directories;
-    original.validate()?;
+    original.validate(true)?;
     let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
     let destination = original.prepare_destination()?;
     // Clone the pinned file identity, never recapture the target pathname
@@ -6036,6 +6059,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
             destination_path: original.destination_path.clone(),
             source,
             destination: std::sync::OnceLock::from(destination),
+            destination_ancestors: std::sync::OnceLock::new(),
             destination_base: original.destination_base.clone(),
         }),
     })
@@ -6117,6 +6141,7 @@ pub(crate) fn prepare_rename_commit_guard(
                 destination_path: destination_parent.to_path_buf(),
                 source,
                 destination,
+                destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: destination_base.to_path_buf(),
             }),
         })
@@ -7226,6 +7251,7 @@ fn same_parent_commit_guard(
                     device: dir.device,
                     inode: dir.inode,
                 }),
+                destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: base.to_path_buf(),
             }),
         });
@@ -8264,37 +8290,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         #[cfg(target_os = "linux")]
-        let base = {
-            use rustix::fs::{ResolveFlags, openat2};
-            use std::os::fd::AsFd;
-
-            let owned_base = (base_dir != publication_root.io_path.as_path() && base_dir != publication_root.path.as_path())
-                .then(|| publication_root.open_directory(base_dir).map(std::os::fd::OwnedFd::from))
-                .transpose()?;
-            #[cfg(test)]
-            let has_hook = prepare_rename_test_hooks::has_after_component_opened();
-            #[cfg(not(test))]
-            let has_hook = false;
-            if !has_hook {
-                let base_fd = owned_base
-                    .as_ref()
-                    .map_or_else(|| publication_root.directory.as_fd(), AsFd::as_fd);
-                let target = if relative.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    relative
-                };
-                match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
-                    Ok(leaf) => return Ok(vec![leaf]),
-                    Err(Errno::NOENT | Errno::NOSYS) => {}
-                    Err(err) => return Err(err.into()),
-                }
-            }
-            match owned_base {
-                Some(base) => base,
-                None => publication_root.open_directory(base_dir)?.into(),
-            }
-        };
+        let base = publication_root.open_directory(base_dir)?.into();
         #[cfg(not(target_os = "linux"))]
         let base = {
             // The configured endpoint is trusted; every component beneath it
