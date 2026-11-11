@@ -15,7 +15,7 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, S3Router};
 use crate::admin::runtime_sources::{ServerContextSlot, current_action_credentials, current_object_store_handle, current_region};
-use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request, authorize_request};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -521,14 +521,14 @@ async fn authorize_object_zip_download_s3_action(
     authorize_owned_request(&mut authorization, Action::S3Action(action), None).await
 }
 
-/// Builds the legacy authorization request used when a download token is redeemed.
-fn s3_authorization_request(
+/// Builds the owned authorization request used when a download token is redeemed.
+fn token_authorization_request(
     method: Method,
     uri: Uri,
     auth_context: &ObjectZipDownloadAuthContext,
     server_context: Option<Arc<ServerContextSlot>>,
     req_info: Option<ReqInfo>,
-) -> s3s::S3Request<()> {
+) -> RequestEnvelope {
     let mut extensions = http::Extensions::new();
     extensions.insert(auth_context.remote_addr);
     if let Some(client_info) = auth_context.client_info.clone() {
@@ -540,17 +540,17 @@ fn s3_authorization_request(
     if let Some(req_info) = req_info {
         extensions.insert(req_info);
     }
-    s3s::S3Request {
-        input: (),
-        method,
-        uri,
-        headers: auth_context.headers.clone(),
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri,
+            headers: auth_context.headers.clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
         extensions,
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+    )
 }
 
 fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
@@ -747,7 +747,7 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
         req_info.bucket = Some(record.request.bucket.clone());
         req_info.object = Some(item.key.clone());
         req_info.version_id = None;
-        let mut req = s3_authorization_request(
+        let mut req = token_authorization_request(
             Method::GET,
             format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
                 .parse()
@@ -756,7 +756,7 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
             None,
             Some(req_info),
         );
-        authorize_request(&mut req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        authorize_owned_request(&mut req, Action::S3Action(S3Action::GetObjectAction), None).await?;
     }
     Ok(())
 }
