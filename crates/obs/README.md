@@ -158,7 +158,7 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 | Variable                                        | Default      | Description                                                 |
 |-------------------------------------------------|--------------|-------------------------------------------------------------|
 | `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Byte budget (2 GiB), applied to rolled logs and to compressed archives separately; `0` = no budget. See [Disk usage bound](#disk-usage-bound) |
-| `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | unset        | Unset: the active file rolls at 256 MiB. A value: the active file rolls at that size and the cleaner also processes rolled files above it. `0` = no size roll |
+| `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | unset        | Unset or unparsable: the active file rolls at 256 MiB, or at a quarter of the byte budget when that is smaller (at least 1 MiB). A value: the active file rolls at that size and the cleaner also processes rolled files above it. `0` = no size roll |
 | `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Compress files before deleting                              |
 | `RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL`         | `6`          | Gzip level `1` (fastest) – `9` (best)                       |
 | `RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM`          | `zstd`       | Compression codec: `zstd` or `gzip`                         |
@@ -176,9 +176,11 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 
 ### Disk usage bound
 
-With the defaults the log directory holds at most the byte budget of rolled logs, the same budget of compressed archives, and one active file of up to 256 MiB. The active file is rolled by size as well as by time, and the cleaner runs a pass after every roll in addition to its interval, so the budget is enforced when a file is rolled. While the rolled logs exceed the budget the cleaner processes the oldest ones even if they are younger than `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`.
+With the defaults the log directory holds at most the byte budget of rolled logs, the same budget of compressed archives, and one active file of up to 256 MiB. The active file is rolled by size as well as by time, and the cleaner runs a pass after every roll in addition to its interval, so the budget is enforced when a file is rolled. While the rolled logs exceed the budget the cleaner processes the oldest ones, as many as the budget requires, even if they are younger than `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`; `RUSTFS_OBS_LOG_KEEP_FILES` still applies only to files past that age.
 
-The bound is not instantaneous: the directory can exceed it by what is written while one cleanup pass runs, and a cleaner that compresses more slowly than logs are produced falls behind. Setting `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES=0` removes the budget and `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES=0` turns size rolling off, which leaves the active file bounded only by the rotation period. Neither setting limits how fast logs are produced.
+The bound is not instantaneous: the directory can exceed it by what is written while one cleanup pass runs, archives created by a pass are trimmed by the next one, and a cleaner that compresses more slowly than logs are produced falls behind. Setting `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES=0` removes the budget and `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES=0` turns size rolling off, which leaves the active file bounded only by the rotation period. Neither setting limits how fast logs are produced.
+
+The cleaner recognizes only its own process's active file. Do not let two processes write log files that match the same pattern in one directory: a file another process is still writing looks like a rolled log, and the minimum file age no longer shields it once the budget is exceeded.
 
 ---
 

@@ -160,13 +160,56 @@ fn validate_distinct_file_identities(
     Ok(())
 }
 
-/// Size at which the active log file is rolled. An unset limit rolls at the
-/// shipped default so the active file is bounded; an explicit `0` keeps size
-/// rolling off.
+/// Smallest roll size derived from a small byte budget.
+const MIN_DERIVED_ROLL_SIZE_BYTES: u64 = 1024 * 1024;
+
+/// Size at which the active log file is rolled. An explicit limit is used as
+/// is, and an explicit `0` keeps size rolling off. An unset limit rolls at the
+/// shipped default so the active file is bounded, lowered to a quarter of the
+/// byte budget when the budget is small: a rolled file larger than the whole
+/// budget would be removed by the pass its own roll starts.
 pub(crate) fn resolve_active_file_roll_size(config: &OtelConfig) -> u64 {
+    if let Some(configured) = config.log_max_single_file_size_bytes {
+        return configured;
+    }
+    match config
+        .log_max_total_size_bytes
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES)
+    {
+        0 => DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES,
+        budget => DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES.min((budget / 4).max(MIN_DERIVED_ROLL_SIZE_BYTES)),
+    }
+}
+
+/// Per-file limit above which the cleaner processes a rolled file. Unset stays
+/// off: the appender's default roll size is not a reason to trim files that an
+/// earlier release rolled by time only.
+pub(crate) fn resolve_cleanup_single_file_limit(config: &OtelConfig) -> u64 {
     config
         .log_max_single_file_size_bytes
-        .unwrap_or(DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES)
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES)
+}
+
+/// Open the rolling appender for the configured log file together with the
+/// signal it raises after every roll. The caller hands that signal to
+/// [`spawn_cleanup_task`].
+pub(crate) fn open_rolling_appender(
+    config: &OtelConfig,
+    log_directory: &str,
+    log_filename: &str,
+    rotation: Rotation,
+    match_mode: FileMatchMode,
+) -> std::io::Result<(RollingAppender, Arc<tokio::sync::Notify>)> {
+    let roll_signal = Arc::new(tokio::sync::Notify::new());
+    let appender = RollingAppender::new(
+        log_directory,
+        log_filename.to_string(),
+        rotation,
+        resolve_active_file_roll_size(config),
+        match_mode,
+    )?
+    .with_roll_signal(roll_signal.clone());
+    Ok((appender, roll_signal))
 }
 
 fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
@@ -461,11 +504,7 @@ fn init_file_logging_internal(
         _ => Rotation::Daily,
     };
 
-    let roll_size = resolve_active_file_roll_size(config);
-    let roll_signal = Arc::new(tokio::sync::Notify::new());
-
-    let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, roll_size, match_mode)?
-        .with_roll_signal(roll_signal.clone());
+    let (file_appender, roll_signal) = open_rolling_appender(config, log_directory, log_filename, rotation, match_mode)?;
     validate_stdout_sink(&file_appender)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -662,9 +701,7 @@ pub fn spawn_cleanup_task(
     let max_total_size = config
         .log_max_total_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES);
-    let max_single_file_size = config
-        .log_max_single_file_size_bytes
-        .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+    let max_single_file_size = resolve_cleanup_single_file_limit(config);
     let compress = config.log_compress_old_files.unwrap_or(DEFAULT_OBS_LOG_COMPRESS_OLD_FILES);
     let gzip_level = config
         .log_gzip_compression_level
@@ -1281,22 +1318,89 @@ mod tests {
     fn active_file_rolls_by_size_unless_explicitly_disabled() {
         let unset = OtelConfig {
             log_max_single_file_size_bytes: None,
+            log_max_total_size_bytes: None,
             ..OtelConfig::default()
         };
         assert_eq!(resolve_active_file_roll_size(&unset), DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES);
         assert_eq!(DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(
+            resolve_cleanup_single_file_limit(&unset),
+            0,
+            "the appender's default roll size is not a per-file trim for the cleaner"
+        );
 
         let disabled = OtelConfig {
             log_max_single_file_size_bytes: Some(0),
             ..OtelConfig::default()
         };
         assert_eq!(resolve_active_file_roll_size(&disabled), 0, "an explicit 0 keeps size rolling off");
+        assert_eq!(resolve_cleanup_single_file_limit(&disabled), 0);
 
         let configured = OtelConfig {
             log_max_single_file_size_bytes: Some(64 * 1024 * 1024),
+            log_max_total_size_bytes: Some(1024),
             ..OtelConfig::default()
         };
-        assert_eq!(resolve_active_file_roll_size(&configured), 64 * 1024 * 1024);
+        assert_eq!(
+            resolve_active_file_roll_size(&configured),
+            64 * 1024 * 1024,
+            "an explicit limit is never derived"
+        );
+        assert_eq!(resolve_cleanup_single_file_limit(&configured), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn default_roll_size_follows_a_small_byte_budget() {
+        let with_budget = |budget: u64| OtelConfig {
+            log_max_single_file_size_bytes: None,
+            log_max_total_size_bytes: Some(budget),
+            ..OtelConfig::default()
+        };
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            resolve_active_file_roll_size(&with_budget(2048 * MIB)),
+            256 * MIB,
+            "the default budget keeps 256 MiB"
+        );
+        assert_eq!(resolve_active_file_roll_size(&with_budget(1024 * MIB)), 256 * MIB);
+        assert_eq!(
+            resolve_active_file_roll_size(&with_budget(256 * MIB)),
+            64 * MIB,
+            "a quarter of a small budget"
+        );
+        assert_eq!(resolve_active_file_roll_size(&with_budget(MIB)), MIB, "never below 1 MiB");
+        assert_eq!(resolve_active_file_roll_size(&with_budget(0)), 256 * MIB, "no budget, no derivation");
+    }
+
+    /// Both logging setups open the appender through this function, so the
+    /// cleanup task they start is always the one the appender wakes.
+    #[test]
+    fn opened_appender_reports_its_rolls_on_the_returned_signal() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().expect("log directory");
+        let config = OtelConfig {
+            log_max_single_file_size_bytes: Some(8),
+            ..OtelConfig::default()
+        };
+        let (mut appender, roll_signal) = open_rolling_appender(
+            &config,
+            tmp.path().to_str().expect("UTF-8 path"),
+            "rustfs.log",
+            Rotation::Daily,
+            FileMatchMode::Suffix,
+        )
+        .expect("appender");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let reported = || runtime.block_on(async { tokio::time::timeout(Duration::ZERO, roll_signal.notified()).await.is_ok() });
+
+        appender.write_all(b"12345678").expect("first write");
+        assert!(!reported());
+        appender.write_all(b"9").expect("write that rolls at the configured size");
+        assert!(reported(), "the configured roll size is in effect and the roll reaches the signal");
     }
 
     /// The cleanup loop runs a pass when the appender reports a roll, long
@@ -1324,26 +1428,34 @@ mod tests {
                 .filter(|entry| entry.file_name() != "rustfs.log")
                 .count()
         };
-        let cleanup = spawn_cleanup_task(&config, dir.to_str().expect("UTF-8 path"), "rustfs.log", 30, roll_signal.clone());
+        let write_rolled = |range: std::ops::Range<u32>| {
+            for index in range {
+                fs::write(dir.join(format!("2026-01-01-00-{index:02}.rustfs.log")), vec![b'x'; 1024]).expect("rolled file");
+            }
+        };
+        let wait_for_two_rolled_files = |what: &'static str| async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while rolled_files() > 2 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        };
 
-        // Let the pass that the interval starts immediately finish on an empty
-        // directory, then fill it past the budget with fresh rolled files.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The pass the interval starts at once is observed through its effect,
+        // so what follows cannot be that pass arriving late.
         fs::write(dir.join("rustfs.log"), vec![b'a'; 1024]).expect("active file");
-        for index in 0..6 {
-            fs::write(dir.join(format!("2026-01-01-00-0{index}.rustfs.log")), vec![b'x'; 1024]).expect("rolled file");
-        }
+        write_rolled(0..6);
+        let cleanup = spawn_cleanup_task(&config, dir.to_str().expect("UTF-8 path"), "rustfs.log", 30, roll_signal.clone());
+        wait_for_two_rolled_files("the startup pass enforces the budget").await;
+
+        write_rolled(10..14);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(rolled_files(), 6, "without a roll report nothing runs before the interval");
+        assert_eq!(rolled_files(), 6, "without a roll report nothing runs before the next interval");
 
         roll_signal.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while rolled_files() > 2 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the reported roll starts a pass that brings the rolled files back under the budget");
+        wait_for_two_rolled_files("the reported roll starts a pass that brings the rolled files back under the budget").await;
         assert_eq!(rolled_files(), 2);
         assert!(dir.join("rustfs.log").exists(), "the active file is never removed");
         cleanup.abort();

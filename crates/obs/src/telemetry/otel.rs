@@ -41,10 +41,10 @@ use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
-use crate::telemetry::local::{build_json_log_layer, resolve_active_file_roll_size, spawn_cleanup_task};
+use crate::telemetry::local::{build_json_log_layer, open_rolling_appender, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
-use crate::telemetry::rolling::{RollingAppender, Rotation};
+use crate::telemetry::rolling::Rotation;
 // Import helper functions from local.rs (sibling module)
 use crate::TelemetryError;
 use metrics::counter;
@@ -64,7 +64,6 @@ use rustfs_config::{
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::{fs, io::IsTerminal, path::Path, time::Duration};
 use tracing::{info, warn};
 use tracing_error::ErrorLayer;
@@ -245,11 +244,7 @@ pub(super) fn init_observability_http(
                 "daily" => Rotation::Daily,
                 _ => Rotation::Daily,
             };
-            let roll_size = resolve_active_file_roll_size(config);
-            let roll_signal = Arc::new(tokio::sync::Notify::new());
-
-            let file_appender = RollingAppender::new(log_directory, log_filename.to_string(), rotation, roll_size, match_mode)?
-                .with_roll_signal(roll_signal.clone());
+            let (file_appender, roll_signal) = open_rolling_appender(config, log_directory, log_filename, rotation, match_mode)?;
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);

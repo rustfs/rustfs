@@ -188,10 +188,13 @@ pub struct OtelConfig {
     pub log_keep_files: Option<usize>,
 
     // ── Log cleanup ───────────────────────────────────────────────────────────
-    /// Hard ceiling on the total size (bytes) of all log files (default: 2 GiB).
+    /// Byte budget for rolled log files, and separately for compressed
+    /// archives (default: 2 GiB); `0` means no budget. The active file is not
+    /// counted.
     pub log_max_total_size_bytes: Option<u64>,
-    /// Per-file size ceiling (bytes). Unset: the active file rolls at 256 MiB
-    /// and the cleaner applies no per-file trim. `0`: no size roll and no trim.
+    /// Per-file size ceiling (bytes). Unset or unparsable: the active file
+    /// rolls at 256 MiB (less under a small byte budget) and the cleaner
+    /// applies no per-file trim. `0`: no size roll and no trim.
     pub log_max_single_file_size_bytes: Option<u64>,
     /// Compress eligible files with gzip before deletion (default: `true`).
     pub log_compress_old_files: Option<bool>,
@@ -489,6 +492,12 @@ mod tests {
                 let config = OtelConfig::extract_otel_config_from_env(None);
                 assert_eq!(config.log_max_single_file_size_bytes, Some(0), "an explicit 0 is kept as unlimited");
             });
+            for unparsable in ["", "256MiB"] {
+                temp_env::with_var(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, Some(unparsable), || {
+                    let config = OtelConfig::extract_otel_config_from_env(None);
+                    assert_eq!(config.log_max_single_file_size_bytes, None, "{unparsable:?} is treated as unset");
+                });
+            }
             temp_env::with_var(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, Some("1048576"), || {
                 let config = OtelConfig::extract_otel_config_from_env(None);
                 assert_eq!(config.log_max_single_file_size_bytes, Some(1_048_576));
