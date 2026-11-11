@@ -205,6 +205,13 @@ pub trait ActionCredentialInterface: Send + Sync {
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
     fn get(&self) -> Option<s3s::region::Region>;
+
+    /// Further regions accepted as a bucket `LocationConstraint` besides
+    /// [`Self::get`]; none unless the instance was started with a
+    /// comma-separated region list.
+    fn additional(&self) -> Vec<s3s::region::Region> {
+        Vec::new()
+    }
 }
 
 /// Tier config interface for application-layer and admin handlers.

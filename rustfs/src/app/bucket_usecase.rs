@@ -1276,6 +1276,13 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
+/// Whether `CreateBucket` may record `location`: the server's own region, or
+/// one of the further regions listed after it in `RUSTFS_REGION`. `location`
+/// has already had the `EU` alias resolved.
+fn location_constraint_is_served(location: &str, server_region: &str, additional_regions: &[Region]) -> bool {
+    location == server_region || additional_regions.iter().any(|region| region.as_str() == location)
+}
+
 /// Answer a `CreateBucket` for a bucket that already exists.
 ///
 /// A deployment owns one bucket namespace, so every requester that passed
@@ -1468,6 +1475,13 @@ impl DefaultBucketUsecase {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
+    fn additional_regions(&self) -> Vec<Region> {
+        self.context
+            .as_ref()
+            .map(|context| context.region().additional())
+            .unwrap_or_default()
+    }
+
     fn object_store(&self) -> Option<Arc<ECStore>> {
         current_object_store_handle_for_context(self.context.as_deref())
     }
@@ -1497,7 +1511,11 @@ impl DefaultBucketUsecase {
         {
             let location = if location == "EU" { "eu-west-1" } else { location };
             let region = self.global_region();
-            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+            if !location_constraint_is_served(
+                location,
+                region.as_ref().map_or(RUSTFS_REGION, Region::as_str),
+                &self.additional_regions(),
+            ) {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidLocationConstraint,
                     "The specified location constraint does not match this server's region.",
@@ -4501,6 +4519,23 @@ mod tests {
     fn resolve_notification_region_defaults_value() {
         let binding = resolve_notification_region(None, None);
         assert_eq!(binding, RUSTFS_REGION);
+    }
+
+    #[test]
+    fn location_constraint_is_served_accepts_server_and_additional_regions() {
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &[]));
+        assert!(!location_constraint_is_served("us-west-2", "us-east-1", &[]));
+
+        let additional: Vec<Region> = ["ap-southeast-2", "us-west-2"]
+            .into_iter()
+            .map(|region| region.parse().expect("region"))
+            .collect();
+        assert!(location_constraint_is_served("ap-southeast-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-west-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &additional));
+        assert!(!location_constraint_is_served("eu-west-1", "us-east-1", &additional));
+        // whole region names only, never a prefix
+        assert!(!location_constraint_is_served("us-west", "us-east-1", &additional));
     }
 
     #[test]
