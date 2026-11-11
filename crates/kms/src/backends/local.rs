@@ -16,8 +16,8 @@
 
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
-    classify_listed_key_failure, ensure_key_status_permits, ensure_tag_keys_are_mutable, paginate_keys, started_at_the_first_key,
-    validate_key_id_segment,
+    classify_listed_key_failure, destruction_requires_pending_deletion, ensure_key_status_permits, ensure_tag_keys_are_mutable,
+    paginate_keys, started_at_the_first_key, validate_key_id_segment,
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
@@ -2085,8 +2085,6 @@ impl KmsBackend for LocalKmsBackend {
     }
 
     async fn delete_key(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
-        // For local backend, we'll implement immediate deletion by default
-        // unless a pending window is specified
         let key_id = &request.key_id;
 
         // Deletion is a read-modify-write (or read-then-remove) cycle, so hold
@@ -2101,6 +2099,13 @@ impl KmsBackend for LocalKmsBackend {
             .map_err(|_| KmsError::key_not_found(format!("Key {key_id} not found")))?;
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
+            // Expedited destruction only skips the rest of the waiting window:
+            // the key must already be pending deletion (or be a tombstone left
+            // by a crashed removal, which may simply be completed).
+            if matches!(master_key.status, KeyStatus::Active | KeyStatus::Disabled) {
+                return Err(destruction_requires_pending_deletion(key_id));
+            }
+
             // Tombstone first: mark the record Deleted before removing the
             // file, so a crash between the two steps leaves a key that is
             // already unusable and whose removal can simply be re-run.
@@ -3617,6 +3622,13 @@ mod tests {
         assert!(fsync_recorder::dir_sync_count(dir) > dirs_before, "update must fsync the key directory");
 
         let backend = LocalKmsBackend { client };
+        backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "durable-key".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("schedule deletion");
         let dirs_before = fsync_recorder::dir_sync_count(dir);
         backend
             .delete_key(DeleteKeyRequest {
