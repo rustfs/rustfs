@@ -90,7 +90,9 @@ impl IamAdapters {
     /// `authenticator` builds over it (for example `SigV4Authenticator::new(provider, regions)`
     /// with the RustFS profile applied), and the policy source.
     ///
-    /// Consumes the pair, so neither half reaches a builder without the other.
+    /// Consumes the pair and gives both halves to this one builder. The `authenticator` closure
+    /// receives the provider handle and may keep a clone of it; nothing here prevents that, so
+    /// the closure must not hand it to a second builder.
     #[must_use]
     pub fn install<A: Authenticator>(
         self,
