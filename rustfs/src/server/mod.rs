@@ -16,6 +16,10 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+#[cfg(feature = "gateway-stack")]
+mod gateway_handlers;
+#[cfg(feature = "gateway-stack")]
+mod gateway_stack;
 mod health;
 mod http;
 mod hybrid;
@@ -29,6 +33,7 @@ mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
+mod stack;
 pub mod tls_material;
 pub(crate) mod tls_publish;
 

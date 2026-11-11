@@ -70,6 +70,11 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	@echo "📦 Checking s3s footprint ratchet..."
 	./scripts/check_s3s_footprint.sh
 
+.PHONY: gateway-stack-release-boundary-check
+gateway-stack-release-boundary-check: ## Check no release build can enable the gateway-stack feature
+	@echo "🚧 Checking gateway-stack release boundary..."
+	./scripts/check_gateway_stack_release_boundary.sh
+
 .PHONY: test-count-ratchet-check
 test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
 	@echo "🧪 Checking per-crate test-count ratchet..."

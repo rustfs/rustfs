@@ -97,6 +97,10 @@ runs:
       shell: bash
       run: ./scripts/check_s3s_footprint.sh
 
+    - name: Check gateway-stack release boundary
+      shell: bash
+      run: ./scripts/check_gateway_stack_release_boundary.sh
+
     - name: Check per-crate test-count ratchet
       shell: bash
       run: ./scripts/check_test_count_ratchet.sh

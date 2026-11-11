@@ -18,6 +18,9 @@ use crate::app::object::request_body::{BodyReadControl, ObservedBody};
 use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
+#[cfg(feature = "gateway-stack")]
+use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_enabled_in_configuration};
+use crate::server::stack::{MetadataListing, S3StackService, WebsiteHosts, select_stack};
 use crate::server::{
     Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
@@ -259,6 +262,7 @@ const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
 const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
 const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
+const EVENT_S3_STACK_SELECTED: &str = "s3_stack_selected";
 const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
@@ -1460,6 +1464,41 @@ fn control_request_body(body: s3s::Body) -> ControlRequestBody {
     ControlRequestBody(body)
 }
 
+/// The S3 service mounted under the middleware: the legacy stack or the gateway stack, selected
+/// at startup (`server/stack.rs`).
+type S3EdgeService = S3StackService<S3Service, GatewayEdgeService>;
+
+/// A build without the `gateway-stack` feature has no gateway stack to select, so this side of
+/// [`S3EdgeService`] is never constructed.
+#[cfg(not(feature = "gateway-stack"))]
+type GatewayEdgeService = S3Service;
+
+/// The gateway stack where the legacy service is mounted: the same response and error types, so
+/// the layers around it do not change with the stack.
+#[cfg(feature = "gateway-stack")]
+#[derive(Clone)]
+struct GatewayEdgeService(GatewayStack);
+
+#[cfg(feature = "gateway-stack")]
+impl<B> Service<HttpRequest<B>> for GatewayEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<s3s::Body>;
+    type Error = s3s::HttpError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let answer = self.0.call(request);
+        Box::pin(async move { Ok(answer.await.map(s3s::Body::http_body_unsync)) })
+    }
+}
+
 #[derive(Clone)]
 struct ControlBodyDigestService<S> {
     inner: S,
@@ -2309,6 +2348,10 @@ async fn start_http_server_inner(
     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
     // Same domain set for resolving the bucket of virtual-hosted-style CORS requests.
     let vh_domain_hosts = rate_limit_vh_domain_hosts(rate_limit_vh_domains.clone());
+    // The metadata route's own domains, also handed to the stack dispatcher (rustfs/backlog#2734
+    // T2.11) so the gateway stack leaves the legacy service exactly the requests it serves there.
+    let website_route_domains = website_host_domains(config)?.unwrap_or_default();
+    let metadata_listing = MetadataListing::new(host_domain_sets.as_deref())?;
 
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
@@ -2326,15 +2369,13 @@ async fn start_http_server_inner(
             .map(MultiDomain::new)
             .transpose()
             .map_err(Error::other)?;
-        let website_host_sets = website_host_domains(config)?;
-        let website_route_domains = website_host_sets.unwrap_or_default();
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
             admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
-            website_route_domains,
+            website_route_domains.clone(),
             protocol,
             Arc::clone(&server_ctx),
         ));
@@ -2452,6 +2493,54 @@ async fn start_http_server_inner(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     ));
+
+    // The S3 stack is selected once, for the whole server. A gateway stack that cannot be
+    // assembled fails startup here; the legacy stack is never started in its place.
+    #[cfg(feature = "gateway-stack")]
+    let assemble_gateway = || -> Result<GatewayEdgeService> {
+        let stack = GatewayStack::assemble(GatewayAssembly {
+            server_ctx: Arc::clone(&server_ctx),
+            root_access_key: config.access_key.clone(),
+            root_secret_key: config.secret_key.clone(),
+            region: config.region.clone(),
+            server_domains: vh_domain_hosts.to_vec(),
+            body_read_timeout: http_request_body_read_timeout,
+            keystone_enabled: keystone_enabled_in_configuration(),
+        })
+        .map_err(Error::other)?;
+        info!(
+            event = EVENT_S3_STACK_SELECTED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            stack = "gateway",
+            registered_operations = stack.registered_operations().len(),
+            "S3 stack selected"
+        );
+        Ok(GatewayEdgeService(stack))
+    };
+    #[cfg(not(feature = "gateway-stack"))]
+    let assemble_gateway = || {
+        Err(Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the gateway S3 stack is not built into this binary",
+        ))
+    };
+    let s3_service: S3EdgeService = select_stack(
+        config.s3_stack,
+        s3_service,
+        WebsiteHosts::new(website_route_domains),
+        metadata_listing,
+        assemble_gateway,
+    )?;
+    if s3_service.selected() == crate::config::S3Stack::Legacy {
+        info!(
+            event = EVENT_S3_STACK_SELECTED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            stack = "legacy",
+            "S3 stack selected"
+        );
+    }
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();
@@ -2889,7 +2978,7 @@ async fn start_http_server_inner(
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<HttpTaskExecutor>>,
     task_owner: HttpTaskExecutor,
-    s3_service: S3Service,
+    s3_service: S3EdgeService,
     compression_config: HttpCompressionConfig,
     is_console: bool,
     /// Whether `RUSTFS_SERVER_DOMAINS` is configured (i.e. s3s virtual-hosted-style routing is active).

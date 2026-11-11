@@ -1357,7 +1357,12 @@ fn object_store_not_initialized_error() -> S3Error {
 }
 
 fn request_iam_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<IamSys<ObjectStore>>> {
-    let iam_store = match req.server_context() {
+    iam_store_for(req.server_context())
+}
+
+/// The IAM store of `server_ctx`, or the process default when the request carries no server context.
+fn iam_store_for(server_ctx: Option<&Arc<ServerContextSlot>>) -> S3Result<Arc<IamSys<ObjectStore>>> {
+    let iam_store = match server_ctx {
         Some(server_ctx) => server_ctx
             .installed_app_context()
             .filter(|context| context.iam().is_ready())
@@ -1370,6 +1375,86 @@ fn request_iam_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<
             S3ErrorCode::InternalError,
             format!("authorize_request {:?}", IamError::IamSysNotInitialized),
         )
+    })
+}
+
+/// Resolves the caller of one request as the access phase of either edge needs it: the credential
+/// IAM holds for `access_key` (validated against `session_token`), whether it owns the deployment,
+/// and the request-scoped facts later authorization steps read.
+///
+/// `access_key` is the key whose signature the edge already verified; `None` is an anonymous
+/// request. Resolved against `server_ctx` so each embedded server reads its own IAM domain.
+///
+/// # Errors
+///
+/// What [`check_key_valid_with_context`] refuses: an unknown, disabled or expired credential, a
+/// session token that does not belong to it, or an IAM system that is not initialized.
+pub(crate) async fn resolve_req_info(
+    server_ctx: &Arc<ServerContextSlot>,
+    access_key: Option<&str>,
+    session_token: &str,
+    request_context: Option<RequestContext>,
+) -> S3Result<ReqInfo> {
+    let app_context = server_ctx.app_context();
+    let (cred, is_owner) = match access_key {
+        Some(access_key) => {
+            let (cred, is_owner) = check_key_valid_with_context(session_token, access_key, app_context.as_deref()).await?;
+            (Some(cred), is_owner)
+        }
+        None => (None, false),
+    };
+    let region = match app_context.as_deref() {
+        Some(context) => context.region().get(),
+        None => runtime_sources::current_region(),
+    };
+    Ok(ReqInfo {
+        cred,
+        is_owner,
+        region,
+        request_context,
+        ..Default::default()
+    })
+}
+
+/// The operation-aware admission checks every S3 request passes after its caller is resolved and
+/// before its own authorization: the signed upload-size capabilities are refused on any operation
+/// but the one each is scoped to, and the license must be valid.
+///
+/// `operation` is the S3 operation name (`PutObject`). Both edges call this with the request they
+/// accepted, so a capability query cannot be silently ignored on one of them.
+///
+/// # Errors
+///
+/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
+/// `InternalError` when the license cannot be checked.
+pub(crate) fn admit_operation(headers: &HeaderMap, raw_query: Option<&str>, operation: &str) -> S3Result<()> {
+    let auth_type = get_request_auth_type_with_query(headers, raw_query);
+    let verified_presigned = matches!(auth_type, AuthType::Presigned);
+    let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
+    // The size capability is intentionally scoped to the single-object
+    // PutObject operation. Validate this at the operation-aware access
+    // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
+    // ignore a signed capability query.
+    if parse_presigned_put_max_content_length(headers, raw_query, verified_presigned)?.is_some() && operation != "PutObject" {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        ));
+    }
+    if parse_presigned_multipart_max_total_object_size(headers, raw_query, verified_sigv4)?.is_some()
+        && operation != "CreateMultipartUpload"
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        ));
+    }
+    license_check().map_err(|er| match er.kind() {
+        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        _ => {
+            tracing::error!("license check failed due to unexpected error: {er}");
+            s3_error!(InternalError, "License validation failed")
+        }
     })
 }
 
@@ -1410,22 +1495,46 @@ impl ListBucketsIamAuthorization {
     }
 }
 
+/// The request facts the ListBuckets discovery decision reads.
+///
+/// Owned by no HTTP framework: the legacy s3s edge and the gateway edge both fill it from their own
+/// request, so the decision cannot differ by the edge that accepted the request.
+pub(crate) struct ListBucketsAuthzRequest<'a> {
+    /// The caller as the access phase resolved it.
+    pub(crate) req_info: &'a ReqInfo,
+    pub(crate) headers: &'a HeaderMap,
+    /// The query exactly as it arrived, without its `?`.
+    pub(crate) raw_query: Option<&'a str>,
+    pub(crate) remote_addr: Option<std::net::SocketAddr>,
+    pub(crate) client_info: Option<&'a ClientInfo>,
+    pub(crate) server_context: Option<&'a Arc<ServerContextSlot>>,
+}
+
 /// Prepare the IAM-only authorization used to decide which buckets are visible in ListBuckets.
 /// Bucket policies are intentionally excluded from this discovery decision, matching MinIO.
-pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>) -> S3Result<ListBucketsIamAuthorization> {
-    let req_info = req_info_ref(req)?;
+///
+/// # Errors
+///
+/// `AccessDenied` for an anonymous caller, and `InternalError` when the IAM store is not ready.
+pub(crate) async fn prepare_list_buckets_iam_authorization(
+    req: ListBucketsAuthzRequest<'_>,
+) -> rustfs_s3_types::S3Result<ListBucketsIamAuthorization> {
+    let req_info = req.req_info;
     let Some(cred) = req_info.cred.as_ref() else {
         return Err(ApiError::access_denied().into());
     };
-    let iam_store = request_iam_store(req)?;
+    let iam_store = iam_store_for(req.server_context)?;
     let account = cred.access_key.clone();
     let groups = cred.groups.clone();
     let claims = cred.claims.clone().unwrap_or_default();
     let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
     let root_access_key = root_access_key();
     let principal = AuthzPrincipal::new(cred, &root_access_key);
-    let facts = request_authz_facts(
-        req,
+    let facts = AuthzFacts::from_request_parts(
+        req.headers,
+        req.raw_query,
+        req.remote_addr,
+        req.client_info,
         AuthzTarget {
             action,
             bucket: "",
@@ -1433,8 +1542,12 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>
             version_id: None,
             location_constraint: None,
         },
+        OffsetDateTime::now_utc(),
     );
-    let base_conditions = authorization_conditions(req, &principal, &facts)?;
+    // The service-level listing has no bucket, object, tag or lock input, so its condition values
+    // are the request's own: the same values `authorization_conditions` yields for this action.
+    let mut base_conditions = build_conditions(&principal, &facts);
+    forward_secret_headers(req.headers, &mut base_conditions);
     let mut bucket_conditions = base_conditions.clone();
     bucket_conditions.insert("prefix".to_string(), vec![String::new()]);
     bucket_conditions.insert("delimiter".to_string(), vec!["/".to_string()]);
@@ -1466,8 +1579,7 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>
 
 /// Preserve the top-level IAM denial audit emitted before ListBuckets falls back
 /// to bucket-level visibility checks.
-pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Result<()> {
-    let req_info = req_info_ref(req)?;
+pub(crate) fn log_list_buckets_iam_implicit_deny(req_info: &ReqInfo) {
     let denial = DenialContext {
         quiet: true,
         suppress_audit: true,
@@ -1479,7 +1591,6 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Res
         is_owner: req_info.is_owner,
     };
     denial.log("iam_implicit_deny", Action::S3Action(S3Action::ListAllMyBucketsAction));
-    Ok(())
 }
 
 pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action {
@@ -2676,33 +2787,10 @@ impl S3Access for FS {
         // second embedded server validates keys against its own root identity
         // and IAM domain; the slot resolves the process default when it has
         // not been installed, keeping single-instance behavior unchanged.
-        let app_context = self.server_ctx().app_context();
-        let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
-            let (cred, is_owner) = check_key_valid_with_context(
-                get_session_token(cx.uri(), cx.headers()).unwrap_or_default(),
-                &input_cred.access_key,
-                app_context.as_deref(),
-            )
-            .await?;
-            (Some(cred), is_owner)
-        } else {
-            (None, false)
-        };
-
+        let access_key = cx.credentials().map(|credentials| credentials.access_key.clone());
+        let session_token = get_session_token(cx.uri(), cx.headers()).unwrap_or_default().to_owned();
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
-
-        let region = match app_context.as_deref() {
-            Some(context) => context.region().get(),
-            None => runtime_sources::current_region(),
-        };
-
-        let req_info = ReqInfo {
-            cred,
-            is_owner,
-            region,
-            request_context,
-            ..Default::default()
-        };
+        let req_info = resolve_req_info(self.server_ctx(), access_key.as_deref(), &session_token, request_context).await?;
 
         let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
         let verified_presigned = matches!(auth_type, AuthType::Presigned);
@@ -2725,37 +2813,7 @@ impl S3Access for FS {
             }
         }
 
-        // The size capability is intentionally scoped to the single-object
-        // PutObject operation. Validate this at the operation-aware access
-        // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
-        // ignore a signed capability query.
-        if parse_presigned_put_max_content_length(cx.headers(), cx.uri().query(), verified_presigned)?.is_some()
-            && cx.s3_op().name() != "PutObject"
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
-            ));
-        }
-        if parse_presigned_multipart_max_total_object_size(cx.headers(), cx.uri().query(), verified_sigv4)?.is_some()
-            && cx.s3_op().name() != "CreateMultipartUpload"
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
-            ));
-        }
-        license_check().map_err(|er| match er.kind() {
-            std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
-            _ => {
-                tracing::error!("license check failed due to unexpected error: {er}");
-                s3_error!(InternalError, "License validation failed")
-            }
-        })?;
-
-        // Verify uniformly here? Or verify separately below?
-
-        Ok(())
+        admit_operation(cx.headers(), cx.uri().query(), cx.s3_op().name())
     }
 
     /// Checks whether the CreateBucket request has accesses to the resources.
