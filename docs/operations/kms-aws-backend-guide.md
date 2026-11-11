@@ -143,6 +143,17 @@ Observed on the AWS backend. Status codes are what an S3 client receives.
 | Create a key through RustFS with a chosen name (including the `mc`-compatible `create-key?key-id=`) | `501 NotImplemented`. AWS assigns key IDs; create without a name and use the returned ID. |
 | Describe a key by ARN through `GET /rustfs/admin/v3/kms/keys/{key_id}` | Works when the ARN is percent-encoded into the path segment; the `describe-key?keyId=` form takes it as a query value. |
 
+### Pairing with a Vault site under site replication
+
+**Delivery requirement.** Site replication synchronizes key names verbatim and never synchronizes keys, so every site must hold a key of the same name ([details](site-replication-operations.md)). AWS assigns key IDs and this backend does not manage aliases, so in a Vault and AWS pair the Vault site must follow the AWS names:
+
+1. Create the key in AWS first and note its key ID.
+2. On each Vault site (`vault-transit` or `vault-kv2`), create a key whose name is that bare key ID, for example `74e5921e-107a-4584-bfda-a5dadeb3e13e`.
+3. Set `RUSTFS_KMS_DEFAULT_KEY_ID` to the same bare key ID on every site, the AWS site included. Do not configure the AWS site's default key as an ARN: the configured spelling is what gets synchronized, and only the bare-ID form was verified to be usable as a Vault key name.
+4. Repeat steps 1 and 2 for every additional key that a bucket default or an IAM policy will name.
+
+Observed with this layout on `vault-transit` + AWS and `vault-kv2` + AWS: bucket defaults naming a key, and `aws:kms` defaults naming none, work for writes on both sites and replicate in both directions, with each replica sealed by the receiving site's own KMS. Without the alignment the receiving site answers `400 KMS.NotFoundException` and replication of the affected objects stays `FAILED`.
+
 ### Key state
 
 | AWS key state | `PUT` (encrypt) | `GET` / range / copy source (decrypt) | `HEAD` |

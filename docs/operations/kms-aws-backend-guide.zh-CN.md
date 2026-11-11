@@ -143,6 +143,17 @@ GET /rustfs/admin/v3/kms/status
 | 通过 RustFS 用自定义名称创建密钥（含兼容 `mc` 的 `create-key?key-id=`） | `501 NotImplemented`。密钥 ID 由 AWS 分配，创建时不要带名称，使用返回的 ID。 |
 | 通过 `GET /rustfs/admin/v3/kms/keys/{key_id}` 用 ARN 描述密钥 | 把 ARN 百分号编码后放入路径段即可；`describe-key?keyId=` 形式则把它作为查询参数。 |
 
+### 站点复制下与 Vault 站点配对
+
+**交付约束**：站点复制原样同步密钥名称，但从不同步密钥本身，所以每个站点都必须有同名密钥（[详见](site-replication-operations.md)）。密钥 ID 由 AWS 分配，本后端也不管理别名，因此 Vault 与 AWS 配对时，必须由 Vault 站点跟随 AWS 的命名：
+
+1. 先在 AWS 创建密钥，记下它的密钥 ID。
+2. 在每个 Vault 站点（`vault-transit` 或 `vault-kv2`）创建一个以该裸密钥 ID 命名的密钥，例如 `74e5921e-107a-4584-bfda-a5dadeb3e13e`。
+3. 所有站点（包括 AWS 站点）的 `RUSTFS_KMS_DEFAULT_KEY_ID` 都设为同一个裸密钥 ID。AWS 站点的默认密钥不要配成 ARN：同步出去的就是配置里的写法，而只有裸 ID 形式经过验证可以用作 Vault 密钥名。
+4. 桶默认加密或 IAM 策略还会点名其它密钥时，对每个密钥重复第 1、2 步。
+
+按此布局在 `vault-transit` + AWS 与 `vault-kv2` + AWS 上实测：点名密钥的桶默认加密，以及不点名密钥的 `aws:kms` 默认加密，在两个站点上都能写入并双向复制，每个副本由接收站点自己的 KMS 封装。未对齐时，接收站点返回 `400 KMS.NotFoundException`，相关对象的复制状态停在 `FAILED`。
+
 ### 密钥状态
 
 | AWS 密钥状态 | `PUT`（加密） | `GET` / Range / 拷贝源（解密） | `HEAD` |
