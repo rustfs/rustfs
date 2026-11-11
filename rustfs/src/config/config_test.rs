@@ -367,6 +367,34 @@ mod tests {
 
     #[test]
     #[serial]
+    fn root_credential_lengths_are_checked_after_resolving_key_files() {
+        let dir = tempfile::tempdir().expect("temporary credential directory");
+        let file = dir.path().join("secret");
+        let config = |access_key| {
+            Config::from_opt(Opt::parse_from([
+                "rustfs",
+                "server",
+                "--access-key",
+                access_key,
+                "--secret-key-file",
+                file.to_str().expect("temporary secret key path"),
+                "/data",
+            ]))
+        };
+
+        std::fs::write(&file, "1234567\n").expect("write short secret");
+        let err = config("root").expect_err("seven-byte secret must be rejected after trimming");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "RUSTFS_SECRET_KEY must be at least 8 bytes");
+
+        std::fs::write(&file, "12345678\n").expect("write eight-byte secret");
+        let err = config("ab").expect_err("two-byte access key must be rejected");
+        assert_eq!(err.to_string(), "RUSTFS_ACCESS_KEY must be at least 3 bytes");
+        assert!(config("abc").is_ok());
+    }
+
+    #[test]
+    #[serial]
     fn test_access_key_envs_are_used_for_bootstrap_credentials() {
         temp_env::with_vars(
             [
