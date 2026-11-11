@@ -61,7 +61,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, Tag, Tagging,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, Tag, Tagging,
     };
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
