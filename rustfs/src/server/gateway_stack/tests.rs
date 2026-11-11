@@ -228,13 +228,15 @@ async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothi
     );
 
     // Injected: a root source that returns nothing, so the provider returns an error for the
-    // lookup. The key that was root a moment ago verifies nothing; the pinned gateway answers the
-    // provider fault as an unknown key. Ledger entry R-068 (rustfs/backlog#2684): this status
-    // becomes `500` when the pin includes rustfs/gateway#1585 and the assembly sets its switch.
+    // lookup. The key that was root a moment ago verifies nothing, and the fault is answered as
+    // one, `500`, as the legacy stack answers a failed lookup. Ledger entry R-068
+    // (rustfs/backlog#2684): the gateway's RustFS authenticator preset sets the switch of
+    // rustfs/gateway#1585; the assembly sets nothing of its own.
     live.clear();
     let (status, _, withdrawn) = answer(&stack, signed_as(ROTATED_ACCESS_KEY)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{withdrawn}");
-    assert!(withdrawn.contains("<Code>InvalidAccessKeyId</Code>"), "{withdrawn}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{withdrawn}");
+    assert!(withdrawn.contains("<Code>InternalError</Code>"), "{withdrawn}");
+    assert!(!withdrawn.contains("ListAllMyBucketsResult"), "{withdrawn}");
 }
 
 #[test]
@@ -493,19 +495,19 @@ async fn an_unknown_access_key_is_refused_as_the_caller_s_fault() {
 
 /// Injected: a credential provider that returns an error for the lookup of a non-root key.
 ///
-/// The pinned gateway's SigV4 authenticator answers a provider fault exactly as it answers an
-/// unknown key, `403 InvalidAccessKeyId`; the legacy stack answers a failed lookup `500`. Ledger
-/// entry R-068 (rustfs/backlog#2684): rustfs/gateway#1585 adds an opt-in switch that answers the
-/// fault as one. When the pin includes it and the assembly sets it, this test expects `500`.
-/// Until then the status is pinned, and what holds on both stacks is that nothing is served.
+/// The fault is answered as one, `500 InternalError`, as the legacy stack answers a failed lookup,
+/// and not as an unknown key. Ledger entry R-068 (rustfs/backlog#2684): the gateway's RustFS
+/// authenticator preset sets the switch of rustfs/gateway#1585; the assembly sets nothing of its
+/// own. Nothing is served either way.
 #[tokio::test]
 async fn a_credential_lookup_that_fails_is_refused_and_never_served() {
     let stack = stack_over(ScriptedIam { ready: false });
 
     let (status, _, body) = answer(&stack, signed_with_a_wrong_signature(request(Method::GET, "/"), "AKIDUSER0001")).await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("<Code>InternalError</Code>"), "{body}");
+    assert!(!body.contains("InvalidAccessKeyId"), "a store fault is not an unknown key: {body}");
     assert!(!body.contains("ListAllMyBucketsResult"), "{body}");
 }
 
