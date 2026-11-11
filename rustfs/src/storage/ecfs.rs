@@ -912,7 +912,7 @@ impl S3 for FS {
         } = req.input.clone();
 
         reject_veeam_sosapi_mutation(self, &bucket, &object).await?;
-        validate_table_catalog_object_mutation(&bucket, &object).await?;
+        validate_table_catalog_object_mutation(&bucket, object.as_str()).await?;
 
         let Some(store) = self.server_ctx.object_store() else {
             error!(
@@ -1678,7 +1678,8 @@ impl S3 for FS {
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let prepared = persisted_from_s3s(&req.input.cors_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req, prepared)).await
+        let operation = S3Operation::PutBucketCors;
+        audit_only_operation(req, operation, |req| usecase.execute_put_bucket_cors(req, prepared)).await
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
@@ -2291,7 +2292,7 @@ mod audit_coverage_tests {
     }
 
     #[test]
-    fn mutating_operations_without_a_notification_event_are_wrapped_for_audit() {
+    pub(super) fn mutating_operations_without_a_notification_event_are_wrapped_for_audit() {
         let mut expected: Vec<S3Operation> = S3Operation::ALL
             .into_iter()
             .filter(|op| !is_read_only(*op) && op.to_event_name().is_none())
@@ -2310,6 +2311,80 @@ mod audit_coverage_tests {
                 source.describe()
             );
         }
+    }
+}
+
+/// PROBE ONLY (DO NOT MERGE): the guard as it is on `gateway/integration`, verbatim.
+#[cfg(test)]
+mod audit_coverage_tests_before {
+    use rustfs_s3_ops::S3Operation;
+
+    const SOURCE: &str = include_str!("ecfs.rs");
+
+    fn is_read_only(op: S3Operation) -> bool {
+        let name = op.as_str().trim_start_matches("s3:");
+        ["Get", "Head", "List", "Select"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }
+
+    #[test]
+    fn mutating_operations_without_a_notification_event_are_wrapped_for_audit() {
+        let mut expected: Vec<S3Operation> = S3Operation::ALL
+            .into_iter()
+            .filter(|op| !is_read_only(*op) && op.to_event_name().is_none())
+            .collect();
+        // AbortMultipartUpload has an internal event but no handler-built helper.
+        expected.push(S3Operation::AbortMultipartUpload);
+        assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
+
+        for op in expected {
+            let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
+            assert!(SOURCE.contains(&wrapper), "{} is not run through audit_only_operation", op.as_str());
+        }
+    }
+}
+
+/// PROBE ONLY (DO NOT MERGE): the new guard against a mirror in which `put_bucket_cors`
+/// moved to `legacy_edge/bucket_configs.rs`, without and with the break.
+#[cfg(test)]
+mod audit_coverage_probe {
+    use super::audit_coverage_tests::mutating_operations_without_a_notification_event_are_wrapped_for_audit as guard;
+    use crate::guard_sources::probe::{Mirror, cut_method, real, replace_once};
+
+    fn intact() -> String {
+        format!("audit_only_operation(req, S3Operation::{},", "PutBucketCors")
+    }
+
+    fn broken() -> String {
+        format!(
+            "let operation = S3Operation::{};\n        audit_only_operation(req, operation,",
+            "PutBucketCors"
+        )
+    }
+
+    fn moved_tree(break_moved: bool) -> Mirror {
+        let ecfs = replace_once(&real("src/storage/ecfs.rs"), &broken(), &intact());
+        let (rest, mut moved) = cut_method(&ecfs, &format!("async fn {}(", "put_bucket_cors"));
+        assert!(!rest.contains(&intact()) && moved.contains(&intact()));
+        if break_moved {
+            moved = replace_once(&moved, &intact(), &broken());
+        }
+        Mirror::new(&[
+            ("src/storage/ecfs.rs", &rest),
+            ("src/storage/legacy_edge/bucket_configs.rs", &format!("impl FS {{\n{moved}}}\n")),
+        ])
+    }
+
+    #[test]
+    fn probe_after_move_guard_passes() {
+        moved_tree(false).assert_passes(guard);
+    }
+
+    #[test]
+    fn probe_after_move_and_break_guard_fails() {
+        let message = moved_tree(true).assert_fails(guard);
+        assert!(message.contains("s3:PutBucketCors"), "{message}");
     }
 }
 

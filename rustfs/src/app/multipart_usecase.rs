@@ -618,7 +618,7 @@ impl DefaultMultipartUsecase {
         let customer_key_provided = sse_customer_key.is_some();
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
-        validate_table_catalog_object_mutation(&bucket, &key).await?;
+        validate_table_catalog_object_mutation(&bucket, key.as_str()).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = self.object_store() else {

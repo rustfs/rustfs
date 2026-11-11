@@ -48,7 +48,11 @@ impl SourceSet {
     /// Panics, naming the path, when `file` is missing or unreadable, when `split_dir` exists but
     /// is not a directory, or when a file under `split_dir` cannot be read.
     pub(crate) fn read(file: &str, split_dir: &str) -> Self {
-        Self::read_under(Path::new(env!("CARGO_MANIFEST_DIR")), file, split_dir)
+        // PROBE ONLY (DO NOT MERGE): a probe test may point the guards at a mirror tree.
+        let root = probe::ROOT_OVERRIDE
+            .with(|cell| cell.borrow().clone())
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        Self::read_under(&root, file, split_dir)
     }
 
     fn read_under(root: &Path, file: &str, split_dir: &str) -> Self {
@@ -125,6 +129,94 @@ impl SourceSet {
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// PROBE ONLY (DO NOT MERGE): run a guard against a mirror of the package tree in which
+/// guarded code has been moved into a split directory, with or without a break.
+pub(crate) mod probe {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        pub(super) static ROOT_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// A real package file, as it is in this checkout.
+    pub(crate) fn real(relative: &str) -> String {
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)).expect("real source")
+    }
+
+    /// `text` with the one occurrence of `from` replaced by `to`.
+    pub(crate) fn replace_once(text: &str, from: &str, to: &str) -> String {
+        assert_eq!(text.matches(from).count(), 1, "probe edit must apply exactly once: {from:?}");
+        text.replacen(from, to, 1)
+    }
+
+    /// Cut the 4-space-indented method that contains `marker`, with its attributes and doc
+    /// comments; returns (remaining text, moved method text).
+    pub(crate) fn cut_method(text: &str, marker: &str) -> (String, String) {
+        assert_eq!(text.matches(marker).count(), 1, "probe cut marker must be unique: {marker:?}");
+        let idx = text.find(marker).expect("counted");
+        let mut start = text[..idx].rfind('\n').map_or(0, |i| i + 1);
+        while start > 0 {
+            let prev = text[..start - 1].rfind('\n').map_or(0, |i| i + 1);
+            let line = text[prev..start].trim_start();
+            if line.starts_with("#[") || line.starts_with("///") {
+                start = prev;
+            } else {
+                break;
+            }
+        }
+        let end = idx + text[idx..].find("\n    }\n").expect("method end") + "\n    }\n".len();
+        (format!("{}{}", &text[..start], &text[end..]), text[start..end].to_owned())
+    }
+
+    /// A temporary package root holding only the files a guard reads.
+    pub(crate) struct Mirror {
+        dir: tempfile::TempDir,
+    }
+
+    impl Mirror {
+        pub(crate) fn new(files: &[(&str, &str)]) -> Self {
+            let dir = tempfile::tempdir().expect("mirror dir");
+            for (relative, text) in files {
+                let path = dir.path().join(relative);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mirror parent");
+                std::fs::write(path, text).expect("mirror file");
+            }
+            Self { dir }
+        }
+
+        fn run(&self, guard: fn()) -> std::thread::Result<()> {
+            ROOT_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(self.dir.path().to_path_buf()));
+            let result = std::panic::catch_unwind(guard);
+            ROOT_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+            result
+        }
+
+        /// The guard must pass against this mirror.
+        pub(crate) fn assert_passes(&self, guard: fn()) {
+            if let Err(payload) = self.run(guard) {
+                panic!("guard failed against the moved tree: {}", message(&*payload));
+            }
+        }
+
+        /// The guard must fail against this mirror; returns its panic message.
+        pub(crate) fn assert_fails(&self, guard: fn()) -> String {
+            let payload = self.run(guard).expect_err("guard passed against the moved-and-broken tree");
+            let text = message(&*payload);
+            eprintln!("PROBE guard failed as expected: {text}");
+            text
+        }
+    }
+
+    fn message(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default()
     }
 }
 

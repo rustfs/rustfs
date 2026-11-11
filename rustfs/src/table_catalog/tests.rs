@@ -14506,6 +14506,99 @@ fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
     );
 }
 
+// PROBE ONLY (DO NOT MERGE): the two guards as they are on `gateway/integration`, verbatim.
+#[test]
+fn before_multipart_mutation_entrypoints_call_reserved_prefix_guard() {
+    let source = include_str!("../app/multipart_usecase.rs");
+
+    assert_eq!(
+        source
+            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn before_object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
+    let source = include_str!("../storage/ecfs.rs");
+
+    assert_eq!(
+        source
+            .matches("validate_table_catalog_object_mutation(&bucket, &object).await?;")
+            .count(),
+        2
+    );
+    assert_eq!(
+        source
+            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
+            .count(),
+        2
+    );
+}
+
+// PROBE ONLY (DO NOT MERGE): the new guards against mirrors in which one guarded method moved
+// into the split directory, without and with the break.
+mod reserved_prefix_guard_probe {
+    use crate::guard_sources::probe::{Mirror, cut_method, real, replace_once};
+
+    const MU_INTACT: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+    const MU_BROKEN: &str = "validate_table_catalog_object_mutation(&bucket, key.as_str()).await?;";
+    const ECFS_INTACT: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
+    const ECFS_BROKEN: &str = "validate_table_catalog_object_mutation(&bucket, object.as_str()).await?;";
+
+    fn multipart_tree(break_moved: bool) -> Mirror {
+        let source = replace_once(&real("src/app/multipart_usecase.rs"), MU_BROKEN, MU_INTACT);
+        let (rest, mut moved) = cut_method(&source, "async fn execute_complete_multipart_upload_owned(");
+        assert_eq!(rest.matches(MU_INTACT).count(), 3);
+        if break_moved {
+            moved = replace_once(&moved, MU_INTACT, MU_BROKEN);
+        }
+        Mirror::new(&[
+            ("src/app/multipart_usecase.rs", &rest),
+            (
+                "src/app/multipart_usecase/complete.rs",
+                &format!("impl DefaultMultipartUsecase {{\n{moved}}}\n"),
+            ),
+        ])
+    }
+
+    fn ecfs_tree(break_moved: bool) -> Mirror {
+        let source = replace_once(&real("src/storage/ecfs.rs"), ECFS_BROKEN, ECFS_INTACT);
+        let (rest, mut moved) = cut_method(&source, "async fn delete_object_tagging(");
+        assert_eq!(rest.matches(ECFS_INTACT).count(), 1);
+        if break_moved {
+            moved = replace_once(&moved, ECFS_INTACT, ECFS_BROKEN);
+        }
+        Mirror::new(&[
+            ("src/storage/ecfs.rs", &rest),
+            ("src/storage/legacy_edge/object_meta.rs", &format!("impl FS {{\n{moved}}}\n")),
+        ])
+    }
+
+    #[test]
+    fn probe_multipart_after_move_guard_passes() {
+        multipart_tree(false).assert_passes(super::multipart_mutation_entrypoints_call_reserved_prefix_guard);
+    }
+
+    #[test]
+    fn probe_multipart_after_move_and_break_guard_fails() {
+        let message = multipart_tree(true).assert_fails(super::multipart_mutation_entrypoints_call_reserved_prefix_guard);
+        assert!(message.contains("src/app/multipart_usecase/complete.rs"), "{message}");
+    }
+
+    #[test]
+    fn probe_ecfs_after_move_guard_passes() {
+        ecfs_tree(false).assert_passes(super::object_metadata_mutation_entrypoints_call_reserved_prefix_guard);
+    }
+
+    #[test]
+    fn probe_ecfs_after_move_and_break_guard_fails() {
+        let message = ecfs_tree(true).assert_fails(super::object_metadata_mutation_entrypoints_call_reserved_prefix_guard);
+        assert!(message.contains("src/storage/legacy_edge/object_meta.rs"), "{message}");
+    }
+}
+
 #[test]
 fn identifier_segment_accepts_conservative_catalog_names() {
     for value in [

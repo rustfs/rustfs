@@ -1520,7 +1520,8 @@ impl DefaultBucketUsecase {
             return result;
         }
         let usecase = self.clone();
-        await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
+        let operation = "bucket creation";
+        await_bucket_usecase_on_fresh_task(operation, move |mutation_permit| async move {
             usecase.execute_create_bucket_inner(req, mutation_permit).await
         })
         .await
@@ -1650,6 +1651,7 @@ impl DefaultBucketUsecase {
         let operation_bucket = input.bucket.clone();
         let operation_store = store.clone();
         with_site_replication_bucket_mutation_lock(store, &input.bucket, move || async move {
+            // probe: operation_store.delete_bucket( text placed ahead of the reservation
             let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
             let delete_result = operation_store
                 .delete_bucket(
@@ -2785,7 +2787,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false).await;
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, true).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
@@ -3948,6 +3950,156 @@ mod tests {
             .min()
             .unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    // PROBE ONLY (DO NOT MERGE): the helper and two guards as they are on `gateway/integration`, verbatim.
+    fn before_usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
+        let public_start_marker = format!("pub async fn {method}");
+        let private_start_marker = format!("async fn {method}");
+        let (start, marker_len) = if let Some(start) = source.find(&public_start_marker) {
+            (start, public_start_marker.len())
+        } else {
+            let start = source.find(&private_start_marker).expect("method should exist");
+            (start, private_start_marker.len())
+        };
+        let rest = &source[start + marker_len..];
+        let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn before_bucket_create_and_delete_use_admitted_fresh_tasks() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation, inner_call) in [
+            (
+                "execute_create_bucket",
+                "bucket creation",
+                "execute_create_bucket_inner(req, mutation_permit).await",
+            ),
+            ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
+        ] {
+            let body = before_usecase_method_source(source, method);
+            assert!(
+                body.contains(&format!("await_bucket_usecase_on_fresh_task(\"{operation}\"")),
+                "{method} must use bounded detached-task admission"
+            );
+            assert!(body.contains(inner_call), "{method} must run its mutation inside the admitted task");
+        }
+        let create_body = before_usecase_method_source(source, "execute_create_bucket_inner");
+        assert!(
+            create_body.contains("notify_bucket_metadata_reload_with_context("),
+            "a successful bucket creation must refresh peer metadata caches"
+        );
+    }
+
+    #[test]
+    fn before_bucket_metadata_config_changes_notify_peer_metadata_reload() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation, scanner_maintenance_change) in [
+            ("execute_delete_bucket_policy", "delete bucket policy", false),
+            ("execute_put_bucket_policy", "put bucket policy", false),
+            ("execute_delete_public_access_block", "delete public access block", false),
+            ("execute_put_public_access_block", "put public access block", false),
+            ("execute_delete_bucket_lifecycle", "delete bucket lifecycle", true),
+            ("execute_put_bucket_lifecycle_configuration", "put bucket lifecycle", true),
+            ("execute_put_bucket_versioning", "put bucket versioning", false),
+            ("execute_delete_bucket_tagging", "delete bucket tagging", false),
+            ("execute_put_bucket_tagging", "put bucket tagging", false),
+            ("execute_delete_bucket_replication", "delete bucket replication", true),
+            ("execute_put_bucket_replication", "put bucket replication", true),
+            ("execute_delete_bucket_cors", "delete bucket cors", false),
+            ("execute_put_bucket_cors", "put bucket cors", false),
+            ("execute_delete_bucket_encryption", "delete bucket encryption", false),
+            ("execute_put_bucket_encryption", "put bucket encryption", false),
+            ("execute_put_bucket_notification_configuration", "put bucket notification", false),
+        ] {
+            let body = before_usecase_method_source(source, method);
+            assert!(
+                body.contains("notify_bucket_metadata_reload("),
+                "{method} should notify peers to reload cached bucket metadata"
+            );
+            assert!(
+                body.contains(operation),
+                "{method} should identify the bucket metadata operation in reload logs"
+            );
+            let expected_reload = format!(
+                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
+            );
+            assert!(
+                body.contains(&expected_reload),
+                "{method} should propagate scanner_maintenance_change={scanner_maintenance_change}"
+            );
+        }
+    }
+
+    // PROBE ONLY (DO NOT MERGE): the new guards against a mirror in which execute_create_bucket
+    // moved to bucket_usecase/core.rs and execute_put_bucket_cors to bucket_usecase/cors.rs.
+    mod bucket_guard_probe {
+        use crate::guard_sources::probe::{Mirror, cut_method, real, replace_once};
+
+        fn create_intact() -> String {
+            format!("await_bucket_usecase_on_fresh_task({:?}, move", "bucket creation")
+        }
+        fn create_broken() -> String {
+            format!(
+                "let operation = {:?};\n        await_bucket_usecase_on_fresh_task(operation, move",
+                "bucket creation"
+            )
+        }
+        fn cors_intact() -> String {
+            format!("{:?}, request_context, false).await;", "put bucket cors")
+        }
+        fn cors_broken() -> String {
+            format!("{:?}, request_context, true).await;", "put bucket cors")
+        }
+
+        fn moved_tree(break_create: bool, break_cors: bool) -> Mirror {
+            let source = real("src/app/bucket_usecase.rs");
+            let source = replace_once(&source, &create_broken(), &create_intact());
+            let source = replace_once(&source, &cors_broken(), &cors_intact());
+            let (rest, mut create) = cut_method(&source, &format!("pub async fn {}(", "execute_create_bucket"));
+            let (rest, mut cors) = cut_method(&rest, &format!("pub async fn {}(", "execute_put_bucket_cors"));
+            if break_create {
+                create = replace_once(&create, &create_intact(), &create_broken());
+            }
+            if break_cors {
+                cors = replace_once(&cors, &cors_intact(), &cors_broken());
+            }
+            Mirror::new(&[
+                ("src/app/bucket_usecase.rs", &rest),
+                ("src/app/bucket_usecase/core.rs", &format!("impl DefaultBucketUsecase {{\n{create}}}\n")),
+                ("src/app/bucket_usecase/cors.rs", &format!("impl DefaultBucketUsecase {{\n{cors}}}\n")),
+            ])
+        }
+
+        #[test]
+        fn probe_create_after_move_guard_passes() {
+            moved_tree(false, false).assert_passes(super::bucket_create_and_delete_use_admitted_fresh_tasks);
+        }
+
+        #[test]
+        fn probe_create_after_move_and_break_guard_fails() {
+            let message = moved_tree(true, false).assert_fails(super::bucket_create_and_delete_use_admitted_fresh_tasks);
+            assert!(
+                message.contains("execute_create_bucket must use bounded detached-task admission"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn probe_notify_after_move_guard_passes() {
+            moved_tree(false, false).assert_passes(super::bucket_metadata_config_changes_notify_peer_metadata_reload);
+        }
+
+        #[test]
+        fn probe_notify_after_move_and_break_guard_fails() {
+            let message = moved_tree(false, true).assert_fails(super::bucket_metadata_config_changes_notify_peer_metadata_reload);
+            assert!(message.contains("execute_put_bucket_cors should propagate"), "{message}");
+        }
     }
 
     #[test]

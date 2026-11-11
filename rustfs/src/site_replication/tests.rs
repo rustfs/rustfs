@@ -1349,6 +1349,77 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
     );
 }
 
+// PROBE ONLY (DO NOT MERGE): the guard as it is on `gateway/integration`, verbatim.
+#[test]
+fn before_test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
+    let hooks = include_str!("hooks.rs");
+    let delete_broadcast = hooks
+        .split("async fn broadcast_site_replication_delete_bucket")
+        .nth(1)
+        .and_then(|rest| rest.split("pub(crate) async fn commit_site_replication_delete_bucket").next())
+        .expect("delete-bucket broadcast should exist");
+    assert!(
+        delete_broadcast.contains("with_site_replication_state_read_lock(move |state| async move {")
+            && delete_broadcast.contains("state.peers.get(&fallback_peer.deployment_id)")
+            && delete_broadcast.contains("site_replicator_service_account_secret(&state.service_account_access_key)")
+            && delete_broadcast
+                .contains("PeerAdminRequest::put(&transport.connection, &delivery_path, &state.service_account_access_key)"),
+        "a destructive bucket delivery must resolve current topology and credentials under the distributed state read lock"
+    );
+    assert!(
+        delete_broadcast.contains("enqueue_site_replication_retry_event(&current_peer, &request_path, &err).await"),
+        "a failed destructive delivery must remain visible for operator repair"
+    );
+
+    let usecase = include_str!("../app/bucket_usecase.rs");
+    let delete = usecase
+        .split("async fn execute_delete_bucket_inner")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn execute_head_bucket").next())
+        .expect("delete bucket usecase");
+    assert!(
+        delete
+            .find("prepare_site_replication_delete_bucket")
+            .expect("durable reservation")
+            < delete.find(".delete_bucket(").expect("local delete"),
+        "destructive peer liabilities must be persisted before the local bucket is deleted"
+    );
+}
+
+// PROBE ONLY (DO NOT MERGE): the new guard against a mirror in which execute_delete_bucket_inner
+// moved to bucket_usecase/core.rs, without and with the break.
+mod delete_bucket_guard_probe {
+    use crate::guard_sources::probe::{Mirror, cut_method, real, replace_once};
+
+    const BREAK: &str = "            // probe: operation_store.delete_bucket( text placed ahead of the reservation\n";
+    const RESERVATION: &str =
+        "            let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;\n";
+
+    fn moved_tree(break_moved: bool) -> Mirror {
+        let source = replace_once(&real("src/app/bucket_usecase.rs"), &format!("{BREAK}{RESERVATION}"), RESERVATION);
+        let (rest, mut moved) = cut_method(&source, "async fn execute_delete_bucket_inner");
+        if break_moved {
+            moved = replace_once(&moved, RESERVATION, &format!("{BREAK}{RESERVATION}"));
+        }
+        Mirror::new(&[
+            ("src/app/bucket_usecase.rs", &rest),
+            ("src/app/bucket_usecase/core.rs", &format!("impl DefaultBucketUsecase {{\n{moved}}}\n")),
+        ])
+    }
+
+    #[test]
+    fn probe_after_move_guard_passes() {
+        moved_tree(false).assert_passes(super::test_delete_bucket_broadcast_fences_target_membership_through_delivery);
+    }
+
+    #[test]
+    fn probe_after_move_and_break_guard_fails() {
+        let message =
+            moved_tree(true).assert_fails(super::test_delete_bucket_broadcast_fences_target_membership_through_delivery);
+        assert!(message.contains("destructive peer liabilities must be persisted"), "{message}");
+    }
+}
+
 #[test]
 fn test_bucket_retry_settlement_preserves_a_newer_same_path_failure() {
     let peer = peer("remote", "https://remote.example.com");
