@@ -206,6 +206,13 @@ grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: "100"' <<<"$scanner_config_output
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: "1099511627776"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS: "65538"' <<<"$scanner_config_output"
 
+target_store_output=$(render_chart --set config.rustfs.target_store_dir=/data/rustfs0/.rustfs)
+grep -q 'RUSTFS_TARGET_STORE_DIR: "/data/rustfs0/.rustfs"' <<<"$target_store_output"
+if grep -q 'RUSTFS_TARGET_STORE_DIR' <<<"$(render_chart)"; then
+  echo "RUSTFS_TARGET_STORE_DIR must not be rendered by default" >&2
+  exit 1
+fi
+
 # Fail-closed credential checks. Rendering must fail when no credentials,
 # existingSecret, or allowInsecureDefaults override is supplied.
 default_render_status=0

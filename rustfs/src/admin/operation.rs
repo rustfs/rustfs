@@ -210,9 +210,17 @@ pub(crate) mod test_support {
         /// token is read from the request like the s3s edge does, so a test
         /// that sets `x-amz-security-token` keeps working unchanged.
         pub(crate) fn credentials(mut self, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Self {
-            self.credentials = Some(RequestCredentials::new(
+            self.credentials = Some(
+                RequestCredentials::new(access_key.to_owned(), secret_key.to_owned(), session_token.map(str::to_owned))
+                    .expect("test credentials carry a non-empty secret"),
+            );
+            self
+        }
+
+        /// A presented identity whose verified credential carries no secret key.
+        pub(crate) fn credentials_without_secret(mut self, access_key: &str, session_token: Option<&str>) -> Self {
+            self.credentials = Some(RequestCredentials::without_secret_key(
                 access_key.to_owned(),
-                secret_key.to_owned(),
                 session_token.map(str::to_owned),
             ));
             self
@@ -246,11 +254,7 @@ pub(crate) mod test_support {
         pub(crate) fn build(self) -> AdminRequest {
             let credentials = self.credentials.map(|credentials| match credentials.session_token() {
                 Some(_) => credentials,
-                None => RequestCredentials::new(
-                    credentials.access_key().to_owned(),
-                    credentials.secret_key().to_owned(),
-                    get_session_token(&self.uri, &self.headers).map(str::to_owned),
-                ),
+                None => credentials.with_session_token(get_session_token(&self.uri, &self.headers).map(str::to_owned)),
             });
             let head = RequestHead {
                 method: self.method,
@@ -298,7 +302,7 @@ mod tests {
             .build();
         let credentials = req.credentials().expect("credentials were supplied");
         assert_eq!(credentials.access_key(), "AKIATEST");
-        assert_eq!(credentials.secret_key(), "secret");
+        assert_eq!(credentials.secret_key(), Some("secret"));
         assert_eq!(credentials.session_token(), Some("from-header"));
 
         let explicit = TestRequest::new(Method::GET, "/rustfs/admin/v3/info")

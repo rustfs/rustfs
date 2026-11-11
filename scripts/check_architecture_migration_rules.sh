@@ -139,6 +139,23 @@ guard_source_set "$ROOT_DIR" rustfs/src/app/lifecycle_transition_api_test.rs rus
   report_failure "lifecycle transition API test guard source set is unreadable"
 LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
 LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES=("${GUARD_SOURCES[@]:1}")
+guard_source_set "$ROOT_DIR" rustfs/src/storage/ecfs_test.rs rustfs/src/storage/legacy_edge/tests ||
+  report_failure "ECFS test guard source set is unreadable"
+ECFS_TEST_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+# Every .rs file under rustfs/src/app, for depth-aware rules over the whole app tree.
+APP_RUNTIME_RULE_SOURCES=()
+while IFS= read -r app_source; do
+  APP_RUNTIME_RULE_SOURCES+=("$app_source")
+done < <(cd "$ROOT_DIR" && rg --files rustfs/src/app --glob '*.rs' --glob '!rustfs/src/app/storage_api.rs' | LC_ALL=C sort)
+APP_OBJECT_SOURCES=()
+while IFS= read -r app_source; do
+  APP_OBJECT_SOURCES+=("$app_source")
+done < <(cd "$ROOT_DIR" && rg --files rustfs/src/app/object --glob '*.rs' | LC_ALL=C sort)
+APP_USECASE_RULE_SOURCES=("${BUCKET_USECASE_GUARD_SOURCES[@]}" rustfs/src/app/object_usecase.rs "${APP_OBJECT_SOURCES[@]}"
+  "${MULTIPART_USECASE_GUARD_SOURCES[@]}" "${LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES[@]}")
+if [[ ${#APP_RUNTIME_RULE_SOURCES[@]} -eq 0 || ${#APP_OBJECT_SOURCES[@]} -eq 0 ]]; then
+  report_failure "app source listing for depth-aware import rules is empty"
+fi
 
 PR_TYPES_FILE="${TMP_DIR}/pr_types.txt"
 PR_TYPE_HITS_FILE="${TMP_DIR}/pr_type_hits.txt"
@@ -2253,7 +2270,7 @@ fi
   # A glob containing a slash is anchored at the search root, so object files
   # need the leading **/ to match under rustfs/src/app.
   rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' --glob '**/object/*.rs' \
-    "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
+    ${BUCKET_USECASE_SPLIT_SOURCES[@]+"${BUCKET_USECASE_SPLIT_SOURCES[@]}"} ${MULTIPART_USECASE_SPLIT_SOURCES[@]+"${MULTIPART_USECASE_SPLIT_SOURCES[@]}"} || true
 ) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
@@ -2272,7 +2289,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' --glob '**/object/*.rs' \
-    "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
+    ${BUCKET_USECASE_SPLIT_SOURCES[@]+"${BUCKET_USECASE_SPLIT_SOURCES[@]}"} ${MULTIPART_USECASE_SPLIT_SOURCES[@]+"${MULTIPART_USECASE_SPLIT_SOURCES[@]}"} || true
 ) >"$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE" ]]; then
@@ -2285,13 +2302,18 @@ fi
     rg -n --with-filename \
       '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
       rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs rustfs/src/app/object \
-      "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
-    rg -n --with-filename \
-      'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
-      "${BUCKET_USECASE_GUARD_SOURCES[@]}" rustfs/src/app/object_usecase.rs rustfs/src/app/object "${MULTIPART_USECASE_GUARD_SOURCES[@]}" "${LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES[@]}" || true
-    rg -n --with-filename \
-      'use super::(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|super::(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|super::super::(?:metadata_sys|lifecycle|target)::' \
-      "${BUCKET_USECASE_GUARD_SOURCES[@]}" rustfs/src/app/object_usecase.rs rustfs/src/app/object "${MULTIPART_USECASE_GUARD_SOURCES[@]}" "${LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES[@]}" rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
+      ${BUCKET_USECASE_SPLIT_SOURCES[@]+"${BUCKET_USECASE_SPLIT_SOURCES[@]}"} ${MULTIPART_USECASE_SPLIT_SOURCES[@]+"${MULTIPART_USECASE_SPLIT_SOURCES[@]}"} || true
+    # The super:: chain that names crate::app depends on each file's depth, so
+    # these rules are rewritten per depth (scripts/guard_source_set.sh).
+    module_relative_rg rustfs/src/app \
+      '(?:use @UP@|use crate::app::)(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
+      -n --with-filename -- "${APP_USECASE_RULE_SOURCES[@]}" ||
+      echo "storage helper import rule could not search its sources"
+    module_relative_rg rustfs/src/app \
+      '(?:use @UP@|use crate::app::)(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|(?:@UP@|crate::app::)(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|@UP@super::(?:metadata_sys|lifecycle|target)::' \
+      -n --with-filename -- "${APP_USECASE_RULE_SOURCES[@]}" rustfs/src/app/capacity_dirty_scope_test.rs \
+      rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs ||
+      echo "storage owner import rule could not search its sources"
   }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 
@@ -2304,7 +2326,7 @@ fi
   rg -n --with-filename \
     '(use crate::storage::(access|request_context|ecfs)|use crate::storage::\{[^}]*Storage(ObjectInfo|ObjectOptions|PutObjReader)|crate::storage::StorageObjectOptions)' \
     rustfs/src/app/*_test.rs \
-    "${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}" \
+    ${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]+"${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}"} \
     rustfs/src/admin/router.rs \
     rustfs/src/admin/console.rs \
     rustfs/src/admin/handlers/heal.rs \
@@ -2319,16 +2341,14 @@ fi
 (
   cd "$ROOT_DIR"
   {
-    rg -n --with-filename \
-      'use super::(?:\{[^}]*\b(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b|(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b)' \
-      rustfs/src/app \
-      --glob '*.rs' \
-      --glob '!rustfs/src/app/storage_api.rs' || true
-    rg -n --with-filename \
-      'super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)|super::super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)' \
-      rustfs/src/app \
-      --glob '*.rs' \
-      --glob '!rustfs/src/app/storage_api.rs' || true
+    module_relative_rg rustfs/src/app \
+      'use @UP@(?:\{[^}]*\b(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b|(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b)' \
+      -n --with-filename -- "${APP_RUNTIME_RULE_SOURCES[@]}" ||
+      echo "runtime facade import rule could not search its sources"
+    module_relative_rg rustfs/src/app \
+      '@UP@(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)|@UP@super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)' \
+      -n --with-filename -- "${APP_RUNTIME_RULE_SOURCES[@]}" ||
+      echo "runtime facade path rule could not search its sources"
     rg -n --with-filename \
       'crate::app::(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|get_global_|set_object_store_resolver)' \
       rustfs/src --glob '*.rs' || true
@@ -2552,9 +2572,22 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n -U --with-filename \
-    'use\s+(?:super::super|crate::storage)::\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
-    rustfs/src/storage/ecfs_test.rs || true
+  # ecfs_test.rs holds its tests in an inline `mod tests`, so the storage root
+  # is one super:: past the depth of the file itself. legacy_edge/tests/ is
+  # where a split of ecfs.rs moves them, with or without that inline module,
+  # so both depths are forbidden there.
+  {
+    module_relative_rg rustfs/src/storage \
+      'use\s+(?:@UP@super::|crate::storage::)\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
+      -n -U --with-filename -- rustfs/src/storage/ecfs_test.rs ||
+      echo "storage-owner test import rule could not search rustfs/src/storage/ecfs_test.rs"
+    if [[ ${#ECFS_TEST_GUARD_SOURCES[@]} -gt 1 ]]; then
+      module_relative_rg rustfs/src/storage \
+        'use\s+(?:@UP@(?:super::)?|crate::storage::)\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
+        -n -U --with-filename -- "${ECFS_TEST_GUARD_SOURCES[@]:1}" ||
+        echo "storage-owner test import rule could not search rustfs/src/storage/legacy_edge/tests"
+    fi
+  }
 ) >"$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE"
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE" ]]; then
@@ -4605,12 +4638,12 @@ fi
   cd "$ROOT_DIR"
   {
     rg -n --with-filename 'crate::app::usecase_storage_compat' \
-      rustfs/src/app/*.rs "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" \
-      "${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}" || true
+      rustfs/src/app/*.rs ${BUCKET_USECASE_SPLIT_SOURCES[@]+"${BUCKET_USECASE_SPLIT_SOURCES[@]}"} ${MULTIPART_USECASE_SPLIT_SOURCES[@]+"${MULTIPART_USECASE_SPLIT_SOURCES[@]}"} \
+      ${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]+"${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}"} || true
     rg -n --with-filename 'crate::admin::router_storage_compat' \
       rustfs/src/admin/router.rs || true
     rg -n --with-filename 'crate::storage::core_storage_compat' \
-      rustfs/src/storage/ecfs_test.rs || true
+      "${ECFS_TEST_GUARD_SOURCES[@]}" || true
   }
 ) >"$RUSTFS_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE"
 

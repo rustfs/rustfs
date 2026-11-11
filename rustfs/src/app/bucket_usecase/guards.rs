@@ -14,42 +14,15 @@
 
 //! Source-text guards over the bucket use-case sources.
 
-/// Bucket usecase source: this file plus `bucket_usecase/`, where a split moves its methods.
+/// Production text of this file plus `bucket_usecase/`, where a split moves its methods.
 fn bucket_usecase_sources() -> crate::guard_sources::SourceSet {
-    crate::guard_sources::SourceSet::read("src/app/bucket_usecase.rs", "src/app/bucket_usecase")
+    crate::guard_sources::SourceSet::production("src/app/bucket_usecase.rs", "src/app/bucket_usecase")
 }
 
-/// Text after each exact `{marker}(` or `{marker}<` definition, in set order.
-fn method_definitions<'a>(source: &'a crate::guard_sources::SourceSet, marker: &str) -> Vec<&'a str> {
-    source
-        .files()
-        .iter()
-        .flat_map(|file| {
-            file.text
-                .match_indices(marker)
-                .map(move |(start, _)| &file.text[start + marker.len()..])
-                .filter(|rest| rest.starts_with(['(', '<']))
-        })
-        .collect()
-}
-
-/// The body of the one definition of `method` across the bucket usecase set, preferring the
-/// public form; it ends at the next method of the same indentation or at the end of its file.
+/// The one `async fn method` of the set, through its own closing line, so a neighbour of any
+/// visibility or a test module can never satisfy a check about it.
 fn usecase_method_source<'a>(source: &'a crate::guard_sources::SourceSet, method: &str) -> &'a str {
-    let public = method_definitions(source, &format!("pub async fn {method}"));
-    let definitions = if public.is_empty() {
-        method_definitions(source, &format!("async fn {method}"))
-    } else {
-        public
-    };
-    assert_eq!(definitions.len(), 1, "{method} must be defined exactly once across {}", source.describe());
-    let rest = definitions[0];
-    let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(rest.len());
-    &rest[..end]
+    source.method_body(method)
 }
 
 #[test]

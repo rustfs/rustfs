@@ -175,6 +175,22 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     return Err(cleanup_conflict("table directory candidate references a retained table entry"));
                 }
                 etag
+            } else if self
+                .paths
+                .historical_table_maintenance_path(bucket, &object.key)
+                .is_some_and(|(_, suffix)| suffix == MAINTENANCE_CONFIG_FILE)
+            {
+                // The complete fenced inventory rejects every table entry and maintenance job
+                // before any deletion. Old configs can outlive even their warehouse index.
+                let value = self
+                    .backend
+                    .read_object_limited(self.catalog_bucket(), &object.key, TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE)
+                    .await?
+                    .ok_or_else(|| cleanup_conflict("table maintenance config changed during cleanup"))?;
+                let config = serde_json::from_slice(&value.data)
+                    .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table maintenance config: {err}")))?;
+                validate_table_maintenance_config(&config)?;
+                value.etag
             } else {
                 return Err(cleanup_conflict("table bucket contains namespaces or retained catalog resources"));
             };

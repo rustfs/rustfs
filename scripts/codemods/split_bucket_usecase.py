@@ -511,7 +511,6 @@ TESTS: dict[str, list[str]] = {
     "test_support": ["build_request", "build_request_with_req_info", "s3_op_total"],
     "guards": [
         "bucket_usecase_sources",
-        "method_definitions",
         "usecase_method_source",
         "bucket_create_and_delete_use_admitted_fresh_tasks",
         "bucket_metadata_config_changes_notify_peer_metadata_reload",
