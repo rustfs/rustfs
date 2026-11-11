@@ -247,6 +247,8 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
         ("protocol-sftp-tests", "test-and-lint-protocols", "test", ["sftp"]),
         ("protocol-http3-lint", "test-and-lint-protocols", "dev", ["http3", "swift"]),
         ("protocol-http3-tests", "test-and-lint-protocols", "test", ["http3", "swift"]),
+        ("protocol-gateway-stack-lint", "test-and-lint-protocols", "dev", ["gateway-stack"]),
+        ("protocol-gateway-stack-tests", "test-and-lint-protocols", "test", ["gateway-stack"]),
         ("server-rio-v2", "build-rustfs-debug-binary-rio-v2", "dev", ["e2e-test-hooks", "rio-v2"]),
     ]
     return [{"id": identity, "job": job, "target": "x86_64-unknown-linux-gnu", "profile": profile,
@@ -601,7 +603,8 @@ def check_workflow(root: Path) -> list[str]:
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "gateway-stack": "--features gateway-stack"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):

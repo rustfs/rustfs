@@ -648,6 +648,10 @@ jobs:
             flags: "--features sftp"
           - name: http3
             flags: "--features http3,swift"
+          # The gateway S3 stack (rustfs/backlog#2734): its unit tests, its embedded
+          # server test and its lints compile only with the feature.
+          - name: gateway-stack
+            flags: "--features gateway-stack"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:

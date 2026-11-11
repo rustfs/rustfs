@@ -53,6 +53,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	./scripts/check_embedded_secrets.sh --self-test
 	./scripts/check_s3s_footprint.sh --self-test
+	./scripts/check_gateway_stack_release_boundary.sh --self-test
 	./scripts/test_check_test_count_ratchet.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
