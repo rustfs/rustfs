@@ -61,7 +61,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, PutObjectInput, Tag, Tagging,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, Tag, Tagging,
     };
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
@@ -1828,8 +1828,9 @@ pub(crate) mod owned_parity {
     pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
         AuditRequestView, DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders,
         PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
-        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
-        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG,
+        TableDataPlanePublicationGuards, authorization_denial_entry, authorization_denial_entry_for_view, authorize_request,
+        parity_test_support,
     };
 }
 

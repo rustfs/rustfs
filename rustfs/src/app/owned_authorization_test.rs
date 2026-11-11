@@ -23,11 +23,13 @@ use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
 use crate::app::storage_api::owned_parity::{
     ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
-    RequestedObjectLegalHold, RequestedObjectTags, TableDataPlanePublicationGuards,
+    RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
+    TableDataPlanePublicationGuards,
 };
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, PutObjectInput, S3Access, S3ErrorCode, S3Request, Tag, Tagging,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, S3Access, S3ErrorCode, S3Request, Tag,
+    Tagging,
 };
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -1138,4 +1140,411 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
             "{name}: supplied input passes the gate"
         );
     }
+}
+
+/// One request shape for the decision matrix: who asks, for what, and which
+/// request facts it carries.
+struct DecisionCase {
+    name: &'static str,
+    bucket: &'static str,
+    object: &'static str,
+    principal: Principal,
+    action: S3Action,
+    facts: fn(&mut S3Request<()>),
+    allowed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Principal {
+    Anonymous,
+    User,
+    Owner,
+}
+
+fn no_facts(_: &mut S3Request<()>) {}
+
+fn peer(req: &mut S3Request<()>, addr: [u8; 4]) {
+    req.extensions
+        .insert(Some(crate::shared_types::RemoteAddr(std::net::SocketAddr::from((addr, 40000)))));
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
+    use rustfs_iam::store::{Store as _, UserType};
+    use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+    use rustfs_policy::policy::Policy;
+
+    struct ReadyIam(Arc<IamSys<ObjectStore>>);
+    impl IamInterface for ReadyIam {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            Arc::clone(&self.0)
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
+    const PRIVATE: &str = "parity-private";
+    const PUBLIC: &str = "parity-public";
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    for bucket in [PRIVATE, PUBLIC] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+    }
+    let public_policy = serde_json::json!({"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{PUBLIC}/open/*")},
+        {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{PUBLIC}/open/bucket-denied")},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{PUBLIC}/ip/*"),
+            "Condition":{"IpAddress":{"aws:SourceIp":"203.0.113.0/24"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObjectLegalHold","Resource":format!("arn:aws:s3:::{PUBLIC}/body/*"),
+            "Condition":{"StringEquals":{"s3:object-lock-legal-hold":"ON"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObjectTagging","Resource":format!("arn:aws:s3:::{PUBLIC}/body/*"),
+            "Condition":{"StringEquals":{"s3:RequestObjectTag/class":"public"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObjectRetention","Resource":format!("arn:aws:s3:::{PUBLIC}/body/*"),
+            "Condition":{"StringEquals":{"s3:object-lock-mode":"GOVERNANCE"},"NumericGreaterThanEquals":{"s3:object-lock-remaining-retention-days":"30"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/copy/*"),
+            "Condition":{"StringEquals":{"s3:x-amz-copy-source":"src/key"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/post/*"),
+            "Condition":{"StringEquals":{"s3:RequestObjectTag/class":"public"}}}
+    ]});
+    store
+        .update_bucket_metadata_config(
+            PUBLIC,
+            crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+            serde_json::to_vec(&public_policy).expect("serialize policy"),
+        )
+        .await
+        .expect("publish public bucket policy");
+
+    ObjectStore::new(Arc::clone(&store))
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("seed IAM format");
+    let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+    let access_key = "parity-user";
+    iam.create_user(
+        access_key,
+        &AddOrUpdateUserReq {
+            secret_key: "parity-user-secret-key".to_owned(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .expect("create IAM user");
+    iam.set_policy(
+        "parity-user-policy",
+        Policy::parse_config(
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                    {{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{PRIVATE}/*"}},
+                    {{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::{PRIVATE}/iam-denied"}}
+                ]}}"#
+            )
+            .as_bytes(),
+        )
+        .expect("parse user policy"),
+    )
+    .await
+    .expect("store user policy");
+    iam.policy_db_set(access_key, UserType::Reg, false, "parity-user-policy")
+        .await
+        .expect("attach user policy");
+    let user = iam.get_user(access_key).await.expect("load IAM user").credentials;
+    let owner = rustfs_credentials::Credentials {
+        access_key: "parity-owner".to_owned(),
+        secret_key: "parity-owner-secret".to_owned(),
+        ..Default::default()
+    };
+    let context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context), "install request context");
+
+    let cases = [
+        DecisionCase {
+            name: "user allowed by IAM",
+            bucket: PRIVATE,
+            object: "allowed",
+            principal: Principal::User,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: true,
+        },
+        DecisionCase {
+            name: "user IAM explicit deny",
+            bucket: PRIVATE,
+            object: "iam-denied",
+            principal: Principal::User,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: false,
+        },
+        DecisionCase {
+            name: "owner on private bucket",
+            bucket: PRIVATE,
+            object: "owner-only",
+            principal: Principal::Owner,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: true,
+        },
+        DecisionCase {
+            name: "anonymous on private bucket",
+            bucket: PRIVATE,
+            object: "allowed",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: false,
+        },
+        DecisionCase {
+            name: "anonymous on public bucket",
+            bucket: PUBLIC,
+            object: "open/readme",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: true,
+        },
+        DecisionCase {
+            name: "bucket-policy explicit deny",
+            bucket: PUBLIC,
+            object: "open/bucket-denied",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: no_facts,
+            allowed: false,
+        },
+        DecisionCase {
+            name: "SourceIp from the peer, inside",
+            bucket: PUBLIC,
+            object: "ip/file",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: |req| peer(req, [203, 0, 113, 9]),
+            allowed: true,
+        },
+        DecisionCase {
+            name: "SourceIp from the peer, outside",
+            bucket: PUBLIC,
+            object: "ip/file",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: |req| peer(req, [198, 51, 100, 1]),
+            allowed: false,
+        },
+        DecisionCase {
+            name: "SourceIp from the verified client",
+            bucket: PUBLIC,
+            object: "ip/file",
+            principal: Principal::Anonymous,
+            action: S3Action::GetObjectAction,
+            facts: |req| {
+                peer(req, [198, 51, 100, 1]);
+                req.extensions
+                    .insert(rustfs_trusted_proxies::ClientInfo::direct(std::net::SocketAddr::from((
+                        [203, 0, 113, 9],
+                        443,
+                    ))));
+            },
+            allowed: true,
+        },
+        DecisionCase {
+            name: "legal hold body ON, header OFF",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectLegalHoldAction,
+            facts: |req| {
+                req.headers
+                    .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("OFF"));
+                req.extensions.insert(RequestedObjectLegalHold(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+                }));
+            },
+            allowed: true,
+        },
+        DecisionCase {
+            name: "legal hold body OFF, header ON",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectLegalHoldAction,
+            facts: |req| {
+                req.headers
+                    .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+                req.extensions.insert(RequestedObjectLegalHold(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+                }));
+            },
+            allowed: false,
+        },
+        DecisionCase {
+            name: "tagging body public, header secret",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectTaggingAction,
+            facts: |req| {
+                req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=secret"));
+                req.extensions.insert(RequestedObjectTags(Tagging {
+                    tag_set: vec![Tag {
+                        key: Some("class".to_owned()),
+                        value: Some("public".to_owned()),
+                    }],
+                }));
+            },
+            allowed: true,
+        },
+        DecisionCase {
+            name: "tagging body secret, header public",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectTaggingAction,
+            facts: |req| {
+                req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=public"));
+                req.extensions.insert(RequestedObjectTags(Tagging {
+                    tag_set: vec![Tag {
+                        key: Some("class".to_owned()),
+                        value: Some("secret".to_owned()),
+                    }],
+                }));
+            },
+            allowed: false,
+        },
+        DecisionCase {
+            name: "retention body governance for 40 days",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectRetentionAction,
+            facts: |req| retain(req, "GOVERNANCE", 40),
+            allowed: true,
+        },
+        DecisionCase {
+            name: "retention body compliance",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectRetentionAction,
+            facts: |req| retain(req, "COMPLIANCE", 40),
+            allowed: false,
+        },
+        DecisionCase {
+            name: "retention for 10 days",
+            bucket: PUBLIC,
+            object: "body/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectRetentionAction,
+            facts: |req| retain(req, "GOVERNANCE", 10),
+            allowed: false,
+        },
+        DecisionCase {
+            name: "resolved copy source matches",
+            bucket: PUBLIC,
+            object: "copy/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: |req| {
+                req.headers.insert("x-amz-copy-source", HeaderValue::from_static("other/key"));
+                req.extensions.insert(RequestedCopySource("src/key".to_owned()));
+            },
+            allowed: true,
+        },
+        DecisionCase {
+            name: "resolved copy source differs",
+            bucket: PUBLIC,
+            object: "copy/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: |req| {
+                req.headers.insert("x-amz-copy-source", HeaderValue::from_static("src/key"));
+                req.extensions.insert(RequestedCopySource("other/key".to_owned()));
+            },
+            allowed: false,
+        },
+        DecisionCase {
+            name: "POST form tag public, header secret",
+            bucket: PUBLIC,
+            object: "post/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: |req| post_form(req, "class=public", "class=secret"),
+            allowed: true,
+        },
+        DecisionCase {
+            name: "POST form tag secret, header public",
+            bucket: PUBLIC,
+            object: "post/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: |req| post_form(req, "class=secret", "class=public"),
+            allowed: false,
+        },
+    ];
+
+    for case in cases {
+        let mut legacy = build_request((), Method::PUT);
+        legacy.uri = format!("/{}/{}", case.bucket, case.object).parse().expect("case uri");
+        legacy.extensions.insert(Arc::clone(&slot));
+        let (cred, is_owner) = match case.principal {
+            Principal::Anonymous => (None, false),
+            Principal::User => (Some(user.clone()), false),
+            Principal::Owner => (Some(owner.clone()), true),
+        };
+        legacy.extensions.insert(ReqInfo {
+            cred,
+            is_owner,
+            bucket: Some(case.bucket.to_owned()),
+            object: Some(case.object.to_owned()),
+            ..Default::default()
+        });
+        (case.facts)(&mut legacy);
+        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let action = Action::S3Action(case.action);
+        let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
+        let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
+        assert_eq!(legacy_result.is_ok(), case.allowed, "{}: legacy decision {legacy_result:?}", case.name);
+        assert_eq!(owned_result.is_ok(), case.allowed, "{}: owned decision {owned_result:?}", case.name);
+        if !case.allowed {
+            assert_eq!(legacy_result.expect_err(case.name).code(), &S3ErrorCode::AccessDenied, "{}", case.name);
+            assert_eq!(
+                owned_result.expect_err(case.name).code(),
+                &rustfs_s3_types::S3ErrorCode::AccessDenied,
+                "{}",
+                case.name
+            );
+        }
+    }
+}
+
+fn retain(req: &mut S3Request<()>, mode: &'static str, days: i64) {
+    let retention = ObjectLockRetention {
+        mode: Some(mode.to_owned().into()),
+        ..Default::default()
+    };
+    req.extensions.insert(RequestedObjectLockRetention(retention));
+    req.extensions.insert(RequestedObjectLockRetainUntil(
+        time::OffsetDateTime::now_utc() + time::Duration::days(days),
+    ));
+    // Headers name a different mode; only the body may describe the request.
+    req.headers
+        .insert("x-amz-object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
+}
+
+fn post_form(req: &mut S3Request<()>, form_tagging: &'static str, header_tagging: &'static str) {
+    req.method = Method::POST;
+    req.headers.insert("x-amz-tagging", HeaderValue::from_static(header_tagging));
+    let mut form = req.headers.clone();
+    form.insert("x-amz-tagging", HeaderValue::from_static(form_tagging));
+    req.extensions.insert(PostObjectRequestMarker);
+    req.extensions.insert(PostObjectPolicyHeaders(form));
 }
