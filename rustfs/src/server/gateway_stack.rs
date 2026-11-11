@@ -108,9 +108,7 @@ impl GatewayStack {
         let iam = Arc::new(ServerIam {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
-        let root = Arc::new(ServerRoot {
-            server_ctx: Arc::clone(&assembly.server_ctx),
-        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
         // WIRED BY rustfs/rustfs#9281: the owned authorization entry point replaces the unwired core.
         let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
         Self::assemble_with(assembly, iam, root, authorizer)
@@ -126,10 +124,6 @@ impl GatewayStack {
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
             .map_err(GatewayAssemblyError::RootCredentials)?;
-        // Both adapters are built over one IAM and one live root. Only the credential provider
-        // is installed: the caller is resolved by the access check each handler runs, which is
-        // the legacy resolver, and the pinned gateway hands a handler no policy snapshot.
-        let IamAdapters { credentials, policy: _ } = IamAdapters::new(iam, root);
         let region = assembly.region.as_deref().unwrap_or(RUSTFS_REGION);
         let regions = RegionSet::new([region]).map_err(|_| GatewayAssemblyError::Region {
             region: region.to_owned(),
@@ -137,11 +131,14 @@ impl GatewayStack {
         let hosts = LegacyRustfsVirtualHosts::new(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
 
-        let builder = ServiceBuilder::new()
-            // Every legacy RustFS reading of a request, a credential scope and an answer, in the
-            // gateway's one reviewable preset; its other half is on the authenticator below.
-            .rustfs_profile()
-            .authenticator(SigV4Authenticator::new(Arc::new(credentials), regions).rustfs_profile())
+        // Every legacy RustFS reading of a request, a credential scope and an answer, in the
+        // gateway's one reviewable preset; its other half is on the authenticator below.
+        let builder = ServiceBuilder::new().rustfs_profile();
+        // The credential provider and the policy source go in together, over one IAM and one
+        // live root, so a key cannot be root to one and an ordinary user to the other.
+        let builder = IamAdapters::new(iam, root)
+            .install(builder, |credentials| SigV4Authenticator::new(credentials, regions).rustfs_profile());
+        let builder = builder
             .authorizer(authorizer)
             // The outer SSE-C transport layer answers first; the gateway's own gate stays strict
             // behind it.
@@ -232,15 +229,12 @@ fn attach_host_facts(extensions: &mut Extensions) {
     }
 }
 
-/// The root credentials of one server as they are now, read on every request from where the
-/// legacy stack reads them, so a root change reaches both stacks at once.
-struct ServerRoot {
-    server_ctx: Arc<ServerContextSlot>,
-}
-
-impl RootSource for ServerRoot {
-    fn current(&self) -> Option<Arc<RootCredentials>> {
-        let root = match self.server_ctx.app_context() {
+/// The root credentials of one server as they are now, read on every call from where the legacy
+/// stack reads them, so a root change reaches both stacks at once. `None` while they are not
+/// initialized or cannot verify a signature, which the adapters answer as unavailable.
+fn live_root(server_ctx: Arc<ServerContextSlot>) -> impl Fn() -> Option<Arc<RootCredentials>> + Send + Sync + 'static {
+    move || {
+        let root = match server_ctx.app_context() {
             Some(context) => context.action_credentials().get(),
             None => current_action_credentials(),
         }?;

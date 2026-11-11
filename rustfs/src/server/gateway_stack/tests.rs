@@ -20,7 +20,6 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use rustfs_gateway::{AuthzRequest, ClientFacts, Decision, InputAuthzRequest, InputDecisions, NO_DEADLINE};
-use rustfs_gateway_adapter::RootCell;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -65,16 +64,35 @@ impl IamPrincipalLookup for ScriptedIam {
     }
 }
 
-/// A live root source holding the test root.
-fn root() -> Arc<RootCell> {
+/// A settable live root, standing in for the server's runtime credentials.
+#[derive(Clone)]
+struct LiveRoot(Arc<Mutex<Option<Arc<RootCredentials>>>>);
+
+impl LiveRoot {
+    fn set(&self, root: RootCredentials) {
+        *self.0.lock().expect("root lock") = Some(Arc::new(root));
+    }
+
+    fn clear(&self) {
+        *self.0.lock().expect("root lock") = None;
+    }
+
+    fn source(&self) -> Arc<dyn RootSource> {
+        let cell = Arc::clone(&self.0);
+        Arc::new(move || cell.lock().expect("root lock").clone())
+    }
+}
+
+/// A live root holding the test root.
+fn root() -> LiveRoot {
     let root = RootCredentials::new(ROOT_ACCESS_KEY, ROOT_SECRET_KEY, ROOT_SECRET_KEY).expect("a usable root");
-    Arc::new(RootCell::new(Some(root)))
+    LiveRoot(Arc::new(Mutex::new(Some(Arc::new(root)))))
 }
 
 /// The stack as production assembles it, over an IAM that knows no key but the root's.
 fn stack_over(iam: ScriptedIam) -> GatewayStack {
     let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
-    GatewayStack::assemble_with(assembly(), Arc::new(iam), root(), authorizer).expect("the stack assembles")
+    GatewayStack::assemble_with(assembly(), Arc::new(iam), root().source(), authorizer).expect("the stack assembles")
 }
 
 fn request(method: Method, target: &str) -> http::request::Builder {
@@ -183,7 +201,7 @@ fn a_missing_or_short_root_secret_fails_the_assembly() {
 async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothing() {
     let live = root();
     let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
-    let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.clone(), authorizer)
+    let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), authorizer)
         .expect("the stack assembles");
     let as_root = || signed_with_a_wrong_signature(request(Method::GET, "/"), ROOT_ACCESS_KEY);
 
@@ -306,8 +324,8 @@ impl Authorizer for RecordingAuthorizer {
 async fn the_authorizer_sees_the_client_facts_the_host_attached() {
     let seen = Arc::new(Mutex::new(None));
     let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
-    let stack =
-        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root(), authorizer).expect("assembles");
+    let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
+        .expect("assembles");
     let proxied = request(Method::GET, "/")
         .extension(Some(RemoteAddr(SocketAddr::from(PEER))))
         .extension(ClientInfo::direct(SocketAddr::new(IpAddr::from(CLIENT), 443)))
@@ -331,8 +349,8 @@ async fn the_authorizer_sees_the_client_facts_the_host_attached() {
 async fn the_authorizer_sees_a_cleartext_transport_as_cleartext() {
     let seen = Arc::new(Mutex::new(None));
     let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
-    let stack =
-        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root(), authorizer).expect("assembles");
+    let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
+        .expect("assembles");
 
     let (status, _, _) = answer(&stack, request(Method::GET, "/").extension(NativeTlsTransport(false))).await;
 
