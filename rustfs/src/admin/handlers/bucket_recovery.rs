@@ -63,8 +63,10 @@ impl Operation for RecoverOrphanedBucketHandler {
         authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RecoverOrphanedBucketAction)]).await?;
         let secret_key = req
             .credentials()
-            .map(|credentials| Zeroizing::new(credentials.secret_key().to_owned()))
-            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "authentication required"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "authentication required"))?
+            .require_secret_key()
+            .map(|secret| Zeroizing::new(secret.to_owned()))
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?;
         let bucket = params
             .get("bucket")
             .filter(|bucket| !bucket.is_empty())
