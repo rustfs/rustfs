@@ -1334,11 +1334,11 @@ fn test_delete_bucket_broadcast_fences_target_membership_through_delivery() {
         "a failed destructive delivery must remain visible for operator repair"
     );
 
-    let usecase = include_str!("../app/bucket_usecase.rs");
+    let usecase = crate::guard_sources::SourceSet::read("src/app/bucket_usecase.rs", "src/app/bucket_usecase");
     let delete = usecase
-        .split("async fn execute_delete_bucket_inner")
-        .nth(1)
-        .and_then(|rest| rest.split("pub async fn execute_head_bucket").next())
+        .after_unique_marker("async fn execute_delete_bucket_inner")
+        .split("pub async fn execute_head_bucket")
+        .next()
         .expect("delete bucket usecase");
     assert!(
         delete

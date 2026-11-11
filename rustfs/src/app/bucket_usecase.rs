@@ -3912,16 +3912,36 @@ mod tests {
         req
     }
 
-    fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
-        let public_start_marker = format!("pub async fn {method}");
-        let private_start_marker = format!("async fn {method}");
-        let (start, marker_len) = if let Some(start) = source.find(&public_start_marker) {
-            (start, public_start_marker.len())
+    /// Bucket usecase source: this file plus `bucket_usecase/`, where a split moves its methods.
+    fn bucket_usecase_sources() -> crate::guard_sources::SourceSet {
+        crate::guard_sources::SourceSet::read("src/app/bucket_usecase.rs", "src/app/bucket_usecase")
+    }
+
+    /// Text after each exact `{marker}(` or `{marker}<` definition, in set order.
+    fn method_definitions<'a>(source: &'a crate::guard_sources::SourceSet, marker: &str) -> Vec<&'a str> {
+        source
+            .files()
+            .iter()
+            .flat_map(|file| {
+                file.text
+                    .match_indices(marker)
+                    .map(move |(start, _)| &file.text[start + marker.len()..])
+                    .filter(|rest| rest.starts_with(['(', '<']))
+            })
+            .collect()
+    }
+
+    /// The body of the one definition of `method` across the bucket usecase set, preferring the
+    /// public form; it ends at the next method of the same indentation or at the end of its file.
+    fn usecase_method_source<'a>(source: &'a crate::guard_sources::SourceSet, method: &str) -> &'a str {
+        let public = method_definitions(source, &format!("pub async fn {method}"));
+        let definitions = if public.is_empty() {
+            method_definitions(source, &format!("async fn {method}"))
         } else {
-            let start = source.find(&private_start_marker).expect("method should exist");
-            (start, private_start_marker.len())
+            public
         };
-        let rest = &source[start + marker_len..];
+        assert_eq!(definitions.len(), 1, "{method} must be defined exactly once across {}", source.describe());
+        let rest = definitions[0];
         let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
             .into_iter()
             .flatten()
@@ -3932,7 +3952,8 @@ mod tests {
 
     #[test]
     fn bucket_create_and_delete_use_admitted_fresh_tasks() {
-        let source = include_str!("bucket_usecase.rs");
+        let sources = bucket_usecase_sources();
+        let source = &sources;
         for (method, operation, inner_call) in [
             (
                 "execute_create_bucket",
@@ -3957,7 +3978,8 @@ mod tests {
 
     #[test]
     fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
-        let source = include_str!("bucket_usecase.rs");
+        let sources = bucket_usecase_sources();
+        let source = &sources;
         for (method, operation, scanner_maintenance_change) in [
             ("execute_delete_bucket_policy", "delete bucket policy", false),
             ("execute_put_bucket_policy", "put bucket policy", false),
