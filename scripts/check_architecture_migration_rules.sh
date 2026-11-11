@@ -118,6 +118,28 @@ require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "Do 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# Rules about one of the large files below read that file plus the sibling
+# directory a mechanical split moves its code into (rustfs/backlog#2765), so a
+# split neither breaks nor silently blinds them. The *_SPLIT_SOURCES arrays hold
+# only the directory part, for rules that select the file itself by glob.
+# shellcheck source=scripts/guard_source_set.sh
+source "${ROOT_DIR}/scripts/guard_source_set.sh"
+guard_source_set "$ROOT_DIR" rustfs/src/storage/ecfs.rs rustfs/src/storage/legacy_edge ||
+  report_failure "ECFS guard source set is unreadable"
+ECFS_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+guard_source_set "$ROOT_DIR" rustfs/src/app/bucket_usecase.rs rustfs/src/app/bucket_usecase ||
+  report_failure "bucket usecase guard source set is unreadable"
+BUCKET_USECASE_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+BUCKET_USECASE_SPLIT_SOURCES=("${GUARD_SOURCES[@]:1}")
+guard_source_set "$ROOT_DIR" rustfs/src/app/multipart_usecase.rs rustfs/src/app/multipart_usecase ||
+  report_failure "multipart usecase guard source set is unreadable"
+MULTIPART_USECASE_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+MULTIPART_USECASE_SPLIT_SOURCES=("${GUARD_SOURCES[@]:1}")
+guard_source_set "$ROOT_DIR" rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/lifecycle_transition_api_test ||
+  report_failure "lifecycle transition API test guard source set is unreadable"
+LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES=("${GUARD_SOURCES[@]}")
+LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES=("${GUARD_SOURCES[@]:1}")
+
 PR_TYPES_FILE="${TMP_DIR}/pr_types.txt"
 PR_TYPE_HITS_FILE="${TMP_DIR}/pr_type_hits.txt"
 SOURCE_MARKERS_FILE="${TMP_DIR}/source_markers.txt"
@@ -2157,7 +2179,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b|(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b)' \
     rustfs/src/storage/access.rs \
-    rustfs/src/storage/ecfs.rs \
+    "${ECFS_GUARD_SOURCES[@]}" \
     rustfs/src/storage/ecfs_extend.rs \
     rustfs/src/storage/helper.rs \
     rustfs/src/storage/concurrency/manager.rs \
@@ -2175,7 +2197,7 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase|object\b)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
-    rustfs/src/storage/ecfs.rs \
+    "${ECFS_GUARD_SOURCES[@]}" \
     --glob '*.rs' || true
 ) >"$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE"
 
@@ -2228,7 +2250,10 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
+  # A glob containing a slash is anchored at the search root, so object files
+  # need the leading **/ to match under rustfs/src/app.
+  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' --glob '**/object/*.rs' \
+    "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
 ) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
@@ -2246,7 +2271,8 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
+  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' --glob '**/object/*.rs' \
+    "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
 ) >"$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE" ]]; then
@@ -2258,13 +2284,14 @@ fi
   {
     rg -n --with-filename \
       '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
-      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs rustfs/src/app/object || true
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs rustfs/src/app/object \
+      "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
+      "${BUCKET_USECASE_GUARD_SOURCES[@]}" rustfs/src/app/object_usecase.rs rustfs/src/app/object "${MULTIPART_USECASE_GUARD_SOURCES[@]}" "${LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES[@]}" || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|super::(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|super::super::(?:metadata_sys|lifecycle|target)::' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
+      "${BUCKET_USECASE_GUARD_SOURCES[@]}" rustfs/src/app/object_usecase.rs rustfs/src/app/object "${MULTIPART_USECASE_GUARD_SOURCES[@]}" "${LIFECYCLE_TRANSITION_TEST_GUARD_SOURCES[@]}" rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
   }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 
@@ -2277,6 +2304,7 @@ fi
   rg -n --with-filename \
     '(use crate::storage::(access|request_context|ecfs)|use crate::storage::\{[^}]*Storage(ObjectInfo|ObjectOptions|PutObjReader)|crate::storage::StorageObjectOptions)' \
     rustfs/src/app/*_test.rs \
+    "${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}" \
     rustfs/src/admin/router.rs \
     rustfs/src/admin/console.rs \
     rustfs/src/admin/handlers/heal.rs \
@@ -4561,7 +4589,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'crate::storage::core_storage_compat' \
     rustfs/src/storage/mod.rs \
-    rustfs/src/storage/ecfs.rs \
+    "${ECFS_GUARD_SOURCES[@]}" \
     rustfs/src/storage/ecfs_extend.rs \
     rustfs/src/storage/access.rs \
     rustfs/src/storage/head_prefix.rs \
@@ -4577,7 +4605,8 @@ fi
   cd "$ROOT_DIR"
   {
     rg -n --with-filename 'crate::app::usecase_storage_compat' \
-      rustfs/src/app/*.rs || true
+      rustfs/src/app/*.rs "${BUCKET_USECASE_SPLIT_SOURCES[@]}" "${MULTIPART_USECASE_SPLIT_SOURCES[@]}" \
+      "${LIFECYCLE_TRANSITION_TEST_SPLIT_SOURCES[@]}" || true
     rg -n --with-filename 'crate::admin::router_storage_compat' \
       rustfs/src/admin/router.rs || true
     rg -n --with-filename 'crate::storage::core_storage_compat' \

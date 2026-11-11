@@ -17,7 +17,8 @@
 
 Compares the operations defined by the s3s `S3` trait (at the revision pinned
 in the workspace Cargo.toml) against the methods RustFS overrides in
-`impl S3 for FS` (rustfs/src/storage/ecfs.rs). Trait methods that are not
+`impl S3 for FS` (rustfs/src/storage/ecfs.rs, or the rustfs/src/storage/legacy_edge/
+directory a mechanical split of that file moves code into). Trait methods that are not
 overridden fall back to the s3s default implementation, which returns
 NotImplemented — so "overridden" is a faithful proxy for "implemented".
 
@@ -36,6 +37,8 @@ import sys
 import tempfile
 
 ECFS_PATH = "rustfs/src/storage/ecfs.rs"
+ECFS_SPLIT_DIR = "rustfs/src/storage/legacy_edge"
+IMPL_MARKER = "impl S3 for FS {"
 TRAIT_RELPATH = "crates/s3s/src/s3_trait.rs"
 
 
@@ -97,14 +100,28 @@ def trait_operations(trait_source: pathlib.Path) -> dict[str, str]:
     return ops
 
 
-def implemented_operations(ecfs_source: pathlib.Path) -> set[str]:
-    src = ecfs_source.read_text(encoding="utf-8")
-    marker = "impl S3 for FS {"
-    start = src.find(marker)
-    if start < 0:
-        raise RuntimeError(f"`{marker}` not found in {ecfs_source}")
-    block = extract_block(src, start)
-    return set(re.findall(r"async fn (\w+)", block))
+def ecfs_sources(root: pathlib.Path) -> list[pathlib.Path]:
+    """Return ecfs.rs (required) followed by every .rs file under the split directory, in path order."""
+    required = root / ECFS_PATH
+    if not required.is_file():
+        raise RuntimeError(f"{required} is missing")
+    split_dir = root / ECFS_SPLIT_DIR
+    if not split_dir.exists():
+        return [required]
+    if not split_dir.is_dir():
+        raise RuntimeError(f"{split_dir} is not a directory")
+    return [required, *sorted(split_dir.rglob("*.rs"), key=lambda path: path.relative_to(root).as_posix())]
+
+
+def implemented_operations(root: pathlib.Path) -> set[str]:
+    """Return the methods of the one `impl S3 for FS` block across the ECFS source set."""
+    blocks = []
+    for source in ecfs_sources(root):
+        src = source.read_text(encoding="utf-8")
+        blocks += [extract_block(src, match.start()) for match in re.finditer(re.escape(IMPL_MARKER), src)]
+    if len(blocks) != 1:
+        raise RuntimeError(f"`{IMPL_MARKER}` must occur exactly once under {ECFS_PATH} and {ECFS_SPLIT_DIR}, found {len(blocks)}")
+    return set(re.findall(r"async fn (\w+)", blocks[0]))
 
 
 def main() -> int:
@@ -122,7 +139,7 @@ def main() -> int:
     trait_source = args.s3s_trait or locate_trait_source(git_url, rev)
 
     all_ops = trait_operations(trait_source)
-    impl_ops = implemented_operations(root / ECFS_PATH)
+    impl_ops = implemented_operations(root)
 
     stale = sorted(impl_ops - all_ops.keys())
     implemented = sorted(op for op in all_ops if op in impl_ops)
