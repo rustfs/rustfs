@@ -3614,6 +3614,9 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
 
 #[cfg(test)]
 mod tests {
+    #[path = "production_batch_lock_rpc_tests.rs"]
+    mod production_batch_lock_rpc_tests;
+
     use super::*;
     use crate::server::compress::RequestPathCategory;
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
