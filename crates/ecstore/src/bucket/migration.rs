@@ -17,7 +17,7 @@
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
 use crate::bucket::replication::ReplicationMigrationBridge;
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::error::{Error, Result, is_err_strict_not_found, is_err_strict_volume_not_found};
+use crate::error::{Error, Result, is_err_strict_not_found, is_err_strict_volume_not_found, to_object_err};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions},
@@ -334,6 +334,14 @@ async fn migration_target_exists<S: EcstoreObjectOperations>(store: &S, path: &s
     }
 }
 
+/// Names the target record in a failed migration write, as the existence
+/// probe's error already does. The commit path returns bare disk errors, and on
+/// Windows a blocked record is first seen here: reading through a regular-file
+/// ancestor reports the record missing instead of refusing access to it.
+fn migration_write_error(err: Error, path: &str) -> Error {
+    to_object_err(err, vec![RUSTFS_META_BUCKET, path])
+}
+
 async fn migrate_one_if_missing<S>(
     store: Arc<S>,
     opts: &ObjectOptions,
@@ -369,7 +377,10 @@ where
         .unwrap_or(data);
 
     let mut put_data = PutObjReader::from_vec(data);
-    store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, opts).await?;
+    store
+        .put_object(RUSTFS_META_BUCKET, path, &mut put_data, opts)
+        .await
+        .map_err(|err| migration_write_error(err, path))?;
     info!("Migrated {label}");
     Ok(())
 }
@@ -481,7 +492,10 @@ where
                 Err(_) => return Err(MigrationMetadataError::Incompatible(path.to_owned()).into()),
             };
             let mut put_data = PutObjReader::from_vec(data);
-            store.put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts).await?;
+            store
+                .put_object(RUSTFS_META_BUCKET, path, &mut put_data, &opts)
+                .await
+                .map_err(|err| migration_write_error(err, path))?;
             info!("Migrated IAM config: {path}");
             total_migrated += 1;
         }
@@ -529,6 +543,27 @@ mod tests {
             legacy_iam_source_exists(Err(Error::ErasureReadQuorum)),
             Err(Error::ErasureReadQuorum)
         ));
+    }
+
+    #[test]
+    fn migration_write_errors_name_the_target_record_without_fragmenting_groups() {
+        use super::{Error, migration_write_error};
+
+        let first = migration_write_error(Error::FileAccessDenied, "buckets/first/.metadata.bin");
+        let second = migration_write_error(Error::FileAccessDenied, "config/iam/format.json");
+        assert!(matches!(first, Error::PrefixAccessDenied(..)), "unexpected error: {first:?}");
+        assert!(
+            first.to_string().contains(".rustfs.sys/buckets/first/.metadata.bin"),
+            "the startup error must name the blocked record: {first}"
+        );
+        assert_eq!(first, second, "record paths must not fragment error grouping");
+
+        let unrelated = migration_write_error(Error::other("disk offline"), "buckets/first/.metadata.bin");
+        assert_eq!(
+            unrelated,
+            Error::other("disk offline"),
+            "errors without a record form pass through unchanged"
+        );
     }
 
     #[test]

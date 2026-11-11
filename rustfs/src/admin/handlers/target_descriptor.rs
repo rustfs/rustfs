@@ -563,6 +563,8 @@ where
 }
 
 pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
+    let queue_dir = rustfs_targets::store::resolve_queue_dir(queue_dir);
+    let queue_dir = queue_dir.as_ref();
     if !queue_dir.is_empty() {
         if !Path::new(queue_dir).is_absolute() {
             return Err(s3_error!(InvalidArgument, "queue_dir must be an absolute path"));
@@ -1098,5 +1100,60 @@ mod instance_runtime_status_tests {
         assert_eq!(statuses.len(), 2);
         assert!(statuses.contains_key(&("Primary".into(), "custom-one".into())));
         assert!(statuses.contains_key(&("PRIMARY".into(), "custom-two".into())));
+    }
+}
+
+#[cfg(test)]
+mod queue_dir_resolution_tests {
+    use super::validate_queue_dir;
+    use rustfs_config::server_config::KVS;
+    use rustfs_config::{AUDIT_DEFAULT_DIR, ENV_TARGET_STORE_DIR, EVENT_DEFAULT_DIR, REDIS_QUEUE_DIR, REDIS_URL};
+    use rustfs_targets::{config::build_redis_args, target::TargetType};
+    use serial_test::serial;
+
+    fn redis_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/".to_string());
+        config
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_queue_dirs_follow_the_target_store_root() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let notify = build_redis_args(&redis_config(), EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent)
+                .expect("default notify queue");
+            assert_eq!(notify.queue_dir, root.path().join("events").to_string_lossy());
+            let audit =
+                build_redis_args(&redis_config(), AUDIT_DEFAULT_DIR, "audit", TargetType::AuditLog).expect("default audit queue");
+            assert_eq!(audit.queue_dir, root.path().join("audit").to_string_lossy());
+
+            let explicit = root.path().join("operator-queue").to_string_lossy().into_owned();
+            let mut config = redis_config();
+            config.insert(REDIS_QUEUE_DIR.to_string(), explicit.clone());
+            let args = build_redis_args(&config, EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent).expect("explicit queue");
+            assert_eq!(args.queue_dir, explicit, "an operator path must not be relocated");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_logical_default_is_validated_at_its_resolved_directory() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let missing = validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect_err("the resolved queue directory does not exist yet");
+            assert!(missing.message().is_some_and(|message| message.contains("does not exist")));
+            std::fs::create_dir(root.path().join("events")).expect("resolved queue directory");
+            validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect("the logical default must be checked where this node stores it");
+        })
+        .await;
     }
 }
