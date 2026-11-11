@@ -53,6 +53,7 @@ jobs:
       version: ${{ steps.source.outputs.version }}
       packaging: ${{ steps.source.outputs.packaging }}
       tool_sha: ${{ steps.source.outputs.tool_sha }}
+      confirm_from: ${{ steps.source.outputs.confirm_from }}
       toolchain: ${{ steps.inputs.outputs.toolchain }}
       console: ${{ steps.inputs.outputs.console }}
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -144,10 +145,10 @@ jobs:
           persist-credentials: false
 
       # Tags cut before the manual packaging script still compile from their
-      # own tree. The official zip/deb/rpm recipe then comes from the prepare
-      # checkout, which contains the current packaging scripts.
+      # own tree. The official zip/deb/rpm recipe, and confirm-source when the
+      # tagged script does not implement it, come from the prepare checkout.
       - name: Checkout packaging recipe
-        if: needs.prepare.outputs.packaging == 'tool'
+        if: ${{ needs.prepare.outputs.packaging == 'tool' || needs.prepare.outputs.confirm_from == 'tool' }}
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           ref: ${{ needs.prepare.outputs.tool_sha }}
@@ -163,7 +164,15 @@ jobs:
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
-          bash scripts/release/package_manual_artifacts.sh confirm-source \
+          helper=scripts/release/package_manual_artifacts.sh
+          if [[ ! -f "$helper" ]] || ! grep -q 'confirm-source)' "$helper"; then
+            helper=packaging-tools/scripts/release/package_manual_artifacts.sh
+          fi
+          if [[ ! -f "$helper" ]] || ! grep -q 'confirm-source)' "$helper"; then
+            printf 'no packaging script implements confirm-source\n' >&2
+            exit 1
+          fi
+          bash "$helper" confirm-source \
             --kind "$SOURCE_KIND" \
             --name "$SOURCE_NAME" \
             --sha "$SOURCE_SHA"

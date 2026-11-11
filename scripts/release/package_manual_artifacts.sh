@@ -481,6 +481,14 @@ packaging_mode() {
   fi
 }
 
+# Older copies of this file can package a binary and still lack confirm-source.
+commit_implements_confirm() {
+  local sha=$1
+  local script
+  script=$(git cat-file -p "${sha}:scripts/release/package_manual_artifacts.sh" 2>/dev/null) || return 1
+  grep -q 'confirm-source)' <<< "$script"
+}
+
 emit_source() {
   printf 'source_sha=%s\n' "$1"
   printf 'source_kind=%s\n' "$2"
@@ -488,20 +496,28 @@ emit_source() {
   printf 'version=%s\n' "$4"
   printf 'packaging=%s\n' "$5"
   printf 'tool_sha=%s\n' "$6"
+  printf 'confirm_from=%s\n' "$7"
 }
 
 # packaging=source means the resolved commit contains the manual packaging
 # script. packaging=tool means the package job must use the prepare checkout
 # (tool_sha), which is required for tags cut before that script existed.
+# confirm_from=tool means that checkout must also supply confirm-source,
+# including when an older script is present but cannot confirm the pin.
 finish_source() {
   local sha=$1 kind=$2 name=$3 resolved_version=$4 tool_sha=$5
-  local packaging
+  local packaging confirm_from=tool
   packaging=$(packaging_mode "$sha")
-  if [[ "$packaging" == tool ]]; then
+  if commit_implements_confirm "$sha"; then
+    confirm_from=source
+  fi
+  if [[ "$packaging" == tool || "$confirm_from" == tool ]]; then
     git cat-file -e "${tool_sha}:scripts/release/package_manual_artifacts.sh" 2>/dev/null ||
       die "packaging recipe commit ${tool_sha} does not contain scripts/release/package_manual_artifacts.sh"
+    commit_implements_confirm "$tool_sha" ||
+      die "packaging recipe commit ${tool_sha} does not implement confirm-source"
   fi
-  emit_source "$sha" "$kind" "$name" "$resolved_version" "$packaging" "$tool_sha"
+  emit_source "$sha" "$kind" "$name" "$resolved_version" "$packaging" "$tool_sha" "$confirm_from"
   printf 'Resolved %s %s at %s as version %s\n' "$kind" "$name" "$sha" "$resolved_version" >&2
 }
 

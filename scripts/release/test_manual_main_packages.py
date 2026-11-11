@@ -73,9 +73,13 @@ def init_packaging_remote(root, *, clone_head):
         run_git(root, "clone", "--no-tags", str(origin), str(work))
     script = seed / "scripts" / "release" / "package_manual_artifacts.sh"
     script.parent.mkdir(parents=True)
-    script.write_text("# packaging recipe\n", encoding="utf-8")
+    script.write_text("# packaging recipe without confirmation\npackage)\n  ;;\n", encoding="utf-8")
     run_git(seed, "add", "scripts/release/package_manual_artifacts.sh")
     run_git(seed, "commit", "-m", "add packaging script")
+    legacy = git_head(seed)
+    script.write_text("# packaging recipe\nconfirm-source)\n  ;;\n", encoding="utf-8")
+    run_git(seed, "add", "scripts/release/package_manual_artifacts.sh")
+    run_git(seed, "commit", "-m", "add confirm-source")
     main = git_head(seed)
     run_git(seed, "checkout", "--orphan", "side")
     run_git(seed, "rm", "-rf", ".")
@@ -87,6 +91,7 @@ def init_packaging_remote(root, *, clone_head):
     run_git(seed, "tag", "-a", "v1.2.3", "-m", "annotated", base)
     run_git(seed, "tag", "1.2.3-beta.2", base)
     run_git(seed, "tag", "v1.2.3-rc.1", base)
+    run_git(seed, "tag", "v8.8.8", legacy)
     run_git(seed, "tag", "v9.9.9", main)
     run_git(seed, "tag", "v2.0.0", side)
     run_git(seed, "tag", "not-a-version", base)
@@ -99,14 +104,35 @@ def init_packaging_remote(root, *, clone_head):
     run_git(seed, "push", "origin", "refs/heads/topic:refs/heads/topic")
     run_git(seed, "push", "origin", "refs/heads/release/1.2:refs/heads/release/1.2")
     run_git(seed, "push", "origin", "refs/heads/v1.2.3:refs/heads/v1.2.3")
-    for tag in ("v1.2.3", "1.2.3-beta.2", "v1.2.3-rc.1", "v9.9.9", "v2.0.0", "not-a-version", "vv1.2.3"):
+    for tag in ("v1.2.3", "1.2.3-beta.2", "v1.2.3-rc.1", "v8.8.8", "v9.9.9", "v2.0.0", "not-a-version", "vv1.2.3"):
         run_git(seed, "push", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
     run_git(origin, "config", "uploadpack.allowReachableSHA1InWant", "true")
     if clone_head == "main":
         run_git(root, "clone", "--no-tags", str(origin), str(work))
     elif clone_head != "stale":
         raise AssertionError(f"unsupported clone_head {clone_head}")
-    return {"work": work, "origin": origin, "seed": seed, "base": base, "main": main, "side": side}
+    return {"work": work, "origin": origin, "seed": seed, "base": base, "legacy": legacy, "main": main, "side": side}
+
+
+def confirm_step_script():
+    document = workflow_document(WORKFLOW.read_text(encoding="utf-8"))
+    steps = document["jobs"]["package"]["steps"]
+    step = next(item for item in steps if item["name"] == "Confirm the pinned source")
+    return step["run"]
+
+
+def run_confirm_step(cwd, kind, name, sha):
+    env = os.environ.copy()
+    env.update({"SOURCE_KIND": kind, "SOURCE_NAME": name, "SOURCE_SHA": sha})
+    return subprocess.run(["bash", "-c", confirm_step_script()], cwd=cwd, env=env, text=True,
+                          capture_output=True, timeout=60)
+
+
+def install_confirm_helper(root):
+    destination = root / "packaging-tools" / "scripts" / "release" / "package_manual_artifacts.sh"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(SCRIPT.read_bytes())
+    destination.chmod(0o755)
 
 
 def trigger(text):
@@ -272,7 +298,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("github.sha", text)
         self.assertIn("refs/heads/main", SCRIPT.read_text(encoding="utf-8"))
         self.assertIn("package_manual_artifacts.sh resolve-source", text)
-        self.assertIn("package_manual_artifacts.sh confirm-source", text)
+        confirm_run = confirm_step_script()
+        self.assertIn("packaging-tools/scripts/release/package_manual_artifacts.sh", confirm_run)
+        self.assertIn("confirm-source)", confirm_run)
+        self.assertIn('bash "$helper" confirm-source', confirm_run)
+        self.assertIn("needs.prepare.outputs.confirm_from == 'tool'", text)
         self.assertIn("package_manual_artifacts.sh matrix", text)
         self.assertIn('bash "$script" package', text)
         self.assertIn('SOURCE_REF: ${{ inputs.ref }}', text)
@@ -332,6 +362,7 @@ class SourceResolutionTests(unittest.TestCase):
                 "version": "1.2.3",
                 "packaging": "source",
                 "tool_sha": repo["base"],
+                "confirm_from": "source",
             })
             self.assertEqual(git_head(repo["work"]), repo["main"])
             self.assertEqual(self.confirm(repo, "main", "main", repo["main"]).returncode, 0)
@@ -366,6 +397,7 @@ class SourceResolutionTests(unittest.TestCase):
             self.assertEqual(data["source_name"], "v1.2.3")
             self.assertEqual(data["version"], "1.2.3")
             self.assertEqual(data["packaging"], "tool")
+            self.assertEqual(data["confirm_from"], "tool")
             self.assertEqual(data["tool_sha"], repo["main"])
             self.assertEqual(git_head(repo["work"]), before)
             run_git(repo["work"], "checkout", "--detach", repo["base"])
@@ -393,8 +425,10 @@ class SourceResolutionTests(unittest.TestCase):
                     self.assertEqual(git_head(repo["work"]), repo["main"])
             side = self.resolve(repo, "v2.0.0", "")
             self.assertEqual(output_map(side.stdout)["packaging"], "tool")
+            self.assertEqual(output_map(side.stdout)["confirm_from"], "tool")
             current = self.resolve(repo, "v9.9.9", "")
             self.assertEqual(output_map(current.stdout)["packaging"], "source")
+            self.assertEqual(output_map(current.stdout)["confirm_from"], "source")
             run_git(repo["work"], "checkout", "--detach", repo["side"])
             confirmed = self.confirm(repo, "tag", "v2.0.0", repo["side"])
             self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
@@ -495,6 +529,54 @@ class SourceResolutionTests(unittest.TestCase):
                     self.assertIn("unsupported git ref:", result.stderr)
                     self.assertNotIn("does not exist", result.stderr)
                     self.assertEqual(git_head(repo["work"]), repo["main"])
+
+    def test_confirm_step_uses_the_tooling_helper_when_the_tag_cannot_confirm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = init_packaging_remote(Path(temp), clone_head="main")
+            historical = self.resolve(repo, "v1.2.3", "")
+            self.assertEqual(historical.returncode, 0, historical.stderr)
+            self.assertEqual(output_map(historical.stdout)["confirm_from"], "tool")
+            self.assertEqual(output_map(historical.stdout)["packaging"], "tool")
+            legacy = self.resolve(repo, "v8.8.8", "")
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            legacy_data = output_map(legacy.stdout)
+            self.assertEqual(legacy_data["source_sha"], repo["legacy"])
+            self.assertEqual(legacy_data["packaging"], "source")
+            self.assertEqual(legacy_data["confirm_from"], "tool")
+
+            run_git(repo["work"], "checkout", "--detach", repo["base"])
+            direct = subprocess.run(
+                ["bash", "scripts/release/package_manual_artifacts.sh", "confirm-source",
+                 "--kind", "tag", "--name", "v1.2.3", "--sha", repo["base"]],
+                cwd=repo["work"], text=True, capture_output=True, timeout=60)
+            self.assertEqual(direct.returncode, 127, direct.stderr)
+            missing_helper = run_confirm_step(repo["work"], "tag", "v1.2.3", repo["base"])
+            self.assertNotEqual(missing_helper.returncode, 0)
+            self.assertIn("no packaging script implements confirm-source", missing_helper.stderr)
+            install_confirm_helper(repo["work"])
+            confirmed = run_confirm_step(repo["work"], "tag", "v1.2.3", repo["base"])
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+
+            stub = repo["work"] / "scripts" / "release" / "package_manual_artifacts.sh"
+            stub.parent.mkdir(parents=True, exist_ok=True)
+            stub.write_text("#!/bin/bash\ncase \"${1:-}\" in\n  package) ;;\n  *) exit 2 ;;\nesac\n", encoding="utf-8")
+            helper = repo["work"] / "packaging-tools" / "scripts" / "release" / "package_manual_artifacts.sh"
+            helper.unlink()
+            old_script = run_confirm_step(repo["work"], "tag", "v1.2.3", repo["base"])
+            self.assertNotEqual(old_script.returncode, 0)
+            self.assertIn("no packaging script implements confirm-source", old_script.stderr)
+            install_confirm_helper(repo["work"])
+            confirmed = run_confirm_step(repo["work"], "tag", "v1.2.3", repo["base"])
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+
+            helper.unlink()
+            install_confirm_helper(repo["work"])
+            source_helper = repo["work"] / "scripts" / "release" / "package_manual_artifacts.sh"
+            source_helper.write_bytes(SCRIPT.read_bytes())
+            source_helper.chmod(0o755)
+            (repo["work"] / "packaging-tools").rename(repo["work"] / "packaging-tools-absent")
+            confirmed = run_confirm_step(repo["work"], "tag", "v1.2.3", repo["base"])
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
 
     def test_recipe_must_exist_on_the_tooling_checkout_when_the_commit_lacks_it(self):
         with tempfile.TemporaryDirectory() as temp:
