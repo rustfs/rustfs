@@ -25,17 +25,18 @@
 //!
 //! Secrets travel only inside the gateway's [`Credentials`], whose `Debug` redacts them. No type
 //! in this module derives or implements `Debug`, and no error produced here carries text: the
-//! IAM error is classified and dropped.
+//! IAM error is classified and dropped. A secret shorter than [`MIN_SECRET_KEY_LEN`] is never
+//! handed to the gateway, whatever the lookup says about its validity.
 
 use std::sync::Arc;
 
-use rustfs_gateway::{
-    BoxFuture, CredentialLookup, CredentialProvider, Credentials, CredentialsError, ProviderError, SessionBinding,
-};
+use rustfs_gateway::{BoxFuture, CredentialLookup, CredentialProvider, Credentials, ProviderError, SessionBinding};
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::auth::{ACCOUNT_OFF, UserIdentity};
+
+use crate::root::{MIN_SECRET_KEY_LEN, RootSource};
 
 /// The opaque issuer recorded in the [`rustfs_gateway::SessionBinding`] of every RustFS STS
 /// credential.
@@ -69,26 +70,18 @@ impl<T: Store> IamKeyLookup for IamSys<T> {
     }
 }
 
-/// A [`CredentialProvider`] over RustFS IAM, with the root credentials injected at assembly.
+/// A [`CredentialProvider`] over RustFS IAM and the live root credentials.
+///
+/// Built only by [`crate::IamAdapters::new`], so it always reads the same [`RootSource`] as the
+/// policy source it was assembled with.
 pub struct IamCredentials {
     iam: Arc<dyn IamKeyLookup>,
-    root: Option<Credentials>,
+    root: Arc<dyn RootSource>,
 }
 
 impl IamCredentials {
-    /// A provider that resolves every access key through `iam`.
-    pub fn new(iam: Arc<dyn IamKeyLookup>) -> Self {
-        Self { iam, root: None }
-    }
-
-    /// Adds the root credentials, which resolve even before IAM is ready.
-    ///
-    /// # Errors
-    ///
-    /// [`CredentialsError::Malformed`] when the access key id is not one the gateway can hold.
-    pub fn with_root(mut self, access_key: &str, secret_key: &[u8]) -> Result<Self, CredentialsError> {
-        self.root = Some(Credentials::new(access_key, secret_key)?);
-        Ok(self)
+    pub(crate) fn new(iam: Arc<dyn IamKeyLookup>, root: Arc<dyn RootSource>) -> Self {
+        Self { iam, root }
     }
 
     async fn resolve(&self, access_key: &str) -> Result<CredentialLookup, ProviderError> {
@@ -99,11 +92,14 @@ impl IamCredentials {
             return Ok(CredentialLookup::NotFound);
         }
 
+        // Legacy answers every key with an internal error while the root credentials are not
+        // initialized; without them no key can be classified as root or not.
+        let Some(root) = self.root.current() else {
+            return Err(ProviderError::Unavailable);
+        };
         // Byte-exact, as the trait requires: the access key id is signed material.
-        if let Some(root) = &self.root
-            && root.identity().access_key_id() == access_key
-        {
-            return Ok(CredentialLookup::Found(root.clone_credentials()));
+        if root.access_key() == access_key {
+            return Ok(CredentialLookup::Found(root.credentials().clone_credentials()));
         }
 
         if !self.iam.is_ready() {
@@ -111,6 +107,11 @@ impl IamCredentials {
         }
 
         match self.iam.check_key(access_key).await {
+            // IAM refuses such a secret through `valid`, but this provider does not rely on every
+            // lookup doing so: a short secret is never usable, so it is not a credential at all.
+            Ok((Some(identity), _)) if identity.credentials.secret_key.len() < MIN_SECRET_KEY_LEN => {
+                Ok(CredentialLookup::NotFound)
+            }
             Ok((Some(identity), valid)) => to_gateway_credentials(access_key, &identity, valid).map(CredentialLookup::Found),
             Ok((None, _)) => Ok(CredentialLookup::NotFound),
             Err(error) => classify_iam_error(&error),
@@ -165,6 +166,7 @@ impl CredentialProvider for IamCredentials {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::root::{RootCell, RootCredentials};
     use rustfs_credentials::Credentials as IamCredential;
     use rustfs_gateway::RequestNow;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -217,8 +219,13 @@ mod tests {
         Ok((Some(UserIdentity::new(cred)), valid))
     }
 
+    fn root_cell() -> Arc<RootCell> {
+        let root = RootCredentials::new("rootadmin", "root-secret-key", "sts-signing-key").expect("valid root credentials");
+        Arc::new(RootCell::new(Some(root)))
+    }
+
     async fn lookup(iam: Arc<FakeIam>, access_key: &str) -> Result<CredentialLookup, ProviderError> {
-        IamCredentials::new(iam).lookup(access_key).await
+        IamCredentials::new(iam, root_cell()).lookup(access_key).await
     }
 
     fn expect_found(result: Result<CredentialLookup, ProviderError>) -> Credentials {
@@ -368,12 +375,62 @@ mod tests {
     #[tokio::test]
     async fn credentials_root_resolves_without_iam() {
         let iam = fake(false, || found(user("on"), true));
-        let provider = IamCredentials::new(iam.clone())
-            .with_root("rootadmin", b"root-secret-key")
-            .expect("valid root credentials");
+        let provider = IamCredentials::new(iam.clone(), root_cell());
         let root = expect_found(provider.lookup("rootadmin").await);
         assert_eq!(root.secret().expose(), b"root-secret-key");
         assert!(matches!(provider.lookup("ROOTADMIN").await, Err(ProviderError::Unavailable)));
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Negative — a lookup that calls an identity valid but holds an empty or short secret is not
+    /// trusted: such a secret is not a credential, so the key is `NotFound`, never `Found`.
+    #[tokio::test]
+    async fn credentials_short_secret_is_never_found() {
+        for weak in ["", "1234567"] {
+            let iam = fake(true, move || {
+                let mut cred = user("on");
+                cred.secret_key = weak.to_owned();
+                found(cred, true)
+            });
+            let result = lookup(iam, ACCESS_KEY).await;
+            assert!(is_not_found(&result), "{} bytes must be NotFound", weak.len());
+        }
+    }
+
+    /// Negative — a switched-off account is disabled even when the lookup calls it valid.
+    #[tokio::test]
+    async fn credentials_off_status_alone_disables() {
+        let off = expect_found(lookup(fake(true, || found(user("off"), true)), ACCESS_KEY).await);
+        assert!(off.is_disabled());
+        assert!(off.admit(None, RequestNow::from_unix_seconds(0)).is_err());
+    }
+
+    /// Negative — an STS credential admits only its own session's token: the token of another
+    /// session, or none, is refused.
+    #[tokio::test]
+    async fn credentials_sts_refuses_another_sessions_token() {
+        let expires_at = 4_000_000_000_i64;
+        let iam = fake(true, move || {
+            let mut cred = user("on");
+            cred.session_token = "session-token-a".to_owned();
+            cred.parent_user = "parent".to_owned();
+            cred.expiration = Some(OffsetDateTime::from_unix_timestamp(expires_at).expect("valid timestamp"));
+            found(cred, true)
+        });
+        let credentials = expect_found(lookup(iam, ACCESS_KEY).await);
+        let now = RequestNow::from_unix_seconds(expires_at - 1);
+        assert!(credentials.admit(Some(b"session-token-b"), now).is_err());
+        assert!(credentials.admit(Some(b"session-token-a"), now).is_ok());
+    }
+
+    /// Negative — without root credentials no key can be classified, so every lookup is
+    /// `Unavailable` and IAM is not asked.
+    #[tokio::test]
+    async fn credentials_without_root_are_unavailable() {
+        let iam = fake(true, || found(user("on"), true));
+        let provider = IamCredentials::new(iam.clone(), Arc::new(RootCell::new(None)));
+        assert!(matches!(provider.lookup(ACCESS_KEY).await, Err(ProviderError::Unavailable)));
+        assert!(matches!(provider.lookup("rootadmin").await, Err(ProviderError::Unavailable)));
         assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
     }
 }

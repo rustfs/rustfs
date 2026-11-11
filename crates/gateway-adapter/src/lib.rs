@@ -20,6 +20,34 @@
 
 pub mod credentials;
 pub mod policy;
+pub mod root;
+
+use std::sync::Arc;
 
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
+pub use root::{MIN_SECRET_KEY_LEN, RootCell, RootCredentials, RootCredentialsError, RootSource};
+
+/// The IAM-backed credential provider and policy source, assembled together.
+///
+/// This is the only way to build either one, so the two always read the same IAM and the same
+/// live [`RootSource`]: a key cannot be root to one and an ordinary user to the other.
+pub struct IamAdapters {
+    /// The gateway `CredentialProvider`.
+    pub credentials: IamCredentials,
+    /// The gateway `PolicySource`.
+    pub policy: IamPolicySource,
+}
+
+impl IamAdapters {
+    /// Assembles both adapters over one IAM handle and one root source. The binary supplies a
+    /// source that follows its live root credentials, such as a [`RootCell`] it updates on every
+    /// root change.
+    #[must_use]
+    pub fn new(iam: Arc<dyn IamPrincipalLookup>, root: Arc<dyn RootSource>) -> Self {
+        Self {
+            credentials: IamCredentials::new(iam.clone(), root.clone()),
+            policy: IamPolicySource::new(iam, root),
+        }
+    }
+}

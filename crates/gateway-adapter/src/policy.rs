@@ -26,8 +26,10 @@
 //! # Failure classes
 //!
 //! Every refusal is a [`PolicyError`] with a constant label and nothing from IAM or the request:
-//! IAM not ready, not initialized, or failing is [`PolicyError::unavailable`]; a principal IAM no
-//! longer knows is [`UNKNOWN_PRINCIPAL`]; a disabled one is [`DISABLED_PRINCIPAL`]; an identity
+//! IAM not ready, not initialized, or failing, or root credentials not initialized, is
+//! [`PolicyError::unavailable`]; a principal IAM no longer knows is [`UNKNOWN_PRINCIPAL`]; a
+//! disabled one, or one whose secret is shorter than [`MIN_SECRET_KEY_LEN`], is
+//! [`DISABLED_PRINCIPAL`]; an identity
 //! whose credential kind disagrees with IAM's record is [`SESSION_MISMATCH`]; a token whose claims
 //! cannot be read is [`PolicyError::malformed`]. None of them is ever an empty snapshot: an empty
 //! snapshot is what an anonymous caller gets, and answering a fault with it would judge an
@@ -36,14 +38,14 @@
 //! # Secret handling
 //!
 //! [`RustfsPrincipal`] holds no secret key and no session token, and implements no `Debug`, so a
-//! snapshot formatted into a log cannot print its claims either. The root secret is held only in
-//! the gateway's [`Credentials`], whose `Debug` redacts it, and is used to read STS claims.
+//! snapshot formatted into a log cannot print its claims either. The root credentials and the STS
+//! token-signing key are read per request from the shared [`RootSource`] and never stored here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use rustfs_credentials::Credentials as IamCredential;
-use rustfs_gateway::{BoxFuture, Credentials, CredentialsError, Identity, PolicyError, PolicySnapshot, PolicySource};
+use rustfs_gateway::{BoxFuture, Identity, PolicyError, PolicySnapshot, PolicySource};
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::{
@@ -54,6 +56,7 @@ use rustfs_policy::auth::ACCOUNT_OFF;
 use serde_json::Value;
 
 use crate::credentials::IamKeyLookup;
+use crate::root::{MIN_SECRET_KEY_LEN, RootCredentials, RootSource};
 
 /// [`PolicyError`] label: IAM does not know the authenticated principal (any longer).
 pub const UNKNOWN_PRINCIPAL: &str = "unknown-principal";
@@ -157,28 +160,18 @@ impl RustfsPrincipal {
     }
 }
 
-/// A [`PolicySource`] over RustFS IAM, with the root credentials injected at assembly.
+/// A [`PolicySource`] over RustFS IAM and the live root credentials.
+///
+/// Built only by [`crate::IamAdapters::new`], so it always reads the same [`RootSource`] as the
+/// credential provider it was assembled with.
 pub struct IamPolicySource {
     iam: Arc<dyn IamPrincipalLookup>,
-    root: Credentials,
+    root: Arc<dyn RootSource>,
 }
 
 impl IamPolicySource {
-    /// A source that reads every non-root principal through `iam`. The root secret is what RustFS
-    /// signs STS tokens with, so it is needed to read their claims.
-    ///
-    /// # Errors
-    ///
-    /// [`CredentialsError`] when the root access key id is not one the gateway can hold.
-    pub fn new(
-        iam: Arc<dyn IamPrincipalLookup>,
-        root_access_key: &str,
-        root_secret_key: &[u8],
-    ) -> Result<Self, CredentialsError> {
-        Ok(Self {
-            iam,
-            root: Credentials::new(root_access_key, root_secret_key)?,
-        })
+    pub(crate) fn new(iam: Arc<dyn IamPrincipalLookup>, root: Arc<dyn RootSource>) -> Self {
+        Self { iam, root }
     }
 
     async fn read(&self, identity: Option<&Identity>) -> Result<PolicySnapshot, PolicyError> {
@@ -192,7 +185,11 @@ impl IamPolicySource {
     async fn principal(&self, identity: &Identity) -> Result<RustfsPrincipal, PolicyError> {
         let access_key = identity.access_key_id();
         let has_session = identity.session().is_some();
-        let root_access_key = self.root.identity().access_key_id();
+        // Without root credentials neither ownership nor STS claims can be decided.
+        let Some(root) = self.root.current() else {
+            return Err(PolicyError::unavailable());
+        };
+        let root_access_key = root.access_key();
 
         if access_key == root_access_key {
             // Root has no session token, so a session identity for its key is not one IAM issued.
@@ -220,7 +217,7 @@ impl IamPolicySource {
             Ok((None, _)) => return Err(PolicyError::because(UNKNOWN_PRINCIPAL)),
             Err(error) => return Err(classify_iam_error(&error)),
         };
-        if cred.status == ACCOUNT_OFF {
+        if cred.status == ACCOUNT_OFF || cred.secret_key.len() < MIN_SECRET_KEY_LEN {
             return Err(PolicyError::because(DISABLED_PRINCIPAL));
         }
 
@@ -237,7 +234,7 @@ impl IamPolicySource {
             return Err(PolicyError::because(SESSION_MISMATCH));
         }
 
-        let claims = self.claims(kind, &cred)?;
+        let claims = read_claims(kind, &cred, &root)?;
         let username = match kind {
             PrincipalKind::Temporary | PrincipalKind::ServiceAccount => cred.parent_user.clone(),
             PrincipalKind::Root | PrincipalKind::User => cred.access_key.clone(),
@@ -257,27 +254,29 @@ impl IamPolicySource {
             is_owner,
         })
     }
+}
 
-    /// The claims of the credential's own token. The gateway admitted the presented token only
-    /// when it equals the stored one, so reading the stored token reads the presented one.
-    fn claims(&self, kind: PrincipalKind, cred: &IamCredential) -> Result<Option<HashMap<String, Value>>, PolicyError> {
-        // As in legacy `check_claims_from_token_with_context`: no token, no claims.
-        if cred.session_token.is_empty() {
-            return Ok(None);
-        }
-        let claims = match kind {
-            PrincipalKind::ServiceAccount => {
-                get_claims_from_token_with_secret_allow_missing_exp(&cred.session_token, &cred.secret_key)
-                    .map_err(|_| PolicyError::malformed())?
-            }
-            PrincipalKind::Temporary => {
-                let root_secret = std::str::from_utf8(self.root.secret().expose()).map_err(|_| PolicyError::malformed())?;
-                get_claims_from_token_with_secret(&cred.session_token, root_secret).map_err(|_| PolicyError::malformed())?
-            }
-            PrincipalKind::Root | PrincipalKind::User => return Ok(None),
-        };
-        Ok(if claims.is_empty() { None } else { Some(claims) })
+/// The claims of the credential's own token. The gateway admitted the presented token only when it
+/// equals the stored one, so reading the stored token reads the presented one.
+fn read_claims(
+    kind: PrincipalKind,
+    cred: &IamCredential,
+    root: &RootCredentials,
+) -> Result<Option<HashMap<String, Value>>, PolicyError> {
+    // As in legacy `check_claims_from_token_with_context`: no token, no claims.
+    if cred.session_token.is_empty() {
+        return Ok(None);
     }
+    let claims = match kind {
+        PrincipalKind::ServiceAccount => {
+            get_claims_from_token_with_secret_allow_missing_exp(&cred.session_token, &cred.secret_key)
+                .map_err(|_| PolicyError::malformed())?
+        }
+        PrincipalKind::Temporary => get_claims_from_token_with_secret(&cred.session_token, root.sts_signing_key())
+            .map_err(|_| PolicyError::malformed())?,
+        PrincipalKind::Root | PrincipalKind::User => return Ok(None),
+    };
+    Ok(if claims.is_empty() { None } else { Some(claims) })
 }
 
 /// Classifies an IAM failure without keeping any of its text.
@@ -309,6 +308,7 @@ impl PolicySource for IamPolicySource {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::root::RootCell;
     use rustfs_credentials::{Credentials as IamCredential, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_gateway::SessionBinding;
     use rustfs_iam::error::Error as IamError;
@@ -320,6 +320,8 @@ mod tests {
 
     const ROOT_ACCESS_KEY: &str = "rootadmin";
     const ROOT_SECRET: &str = "root-secret-key-0001";
+    /// Deliberately not the root secret, so every STS test proves which key claims are read with.
+    const SIGNING_KEY: &str = "sts-signing-key-0001";
     const ACCESS_KEY: &str = "AKIDUSER0001";
     const SECRET: &str = "user-secret-key-0001";
     const PARENT: &str = "alice";
@@ -331,7 +333,6 @@ mod tests {
     struct FakeIam {
         ready: bool,
         answer: Answer,
-        memberships: Vec<String>,
         calls: AtomicUsize,
     }
 
@@ -348,11 +349,13 @@ mod tests {
     }
 
     impl IamPrincipalLookup for FakeIam {
+        /// Distinct groups per name, so a test can tell which name the source asked about.
         fn group_memberships(&self, user: &str) -> Vec<String> {
-            if user == PARENT || user == ACCESS_KEY {
-                self.memberships.clone()
-            } else {
-                Vec::new()
+            match user {
+                PARENT => vec!["parent-group".to_owned()],
+                ACCESS_KEY => vec!["key-group".to_owned()],
+                ROOT_ACCESS_KEY => vec!["root-group".to_owned()],
+                _ => Vec::new(),
             }
         }
     }
@@ -361,13 +364,16 @@ mod tests {
         Arc::new(FakeIam {
             ready,
             answer: Box::new(answer),
-            memberships: vec!["live-group".to_owned()],
             calls: AtomicUsize::new(0),
         })
     }
 
+    fn root() -> RootCredentials {
+        RootCredentials::new(ROOT_ACCESS_KEY, ROOT_SECRET, SIGNING_KEY).expect("valid root credentials")
+    }
+
     fn source(iam: Arc<FakeIam>) -> IamPolicySource {
-        IamPolicySource::new(iam, ROOT_ACCESS_KEY, ROOT_SECRET.as_bytes()).expect("valid root credentials")
+        IamPolicySource::new(iam, Arc::new(RootCell::new(Some(root()))))
     }
 
     fn user() -> IamCredential {
@@ -448,7 +454,7 @@ mod tests {
         assert_eq!(principal.username(), ACCESS_KEY);
         assert_eq!(principal.parent_user(), "");
         assert_eq!(principal.credential_groups(), &Some(vec!["cred-group".to_owned()]));
-        assert_eq!(principal.group_memberships(), ["live-group".to_owned()]);
+        assert_eq!(principal.group_memberships(), ["key-group".to_owned()]);
         assert!(principal.claims().is_none());
         assert!(!principal.is_owner());
     }
@@ -457,7 +463,7 @@ mod tests {
     /// token carries, read with the root secret that signed it.
     #[tokio::test]
     async fn policy_sts_snapshot_carries_parent_user_and_claims() {
-        let token = sts_token(&[("sub", Value::from("alice-session"))], ROOT_SECRET);
+        let token = sts_token(&[("sub", Value::from("alice-session"))], SIGNING_KEY);
         let iam = fake(true, move || found(sts(PARENT, token.clone())));
         let snapshot = principal_of(&source(iam), &session(ACCESS_KEY)).await;
         let principal = payload(&snapshot);
@@ -467,7 +473,7 @@ mod tests {
         assert_eq!(principal.username(), PARENT);
         let claims = principal.claims().expect("an STS principal has claims");
         assert_eq!(claims.get("sub"), Some(&Value::from("alice-session")));
-        assert_eq!(principal.group_memberships(), ["live-group".to_owned()]);
+        assert_eq!(principal.group_memberships(), ["parent-group".to_owned()]);
         assert!(!principal.is_owner());
     }
 
@@ -491,6 +497,8 @@ mod tests {
         assert!(principal.kind() == PrincipalKind::ServiceAccount);
         assert_eq!(principal.username(), PARENT);
         assert_eq!(principal.claims().and_then(|c| c.get("parent")), Some(&Value::from(PARENT)));
+        assert_eq!(principal.group_memberships(), ["parent-group".to_owned()]);
+        assert!(!principal.is_owner());
     }
 
     /// Positive and negative — root is the owner without asking IAM, even before IAM is ready;
@@ -504,11 +512,11 @@ mod tests {
         assert!(root.is_owner());
         assert_eq!(not_ready.calls.load(Ordering::SeqCst), 0);
 
-        let plain = sts_token(&[], ROOT_SECRET);
+        let plain = sts_token(&[], SIGNING_KEY);
         let iam = fake(true, move || found(sts(ROOT_ACCESS_KEY, plain.clone())));
         assert!(payload(&principal_of(&source(iam), &session(ACCESS_KEY)).await).is_owner());
 
-        let narrowed = sts_token(&[(SESSION_POLICY_NAME, Value::from("e30"))], ROOT_SECRET);
+        let narrowed = sts_token(&[(SESSION_POLICY_NAME, Value::from("e30"))], SIGNING_KEY);
         let iam = fake(true, move || found(sts(ROOT_ACCESS_KEY, narrowed.clone())));
         assert!(!payload(&principal_of(&source(iam), &session(ACCESS_KEY)).await).is_owner());
     }
@@ -582,7 +590,7 @@ mod tests {
     /// a long-term key, or a long-term identity for an STS key, is refused.
     #[tokio::test]
     async fn policy_session_kind_mismatch_is_refused() {
-        let token = sts_token(&[], ROOT_SECRET);
+        let token = sts_token(&[], SIGNING_KEY);
         let iam = fake(true, move || found(sts(PARENT, token.clone())));
         let error = refusal(source(iam).snapshot(Some(&long_term(ACCESS_KEY))).await);
         assert_eq!(error, PolicyError::because(SESSION_MISMATCH));
@@ -594,5 +602,131 @@ mod tests {
         let iam = fake(false, || found(user()));
         let error = refusal(source(iam).snapshot(Some(&session(ROOT_ACCESS_KEY))).await);
         assert_eq!(error, PolicyError::because(SESSION_MISMATCH));
+    }
+
+    fn service_account(parent: &str, extra_claims: &[(&str, Value)]) -> KeyAnswer {
+        let mut token_claims: HashMap<String, Value> = extra_claims.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect();
+        token_claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_owned(), Value::from("inherited-policy"));
+        let mut cred = user();
+        cred.session_token = generate_jwt(&token_claims, SECRET).expect("a token");
+        cred.parent_user = parent.to_owned();
+        cred.claims = Some([(IAM_POLICY_CLAIM_NAME_SA.to_owned(), Value::from("inherited-policy"))].into());
+        found(cred)
+    }
+
+    /// Negative — a valid-flagged identity whose secret is empty or short gets no snapshot.
+    #[tokio::test]
+    async fn policy_short_secret_principal_is_refused() {
+        for weak in ["", "1234567"] {
+            let iam = fake(true, move || {
+                let mut cred = user();
+                cred.secret_key = weak.to_owned();
+                found(cred)
+            });
+            let error = refusal(source(iam).snapshot(Some(&long_term(ACCESS_KEY))).await);
+            assert_eq!(error, PolicyError::because(DISABLED_PRINCIPAL), "{} bytes", weak.len());
+        }
+    }
+
+    /// Negative — a root session issued through external OIDC is not the owner, though its parent
+    /// is root; the same session without the OIDC issuer is.
+    #[tokio::test]
+    async fn policy_oidc_root_session_is_not_owner() {
+        let oidc = sts_token(
+            &[
+                ("iss", Value::from("rustfs-oidc")),
+                ("oidc_provider", Value::from("corp-idp")),
+                ("sub", Value::from("alice@corp")),
+            ],
+            SIGNING_KEY,
+        );
+        let iam = fake(true, move || found(sts(ROOT_ACCESS_KEY, oidc.clone())));
+        assert!(!payload(&principal_of(&source(iam), &session(ACCESS_KEY)).await).is_owner());
+
+        let local = sts_token(
+            &[
+                ("iss", Value::from("rustfs-sts")),
+                ("oidc_provider", Value::from("corp-idp")),
+                ("sub", Value::from("alice@corp")),
+            ],
+            SIGNING_KEY,
+        );
+        let iam = fake(true, move || found(sts(ROOT_ACCESS_KEY, local.clone())));
+        assert!(payload(&principal_of(&source(iam), &session(ACCESS_KEY)).await).is_owner());
+    }
+
+    /// Positive and negative — a service account of root is the owner; one narrowed by a session
+    /// policy is not, and neither is a service account of an ordinary user.
+    #[tokio::test]
+    async fn policy_service_account_of_root_is_owner() {
+        let iam = fake(true, || service_account(ROOT_ACCESS_KEY, &[]));
+        let principal = principal_of(&source(iam), &long_term(ACCESS_KEY)).await;
+        assert!(payload(&principal).kind() == PrincipalKind::ServiceAccount);
+        assert!(payload(&principal).is_owner());
+
+        let iam = fake(true, || service_account(ROOT_ACCESS_KEY, &[(SESSION_POLICY_NAME, Value::from("e30"))]));
+        assert!(!payload(&principal_of(&source(iam), &long_term(ACCESS_KEY)).await).is_owner());
+
+        let iam = fake(true, || service_account(PARENT, &[]));
+        assert!(!payload(&principal_of(&source(iam), &long_term(ACCESS_KEY)).await).is_owner());
+    }
+
+    /// Negative — STS claims are read with the STS signing key, not with the root secret: a token
+    /// signed with the root secret while the signing key differs is `malformed`.
+    #[tokio::test]
+    async fn policy_sts_claims_use_the_signing_key() {
+        let root_signed = sts_token(&[("sub", Value::from("alice-session"))], ROOT_SECRET);
+        let iam = fake(true, move || found(sts(PARENT, root_signed.clone())));
+        let error = refusal(source(iam).snapshot(Some(&session(ACCESS_KEY))).await);
+        assert_eq!(error, PolicyError::malformed());
+    }
+
+    /// Negative — without root credentials no principal can be judged: `unavailable`, never an
+    /// empty snapshot, and IAM is not asked.
+    #[tokio::test]
+    async fn policy_without_root_is_unavailable() {
+        let iam = fake(true, || found(user()));
+        let source = IamPolicySource::new(iam.clone(), Arc::new(RootCell::new(None)));
+        for identity in [long_term(ACCESS_KEY), long_term(ROOT_ACCESS_KEY)] {
+            assert_eq!(refusal(source.snapshot(Some(&identity)).await), PolicyError::unavailable());
+        }
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Positive and negative — the two adapters assembled together read one root source: a root
+    /// change is seen by both on the next request, the old root key stops being root to both, and
+    /// clearing the source makes both unavailable.
+    #[tokio::test]
+    async fn adapters_share_one_live_root() {
+        use rustfs_gateway::{CredentialLookup, CredentialProvider, ProviderError};
+
+        let cell = Arc::new(RootCell::new(Some(root())));
+        let iam = fake(true, || Ok((None, false)));
+        let adapters = crate::IamAdapters::new(iam, cell.clone());
+
+        let found = adapters.credentials.lookup(ROOT_ACCESS_KEY).await;
+        assert!(matches!(found, Ok(CredentialLookup::Found(_))));
+        let snapshot = principal_of(&adapters.policy, &long_term(ROOT_ACCESS_KEY)).await;
+        assert!(payload(&snapshot).is_owner());
+
+        cell.set(RootCredentials::new("newroot", "new-root-secret-01", SIGNING_KEY).expect("valid root credentials"));
+        match adapters.credentials.lookup("newroot").await {
+            Ok(CredentialLookup::Found(credentials)) => assert_eq!(credentials.secret().expose(), b"new-root-secret-01"),
+            _ => panic!("the new root key must resolve to the new secret"),
+        }
+        assert!(matches!(
+            adapters.credentials.lookup(ROOT_ACCESS_KEY).await,
+            Ok(CredentialLookup::NotFound)
+        ));
+        assert!(payload(&principal_of(&adapters.policy, &long_term("newroot")).await).is_owner());
+        let old = refusal(adapters.policy.snapshot(Some(&long_term(ROOT_ACCESS_KEY))).await);
+        assert_eq!(old, PolicyError::because(UNKNOWN_PRINCIPAL));
+
+        cell.clear();
+        assert!(matches!(adapters.credentials.lookup("newroot").await, Err(ProviderError::Unavailable)));
+        assert_eq!(
+            refusal(adapters.policy.snapshot(Some(&long_term("newroot"))).await),
+            PolicyError::unavailable()
+        );
     }
 }
