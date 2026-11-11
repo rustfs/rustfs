@@ -230,7 +230,7 @@ async fn handle_assume_role(
 
     // The signature was verified before the request body was consumed. A fresh
     // IAM lookup must not silently replace the secret that authenticated it.
-    if !crate::auth::constant_time_eq(&cred.secret_key, user.secret_key()) {
+    if !user.secret_key_matches(&cred.secret_key) {
         return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
     }
 

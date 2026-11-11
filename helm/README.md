@@ -157,6 +157,7 @@ behavior.
 | config.rustfs.obs_environment | string | `"development"` |  |
 | config.rustfs.obs_log_directory | string | `"/logs"` | Log directory inside the RustFS container. Set to `""` to disable log PVCs and mounts. |
 | config.rustfs.region | string | `"us-east-1"` |  |
+| config.rustfs.target_store_dir | string | `""` | Absolute root for notify and audit target queues that keep the default `queue_dir`, set as `RUSTFS_TARGET_STORE_DIR`; queues move to `<root>/events` and `<root>/audit`. Empty keeps the image layout, where `/opt/rustfs/events` and `/opt/rustfs/audit` link into `/data/.rustfs`. |
 | config.rustfs.volumes | string | `""` | Explicit distributed volume topology. When empty, the chart generates the topology and normally injects `RUSTFS_LOCAL_ENDPOINT_HOST`; custom topologies must configure local endpoint identity explicitly when needed. |
 | config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
 | config.rustfs.log_rotation.time | string | `"hour"` | Default log rotation time for rustfs. |
