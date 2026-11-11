@@ -753,7 +753,7 @@ fn list_objects_v2_input(bucket: String, uri: &Uri, headers: &HeaderMap) -> S3Re
     })
 }
 
-fn bucket_from_request(uri: &Uri, headers: &HeaderMap, host: Option<&MultiDomain>) -> S3Result<String> {
+pub(crate) fn bucket_from_request(uri: &Uri, headers: &HeaderMap, host: Option<&MultiDomain>) -> S3Result<String> {
     if let Some(host) = host
         && let Some(host_header) = headers.get(HOST).and_then(|value| value.to_str().ok())
     {

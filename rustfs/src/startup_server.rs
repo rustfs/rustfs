@@ -78,6 +78,23 @@ pub(crate) struct StartupHttpServers {
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
 }
 
+/// cuObject S3-over-RDMA servers live for the process lifetime; they stop with it.
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+async fn init_cuobject_servers() -> Result<()> {
+    crate::app::object::cuobject::init_cuobject_service().await?;
+    // Bucket engines move data over the same NIXL server.
+    #[cfg(feature = "nixl")]
+    if let Some(server) = crate::app::object::cuobject::nixl_server() {
+        crate::bucket_engine::rdma::set_server(server);
+    }
+    Ok(())
+}
+
+#[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+async fn init_cuobject_servers() -> Result<()> {
+    Ok(())
+}
+
 pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
@@ -278,6 +295,8 @@ pub(crate) async fn init_startup_http_servers(
         Some(console_config) => Some(start_http_server(&console_config, readiness, server_ctx).await?.0),
         None => None,
     };
+
+    init_cuobject_servers().await?;
 
     Ok(StartupHttpServers {
         state_manager,

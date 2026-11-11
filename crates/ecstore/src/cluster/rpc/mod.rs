@@ -20,6 +20,7 @@ pub(crate) mod context_propagation;
 pub(crate) mod http_auth;
 pub(crate) mod internode_data_transport;
 mod network_probe;
+pub(crate) mod nixl_internode;
 pub(crate) mod peer_rest_client;
 pub(crate) mod peer_s3_client;
 pub(crate) mod remote_disk;

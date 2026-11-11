@@ -987,6 +987,17 @@ impl_canonical_mutation_body!(
     }
 );
 impl_canonical_mutation_body!(
+    proto_gen::node_service::EngineCallRequest,
+    b"rustfs-engine-call-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+        body.push_str(&request.engine)?;
+        body.push_str(&request.operation)?;
+        body.push_bytes(&request.body)?;
+    }
+);
+impl_canonical_mutation_body!(
     proto_gen::node_service::DeleteBucketMetadataRequest,
     b"rustfs-delete-bucket-metadata-request-v1\0",
     |request, body| {
@@ -2300,6 +2311,13 @@ mod non_disk_mutation_canonical_tests {
         assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
         assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(EngineCallRequest, {
+            bucket: "bucket".into(),
+            bucket_incarnation_id: vec![1; 16].into(),
+            engine: "kv-cache".into(),
+            operation: "batch-read".into(),
+            body: vec![2; 8].into()
+        });
         assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
         assert_fields_bound!(BatchGenerallyLockRequest, { args: vec!["first".into(), "second".into()] });
 

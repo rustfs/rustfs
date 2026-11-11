@@ -46,6 +46,10 @@ pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
 /// Maximum logical object size for a capability-bound multipart upload.
 pub const SUFFIX_MAX_TOTAL_OBJECT_SIZE: &str = "max-total-object-size";
+/// ETag algorithm pinned for a multipart upload at its creation (`xxh3`
+/// when the bucket uses XXH3 ETags), so every part of one upload hashes the
+/// same way even if the bucket setting changes mid-upload.
+pub const SUFFIX_ETAG_ALGORITHM: &str = "etag-algorithm";
 pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";

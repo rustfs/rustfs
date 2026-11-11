@@ -17,10 +17,10 @@
 #[cfg(test)]
 pub(super) use crate::storage_api::on_demand_migration::test_support;
 pub(super) use crate::storage_api::on_demand_migration::{
-    BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_META_PREFIX, BUCKET_ON_DEMAND_MIGRATION_CONFIG, ECStore, HTTPPreconditions, HTTPRangeSpec,
-    NamespaceLocking, ObjectOperations, ObjectOptions, RUSTFS_META_BUCKET, StorageError, WriteCompletion,
-    get_lock_acquire_timeout, get_on_demand_migration_config, get_on_demand_migration_config_in, read_config_with_metadata,
-    remote_s3_client, save_config_with_opts,
+    BUCKET_META_PREFIX, BUCKET_ON_DEMAND_MIGRATION_CONFIG, ECStore, HTTPPreconditions, HTTPRangeSpec, NamespaceLocking,
+    ObjectOperations, ObjectOptions, RUSTFS_META_BUCKET, StorageError, WriteCompletion, get_lock_acquire_timeout,
+    get_on_demand_migration_config, get_on_demand_migration_config_in, read_config_with_metadata,
+    register_bucket_config_subscriber, remote_s3_client, save_config_with_opts,
 };
 
 pub(super) async fn local_node_name() -> String {

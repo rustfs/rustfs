@@ -19,6 +19,7 @@ pub mod admin_usecase;
 pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;
+pub(crate) mod engine_operation_route;
 pub(crate) mod metadata_route;
 pub mod multipart_usecase;
 pub mod object;

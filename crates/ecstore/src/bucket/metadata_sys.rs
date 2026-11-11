@@ -58,8 +58,54 @@ use uuid::Uuid;
 
 /// Opaque bucket configuration notifications for application-owned services.
 /// `None` withdraws a configuration; consumers validate nonempty bytes.
-pub type BucketConfigPublishHook = Box<dyn Fn(&str, &str, Option<(&[u8], OffsetDateTime, Uuid)>) + Send + Sync>;
-pub static BUCKET_CONFIG_PUBLISH_HOOK: std::sync::OnceLock<BucketConfigPublishHook> = std::sync::OnceLock::new();
+pub type BucketConfigPublishHook = Box<BucketConfigHookFn>;
+
+/// Callback signature shared by every bucket config subscriber: bucket, config
+/// entry name, and the stored bytes with their timestamp and bucket incarnation.
+pub type BucketConfigHookFn = dyn Fn(&str, &str, Option<(&[u8], OffsetDateTime, Uuid)>) + Send + Sync;
+
+struct BucketConfigSubscriber {
+    name: &'static str,
+    config_file: &'static str,
+    hook: Arc<BucketConfigHookFn>,
+}
+
+/// Application-owned services that observe bucket configuration entries.
+static BUCKET_CONFIG_SUBSCRIBERS: std::sync::RwLock<Vec<BucketConfigSubscriber>> = std::sync::RwLock::new(Vec::new());
+
+/// Subscribes `hook` to the application-owned bucket configuration entry
+/// `config_file`. The hook runs on every path that installs bucket metadata
+/// into the cache (set, initial load, peer reload, refresh loop, lazy load) and
+/// with `None` when the entry or the bucket leaves the cache. Returns `false`
+/// when a subscriber with the same `name` is already registered.
+pub fn register_bucket_config_subscriber(name: &'static str, config_file: &'static str, hook: BucketConfigPublishHook) -> bool {
+    let mut subscribers = BUCKET_CONFIG_SUBSCRIBERS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if subscribers.iter().any(|subscriber| subscriber.name == name) {
+        return false;
+    }
+    subscribers.push(BucketConfigSubscriber {
+        name,
+        config_file,
+        hook: Arc::from(hook),
+    });
+    true
+}
+
+fn publish_bucket_config(bucket: &str, config_file: &str, stored: Option<(&[u8], OffsetDateTime, Uuid)>) {
+    // Hooks run outside the lock so a subscriber cannot block registration or other publishers.
+    let hooks: Vec<_> = BUCKET_CONFIG_SUBSCRIBERS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|subscriber| subscriber.config_file == config_file)
+        .map(|subscriber| Arc::clone(&subscriber.hook))
+        .collect();
+    for hook in hooks {
+        hook(bucket, config_file, stored);
+    }
+}
 
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -440,22 +486,45 @@ fn clear_bucket_durability(bucket: &str) {
     crate::disk::local::bucket_durability::set(bucket, None);
 }
 
-/// Publish application-owned bytes on every cache install path.
-fn sync_on_demand_migration(bucket: &str, bm: &BucketMetadata) {
-    if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
-        hook(
-            bucket,
-            super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG,
-            bm.on_demand_migration_config()
-                .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
-        );
-    }
+/// Publish the bucket's ETag algorithm to the registry the write path consults.
+fn sync_bucket_etag(bucket: &str, bm: &BucketMetadata) {
+    let xxh3 = bm.etag_config().is_some_and(|cfg| cfg.uses_xxh3());
+    crate::bucket::etag::set_bucket_xxh3_etag(bucket, xxh3);
 }
 
-fn clear_on_demand_migration(bucket: &str) {
-    if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
-        hook(bucket, super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, None);
-    }
+/// Publish every per-bucket override kept outside the metadata cache
+/// (durability tier, ETag algorithm) on each install path.
+fn sync_bucket_overrides(bucket: &str, bm: &BucketMetadata) {
+    sync_bucket_durability(bucket, bm);
+    sync_bucket_etag(bucket, bm);
+}
+
+/// Drop every per-bucket override when the bucket's metadata leaves the cache.
+fn clear_bucket_overrides(bucket: &str) {
+    clear_bucket_durability(bucket);
+    crate::bucket::etag::set_bucket_xxh3_etag(bucket, false);
+}
+
+/// Publish application-owned bytes on every cache install path.
+fn sync_application_configs(bucket: &str, bm: &BucketMetadata) {
+    publish_bucket_config(
+        bucket,
+        super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+        bm.on_demand_migration_config()
+            .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
+    );
+    publish_bucket_config(
+        bucket,
+        super::metadata::BUCKET_ENGINE_CONFIG,
+        bm.engine_config()
+            .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
+    );
+}
+
+/// Withdraw every application-owned configuration when the bucket leaves the cache.
+fn clear_application_configs(bucket: &str) {
+    publish_bucket_config(bucket, super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, None);
+    publish_bucket_config(bucket, super::metadata::BUCKET_ENGINE_CONFIG, None);
 }
 
 pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -1587,6 +1656,16 @@ pub async fn get_durability_config(
     Ok((bm.durability_config(), bm.durability_config_updated_at))
 }
 
+/// The bucket's ETag algorithm config with its update time. `Ok((None, ..))`
+/// means the bucket keeps MD5 ETags.
+pub async fn get_etag_config(bucket: &str) -> Result<(Option<crate::bucket::etag::BucketEtagConfig>, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    let (bm, _) = bucket_meta_sys.get_config(bucket).await?;
+    Ok((bm.etag_config(), bm.etag_config_updated_at))
+}
+
 /// The bucket's on-demand migration config with its update time, or
 /// `Ok(None)` when the bucket has none. Bytes are opaque to the metadata owner.
 pub async fn get_on_demand_migration_config(bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
@@ -2451,8 +2530,8 @@ impl BucketMetadataSys {
                 self.missing_buckets.insert(bucket.to_string(), ()).await;
                 if removed {
                     BucketTargetSys::get().delete(bucket).await;
-                    clear_bucket_durability(bucket);
-                    clear_on_demand_migration(bucket);
+                    clear_bucket_overrides(bucket);
+                    clear_application_configs(bucket);
                 }
             }
             return Ok(());
@@ -2489,8 +2568,8 @@ impl BucketMetadataSys {
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
-                sync_bucket_durability(bucket, &bm);
-                sync_on_demand_migration(bucket, &bm);
+                sync_bucket_overrides(bucket, &bm);
+                sync_application_configs(bucket, &bm);
             }
             MetadataLoadMode::Initial => {
                 let _publish_guard = self
@@ -2537,8 +2616,8 @@ impl BucketMetadataSys {
             self.missing_buckets.invalidate(bucket).await;
             if removed {
                 BucketTargetSys::get().delete(bucket).await;
-                clear_bucket_durability(bucket);
-                clear_on_demand_migration(bucket);
+                clear_bucket_overrides(bucket);
+                clear_application_configs(bucket);
             }
             return Ok(());
         }
@@ -2560,8 +2639,8 @@ impl BucketMetadataSys {
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
-        sync_bucket_durability(bucket, &metadata);
-        sync_on_demand_migration(bucket, &metadata);
+        sync_bucket_overrides(bucket, &metadata);
+        sync_application_configs(bucket, &metadata);
         Ok(())
     }
 
@@ -2590,8 +2669,8 @@ impl BucketMetadataSys {
             self.fabricated_metadata.write().await.remove(&bucket);
             self.missing_buckets.invalidate(&bucket).await;
             sync_bucket_target_sys(&bucket, &bm).await;
-            sync_bucket_durability(&bucket, &bm);
-            sync_on_demand_migration(&bucket, &bm);
+            sync_bucket_overrides(&bucket, &bm);
+            sync_application_configs(&bucket, &bm);
         }
     }
 
@@ -2614,8 +2693,8 @@ impl BucketMetadataSys {
         super::config_parse_mode::forget_bucket_config_parse_state(bucket);
         if removed {
             BucketTargetSys::get().delete(bucket).await;
-            clear_bucket_durability(bucket);
-            clear_on_demand_migration(bucket);
+            clear_bucket_overrides(bucket);
+            clear_application_configs(bucket);
         }
         removed || removed_fabricated
     }
@@ -2957,8 +3036,8 @@ impl BucketMetadataSys {
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
-                sync_bucket_durability(bucket, &bm);
-                sync_on_demand_migration(bucket, &bm);
+                sync_bucket_overrides(bucket, &bm);
+                sync_application_configs(bucket, &bm);
                 return Ok((bm, true));
             } else {
                 let exists = self
@@ -3408,8 +3487,8 @@ impl BucketMetadataSys {
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
-        sync_bucket_durability(bucket, &metadata);
-        sync_on_demand_migration(bucket, &metadata);
+        sync_bucket_overrides(bucket, &metadata);
+        sync_application_configs(bucket, &metadata);
         Ok(BucketMetadataAuthority::Authoritative(metadata))
     }
 
@@ -6686,6 +6765,41 @@ mod tests {
         target_sys.delete(bucket).await;
     }
 
+    /// Installing bucket metadata publishes the bucket's ETag algorithm to the
+    /// write-path registry; metadata without it, an invalid payload or
+    /// clearing the bucket's overrides withdraws XXH3.
+    #[test]
+    fn metadata_sync_publishes_and_clears_etag_algorithm() {
+        use crate::bucket::etag::bucket_uses_xxh3_etag;
+
+        let bucket = "metadata-sync-etag";
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"xxh3"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(bucket_uses_xxh3_etag(bucket));
+
+        sync_bucket_overrides(bucket, &BucketMetadata::new(bucket));
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"md5"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = b"not-json".to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"XXH3"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(bucket_uses_xxh3_etag(bucket));
+        clear_bucket_overrides(bucket);
+        assert!(!bucket_uses_xxh3_etag(bucket));
+    }
+
     /// HP-5b (rustfs/backlog#938): installing bucket metadata publishes the
     /// durability override to the disk-layer registry, and clearing the
     /// config (or an invalid payload) withdraws it.
@@ -6730,15 +6844,73 @@ mod tests {
     static ODM_HOOK_CALLS: std::sync::Mutex<Vec<RecordedOdmHookCall>> = std::sync::Mutex::new(Vec::new());
 
     fn install_recording_odm_hook() {
-        BUCKET_CONFIG_PUBLISH_HOOK.get_or_init(|| {
+        // Registered once per process; later calls are refused by name and keep the first hook.
+        let _ = register_bucket_config_subscriber(
+            "test-odm-recorder",
+            super::super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG,
             Box::new(|bucket, config_file, config| {
                 assert_eq!(config_file, super::super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG);
                 ODM_HOOK_CALLS.lock().unwrap().push((
                     bucket.to_string(),
                     config.map(|(bytes, stamp, incarnation)| (bytes.to_vec(), stamp, incarnation)),
                 ));
+            }),
+        );
+    }
+
+    #[test]
+    fn bucket_config_subscribers_receive_only_their_entry_and_names_are_unique() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<Vec<u8>>)>>>;
+        fn recorder(seen: &Seen) -> BucketConfigPublishHook {
+            let seen = std::sync::Arc::clone(seen);
+            Box::new(move |bucket, _file, stored| {
+                seen.lock()
+                    .expect("recorder lock")
+                    .push((bucket.to_string(), stored.map(|(bytes, _, _)| bytes.to_vec())));
             })
-        });
+        }
+        let (first, second, other) = (Seen::default(), Seen::default(), Seen::default());
+        assert!(register_bucket_config_subscriber(
+            "test-subscriber-first",
+            "test-entry-a.json",
+            recorder(&first)
+        ));
+        assert!(register_bucket_config_subscriber(
+            "test-subscriber-second",
+            "test-entry-a.json",
+            recorder(&second)
+        ));
+        assert!(register_bucket_config_subscriber(
+            "test-subscriber-other",
+            "test-entry-b.json",
+            recorder(&other)
+        ));
+        assert!(
+            !register_bucket_config_subscriber("test-subscriber-first", "test-entry-b.json", recorder(&other)),
+            "a second subscriber with the same name must be refused"
+        );
+
+        publish_bucket_config(
+            "subscriber-bucket",
+            "test-entry-a.json",
+            Some((b"cfg", OffsetDateTime::UNIX_EPOCH, Uuid::nil())),
+        );
+        publish_bucket_config("subscriber-bucket", "test-entry-a.json", None);
+
+        let expected = vec![
+            ("subscriber-bucket".to_string(), Some(b"cfg".to_vec())),
+            ("subscriber-bucket".to_string(), None),
+        ];
+        assert_eq!(
+            *first.lock().expect("recorder lock"),
+            expected,
+            "every subscriber of the entry is notified"
+        );
+        assert_eq!(*second.lock().expect("recorder lock"), expected);
+        assert!(
+            other.lock().expect("recorder lock").is_empty(),
+            "subscribers of other entries are not notified"
+        );
     }
 
     fn odm_hook_calls(bucket: &str) -> Vec<RecordedOdmConfig> {

@@ -21,6 +21,7 @@ use super::storage_api::multipart_usecase::access::{
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
+    etag::bucket_uses_xxh3_etag,
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
@@ -47,7 +48,9 @@ use super::storage_api::multipart_usecase::error::{
 use super::storage_api::multipart_usecase::helper::{OperationHelper, run_owned_mutation};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::io::{
+    EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
+};
 use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
@@ -109,7 +112,7 @@ use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, insert_header};
 use rustfs_utils::http::{
-    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
+    SUFFIX_ETAG_ALGORITHM, SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
     SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header, get_source_scheme,
     headers::{AMZ_CHECKSUM_TYPE, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
@@ -274,6 +277,18 @@ fn create_multipart_upload_metadata(
     }
 
     metadata
+}
+
+/// ETag value pinned by CreateMultipartUpload for a bucket with XXH3 ETags.
+const ETAG_ALGORITHM_XXH3: &str = "xxh3";
+
+/// The ETag algorithm pinned for this multipart upload at its creation;
+/// uploads without the pin (MD5 buckets, older uploads) keep MD5.
+fn multipart_etag_algorithm(metadata: &HashMap<String, String>) -> EtagAlgorithm {
+    match get_consistent_str(metadata, SUFFIX_ETAG_ALGORITHM) {
+        Some(value) if value.eq_ignore_ascii_case(ETAG_ALGORITHM_XXH3) => EtagAlgorithm::Xxh3,
+        _ => EtagAlgorithm::Md5,
+    }
 }
 
 fn multipart_max_total_object_size(metadata: &HashMap<String, String>) -> S3Result<Option<u64>> {
@@ -1080,6 +1095,9 @@ impl DefaultMultipartUsecase {
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
         }
+        if bucket_uses_xxh3_etag(&bucket) {
+            insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
+        }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some()
             || object_lock_retain_until_date.is_some()
@@ -1295,6 +1313,20 @@ impl DefaultMultipartUsecase {
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
+        // cuObject S3-over-RDMA UploadPart: an empty HTTP body plus
+        // `x-amz-rdma-token` means the part bytes are read from the client's
+        // registered buffer (see `object::cuobject::rdma_put_body`).
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(&req.headers) {
+            Some(token) if content_length.unwrap_or(0) == 0 => {
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(&bucket, &key, &token, true)?;
+                let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                (Some(body), Some(total), Some(total))
+            }
+            _ => (body, content_length, None),
+        };
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let rdma_put: Option<i64> = None;
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
         if let Some(size) = size {
             reject_oversize_single_upload(size)?;
@@ -1303,10 +1335,12 @@ impl DefaultMultipartUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let multipart_info_started = rustfs_io_metrics::put_stage_timer();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(multipart_upload_api_error)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
@@ -1392,10 +1426,19 @@ impl DefaultMultipartUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         let mut write_plan = WritePlan::new();
+        let etag_algorithm = multipart_etag_algorithm(&fi.user_defined);
         let mut reader = if is_disk_compressed {
             let algorithm = CompressionAlgorithm::default();
-            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
-                .map_err(ApiError::from)?;
+            let mut hrd = HashReader::from_stream_with_etag(
+                body,
+                size,
+                actual_size,
+                md5hex.take(),
+                sha256hex.take(),
+                false,
+                etag_algorithm,
+            )
+            .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
@@ -1405,7 +1448,8 @@ impl DefaultMultipartUsecase {
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                .map_err(ApiError::from)?
         };
 
         if let Err(err) = reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), size < 0) {
@@ -1559,7 +1603,20 @@ impl DefaultMultipartUsecase {
 
         // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
         // server-computed part checksum as a raw response header (#1261).
-        let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut upload_part_extra_checksum_headers =
+            crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let _ = rdma_put;
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        if let Some(moved) = rdma_put {
+            upload_part_extra_checksum_headers.push((crate::app::object::cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
+            upload_part_extra_checksum_headers
+                .push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+        }
 
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
@@ -2859,6 +2916,24 @@ mod tests {
 
         let other = multipart_upload_api_error(StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()));
         assert_eq!(other.code(), &S3ErrorCode::NoSuchKey);
+    }
+
+    #[test]
+    fn multipart_etag_algorithm_reads_the_pinned_value() {
+        let mut metadata = HashMap::new();
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Md5);
+
+        insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Xxh3);
+        assert_eq!(
+            metadata.get("x-minio-internal-etag-algorithm").map(String::as_str),
+            Some("xxh3"),
+            "the pin is written under both internal prefixes"
+        );
+
+        // Conflicting copies fail closed to MD5.
+        metadata.insert("x-minio-internal-etag-algorithm".to_string(), "md5".to_string());
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Md5);
     }
 
     #[tokio::test]

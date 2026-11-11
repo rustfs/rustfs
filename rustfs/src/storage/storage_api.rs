@@ -125,6 +125,12 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSink = ecstore_object::GetObjectSink;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkSegments = ecstore_object::GetObjectSinkSegments;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkWriter = ecstore_object::GetObjectSinkWriter;
 pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
@@ -295,6 +301,18 @@ pub(crate) mod rpc_consumer {
         };
     }
 
+    /// Server side of internode NIXL chunk reads (`nixl` feature).
+    #[cfg(feature = "nixl")]
+    pub(crate) mod nixl_read {
+        pub(crate) use super::super::check_and_record_signed_rpc_nonce;
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
+        pub(crate) use super::super::find_local_disk_by_ref_for_rpc;
+        pub(crate) use rustfs_ecstore::api::disk::Disk;
+        pub(crate) use rustfs_ecstore::api::rpc::nixl::{
+            NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH,
+        };
+    }
+
     pub(crate) mod node_service {
         pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
@@ -460,8 +478,8 @@ pub(crate) mod ecstore_bucket {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
-        remote_s3_client, replication, tagging, target, utils,
+        bandwidth, bucket_target_sys, durability, etag, lifecycle, lockless_cache, metadata, metadata_sys, migration,
+        object_lock, policy_sys, remote_s3_client, replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{config_parse_mode, quota, versioning, versioning_sys};
 }
@@ -611,7 +629,7 @@ pub(crate) mod ecstore_rio {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, boxed_reader};
     pub(crate) use rustfs_ecstore::api::rio::{
-        DynReader, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+        DynReader, EtagAlgorithm, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
 }
 
@@ -648,6 +666,8 @@ pub(crate) mod ecstore_object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
     };
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectSink, GetObjectSinkSegments, GetObjectSinkWriter};
 }
 
 #[cfg(all(test, feature = "rio-v2"))]
@@ -780,6 +800,7 @@ pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
+pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
