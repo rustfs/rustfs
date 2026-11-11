@@ -641,6 +641,20 @@ def leaf_used(leaf: Leaf, code: str) -> bool:
     return leaf.binding in free_identifiers(code)
 
 
+def require_some_user(tree: UseNode, codes: list[str], where: str) -> None:
+    """Fail when no code uses an import: the input compiles warning-free, so the scan missed a use.
+
+    The usual cause is a trait used only through method calls that TRAIT_METHODS does not list;
+    dropping such an import silently would only surface as a compile error.
+    """
+    for leaf in leaves(tree):
+        if leaf.binding != "*" and not any(leaf_used(leaf, code) for code in codes):
+            raise ShapeError(
+                f"import {'::'.join(leaf.path)} in {where} has no use the scan can see; "
+                "if it is a trait, list its methods in TRAIT_METHODS"
+            )
+
+
 def is_trait(leaf: Leaf) -> bool:
     return leaf.binding == "_" or leaf.path[-1] in TRAIT_METHODS or leaf.binding == "S3"
 
@@ -976,6 +990,7 @@ def split(root: Path) -> dict[str, str]:
             replacement[k] = None
         elif len(leaves(kept)) != len(leaves(tree)):
             replacement[k] = f"use {render_use(kept)};"
+        require_some_user(tree, [residual_code, moved_code], ECFS)
         if from_s3s:
             continue
         for stem, batch in out.items():
@@ -1050,6 +1065,7 @@ def split(root: Path) -> dict[str, str]:
                 continue
             tree = parse_use(src.mask[item.start : item.end])
             kept = filter_use(tree, lambda leaf: leaf_used(leaf, remaining))
+            require_some_user(tree, [remaining, *moved_here.values()], f"{module.origin}::{module.item.name}")
             if kept is None:
                 texts[j] = None
             elif len(leaves(kept)) != len(leaves(tree)):
@@ -1379,6 +1395,11 @@ class SelfTest(unittest.TestCase):
         self.assertIn("BucketOperations as _", edge, "ecfs.rs no longer imports this trait")
         self.assertIn("ObjectOperations as _", files[ECFS])
         self.assertNotIn("BucketOperations", files[ECFS])
+
+    def test_import_without_a_visible_use_is_refused(self) -> None:
+        ecfs = FIXTURE_ECFS.replace("use tracing::{debug, instrument};\n", "use tracing::{debug, instrument};\nuse m::UnlistedTrait;\n")
+        with self.assertRaisesRegex(ShapeError, "UnlistedTrait in .* has no use the scan can see"):
+            split(self.tree(ecfs=ecfs))
 
     def test_anonymous_trait_without_method_list_is_refused(self) -> None:
         with self.assertRaisesRegex(ShapeError, "no method list"):
