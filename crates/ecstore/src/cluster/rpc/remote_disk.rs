@@ -931,7 +931,15 @@ pub struct RemoteDisk {
     #[cfg(test)]
     recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     data_transport: Arc<dyn InternodeDataTransport>,
+    /// Bound the per-operation failure warnings of this peer. An unreachable
+    /// peer fails every in-flight shard operation; the counters keep the exact
+    /// numbers per operation. Per handle, so one peer cannot hide another's.
+    timeout_logs: rustfs_utils::LogThrottle,
+    network_error_logs: rustfs_utils::LogThrottle,
 }
+
+/// Shortest gap between two failure warnings of one kind from one remote disk.
+const REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS: u64 = 5_000;
 
 struct RecoveryMonitorLease {
     active: Arc<AtomicBool>,
@@ -1364,6 +1372,8 @@ impl RemoteDisk {
             #[cfg(test)]
             recovery_monitor_teardown_hook: Arc::new(tokio::sync::Mutex::new(None)),
             data_transport,
+            timeout_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
+            network_error_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -2090,17 +2100,20 @@ impl RemoteDisk {
             "op" => op.to_string()
         )
         .increment(1);
-        warn!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            addr = %self.addr,
-            op,
-            timeout_ms = timeout_duration.as_millis(),
-            state = "timeout",
-            "Remote disk operation timed out"
-        );
+        if let Some(suppressed) = self.timeout_logs.claim() {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %self.endpoint,
+                addr = %self.addr,
+                op,
+                timeout_ms = timeout_duration.as_millis(),
+                suppressed,
+                state = "timeout",
+                "Remote disk operation timed out"
+            );
+        }
     }
 
     async fn handle_network_like_error<T>(
@@ -2120,17 +2133,20 @@ impl RemoteDisk {
                 "op" => op.to_string()
             )
             .increment(1);
-            warn!(
-                event = EVENT_REMOTE_DISK_RPC,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                endpoint = %self.endpoint,
-                addr = %self.addr,
-                op,
-                timeout_ms = timeout_duration.as_millis(),
-                state = "network_like_error",
-                "Remote disk operation returned network-like error"
-            );
+            if let Some(suppressed) = self.network_error_logs.claim() {
+                warn!(
+                    event = EVENT_REMOTE_DISK_RPC,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                    endpoint = %self.endpoint,
+                    addr = %self.addr,
+                    op,
+                    timeout_ms = timeout_duration.as_millis(),
+                    suppressed,
+                    state = "network_like_error",
+                    "Remote disk operation returned network-like error"
+                );
+            }
             if failure_health_action == FailureHealthAction::MarkFailure {
                 self.mark_faulty_and_evict("operation_network_error").await;
             }
@@ -11686,6 +11702,66 @@ mod tests {
             runtime_sources::test_node_channel_is_cached(&addr).await,
             "ignored network-like error should not evict cached connection"
         );
+    }
+
+    /// A peer that fails every operation logs one warning per interval, each
+    /// operation still gets its own error, and another peer's first warning is
+    /// not held back by the noisy one.
+    #[tokio::test]
+    async fn rpc_failure_warnings_are_bounded_per_remote_disk() {
+        async fn remote_disk(port: u16) -> RemoteDisk {
+            let url = url::Url::parse(&format!("http://127.0.0.1:{port}/data")).expect("endpoint url");
+            let endpoint = Endpoint {
+                url,
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            };
+            RemoteDisk::new(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+                Arc::new(TcpHttpInternodeDataTransport),
+            )
+            .await
+            .expect("remote disk handle")
+        }
+        let noisy = remote_disk(59981).await;
+        let quiet = remote_disk(59982).await;
+
+        for _ in 0..50 {
+            let error = noisy
+                .execute_with_timeout_for_op_and_health_action(
+                    "read_all",
+                    || async {
+                        Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "connection refused",
+                        )))
+                    },
+                    Duration::from_secs(1),
+                    FailureHealthAction::IgnoreFailure,
+                )
+                .await
+                .expect_err("every failing operation still fails");
+            assert!(matches!(error, DiskError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused));
+            noisy.record_timeout("read_all", Duration::from_secs(1));
+        }
+
+        assert!(
+            noisy.network_error_logs.claim().is_none(),
+            "the burst used this peer's network-error window"
+        );
+        assert!(noisy.timeout_logs.claim().is_none(), "the burst used this peer's timeout window");
+        assert_eq!(
+            quiet.network_error_logs.claim(),
+            Some(0),
+            "another peer's first warning is not suppressed"
+        );
+        assert_eq!(quiet.timeout_logs.claim(), Some(0));
     }
 
     #[tokio::test]

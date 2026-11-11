@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bounds a repetitive diagnostic without changing its underlying counters.
 /// Each emitted event includes the number suppressed since the previous one.
+#[derive(Debug)]
 pub struct LogThrottle {
     interval_ms: u64,
     last_ms: AtomicU64,
