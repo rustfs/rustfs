@@ -24,9 +24,10 @@
 #
 # Supports cross-compilation for amd64 and arm64 via TARGETPLATFORM.
 
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-ARG TARGETARCH
+# Do not declare TARGETPLATFORM, BUILDPLATFORM or TARGETARCH here: a global
+# declaration without a value shadows BuildKit's automatic values, so the
+# stage-level re-declarations below see empty strings. They are only
+# declared inside the stage that uses them.
 ARG RUSTFS_BUILD_FEATURES=""
 ARG RC_RELEASE=latest
 
