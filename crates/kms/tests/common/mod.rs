@@ -281,6 +281,17 @@ impl TestKms {
     }
 }
 
+/// Move `key_id` to `PendingDeletion` with the default waiting window — the
+/// step every destruction has to pass through first.
+pub async fn schedule_deletion(kms: &KmsManager, key_id: &str) {
+    kms.delete_key(DeleteKeyRequest {
+        key_id: key_id.to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|error| panic!("scheduling the deletion of {key_id} should succeed: {error:?}"));
+}
+
 /// Best-effort removal of the Vault keys a harness instance created, so a
 /// persistent dev Vault does not accumulate `behavior-*` keys across runs
 /// (rustfs/backlog#1774). A no-op for the Local and Static backends, whose
@@ -306,26 +317,29 @@ pub async fn cleanup_vault_keys(kind: BackendKind, config: &KmsConfig, created_k
     let manager = start_manager(&config).await;
     let kms = manager.get_manager().await.expect("KMS manager should be running");
     for key_id in key_ids {
-        // The Transit backend deletes in two steps (first call parks the key in
-        // PendingDeletion, the next call destroys it); KV2 destroys on the
-        // first call and reports KeyNotFound on the second.
-        for _ in 0..2 {
-            match kms
-                .delete_key(DeleteKeyRequest {
-                    key_id: key_id.clone(),
-                    pending_window_in_days: None,
-                    force_immediate: Some(true),
-                    confirm_key_id: Some(key_id.clone()),
-                })
-                .await
-            {
-                Ok(_) => continue,
-                Err(KmsError::KeyNotFound { .. }) => break,
-                Err(error) => {
-                    eprintln!("vault key cleanup: could not delete {key_id}: {error:?}");
-                    break;
-                }
-            }
+        // Destruction is two requests: park the key in PendingDeletion, then
+        // destroy it. A spec may have left the key scheduled already (the
+        // schedule is refused, the destruction still applies) or destroyed it.
+        let scheduled = kms
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                ..Default::default()
+            })
+            .await;
+        if matches!(scheduled, Err(KmsError::KeyNotFound { .. })) {
+            continue;
+        }
+        match kms
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+            })
+            .await
+        {
+            Ok(_) | Err(KmsError::KeyNotFound { .. }) => {}
+            Err(error) => eprintln!("vault key cleanup: could not delete {key_id}: {error:?}"),
         }
     }
     if let Err(error) = manager.stop().await {

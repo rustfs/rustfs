@@ -13,16 +13,33 @@
 // limitations under the License.
 
 use super::NodeService;
-use rustfs_lock::LockRequest;
+use rustfs_lock::{BatchAcquireOutcome, LockRequest};
 use rustfs_protos::proto_gen::node_service::*;
+use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
-fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLockResult {
+fn lock_result_from_acquire(outcome: BatchAcquireOutcome) -> GenerallyLockResult {
+    match outcome {
+        BatchAcquireOutcome::Granted { lock_info, .. } => GenerallyLockResult {
+            success: true,
+            lock_info: lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+            ..Default::default()
+        },
+        BatchAcquireOutcome::RetryableNoGrant { error } => lock_result_from_no_grant(error, LockAcquireStatus::RetryableNoGrant),
+        BatchAcquireOutcome::TerminalNoGrant { error } => lock_result_from_no_grant(error, LockAcquireStatus::RejectedNoGrant),
+        BatchAcquireOutcome::Ambiguous { error, .. } => lock_result_from_error(error.to_string()),
+    }
+}
+
+fn lock_result_from_no_grant(error: rustfs_lock::LockError, status: LockAcquireStatus) -> GenerallyLockResult {
+    let message = match error {
+        rustfs_lock::LockError::Timeout { .. } => "Lock acquisition timeout".to_string(),
+        rustfs_lock::LockError::Internal { message } => message,
+        error => error.to_string(),
+    };
     GenerallyLockResult {
-        success: response.success,
-        error_info: response.error,
-        lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
-        ..Default::default()
+        acquire_status: status.into(),
+        ..lock_result_from_error(message)
     }
 }
 
@@ -83,6 +100,7 @@ fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> Gen
         } else {
             LockReleaseStatus::AlreadyAbsent.into()
         },
+        ..Default::default()
     }
 }
 
@@ -245,6 +263,7 @@ impl NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let entered = Instant::now();
         #[cfg(feature = "e2e-test-hooks")]
         let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
@@ -259,7 +278,10 @@ impl NodeService {
                     valid_indices.push(idx);
                 }
                 Err(err) => {
-                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                    results[idx] = GenerallyLockResult {
+                        acquire_status: LockAcquireStatus::RejectedNoGrant.into(),
+                        ..lock_result_from_error(format!("can not decode args, err: {err}"))
+                    };
                 }
             }
         }
@@ -271,18 +293,17 @@ impl NodeService {
                     .await;
             }
             let lock_client = self.get_lock_client()?;
-            match lock_client.acquire_locks_batch(&valid_requests).await {
-                Ok(batch_results) => {
-                    for (result_idx, response) in batch_results.into_iter().enumerate() {
-                        if let Some(request_idx) = valid_indices.get(result_idx) {
-                            results[*request_idx] = lock_result_from_response(response);
-                        }
-                    }
-                }
-                Err(err) => {
-                    for request_idx in valid_indices {
-                        results[request_idx] = lock_result_from_error(format!("can not batch lock, err: {err}"));
-                    }
+            // The payload's wait budget also pays for decoding and handler admission.
+            let wait = valid_requests
+                .iter()
+                .map(|request| request.acquire_timeout)
+                .max()
+                .unwrap_or_default();
+            let deadline = entered.checked_add(wait).unwrap_or(entered);
+            let batch_results = lock_client.acquire_locks_batch_until(&valid_requests, deadline).await;
+            for (result_idx, outcome) in batch_results.into_iter().enumerate() {
+                if let Some(request_idx) = valid_indices.get(result_idx) {
+                    results[*request_idx] = lock_result_from_acquire(outcome);
                 }
             }
         }
@@ -338,7 +359,7 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_result_from_release, lock_result_from_response};
+    use super::{lock_result_from_acquire, lock_result_from_release};
 
     fn test_lock_id() -> rustfs_lock::LockId {
         rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Exclusive, "owner")
@@ -362,14 +383,55 @@ mod tests {
     }
 
     #[test]
-    fn lock_result_from_response_preserves_lock_failure_error() {
-        let response = rustfs_lock::LockResponse::failure("lock conflict", std::time::Duration::ZERO);
-        let result = lock_result_from_response(response);
+    fn batch_acquire_mapping_preserves_explicit_and_ambiguous_failures() {
+        for (outcome, status) in [
+            (
+                rustfs_lock::BatchAcquireOutcome::RetryableNoGrant {
+                    error: rustfs_lock::LockError::internal("lock conflict"),
+                },
+                super::LockAcquireStatus::RetryableNoGrant,
+            ),
+            (
+                rustfs_lock::BatchAcquireOutcome::TerminalNoGrant {
+                    error: rustfs_lock::LockError::internal("invalid request"),
+                },
+                super::LockAcquireStatus::RejectedNoGrant,
+            ),
+            (
+                rustfs_lock::BatchAcquireOutcome::Ambiguous {
+                    error: rustfs_lock::LockError::internal("legacy batch failed"),
+                    cleanup_owned_by_client: false,
+                },
+                super::LockAcquireStatus::Unspecified,
+            ),
+        ] {
+            let result = lock_result_from_acquire(outcome);
+            assert!(!result.success);
+            assert!(result.error_info.is_some());
+            assert!(result.lock_info.is_none());
+            assert_eq!(result.acquire_status, status as i32);
+            assert_eq!(result.release_status, super::LockReleaseStatus::Unspecified as i32);
+        }
+    }
 
-        assert!(!result.success);
-        assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
-        assert!(result.lock_info.is_none());
-        assert_eq!(result.release_status, super::LockReleaseStatus::Unspecified as i32);
+    #[test]
+    fn batch_acquire_timeout_preserves_legacy_business_error_text() {
+        let result = lock_result_from_acquire(rustfs_lock::BatchAcquireOutcome::RetryableNoGrant {
+            error: rustfs_lock::LockError::timeout("bucket/object", std::time::Duration::from_millis(50)),
+        });
+        assert_eq!(result.error_info.as_deref(), Some("Lock acquisition timeout"));
+        assert_eq!(result.acquire_status, super::LockAcquireStatus::RetryableNoGrant as i32);
+    }
+
+    #[test]
+    fn batch_acquire_mapping_preserves_legacy_success() {
+        let result = lock_result_from_acquire(rustfs_lock::BatchAcquireOutcome::Granted {
+            lock_info: None,
+            wait_time: std::time::Duration::ZERO,
+        });
+        assert!(result.success);
+        assert!(result.error_info.is_none());
+        assert_eq!(result.acquire_status, super::LockAcquireStatus::Unspecified as i32);
     }
 
     #[tokio::test]

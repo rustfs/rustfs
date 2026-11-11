@@ -77,8 +77,7 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     load_table_request_builder(context, access_key, secret_key).build()
 }
 
-/// The s3s form of [`table_catalog_handler_request`] for the commit backend,
-/// which still holds the legacy request (see `legacy_request_view`).
+/// Builds the legacy request accepted by the commit backend, which derives an owned view.
 // TODO(T1.12-codemod): remove with `TableCommitObjectBackend::for_request`'s s3s parameter.
 fn legacy_table_catalog_handler_request(
     context: Arc<AppContext>,
@@ -1295,6 +1294,10 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
 #[tokio::test]
 async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    store
+        .make_bucket("warehouse", &MakeBucketOptions::default())
+        .await
+        .expect("create warehouse bucket");
     rustfs_iam::store::object::ObjectStore::new(store.clone())
         .save_iam_config(
             serde_json::json!({"version": 1}),
@@ -1332,6 +1335,18 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     iam.policy_db_set(access_key, UserType::Reg, false, "location-creator")
         .await
         .expect("attach location policy");
+    iam.set_policy(
+        "owned-object-policy",
+        Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::warehouse/owned/*"},{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::warehouse/owned/writable"}]}"#,
+        )
+        .expect("parse object policy"),
+    )
+    .await
+    .expect("store object policy");
+    iam.policy_db_set(access_key, UserType::Reg, false, "location-creator,owned-object-policy")
+        .await
+        .expect("attach object policy");
     let context = Arc::new(AppContext::new(store, Arc::new(RequestIam { handle: iam }), Arc::new(RequestKms)));
     assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
         access_key: "location-root".to_string(),
@@ -1339,6 +1354,125 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         status: "on".to_string(),
         ..Default::default()
     }));
+    // Exercise the actual owned internal authorization path, including its temporary target.
+    let mut legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    let principal = table_catalog_request_principal(&legacy_request_view(&legacy))
+        .await
+        .expect("resolve principal");
+    install_table_catalog_s3_request_info(&mut legacy, &principal).expect("install authorization context");
+    let info = legacy.extensions.get_mut::<ReqInfo>().expect("request info");
+    info.bucket = Some("original-bucket".to_owned());
+    info.object = Some("original-object".to_owned());
+    info.version_id = Some("original-version".to_owned());
+    let mut owned = legacy_request_view(&legacy);
+    for (object, allowed) in [("owned/allowed", true), ("shared/denied", false)] {
+        let result = authorize_table_catalog_s3_actions(&mut owned, "warehouse", object, &[S3Action::GetObjectAction]).await;
+        if allowed {
+            result.expect("the exact owned object should be allowed");
+        } else {
+            assert_eq!(result.expect_err("the other object should be denied").code(), &S3ErrorCode::AccessDenied);
+        }
+        let info = owned.envelope().req_info().expect("request info remains installed");
+        assert_eq!(info.bucket.as_deref(), Some("original-bucket"));
+        assert_eq!(info.object.as_deref(), Some("original-object"));
+        assert_eq!(info.version_id.as_deref(), Some("original-version"));
+    }
+    // The exact-key check selects internal-object mode: a request header the object
+    // write does not apply (a malformed x-amz-tagging) must not reach the decision,
+    // while the ordinary owned entry point still evaluates it and rejects it.
+    let mut tagged = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
+    tagged
+        .headers
+        .insert("x-amz-tagging", http::HeaderValue::from_static("classification=%ZZ"));
+    let mut tagged = legacy_request_view(&tagged);
+    authorize_table_catalog_s3_actions(&mut tagged, "warehouse", "owned/writable", &[S3Action::PutObjectAction])
+        .await
+        .expect("internal-object mode ignores request options the write does not apply");
+    let info = tagged.req_info_mut().expect("request info");
+    info.bucket = Some("warehouse".to_owned());
+    info.object = Some("owned/writable".to_owned());
+    crate::app::authorize_owned_request(
+        tagged.envelope_mut(),
+        rustfs_policy::policy::action::Action::S3Action(S3Action::PutObjectAction),
+        None,
+    )
+    .await
+    .expect_err("ordinary mode evaluates the malformed tagging header");
+    let objects = TestTableCatalogObjectBackend::default();
+    objects
+        .seed_object("warehouse", "owned/read-only", b"readable".to_vec())
+        .await;
+    objects.seed_object("warehouse", "shared/denied", b"unchanged".to_vec()).await;
+    let backend = || {
+        let mut request = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
+        TableCommitObjectBackend::for_request(objects.clone(), request)
+    };
+    let allowed = backend();
+    let object = allowed
+        .read_object("warehouse", "owned/read-only")
+        .await
+        .expect("authorized read")
+        .expect("seeded object");
+    assert_eq!(object.data, b"readable");
+    allowed
+        .put_object(
+            "warehouse",
+            "owned/writable",
+            b"written".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("authorized write");
+    assert_eq!(
+        objects
+            .read_object("warehouse", "owned/writable")
+            .await
+            .expect("read stored object")
+            .expect("written object")
+            .data,
+        b"written"
+    );
+    for (object, write) in [("shared/denied", false), ("owned/read-only", true), ("shared/denied", true)] {
+        let denied = backend();
+        let result = if write {
+            denied
+                .put_object(
+                    "warehouse",
+                    object,
+                    b"modified".to_vec(),
+                    crate::table_catalog::TableCatalogPutPrecondition::Any,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            denied.read_object("warehouse", object).await.map(|_| ())
+        };
+        assert!(result.is_err(), "unauthorized {object} operation must fail");
+        assert_eq!(
+            denied.finish(Ok(())).await.expect_err("retain authorization error").code(),
+            &S3ErrorCode::AccessDenied
+        );
+    }
+    assert_eq!(
+        objects
+            .read_object("warehouse", "owned/read-only")
+            .await
+            .expect("read object")
+            .expect("seeded object")
+            .data,
+        b"readable"
+    );
+    assert_eq!(
+        objects
+            .read_object("warehouse", "shared/denied")
+            .await
+            .expect("read object")
+            .expect("seeded object")
+            .data,
+        b"unchanged"
+    );
     let request = || table_catalog_handler_request(context.clone(), access_key, secret_key);
     for location in ["s3://warehouse/owned", "s3://warehouse/owned/", "s3://warehouse/owned/child"] {
         authorize_table_warehouse_location_request(&request(), "warehouse", location)
@@ -17897,6 +18031,74 @@ async fn cleanup_empty_table_bucket_reclaims_twenty_dropped_tables_and_allows_bu
             .enabled
     );
     object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cleanup_empty_table_bucket_retries_a_retained_table_config_after_validating_all_resources() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{IdentifierSegment, Namespace, TableCatalogObjectPaths, TableMaintenanceConfig};
+
+    let (_temp, _disks, storage) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-config-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata = create_dropped_empty_tables_for_cleanup(&catalog, &backend, &storage, &bucket, 1).await;
+    let object = backend.read_object(&bucket, &metadata[0]).await.unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&object.data).unwrap();
+    let table_id = json["location"].as_str().unwrap().rsplit('/').next().unwrap();
+    let paths = TableCatalogObjectPaths::default();
+    let namespace = Namespace::parse("analytics").unwrap();
+    let table = IdentifierSegment::parse("events_00").unwrap();
+    let config = paths.table_maintenance_config_path(&bucket, &namespace, &table, table_id);
+    let bytes = serde_json::to_vec(&TableMaintenanceConfig::default()).unwrap();
+    backend.seed_object(RUSTFS_META_BUCKET, &config, bytes.clone()).await;
+
+    for blocker in [
+        paths.table_entry_path(&bucket, &namespace, &table),
+        paths.table_maintenance_current_job_path(&bucket, &namespace, &table, table_id),
+        paths.table_bucket_maintenance_config_path(&bucket),
+        format!("{}/maintenance/invalid/config.json", config.rsplit_once("/maintenance/").unwrap().0),
+    ] {
+        backend.seed_object(RUSTFS_META_BUCKET, &blocker, bytes.clone()).await;
+        let publication = TableCommitObjectBackend::trusted(backend.clone());
+        assert!(
+            cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+                .await
+                .is_err()
+        );
+        assert!(backend.object_exists(&bucket, &metadata[0]).await.unwrap());
+        assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+        backend.delete_object(RUSTFS_META_BUCKET, &blocker).await.unwrap();
+    }
+    backend.seed_object(RUSTFS_META_BUCKET, &config, b"{}".to_vec()).await;
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+            .await
+            .is_err()
+    );
+    assert!(backend.object_exists(&bucket, &metadata[0]).await.unwrap());
+
+    backend.seed_object(RUSTFS_META_BUCKET, &config, bytes).await;
+    backend.fail_delete_attempt(RUSTFS_META_BUCKET, &config, 1).await;
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    let error = cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
 }
 
 #[tokio::test]
