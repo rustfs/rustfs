@@ -495,7 +495,10 @@ async fn compare_degraded_legacy_list_parts(dist: &mut DistCluster, seed: &Upgra
     assert_eq!(current.raw_response().expect("current S3 response").status().as_u16(), 503);
     // Since #9149, SlowDownRead is reserved for GET/HEAD object reads; a
     // ListParts read-quorum failure is reported as ServiceUnavailable.
-    assert_eq!(current.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+    assert_eq!(
+        current.as_service_error().and_then(|error| error.meta().code()),
+        Some("ServiceUnavailable")
+    );
     dist.cluster.start_node_from_binary(3, previous).await?;
     wait_for_upgrade_write_readiness(&clients, &seed.history_bucket, "mixed-list-restored", CREDENTIAL_TIMEOUT).await?;
     for (path, before) in original_files {
