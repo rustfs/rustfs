@@ -1,779 +1,99 @@
-# Copyright 2024 RustFS Team
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# Docker Images Workflow
-#
-# This workflow builds Docker images using pre-built binaries from the build workflow.
-#
-# Trigger Types:
-# 1. workflow_run: Automatically triggered when "Build and Release" workflow completes
-# 2. workflow_dispatch: Manual trigger for standalone Docker builds
-#
-# Key Features:
-# - Only triggers when Linux builds (x86_64 + aarch64) are successful
-# - Independent of macOS/Windows build status
-# - Uses workflow_run event for precise control
-# - Only builds Docker images for releases and prereleases (development builds are skipped)
-
-name: Docker Images
-
-# Permissions needed for workflow_run event and Docker registry access
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+name: Build candidate images
+on:
+  workflow_call:
+    inputs:
+      candidate_manifest:
+        type: string
+        required: true
 permissions:
   contents: read
-  packages: write
-
-on:
-  # Automatically triggered when build workflow completes
-  workflow_run:
-    workflows: [ "Build and Release" ]
-    types: [ completed ]
-  # Manual trigger with same parameters for consistency
-  workflow_dispatch:
-    inputs:
-      push_images:
-        description: "Push images to registries"
-        required: false
-        default: true
-        type: boolean
-      version:
-        description: "Version to build (latest, v1.0.0, v1.0.0-alpha1, or v1.0.1-preview.1)"
-        required: false
-        default: "latest"
-        type: string
-      force_rebuild:
-        description: "Force rebuild even if binary exists (useful for testing)"
-        required: false
-        default: false
-        type: boolean
-
-env:
-  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-  TRIGGERING_EVENT: ${{ github.event.workflow_run.event }}
-  DOCKERHUB_USERNAME: rustfs
-  CARGO_TERM_COLOR: always
-  REGISTRY_DOCKERHUB: rustfs/rustfs
-  REGISTRY_GHCR: ghcr.io/${{ github.repository }}
-  REGISTRY_QUAY: quay.io/rustfs/rustfs
-  DOCKER_PLATFORMS: linux/amd64,linux/arm64
-
+  actions: read
 jobs:
-  # Check if we should build Docker images.
-  # Short-circuit at job level so per-merge development builds (workflow_run
-  # from a push to main) skip the whole run without spawning a checkout job:
-  # images are only published for tag builds — build.yml push triggers cover
-  # only main and tags, so a non-main head_branch is a tag name — and for
-  # manual dispatch.
-  build-check:
-    name: Docker Build Check
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main')
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-      should_push: ${{ steps.check.outputs.should_push }}
-      build_type: ${{ steps.check.outputs.build_type }}
-      version: ${{ steps.check.outputs.version }}
-      short_sha: ${{ steps.check.outputs.short_sha }}
-      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
-      create_latest: ${{ steps.check.outputs.create_latest }}
-      source_ref: ${{ steps.check.outputs.source_ref }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-          # For workflow_run events, checkout the specific commit that triggered the workflow
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-
-      - name: Check build conditions
-        id: check
-        env:
-          # dispatch inputs via env, not `${{ }}` interpolation: they are
-          # free-form strings and would otherwise be evaluated by bash.
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          INPUT_PUSH_IMAGES: ${{ github.event.inputs.push_images }}
-          INPUT_FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
-        run: |
-          should_build=false
-          should_push=false
-          build_type="none"
-          version=""
-          short_sha=""
-          is_prerelease=false
-          create_latest=false
-          source_ref="$GITHUB_SHA"
-
-          # Pre-GA policy: until the first stable (vX.Y.Z) tag exists, every
-          # prerelease (alpha/beta/rc) also moves `latest`, so users pulling
-          # `latest` get the newest test build. Once a stable tag is published
-          # this returns false and `latest` follows stable releases only.
-          prerelease_moves_latest() {
-            local stable_tags
-            stable_tags=$(git ls-remote --tags --refs origin 2>/dev/null \
-              | awk '{print $2}' \
-              | grep -E '^refs/tags/v?[0-9]+\.[0-9]+\.[0-9]+$' || true)
-            if [[ -z "$stable_tags" ]]; then
-              return 0
-            fi
-            echo "ℹ️  Stable release tag(s) already exist; prereleases no longer update latest"
-            return 1
-          }
-
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            # Triggered by build workflow completion
-            echo "🔗 Triggered by build workflow completion"
-
-            # Check if the triggering workflow was successful
-            # If the workflow succeeded, it means ALL builds (including Linux x86_64 and aarch64) succeeded
-            if [[ "$CONCLUSION" == "success" ]]; then
-              echo "✅ Build workflow succeeded, all builds including Linux are successful"
-              should_build=true
-              should_push=true
-            else
-              echo "❌ Build workflow failed (conclusion: $CONCLUSION), skipping Docker build"
-              should_build=false
-            fi
-
-            # Extract version info from commit message or use commit SHA
-            # Use Git to generate consistent short SHA (ensures uniqueness like build.yml)
-            short_sha=$(git rev-parse --short "$HEAD_SHA")
-            source_ref="$HEAD_SHA"
-
-            # Determine build type based on triggering workflow event and ref
-            triggering_event="$TRIGGERING_EVENT"
-            head_branch="$HEAD_BRANCH"
-
-            echo "🔍 Analyzing triggering workflow:"
-            echo "   📋 Event: $triggering_event"
-            echo "   🌿 Head branch: $head_branch"
-            echo "   📎 Head SHA: $HEAD_SHA"
-
-            # Check if this was triggered by a tag push
-            if [[ "$triggering_event" == "push" ]]; then
-              # For tag pushes, head_branch will be like "refs/tags/v1.0.0" or just "v1.0.0"
-              if [[ "$head_branch" == refs/tags/* ]]; then
-                # Extract tag name from refs/tags/TAG_NAME
-                tag_name="${head_branch#refs/tags/}"
-                version="$tag_name"
-              elif [[ "$head_branch" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-                # Direct tag name like "v1.0.0" or "1.0.0-alpha.1"
-                version="$head_branch"
-              elif [[ "$head_branch" == "main" ]]; then
-                # Regular branch push to main
-                build_type="development"
-                version="dev-${short_sha}"
-                should_build=false
-                echo "⏭️  Skipping Docker build for development version (main branch push)"
-              else
-                # Other branch push
-                build_type="development"
-                version="dev-${short_sha}"
-                should_build=false
-                echo "⏭️  Skipping Docker build for development version (branch: $head_branch)"
-              fi
-
-              # If we extracted a version (tag), determine release type
-              if [[ -n "$version" ]] && [[ "$version" != "dev-${short_sha}" ]]; then
-                # Remove 'v' prefix if present for consistent version format
-                if [[ "$version" == v* ]]; then
-                  version="${version#v}"
-                fi
-
-                if [[ "$version" =~ -preview\.[0-9]+$ ]]; then
-                  build_type="preview"
-                  is_prerelease=true
-                  echo "🔍 Building Docker image for preview: $version (version tags only)"
-                elif [[ "$version" == *"-preview"* ]]; then
-                  echo "❌ Invalid preview tag: $version (expected suffix: -preview.<number>)" >&2
-                  exit 1
-                elif [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
-                  build_type="prerelease"
-                  is_prerelease=true
-                  # Pre-GA policy: prereleases update latest until the first stable tag exists.
-                  if prerelease_moves_latest; then
-                    create_latest=true
-                    echo "🧪 Building Docker image for prerelease: $version (creating latest tag)"
-                  else
-                    echo "🧪 Building Docker image for prerelease: $version"
-                  fi
-                else
-                  build_type="release"
-                  create_latest=true
-                  echo "🚀 Building Docker image for release: $version"
-                fi
-              fi
-            else
-              # Non-push events
-              build_type="development"
-              version="dev-${short_sha}"
-              should_build=false
-              echo "⏭️  Skipping Docker build for development version (event: $triggering_event)"
-            fi
-
-            echo "🔄 Build triggered by workflow_run:"
-            echo "   📋 Conclusion: $CONCLUSION"
-            echo "   🌿 Branch: $HEAD_BRANCH"
-            echo "   📎 SHA: $HEAD_SHA"
-            echo "   🎯 Event: $TRIGGERING_EVENT"
-
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Manual trigger
-            input_version="$INPUT_VERSION"
-            version="${input_version}"
-            should_push="$INPUT_PUSH_IMAGES"
-            should_build=true
-
-            # Get short SHA
-            short_sha=$(git rev-parse --short HEAD)
-
-            echo "🎯 Manual Docker build triggered:"
-            echo "   📋 Requested version: $input_version"
-            echo "   🔧 Force rebuild: $INPUT_FORCE_REBUILD"
-            echo "   🚀 Push images: $should_push"
-
-            case "$input_version" in
-              "latest")
-                build_type="release"
-                create_latest=true
-                echo "🚀 Building with latest stable release version"
-                ;;
-              *-preview*)
-                if [[ ! "$input_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-preview\.[0-9]+$ ]]; then
-                  echo "❌ Invalid preview version: $input_version" >&2
-                  exit 1
-                fi
-                build_type="preview"
-                is_prerelease=true
-                version="${input_version#v}"
-                echo "🔍 Building with preview version: $version (version tags only)"
-                ;;
-              # Prerelease versions (must match first, more specific)
-              v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
-                build_type="prerelease"
-                is_prerelease=true
-                # Pre-GA policy: prereleases update latest until the first stable tag exists.
-                if prerelease_moves_latest; then
-                  create_latest=true
-                  echo "🧪 Building with prerelease version: $input_version (creating latest tag)"
-                else
-                  echo "🧪 Building with prerelease version: $input_version"
-                fi
-                ;;
-              # Release versions (match after prereleases, more general)
-              v[0-9]*|[0-9]*.*.*)
-                build_type="release"
-                create_latest=true
-                echo "📦 Building with specific release version: $input_version"
-                ;;
-              *)
-                # Invalid version for Docker build
-                should_build=false
-                echo "❌ Invalid version for Docker build: $input_version"
-                echo "⚠️  Only release versions (latest, v1.0.0, 1.0.0) and prereleases (v1.0.0-alpha1, 1.0.0-beta2) are supported"
-                ;;
-            esac
-
-            if [[ "$should_build" == true && "$input_version" != "latest" ]]; then
-              tag_ref="refs/tags/$input_version"
-              if ! git ls-remote --exit-code origin "$tag_ref" >/dev/null 2>&1; then
-                if [[ "$input_version" == v* ]]; then
-                  tag_ref="refs/tags/${input_version#v}"
-                else
-                  tag_ref="refs/tags/v$input_version"
-                fi
-              fi
-
-              if ! git ls-remote --exit-code origin "$tag_ref" >/dev/null 2>&1; then
-                echo "❌ Release tag not found for Docker build: $input_version"
-                exit 1
-              fi
-              source_ref="$tag_ref"
-            fi
-          fi
-
-          {
-            echo "should_build=$should_build"
-            echo "should_push=$should_push"
-            echo "build_type=$build_type"
-            echo "version=$version"
-            echo "short_sha=$short_sha"
-            echo "is_prerelease=$is_prerelease"
-            echo "create_latest=$create_latest"
-            echo "source_ref=$source_ref"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "🐳 Docker Build Summary:"
-          echo "  - Should build: $should_build"
-          echo "  - Should push: $should_push"
-          echo "  - Build type: $build_type"
-          echo "  - Version: $version"
-          echo "  - Short SHA: $short_sha"
-          echo "  - Is prerelease: $is_prerelease"
-          echo "  - Create latest: $create_latest"
-          echo "  - Source ref: $source_ref"
-
-  # Consume the trusted release certification for the exact version this
-  # workflow wraps and verify the certified input digests. A manual dispatch
-  # without that certification fails here and pushes no official tag; only
-  # results from the trusted verification sources carry release authority.
-  release-certification:
-    name: Release Certification
-    needs: build-check
-    if: needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-          ref: ${{ needs.build-check.outputs.source_ref }}
-
-      - name: Download and verify release certification
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
-          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
-          VERSION: ${{ needs.build-check.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p certification
-          run_id="$TRIGGERING_RUN_ID"
-          if [[ -z "$run_id" ]]; then
-            run_id="$(gh api --method GET \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
-              -f branch="$VERSION" -f status=success -F per_page=1 \
-              --jq '.workflow_runs[0].id // empty' || true)"
-          fi
-          if [[ -z "$run_id" ]]; then
-            echo "No certified Build and Release run found for ${VERSION}; failing closed" >&2
-            exit 1
-          fi
-          if ! gh run download "$run_id" -n release-certification -D certification; then
-            echo "Build run ${run_id} published no release-certification artifact; failing closed" >&2
-            exit 1
-          fi
-          python3 scripts/release/release_gate.py verify-promotion \
-            --plan .config/release-validation-plan.json \
-            --candidate certification/candidate.json \
-            --summary certification/release-gate-output \
-            --artifact-sha256 "$(jq -r '.deliverables[0].sha256' certification/candidate.json)" \
-            --artifact-name "$(jq -r '.deliverables[0].name' certification/candidate.json)"
-
-          # Input digest binding: every zip this image wraps must be the
-          # certified byte-for-byte content, never a mutable latest pointer.
-          while IFS=$'\t' read -r name location expected; do
-            echo "Verifying certified input ${name}"
-            actual="$(curl -fsSL "$location" | sha256sum | awk '{print $1}')"
-            if [[ "$actual" != "$expected" ]]; then
-              echo "Certified input ${name} does not match its recorded digest" >&2
-              exit 1
-            fi
-          done < <(jq -r '.deliverables[] | select(.name | contains("linux")) | [.name, .location, .sha256] | @tsv' certification/candidate.json)
-
-  # Build multi-arch Docker images
-  # Strategy: Build images using pre-built binaries from dl.rustfs.com
-  # Supports both release and dev channel binaries based on build context
-  # Only runs when should_build is true (which includes workflow success check)
   build-docker:
-    name: Build Docker Images
-    needs: [ build-check, release-certification ]
-    if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - variant: musl
             file: Dockerfile
-            suffix: ""
-          - variant: glibc
+          - variant: gnu
             file: Dockerfile.glibc
-            suffix: "-glibc"
-
+    env:
+      CANDIDATE_MANIFEST: ${{ inputs.candidate_manifest }}
+      VARIANT: ${{ matrix.variant }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: ${{ fromJson(inputs.candidate_manifest).source_sha }}
           persist-credentials: false
-          ref: ${{ needs.build-check.outputs.source_ref }}
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ secrets.GHCR_USERNAME }}
-          password: ${{ secrets.GHCR_PASSWORD }}
-
-      - name: Login to Quay.io
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Extract metadata and generate tags
-        id: meta
+      - name: Reuse completed image
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/deliver.py reuse --kind image --target "$VARIANT"
+      - name: Install OCI tools
+        if: steps.reuse.outputs.reused != 'true'
         run: |
-          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
-          VERSION="${{ needs.build-check.outputs.version }}"
-          CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
-          VARIANT_SUFFIX="${{ matrix.suffix }}"
-
-          # Convert version format for Dockerfile compatibility. The former
-          # DOCKER_CHANNEL was "release" down every branch and was passed as a
-          # build-arg no Dockerfile declares, so it is gone.
-          case "$VERSION" in
-            "latest")
-              DOCKER_RELEASE="latest"
-              ;;
-            v*)
-              # For versioned releases (v1.0.0), remove 'v' prefix for Dockerfile
-              DOCKER_RELEASE="${VERSION#v}"
-              ;;
-            *)
-              # For other versions, pass as-is
-              DOCKER_RELEASE="${VERSION}"
-              ;;
-          esac
-
-          echo "docker_release=$DOCKER_RELEASE" >> "$GITHUB_OUTPUT"
-
-          echo "🐳 Docker build parameters:"
-          echo "  - Original version: $VERSION"
-          echo "  - Docker RELEASE: $DOCKER_RELEASE"
-
-          # Generate tags based on build type
-          # Only support release and prerelease builds (no development builds)
-          TAG_BASE="${VERSION}${VARIANT_SUFFIX}"
-          TAGS="${{ env.REGISTRY_DOCKERHUB }}:$TAG_BASE,${{ env.REGISTRY_GHCR }}:$TAG_BASE,${{ env.REGISTRY_QUAY }}:$TAG_BASE"
-
-          # Add latest when requested (stable releases, and prereleases before GA)
-          if [[ "$CREATE_LATEST" == "true" ]]; then
-            TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:latest${VARIANT_SUFFIX}"
-          fi
-
-          # Always add the channel tag for prereleases, independent of latest
-          if [[ "$BUILD_TYPE" == "prerelease" ]]; then
-            # Prerelease channel tags (alpha, beta, rc)
-            if [[ "$VERSION" == *"alpha"* ]]; then
-              CHANNEL="alpha"
-            elif [[ "$VERSION" == *"beta"* ]]; then
-              CHANNEL="beta"
-            elif [[ "$VERSION" == *"rc"* ]]; then
-              CHANNEL="rc"
-            fi
-
-            if [[ -n "$CHANNEL" ]]; then
-              TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:${CHANNEL}${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:${CHANNEL}${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:${CHANNEL}${VARIANT_SUFFIX}"
-            fi
-          fi
-
-          # Output tags
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-
-          # Staging identity for this run's promotion: official tags are only
-          # created after the staged image verifies against the certification,
-          # and they point at this same digest (no rebuild-after-verify).
-          STAGING_TAG="staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${VARIANT_SUFFIX}"
-          STAGING_TAGS="${{ env.REGISTRY_DOCKERHUB }}:${STAGING_TAG},${{ env.REGISTRY_GHCR }}:${STAGING_TAG},${{ env.REGISTRY_QUAY }}:${STAGING_TAG}"
-          echo "staging_tags=$STAGING_TAGS" >> "$GITHUB_OUTPUT"
-          echo "staging_tag=$STAGING_TAG" >> "$GITHUB_OUTPUT"
-
-          # Generate labels
-          LABELS="org.opencontainers.image.title=RustFS"
-          LABELS="$LABELS,org.opencontainers.image.description=RustFS distributed object storage system"
-          LABELS="$LABELS,org.opencontainers.image.version=$VERSION"
-          SOURCE_REVISION="$(git rev-parse HEAD)"
-          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"
-          LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
-          LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          LABELS="$LABELS,org.opencontainers.image.build-type=$BUILD_TYPE"
-
-          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
-
-          echo "🐳 Generated Docker tags:"
-          echo "$TAGS" | tr ',' '\n' | sed 's/^/  - /'
-          echo "📋 Build type: $BUILD_TYPE"
-          echo "🔖 Version: $VERSION"
-
-      - name: Build and push Docker image
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        if: steps.reuse.outputs.reused != 'true'
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: steps.reuse.outputs.reused != 'true'
+      - name: Supply accepted binaries and pinned CLI
+        if: steps.reuse.outputs.reused != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/deliver.py image-prepare --target "$VARIANT"
+      - name: Build OCI archive without registry writes
+        if: steps.reuse.outputs.reused != 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ${{ matrix.file }}
-          platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ needs.build-check.outputs.should_push == 'true' }}
-          # Push to staging tags only: official tags are created by the
-          # certification-gated promotion step below from this same digest.
-          tags: ${{ steps.meta.outputs.staging_tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # No layer cache. This build compiles nothing — it downloads a
-          # release zip and runs apk/apt — so the cache could only save the
-          # minute or two those take, while creating a correctness problem: with
-          # RELEASE=latest the binary URL is resolved by curl *inside* a RUN
-          # layer, and the layer key does not include what that resolved to. A
-          # rebuild at the same RELEASE value (dispatch with version=latest, or
-          # a re-run of the same version) would hit the old layer and ship the
-          # previous release's binary. mode=max also consumed the same 10GB
-          # Actions cache quota the Rust lanes are fighting over.
-          #
-          # Only RELEASE is passed: it is the sole build-arg the Dockerfiles
-          # declare besides TARGETARCH. BUILDTIME, VERSION, BUILD_TYPE, REVISION
-          # and CHANNEL were never read by any stage (and BUILDTIME's $(date ...)
-          # was a literal here, not a shell substitution). BUILD_DATE and VCS_REF
-          # are declared by the Dockerfiles but deliberately left unset —
-          # supplying them would change the published image labels.
+          platforms: linux/amd64,linux/arm64
+          push: false
+          provenance: false
+          outputs: type=oci,dest=delivery/image-${{ matrix.variant }}.tar
           build-args: |
-            RELEASE=${{ steps.meta.outputs.docker_release }}
-          provenance: true
-          sbom: true
-          # Add retry mechanism by splitting the build process
-          no-cache: false
-          pull: true
-
-      # A later-built wrapper: the staged image must complete this platform's
-      # own binary identity verification before any official tag is written.
-      # It may not inherit an unverified package's conclusion.
-      - name: Verify staged image against certification
-        if: needs.build-check.outputs.should_push == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
-          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
-          VERSION: ${{ needs.build-check.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p certification
-          run_id="$TRIGGERING_RUN_ID"
-          if [[ -z "$run_id" ]]; then
-            run_id="$(gh api --method GET \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
-              -f branch="$VERSION" -f status=success -F per_page=1 \
-              --jq '.workflow_runs[0].id // empty' || true)"
-          fi
-          gh run download "$run_id" -n release-certification -D certification
-
-          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
-          case "${{ matrix.variant }}" in
-            musl) libc="musl" ;;
-            glibc) libc="gnu" ;;
-          esac
-          for platform in linux/amd64 linux/arm64; do
-            case "$platform" in
-              linux/amd64) arch_sub="x86_64" ;;
-              linux/arm64) arch_sub="aarch64" ;;
-            esac
-            docker pull --platform "$platform" "$STAGING_REF"
-            container="$(docker create --platform "$platform" "$STAGING_REF")"
-            docker cp "$container:/usr/bin/rustfs" "$RUNNER_TEMP/staged-rustfs"
-            docker rm "$container" >/dev/null
-            actual="$(sha256sum "$RUNNER_TEMP/staged-rustfs" | awk '{print $1}')"
-            expected="$(jq -r --arg needle "linux-${arch_sub}-${libc}" \
-              '[.deliverables[] | select(.name | contains($needle)) | .binary_sha256][0] // empty' \
-              certification/candidate.json)"
-            if [[ -z "$expected" || "$actual" != "$expected" ]]; then
-              echo "Staged image binary for ${platform} does not match the certified binary digest" >&2
-              exit 1
-            fi
-            python3 scripts/release/release_gate.py verify-promotion \
-              --plan .config/release-validation-plan.json \
-              --candidate certification/candidate.json \
-              --summary certification/release-gate-output \
-              --artifact "$RUNNER_TEMP/staged-rustfs" \
-              --artifact-role binary
-          done
-
-      - name: Promote staged image to official tags
-        if: needs.build-check.outputs.should_push == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
-          IFS=',' read -r -a official_tags <<< "${{ steps.meta.outputs.tags }}"
-          for tag in "${official_tags[@]}"; do
-            docker buildx imagetools create -t "$tag" "$STAGING_REF"
-            echo "Promoted $tag -> $STAGING_REF"
-          done
-
-      # Downstream consumers (Helm) verify this record instead of inheriting
-      # an unverified wrapper's conclusion.
-      - name: Record image promotion
-        if: needs.build-check.outputs.should_push == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
-          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
-          VERSION: ${{ needs.build-check.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p certification
-          run_id="$TRIGGERING_RUN_ID"
-          if [[ -z "$run_id" ]]; then
-            run_id="$(gh api --method GET \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
-              -f branch="$VERSION" -f status=success -F per_page=1 \
-              --jq '.workflow_runs[0].id // empty' || true)"
-          fi
-          gh run download "$run_id" -n release-certification -D certification
-          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
-          digest="$(docker buildx imagetools inspect "$STAGING_REF" --format '{{json .Manifest}}' | jq -r '.digest')"
-          candidate_sha="$(python3 -c "import json,hashlib,sys; sys.path.insert(0,'scripts/release'); import release_gate; print(release_gate.canonical_sha256(json.load(open('certification/candidate.json'))))")"
-          jq -n \
-            --arg version "$VERSION" \
-            --arg digest "$digest" \
-            --arg staging_ref "$STAGING_REF" \
-            --arg candidate_sha256 "$candidate_sha" \
-            --arg tags "${{ steps.meta.outputs.tags }}" \
-            --slurpfile candidate certification/candidate.json \
-            '{schema_version: 1, version: $version, image_digest: $digest, staging_ref: $staging_ref,
-              promoted_tags: ($tags | split(",")), candidate_sha256: $candidate_sha256,
-              binary_sha256s: ($candidate[0].deliverables | map(.binary_sha256) | unique)}' \
-            > image-promotion-record.json
-
-      - name: Upload image promotion record
-        if: needs.build-check.outputs.should_push == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: image-promotion-record${{ matrix.suffix }}
-          path: image-promotion-record.json
-          if-no-files-found: error
-          retention-days: 30
-
-  # Note: Manifest creation is no longer needed as we only build one variant
-  # Multi-arch manifests are automatically created by docker/build-push-action
-
-  # Report-only container image vulnerability scan
-  scan-docker-image:
-    name: Scan Docker Images
-    needs: [ build-check, build-docker ]
-    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: musl
-            suffix: ""
-          - variant: glibc
-            suffix: "-glibc"
-    steps:
-      - name: Login to GitHub Container Registry
-        # docker/login-action v3
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: ghcr.io
-          username: ${{ secrets.GHCR_USERNAME }}
-          password: ${{ secrets.GHCR_PASSWORD }}
-
-      - name: Scan image with Trivy
-        # aquasecurity/trivy-action v0.36.0
+            BINARY_SOURCE=supplied
+            RELEASE=${{ fromJson(inputs.candidate_manifest).version }}
+            VCS_REF=${{ fromJson(inputs.candidate_manifest).source_sha }}
+      - name: Verify wrapped binaries and startup on both architectures
+        if: steps.reuse.outputs.reused != 'true'
+        run: python3 scripts/release/deliver.py image-smoke --target "$VARIANT"
+      - name: Scan amd64 image before sealing
+        if: steps.reuse.outputs.reused != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/amd64
         with:
-          image-ref: ${{ env.REGISTRY_GHCR }}:${{ needs.build-check.outputs.version }}${{ matrix.suffix }}
+          input: delivery-scan/image-${{ matrix.variant }}-amd64.tar
           format: sarif
-          output: trivy-${{ matrix.variant }}.sarif
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
+          output: delivery/scan-${{ matrix.variant }}-amd64.sarif
+          exit-code: "0" # Keep the repository's report-only vulnerability policy.
+      - name: Scan arm64 image before sealing
+        if: steps.reuse.outputs.reused != 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          input: delivery-scan/image-${{ matrix.variant }}-arm64.tar
+          format: sarif
+          output: delivery/scan-${{ matrix.variant }}-arm64.sarif
           exit-code: "0"
-
-      # Surface findings in the Security tab; an artifact alone is write-only
-      # reporting nobody reviews.
-      - name: Upload scan results to code scanning
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+      - name: Record verified OCI identity
+        if: steps.reuse.outputs.reused != 'true'
+        run: python3 scripts/release/deliver.py image-record --target "$VARIANT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.reuse.outputs.reused != 'true'
         with:
-          sarif_file: trivy-${{ matrix.variant }}.sarif
-          category: container-image-${{ matrix.variant }}
-
-      - name: Upload container scan report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: container-image-scan-${{ matrix.variant }}
-          path: trivy-${{ matrix.variant }}.sarif
+          name: image-${{ matrix.variant }}
+          path: delivery/*
           if-no-files-found: error
           retention-days: 30
-
-  # Docker build summary
-  docker-summary:
-    name: Docker Build Summary
-    needs: [ build-check, build-docker ]
-    if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Docker build completion summary
-        run: |
-          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
-          VERSION="${{ needs.build-check.outputs.version }}"
-          CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
-
-          echo "🐳 Docker build completed successfully!"
-          echo "📦 Build type: $BUILD_TYPE"
-          echo "🔢 Version: $VERSION"
-          echo "🚀 Strategy: Images using pre-built binaries (release channel only)"
-          echo ""
-
-          case "$BUILD_TYPE" in
-            "preview")
-              echo "🔍 Preview Docker image has been built with ${VERSION} tags"
-              echo "⏭️  Preview images do not update latest or prerelease channels"
-              ;;
-            "release")
-              echo "🚀 Release Docker image has been built with ${VERSION} tags"
-              echo "✅ This image is ready for production use"
-              if [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for stable release"
-              fi
-              ;;
-            "prerelease")
-              echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
-              echo "⚠️  This is a prerelease image - use with caution"
-              # Prereleases move latest until the first stable tag exists (pre-GA policy).
-              if [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for prerelease: $VERSION"
-              else
-                echo "🚫 Latest tag NOT created for prerelease"
-              fi
-              ;;
-            *)
-              echo "❌ Unexpected build type: $BUILD_TYPE"
-              ;;
-          esac
+          compression-level: 0

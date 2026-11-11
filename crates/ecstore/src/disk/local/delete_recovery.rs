@@ -1128,6 +1128,8 @@ struct PreparedDeleteReceiptEntry {
     journal_raw: Vec<u8>,
     journal: DeleteRecoveryJournal,
     sole_transaction: bool,
+    had_old_data_dir: bool,
+    rollback_dir_fd: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Clone)]
@@ -1137,6 +1139,8 @@ struct PublishedDeleteReceiptEntry {
     file_path: PathBuf,
     staging_root: PathBuf,
     journal_raw: Vec<u8>,
+    had_old_data_dir: bool,
+    rollback_dir_fd: Option<Arc<std::fs::File>>,
 }
 
 const PREPARED_DELETE_RECEIPTS_PER_SHARD: usize = 64;
@@ -2495,8 +2499,9 @@ impl LocalDisk {
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(None)),
                     Err(err) => return Err(err),
                 };
-                type PreparedDeleteTuple = (Option<Uuid>, Option<Vec<u8>>, Vec<u8>, DeleteRecoveryJournal, bool, bool, bool);
-                let (old_dir, target, journal_raw, journal, sole_transaction, destination_missing, old_data_dir_present) =
+                type PreparedDeleteTuple =
+                    (Option<Uuid>, Option<Vec<u8>>, Vec<u8>, DeleteRecoveryJournal, bool, bool, Option<bool>);
+                let (old_dir, target, journal_raw, journal, sole_transaction, destination_missing, old_data_dir_state) =
                     match (|| -> Result<Option<PreparedDeleteTuple>> {
                         let mut meta = FileMeta::load(&buf)?;
                         let mut deleted_headers: Vec<_> = meta
@@ -2513,13 +2518,12 @@ impl LocalDisk {
                         if old_dir.is_some_and(|dir| dir == transaction || dir.is_nil()) {
                             return Err(DiskError::FileCorrupt);
                         }
+                        let mut old_path_to_verify = None;
                         if let Some(uuid) = old_dir {
                             meta.data.remove(vec![fi_clone.version_id.unwrap_or_default(), uuid])?;
                             let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
                             check_path_length(old_path.to_string_lossy().as_ref())?;
-                            if old_path.join(STORAGE_FORMAT_FILE).exists() {
-                                return Ok(None);
-                            }
+                            old_path_to_verify = Some(old_path);
                         }
                         let surviving: HashSet<_> = meta
                             .versions
@@ -2601,6 +2605,12 @@ impl LocalDisk {
                                 }
                             }
                         }
+                        if let Some(old_path) = old_path_to_verify
+                            && (!scanned_file_path || old_data_dir_exists)
+                            && old_path.join(STORAGE_FORMAT_FILE).exists()
+                        {
+                            return Ok(None);
+                        }
                         sole_transaction &= predecessors.is_empty();
                         let mut sparse = fi_clone;
                         sparse.data = None;
@@ -2626,15 +2636,21 @@ impl LocalDisk {
                             journal,
                             sole_transaction,
                             scanned_file_path && !destination_exists,
-                            scanned_file_path && old_data_dir_exists,
+                            scanned_file_path.then_some(old_data_dir_exists),
                         )))
                     })() {
                         Ok(Some(tuple)) => tuple,
                         Ok(None) => return Ok(Ok(None)),
                         Err(err) => return Ok(Err(err)),
                     };
-                std::fs::create_dir_all(&staging_root)?;
-                let staged = tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root)?;
+                let staged = match tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root) {
+                    Ok(dir) => dir,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        std::fs::create_dir_all(&staging_root)?;
+                        tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root)?
+                    }
+                    Err(err) => return Err(err),
+                };
                 let staged_dir = staged.path().to_path_buf();
                 let backup_path = staged_dir.join(STORAGE_FORMAT_FILE_BACKUP);
                 if std::fs::hard_link(&xl_path, &backup_path).is_err() {
@@ -2658,8 +2674,12 @@ impl LocalDisk {
                 for file in written_files {
                     file.sync_data()?;
                 }
+                #[cfg(unix)]
+                let rollback_dir_fd = sync.then(|| std::fs::File::open(&staged_dir).ok().map(Arc::new)).flatten();
+                #[cfg(not(unix))]
+                let rollback_dir_fd: Option<Arc<std::fs::File>> = None;
                 if sync {
-                    os::fsync_dir_std(&staged_dir)?;
+                    os::fsync_directory_handle_std(&staged_dir, rollback_dir_fd.as_deref())?;
                 }
                 if !destination_missing {
                     match std::fs::symlink_metadata(&destination) {
@@ -2682,8 +2702,12 @@ impl LocalDisk {
                 }
                 let old_data_path = old_dir
                     .map(|uuid| file_path.join(uuid.to_string()))
-                    .filter(|p| old_data_dir_present || p.is_dir());
-                if sync && let Err(err) = os::fsync_dir_std(&file_path) {
+                    .filter(|p| old_data_dir_state.unwrap_or_else(|| p.is_dir()));
+                #[cfg(unix)]
+                let file_path_dir = sync.then(|| std::fs::File::open(&file_path).ok()).flatten();
+                #[cfg(not(unix))]
+                let file_path_dir: Option<std::fs::File> = None;
+                if sync && let Err(err) = os::fsync_directory_handle_std(&file_path, file_path_dir.as_ref()) {
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
                 }
@@ -2692,11 +2716,15 @@ impl LocalDisk {
                 let mut reserved_data_path = None;
                 if let Some(old_path) = old_data_path {
                     let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
+                    #[cfg(unix)]
+                    let old_dir_file = sync.then(|| std::fs::File::open(&old_path).ok()).flatten();
+                    #[cfg(not(unix))]
+                    let old_dir_file: Option<std::fs::File> = None;
                     let reserve_res = (|| -> std::io::Result<()> {
                         let marker = std::fs::File::create(&reserved_marker)?;
                         if sync {
                             marker.sync_all()?;
-                            os::fsync_dir_std(&old_path)?;
+                            os::fsync_directory_handle_std(&old_path, old_dir_file.as_ref())?;
                         }
                         Ok(())
                     })();
@@ -2705,7 +2733,7 @@ impl LocalDisk {
                         let _ = std::fs::remove_dir_all(&destination);
                         return Err(err);
                     }
-                    reserved_data_path = Some((old_path, reserved_marker));
+                    reserved_data_path = Some((old_path, reserved_marker, old_dir_file));
                 }
                 if let Some(ref target_bytes) = target {
                     // A provisional head must stay outside the published recovery transaction.
@@ -2737,7 +2765,7 @@ impl LocalDisk {
                         })()
                     };
                     if let Err(err) = write_res {
-                        if let Some((_, reserved_marker)) = &reserved_data_path {
+                        if let Some((_, reserved_marker, _)) = &reserved_data_path {
                             let _ = std::fs::remove_file(reserved_marker);
                         }
                         let _ = std::fs::remove_dir_all(&destination);
@@ -2746,19 +2774,20 @@ impl LocalDisk {
                 } else if let Err(err) = std::fs::remove_file(&xl_path)
                     && err.kind() != ErrorKind::NotFound
                 {
-                    if let Some((_, reserved_marker)) = &reserved_data_path {
+                    if let Some((_, reserved_marker, _)) = &reserved_data_path {
                         let _ = std::fs::remove_file(reserved_marker);
                     }
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
                 }
                 if sync {
-                    os::fsync_dir_std(&file_path)?;
+                    os::fsync_directory_handle_std(&file_path, file_path_dir.as_ref())?;
                 }
-                if let Some((old_path, reserved_marker)) = reserved_data_path {
+                let had_old_data_dir = reserved_data_path.is_some();
+                if let Some((old_path, reserved_marker, old_dir_file)) = reserved_data_path {
                     let recovery_marker = old_path.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
                     match std::fs::rename(&reserved_marker, &recovery_marker) {
-                        Ok(()) if sync => os::fsync_dir_std(&old_path)?,
+                        Ok(()) if sync => os::fsync_directory_handle_std(&old_path, old_dir_file.as_ref())?,
                         Ok(()) => {}
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
                         Err(err) => return Err(err),
@@ -2774,9 +2803,11 @@ impl LocalDisk {
                         journal_raw,
                         journal,
                         sole_transaction,
+                        had_old_data_dir,
+                        rollback_dir_fd,
                     },
                 );
-                Ok(Ok(Some(old_dir)))
+                Ok(Ok(Some(old_dir.filter(|_| had_old_data_dir))))
             },
         )
         .await
@@ -2829,7 +2860,13 @@ impl LocalDisk {
                 Some(entry.bucket_path),
                 entry.file_path,
                 entry.staging_root,
-                Some((entry.journal_raw, entry.journal, entry.sole_transaction)),
+                Some((
+                    entry.journal_raw,
+                    entry.journal,
+                    entry.sole_transaction,
+                    entry.had_old_data_dir,
+                    entry.rollback_dir_fd,
+                )),
             ),
             None => {
                 self.reject_multipart_delete_recovery_mutation(volume, object)?;
@@ -2860,7 +2897,7 @@ impl LocalDisk {
             lease,
             sync,
             move || -> std::io::Result<Result<Option<(DeleteRecoveryJournal, bool, bool)>>> {
-                if let Some((journal_raw, journal, sole_transaction)) = cached_receipt
+                if let Some((journal_raw, journal, sole_transaction, had_old_data_dir, rollback_dir_fd)) = cached_receipt
                     && rollback.join(PREPARED).is_file()
                 {
                     let tmp_receipt = staging_root.join(format!("receipt-{transaction}.tmp"));
@@ -2874,7 +2911,7 @@ impl LocalDisk {
                         os::record_native_publication(&receipt_path);
                         std::fs::rename(&tmp_receipt, &receipt_path)?;
                         if sync {
-                            os::fsync_dir_std(&rollback)?;
+                            os::fsync_directory_handle_std(&rollback, rollback_dir_fd.as_deref())?;
                         }
                         Ok(())
                     })();
@@ -2891,6 +2928,8 @@ impl LocalDisk {
                                 file_path: root,
                                 staging_root,
                                 journal_raw,
+                                had_old_data_dir,
+                                rollback_dir_fd,
                             },
                         );
                     }
@@ -3027,29 +3066,34 @@ impl LocalDisk {
             None
         };
         let cached_published = rollback_open_path.as_deref().and_then(take_published_delete_receipt);
-        let (object_path, bucket_path, staging_root, root, cached_journal_raw) = match cached_published {
-            Some(entry) => (
-                entry.object_path,
-                entry.bucket_path,
-                entry.staging_root,
-                entry.file_path,
-                Some(entry.journal_raw),
-            ),
-            None => {
-                self.reject_multipart_delete_recovery_mutation(volume, object)?;
-                if !safe_path(object, false) {
-                    return Err(DiskError::InvalidPath);
+        let (object_path, bucket_path, staging_root, root, cached_journal_raw, cached_had_old_data_dir, mut rollback_dir_fd) =
+            match cached_published {
+                Some(entry) => (
+                    entry.object_path,
+                    entry.bucket_path,
+                    entry.staging_root,
+                    entry.file_path,
+                    Some(entry.journal_raw),
+                    Some(entry.had_old_data_dir),
+                    entry.rollback_dir_fd,
+                ),
+                None => {
+                    self.reject_multipart_delete_recovery_mutation(volume, object)?;
+                    if !safe_path(object, false) {
+                        return Err(DiskError::InvalidPath);
+                    }
+                    let obj_path = self.get_object_path(volume, object)?;
+                    (
+                        obj_path,
+                        self.io_get_bucket_path(volume)?,
+                        self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?,
+                        self.io_get_object_path(volume, object)?,
+                        None,
+                        None,
+                        None,
+                    )
                 }
-                let obj_path = self.get_object_path(volume, object)?;
-                (
-                    obj_path,
-                    self.io_get_bucket_path(volume)?,
-                    self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?,
-                    self.io_get_object_path(volume, object)?,
-                    None,
-                )
-            }
-        };
+            };
         let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
         let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
@@ -3123,56 +3167,61 @@ impl LocalDisk {
             let recovery_committed = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             let reserved = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             let mut had_physical_data_dirs = false;
-            for data_dir in &data_dirs {
-                for base in [&root, &rollback] {
-                    let dir_path = base.join(data_dir.to_string());
-                    match std::fs::read_dir(&dir_path) {
-                        Ok(entries) => {
-                            had_physical_data_dirs = true;
-                            let mut removable = Vec::new();
-                            let mut preserve_dir = false;
-                            for entry in recovery_entries(entries, work_budget.as_deref()) {
-                                let entry = entry?;
-                                let name = entry.file_name();
-                                let Some(name) = name.to_str() else {
-                                    preserve_dir = true;
-                                    continue;
-                                };
-                                if entry.file_type()?.is_file()
-                                    && (delete_recovery_part_file(name)
-                                        || name == committed
-                                        || name == recovery_committed
-                                        || name == reserved
-                                        || is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
-                                {
-                                    removable.push(entry.path());
-                                } else {
-                                    preserve_dir = true;
+            let fast_cleanup = cached_journal_raw.is_some();
+            if cached_had_old_data_dir != Some(false) {
+                let bases: &[&Path] = if fast_cleanup { &[&root] } else { &[&root, &rollback] };
+                for data_dir in &data_dirs {
+                    for base in bases {
+                        let dir_path = base.join(data_dir.to_string());
+                        match std::fs::read_dir(&dir_path) {
+                            Ok(entries) => {
+                                had_physical_data_dirs = true;
+                                let mut removable = Vec::new();
+                                let mut preserve_dir = false;
+                                for entry in recovery_entries(entries, work_budget.as_deref()) {
+                                    let entry = entry?;
+                                    let name = entry.file_name();
+                                    let Some(name) = name.to_str() else {
+                                        preserve_dir = true;
+                                        continue;
+                                    };
+                                    if entry.file_type()?.is_file()
+                                        && (delete_recovery_part_file(name)
+                                            || name == committed
+                                            || name == recovery_committed
+                                            || name == reserved
+                                            || is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
+                                    {
+                                        removable.push(entry.path());
+                                    } else {
+                                        preserve_dir = true;
+                                    }
+                                }
+                                for path in removable {
+                                    ignore_not_found(std::fs::remove_file(path))?;
+                                }
+                                let mut dir_removed = false;
+                                if !preserve_dir {
+                                    match std::fs::remove_dir(&dir_path) {
+                                        Ok(()) => dir_removed = true,
+                                        Err(err) if err.kind() == ErrorKind::NotFound => dir_removed = true,
+                                        Err(err) if is_dir_not_empty_error(&err) => {}
+                                        Err(err) => return Err(err),
+                                    }
+                                }
+                                if !dir_removed && sync {
+                                    os::fsync_dir_std(&dir_path)?;
                                 }
                             }
-                            for path in removable {
-                                ignore_not_found(std::fs::remove_file(path))?;
-                            }
-                            if sync {
-                                os::fsync_dir_std(&dir_path)?;
-                            }
-                            if !preserve_dir {
-                                match std::fs::remove_dir(&dir_path) {
-                                    Ok(()) => {}
-                                    Err(err) if err.kind() == ErrorKind::NotFound || is_dir_not_empty_error(&err) => {}
-                                    Err(err) => return Err(err),
-                                }
-                            }
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) => return Err(err),
                         }
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(err),
                     }
                 }
             }
             if had_physical_data_dirs && sync && root.is_dir() {
                 os::fsync_dir_std(&root)?;
             }
-            let fast_cleanup = cached_journal_raw.is_some();
             if fast_cleanup {
                 let backup_or_marker = if has_original {
                     Some(STORAGE_FORMAT_FILE_BACKUP)
@@ -3221,12 +3270,15 @@ impl LocalDisk {
                     }
                 }
             }
-            if sync && let Err(err) = os::fsync_dir_std(&rollback) {
+            let rollback_sync = rollback_dir_fd.take();
+            if sync && let Err(err) = os::fsync_directory_handle_std(&rollback, rollback_sync.as_deref()) {
+                drop(rollback_sync);
                 if has_target || had_physical_data_dirs {
                     let _ = persist_receipt(true);
                 }
                 return Err(err);
             }
+            drop(rollback_sync);
             #[cfg(all(any(test, feature = "test-util"), not(windows)))]
             os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &receipt_path);
             if let Err(err) = ignore_not_found(std::fs::remove_file(&receipt_path)) {
