@@ -14478,31 +14478,31 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../app/multipart_usecase.rs");
+    let source = crate::guard_sources::SourceSet::read("src/app/multipart_usecase.rs", "src/app/multipart_usecase");
 
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        4
+        source.count("validate_table_catalog_object_mutation(&bucket, &key).await?;"),
+        4,
+        "reserved-prefix guard calls across {}",
+        source.describe()
     );
 }
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../storage/ecfs.rs");
+    let source = crate::guard_sources::SourceSet::read("src/storage/ecfs.rs", "src/storage/legacy_edge");
 
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &object).await?;")
-            .count(),
-        2
+        source.count("validate_table_catalog_object_mutation(&bucket, &object).await?;"),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
     );
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        2
+        source.count("validate_table_catalog_object_mutation(&bucket, &key).await?;"),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
     );
 }
 
