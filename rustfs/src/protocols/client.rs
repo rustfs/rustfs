@@ -1260,7 +1260,7 @@ mod tests {
 
     #[test]
     fn legacy_copy_source_keeps_keys_that_need_percent_encoding() {
-        for key in ["%2F", "foo?versionId=1", "a b+c", "caf\u{e9}", "x&y=z#frag"] {
+        for key in ["%2F", "foo?versionId=1", "a b+c", "\u{4e2d}\u{6587}", "x&y=z#frag"] {
             let source = legacy_copy_source(bucket_source("bucket", key, None)).expect("encoded source");
             assert_eq!(s3s_bucket(source), ("bucket".to_owned(), key.to_owned(), None), "{key}");
         }
