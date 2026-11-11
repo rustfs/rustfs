@@ -1048,6 +1048,139 @@ mod tests {
         assert_eq!(request.uri().to_string(), original_uri);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn token_redemption_authorizes_each_item_through_real_iam() {
+        crate::app::gating_test_env::run_large_stack_test("zip-token-redemption", || async {
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            store
+                .make_bucket("photos", &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+            let access_key = "zip-redeem-user";
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: "zip-redeem-secret-key".to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create user");
+            iam.set_policy(
+                "zip-redeem-policy",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(access_key, UserType::Reg, false, "zip-redeem-policy")
+                .await
+                .expect("attach policy");
+            let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+            // Redemption carries no server context slot, so it resolves the ambient context.
+            publish_test_app_context(Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms))));
+
+            let record = zip_redemption_record(access_key, credentials, test_auth_context());
+
+            authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("allowed/two")])
+                .await
+                .expect("every saved item is readable by the token principal");
+            let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("denied/one")])
+                .await
+                .expect_err("one unreadable item denies the download");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            let err = authorize_zip_items_for_download(&record, &[zip_item("denied/one")])
+                .await
+                .expect_err("an unreadable item is denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
+    /// A saved copy-source header is a body-derived policy input the token cannot supply,
+    /// so redemption fails closed before any policy is evaluated.
+    #[tokio::test]
+    async fn token_redemption_denies_saved_copy_source_header() {
+        let mut auth_context = test_auth_context();
+        auth_context
+            .headers
+            .insert("x-amz-copy-source", HeaderValue::from_static("/photos/allowed/one"));
+        let record = zip_redemption_record("zip-redeem-user", rustfs_credentials::Credentials::default(), auth_context);
+        let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one")])
+            .await
+            .expect_err("an unresolved copy-source input fails closed");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("request body policy input is missing for this action"));
+    }
+
+    fn zip_redemption_record(
+        access_key: &str,
+        credentials: rustfs_credentials::Credentials,
+        auth_context: ObjectZipDownloadAuthContext,
+    ) -> ObjectZipDownloadToken {
+        ObjectZipDownloadToken {
+            id: "zip-redeem-token".to_owned(),
+            principal: access_key.to_owned(),
+            req_info: ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            },
+            auth_context,
+            request: CreateObjectZipDownloadRequest {
+                bucket: "photos".to_owned(),
+                prefix: None,
+                objects: Vec::new(),
+                prefixes: Vec::new(),
+                filename: None,
+            },
+        }
+    }
+
+    fn zip_item(key: &str) -> ZipDownloadItem {
+        ZipDownloadItem {
+            key: key.to_owned(),
+            entry_name: key.to_owned(),
+        }
+    }
+
     fn valid_request() -> CreateObjectZipDownloadRequest {
         CreateObjectZipDownloadRequest {
             bucket: "photos".to_string(),
