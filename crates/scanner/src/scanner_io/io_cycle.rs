@@ -607,6 +607,14 @@ where
     };
 
     let distributed = store.setup_is_dist_erasure().await;
+    let local_node = if distributed {
+        store
+            .scanner_local_node_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| Error::other("scanner local member identity is unavailable"))?
+    } else {
+        crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE.to_string()
+    };
     #[cfg(test)]
     let distributed = distributed || peer_observations.is_some();
     let activity_before = match scanner_activity_preflight(
@@ -711,13 +719,19 @@ where
     let activity_before = remote_start
         .as_ref()
         .map_or(activity_before, ScannerRemoteDirtyUsageWindow::activity_for_walk);
-    let structural_scan_plan_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
+    let structural_scan_plan_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_structural_digest(&activity_before, &local_node),
+    );
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
     let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
-    let checkpoint_coverage_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_coverage_digest(&activity_before));
+    let checkpoint_coverage_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_coverage_digest(&activity_before, &local_node),
+    );
+    let completed_checkpoint_cycle_floor =
+        completed_checkpoint_cycle_floor(persisted_usage_baseline.as_deref(), &expected_sources, want_cycle, leader_epoch);
     let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
     let baseline_proof = ScannerCacheBaselineProof {
@@ -980,6 +994,7 @@ where
             digest: structural_scan_plan_digest,
             bucket_coverage_digest,
             checkpoint_coverage_digest,
+            completed_checkpoint_cycle_floor,
             requires_full_scan,
             service_cohort: service_cohort.clone(),
             execution_digest,

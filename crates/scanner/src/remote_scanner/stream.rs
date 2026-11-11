@@ -742,6 +742,26 @@ async fn scan_and_persist_local_bucket(
     let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
         .await
         .generation;
+    // Read the authoritative floor only for a completed checkpoint. No wire
+    // change is needed, and an unavailable/legacy floor falls back to a walk.
+    let completed_checkpoint_cycle_floor = if cache.info.snapshot_complete
+        && cache.info.scan_plan_digest == Some(scan_plan_digest)
+        && checkpoint_plan_digest.is_some()
+        && cache.info.scan_coverage_digest == checkpoint_plan_digest
+        && cache.info.next_cycle < next_cycle
+    {
+        let baseline = read_config(store.clone(), crate::DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .ok();
+        let sources = store
+            .all_set_disks()
+            .iter()
+            .map(|set| DataUsageCacheSource::new(set.pool_index, set.set_index))
+            .collect();
+        crate::scanner_io::completed_checkpoint_cycle_floor(baseline.as_deref(), &sources, next_cycle, leader_epoch)
+    } else {
+        None
+    };
     let scan_state = current_cache_root_or_prepare_with_generation(
         &mut cache,
         &bucket,
@@ -766,6 +786,7 @@ async fn scan_and_persist_local_bucket(
                 ))
             })?,
             checkpoint_plan_digest,
+            completed_checkpoint_cycle_floor,
         },
     );
     match scan_state {
@@ -960,6 +981,7 @@ async fn scan_and_persist_local_bucket(
             // The folder completes under its coverage plan; finished cache
             // reuse and the response remain bound to the requested reuse plan.
             cache.info.scan_plan_digest = Some(scan_plan_digest);
+            cache.info.scan_coverage_digest = checkpoint_plan_digest;
             (cache, None)
         }
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),

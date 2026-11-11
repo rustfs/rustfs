@@ -1131,10 +1131,11 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
 /// `publication_blocked` is omitted from every identity: a movement pause
 /// vetoes the cycle it moves in (`scanner_activity_guardrail_veto`) and
 /// describes nothing about the heap.
-pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnapshot, local_node: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(b"scanner-reuse-members-v2");
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
-    for (host, activity) in snapshot {
+    for (host, activity) in scanner_activity_members(snapshot, local_node) {
         let host = host.as_bytes();
         let instance_id = activity.instance_id.as_bytes();
         hasher.update(u64::try_from(host.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -1150,6 +1151,29 @@ pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnaps
     hasher.finalize().into()
 }
 
+fn scanner_activity_members<'a>(
+    snapshot: &'a ScannerActivitySnapshot,
+    local_node: &'a str,
+) -> Vec<(&'a str, &'a ScannerNodeActivity)> {
+    // The local marker moves to another member when leadership changes.
+    // Hash the actual member identities in canonical order instead.
+    let mut nodes = snapshot
+        .iter()
+        .map(|(host, activity)| {
+            (
+                if host == LOCAL_SCANNER_ACTIVITY_NODE {
+                    local_node
+                } else {
+                    host.as_str()
+                },
+                activity,
+            )
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_unstable_by_key(|(host, _)| *host);
+    nodes
+}
+
 /// The coverage identity: hash the activity inputs under which a bucket
 /// sweep's traversal stays one traversal, so a checkpoint resumed in a later
 /// cycle is not mixed coverage. It binds the peer set, the protocol, the
@@ -1158,17 +1182,16 @@ pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnaps
 /// namespace a sweep walks, so `instance_id`, `maintenance_generation` and
 /// `publication_blocked` are left out; hashing them made every resumed sweep
 /// restart as mixed coverage after such an event (rustfs/rustfs#8494). The
-/// local node's namespace and dirty generations are left out too: the
+/// standalone node's namespace and dirty generations are left out too: the
 /// bucket's own dirty generation joins the checkpoint plan in
-/// `scanner_bucket_cache_digest`, which is what certification compares. A
-/// remote peer's generations stay in, because its dirty buckets are still
-/// acknowledged per cycle rather than per bucket, and a write there between
-/// the two halves of a sweep would otherwise be acknowledged without having
-/// been walked.
-pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+/// `scanner_bucket_cache_digest`, which is what certification compares.
+/// Distributed plans retain every member's generations, including the
+/// coordinator's, so a leader rotation cannot remove a mutation witness.
+pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapshot, local_node: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(b"scanner-checkpoint-coverage-v2");
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
-    for (host, activity) in snapshot {
+    for (host, activity) in scanner_activity_members(snapshot, local_node) {
         let host_bytes = host.as_bytes();
         hasher.update(u64::try_from(host_bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(host_bytes);
@@ -1176,7 +1199,12 @@ pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapsho
         hasher.update(activity.topology_digest);
         hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.movement_generation.to_be_bytes());
-        if host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE {
+        if host == LOCAL_SCANNER_ACTIVITY_NODE {
+            // Standalone writes are fenced by the bucket's own generation.
+            hasher.update(0_u64.to_be_bytes());
+            hasher.update(0_u64.to_be_bytes());
+            hasher.update([0]);
+        } else {
             hasher.update(activity.namespace_generation.to_be_bytes());
             hasher.update(activity.dirty_usage_generation.to_be_bytes());
             hasher.update([u8::from(activity.dirty_usage_pending)]);

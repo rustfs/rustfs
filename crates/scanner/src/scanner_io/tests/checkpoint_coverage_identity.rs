@@ -14,6 +14,141 @@ use super::*;
 const HOT_OBJECTS: [&str; 6] = ["p0/a", "p1/b", "p2/c", "p3/d", "p4/e", "p5/f"];
 const LEADER_EPOCH: u64 = 11;
 
+#[test]
+fn completed_checkpoint_reuse_requires_unpublished_unchanged_coverage() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let plan = DataUsageScanPlanDigest([1; 32]);
+    let coverage = DataUsageScanPlanDigest([2; 32]);
+    let identity = crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::new_v4(),
+        set_layout: DataUsageScanPlanDigest([3; 32]),
+        publication_epoch: 1,
+        tier_registry_generation: 2,
+        scan_mode: HealScanMode::Normal,
+    };
+    let mut saved = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "completed".to_string(),
+            next_cycle: 8,
+            leader_epoch: 11,
+            last_update: Some(SystemTime::now()),
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(plan),
+            scan_coverage_digest: Some(coverage),
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(2),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    saved.replace(
+        "completed",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            size: 48,
+            ..Default::default()
+        },
+    );
+    for case in [
+        "unpublished",
+        "published",
+        "missing_floor",
+        "restart",
+        "mutation",
+        "legacy",
+        "newer_cycle",
+        "newer_leader",
+        "tier",
+        "incarnation",
+        "source",
+        "deep",
+        "corrupt",
+        "partial",
+    ] {
+        let mut cache = saved.clone();
+        let mut options = DataUsageCacheReuseOptions {
+            require_source: true,
+            tier_registry_generation: Some(2),
+            checkpoint_identity: Some(identity),
+            checkpoint_plan_digest: Some(coverage),
+            completed_checkpoint_cycle_floor: Some(7),
+        };
+        match case {
+            "published" => options.completed_checkpoint_cycle_floor = Some(8),
+            "missing_floor" => options.completed_checkpoint_cycle_floor = None,
+            "restart" => cache.info.scan_plan_digest = Some(DataUsageScanPlanDigest([4; 32])),
+            "mutation" => cache.info.scan_coverage_digest = Some(DataUsageScanPlanDigest([4; 32])),
+            "legacy" => cache.info.scan_coverage_digest = None,
+            "newer_cycle" => cache.info.next_cycle = 10,
+            "newer_leader" => cache.info.leader_epoch = 13,
+            "tier" => options.tier_registry_generation = Some(3),
+            "incarnation" => options.checkpoint_identity.as_mut().expect("identity").bucket_incarnation = Uuid::new_v4(),
+            "source" => cache.info.source = Some(DataUsageCacheSource::new(1, 0)),
+            "deep" => options.checkpoint_identity.as_mut().expect("identity").scan_mode = HealScanMode::Deep,
+            "corrupt" => cache.cache.clear(),
+            "partial" => cache.info.scan_resume_after = Some("completed/a".to_string()),
+            "unpublished" => {}
+            _ => unreachable!("all fixture cases are handled"),
+        }
+        let state = current_cache_root_or_prepare_with_generation(&mut cache, "completed", source, 9, 12, plan, options);
+        assert_eq!(matches!(state, DataUsageCacheScanState::Current(_)), case == "unpublished", "{case}");
+        if case == "unpublished" {
+            assert_eq!(cache.info.next_cycle, 8, "adoption must not extend the saved receipt's lifetime");
+            let DataUsageCacheScanState::Current(root) = state else { unreachable!() };
+            assert_eq!(root.entry.objects, 3);
+        }
+    }
+}
+
+#[test]
+fn completed_checkpoint_floor_requires_an_authoritative_baseline() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let sources = HashSet::from([source]);
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&complete_usage_baseline(source, DataUsageScanPlanDigest([1; 32]), 7, 11))
+            .expect("complete baseline");
+    for case in [
+        "complete",
+        "bootstrap",
+        "observational",
+        "partial",
+        "incomplete",
+        "legacy",
+        "no_cycle",
+    ] {
+        let mut value = baseline.clone();
+        match case {
+            "bootstrap" => {
+                value = serde_json::to_value(crate::scanner::scanner_usage_bootstrap_marker(SystemTime::now(), Some(11)))
+                    .expect("bootstrap marker");
+            }
+            "observational" => value["usage_snapshot_observational"] = true.into(),
+            "partial" => value["usage_snapshot_partial"] = true.into(),
+            "incomplete" => value["usage_snapshot_complete"] = false.into(),
+            "legacy" => value["scanner_epoch"] = serde_json::Value::Null,
+            "no_cycle" => value["scanner_cycle"] = serde_json::Value::Null,
+            "complete" => {}
+            _ => unreachable!("all fixture cases are handled"),
+        }
+        let bytes = serde_json::to_vec(&value).expect("baseline fixture");
+        assert_eq!(
+            completed_checkpoint_cycle_floor(Some(&bytes), &sources, 9, 12),
+            match case {
+                "complete" => Some(7),
+                "bootstrap" => Some(0),
+                _ => None,
+            },
+            "{case}"
+        );
+    }
+    assert_eq!(completed_checkpoint_cycle_floor(None, &sources, 9, 12), None);
+    assert_eq!(completed_checkpoint_cycle_floor(Some(b"invalid"), &sources, 9, 12), None);
+}
+
 async fn put_fixture_object(store: &Arc<ECStore>, bucket: &str, object: &str) {
     let mut reader = ScannerPutObjReader::from_vec(vec![7; 16]);
     store
@@ -26,6 +161,16 @@ async fn run_full_cycle(
     store: &Arc<ECStore>,
     cycle: u64,
     max_objects: Option<u64>,
+) -> (ScannerCycleResult, Option<DataUsageInfo>, Arc<ScannerCycleBudget>) {
+    run_full_cycle_at_epoch(store, cycle, LEADER_EPOCH, max_objects, None).await
+}
+
+async fn run_full_cycle_at_epoch(
+    store: &Arc<ECStore>,
+    cycle: u64,
+    leader_epoch: u64,
+    max_objects: Option<u64>,
+    persisted_usage_baseline: Option<Bytes>,
 ) -> (ScannerCycleResult, Option<DataUsageInfo>, Arc<ScannerCycleBudget>) {
     let ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -45,10 +190,10 @@ async fn run_full_cycle(
                 budget: Arc::clone(&budget),
                 updates,
                 want_cycle: cycle,
-                leader_epoch: LEADER_EPOCH,
+                leader_epoch,
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
-                persisted_usage_baseline: None,
+                persisted_usage_baseline,
                 observed_usage_candidate: None,
                 requires_full_scan: true,
                 service_cohort: None,
@@ -64,6 +209,46 @@ async fn run_full_cycle(
     let snapshot = receiver.recv().await;
     assert!(receiver.recv().await.is_none(), "a cycle publishes at most one terminal snapshot");
     (result, snapshot, budget)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_small_budget_accumulates_completed_buckets_across_leaders() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    let names = ["bounded-a", "bounded-b", "bounded-c", "bounded-d"];
+    for bucket in names {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bounded fixture bucket");
+        for object in ["a", "b", "c"] {
+            put_fixture_object(&store, bucket, object).await;
+        }
+        record_dirty_usage_bucket(bucket);
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let baseline = Bytes::from(
+        serde_json::to_vec(&crate::scanner::scanner_usage_bootstrap_marker(SystemTime::now(), Some(LEADER_EPOCH)))
+            .expect("bootstrap baseline"),
+    );
+    let mut observations = Vec::new();
+    for cycle in 1..=20 {
+        let (result, usage, budget) =
+            run_full_cycle_at_epoch(&store, cycle, LEADER_EPOCH + cycle, Some(2), Some(baseline.clone())).await;
+        observations.push((cycle, result.status, budget.progress()));
+        if result.status == ScannerCycleStatus::Complete {
+            let usage = usage.expect("completed bounded sweep publishes usage");
+            assert_eq!(usage.objects_total_count, 12);
+            assert_eq!(usage.usage_snapshot_converged, Some(true));
+            for bucket in names {
+                assert_eq!(usage.buckets_usage[bucket].objects_count, 3);
+            }
+            clear_dirty_usage_buckets_for_tests();
+            return;
+        }
+    }
+    panic!("fixed budget must accumulate the completed buckets: {observations:?}");
 }
 
 #[tokio::test]
@@ -130,13 +315,13 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
         .await
         .expect("the fixture activity should be observable");
     assert_ne!(
-        crate::scanner::scanner_activity_structural_digest(&before),
-        crate::scanner::scanner_activity_structural_digest(&after),
+        crate::scanner::scanner_activity_structural_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        crate::scanner::scanner_activity_structural_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
         "a maintenance publication invalidates reusable results"
     );
     assert_eq!(
-        crate::scanner::scanner_activity_coverage_digest(&before),
-        crate::scanner::scanner_activity_coverage_digest(&after),
+        crate::scanner::scanner_activity_coverage_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        crate::scanner::scanner_activity_coverage_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
         "a maintenance publication keeps the coverage plan"
     );
 
@@ -220,8 +405,14 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
                 .await
                 .expect("activity before maintenance")
         };
-        let coverage = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&before));
-        let reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(&before));
+        let coverage = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(
+            &before,
+            crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+        ));
+        let reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(
+            &before,
+            crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+        ));
         let cycle = 100 + u64::try_from(index).expect("fixture index") * 2;
         for resumed in [false, true] {
             let activity = if resumed && restart {
@@ -237,10 +428,16 @@ async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_chang
             } else {
                 before.clone()
             };
-            let requested_reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(&activity));
+            let requested_reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(
+                &activity,
+                crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+            ));
             assert_eq!(
                 coverage,
-                DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity))
+                DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(
+                    &activity,
+                    crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE
+                ))
             );
             if resumed {
                 assert_ne!(reuse, requested_reuse, "the event must invalidate completed cache reuse");

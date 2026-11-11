@@ -10379,7 +10379,10 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
     let remote = after.get_mut("remote").expect("remote activity should exist");
     remote.dirty_usage_generation += 1;
     remote.dirty_usage_pending = true;
-    assert_eq!(scanner_activity_structural_digest(&before), scanner_activity_structural_digest(&after));
+    assert_eq!(
+        scanner_activity_structural_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     let old_plan = crate::scanner_io::checkpoint_fixture_bucket_digest(
         DataUsageScanPlanDigest(scanner_activity_snapshot_digest(&before)),
         None,
@@ -10421,6 +10424,7 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
                 tier_registry_generation: None,
                 checkpoint_identity: None,
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         ),
         crate::scanner_io::DataUsageCacheScanState::Prepared {
@@ -10638,8 +10642,8 @@ fn scanner_activity_structural_digest_ignores_regular_bucket_writes() {
 
     assert_ne!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&written));
     assert_eq!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&written),
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&written, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
         "bucket writes are refreshed through the dirty-bucket scope rather than invalidating every cache"
     );
 }
@@ -10661,18 +10665,24 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance_but_not_pub
     // maintenance rule needs a maintenance pass, so both invalidate every
     // reusable result (the baseline and the set caches).
     assert_ne!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&restarted)
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&restarted, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
     assert_ne!(
-        scanner_activity_structural_digest(&baseline),
-        scanner_activity_structural_digest(&maintained)
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&maintained, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
     // A publication pause describes nothing about the heap: it vetoes the
     // cycle it moves in and is part of no identity.
-    assert_eq!(scanner_activity_structural_digest(&baseline), scanner_activity_structural_digest(&paused));
+    assert_eq!(
+        scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_structural_digest(&paused, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     assert_eq!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&paused));
-    assert_eq!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&paused));
+    assert_eq!(
+        scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_coverage_digest(&paused, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
     assert_eq!(
         scanner_activity_guardrail_veto(&baseline, &paused).map(|veto| veto.field),
         Some("publication_blocked")
@@ -10701,8 +10711,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
             let mut changed = baseline.clone();
             mutate(changed.get_mut(host).expect("host should be present"));
             assert_eq!(
-                scanner_activity_coverage_digest(&baseline),
-                scanner_activity_coverage_digest(&changed),
+                scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must not change the coverage identity"
             );
             assert_eq!(
@@ -10721,8 +10731,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
         let mut changed = baseline.clone();
         mutate(changed.get_mut(LOCAL_SCANNER_ACTIVITY_NODE).expect("local activity"));
         assert_eq!(
-            scanner_activity_coverage_digest(&baseline),
-            scanner_activity_coverage_digest(&changed),
+            scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+            scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
             "local {field} is certified per bucket through the bucket's own dirty generation"
         );
         // A peer's generations stay in: its dirty buckets are acknowledged
@@ -10731,8 +10741,8 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
         let mut peer_changed = baseline.clone();
         mutate(peer_changed.get_mut("node-2").expect("peer activity"));
         assert_ne!(
-            scanner_activity_coverage_digest(&baseline),
-            scanner_activity_coverage_digest(&peer_changed),
+            scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+            scanner_activity_coverage_digest(&peer_changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
             "remote {field} must change the coverage identity"
         );
     }
@@ -10747,20 +10757,63 @@ fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_
             let mut changed = baseline.clone();
             mutate(changed.get_mut(host).expect("host should be present"));
             assert_ne!(
-                scanner_activity_coverage_digest(&baseline),
-                scanner_activity_coverage_digest(&changed),
+                scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_coverage_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must change the coverage identity"
             );
             assert_ne!(
-                scanner_activity_structural_digest(&baseline),
-                scanner_activity_structural_digest(&changed),
+                scanner_activity_structural_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_structural_digest(&changed, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} on {host} must change the reuse identity"
             );
         }
     }
     let mut peer_lost = baseline.clone();
     peer_lost.remove("node-2");
-    assert_ne!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&peer_lost));
+    assert_ne!(
+        scanner_activity_coverage_digest(&baseline, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        scanner_activity_coverage_digest(&peer_lost, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+    );
+}
+
+#[test]
+fn scanner_checkpoint_coverage_survives_clean_leader_rotation() {
+    let first = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("leader-a", 0, 0)),
+        ("node-b".to_string(), scanner_node_activity("peer-b", 0, 0)),
+        ("node-c".to_string(), scanner_node_activity("peer-c", 0, 0)),
+    ]);
+    let second = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("leader-b", 0, 0)),
+        ("node-a".to_string(), scanner_node_activity("peer-a", 0, 0)),
+        ("node-c".to_string(), scanner_node_activity("peer-c", 0, 0)),
+    ]);
+    assert_eq!(
+        scanner_activity_coverage_digest(&first, "node-a"),
+        scanner_activity_coverage_digest(&second, "node-b"),
+        "a quiet namespace must retain checkpoint coverage when a different node becomes leader"
+    );
+    assert_ne!(
+        scanner_activity_structural_digest(&first, "node-a"),
+        scanner_activity_structural_digest(&second, "node-b"),
+        "restarted processes must invalidate completed results even with reset mutation counters"
+    );
+    let mut rotated = first.clone();
+    let previous_leader = rotated.remove(LOCAL_SCANNER_ACTIVITY_NODE).expect("previous leader");
+    let next_leader = rotated.remove("node-b").expect("next leader");
+    rotated.insert("node-a".to_string(), previous_leader);
+    rotated.insert(LOCAL_SCANNER_ACTIVITY_NODE.to_string(), next_leader);
+    assert_eq!(
+        scanner_activity_structural_digest(&first, "node-a"),
+        scanner_activity_structural_digest(&rotated, "node-b"),
+        "a leadership change alone must retain completed coverage"
+    );
+    rotated.get_mut("node-a").expect("previous leader").namespace_generation += 1;
+    assert_ne!(
+        scanner_activity_coverage_digest(&first, "node-a"),
+        scanner_activity_coverage_digest(&rotated, "node-b"),
+        "a write on the previous coordinator must invalidate its completed coverage"
+    );
 }
 
 #[test]
@@ -10792,10 +10845,18 @@ fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
     // restarted coordinator requests, or every resumed sweep restarts as
     // mixed coverage and the bucket can never certify (rustfs/rustfs#8494).
     // The reuse plan does change: finished results are walked again.
-    let coverage_plan =
-        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_coverage_digest(snapshot));
-    let reuse_plan =
-        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_structural_digest(snapshot));
+    let coverage_plan = |snapshot| {
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &buckets,
+            scanner_activity_coverage_digest(snapshot, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        )
+    };
+    let reuse_plan = |snapshot| {
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &buckets,
+            scanner_activity_structural_digest(snapshot, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+        )
+    };
     assert_eq!(coverage_plan(&before), coverage_plan(&restarted));
     assert_ne!(reuse_plan(&before), reuse_plan(&restarted));
 
@@ -10803,7 +10864,10 @@ fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
     extra_bucket.push(bucket_info("gamma"));
     assert_ne!(
         coverage_plan(&before),
-        crate::scanner_io::scanner_bucket_plan_digest(&extra_bucket, scanner_activity_coverage_digest(&before)),
+        crate::scanner_io::scanner_bucket_plan_digest(
+            &extra_bucket,
+            scanner_activity_coverage_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+        ),
         "the bucket list stays part of the plan"
     );
 }
@@ -10999,8 +11063,8 @@ fn generation_movement_shades_buckets_without_a_guardrail_veto() {
             assert_eq!(scanner_activity_guardrail_veto(&before, &after), None, "{field} on {host} must not veto");
             assert!(SCANNER_ACTIVITY_SHADE_FIELDS.contains(field));
             assert_eq!(
-                scanner_activity_structural_digest(&before),
-                scanner_activity_structural_digest(&after),
+                scanner_activity_structural_digest(&before, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
+                scanner_activity_structural_digest(&after, crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE),
                 "{field} must stay outside the structural digest"
             );
         }

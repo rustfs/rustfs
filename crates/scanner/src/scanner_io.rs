@@ -929,6 +929,7 @@ pub struct ScannerBucketScanPlan {
     /// coordinator restart or a maintenance publication does not turn a
     /// resumed sweep into mixed coverage.
     checkpoint_coverage_digest: DataUsageScanPlanDigest,
+    completed_checkpoint_cycle_floor: Option<u64>,
     requires_full_scan: bool,
     service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
@@ -2018,8 +2019,8 @@ use guards::*;
 
 pub(crate) use cache::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
-    persist_scanner_checkpoint,
+    acquire_scanner_cache_locks, completed_checkpoint_cycle_floor, current_cache_root_or_prepare_with_generation,
+    log_saved_partial_bucket_cache, persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,

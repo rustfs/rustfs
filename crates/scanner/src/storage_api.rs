@@ -440,6 +440,9 @@ pub(crate) trait ScannerStorage:
     + storage_contracts::NamespaceLocking<Error = EcstoreErrorType, NamespaceLock = NamespaceLockWrapper>
 {
     fn scanner_topology_digest(&self) -> [u8; 32];
+    fn scanner_local_node_name(&self) -> Option<String> {
+        None
+    }
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
     async fn scanner_data_usage_publication_blocked(&self) -> bool;
@@ -470,6 +473,15 @@ pub(crate) trait ScannerStorage:
 impl ScannerStorage for EcstoreStore {
     fn scanner_topology_digest(&self) -> [u8; 32] {
         crate::scanner::scanner_topology_digest(self)
+    }
+
+    fn scanner_local_node_name(&self) -> Option<String> {
+        self.endpoints()
+            .0
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref().iter())
+            .find(|endpoint| endpoint.is_local)
+            .map(|endpoint| endpoint.grid_host())
     }
 
     fn scanner_namespace_mutation_generation(&self) -> u64 {

@@ -2466,6 +2466,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             digest: DataUsageScanPlanDigest([6; 32]),
             bucket_coverage_digest: DataUsageScanPlanDigest([6; 32]),
             checkpoint_coverage_digest: DataUsageScanPlanDigest([6; 32]),
+            completed_checkpoint_cycle_floor: None,
             requires_full_scan: false,
             execution_digest: empty_execution,
             leader_epoch: 11,

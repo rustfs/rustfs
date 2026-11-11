@@ -964,6 +964,7 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;
@@ -1267,6 +1268,7 @@ where
                 tier_registry_generation: None,
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         let prepared = retained(&cache);
@@ -1407,6 +1409,7 @@ where
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;

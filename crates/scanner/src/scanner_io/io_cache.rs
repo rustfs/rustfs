@@ -301,6 +301,7 @@ impl ScannerIOCache for SetDisks {
             digest: scan_plan_digest,
             bucket_coverage_digest,
             checkpoint_coverage_digest,
+            completed_checkpoint_cycle_floor,
             requires_full_scan,
             service_cohort,
             execution_digest,
@@ -1238,6 +1239,7 @@ impl ScannerIOCache for SetDisks {
                             tier_registry_generation: Some(tier_registry_generation),
                             checkpoint_identity,
                             checkpoint_plan_digest: Some(bucket_checkpoint_plan_digest),
+                            completed_checkpoint_cycle_floor,
                         },
                     );
                     let outcome = match scan_state {
@@ -1582,10 +1584,11 @@ impl ScannerIOCache for SetDisks {
                         ScannerDiskScanOutcome::Complete(mut completed_cache) => {
                             // The sweep finished under its coverage plan; the
                             // complete cache is current under the reuse plan,
-                            // which a restart or a maintenance publication
-                            // changes so the bucket is walked again next time.
+                            // while its coverage plan remains available until
+                            // the coordinated aggregate is published.
                             if completed_cache.info.snapshot_complete {
                                 completed_cache.info.scan_plan_digest = Some(bucket_scan_plan_digest);
+                                completed_cache.info.scan_coverage_digest = Some(bucket_checkpoint_plan_digest);
                             }
                             (completed_cache, false)
                         }
