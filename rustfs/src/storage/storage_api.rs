@@ -173,9 +173,7 @@ pub(crate) mod owned_parity_consumer {
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
-    pub(crate) use super::super::helper::{
-        AuditRequestView, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
-    };
+    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
     pub(crate) use super::super::request_context::RequestContext;
 }
 

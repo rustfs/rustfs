@@ -1826,11 +1826,10 @@ pub(crate) mod select_object {
 #[cfg(test)]
 pub(crate) mod owned_parity {
     pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
-        AuditRequestView, DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders,
-        PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
-        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG,
-        TableDataPlanePublicationGuards, authorization_denial_entry, authorization_denial_entry_for_view, authorize_request,
-        parity_test_support,
+        DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
+        ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
     };
 }
 

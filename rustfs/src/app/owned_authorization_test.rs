@@ -986,6 +986,9 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
     assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
 }
 
+/// Case name, request, action, and how to supply the missing body input.
+type FailClosedCase = (&'static str, S3Request<()>, Action, fn(&mut Extensions));
+
 fn request(extensions: Extensions) -> S3Request<()> {
     let mut req = build_request((), Method::PUT);
     req.uri = Uri::from_static("/bucket/key");
@@ -1071,7 +1074,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         extensions.insert(PostObjectRequestMarker);
         request(extensions)
     };
-    let cases: Vec<(&str, S3Request<()>, Action, fn(&mut Extensions))> = vec![
+    let cases: Vec<FailClosedCase> = vec![
         (
             "legal hold",
             request(Extensions::new()),
