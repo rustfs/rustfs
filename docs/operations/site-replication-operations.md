@@ -302,6 +302,8 @@ it. A bucket-replication target configured with its own credentials needs the
 same `s3:ForceDeleteObject` grant on the target side, or its force-deletes are
 rejected and counted as replication failures.
 
+The same policy grants `kms:GenerateDataKey` on every key, because a site running with `RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true` authorizes each SSE-KMS replica write against the key it resolves to. An account whose stored policy predates this grant is refreshed the same way; until that happens SSE-KMS objects stay `FAILED` with `AccessDenied` from the peer and catch up afterwards. The account holds no `kms:Decrypt`, so a read proxied to a peer for an SSE-KMS object that has not arrived yet is refused under enforcement. See [Per-key KMS authorization](kms-per-key-authorization.md#sse-kms-data-path).
+
 Treat IAM divergence as a security incident: a user deleted on one site can
 remain usable on an unreachable peer until replay or repair completes. A peer
 whose IAM entry is escalated does not receive scheduled snapshots either -
@@ -318,6 +320,26 @@ including the one a bulk import schedules - until the repair settles it.
 Unknown MinIO/RustFS encryption markers are never forwarded as ordinary user
 metadata. They fail replication so an operator must migrate or repair the
 object with a supported format.
+
+### KMS keys must carry the same name on every site
+
+**Delivery requirement.** Site replication copies bucket default-encryption configuration verbatim, including `KMSMasterKeyID`, and copies IAM policies verbatim, including key-scoped `kms:*` resources. It never copies KMS keys or KMS configuration. Each site therefore resolves a synchronized key name in its own KMS, so every key name that appears in a bucket default or a policy must exist on every site before it is used. This is a deployment precondition; RustFS does not translate key names between sites.
+
+- Create each key in every site's KMS under the same name. The key material is independent per site: a replica is always re-encrypted under the receiving site's key of that name, as the table above describes.
+- Give every site the same default key name (`RUSTFS_KMS_DEFAULT_KEY_ID`). A bucket default of `aws:kms` set without a `KMSMasterKeyID` is stored with the originating site's default key name and synchronized in that form, so differing default key names break the peer the same way a missing named key does.
+- A key-scoped policy statement needs one resource per key name, `arn:aws:kms:::key/<name>`; the synchronized policy then names the same key on every site.
+- When one site uses AWS KMS, AWS decides the names. AWS assigns key IDs and RustFS does not manage aliases, so the AWS site cannot adopt another site's key name. Create the key in AWS first, then create a key on every Vault site whose name is the AWS key ID (the bare UUID, not the ARN). Configure the AWS site's default key as the bare key ID too.
+
+What a missing key looks like on the site that lacks it, observed on a Vault and AWS KMS pair:
+
+| Request | Result |
+|---|---|
+| `PUT` with no SSE headers, or with `aws:kms` and no key ID, into a bucket whose synchronized default names the missing key | `400 KMS.NotFoundException`; no object is created. |
+| `PUT` with an explicit `AES256` header into the same bucket | `200`; the object is sealed under the local default key. |
+| Object written on the site that has the key | The `PUT` returns `200`, but the source replication status stays `FAILED` and is retried every scanner cycle; the peer stores nothing. |
+| `GET` of that object on the peer | `200` with the correct bytes, proxied from the source site. This is not evidence of a replica: check `HEAD` for `x-amz-replication-status: REPLICA` (`GET` does not return that header). |
+
+The object-level failure is silent to the writer, so verify key names before enabling a bucket default rather than relying on client errors. Bucket replication through remote targets is not affected by this requirement: it synchronizes no bucket configuration, and the destination bucket's own default decides the key.
 
 ## Rolling upgrades and rollback
 
