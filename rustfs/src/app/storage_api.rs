@@ -53,9 +53,16 @@ pub(crate) mod s3 {
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     #[cfg(test)]
+    pub(crate) use s3s::access::S3Access;
+    #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{
+        BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, PutObjectInput, Tag, Tagging,
+    };
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
@@ -1812,6 +1819,17 @@ pub(crate) mod select_object {
     pub(crate) use crate::storage::storage_api::{
         StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
         validate_ssec_for_read,
+    };
+}
+
+/// The storage items the owned/legacy authorization parity tests drive.
+#[cfg(test)]
+pub(crate) mod owned_parity {
+    pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
+        AuditRequestView, DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders,
+        PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
+        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
     };
 }
 
