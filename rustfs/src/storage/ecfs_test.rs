@@ -205,12 +205,6 @@ mod tests {
         crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
     }
 
-    /// The bucket default retention path reads the persisted shape; the request
-    /// literals in these tests stay on the wire DTO and convert once here.
-    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
-        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
-    }
-
     #[test]
     fn test_validate_object_lock_configuration_rejects_disabled_status() {
         let cfg = ObjectLockConfiguration {
