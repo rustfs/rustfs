@@ -223,8 +223,8 @@ mod tests {
     #[test]
     fn count_does_not_join_a_needle_across_two_files() {
         let root = tempfile::tempdir().expect("tempdir");
-        write(root.path(), "src/app/usecase.rs", "guar");
-        write(root.path(), "src/app/usecase/tail.rs", "ded();\n");
+        write(root.path(), "src/app/usecase.rs", "guard");
+        write(root.path(), "src/app/usecase/tail.rs", "ed();\n");
 
         let set = SourceSet::read_under(root.path(), "src/app/usecase.rs", "src/app/usecase");
 
