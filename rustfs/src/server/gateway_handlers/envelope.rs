@@ -151,7 +151,7 @@ mod tests {
     use crate::server::gateway_handlers::error::handler_error;
     use bytes::Bytes;
     use http::{HeaderValue, Method, Request, StatusCode};
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
     use rustfs_gateway::sig::{AmzDate, PayloadMode, SigService, SigV4Signer, SigningCredentials, SigningRequest, SigningScope};
     use rustfs_gateway::{
         Credentials, Handler, HandlerResult, Limits, RegionSet, Req, Resp, ServiceBuilder, SigV4Authenticator, StaticCredentials,
@@ -198,7 +198,16 @@ mod tests {
             .expect("the probe service assembles");
 
         let response = service.call(request).await;
-        assert_eq!(response.status(), StatusCode::OK, "the probe must be reached");
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|body| body.to_bytes())
+                .unwrap_or_default();
+            panic!("the probe must be reached: {status} {}", String::from_utf8_lossy(&body));
+        }
         probe
             .seen
             .lock()
@@ -223,8 +232,15 @@ mod tests {
         let credentials = SigningCredentials::new(SIGNER_ACCESS_KEY, SIGNER_SECRET_KEY.as_bytes()).expect("credentials");
         let mut signer = SigV4Signer::new(credentials, scope);
         let method = Method::GET;
-        let signing =
-            SigningRequest::new(&method, "/", "", &headers, accepted.host().raw_for_signing(), PayloadMode::Empty, stamp);
+        let signing = SigningRequest::new(
+            &method,
+            "/",
+            "",
+            &headers,
+            accepted.host().raw_for_signing(),
+            PayloadMode::Unsigned,
+            stamp,
+        );
         let signed = signer.sign_headers(&signing).expect("a signable request");
         let mut builder = Request::builder().method(method).uri("/");
         for (name, value) in signed.headers() {
