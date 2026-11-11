@@ -52,6 +52,8 @@ pub(crate) struct DecodeOutcome {
     pub(crate) error: Option<std::io::Error>,
     pub(crate) exact_quorum: bool,
     pub(crate) repair: ShardReadRepair,
+    pub(crate) frame_count: usize,
+    pub(crate) read_dispatch_count: usize,
 }
 
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
@@ -828,6 +830,58 @@ where
         }
     }
 
+    /// Build a reconstruction-verifying reader for one q-aligned slice of a
+    /// logical EC block. The underlying erasure geometry still determines the
+    /// number of data and parity readers, while `read_shard_size` describes the
+    /// smaller byte vector that Reed-Solomon should reconstruct for this range.
+    ///
+    /// The q-range caller opens every reader at the same logical shard offset,
+    /// so this reader only needs one local stripe and no global shard cursor.
+    fn new_for_quantized_decode(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        read_shard_size: usize,
+        metrics_path: Option<&'static str>,
+        read_costs: Option<Vec<ShardReadCost>>,
+    ) -> Self {
+        let mut reader = if let Some(read_costs) = read_costs {
+            Self::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+                readers,
+                e,
+                0,
+                0,
+                metrics_path,
+                read_costs,
+                get_object_disk_read_timeout(),
+                true,
+            )
+        } else {
+            Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                e,
+                0,
+                0,
+                metrics_path,
+                get_object_disk_read_timeout(),
+                true,
+            )
+        };
+        reader.offset = 0;
+        reader.shard_size = read_shard_size;
+        reader.shard_file_size = read_shard_size;
+        // A q-range is already bounded to the exact shard frames needed by the
+        // client request.  Keep healthy reads demand-bound as well: read the
+        // data quorum and retain parity as stripe-aligned reserves for a failed
+        // data reader.  The ordinary GET rollout remains controlled by its
+        // deployment gate, while this bounded path avoids paying parity I/O for
+        // every small Range request.
+        reader.demand_bound_lockstep = true;
+        for (index, engaged) in reader.engaged.iter_mut().enumerate() {
+            *engaged = index < reader.data_shards;
+        }
+        reader
+    }
+
     pub(crate) fn with_repair_evidence(mut self, evidence: Arc<ShardReadRepair>) -> Self {
         self.repair_evidence = Some(evidence);
         self
@@ -981,6 +1035,15 @@ where
         let mut state = StripeReadState::with_slot_count(self.readers.len(), self.data_shards);
         self.read_into_state(&mut state).await;
         state.into_parts()
+    }
+
+    pub(crate) fn read_shape(&self) -> (usize, usize) {
+        self.readers.iter().flatten().fold((0, 0), |(frames, dispatches), reader| {
+            (
+                frames.saturating_add(reader.last_frame_count()),
+                dispatches.saturating_add(reader.last_read_dispatch_count()),
+            )
+        })
     }
 
     async fn read_into_state(&mut self, state: &mut StripeReadState) {
@@ -1818,6 +1881,9 @@ where
                         // fail a stripe that later reaches a real quorum.
                         self.engaged[i] = false;
                     } else {
+                        if let Some(evidence) = &self.repair_evidence {
+                            evidence.observe(&[Some(e.clone())]);
+                        }
                         errs[i] = Some(e);
                         // Lockstep cannot safely reuse a reader after any
                         // error, even when the low-level classifier called it
@@ -2387,6 +2453,301 @@ impl Erasure {
         .await
     }
 
+    /// Decode a range that was opened as one q-aligned slice of every data
+    /// shard. The caller supplies the output offset within the concatenated
+    /// q-slices (`shard_index * read_shard_size + offset_in_shard`). Keeping
+    /// this path separate from `decode_inner` preserves the normal full-shard
+    /// reader geometry for legacy and full-object GETs.
+    /// `allow_direct_data_shard` requires the caller to have established its
+    /// metadata/open quorum and enabled frame authentication; policies requiring
+    /// reconstruction evidence must leave it false.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decode_quantized_range_with_stripe_handles_and_reopeners<W, R>(
+        &self,
+        writer: &mut W,
+        mut readers: Vec<Option<BitrotReader<R>>>,
+        output_offset: usize,
+        length: usize,
+        read_shard_size: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+        mut deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        mut deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+        allow_direct_data_shard: bool,
+    ) -> DecodeOutcome
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: crate::erasure::coding::ShardSource,
+    {
+        if readers.len() != self.data_shards + self.parity_shards {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")),
+                ..Default::default()
+            };
+        }
+        if read_shard_size == 0 {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized shard size must be non-zero")),
+                ..Default::default()
+            };
+        }
+        let Some(required_len) = output_offset.checked_add(length) else {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized output range overflows")),
+                ..Default::default()
+            };
+        };
+        let Some(max_len) = self.data_shards.checked_mul(read_shard_size) else {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized shard geometry overflows")),
+                ..Default::default()
+            };
+        };
+        if required_len > max_len {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return DecodeOutcome {
+                error: Some(io::Error::new(ErrorKind::InvalidInput, "quantized output range exceeds shard geometry")),
+                ..Default::default()
+            };
+        }
+        if length == 0 {
+            return DecodeOutcome::default();
+        }
+
+        let metrics_path = Some(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let target_shard = output_offset / read_shard_size;
+        let within_shard = output_offset % read_shard_size;
+        // The caller has already established the normal metadata and reader-
+        // open quorum. A healthy systematic shard can serve a single-shard
+        // range after authenticating every frame in its opened q-slice. Other
+        // data shards contain no requested bytes; read them only if this shard
+        // fails and reconstruction becomes necessary. Protected layouts and
+        // policies requiring reconstruction evidence keep the quorum decoder.
+        if allow_direct_data_shard
+            && !self.uses_legacy_codec()
+            && length <= read_shard_size - within_shard
+            && readers.iter().flatten().all(|reader| reader.integrity_proof().is_none())
+            && let Some(mut direct_reader) = readers[target_shard].take()
+        {
+            let stripe_read_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+            let read_cost = read_costs
+                .as_ref()
+                .and_then(|costs| costs.get(target_shard))
+                .copied()
+                .unwrap_or(ShardReadCost::Unknown);
+            let read_timeout = get_object_disk_read_timeout();
+            let mut direct_read = Box::pin(read_shard_result(
+                target_shard,
+                read_cost,
+                &mut direct_reader,
+                None,
+                read_shard_size,
+                self.data_shards,
+                read_timeout,
+                metrics_path,
+            ));
+            let initial_result = if let Some(delay) = shard_read_hedge_delay(read_timeout) {
+                tokio::select! {
+                    biased;
+                    result = &mut direct_read => Some(result.0),
+                    _ = tokio::time::sleep(delay) => None,
+                }
+            } else {
+                Some((&mut direct_read).await.0)
+            };
+            let repair = Arc::new(ShardReadRepair::default());
+            let mut outcome = DecodeOutcome::default();
+            let selected_data;
+            match initial_result {
+                Some(Ok(data)) => selected_data = Some((data, within_shard)),
+                initial_result => {
+                    // Keep a pending target alive through its real deadline.
+                    // The hedge only admits competing reconstruction; it is
+                    // not evidence that this healthy source is missing.
+                    if let Some(handle) = deferred_handles.get_mut(target_shard) {
+                        *handle = None;
+                    }
+                    if let Some(reopener) = deferred_reopeners.get_mut(target_shard) {
+                        *reopener = None;
+                    }
+                    if let Some(Err(error)) = &initial_result {
+                        repair.observe(&[Some(error.clone())]);
+                    }
+                    // Buffer at most one requested data-shard slice. Neither
+                    // contender writes to the downstream until authenticated
+                    // direct bytes or a complete verified quorum has won.
+                    let mut fallback_data = Vec::with_capacity(length);
+                    let mut fallback = Box::pin(self.decode_quantized_range_quorum(
+                        &mut fallback_data,
+                        readers,
+                        output_offset,
+                        length,
+                        read_shard_size,
+                        read_costs,
+                        deferred_handles,
+                        deferred_reopeners,
+                        Some(target_shard),
+                        Arc::clone(&repair),
+                    ));
+                    if initial_result.is_some() {
+                        outcome = (&mut fallback).await;
+                        drop(fallback);
+                        selected_data = (outcome.written == length).then_some((fallback_data, 0));
+                    } else {
+                        let race = tokio::select! {
+                            biased;
+                            result = &mut direct_read => Ok(result.0),
+                            outcome = &mut fallback => Err(outcome),
+                        };
+                        match race {
+                            Ok(Ok(data)) => {
+                                drop(fallback);
+                                selected_data = Some((data, within_shard));
+                            }
+                            Ok(Err(error)) => {
+                                repair.observe(&[Some(error)]);
+                                outcome = (&mut fallback).await;
+                                drop(fallback);
+                                selected_data = (outcome.written == length).then_some((fallback_data, 0));
+                            }
+                            Err(fallback_outcome) => {
+                                drop(fallback);
+                                if fallback_outcome.written == length {
+                                    outcome = fallback_outcome;
+                                    selected_data = Some((fallback_data, 0));
+                                } else {
+                                    // A failed alternative quorum must not vote
+                                    // away a still-pending healthy target.
+                                    match (&mut direct_read).await.0 {
+                                        Ok(data) => selected_data = Some((data, within_shard)),
+                                        Err(error) => {
+                                            repair.observe(&[Some(error)]);
+                                            outcome = fallback_outcome;
+                                            selected_data = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            drop(direct_read);
+            outcome.frame_count = outcome.frame_count.saturating_add(direct_reader.last_frame_count());
+            outcome.read_dispatch_count = outcome
+                .read_dispatch_count
+                .saturating_add(direct_reader.last_read_dispatch_count());
+            outcome.repair = repair.snapshot();
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+            if let Some((data, start)) = selected_data {
+                let emit_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+                let result = writer.write_all(&data[start..start + length]).await;
+                record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
+                if let Err(error) = result {
+                    outcome.written = 0;
+                    outcome.error = Some(error);
+                } else {
+                    outcome.written = length;
+                }
+            }
+            return outcome;
+        }
+        self.decode_quantized_range_quorum(
+            writer,
+            readers,
+            output_offset,
+            length,
+            read_shard_size,
+            read_costs,
+            deferred_handles,
+            deferred_reopeners,
+            None,
+            Arc::new(ShardReadRepair::default()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decode_quantized_range_quorum<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        output_offset: usize,
+        length: usize,
+        read_shard_size: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+        deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+        pending_target: Option<usize>,
+        repair: Arc<ShardReadRepair>,
+    ) -> DecodeOutcome
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: crate::erasure::coding::ShardSource,
+    {
+        let metrics_path = Some(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let mut reader =
+            ParallelReader::new_for_quantized_decode(readers, self.clone(), read_shard_size, metrics_path, read_costs)
+                .with_deferred_parity_handles(deferred_handles)
+                .with_deferred_parity_reopeners(deferred_reopeners)
+                .with_repair_evidence(Arc::clone(&repair));
+        let integrity = reader.integrity.clone();
+        // The q-range reader still verifies each bitrot frame.  Requiring an
+        // additional reconstruction source for a healthy range would defeat
+        // demand-bound parity and turn every request back into an all-shard
+        // read; parity is admitted by the lockstep reader only when data is
+        // missing or fails verification.
+        let require_surplus_source = false;
+
+        let stripe_read_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+        let (mut shards, mut errs) = reader.read().await;
+        if let Some(target_shard) = pending_target {
+            // This slot is owned by the direct contender, rather than missing
+            // from storage. Clear only its synthetic error; actual successful
+            // shards still determine the reconstruction quorum below.
+            errs[target_shard] = None;
+        }
+        let (frame_count, read_dispatch_count) = reader.read_shape();
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+        let exact_quorum = shards.iter().filter(|shard| shard.is_some()).count() == self.data_shards;
+        let mut written = 0;
+        let mut ret_err = None;
+        let flow = self
+            .emit_decoded_stripe(
+                writer,
+                &mut shards,
+                &errs,
+                output_offset,
+                length,
+                &mut written,
+                &mut ret_err,
+                &repair,
+                rustfs_io_metrics::get_stage_metrics_enabled(),
+                require_surplus_source,
+                integrity.as_ref(),
+                0,
+            )
+            .await;
+        if matches!(flow, StripeFlow::Continue) {
+            reader.recycle_shards(&mut shards);
+        }
+        if ret_err.is_none() && written < length {
+            ret_err = Some(Error::LessData.into());
+        }
+
+        DecodeOutcome {
+            written,
+            error: ret_err,
+            exact_quorum,
+            repair: repair.snapshot(),
+            frame_count,
+            read_dispatch_count,
+        }
+    }
+
     /// Reconstruct and emit one already-read stripe.
     ///
     /// This is the shared per-stripe body used by both the serial legacy loop
@@ -2837,6 +3198,8 @@ impl Erasure {
             error: ret_err,
             exact_quorum,
             repair,
+            frame_count: 0,
+            read_dispatch_count: 0,
         }
     }
 }
@@ -2964,6 +3327,372 @@ mod tests {
                 self.bytes_read.fetch_add(delta, Ordering::SeqCst);
             }
             result
+        }
+    }
+
+    async fn quantized_counting_readers(
+        erasure: &Erasure,
+        data: &[u8],
+        frame_size: usize,
+        slice_offset: usize,
+        slice_length: usize,
+        corrupt_shard: Option<usize>,
+    ) -> (Vec<Option<BitrotReader<CountingShardReader>>>, Vec<Arc<AtomicUsize>>) {
+        let shards = erasure.encode_data(data).expect("quantized fixture must encode");
+        let mut readers = Vec::with_capacity(shards.len());
+        let mut counters = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let mut writer = BitrotWriter::new(Vec::new(), frame_size, HashAlgorithm::HighwayHash256S);
+            for frame in shard[slice_offset..slice_offset + slice_length].chunks(frame_size) {
+                writer.write(frame).await.expect("quantized fixture frame must write");
+            }
+            let mut encoded = writer.into_inner();
+            if corrupt_shard == Some(readers.len()) {
+                *encoded.last_mut().expect("fixture has a frame payload") ^= 0x80;
+            }
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            readers.push(Some(BitrotReader::new_with_frame_size(
+                CountingShardReader {
+                    inner: Cursor::new(encoded),
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+                erasure.shard_size(),
+                frame_size,
+                HashAlgorithm::HighwayHash256S,
+                false,
+            )));
+            counters.push(bytes_read);
+        }
+        (readers, counters)
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_reads_only_the_requested_authenticated_data_shard() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (readers, counters) = quantized_counting_readers(&erasure, data, 4, 0, 4, None).await;
+        let mut output = Vec::new();
+        let outcome = erasure
+            .decode_quantized_range_with_stripe_handles_and_reopeners(
+                &mut output,
+                readers,
+                5,
+                2,
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                true,
+            )
+            .await;
+
+        assert!(outcome.error.is_none(), "authenticated direct range must succeed: {:?}", outcome.error);
+        assert_eq!(outcome.written, 2);
+        assert_eq!(output, &data[9..11]);
+        assert_eq!(outcome.frame_count, 1);
+        assert_eq!(outcome.read_dispatch_count, 1);
+        for (index, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                if index == 1 {
+                    HashAlgorithm::HighwayHash256S.size() + 4
+                } else {
+                    0
+                },
+                "healthy direct range must not read unrequested shard {index}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_can_be_disabled_without_changing_range_bytes() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (readers, counters) = quantized_counting_readers(&erasure, data, 4, 0, 4, None).await;
+        let mut output = Vec::new();
+        let outcome = erasure
+            .decode_quantized_range_with_stripe_handles_and_reopeners(
+                &mut output,
+                readers,
+                5,
+                2,
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
+            .await;
+
+        assert!(outcome.error.is_none(), "quorum decoder range must succeed: {:?}", outcome.error);
+        assert_eq!(output, &data[9..11]);
+        assert!(counters[0].load(Ordering::SeqCst) > 0, "disabled direct path must read the data quorum");
+        assert!(
+            counters[1].load(Ordering::SeqCst) > 0,
+            "disabled direct path must read the requested data shard"
+        );
+        assert_eq!(counters[2].load(Ordering::SeqCst), 0);
+        assert_eq!(counters[3].load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_verifies_every_frame_before_emitting_and_recovers_corruption() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        for corrupt in [false, true] {
+            let (readers, counters) = quantized_counting_readers(&erasure, data, 4, 0, 8, corrupt.then_some(0)).await;
+            let mut output = Vec::new();
+            let outcome = erasure
+                .decode_quantized_range_with_stripe_handles_and_reopeners(
+                    &mut output,
+                    readers,
+                    2,
+                    6,
+                    8,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )
+                .await;
+
+            assert_eq!(
+                outcome.written, 6,
+                "corrupt={corrupt}: authenticated or reconstructed range must complete"
+            );
+            assert_eq!(output, &data[2..8], "corrupt={corrupt}: no corrupt prefix may reach the writer");
+            assert_eq!(
+                outcome.repair.needed(false),
+                corrupt,
+                "observed corruption must survive successful reconstruction"
+            );
+            assert_eq!(
+                counters[0].load(Ordering::SeqCst),
+                2 * (HashAlgorithm::HighwayHash256S.size() + 4),
+                "target must authenticate both frames exactly once, including the failing second frame"
+            );
+            if !corrupt {
+                assert_eq!(outcome.frame_count, 2);
+                assert_eq!(counters[1].load(Ordering::SeqCst), 0);
+            } else {
+                assert!(
+                    counters[1].load(Ordering::SeqCst) > 0,
+                    "reconstruction must read the remaining data shard"
+                );
+                assert!(counters[2].load(Ordering::SeqCst) + counters[3].load(Ordering::SeqCst) > 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_missing_target_reconstructs_the_same_slice() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (mut readers, counters) = quantized_counting_readers(&erasure, data, 4, 4, 4, None).await;
+        readers[1] = None;
+        let mut output = Vec::new();
+        let outcome = erasure
+            .decode_quantized_range_with_stripe_handles_and_reopeners(
+                &mut output,
+                readers,
+                5,
+                2,
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                true,
+            )
+            .await;
+
+        assert_eq!(outcome.written, 2, "missing target must reconstruct from a read quorum");
+        assert_eq!(output, &data[13..15], "fallback must remain aligned to the nonzero q slice");
+        assert_eq!(counters[1].load(Ordering::SeqCst), 0);
+        assert!(counters[0].load(Ordering::SeqCst) > 0);
+        assert!(counters[2].load(Ordering::SeqCst) + counters[3].load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_unrecoverable_corruption_emits_no_bytes() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (mut readers, _) = quantized_counting_readers(&erasure, data, 4, 0, 4, Some(0)).await;
+        readers[1] = None;
+        readers[3] = None;
+        let mut output = Vec::new();
+        let outcome = erasure
+            .decode_quantized_range_with_stripe_handles_and_reopeners(
+                &mut output,
+                readers,
+                1,
+                2,
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                true,
+            )
+            .await;
+
+        assert!(outcome.error.is_some(), "insufficient reconstruction quorum must fail");
+        assert_eq!(outcome.written, 0);
+        assert!(output.is_empty(), "unverified data must never be emitted");
+        assert!(outcome.repair.needed(false), "failed direct read must retain corruption evidence");
+    }
+
+    #[tokio::test]
+    async fn quantized_direct_preserves_writer_failure() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (readers, _) = quantized_counting_readers(&erasure, data, 4, 0, 4, None).await;
+        let outcome = erasure
+            .decode_quantized_range_with_stripe_handles_and_reopeners(
+                &mut FailingEmitWriter,
+                readers,
+                1,
+                2,
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                true,
+            )
+            .await;
+
+        assert_eq!(outcome.error.expect("writer failure must escape").kind(), ErrorKind::BrokenPipe);
+        assert_eq!(outcome.written, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn quantized_direct_stalled_target_recovers_without_waiting_for_disk_timeout() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        let (readers, _) = quantized_counting_readers(&erasure, data, 4, 4, 4, None).await;
+        let slow_until = TokioInstant::now() + Duration::from_secs(60);
+        let readers = readers
+            .into_iter()
+            .enumerate()
+            .map(|(index, reader)| {
+                let bytes = reader.expect("fixture reader").inner_ref().inner.get_ref().clone();
+                let source = if index == 1 {
+                    TestShardReader::ReadyAt {
+                        cursor: Cursor::new(bytes),
+                        ready_at: slow_until,
+                        sleep: None,
+                    }
+                } else {
+                    TestShardReader::Ready(Cursor::new(bytes))
+                };
+                Some(BitrotReader::new_with_frame_size(
+                    source,
+                    erasure.shard_size(),
+                    4,
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                ))
+            })
+            .collect();
+        let mut output = Vec::new();
+        let started = TokioInstant::now();
+        let outcome = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("30"))], async {
+            erasure
+                .decode_quantized_range_with_stripe_handles_and_reopeners(
+                    &mut output,
+                    readers,
+                    5,
+                    2,
+                    4,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(outcome.written, 2, "fast parity must recover the stalled q slice");
+        assert_eq!(output, &data[13..15], "timeout recovery must retain the original q offset");
+        assert!(!outcome.repair.needed(true), "a hedged healthy target is not a missing storage shard");
+        assert!(
+            started.elapsed() <= Duration::from_millis(150),
+            "direct attempt must admit reconstruction by the existing 100 ms hedge, elapsed={:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn quantized_direct_pending_healthy_target_survives_missing_or_corrupt_parity() {
+        let data = b"abcdefghijklmnop";
+        let erasure = Erasure::new(2, 2, data.len());
+        for corrupt_parity in [false, true] {
+            let (readers, _) = quantized_counting_readers(&erasure, data, 4, 4, 4, None).await;
+            let started = TokioInstant::now();
+            let ready_at = started + Duration::from_millis(200);
+            let readers = readers
+                .into_iter()
+                .enumerate()
+                .map(|(index, reader)| {
+                    let mut bytes = reader.expect("fixture reader").inner_ref().inner.get_ref().clone();
+                    if index >= erasure.data_shards {
+                        if !corrupt_parity {
+                            return None;
+                        }
+                        *bytes.last_mut().expect("parity payload") ^= 0x80;
+                    }
+                    let source = if index == 1 {
+                        TestShardReader::ReadyAt {
+                            cursor: Cursor::new(bytes),
+                            ready_at,
+                            sleep: None,
+                        }
+                    } else {
+                        TestShardReader::Ready(Cursor::new(bytes))
+                    };
+                    Some(BitrotReader::new_with_frame_size(
+                        source,
+                        erasure.shard_size(),
+                        4,
+                        HashAlgorithm::HighwayHash256S,
+                        false,
+                    ))
+                })
+                .collect();
+            let mut output = Vec::new();
+            let outcome = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("30"))], async {
+                erasure
+                    .decode_quantized_range_with_stripe_handles_and_reopeners(
+                        &mut output,
+                        readers,
+                        5,
+                        2,
+                        4,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        true,
+                    )
+                    .await
+            })
+            .await;
+
+            assert!(
+                outcome.error.is_none(),
+                "corrupt_parity={corrupt_parity}: healthy target must remain eligible"
+            );
+            assert_eq!(outcome.written, 2);
+            assert_eq!(output, &data[13..15], "a failed competing quorum must not emit or duplicate range bytes");
+            assert!(
+                started.elapsed() >= Duration::from_millis(200) && started.elapsed() <= Duration::from_millis(250),
+                "corrupt_parity={corrupt_parity}: wait for the healthy target, not the 30 s disk deadline"
+            );
+            assert_eq!(
+                outcome.repair.needed(false),
+                corrupt_parity,
+                "actual observed parity corruption must survive a successful direct winner"
+            );
         }
     }
 
@@ -3226,6 +3955,12 @@ mod tests {
 
         assert_eq!(defaulted.read_costs, vec![ShardReadCost::Unknown; 3]);
         assert!(defaulted.verify_reconstruction);
+
+        let quantized: ParallelReader<Cursor<Vec<u8>>> =
+            ParallelReader::new_for_quantized_decode(vec![None, None, None], Erasure::new(2, 1, 64), 16, None, None);
+        assert!(quantized.verify_reconstruction);
+        assert!(quantized.demand_bound_lockstep);
+        assert_eq!(quantized.engaged.as_slice(), &[true, true, false]);
     }
 
     #[tokio::test]

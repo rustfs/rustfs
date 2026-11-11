@@ -35,6 +35,12 @@ pub(crate) struct ShardReadRepair {
 }
 
 impl ShardReadRepair {
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            observed: AtomicU8::new(self.observed.load(Ordering::Acquire)),
+        }
+    }
+
     pub(crate) fn observe(&self, errors: &[Option<Error>]) {
         let flags = errors.iter().flatten().fold(0, |flags, error| {
             flags
