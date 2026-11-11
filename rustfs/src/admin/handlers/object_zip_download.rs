@@ -15,11 +15,12 @@
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, S3Router};
 use crate::admin::runtime_sources::{ServerContextSlot, current_action_credentials, current_object_store_handle, current_region};
-use crate::admin::storage_api::access::{ReqInfo, authorize_request};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request, authorize_request};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
 use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
+use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -495,25 +496,32 @@ async fn authorize_object_zip_download_s3_action(
         req_info.version_id = None;
     }
 
-    let mut authorization = s3_authorization_request(
-        req.method().clone(),
-        req.uri().clone(),
-        &authenticated_zip_download_auth_context(req),
-        req.envelope().server_context().cloned(),
-        req.req_info().cloned(),
+    let mut extensions = http::Extensions::new();
+    extensions.insert(req.remote_addr().map(RemoteAddr));
+    if let Some(client_info) = req.client_info() {
+        extensions.insert(client_info.clone());
+    }
+    if let Some(server_context) = req.envelope().server_context() {
+        extensions.insert(server_context.clone());
+    }
+    if let Some(req_info) = req.req_info() {
+        extensions.insert(req_info.clone());
+    }
+    let mut authorization = RequestEnvelope::from_parts(
+        RequestHead {
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+            headers: req.headers().clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
     );
-    authorize_request(&mut authorization, Action::S3Action(action))
-        .await
-        .map_err(Into::into)
+    authorize_owned_request(&mut authorization, Action::S3Action(action), None).await
 }
 
-/// The S3 gate (`storage::access::authorize_request`) still evaluates the s3s
-/// request shape, so the facts it reads are copied into one for the duration
-/// of the call: the authenticated `ReqInfo`, the peer and proxy-reported client
-/// addresses, the headers and query the policy conditions come from, and the
-/// server slot that selects the store. The gate reads neither the presented
-/// credentials nor the region or service, so those stay unset, and nothing it
-/// attaches to the request is read afterwards.
+/// Builds the legacy authorization request used when a download token is redeemed.
 fn s3_authorization_request(
     method: Method,
     uri: Uri,
@@ -942,6 +950,103 @@ struct ZipDownloadItem {
 mod tests {
     use super::*;
     use rustfs_s3_types::S3ErrorCode;
+
+    #[tokio::test]
+    async fn zip_scope_authorizes_real_iam_and_restores_prefix_query() {
+        use crate::admin::operation::test_support::TestRequest;
+        use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface};
+        use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use rustfs_iam::store::{Store as _, UserType};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+
+        struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                Arc::clone(&self.0)
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        store
+            .make_bucket("photos", &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+        let access_key = "zip-scope-user";
+        iam.create_user(
+            access_key,
+            &AddOrUpdateUserReq {
+                secret_key: "zip-scope-secret-key".to_owned(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create user");
+        iam.set_policy(
+            "zip-scope-policy",
+            Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos","Condition":{"StringEquals":{"s3:prefix":"allowed/"}}},{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#)
+                .expect("parse policy"),
+        )
+        .await
+        .expect("store policy");
+        iam.policy_db_set(access_key, UserType::Reg, false, "zip-scope-policy")
+            .await
+            .expect("attach policy");
+        let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+        let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let original_uri = "/rustfs/admin/v3/object-zip-downloads?prefix=old&marker=1";
+        let mut request = TestRequest::new(Method::POST, original_uri)
+            .extension(slot)
+            .extension(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            })
+            .build();
+
+        let mut selection = valid_request();
+        selection.prefix = None;
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["allowed/file".to_owned()];
+        authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect("allowed prefix and object");
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["denied/".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another prefix is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["denied/file".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another object is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+    }
 
     fn valid_request() -> CreateObjectZipDownloadRequest {
         CreateObjectZipDownloadRequest {
