@@ -10030,6 +10030,114 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-gateway"
+version = "0.57.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "form_urlencoded",
+ "futures-timer",
+ "futures-util",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "pin-project-lite",
+ "rustfs-gateway-core",
+ "rustfs-gateway-http",
+ "rustfs-gateway-macros",
+ "rustfs-gateway-sig",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
+ "rustfs-gateway-xml",
+ "sha2 0.11.1",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "rustfs-gateway-adapter"
+version = "1.0.5"
+dependencies = [
+ "http 1.5.0",
+ "rustfs-credentials",
+ "rustfs-gateway",
+ "rustfs-gateway-http",
+ "rustfs-iam",
+ "rustfs-policy",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
+name = "rustfs-gateway-core"
+version = "0.54.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "bytes",
+ "http 1.5.0",
+ "md-5 0.11.0",
+ "percent-encoding",
+ "rustfs-gateway-http",
+ "rustfs-gateway-sig",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
+ "rustfs-gateway-xml",
+ "serde",
+ "serde_json",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustfs-gateway-http"
+version = "0.1.4"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "httparse",
+ "memchr",
+ "phf 0.14.0",
+ "rustfs-gateway-stream",
+ "rustfs-gateway-types",
+ "sha2 0.11.1",
+ "smallvec",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustfs-gateway-macros"
+version = "0.1.4"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "rustfs-gateway-sig"
+version = "0.13.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
+dependencies = [
+ "hmac 0.13.0",
+ "http 1.5.0",
+ "rustfs-gateway-http",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "smallvec",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
 source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
