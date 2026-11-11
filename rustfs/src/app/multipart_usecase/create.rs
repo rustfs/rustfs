@@ -248,8 +248,8 @@ impl DefaultMultipartUsecase {
             );
         }
 
-        if !super::object::shared::put_like_write_creates_new_version(&opts)
-            && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state)
+        if !super::super::object::shared::put_like_write_creates_new_version(&opts)
+            && super::super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state)
         {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
                 get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)

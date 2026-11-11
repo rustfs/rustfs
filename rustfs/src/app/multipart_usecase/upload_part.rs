@@ -178,16 +178,16 @@ impl DefaultMultipartUsecase {
         };
         let request_id = req
             .extensions
-            .get::<super::storage_api::multipart_usecase::request_context::RequestContext>()
+            .get::<super::super::storage_api::multipart_usecase::request_context::RequestContext>()
             .map(|ctx| ctx.request_id.as_str())
             .unwrap_or_default();
         let timeout = upload_part_body_read_timeout(put_object_body_read_timeout(), max_total_object_size.is_some());
         let (body_stream, progress_control) =
-            if let Some(control) = req.extensions.get::<super::object::request_body::BodyReadControl>() {
+            if let Some(control) = req.extensions.get::<super::super::object::request_body::BodyReadControl>() {
                 control.activate_upload(timeout, &bucket, &key, request_id, size.max(0) as u64);
                 (body_stream, control.clone())
             } else {
-                super::object::request_body::guard_upload_progress(
+                super::super::object::request_body::guard_upload_progress(
                     body_stream,
                     timeout,
                     &bucket,
@@ -345,7 +345,8 @@ impl DefaultMultipartUsecase {
         {
             use rustfs_rio::HashReaderMut;
             let inner = reader.take_inner();
-            reader.inner = rustfs_rio::boxed_reader(super::object::request_body::DemandReader::new(inner, progress_control));
+            reader.inner =
+                rustfs_rio::boxed_reader(super::super::object::request_body::DemandReader::new(inner, progress_control));
         }
 
         let mut reader = PutObjReader::new(reader);

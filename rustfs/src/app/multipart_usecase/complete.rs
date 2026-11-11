@@ -338,8 +338,8 @@ impl DefaultMultipartUsecase {
 
         let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
         let prelookup_required = quota_enabled
-            || (!super::object::shared::put_like_write_creates_new_version(&opts)
-                && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state));
+            || (!super::super::object::shared::put_like_write_creates_new_version(&opts)
+                && super::super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state));
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
             let current_opts = internal_object_info_lookup_opts(
                 get_opts(&bucket, &key, None, None, &req.headers)
@@ -439,9 +439,9 @@ impl DefaultMultipartUsecase {
                 if !obj_info.multipart_completion_replayed {
                     if quota_tracking {
                         let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
-                        match prelookup_previous_current_size
-                            .or_else(|| super::object::previous_current_size_from_backfill(obj_info.backfilled_old_current_size))
-                        {
+                        match prelookup_previous_current_size.or_else(|| {
+                            super::super::object::previous_current_size_from_backfill(obj_info.backfilled_old_current_size)
+                        }) {
                             Some(previous_current_size) => {
                                 if versioned {
                                     record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size)
@@ -482,7 +482,7 @@ impl DefaultMultipartUsecase {
         })??;
 
         #[cfg(test)]
-        super::storage_api::multipart_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
+        super::super::storage_api::multipart_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
 
         // Storage has authorized the actual source or committed replay candidate
         // before comparing checksums/parts, recovery publication or replay effects.

@@ -259,6 +259,9 @@ CODE, COMMENT, LITERAL = 0, 1, 2
 IDENT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 CHAR_LITERAL = re.compile(r"'(?:\\(?:[nrt\\0'\"]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\})|[^\\'\n])'")
 RAW_STRING_START = re.compile(r'r(#*)"')
+# A relative path in code moved one module down: `super::object::..` named a sibling of
+# multipart_usecase, and from an operation file that is `super::super::object::..`.
+SUPER_PATH = re.compile(r"(?<![A-Za-z0-9_:])super::(?!\*)")
 S3S_PATH = re.compile(r"(?<![\"A-Za-z0-9_])s3s::")
 VIS = r"(?:pub(?:\([^)]*\))?\s+)?"
 FN_HEAD = re.compile(r"^" + VIS + r"(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -588,6 +591,11 @@ def plan(parsed):
         raise SplitError("mod tests: the declared test modules differ from TEST_MODS")
     tests = assign(test_code_items, TESTS, "tests")
 
+    for placed in (functions, methods):
+        for target, item in placed.values():
+            if target != PARENT:
+                push_down(item)
+
     # Piece lists per target file.
     pieces = {f: {"functions": [], "methods": [], "tests": []} for f in (PARENT, SUPPORT, *OPS)}
     for _, (target, item) in functions.items():
@@ -647,18 +655,30 @@ def reference_check(pieces, texts):
 # ---------------------------------------------------------------------------
 
 
-def rewrite_s3s(text):
-    """Send code-position `s3s::` paths through the sanctioned funnel."""
+def rewrite_code(text, pattern, replacement):
+    """Replace `pattern` matches that sit in code, never in comments or literals."""
     kinds = classify(text)
     out, last = [], 0
-    for match in S3S_PATH.finditer(text):
+    for match in pattern.finditer(text):
         if kinds[match.start()] != CODE:
             continue
         out.append(text[last : match.start()])
-        out.append(FUNNEL)
+        out.append(replacement)
         last = match.end()
     out.append(text[last:])
     return "".join(out)
+
+
+def rewrite_s3s(text):
+    """Send code-position `s3s::` paths through the sanctioned funnel."""
+    return rewrite_code(text, S3S_PATH, FUNNEL)
+
+
+def push_down(item):
+    """Make the relative paths of an item that leaves the parent module point where they did."""
+    text = rewrite_code(item.text, SUPER_PATH, "super::super::")
+    item.lines = text.split("\n")
+    item.code_lines = code_only(text).split("\n")
 
 
 def licence(preamble):
