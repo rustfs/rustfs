@@ -1340,7 +1340,7 @@ async fn authorize_table_catalog_s3_actions(
     if let Some(req_info) = req.req_info_mut() {
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
-    result.map_err(Into::into)
+    result
 }
 
 async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCatalogRequestPrincipal> {
@@ -2088,7 +2088,7 @@ where
         let result = match &self.authorization {
             TableCommitObjectAuthorization::Request(req) => {
                 let req = req.lock().await;
-                authorize_table_warehouse_location_request(&legacy_request_view(&req), table_bucket, location).await
+                authorize_table_warehouse_location_request(&req, table_bucket, location).await
             }
             TableCommitObjectAuthorization::Preauthorized => Ok(()),
             #[cfg(test)]
