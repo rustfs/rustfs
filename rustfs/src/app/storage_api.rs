@@ -56,6 +56,7 @@ pub(crate) mod s3 {
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
@@ -64,6 +65,8 @@ pub(crate) mod s3 {
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    #[cfg(test)]
+    pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
