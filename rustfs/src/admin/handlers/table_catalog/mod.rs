@@ -1326,7 +1326,7 @@ async fn authorize_table_catalog_s3_actions(
     if let Some(req_info) = req.req_info_mut() {
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
-    result.map_err(Into::into)
+    result
 }
 
 async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCatalogRequestPrincipal> {
