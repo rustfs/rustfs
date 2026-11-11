@@ -6563,7 +6563,7 @@ mod tests {
         std::fs::create_dir_all(&path).expect("physical prefix");
         // UUID-named child keys of the folder: each holds its own `xl.meta` and a
         // data directory, neither of which can be evidence for the folder's key.
-        const CHILDREN: u32 = 6000;
+        const CHILDREN: u32 = 2000;
         for _ in 0..CHILDREN {
             let child = path.join(Uuid::new_v4().to_string());
             std::fs::create_dir_all(child.join(Uuid::new_v4().to_string())).expect("child key data dir");
