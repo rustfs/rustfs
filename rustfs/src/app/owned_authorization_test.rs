@@ -18,6 +18,7 @@
 //! envelope (and its impl of the storage facts trait) belongs here.
 
 use crate::app::RequestEnvelope;
+use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::FS;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
@@ -1211,6 +1212,8 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             "Condition":{"StringEquals":{"s3:object-lock-mode":"GOVERNANCE"},"NumericGreaterThanEquals":{"s3:object-lock-remaining-retention-days":"30"}}},
         {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/copy/*"),
             "Condition":{"StringEquals":{"s3:x-amz-copy-source":"src/key"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/stage/*"),
+            "Condition":{"Bool":{"s3:ObjectCreationOperation":"false"}}},
         {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/post/*"),
             "Condition":{"StringEquals":{"s3:RequestObjectTag/class":"public"}}}
     ]});
@@ -1490,6 +1493,26 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
             facts: |req| post_form(req, "class=secret", "class=public"),
+            allowed: false,
+        },
+        DecisionCase {
+            name: "multipart staging does not create an object",
+            bucket: PUBLIC,
+            object: "stage/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: |req| {
+                req.extensions.insert(MultipartStagingOperation);
+            },
+            allowed: true,
+        },
+        DecisionCase {
+            name: "a plain PutObject creates an object",
+            bucket: PUBLIC,
+            object: "stage/obj",
+            principal: Principal::Anonymous,
+            action: S3Action::PutObjectAction,
+            facts: no_facts,
             allowed: false,
         },
     ];
