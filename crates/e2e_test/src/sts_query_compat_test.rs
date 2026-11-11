@@ -400,7 +400,8 @@ async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.secret_key = rustfs_credentials::gen_secret_key(8)?;
+    // Exercise the minimum root secret length accepted at startup.
+    env.secret_key.truncate(8);
     assert_eq!(env.secret_key.len(), 8);
     env.start_rustfs_server(vec![]).await?;
 
