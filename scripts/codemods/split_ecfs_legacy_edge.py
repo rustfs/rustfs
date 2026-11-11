@@ -641,6 +641,27 @@ def leaf_used(leaf: Leaf, code: str) -> bool:
     return leaf.binding in free_identifiers(code)
 
 
+def is_trait(leaf: Leaf) -> bool:
+    return leaf.binding == "_" or leaf.path[-1] in TRAIT_METHODS or leaf.binding == "S3"
+
+
+LOCAL_USE = re.compile(r"(?<![A-Za-z0-9_])use\s+[^;]*;")
+
+
+def scoped(code: str) -> str:
+    """Masked item code without its fn-local `use` items and the names they bind.
+
+    A name a fn imports for itself is not a use of the module-level import of that name.
+    """
+    bindings: set[str] = set()
+    for m in reversed(list(LOCAL_USE.finditer(code))):
+        bindings |= {leaf.binding for leaf in leaves(parse_use(m.group())) if leaf.binding not in ("*", "_")}
+        code = code[: m.start()] + " " * (m.end() - m.start()) + code[m.end() :]
+    for name in bindings:
+        code = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", " " * len(name), code)
+    return code
+
+
 # ---------------------------------------------------------------------------
 # Text edits
 
@@ -818,7 +839,7 @@ def split(root: Path) -> dict[str, str]:
         edge, delegate = edge_and_delegate(ecfs, method)
         stem = OWNER[method.name]
         out[stem].edges.append(edge)
-        out[stem].code += "\n" + masked(edge)
+        out[stem].code += "\n" + scoped(masked(edge))
         delegates[k] = delegate
 
     # Tests: which move, and where.
@@ -897,7 +918,7 @@ def split(root: Path) -> dict[str, str]:
             if len(consumers) == 1 and next(iter(consumers)) in BATCHES:
                 stem = consumers.pop()
                 helper_owner[key] = stem
-                out[stem].code += "\n" + ecfs.mask[item.start : item.end]
+                out[stem].code += "\n" + scoped(ecfs.mask[item.start : item.end])
                 changed = True
     moved_names = {slots[key].name: stem for key, stem in helper_owner.items()}
 
@@ -923,15 +944,15 @@ def split(root: Path) -> dict[str, str]:
 
     # Imports of ecfs.rs: keep what the remaining code uses; hand each batch what it uses.
     residual = [ecfs.mask[top[impl_index].start : s3_start]]
-    residual += [masked(delegates[k]) if k in delegates else ecfs.mask[m.start : m.end] for k, m in enumerate(methods)]
+    residual += [masked(delegates[k]) if k in delegates else scoped(ecfs.mask[m.start : m.end]) for k, m in enumerate(methods)]
     for k, it in enumerate(top):
         if k == impl_index or it.kind in ("use", "mod"):
             continue
         if k in impl_fs:
             residual.append(ecfs.mask[it.start : body_bounds(ecfs, it)[0]])
-            residual += [ecfs.mask[i.start : i.end] for j, i in enumerate(impl_fs[k]) if (k, j) not in helper_owner]
+            residual += [scoped(ecfs.mask[i.start : i.end]) for j, i in enumerate(impl_fs[k]) if (k, j) not in helper_owner]
         elif (k, None) not in helper_owner:
-            residual.append(ecfs.mask[it.start : it.end])
+            residual.append(scoped(ecfs.mask[it.start : it.end]))
     residual_code = "\n".join(residual)
     moved_code = "\n".join(b.code + b.test_code for b in out.values())
     explicit_bindings: set[str] = set(moved_names) | {it.name for it in top if it.name}
@@ -958,7 +979,13 @@ def split(root: Path) -> dict[str, str]:
         if from_s3s:
             continue
         for stem, batch in out.items():
-            used = filter_use(tree, lambda leaf, code=batch.code: leaf_used(leaf, code))
+            # A trait ecfs.rs still imports also reaches the file through the ecfs glob, and rustc
+            # credits that one; a second, explicit import of it would be reported unused.
+            used = filter_use(
+                tree,
+                lambda leaf, code=batch.code: leaf_used(leaf, code)
+                and not (is_trait(leaf) and kept is not None and leaf in leaves(kept)),
+            )
             if used is not None:
                 batch.uses.append(f"use {render_use(rebase_use(used, 'super', ('crate', 'storage')))};")
 
@@ -1009,7 +1036,7 @@ def split(root: Path) -> dict[str, str]:
                     raise ShapeError(f"{item.name} names s3s's {name}, which another import shadows in ecfs.rs")
             text = strip_fn_local_s3s_uses(rewrite_code(text, moved_code_rules(super_path)))
             texts.append(None)
-            moved_here[dest] = moved_here.get(dest, "") + "\n" + masked(text)
+            moved_here[dest] = moved_here.get(dest, "") + "\n" + scoped(masked(text))
             if dest == "mod":
                 shared.append(text)
                 shared_code += "\n" + masked(text)
@@ -1017,7 +1044,7 @@ def split(root: Path) -> dict[str, str]:
                 out[dest].tests.append(text)
         if not moved_here:
             continue
-        remaining = "\n".join(t and masked(t) for j, t in enumerate(texts) if t is not None and inner[j].kind != "use")
+        remaining = "\n".join(scoped(masked(t)) for j, t in enumerate(texts) if t is not None and inner[j].kind != "use")
         for j, item in enumerate(inner):
             if item.kind != "use":
                 continue
@@ -1329,6 +1356,29 @@ class SelfTest(unittest.TestCase):
         self.assertFalse(leaf_used(Leaf(("m", "Bar"), "Bar", None), code))
         self.assertTrue(leaf_used(Leaf(("m", "ObjectOperations"), "_", None), masked("store\n  .get_object_info(a)")))
         self.assertFalse(leaf_used(Leaf(("m", "ObjectOperations"), "_", None), masked("self.copy_object_edge(a)")))
+
+    def test_fn_local_import_is_not_a_use_of_the_module_import(self) -> None:
+        method = Leaf(("http", "Method"), "Method", None)
+        self.assertFalse(leaf_used(method, scoped(masked("fn f() { use http::Method; let _ = Method::GET; }"))))
+        self.assertTrue(leaf_used(method, scoped(masked("fn f() { let _ = Method::GET; }"))))
+
+    def test_trait_ecfs_keeps_is_not_imported_again_by_the_batch_file(self) -> None:
+        ecfs = FIXTURE_ECFS.replace(
+            "use tracing::{debug, instrument};\n",
+            "use tracing::{debug, instrument};\nuse super::contract::{BucketOperations as _, ObjectOperations as _};\n",
+        ).replace(
+            "pub struct FS {}\n",
+            "pub struct FS {}\n\npub fn tags(store: &S) {\n    store.get_object_tags();\n}\n",
+        ).replace(
+            "let _ = only_meta(SHARED);",
+            "let _ = only_meta(SHARED);\n        store.get_object_info();\n        store.get_bucket_info();",
+        )
+        files = split(self.tree(ecfs=ecfs))
+        edge = files[f"{EDGE_DIR}/object_meta.rs"]
+        self.assertNotIn("ObjectOperations", edge, "the ecfs glob already supplies the trait")
+        self.assertIn("BucketOperations as _", edge, "ecfs.rs no longer imports this trait")
+        self.assertIn("ObjectOperations as _", files[ECFS])
+        self.assertNotIn("BucketOperations", files[ECFS])
 
     def test_anonymous_trait_without_method_list_is_refused(self) -> None:
         with self.assertRaisesRegex(ShapeError, "no method list"):
