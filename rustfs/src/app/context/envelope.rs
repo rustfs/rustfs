@@ -29,13 +29,19 @@ use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::{
-    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-    OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, RequestContext,
+    AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+};
+use crate::app::storage_api::context::{
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+    ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+    PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
+    RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
     TableDataPlaneListAccess, TableDataPlanePublicationGuards,
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use http::{Extensions, HeaderMap, Method, Uri};
+use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_trusted_proxies::ClientInfo;
 use std::fmt;
 use std::net::SocketAddr;
@@ -145,6 +151,7 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
     bucket_generation: Option<BucketGenerationGuard>,
@@ -155,6 +162,13 @@ pub struct RequestEnvelope {
     table_publication_guards: Option<TableDataPlanePublicationGuards>,
     table_list_access: Option<TableDataPlaneListAccess>,
     object_tag_conditions: Option<ObjectTagConditions>,
+    multipart_staging_operation: Option<MultipartStagingOperation>,
+    staged_multipart_part_authorization: Option<StagedMultipartPartAuthorization>,
+    requested_object_lock_retention: Option<RequestedObjectLockRetention>,
+    requested_object_lock_retain_until: Option<RequestedObjectLockRetainUntil>,
+    requested_object_legal_hold: Option<RequestedObjectLegalHold>,
+    requested_object_tags: Option<RequestedObjectTags>,
+    requested_copy_source: Option<RequestedCopySource>,
     residual_extensions: Extensions,
 }
 
@@ -184,6 +198,7 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
             pending_delete_bucket_generation: extensions.remove(),
@@ -193,6 +208,13 @@ impl RequestEnvelope {
             table_publication_guards: extensions.remove(),
             table_list_access: extensions.remove(),
             object_tag_conditions: extensions.remove(),
+            multipart_staging_operation: extensions.remove(),
+            staged_multipart_part_authorization: extensions.remove(),
+            requested_object_lock_retention: extensions.remove(),
+            requested_object_lock_retain_until: extensions.remove(),
+            requested_object_legal_hold: extensions.remove(),
+            requested_object_tags: extensions.remove(),
+            requested_copy_source: extensions.remove(),
             residual_extensions: extensions,
         }
     }
@@ -329,6 +351,10 @@ impl RequestEnvelope {
         self.table_publication_guards.as_ref()
     }
 
+    pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.table_publication_guards = Some(guards);
+    }
+
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
         self.table_list_access.as_ref()
     }
@@ -336,11 +362,295 @@ impl RequestEnvelope {
     pub(crate) fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions.as_ref()
     }
+
+    pub(crate) fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.object_tag_conditions = Some(conditions);
+    }
+
+    pub(crate) fn multipart_staging_operation(&self) -> Option<&MultipartStagingOperation> {
+        self.multipart_staging_operation.as_ref()
+    }
+
+    pub(crate) fn staged_multipart_part_authorization(&self) -> Option<&StagedMultipartPartAuthorization> {
+        self.staged_multipart_part_authorization.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until.as_ref()
+    }
+
+    pub(crate) fn post_object_policy_headers(&self) -> Option<&PostObjectPolicyHeaders> {
+        self.post_object_policy_headers.as_ref()
+    }
+
+    pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold.as_ref()
+    }
+
+    pub(crate) fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags.as_ref()
+    }
+
+    pub(crate) fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source.as_ref()
+    }
+}
+
+/// The authorization core in `storage` reads requests only through
+/// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
+impl AuthorizationRequest for RequestEnvelope {
+    fn headers(&self) -> &HeaderMap {
+        self.headers()
+    }
+    fn uri(&self) -> &http::Uri {
+        self.uri()
+    }
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        self.remote_addr()
+    }
+    fn client_info(&self) -> Option<&ClientInfo> {
+        self.client_info()
+    }
+    fn server_context(&self) -> Option<&Arc<ServerContextSlot>> {
+        self.server_context()
+    }
+    fn req_info(&self) -> Option<&ReqInfo> {
+        self.req_info()
+    }
+    fn internal_object_authorization(&self) -> bool {
+        false
+    }
+    fn multipart_staging(&self) -> bool {
+        self.multipart_staging_operation().is_some()
+    }
+    fn staged_multipart_part(&self) -> bool {
+        self.staged_multipart_part_authorization().is_some()
+    }
+    fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention()
+    }
+    fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until()
+    }
+    fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold()
+    }
+    fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags()
+    }
+    fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source()
+    }
+    fn policy_headers(&self) -> &HeaderMap {
+        self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
+    }
+    fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
+        self.object_tag_conditions()
+    }
+    fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.install_object_tag_conditions(conditions);
+    }
+    fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards> {
+        self.table_publication_guards()
+    }
+    fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.install_table_publication_guards(guards);
+    }
+    fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
+        auditor.audit_owned(&self.audit_view(), action, reason, DenialScope::Request);
+    }
+}
+
+/// Authorizes an owned request through the same IAM, bucket and table policies as the legacy edge.
+///
+/// Like the legacy `authorize_request`, it first restores the signed `x-amz-meta-*`
+/// query parameters into headers, so policy conditions and duplicate rejection see
+/// the same request shape on both edges.
+///
+/// This is only the policy decision. It does **not** perform the composite checks
+/// the legacy `S3Access` hooks run around their decision, such as the
+/// `s3:BypassGovernanceRetention` authorization for a governance-bypass header or
+/// the copy-source read authorization; a caller that needs them runs them itself.
+///
+/// # Errors
+///
+/// `InvalidArgument` when the signed query repeats a user metadata key;
+/// `AccessDenied` when the decision for `action` depends on a request-body input
+/// the envelope does not carry (see [`require_body_policy_inputs`]) or when the
+/// policies deny the request.
+pub(crate) async fn authorize_owned_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+    location_constraint: Option<String>,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, location_constraint, false)
+        .await
+        .map_err(Into::into)
+}
+
+/// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
+///
+/// It applies the same preparation and has the same limits as [`authorize_owned_request`].
+pub(crate) async fn authorize_owned_internal_object_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+}
+
+fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(rustfs_s3_types::S3Error::from)?;
+    require_body_policy_inputs(req, action)
+}
+
+/// Fails closed when the decision for `action` depends on a value the request
+/// body supplies but the envelope does not carry it. Policy conditions would
+/// otherwise fall back to client headers, which the stored value need not match
+/// (header `OFF` with body `ON` would pass a legal-hold Deny).
+fn require_body_policy_inputs(req: &RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    let missing = match action {
+        Action::S3Action(S3Action::PutObjectLegalHoldAction) => req.requested_object_legal_hold.is_none(),
+        Action::S3Action(S3Action::PutObjectTaggingAction | S3Action::PutObjectVersionTaggingAction) => {
+            req.requested_object_tags.is_none()
+        }
+        Action::S3Action(S3Action::PutObjectRetentionAction) => req.requested_object_lock_retention.is_none(),
+        _ => false,
+    } || (req.post_object.is_some() && req.post_object_policy_headers.is_none())
+        || (req.headers.contains_key(COPY_SOURCE_HEADER) && req.requested_copy_source.is_none());
+    if missing {
+        return Err(rustfs_s3_types::s3_error!(
+            AccessDenied,
+            "request body policy input is missing for this action"
+        ));
+    }
+    Ok(())
+}
+
+const COPY_SOURCE_HEADER: &str = "x-amz-copy-source";
+
+impl RequestEnvelope {
+    /// The request fields an audit entry for this request is built from.
+    pub(crate) fn audit_view(&self) -> AuditRequestView<'_> {
+        AuditRequestView::from_facts(
+            self.headers(),
+            self.uri(),
+            self.req_info(),
+            self.client_info(),
+            self.remote_addr(),
+            self.request_context(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_payloads_move_from_extensions_into_named_fields() {
+        let mut extensions = Extensions::new();
+        extensions.insert(MultipartStagingOperation);
+        extensions.insert(StagedMultipartPartAuthorization);
+        let mut retention = RequestedObjectLockRetention(Default::default());
+        retention.0.mode = Some("COMPLIANCE".to_owned().into());
+        extensions.insert(retention);
+        let retain_until = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("valid timestamp");
+        extensions.insert(RequestedObjectLockRetainUntil(retain_until));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope.multipart_staging_operation().is_some(),
+                envelope.staged_multipart_part_authorization().is_some(),
+                envelope
+                    .requested_object_lock_retention()
+                    .and_then(|value| value.0.mode.as_ref().map(|mode| mode.as_str())),
+                envelope.requested_object_lock_retain_until().map(|value| value.0),
+                envelope.residual_extensions().is_empty(),
+                empty.multipart_staging_operation().is_none(),
+                empty.staged_multipart_part_authorization().is_none(),
+                empty.requested_object_lock_retention().is_none(),
+                empty.requested_object_lock_retain_until().is_none(),
+            ),
+            (true, true, Some("COMPLIANCE"), Some(retain_until), true, true, true, true, true),
+        );
+    }
+
+    #[test]
+    fn request_body_policy_payloads_move_from_extensions_into_named_fields() {
+        let mut form_headers = HeaderMap::new();
+        form_headers.insert("x-amz-tagging", http::HeaderValue::from_static("from=form"));
+        let mut legal_hold = RequestedObjectLegalHold(Default::default());
+        legal_hold.0.status = Some("ON".to_owned().into());
+        let mut tags = RequestedObjectTags(Default::default());
+        tags.0.tag_set.push(Default::default());
+        tags.0.tag_set[0].key = Some("body".to_owned());
+        let mut extensions = Extensions::new();
+        extensions.insert(PostObjectPolicyHeaders(form_headers));
+        extensions.insert(legal_hold);
+        extensions.insert(tags);
+        extensions.insert(RequestedCopySource("source-bucket/source-key".to_owned()));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope
+                    .post_object_policy_headers()
+                    .and_then(|headers| headers.0.get("x-amz-tagging"))
+                    .and_then(|value| value.to_str().ok()),
+                envelope
+                    .requested_object_legal_hold()
+                    .and_then(|hold| hold.0.status.as_ref().map(|status| status.as_str())),
+                envelope
+                    .requested_object_tags()
+                    .and_then(|tags| tags.0.tag_set.first())
+                    .and_then(|tag| tag.key.as_deref()),
+                envelope.requested_copy_source().map(|source| source.0.as_str()),
+                envelope.residual_extensions().is_empty(),
+                empty.post_object_policy_headers().is_none(),
+                empty.requested_object_legal_hold().is_none(),
+                empty.requested_object_tags().is_none(),
+                empty.requested_copy_source().is_none(),
+            ),
+            (
+                Some("from=form"),
+                Some("ON"),
+                Some("body"),
+                Some("source-bucket/source-key"),
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+        );
+    }
 
     #[test]
     fn request_credentials_debug_redacts_secret_and_session_token() {
