@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -33,12 +33,12 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "3"
+PLAN_CONTRACT = "4"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -47,12 +47,23 @@ E2E_SELECTION_FILES = {
         "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
     )
 }
+# Clippy and the test-binary archive share no compiler output, so the lint runs
+# beside the archive producer instead of in front of it. LINT_JOB is the only
+# job that may lint the workspace; nothing downstream of ARCHIVE_PRODUCER may
+# wait for it, or the lint is back on the path every workspace test waits on.
+LINT_JOB = "workspace-clippy"
+ARCHIVE_PRODUCER = "workspace-lint-and-build"
+ARCHIVE_CONSUMERS = ("workspace-tests", "workspace-shards", "workspace-shard-evidence")
+LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 # Report-only lanes stay outside the aggregate until their milestone makes them
 # required. Each reruns a required job's suite with one environment change, so
 # the named steps must stay identical to that job's and the change must stay.
+# The last field names the `select` output that scopes the lane on pull
+# requests: it runs wherever its required job runs, except on a pull request
+# whose selection is the literal `false`. Every other event runs it.
 REPORT_ONLY_JOBS = {
     # rustfs/backlog#2734: required at T2.10.
     "e2e-tests-gateway": (
@@ -65,8 +76,34 @@ REPORT_ONLY_JOBS = {
             "Verify e2e smoke execution completeness",
         ),
         "RUSTFS_S3_STACK: gateway",
+        "gateway_smoke",
     ),
 }
+# Inputs that decide what the gateway S3 stack serves or how the lane starts
+# it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that stack,
+# so a pull request that changes none of these learns nothing from the lane
+# and is not shown its failure. The suite's own contents (crates/e2e_test, the
+# nextest profile, the smoke selection) are deliberately not inputs: feature
+# pull requests change them constantly, and what the suite contains carries no
+# signal while the stack cannot serve it. fnmatch's `*` also matches `/`. Some
+# of these paths exist only on branches that are still assembling the stack.
+#
+# At T2.10, when the lane becomes required, it must run on every pull request
+# again — delete this selection, do not extend it.
+GATEWAY_SMOKE_PATHS = (
+    "crates/gateway-adapter/*",
+    "rustfs/src/server/gateway_stack.rs", "rustfs/src/server/gateway_stack/*",
+    "rustfs/src/server/gateway_handlers.rs", "rustfs/src/server/gateway_handlers/*",
+    "rustfs/src/server/stack.rs", "rustfs/src/server/stack/*",
+    "rustfs/src/config/config_struct.rs",  # parses RUSTFS_S3_STACK
+    "rustfs/Cargo.toml",
+    ".github/workflows/ci.yml", ".github/actions/test-runtime/*",
+    "scripts/ci_gate.py", "scripts/e2e_binary.py",
+)
+# Shared manifests change in most dependency updates; only their gateway pins
+# are inputs of the lane.
+GATEWAY_PIN_FILES = ("Cargo.toml", "Cargo.lock")
+GATEWAY_PACKAGE_PREFIX = "rustfs-gateway"
 INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
@@ -148,6 +185,40 @@ def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
         return normalized[0] == normalized[1]
     except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
         return False
+
+
+def gateway_pins(root: Path, revision: str, path: str) -> list:
+    """The entries of a shared manifest that pin a gateway crate, in file order."""
+    document = tomllib.loads(git_file(root, revision, path))
+    if path == "Cargo.lock":
+        return [package for package in document.get("package", []) if str(package.get("name", "")).startswith(GATEWAY_PACKAGE_PREFIX)]
+    tables = {"workspace.dependencies": document.get("workspace", {}).get("dependencies", {}), "replace": document.get("replace", {})}
+    tables.update({f"patch.{source}": table for source, table in document.get("patch", {}).items()})
+    return [(table, name, spec) for table, entries in tables.items() for name, spec in entries.items()
+            if GATEWAY_PACKAGE_PREFIX in name or (isinstance(spec, dict) and str(spec.get("package", "")).startswith(GATEWAY_PACKAGE_PREFIX))]
+
+
+def gateway_smoke_selection(root: Path, event: str, base: str, head: str, changed: list[str]) -> dict:
+    """Decide whether the report-only gateway lane has anything to say about this run.
+
+    Only a pull request with a known change set that touches no gateway-stack
+    input is skipped; an unreadable manifest or lockfile counts as touched.
+    """
+    if event != "pull_request":
+        return {"run": True, "reason": f"{event} validates the complete candidate"}
+    if not changed or changed == [""]:
+        return {"run": True, "reason": "change set unavailable"}
+    for path in changed:
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in GATEWAY_SMOKE_PATHS):
+            return {"run": True, "reason": f"gateway-stack input changed: {path}"}
+        if path in GATEWAY_PIN_FILES:
+            try:
+                same = gateway_pins(root, base, path) == gateway_pins(root, head, path)
+            except (OSError, subprocess.CalledProcessError, UnicodeError, AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                return {"run": True, "reason": f"gateway pin changed: {path}"}
+    return {"run": False, "reason": "no gateway-stack input changed"}
 
 
 def dependency_tables(document: dict):
@@ -270,8 +341,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "workspace-lint-and-build", "dev", []),
-        ("workspace-tests", "workspace-lint-and-build", "test", []),
+        ("workspace-lint", LINT_JOB, "dev", []),
+        ("workspace-tests", ARCHIVE_PRODUCER, "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -407,6 +478,7 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
             "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
             "rehearse_shards": rehearse_shards,
+            "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
             "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
@@ -601,6 +673,49 @@ def condition(expression: str | bool, context: dict) -> bool:
     return bool(result)
 
 
+def job_needs(jobs: dict, job: str) -> list[str]:
+    dependencies = jobs.get(job, {}).get("needs", [])
+    return [dependencies] if isinstance(dependencies, str) else list(dependencies)
+
+
+def check_lint_lane(jobs: dict) -> list[str]:
+    """Keep workspace Clippy gating every code event without delaying the test archive."""
+    errors = []
+    lint_steps = {job: [step for step in block.get("steps", [])
+                        if any(command in step.get("run", "") for command in LINT_COMMANDS)]
+                  for job, block in jobs.items()}
+    clippy = lint_steps.get(LINT_JOB, [])
+    if len(clippy) != 1 or any("if" in step for step in clippy):
+        errors.append("workspace Clippy must run on every code event, pull requests included")
+    if any(steps for job, steps in lint_steps.items() if job != LINT_JOB):
+        errors.append(f"workspace Clippy belongs to {LINT_JOB} alone")
+    lint, producer = jobs.get(LINT_JOB, {}), jobs.get(ARCHIVE_PRODUCER, {})
+    # The lint replaces a step of the producer; it must keep that job's scope.
+    if not lint or lint.get("if") != producer.get("if"):
+        errors.append(f"{LINT_JOB} must run under the same condition as {ARCHIVE_PRODUCER}")
+    for job in (ARCHIVE_PRODUCER, *ARCHIVE_CONSUMERS):
+        reached, pending = set(), [job]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(job_needs(jobs, current))
+        if LINT_JOB in reached:
+            errors.append(f"{job} must not wait for {LINT_JOB}")
+    if ARCHIVE_PRODUCER not in job_needs(jobs, "workspace-tests"):
+        errors.append(f"workspace-tests must consume the archive of {ARCHIVE_PRODUCER}")
+    return errors
+
+
+def check_plan_contract_marker(jobs: dict) -> list[str]:
+    """The workflow's fallback must test for the marker this revision's planner emits."""
+    scopes = [step for step in jobs.get("classify-changes", {}).get("steps", []) if step.get("id") == "scope"]
+    markers = re.findall(r"grep -q '\^plan_contract=([^$']*)\$'", scopes[0].get("run", "")) if len(scopes) == 1 else []
+    if markers != [PLAN_CONTRACT]:
+        return [f"classify-changes must fall back to the full matrix unless the plan carries contract {PLAN_CONTRACT}"]
+    return []
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -613,11 +728,28 @@ def check_workflow(root: Path) -> list[str]:
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
     if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
-    for job, (mirror, steps, env) in REPORT_ONLY_JOBS.items():
+    for job, (mirror, steps, env, selection) in REPORT_ONLY_JOBS.items():
         block, mirrored = jobs.get(job), jobs.get(mirror)
         if not isinstance(block, dict) or not isinstance(mirrored, dict):
             errors.append(f"report-only {job} and its required {mirror} must both exist")
             continue
+        # A failed suite must render as a failed, non-blocking job: never as a
+        # blocking one, and never as a green one behind a tolerated step.
+        if block.get("continue-on-error") != "true":
+            errors.append(f"{job} must stay report-only with job-level continue-on-error")
+        if any(isinstance(item, dict) and "continue-on-error" in item for item in block.get("steps") or []):
+            errors.append(f"{job} cannot hide a failed step behind continue-on-error")
+        # The selection reaches the job's condition only through a declared
+        # output of a job it needs; otherwise the expression reads an empty
+        # string and the lane silently runs everywhere.
+        dependencies = block.get("needs", [])
+        if "classify-changes" not in ([dependencies] if isinstance(dependencies, str) else dependencies):
+            errors.append(f"{job} must need classify-changes to read {selection}")
+        published = (jobs.get("classify-changes", {}).get("outputs") or {}).get(selection, "")
+        if not isinstance(published, str) or f"steps.scope.outputs.{selection}" not in published:
+            errors.append(f"classify-changes must publish {selection} from the scope step")
+        if re.search(r"\b(always|success|failure|cancelled)\s*\(", re.sub(r"'(?:[^']|'')*'", "", str(block.get("if", "")))):
+            errors.append(f"{job} must not override its prerequisites with a status function")
         key, _, value = env.partition(": ")
         if (block.get("env") or {}).get(key) != value:
             errors.append(f"{job} must set {env}")
@@ -652,15 +784,13 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("env", {}).get("CI_NEEDS") != "${{ toJSON(needs) }}"
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
-    lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
-              if any(command in step.get("run", "") for command in lint_commands)]
-    if not clippy or any("if" in step for step in clippy):
-        errors.append("workspace Clippy must run on every code event, pull requests included")
+    errors.extend(check_lint_lane(jobs))
+    errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "internode-transport": "--features rustfs/internode-transport"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):
@@ -710,6 +840,27 @@ def check_workflow(root: Path) -> list[str]:
                                 continue
                             if actual != should_run:
                                 errors.append(f"{job} condition differs from plan for {event}/{mode}/{connect}/{action}/{ref}")
+                        for job, (mirror, _, _, selection) in REPORT_ONLY_JOBS.items():
+                            block = jobs.get(job)
+                            if not isinstance(block, dict) or mirror not in jobs:
+                                continue
+                            for selected in ("true", "false", ""):
+                                try:
+                                    dependencies = block.get("needs", [])
+                                    ready = all(scheduled(dependency) for dependency in ([dependencies] if isinstance(dependencies, str) else dependencies))
+                                    actual = ready and condition(block.get("if", "success()"), dict(
+                                        context, **{f"needs.classify-changes.outputs.{selection}": selected}))
+                                except (KeyError, TypeError, ValueError) as error:
+                                    errors.append(f"{job}: {error}")
+                                    continue
+                                wanted = scheduled(mirror) and (event != "pull_request" or selected != "false")
+                                if actual and not wanted:
+                                    errors.append(f"{job} runs on pull requests that change no gateway-stack input" if scheduled(mirror)
+                                                  else f"{job} runs where {mirror} does not")
+                                elif wanted and not actual:
+                                    errors.append(f"{job} is skipped on {event}" if event != "pull_request" else
+                                                  f"{job} is skipped on a pull request " + (
+                                                      "that changes a gateway-stack input" if selected == "true" else "whose selection is unknown"))
                         for status in ("failure", "cancelled"):
                             context.update(success=False, failure=status == "failure", cancelled=status == "cancelled")
                             try:
@@ -734,6 +885,7 @@ def main() -> int:
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
                                     ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("gateway_smoke", str(plan["gateway_smoke"]["run"]).lower()),
                                     ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))

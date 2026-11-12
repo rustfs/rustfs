@@ -23,8 +23,10 @@ use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
+use rustfs_policy::auth::{is_access_key_valid, is_secret_key_valid};
 use std::collections::HashSet;
 use std::fmt;
+use std::io::{Error, ErrorKind};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
@@ -249,6 +251,16 @@ impl Config {
         DEFAULT_ACCESS_KEY.eq(&self.access_key) && DEFAULT_SECRET_KEY.eq(&self.secret_key)
     }
 
+    pub(crate) fn validate_root_credentials(access_key: &str, secret_key: &str) -> std::io::Result<()> {
+        if !is_access_key_valid(access_key) {
+            return Err(Error::new(ErrorKind::InvalidInput, "RUSTFS_ACCESS_KEY must be at least 3 bytes"));
+        }
+        if !is_secret_key_valid(secret_key) {
+            return Err(Error::new(ErrorKind::InvalidInput, "RUSTFS_SECRET_KEY must be at least 8 bytes"));
+        }
+        Ok(())
+    }
+
     /// Create Config from Opt
     pub(super) fn from_opt(opt: Opt) -> std::io::Result<Self> {
         let Opt {
@@ -292,6 +304,7 @@ impl Config {
             &[LEGACY_ENV_RUSTFS_ROOT_PASSWORD],
             DEFAULT_SECRET_KEY,
         )?;
+        Self::validate_root_credentials(&access_key, &secret_key)?;
 
         // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));

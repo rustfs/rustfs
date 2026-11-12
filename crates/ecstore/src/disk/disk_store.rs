@@ -124,7 +124,7 @@ where
     Box::pin(operation(io_permit))
 }
 
-struct SlowDiskWriter {
+pub(crate) struct SlowDiskWriter {
     inner: crate::disk::FileWriter,
     endpoint: Endpoint,
     pending: Option<(&'static str, time::Instant)>,
@@ -141,6 +141,10 @@ impl SlowDiskWriter {
             timer: None,
             warned: false,
         }
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut dyn crate::disk::DiskFileWriter {
+        &mut *self.inner
     }
 
     fn observe<T>(&mut self, cx: &mut Context<'_>, op: &'static str, result: Poll<T>) -> Poll<T> {

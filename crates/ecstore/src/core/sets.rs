@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use crate::disk::error_reduce::count_errs;
+#[cfg(any(test, feature = "test-util"))]
+use crate::disk::new_disk;
 use crate::error::{Error, Result, is_all_volume_not_found, is_err_object_not_found, is_err_strict_volume_not_found};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
@@ -28,7 +30,6 @@ use crate::{
         DiskAPI, DiskOption, DiskStore,
         error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
-        new_disk,
     },
     error::StorageError,
     layout::endpoints::{Endpoints, PoolEndpoints},
@@ -1105,6 +1106,7 @@ impl Sets {
         F: FnMut() -> bool + Send,
     {
         let (disks, init_errs) = init_storage_disks_with_errors(
+            &self.ctx,
             &self.endpoints.endpoints,
             &DiskOption {
                 cleanup: false,
@@ -1310,6 +1312,7 @@ async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
 }
 
 async fn init_storage_disks_with_errors(
+    instance: &InstanceContext,
     endpoints: &Endpoints,
     opts: &DiskOption,
 ) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -1318,7 +1321,7 @@ async fn init_storage_disks_with_errors(
     // let errs = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
     let mut futures = Vec::with_capacity(endpoints.as_ref().len());
     for endpoint in endpoints.as_ref().iter() {
-        futures.push(new_disk(endpoint, opts));
+        futures.push(crate::disk::new_disk_for_instance(instance, endpoint, opts));
 
         // let ep = endpoint.clone();
         // let opt = opts.clone();

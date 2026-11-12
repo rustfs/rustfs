@@ -144,6 +144,12 @@ pub const POSTGRES_QUEUE_LIMIT: &str = "queue_limit";
 /// Applies to both notify and audit target queue stores.
 pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
 
+/// Environment variable that relocates the root of the default notify and audit queue directories.
+///
+/// It applies only to targets whose `queue_dir` is the logical default (`EVENT_DEFAULT_DIR` or
+/// `AUDIT_DEFAULT_DIR`); their queues move to `<root>/events` and `<root>/audit` on this node.
+pub const ENV_TARGET_STORE_DIR: &str = "RUSTFS_TARGET_STORE_DIR";
+
 /// Queue-store compression is enabled by default to reduce disk footprint.
 pub const DEFAULT_TARGET_STORE_COMPRESS: bool = true;
 

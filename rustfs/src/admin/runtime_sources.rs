@@ -170,7 +170,8 @@ mod tests {
         AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, app_context_from_extensions,
         app_context_from_req, current_app_context, object_store_from_envelope, publish_test_app_context,
     };
-    use crate::admin::router::{Operation, S3Router};
+    use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+    use crate::admin::router::S3Router;
     use crate::app::RequestEnvelope;
     use hyper::{Method, StatusCode};
     use matchit::Params;
@@ -178,7 +179,7 @@ mod tests {
     use rustfs_kms::KmsServiceManager;
     use rustfs_s3_types::{S3ErrorCode, s3_error};
     use s3s::route::S3Route;
-    use s3s::{Body, S3Request, S3Response};
+    use s3s::{Body, S3Request};
     use std::sync::Arc;
 
     struct UnreadyIam;
@@ -341,13 +342,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Operation for ContextDependentAdminRoute {
-        async fn call(
-            &self,
-            req: S3Request<Body>,
-            _params: Params<'_, '_>,
-        ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
-            app_context_from_req(&req).ok_or_else(|| s3_error!(ServiceUnavailable, "server context is not ready"))?;
-            Ok(S3Response::new((StatusCode::NO_CONTENT, Body::empty())))
+        async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            app_context_from_envelope(req.envelope())
+                .ok_or_else(|| s3_error!(ServiceUnavailable, "server context is not ready"))?;
+            Ok(AdminResponse::new(StatusCode::NO_CONTENT, rustfs_s3_types::Body::empty()))
         }
     }
 

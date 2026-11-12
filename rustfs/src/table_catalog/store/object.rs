@@ -362,6 +362,30 @@ pub(super) fn validate_table_maintenance_report_owner(
     Ok(())
 }
 
+pub(super) fn validate_table_maintenance_report_path(
+    paths: &TableCatalogObjectPaths,
+    bucket: &str,
+    key: &str,
+    suffix: &str,
+    report: &TableMetadataMaintenanceReport,
+) -> TableCatalogStoreResult<()> {
+    let job = &report.job;
+    let namespace = parse_namespace_for_store(&job.namespace)?;
+    let table = parse_table_for_store(&job.table)?;
+    validate_table_maintenance_report_owner(report, bucket, &namespace, &table, &job.table_id)?;
+    let expected = match suffix {
+        MAINTENANCE_CURRENT_JOB_FILE => paths.table_maintenance_current_job_path(bucket, &namespace, &table, &job.table_id),
+        MAINTENANCE_LATEST_JOB_FILE => paths.table_maintenance_latest_job_path(bucket, &namespace, &table, &job.table_id),
+        _ => paths.table_maintenance_job_path(bucket, &namespace, &table, &job.table_id, &job.job_id),
+    };
+    if job.table_id.is_empty() || key != expected {
+        return Err(TableCatalogStoreError::Invalid(
+            "maintenance report does not match its object path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_table_warehouse_index_entry_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
@@ -3476,24 +3500,6 @@ where
             .map(|(config, _)| config)
             .unwrap_or_default();
         validate_table_maintenance_config(&config)?;
-        Ok(config)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    pub(crate) async fn put_table_bucket_maintenance_config(
-        &self,
-        table_bucket: &str,
-        config: TableMaintenanceConfig,
-    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        validate_table_maintenance_config(&config)?;
-        self.require_table_bucket(table_bucket).await?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
-        let config_path = self.paths.table_bucket_maintenance_config_path(table_bucket);
-        self.write_entry(self.catalog_bucket(), &config_path, &config, TableCatalogPutPrecondition::Any)
-            .await?;
         Ok(config)
     }
 
@@ -7852,6 +7858,13 @@ where
             )));
         };
         let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
+        // A rename source tombstone can still share its table ID with a live destination.
+        let history = if entry.state == TableCatalogEntryState::Active {
+            self.prepare_dropped_table_commit_cleanup(&entry).await?
+        } else {
+            Vec::new()
+        };
+        mutation_fence.ensure_held()?;
         self.tombstone_table_warehouse_index_for_drop(&entry, false).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
@@ -7868,10 +7881,11 @@ where
             .await
         {
             match self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await {
-                Ok(None) => return Ok(()),
+                Ok(None) => {}
                 Ok(Some((current, _))) if current == entry => {
                     self.restore_table_warehouse_index_after_failed_drop(&entry, &object, "table entry delete failed")
                         .await;
+                    return Err(err);
                 }
                 Ok(Some(_)) => {
                     return Err(TableCatalogStoreError::Internal(format!(
@@ -7888,9 +7902,25 @@ where
                         error = %read_err,
                         "failed to verify table state after an ambiguous table entry delete"
                     );
+                    return Err(err);
                 }
             }
-            return Err(err);
+        }
+        let config_path = self
+            .paths
+            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+        if let Some(config) = self.backend.object_metadata(self.catalog_bucket(), &config_path).await? {
+            let etag = config
+                .etag
+                .ok_or_else(|| TableCatalogStoreError::Conflict("table maintenance config has no ETag".to_string()))?;
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &config_path, &etag, &mutation_fence)
+                .await?;
+        }
+        for (key, etag) in history {
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &key, &etag, &mutation_fence)
+                .await?;
         }
         Ok(())
     }

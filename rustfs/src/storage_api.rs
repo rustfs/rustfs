@@ -205,7 +205,8 @@ pub(crate) mod server {
         pub(crate) use crate::storage::storage_api::{
             Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
             find_local_disk_by_ref, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
-            init_local_disks, verify_tonic_boot_epoch_response,
+            get_global_lock_client, get_global_lock_clients, init_local_disks, init_lock_clients,
+            verify_tonic_boot_epoch_response,
         };
 
         pub(crate) mod ecfs {
@@ -483,6 +484,10 @@ pub(crate) mod startup {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{
             INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV,
+        };
+        #[cfg(feature = "internode-transport")]
+        pub(crate) use crate::storage::storage_api::rpc_consumer::{
+            ExternalControlService, InstalledControlService, InternodeDataTransport, PeerControlClient,
         };
         pub(crate) use crate::storage::storage_api::{
             ECStore, EndpointServerPools, InstanceContext, bootstrap_instance_ctx, global_config_init_error_is_deterministic,
