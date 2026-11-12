@@ -335,7 +335,7 @@ pub fn parse_multipart_form(
                     .map(|s| s.trim().to_string());
 
                 files.push(UploadedFile {
-                    field_name: field_name.clone(),
+                    field_name,
                     filename: fname,
                     contents: content_bytes,
                     content_type,

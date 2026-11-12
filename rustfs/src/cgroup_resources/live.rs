@@ -255,7 +255,7 @@ fn resolve_scope_with_root(
                     depth,
                     Scope {
                         leaf,
-                        mount: mount.clone(),
+                        mount,
                         components,
                         directories,
                     },
