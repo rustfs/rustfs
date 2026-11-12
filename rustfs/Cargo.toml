@@ -57,6 +57,7 @@ name = "swift_object_integration_test"
 required-features = ["swift"]
 
 [features]
+internode-transport = ["rustfs-ecstore/internode-transport", "rustfs-rio/internode-transport"]
 default = ["ftps", "webdav", "gcs"]
 fips = ["rustls/fips", "tokio-rustls/fips", "rustfs-tls-runtime/fips", "rustfs-ecstore/fips", "rustfs-protocols/fips", "rustfs-s3-client/fips", "rustfs-targets/fips", "rustfs-utils/fips"]
 gcs = ["rustfs-ecstore/gcs", "dep:google-cloud-auth"]

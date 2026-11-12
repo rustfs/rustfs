@@ -283,6 +283,10 @@ pub(crate) mod request_context_consumer {
 
 pub(crate) mod rpc_consumer {
     pub(crate) use super::super::rpc::InternodeRpcService;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use super::super::rpc::external_transport::{
+        ExternalControlService, InstalledControlService, InternodeDataTransport, PeerControlClient,
+    };
 
     pub(crate) mod http_service {
         #[cfg(test)]
@@ -630,6 +634,20 @@ pub(crate) mod ecstore_rio {
     pub(crate) use rustfs_ecstore::api::rio::{
         DynReader, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
+}
+
+#[cfg(feature = "internode-transport")]
+pub(crate) mod ecstore_internode {
+    pub use ecstore_rpc::{
+        ExternalStreamAuth, InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest,
+        NsScannerStreamRequest, ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    use rustfs_ecstore::api::rpc as ecstore_rpc;
+    pub(crate) use rustfs_ecstore::api::storage::external_rpc_disk;
+    pub type TransportError = super::DiskError;
+    pub type FileReader = super::FileReader;
+    pub type FileWriter = super::FileWriter;
+    pub type NsScannerCapabilityResponse = super::storage_contracts::NsScannerCapabilityResponse;
 }
 
 pub(crate) mod ecstore_rpc {

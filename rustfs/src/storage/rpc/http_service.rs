@@ -332,11 +332,25 @@ macro_rules! log_internode_put_file_stage_failure {
 #[derive(Clone)]
 pub struct InternodeRpcService<S> {
     inner: S,
+    #[cfg(feature = "internode-transport")]
+    external: Option<Arc<super::external_transport::InstalledControlService>>,
 }
 
 impl<S> InternodeRpcService<S> {
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            #[cfg(feature = "internode-transport")]
+            external: None,
+        }
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn with_external_control(
+        inner: S,
+        external: Option<Arc<super::external_transport::InstalledControlService>>,
+    ) -> Self {
+        Self { inner, external }
     }
 }
 
@@ -486,7 +500,17 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        Box::pin(async move { Ok(handle_internode_rpc(req).await.map(ResBody::from)) })
+        #[cfg(feature = "internode-transport")]
+        let external = self.external.clone();
+        Box::pin(async move {
+            Ok(handle_internode_rpc(
+                req,
+                #[cfg(feature = "internode-transport")]
+                external,
+            )
+            .await
+            .map(ResBody::from))
+        })
     }
 }
 
@@ -494,7 +518,10 @@ fn is_internode_rpc_path(path: &str) -> bool {
     path.starts_with(RPC_PREFIX)
 }
 
-async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
+async fn handle_internode_rpc(
+    req: Request<Incoming>,
+    #[cfg(feature = "internode-transport")] external: Option<Arc<super::external_transport::InstalledControlService>>,
+) -> Response<Body> {
     let operation = internode_http_operation(req.uri().path());
     let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
@@ -523,6 +550,17 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         let method = req.method().clone();
         let path = req.uri().path();
         let response = match (method, path) {
+            #[cfg(feature = "internode-transport")]
+            (Method::POST, super::external_transport::CONTROL_PATH) => match external {
+                Some(installed) => match super::external_transport::handle(&installed, req).await {
+                    Ok(reader) => {
+                        let stream = tokio_util::io::ReaderStream::with_capacity(reader, 64 * 1024);
+                        Response::new(Body::from_stream(stream))
+                    }
+                    Err(error) => response_with_status(error.status, error.message),
+                },
+                None => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+            },
             (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
@@ -818,6 +856,101 @@ where
             .insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
     }
     response
+}
+
+#[cfg(feature = "internode-transport")]
+pub(super) async fn read_external_stream(
+    instance: &Arc<crate::storage::storage_api::InstanceContext>,
+    request: super::external_transport::ReadStreamRequest,
+) -> Result<FileReader, DiskError> {
+    let disk = crate::storage::storage_api::ecstore_internode::external_rpc_disk(instance, &request.disk).await?;
+    let reader =
+        read_file_stream_with_legacy_meta_fallback(&disk, &request.volume, &request.path, request.offset, request.length).await?;
+    let length = (request.length != 0)
+        .then(|| u64::try_from(request.length))
+        .transpose()
+        .map_err(DiskError::other)?;
+    let reader = match length {
+        Some(length) => Box::new(reader.take(length)) as FileReader,
+        None => reader,
+    };
+    let completion = RemoteBackgroundIo::take_current_completion();
+    if length.is_none() && completion.is_none() {
+        return Ok(reader);
+    }
+    Ok(Box::new(ExternalReadCompletion {
+        reader,
+        remaining: length,
+        completion,
+    }))
+}
+
+#[cfg(feature = "internode-transport")]
+struct ExternalReadCompletion {
+    reader: FileReader,
+    remaining: Option<u64>,
+    completion: Option<rustfs_concurrency::adaptive::permit_set::NodeResourceCompletion>,
+}
+
+#[cfg(feature = "internode-transport")]
+impl tokio::io::AsyncRead for ExternalReadCompletion {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let before = buf.filled().len();
+        if let Err(error) = std::task::ready!(Pin::new(&mut self.reader).poll_read(cx, buf)) {
+            self.completion.take();
+            return Poll::Ready(Err(error));
+        }
+        let read = buf.filled().len() - before;
+        if read == 0 && self.remaining.is_some_and(|remaining| remaining > 0) {
+            self.completion.take();
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated internode read")));
+        }
+        let done = match &mut self.remaining {
+            Some(remaining) => {
+                *remaining = remaining.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+                *remaining == 0
+            }
+            None => read == 0,
+        };
+        if done && let Some(completion) = self.completion.take() {
+            completion.complete();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "internode-transport")]
+pub(super) async fn write_external_chunks(
+    instance: &Arc<crate::storage::storage_api::InstanceContext>,
+    request: super::external_transport::WriteStreamRequest,
+    mut reader: rustfs_rio::ChunkReaderBox,
+) -> Result<u64, DiskError> {
+    let body = stream::poll_fn(move |cx| {
+        Pin::new(reader.as_mut())
+            .poll_read_chunk(cx, DEFAULT_READ_BUFFER_SIZE)
+            .map(Result::transpose)
+    });
+    let disk = crate::storage::storage_api::ecstore_internode::external_rpc_disk(instance, &request.disk).await?;
+    let query = PutFileQuery {
+        disk: request.disk,
+        volume: request.volume,
+        path: request.path,
+        append: request.append,
+        size: request.size,
+        ..Default::default()
+    };
+    write_staged_put_file(&disk, body, &query, StagedWriteAuth::VerifiedStream)
+        .await
+        .map_err(|(_, error)| match error.downcast::<DiskError>() {
+            Ok(error) => *error,
+            Err(error) => match error.downcast::<io::Error>() {
+                Ok(error) => DiskError::from(*error),
+                Err(error) => DiskError::other(error),
+            },
+        })
 }
 
 fn read_file_body_stream<R>(
@@ -1555,12 +1688,35 @@ async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> 
     .map_err(Into::into)
 }
 
-async fn write_authenticated_put_file<S, E>(
+fn write_authenticated_put_file<S, E>(
     disk: &DiskStore,
     body: S,
     query: &PutFileQuery,
     nonce: uuid::Uuid,
     url: &str,
+) -> impl Future<Output = Result<u64, (&'static str, BoxError)>>
+where
+    S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+    E: Into<BoxError>,
+{
+    write_staged_put_file(disk, body, query, StagedWriteAuth::Signed { nonce, url })
+}
+
+#[derive(Clone, Copy)]
+enum StagedWriteAuth<'a> {
+    Signed {
+        nonce: uuid::Uuid,
+        url: &'a str,
+    },
+    #[cfg(feature = "internode-transport")]
+    VerifiedStream,
+}
+
+async fn write_staged_put_file<S, E>(
+    disk: &DiskStore,
+    body: S,
+    query: &PutFileQuery,
+    auth: StagedWriteAuth<'_>,
 ) -> Result<u64, (&'static str, BoxError)>
 where
     S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
@@ -1575,8 +1731,18 @@ where
     };
 
     let result = async {
+        let staging_size = query.size;
+        #[cfg(feature = "internode-transport")]
+        let append_size = match auth {
+            StagedWriteAuth::VerifiedStream if query.append && query.size > 0 => Some(query.size.unsigned_abs()),
+            _ => None,
+        };
+        // A provider's append length excludes the existing prefix. A positive total-size
+        // hint would let the local writer close before it consumes the new payload.
+        #[cfg(feature = "internode-transport")]
+        let staging_size = if append_size.is_some() { 0 } else { staging_size };
         let mut file = disk
-            .create_file("", &query.volume, &staging_path, query.size)
+            .create_file("", &query.volume, &staging_path, staging_size)
             .await
             .map_err(|err| ("create_staging", Box::new(err) as BoxError))?;
 
@@ -1592,10 +1758,20 @@ where
             }
         }
 
-        let copied = write_put_file_body_chunks_to_writer(body, &mut file, query, Some(nonce), url)
-            .await
-            .map_err(|err| ("write_body", Box::new(err) as BoxError))?;
-        if put_body_size_mismatch(query, copied) {
+        let copied = match auth {
+            StagedWriteAuth::Signed { nonce, url } => {
+                write_put_file_body_chunks_to_writer(body, &mut file, query, Some(nonce), url)
+                    .await
+                    .map_err(BoxError::from)
+            }
+            #[cfg(feature = "internode-transport")]
+            StagedWriteAuth::VerifiedStream => write_verified_chunks(body, &mut file).await,
+        }
+        .map_err(|err| ("write_body", err))?;
+        let size_mismatch = put_body_size_mismatch(query, copied);
+        #[cfg(feature = "internode-transport")]
+        let size_mismatch = size_mismatch || append_size.is_some_and(|size| size != copied);
+        if size_mismatch {
             return Err((
                 "verify_size",
                 Box::new(io::Error::new(
@@ -1618,6 +1794,18 @@ where
         Ok(copied) => Ok(copied),
         Err((stage, primary)) => {
             if let Err(cleanup) = remove_put_file_staging(disk, &query.volume, &staging_path).await {
+                #[cfg(feature = "internode-transport")]
+                if matches!(auth, StagedWriteAuth::VerifiedStream) {
+                    // A missing staging file is expected when creation failed. Keep the typed
+                    // primary disk error for the peer's quorum and recovery decisions.
+                    if !matches!(
+                        cleanup.downcast_ref::<DiskError>(),
+                        Some(DiskError::FileNotFound | DiskError::VolumeNotFound)
+                    ) {
+                        log_internode_put_file_stage_failure!("cleanup_staging", query, cleanup);
+                    }
+                    return Err((stage, primary));
+                }
                 return Err((
                     stage,
                     Box::new(io::Error::other(format!("{primary}; staging cleanup failed: {cleanup}"))) as BoxError,
@@ -1626,6 +1814,25 @@ where
             Err((stage, primary))
         }
     }
+}
+
+#[cfg(feature = "internode-transport")]
+async fn write_verified_chunks<S, E, W>(mut body: S, writer: &mut W) -> Result<u64, BoxError>
+where
+    S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+    E: Into<BoxError>,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Keep the provider's registered window alive until the disk writer consumes it.
+    let mut copied = 0_u64;
+    while let Some(chunk) = body.try_next().await.map_err(Into::<BoxError>::into)? {
+        writer.write_all(&chunk).await?;
+        let count = u64::try_from(chunk.len()).map_err(io::Error::other)?;
+        copied = copied
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("stream length overflow"))?;
+    }
+    Ok(copied)
 }
 
 async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response<Body> {
@@ -3043,6 +3250,114 @@ mod tests {
                 .expect("existing data should remain"),
             Bytes::from_static(b"old-data")
         );
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_bounded_read_reports_truncation_without_a_background_permit() {
+        let dir = tempfile::tempdir().expect("temporary disk");
+        let path = dir.path().join("shard");
+        tokio::fs::write(&path, b"abcd").await.expect("initial shard");
+        let file = tokio::fs::File::open(&path).await.expect("open shard");
+        let mut reader = super::ExternalReadCompletion {
+            reader: Box::new(file.take(4)),
+            remaining: Some(4),
+            completion: None,
+        };
+        let mut data = [0; 2];
+        reader.read_exact(&mut data).await.expect("first bytes");
+        assert_eq!(&data, b"ab");
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .expect("open for truncation")
+            .set_len(2)
+            .await
+            .expect("truncate shard");
+        assert_eq!(reader.read(&mut []).await.expect("empty caller buffer"), 0);
+        assert_eq!(
+            reader.read(&mut data).await.expect_err("premature EOF").kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_staged_write_waits_for_verified_eof_and_preserves_append() {
+        let (disk, dir) = new_put_file_test_disk().await;
+        let mut query = PutFileQuery {
+            volume: "bucket".into(),
+            path: "part".into(),
+            size: 3,
+            ..Default::default()
+        };
+        super::write_staged_put_file(
+            &disk,
+            iter([Ok::<_, io::Error>(Bytes::from_static(b"old"))]),
+            &query,
+            super::StagedWriteAuth::VerifiedStream,
+        )
+        .await
+        .expect("publish original bytes");
+        for append in [false, true] {
+            query.append = append;
+            let unverified = iter([
+                Ok(Bytes::from_static(b"new")),
+                Err(io::Error::new(io::ErrorKind::InvalidData, "unverified EOF")),
+            ]);
+            let (stage, cause) = super::write_staged_put_file(&disk, unverified, &query, super::StagedWriteAuth::VerifiedStream)
+                .await
+                .expect_err("final verification failed");
+            assert_eq!(stage, "write_body");
+            assert_eq!(
+                cause.downcast_ref::<io::Error>().expect("original verification error").kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(disk.read_all("bucket", "part").await.expect("existing bytes"), Bytes::from_static(b"old"));
+        }
+        for incorrect in [Bytes::from_static(b"no"), Bytes::from_static(b"extra")] {
+            let (stage, cause) = super::write_staged_put_file(
+                &disk,
+                iter([Ok::<_, io::Error>(incorrect)]),
+                &query,
+                super::StagedWriteAuth::VerifiedStream,
+            )
+            .await
+            .expect_err("declared append length must match");
+            assert_eq!(stage, "verify_size");
+            assert_eq!(
+                cause.downcast_ref::<io::Error>().expect("length error").kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(
+                disk.read_all("bucket", "part")
+                    .await
+                    .expect("original after a length mismatch"),
+                Bytes::from_static(b"old")
+            );
+        }
+        super::write_staged_put_file(
+            &disk,
+            iter([Ok::<_, io::Error>(Bytes::from_static(b"new"))]),
+            &query,
+            super::StagedWriteAuth::VerifiedStream,
+        )
+        .await
+        .expect("append verified bytes");
+        assert_eq!(
+            disk.read_all("bucket", "part").await.expect("appended bytes"),
+            Bytes::from_static(b"oldnew")
+        );
+        for entry in std::fs::read_dir(dir.path().join("bucket")).expect("bucket entries") {
+            assert!(
+                !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".rustfs-put-")
+            );
+        }
     }
 
     #[tokio::test]
