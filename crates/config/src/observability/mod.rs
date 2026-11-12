@@ -91,7 +91,12 @@ pub const ENV_OBS_LOG_MATCH_MODE: &str = "RUSTFS_OBS_LOG_MATCH_MODE";
 
 /// Default values for log cleanup
 pub const DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No single file limit
+pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No per-file trim by the cleaner
+/// Size at which the active log file is rolled when
+/// `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES` is unset. Without a size roll
+/// the active file is bounded only by the rotation period, and the cleaner
+/// never touches the active file. An explicit `0` keeps size rolling off.
+pub const DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 pub const DEFAULT_OBS_LOG_COMPRESS_OLD_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL: u32 = 6;
 pub const DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP: &str = "gzip";

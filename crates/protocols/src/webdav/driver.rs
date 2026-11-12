@@ -949,7 +949,7 @@ where
                             modified,
                             created: modified,
                             is_dir: false,
-                            etag: Some(etag_to_string(&obj.e_tag)),
+                            etag: obj.e_tag.as_ref().map(etag_to_string),
                             content_type: None,
                         },
                     });

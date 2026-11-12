@@ -100,6 +100,43 @@ fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3
     )
 }
 
+/// Formats an S3 copy-source header while preserving the literal object key.
+/// The S3 copy-source parser URL-decodes the path and treats a raw `?versionId=`
+/// as query data, so encode the complete key before building the header.
+fn format_copy_source(bucket: &str, key: &str) -> String {
+    format!("/{bucket}/{}", urlencoding::encode(key))
+}
+
+/// Converts a protocol copy source into the source the s3s storage path consumes.
+///
+/// A bucket source goes through the same header rendering and `CopySource::parse` that the
+/// protocol layer used when it handed the storage client a header string, so bucket-name and
+/// key validation and their errors are unchanged. Access point and Outposts sources are moved
+/// across unchanged, and the storage copy path refuses them as it does for any other request.
+fn legacy_copy_source(
+    source: rustfs_gateway_types::CopySourceValue,
+) -> Result<s3s::dto::CopySource, s3s::dto::ParseCopySourceError> {
+    match source {
+        rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id } => {
+            let mut header = format_copy_source(&bucket, &key);
+            if let Some(version_id) = version_id {
+                header.push_str("?versionId=");
+                header.push_str(&urlencoding::encode(&version_id));
+            }
+            s3s::dto::CopySource::parse(&header)
+        }
+        source => Ok(gateway_s3s_compat::copy_source::to_s3s(source)),
+    }
+}
+
+/// Refuses a listing entry without an ETag, as the compatibility seam did while `Object.ETag` was required.
+fn require_listed_etags(output: gateway_dto::ListObjectsV2Output) -> Result<gateway_dto::ListObjectsV2Output, String> {
+    if output.contents.iter().any(|object| object.e_tag.is_none()) {
+        return Err("ListObjectsV2 contents entry has no e_tag".to_owned());
+    }
+    Ok(output)
+}
+
 fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<gateway_dto::ListBucketsOutput, String> {
     let s3s::dto::ListBucketsOutput {
         buckets,
@@ -667,6 +704,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         match self.fs.list_objects_v2(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(response.output)
+                .map_err(|e| e.to_string())
+                .and_then(require_listed_etags)
                 .map_err(|e| conversion_error("ListObjectsV2 output", e)),
             Err(e) => Err(e.into()),
         }
@@ -904,7 +943,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
         let copy_source =
-            s3s::dto::CopySource::parse(&input.copy_source).map_err(|e| conversion_error("CopyObject copy_source", e))?;
+            legacy_copy_source(input.copy_source.clone()).map_err(|e| conversion_error("CopyObject copy_source", e))?;
         let context = gateway_request_context(Method::PUT, &uri, HeaderMap::new());
         let wire = RequestWire::of(&context);
         let input = gateway_s3s_compat::generated::ops::copy_object::input_to_s3s(input, copy_source, &wire)
@@ -1160,7 +1199,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let copy_source =
-            s3s::dto::CopySource::parse(&input.copy_source).map_err(|e| conversion_error("UploadPartCopy copy_source", e))?;
+            legacy_copy_source(input.copy_source.clone()).map_err(|e| conversion_error("UploadPartCopy copy_source", e))?;
         let input = gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(input, copy_source)
             .map_err(|e| conversion_error("UploadPartCopy input", e))?;
         let part_number = input.part_number;
@@ -1198,6 +1237,144 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 mod tests {
     use super::*;
     use rustfs_credentials::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+
+    fn listed_object(e_tag: Option<&str>) -> gateway_dto::Object {
+        gateway_dto::Object {
+            key: rustfs_gateway_types::ObjectKey::new("dir/object.txt".to_owned()).expect("key"),
+            e_tag: e_tag.map(|tag| rustfs_gateway_types::ETag::new(tag.to_owned()).expect("tag")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn require_listed_etags_refuses_an_entry_without_an_etag() {
+        for contents in [
+            vec![listed_object(None)],
+            vec![listed_object(Some("abc")), listed_object(None)],
+        ] {
+            let output = gateway_dto::ListObjectsV2Output {
+                contents,
+                ..Default::default()
+            };
+            assert!(require_listed_etags(output).is_err());
+        }
+    }
+
+    #[test]
+    fn require_listed_etags_keeps_a_listing_whose_entries_all_have_etags() {
+        for tags in [Vec::new(), vec!["abc", "def"]] {
+            let output = gateway_dto::ListObjectsV2Output {
+                contents: tags.iter().map(|tag| listed_object(Some(tag))).collect(),
+                ..Default::default()
+            };
+            let kept = require_listed_etags(output).expect("listing with tags");
+            let kept_tags: Vec<_> = kept
+                .contents
+                .iter()
+                .map(|object| object.e_tag.as_ref().map(|tag| tag.opaque_tag().to_owned()))
+                .collect();
+            assert_eq!(kept_tags, tags.iter().map(|tag| Some((*tag).to_owned())).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn format_copy_source_preserves_encoded_and_query_like_keys() {
+        assert_eq!(format_copy_source("bucket", "%2F"), "/bucket/%252F");
+        assert_eq!(format_copy_source("bucket", "foo?versionId=1"), "/bucket/foo%3FversionId%3D1");
+        assert_eq!(format_copy_source("bucket", "a/b"), "/bucket/a%2Fb");
+    }
+
+    fn bucket_source(bucket: &str, key: &str, version_id: Option<&str>) -> rustfs_gateway_types::CopySourceValue {
+        rustfs_gateway_types::CopySourceValue::Bucket {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            version_id: version_id.map(str::to_owned),
+        }
+    }
+
+    fn s3s_bucket(source: s3s::dto::CopySource) -> (String, String, Option<String>) {
+        match source {
+            s3s::dto::CopySource::Bucket { bucket, key, version_id } => {
+                (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string()))
+            }
+            other => panic!("expected a bucket source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_copy_source_keeps_a_plain_bucket_key() {
+        let source = legacy_copy_source(bucket_source("bucket", "dir/object.txt", None)).expect("plain source");
+        assert_eq!(s3s_bucket(source), ("bucket".to_owned(), "dir/object.txt".to_owned(), None));
+    }
+
+    #[test]
+    fn legacy_copy_source_keeps_keys_that_need_percent_encoding() {
+        for key in ["%2F", "foo?versionId=1", "a b+c", "\u{4e2d}\u{6587}", "x&y=z#frag"] {
+            let source = legacy_copy_source(bucket_source("bucket", key, None)).expect("encoded source");
+            assert_eq!(s3s_bucket(source), ("bucket".to_owned(), key.to_owned(), None), "{key}");
+        }
+    }
+
+    #[test]
+    fn legacy_copy_source_keeps_a_version_id() {
+        let source =
+            legacy_copy_source(bucket_source("bucket", "object", Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"))).expect("versioned");
+        assert_eq!(
+            s3s_bucket(source),
+            (
+                "bucket".to_owned(),
+                "object".to_owned(),
+                Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_copy_source_rejects_an_invalid_bucket_name_as_before() {
+        for bucket in ["", "ab", "Upper", "under_score"] {
+            assert!(
+                matches!(
+                    legacy_copy_source(bucket_source(bucket, "object", None)),
+                    Err(s3s::dto::ParseCopySourceError::InvalidBucketName | s3s::dto::ParseCopySourceError::PatternMismatch)
+                ),
+                "{bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_copy_source_rejects_an_overlong_key_as_before() {
+        let key = "k".repeat(1025);
+        assert!(matches!(
+            legacy_copy_source(bucket_source("bucket", &key, None)),
+            Err(s3s::dto::ParseCopySourceError::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn legacy_copy_source_hands_access_point_and_outpost_sources_to_the_refusing_copy_path() {
+        let access_point = legacy_copy_source(rustfs_gateway_types::CopySourceValue::AccessPoint {
+            partition: "aws".to_owned(),
+            region: "us-east-1".to_owned(),
+            account_id: "123456789012".to_owned(),
+            access_point_name: "ap".to_owned(),
+            key: "object".to_owned(),
+            version_id: None,
+        })
+        .expect("access point source");
+        assert!(matches!(access_point, s3s::dto::CopySource::AccessPoint { .. }));
+
+        let outpost = legacy_copy_source(rustfs_gateway_types::CopySourceValue::Outpost {
+            partition: "aws".to_owned(),
+            region: "us-east-1".to_owned(),
+            account_id: "123456789012".to_owned(),
+            outpost_id: "op-01234567890123456/accesspoint/ap".to_owned(),
+            key: "object".to_owned(),
+            version_id: None,
+        })
+        .expect("outpost source");
+        assert!(matches!(outpost, s3s::dto::CopySource::Outpost { .. }));
+    }
 
     #[test]
     fn create_request_preserves_authenticated_service_account_identity() {

@@ -894,6 +894,13 @@ fn record_shard_read_result(
     }
 }
 
+/// A slow or misaligned shard reader is retired once per stripe of every read
+/// it lags on. The lines name only a shard index, so one per interval with the
+/// suppressed count is enough.
+const RETIRED_READER_LOG_INTERVAL_MS: u64 = 5_000;
+static ABANDONED_READER_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(RETIRED_READER_LOG_INTERVAL_MS);
+static UNALIGNED_PARITY_READER_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(RETIRED_READER_LOG_INTERVAL_MS);
+
 fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut ShardIndexes, active_readers: &[bool]) {
     for (i, active) in active_readers.iter().enumerate() {
         if !*active {
@@ -904,7 +911,9 @@ fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Sha
             errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read abandoned after read quorum")));
         }
         retire_readers.push(i);
-        warn!(shard_index = i, "retiring in-flight shard reader after read quorum");
+        if let Some(suppressed) = ABANDONED_READER_LOGS.claim() {
+            warn!(shard_index = i, suppressed, "retiring in-flight shard reader after read quorum");
+        }
     }
 }
 
@@ -2024,10 +2033,12 @@ where
             self.engaged[idx] = true;
             true
         } else {
-            warn!(
-                shard_index = idx,
-                stripe_index, "retiring parity reader that cannot be aligned to the current stripe"
-            );
+            if let Some(suppressed) = UNALIGNED_PARITY_READER_LOGS.claim() {
+                warn!(
+                    shard_index = idx,
+                    stripe_index, suppressed, "retiring parity reader that cannot be aligned to the current stripe"
+                );
+            }
             self.readers[idx] = None;
             false
         }
@@ -2844,6 +2855,29 @@ impl Erasure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning is bounded; the retirement is not. Every call retires every
+    /// reader still in flight and records why, however many calls came before.
+    #[test]
+    fn abandoned_readers_are_retired_on_every_call_while_their_log_is_bounded() {
+        let active_readers = [true, false, true, true];
+        for _ in 0..1_000 {
+            let mut errs: Vec<Option<Error>> = vec![None, None, Some(Error::other("already failed")), None];
+            let mut retire_readers = ShardIndexes::new();
+            retire_abandoned_readers(&mut errs, &mut retire_readers, &active_readers);
+
+            assert_eq!(retire_readers.as_slice(), &[0, 2, 3]);
+            assert!(errs[1].is_none(), "an inactive reader is left alone");
+            assert!(errs[0].is_some() && errs[3].is_some(), "an abandoned reader gets its timeout error");
+            assert!(
+                errs[2]
+                    .as_ref()
+                    .is_some_and(|error| error.to_string().contains("already failed")),
+                "an existing error is kept"
+            );
+        }
+        assert!(ABANDONED_READER_LOGS.claim().is_none(), "the burst used the window");
+    }
     use crate::{
         disk::error::DiskError,
         erasure::coding::{BitrotReader, BitrotWriter},

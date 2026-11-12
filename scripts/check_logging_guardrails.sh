@@ -1094,11 +1094,29 @@ trace_hot_spans=(
   "rustfs/src/app/object:execute_get_object"
 )
 
+# A hot span in a file that is due for a mechanical split (rustfs/backlog#2765)
+# is also looked up in the directory the split moves its functions into; the
+# named file itself stays required.
+# shellcheck source=scripts/guard_source_set.sh
+source "${repo_root}/scripts/guard_source_set.sh"
+
 for hot_span in "${trace_hot_spans[@]}"; do
   file="${hot_span%%:*}"
   function="${hot_span##*:}"
+  hot_span_sources=("$file")
+  split_dir=""
+  case "$file" in
+    rustfs/src/app/bucket_usecase.rs) split_dir="rustfs/src/app/bucket_usecase" ;;
+  esac
+  if [[ -n "$split_dir" ]]; then
+    if ! guard_source_set "$repo_root" "$file" "$split_dir"; then
+      echo "❌ logging guardrail violation: $file::$function guard source is missing" >&2
+      exit 1
+    fi
+    hot_span_sources=("${GUARD_SOURCES[@]}")
+  fi
   trace_span_pattern="#\\[(tracing::)?instrument\\([^]]*level = \\\"trace\\\"[^]]*\\)\\]([[:space:]]+#\\[[^]]+\\])*[[:space:]]+(pub(\\([^)]*\\))?[[:space:]]+)?(super[[:space:]]+)?async fn ${function}\\b"
-  if ! rg -U "$trace_span_pattern" "$file" >/dev/null; then
+  if ! rg -U "$trace_span_pattern" "${hot_span_sources[@]}" >/dev/null; then
     echo "❌ logging guardrail violation: $file::$function must remain TRACE-only" >&2
     exit 1
   fi

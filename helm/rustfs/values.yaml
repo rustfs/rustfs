@@ -143,6 +143,9 @@ config:
     console_enable: "true"
     console_address: ":9001"
     region: "us-east-1"
+    # Root for notify/audit target queues that keep the default queue_dir; queues use
+    # <root>/events and <root>/audit. Empty keeps the image layout (/opt/rustfs -> /data/.rustfs).
+    target_store_dir: ""
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"

@@ -26,22 +26,21 @@ use rustfs_config::observability::{
     DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES,
     DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES,
     DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE,
-    DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
-    DEFAULT_OBS_LOG_PARALLEL_COMPRESS, DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
-    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_ENDPOINT, ENV_OBS_ENDPOINT_HEADERS,
-    ENV_OBS_ENDPOINT_LOGS_HEADERS, ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_METRICS_HEADERS,
-    ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TRACES_HEADERS,
-    ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS, ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
-    ENV_OBS_LOG_COMPRESS_OLD_FILES, ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, ENV_OBS_LOG_COMPRESSION_ALGORITHM,
-    ENV_OBS_LOG_DELETE_EMPTY_FILES, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN, ENV_OBS_LOG_ENDPOINT,
-    ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL, ENV_OBS_LOG_KEEP_FILES,
-    ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES,
-    ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, ENV_OBS_LOG_PARALLEL_COMPRESS, ENV_OBS_LOG_PARALLEL_WORKERS, ENV_OBS_LOG_ROTATION_TIME,
-    ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL, ENV_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, ENV_OBS_LOG_ZSTD_WORKERS,
-    ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED, ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT,
-    ENV_OBS_METRICS_EXPORT_ENABLED, ENV_OBS_PROFILING_ENDPOINT, ENV_OBS_PROFILING_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO,
-    ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TLS_CA_FILE, ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED,
-    ENV_OBS_USE_STDOUT,
+    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
+    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
+    DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_ENDPOINT, ENV_OBS_ENDPOINT_HEADERS, ENV_OBS_ENDPOINT_LOGS_HEADERS,
+    ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_METRICS_HEADERS, ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS,
+    ENV_OBS_ENDPOINT_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TRACES_HEADERS, ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS,
+    ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS, ENV_OBS_LOG_COMPRESS_OLD_FILES,
+    ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, ENV_OBS_LOG_COMPRESSION_ALGORITHM, ENV_OBS_LOG_DELETE_EMPTY_FILES,
+    ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN, ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME,
+    ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL, ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
+    ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, ENV_OBS_LOG_PARALLEL_COMPRESS,
+    ENV_OBS_LOG_PARALLEL_WORKERS, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
+    ENV_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, ENV_OBS_LOG_ZSTD_WORKERS, ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED,
+    ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_METRICS_EXPORT_ENABLED, ENV_OBS_PROFILING_ENDPOINT,
+    ENV_OBS_PROFILING_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TLS_CA_FILE,
+    ENV_OBS_TRACE_ENDPOINT, ENV_OBS_TRACES_EXPORT_ENABLED, ENV_OBS_USE_STDOUT,
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
@@ -189,9 +188,13 @@ pub struct OtelConfig {
     pub log_keep_files: Option<usize>,
 
     // ── Log cleanup ───────────────────────────────────────────────────────────
-    /// Hard ceiling on the total size (bytes) of all log files (default: 2 GiB).
+    /// Byte budget for rolled log files, and separately for compressed
+    /// archives (default: 2 GiB); `0` means no budget. The active file is not
+    /// counted.
     pub log_max_total_size_bytes: Option<u64>,
-    /// Per-file size ceiling (bytes); `0` means unlimited (default: `0`).
+    /// Per-file size ceiling (bytes). Unset or unparsable: the active file
+    /// rolls at 256 MiB (less under a small byte budget) and the cleaner
+    /// applies no per-file trim. `0`: no size roll and no trim.
     pub log_max_single_file_size_bytes: Option<u64>,
     /// Compress eligible files with gzip before deletion (default: `true`).
     pub log_compress_old_files: Option<bool>,
@@ -344,10 +347,8 @@ impl OtelConfig {
             log_keep_files,
             // Log cleanup
             log_max_total_size_bytes: Some(get_env_u64(ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES)),
-            log_max_single_file_size_bytes: Some(get_env_u64(
-                ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
-                DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
-            )),
+            // Unset stays `None`: the appender and the cleaner default differently.
+            log_max_single_file_size_bytes: get_env_opt_u64(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES),
             log_compress_old_files: Some(get_env_bool(ENV_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES)),
             log_gzip_compression_level: Some(get_env_u64(
                 ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL,
@@ -478,6 +479,30 @@ mod tests {
 
     fn extract_profiling_export_enabled() -> Option<bool> {
         OtelConfig::extract_otel_config_from_env(None).profiling_export_enabled
+    }
+
+    #[test]
+    fn single_file_size_limit_distinguishes_unset_from_an_explicit_zero() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.log_max_single_file_size_bytes, None, "unset leaves the default to each consumer");
+            });
+            temp_env::with_var(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, Some("0"), || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.log_max_single_file_size_bytes, Some(0), "an explicit 0 is kept as unlimited");
+            });
+            for unparsable in ["", "256MiB"] {
+                temp_env::with_var(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, Some(unparsable), || {
+                    let config = OtelConfig::extract_otel_config_from_env(None);
+                    assert_eq!(config.log_max_single_file_size_bytes, None, "{unparsable:?} is treated as unset");
+                });
+            }
+            temp_env::with_var(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, Some("1048576"), || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.log_max_single_file_size_bytes, Some(1_048_576));
+            });
+        });
     }
 
     #[test]
