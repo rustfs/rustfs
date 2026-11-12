@@ -188,6 +188,11 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
         "s3:PutObjectLegalHold"
       ],
       "Resource": ["arn:aws:s3:::*/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey"],
+      "Resource": ["arn:aws:kms:::*"]
     }
   ]
 }"#,
@@ -195,16 +200,22 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
 }
 
-/// A replicated force-delete needs an explicit `s3:ForceDeleteObject` on the peer; `s3:*` does not grant it.
-/// Accounts created before the action was added to the policy lack it and must be refreshed in place.
-async fn site_replicator_policy_allows_force_delete(policy: Option<&Policy>) -> bool {
+/// Whether a stored site-replicator policy carries every grant added after the account was first shipped.
+/// Accounts created before one of these was added keep their stored policy and must be refreshed in place.
+///
+/// - `s3:ForceDeleteObject`: a replicated force-delete needs it explicitly; `s3:*` does not grant it.
+/// - `kms:GenerateDataKey`: with `RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true` the receiving site authorizes a
+///   replica `PUT` of an SSE-KMS object against the key it resolves to. `kms:Decrypt` is deliberately absent:
+///   replication never reads through this account, and granting it would let a read proxied to a peer return
+///   an SSE-KMS object to a caller who holds no `kms:Decrypt` of their own.
+async fn site_replicator_policy_is_current(policy: Option<&Policy>) -> bool {
     let Some(policy) = policy else {
         return false;
     };
     let groups: Option<Vec<String>> = None;
     let claims = HashMap::new();
     let conditions = HashMap::new();
-    let args = rustfs_policy::policy::Args {
+    let force_delete = rustfs_policy::policy::Args {
         account: SITE_REPLICATOR_SERVICE_ACCOUNT,
         groups: &groups,
         action: Action::S3Action(rustfs_policy::policy::action::S3Action::ForceDeleteObjectAction),
@@ -215,7 +226,14 @@ async fn site_replicator_policy_allows_force_delete(policy: Option<&Policy>) -> 
         bucket: "bucket",
         object: "prefix/",
     };
-    policy.is_allowed(&args).await
+    // KMS call-site contract: the key identifier travels in `object` with `bucket` empty.
+    let generate_data_key = rustfs_policy::policy::Args {
+        action: Action::KmsAction(rustfs_policy::policy::action::KmsAction::GenerateDataKeyAction),
+        bucket: "",
+        object: "any-key",
+        ..force_delete
+    };
+    policy.is_allowed(&force_delete).await && policy.is_allowed(&generate_data_key).await
 }
 
 // Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
@@ -1685,7 +1703,7 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
                 return Ok(());
             };
             if credentials.parent_user == parent_user {
-                if site_replicator_policy_allows_force_delete(stored_policy.as_ref()).await {
+                if site_replicator_policy_is_current(stored_policy.as_ref()).await {
                     return Ok(());
                 }
 
@@ -10719,13 +10737,13 @@ mod tests {
     #[tokio::test]
     async fn test_site_replicator_policy_allows_force_delete_replication() {
         let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
-        assert!(site_replicator_policy_allows_force_delete(Some(&policy)).await);
+        assert!(site_replicator_policy_is_current(Some(&policy)).await);
     }
 
     // Accounts created before the action was added keep their stored policy until the reconciler refreshes it.
     #[tokio::test]
     async fn test_outdated_site_replicator_policy_is_not_treated_as_current() {
-        assert!(!site_replicator_policy_allows_force_delete(None).await);
+        assert!(!site_replicator_policy_is_current(None).await);
 
         let outdated: Policy = serde_json::from_value(serde_json::json!({
             "Version": "2012-10-17",
@@ -10736,7 +10754,57 @@ mod tests {
             }]
         }))
         .expect("outdated policy should parse");
-        assert!(!site_replicator_policy_allows_force_delete(Some(&outdated)).await);
+        assert!(!site_replicator_policy_is_current(Some(&outdated)).await);
+    }
+
+    // With SSE key-policy enforcement on, the receiving site authorizes a replica PUT of an SSE-KMS object
+    // against the key it resolves to, so the replication account needs kms:GenerateDataKey on every key.
+    // It must not hold kms:Decrypt: reads proxied to a peer run as this account.
+    #[tokio::test]
+    async fn test_site_replicator_policy_allows_sse_kms_replica_writes_only() {
+        use rustfs_policy::policy::action::KmsAction;
+
+        let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
+        let groups: Option<Vec<String>> = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let generate = rustfs_policy::policy::Args {
+            account: SITE_REPLICATOR_SERVICE_ACCOUNT,
+            groups: &groups,
+            action: Action::KmsAction(KmsAction::GenerateDataKeyAction),
+            conditions: &conditions,
+            is_owner: false,
+            claims: &claims,
+            deny_only: false,
+            bucket: "",
+            object: "74e5921e-107a-4584-bfda-a5dadeb3e13e",
+        };
+        assert!(policy.is_allowed(&generate).await);
+
+        for action in [
+            KmsAction::DecryptAction,
+            KmsAction::DisableKeyAction,
+            KmsAction::DeleteKeyAction,
+        ] {
+            let args = rustfs_policy::policy::Args {
+                action: Action::KmsAction(action),
+                ..generate
+            };
+            assert!(!policy.is_allowed(&args).await, "site replicator must not hold {action:?}");
+        }
+    }
+
+    // An account whose stored policy predates the KMS grant is refreshed by the reconciler.
+    #[tokio::test]
+    async fn test_site_replicator_policy_without_kms_grant_is_not_current() {
+        let mut value = serde_json::to_value(site_replicator_service_account_policy().expect("policy should parse"))
+            .expect("policy should serialize");
+        let statements = value["Statement"].as_array_mut().expect("statements");
+        let before = statements.len();
+        statements.retain(|statement| !statement["Action"].to_string().contains("kms:"));
+        assert_eq!(statements.len(), before - 1, "exactly the KMS statement is removed");
+        let without_kms: Policy = serde_json::from_value(value).expect("policy without KMS grant should parse");
+        assert!(!site_replicator_policy_is_current(Some(&without_kms)).await);
     }
 
     // The replication service account must be able to carry object-lock metadata to the peer.

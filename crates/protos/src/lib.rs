@@ -4164,7 +4164,7 @@ mod tests {
 
 #[cfg(test)]
 mod lock_release_tests {
-    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockReleaseStatus};
+    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockAcquireStatus, LockReleaseStatus};
     use prost::Message;
 
     /// The release response schema before structured outcomes were added.
@@ -4211,6 +4211,7 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                ..Default::default()
             };
             for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
                 let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive outcome");
@@ -4219,5 +4220,44 @@ mod lock_release_tests {
                 assert!(legacy.lock_info.is_none());
             }
         }
+    }
+
+    #[test]
+    fn batch_acquire_outcomes_are_additive_and_preserve_legacy_grants() {
+        for success in [false, true] {
+            let legacy = LegacyReleaseResponse {
+                success,
+                error_info: (!success).then(|| "legacy failure".to_string()),
+                lock_info: None,
+            };
+            let result = GenerallyLockResult::decode(legacy.encode_to_vec().as_slice()).expect("decode legacy acquire");
+            assert_eq!(result.success, success);
+            assert_eq!(result.acquire_status(), LockAcquireStatus::Unspecified);
+        }
+        for status in [LockAcquireStatus::RetryableNoGrant, LockAcquireStatus::RejectedNoGrant] {
+            let result = GenerallyLockResult {
+                success: false,
+                error_info: Some("not granted".to_string()),
+                acquire_status: status.into(),
+                ..Default::default()
+            };
+            let legacy = LegacyReleaseResponse::decode(result.encode_to_vec().as_slice()).expect("decode additive acquire");
+            assert!(!legacy.success);
+            assert_eq!(legacy.error_info, result.error_info);
+            let single =
+                GenerallyLockResponse::decode(result.encode_to_vec().as_slice()).expect("single schema ignores batch field");
+            assert_eq!(single.release_status(), LockReleaseStatus::Unspecified);
+        }
+    }
+
+    #[test]
+    fn batch_acquire_unknown_status_is_preserved_for_conservative_classification() {
+        let result = GenerallyLockResult {
+            acquire_status: 99,
+            ..Default::default()
+        };
+        let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
+        assert_eq!(decoded.acquire_status, 99);
+        assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
     }
 }

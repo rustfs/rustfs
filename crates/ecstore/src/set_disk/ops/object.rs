@@ -69,6 +69,92 @@ use super::super::{
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::delete_recovery::DeleteRecoveryContext;
 
+const EVENT_SET_DISK_DELETE_OBJECTS_STAGE: &str = "set_disk_delete_objects_stage";
+const DELETE_OBJECTS_STAGE_SLOW_MS: u128 = 1_000;
+
+/// Counts use the stage's actual inputs, not failures inherited from an earlier stage.
+struct DeleteObjectsStageSummary {
+    stage: &'static str,
+    started: Instant,
+    attempted_object_count: usize,
+    attempted_group_count: usize,
+    fence_lost: bool,
+    failed_object_count: usize,
+    failed_group_count: usize,
+    disk_error_counts: std::collections::BTreeMap<u32, usize>,
+}
+
+impl DeleteObjectsStageSummary {
+    fn new(stage: &'static str, attempted_object_count: usize, attempted_group_count: usize) -> Self {
+        Self {
+            stage,
+            started: Instant::now(),
+            attempted_object_count,
+            attempted_group_count,
+            fence_lost: false,
+            failed_object_count: 0,
+            failed_group_count: 0,
+            disk_error_counts: Default::default(),
+        }
+    }
+
+    fn record_disk_failure(&mut self, error: &DiskError, object_count: usize) {
+        self.failed_object_count += object_count;
+        self.failed_group_count += 1;
+        // Wire codes preserve typed disk causes without exposing error messages or paths.
+        *self.disk_error_counts.entry(error.to_u32()).or_default() += 1;
+    }
+
+    fn log(self, pool_index: usize, set_index: usize, disk_index: Option<usize>) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let state = if self.fence_lost { "fence_lost" } else { "completed" };
+        let result = if self.fence_lost || self.failed_object_count > 0 {
+            "failed"
+        } else {
+            "ok"
+        };
+        if self.fence_lost || self.failed_object_count > 0 || elapsed_ms >= DELETE_OBJECTS_STAGE_SLOW_MS {
+            warn!(
+                event = EVENT_SET_DISK_DELETE_OBJECTS_STAGE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state,
+                result,
+                stage = self.stage,
+                pool_index,
+                set_index,
+                disk_index,
+                attempted_object_count = self.attempted_object_count,
+                attempted_group_count = self.attempted_group_count,
+                failed_object_count = self.failed_object_count,
+                failed_group_count = self.failed_group_count,
+                disk_error_counts = ?self.disk_error_counts,
+                elapsed_ms,
+                "Batch delete stage completed"
+            );
+        } else {
+            debug!(
+                event = EVENT_SET_DISK_DELETE_OBJECTS_STAGE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state,
+                result,
+                stage = self.stage,
+                pool_index,
+                set_index,
+                disk_index,
+                attempted_object_count = self.attempted_object_count,
+                attempted_group_count = self.attempted_group_count,
+                failed_object_count = self.failed_object_count,
+                failed_group_count = self.failed_group_count,
+                disk_error_counts = ?self.disk_error_counts,
+                elapsed_ms,
+                "Batch delete stage completed"
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeleteCommitContext<'a> {
     incarnation: Option<Uuid>,
@@ -9975,6 +10061,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dist_erasure = self.ctx.is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
+        let mut raw_lock_summary = DeleteObjectsStageSummary::new("raw_acquire", objects.len(), unique_lock_count);
         if opts.no_lock {
             locked_objects = unique_objects;
         } else if dist_erasure {
@@ -10014,7 +10101,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         for (i, lock_name) in lock_names.iter().enumerate() {
             if let Some(err) = failed_map.get(&(bucket.to_string(), lock_name.to_string())) {
                 del_errs[i] = Some(Error::other(err.to_string()));
+                raw_lock_summary.failed_object_count += 1;
             }
+        }
+        if !opts.no_lock {
+            raw_lock_summary.failed_group_count = failed_map.len();
+            raw_lock_summary.log(self.pool_index, self.set_index, None);
         }
 
         let outer_namespace_lock_fence = opts.namespace_lock_fence.clone();
@@ -10023,12 +10115,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            // Bulk delete is the only multi-key transaction-lock holder; one
-            // batched lock round replaces one quorum round-trip per key and is
-            // deadlock-free by construction (a single `lock_batch` RPC per lock
-            // client, global (shard, key) order at each server). Per-key
-            // failures keep the set layer's per-key error reporting.
+            // Batch unresolved keys per peer under one total acquisition budget.
+            // Confirmed cleanup precedes retries; each key keeps its own quorum
+            // and failure result at the set layer.
             let key_names: Vec<&str> = keys.iter().map(|key| key.as_str()).collect();
+            let mut transaction_summary = DeleteObjectsStageSummary::new(
+                "transaction_acquire",
+                lock_names
+                    .iter()
+                    .filter(|name| locked_objects.contains(name.as_ref()))
+                    .count(),
+                key_names.len(),
+            );
             let acquired = self
                 .acquire_delete_transaction_locks_batch(bucket, &key_names, super::super::get_lock_acquire_timeout())
                 .await;
@@ -10039,14 +10137,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         transaction_guards.insert(key, guard);
                     }
                     Err(error) => {
+                        transaction_summary.failed_group_count += 1;
                         for (index, lock_name) in lock_names.iter().enumerate() {
                             if lock_name.as_ref() == key {
                                 del_errs[index] = Some(error.clone());
+                                transaction_summary.failed_object_count += 1;
                             }
                         }
                     }
                 }
             }
+            transaction_summary.log(self.pool_index, self.set_index, None);
         }
         let transaction_guards = Arc::new(transaction_guards);
         let current_generations = opts.conditional_delete_generations.as_deref();
@@ -10504,11 +10605,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .as_ref()
             .is_some_and(NamespaceLockFence::is_lock_lost)
         {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "fence_before_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             if dist_erasure {
                 self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
             }
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
                         mode: "delete_objects_commit",
                         bucket: bucket.to_string(),
@@ -10518,6 +10626,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
             return (del_objects, del_errs, accounting);
         }
 
@@ -10584,8 +10693,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // let mut errors = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
+        for (disk_index, disk) in disks.iter().enumerate() {
             let disk_namespace_owner = namespace_owner.clone();
+            let group_inputs = &vers;
             let vers = vers.clone();
             let namespace_lock_fence = opts.namespace_lock_fence.clone();
             let lock_lost_during_commit = Arc::clone(&lock_lost_during_commit);
@@ -10594,7 +10704,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     lock_lost_during_commit.store(true, std::sync::atomic::Ordering::Release);
                     return (0..vers.len()).map(|_| Some(DiskError::DiskOngoingReq)).collect();
                 }
-                if let Some(disk) = disk {
+                let mut prepare_summary = DeleteObjectsStageSummary::new(
+                    "prepare",
+                    group_inputs.iter().map(|group| group.versions.len()).sum(),
+                    group_inputs.len(),
+                );
+                let errors = if let Some(disk) = disk {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
@@ -10662,14 +10777,28 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         errs.push(Some(DiskError::DiskNotFound));
                     }
                     errs
+                };
+                for (error, group) in errors.iter().zip(group_inputs) {
+                    if let Some(error) = error {
+                        prepare_summary.record_disk_failure(error, group.versions.len());
+                    }
                 }
+                prepare_summary.log(self.pool_index, self.set_index, Some(disk_index));
+                errors
             });
         }
 
         let results = join_all(futures).await;
         if transaction_guards.values().any(|guard| guard.is_lock_lost()) {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "transaction_fence_after_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     accounting[index] = None;
                     del_errs[index] = Some(StorageError::NamespaceLockQuorumUnavailable {
                         mode: "delete_transaction",
@@ -10680,6 +10809,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
             if dist_erasure {
                 self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
             }
@@ -10746,8 +10876,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         if lock_lost_during_commit.load(std::sync::atomic::Ordering::Acquire) {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "fence_during_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
                         mode: "delete_objects_commit",
                         bucket: bucket.to_string(),
@@ -10757,6 +10894,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
         }
 
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
@@ -10775,6 +10913,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Mark all attempted groups before starting publication. A lost
             // response can hide a persisted decision and must never roll back.
             let groups = groups.collect::<Vec<_>>();
+            let mut receipt_summary = DeleteObjectsStageSummary::new(
+                "receipt",
+                groups.iter().map(|index| vers[*index].versions.len()).sum(),
+                groups.len(),
+            );
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
             // Journal publish fans out per object per drive; keep enough
             // publications in flight to feed the drives' durable-mutation
@@ -10822,11 +10965,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             for (index, result) in publications {
                 let group = &vers[index];
                 if let Err(error) = result {
+                    receipt_summary.record_disk_failure(&error, group.versions.len());
                     for version in &group.versions {
                         del_errs[version.idx] = Some(to_object_err(error.clone().into(), vec![bucket, &group.name]));
                     }
                 }
             }
+            receipt_summary.log(self.pool_index, self.set_index, None);
         }
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
@@ -28955,3 +29100,24 @@ mod delete_recovery_inventory_tests {
 
 #[cfg(all(test, feature = "test-util"))]
 mod data_movement_prefix_cleanup_tests;
+
+#[cfg(test)]
+mod delete_objects_stage_summary_tests {
+    use super::*;
+
+    #[test]
+    fn batch_delete_diagnostics_count_groups_and_versions_separately() {
+        let mut summary = DeleteObjectsStageSummary::new("receipt", 6, 3);
+        summary.record_disk_failure(&DiskError::ErasureWriteQuorum, 3);
+        summary.record_disk_failure(&DiskError::ErasureWriteQuorum, 2);
+
+        assert_eq!(summary.attempted_object_count, 6);
+        assert_eq!(summary.attempted_group_count, 3);
+        assert_eq!(summary.failed_object_count, 5);
+        assert_eq!(summary.failed_group_count, 2);
+        assert_eq!(
+            summary.disk_error_counts,
+            std::collections::BTreeMap::from([(DiskError::ErasureWriteQuorum.to_u32(), 2)])
+        );
+    }
+}

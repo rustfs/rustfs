@@ -225,8 +225,21 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
+impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
-pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn DiskFileWriter>;
+
+pub(crate) fn as_lazy_local_file_writer_mut(writer: &mut dyn DiskFileWriter) -> Option<&mut local::LazyLocalFileWriter> {
+    let any: &mut dyn std::any::Any = writer;
+    if any.is::<local::LazyLocalFileWriter>() {
+        return any.downcast_mut::<local::LazyLocalFileWriter>();
+    }
+    let slow = any.downcast_mut::<disk_store::SlowDiskWriter>()?;
+    let inner_any: &mut dyn std::any::Any = slow.inner_mut();
+    inner_any.downcast_mut::<local::LazyLocalFileWriter>()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotLeaseToken(Uuid);
@@ -1556,13 +1569,36 @@ impl Disk {
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
-    new_disk_with_health_tracker(ep, opt, None).await
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_disk_for_instance(
+    _instance: &crate::runtime::instance::InstanceContext,
+    ep: &Endpoint,
+    opt: &DiskOption,
+) -> Result<DiskStore> {
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        Some(_instance),
+    )
+    .await
 }
 
 pub(crate) async fn new_disk_with_health_tracker(
     ep: &Endpoint,
     opt: &DiskOption,
     reconnect: Option<disk_store::ReconnectDiskHealthState>,
+    #[cfg(feature = "internode-transport")] instance: Option<&crate::runtime::instance::InstanceContext>,
 ) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
@@ -1572,8 +1608,15 @@ pub(crate) async fn new_disk_with_health_tracker(
             reconnect,
         )))))
     } else {
-        let data_transport = build_internode_data_transport_from_env();
-        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
+        #[cfg(feature = "internode-transport")]
+        let remote_disk = match instance.and_then(|ctx| ctx.internode_data_transport()) {
+            Some(transport) => RemoteDisk::new(ep, opt, Arc::clone(transport))
+                .await?
+                .with_instance_transport(),
+            None => RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?,
+        };
+        #[cfg(not(feature = "internode-transport"))]
+        let remote_disk = RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }

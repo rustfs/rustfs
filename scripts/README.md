@@ -38,6 +38,7 @@ their issue closes.
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Exact, lower-only baseline on the direct s3s surface ahead of the gateway migration (reads `.config/s3s-footprint-baseline.txt`; `s3_error_lines` leaves out lines whose file imports the macro from `rustfs-s3-types`, rule in the script header); `--mode allowlist` fails on any Rust file referencing s3s outside `.config/s3s-edge-allowlist.txt`, `--dry-run` lists them | ci.yml Quick Checks; `make pre-commit`; `make script-tests` (`--self-test`) |
 | `check_test_count_ratchet.sh` | ci-gate | Per-crate test-count floor and `#[ignore]` ceiling against `.config/test-count-baseline.txt`; no crate may fall below its tests row or rise above its ignored row (extra tests and new crates pass with a note) | ci.yml Quick Checks; `make pre-commit` |
+| `guard_source_set.sh` | ci-gate (library) | Sourced helpers for text guards that must survive a mechanical file split (rustfs/backlog#2765): `guard_source_set` resolves a required file plus the split directory (a missing required file fails), `module_relative_rg` rewrites a `super::` rule for each file's module depth | Sourced by `check_architecture_migration_rules.sh` and `check_logging_guardrails.sh`; contract tests `test_guard_source_set.sh`; end-to-end split probe `test_split_guard_rules.sh` (both `make script-tests`) |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
@@ -167,7 +168,7 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
-| `codemods/` | dev-tool | Scripted, idempotent source migrations for the gateway migration (rustfs/backlog#2734); `s3_error_to_s3_types.py` moves s3s error-type paths onto `rustfs-s3-types` per crate closure and refuses the s3s edge allowlist | `make script-tests` (`--self-test`); usage in each script's docstring |
+| `codemods/` | dev-tool | Scripted, idempotent source migrations for the gateway migration (rustfs/backlog#2734); `s3_error_to_s3_types.py` moves s3s error-type paths onto `rustfs-s3-types` per crate closure and refuses the s3s edge allowlist; `split_bucket_usecase.py` splits `rustfs/src/app/bucket_usecase.rs` into one file per configuration family (preparatory refactor P2, rustfs/backlog#2765) and stops on any item its tables do not assign | `make script-tests` (`--self-test`); usage in each script's docstring |
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
 | `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml; manual-main-packages.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |

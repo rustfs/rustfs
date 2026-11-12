@@ -3089,7 +3089,11 @@ fn process_connection(
         let http_service = SwiftService::new(true, None, http_service);
         let http_service =
             EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
+        #[cfg(not(feature = "internode-transport"))]
         let http_service = InternodeRpcService::new(http_service);
+        #[cfg(feature = "internode-transport")]
+        let http_service =
+            InternodeRpcService::with_external_control(http_service, if is_console { None } else { server_ctx.peer_control() });
 
         let external_service = hybrid(http_service.clone(), rpc_service.clone());
         let internode_service = hybrid(http_service, rpc_service);
@@ -3614,6 +3618,9 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
 
 #[cfg(test)]
 mod tests {
+    #[path = "production_batch_lock_rpc_tests.rs"]
+    mod production_batch_lock_rpc_tests;
+
     use super::*;
     use crate::server::compress::RequestPathCategory;
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
@@ -6553,8 +6560,16 @@ mod tests {
                     .expect("fixture object");
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("receiver listener");
                 let address = listener.local_addr().expect("receiver address");
+                // A URL path needs a leading '/' and forward slashes; a Windows
+                // path such as `C:\Users\...` has neither, so it would run into the port.
+                let disk_path = root.path().to_string_lossy().replace('\\', "/");
+                let disk_path = if disk_path.starts_with('/') {
+                    disk_path
+                } else {
+                    format!("/{disk_path}")
+                };
                 let mut endpoint =
-                    Endpoint::try_from(format!("http://{address}{}", root.path().display()).as_str()).expect("receiver endpoint");
+                    Endpoint::try_from(format!("http://{address}{disk_path}").as_str()).expect("receiver endpoint");
                 endpoint.is_local = true;
                 endpoint.set_pool_index(0);
                 endpoint.set_set_index(0);

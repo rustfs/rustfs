@@ -53,9 +53,17 @@ pub(crate) mod s3 {
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     #[cfg(test)]
+    pub(crate) use s3s::access::S3Access;
+    #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    pub(crate) use s3s::dto;
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{
+        BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, Tag, Tagging,
+    };
     #[cfg(test)]
     pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
@@ -66,6 +74,8 @@ pub(crate) mod s3 {
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    #[cfg(test)]
+    pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
@@ -1817,17 +1827,35 @@ pub(crate) mod select_object {
     };
 }
 
+/// The storage items the owned/legacy authorization parity tests drive.
+#[cfg(test)]
+pub(crate) mod owned_parity {
+    pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
+        DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
+        ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+    };
+}
+
 pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-        OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, TableDataPlaneListAccess,
+        AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+    };
+    pub(crate) use crate::storage::storage_api::access_consumer::{
+        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+        PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization, TableDataPlaneListAccess,
         TableDataPlanePublicationGuards,
     };
     pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use crate::storage::storage_api::rpc_consumer::InstalledControlService;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};

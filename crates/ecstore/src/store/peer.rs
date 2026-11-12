@@ -527,6 +527,14 @@ pub async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> DiskResult<Option
     Ok(Some(disk))
 }
 
+/// Resolve the target from the verified listener's instance and acquire any background admission.
+#[cfg(feature = "internode-transport")]
+pub async fn external_rpc_disk(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<DiskStore> {
+    let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
+    admit_local_disk(ctx, &disk, id, false).await?;
+    Ok(disk)
+}
+
 pub async fn all_local_disk_path() -> Vec<String> {
     runtime_sources::local_disk_paths().await
 }
@@ -711,6 +719,26 @@ mod tests {
             cmd_line: "instance-ctx-disk-registry-test".to_string(),
             platform: "test".to_string(),
         }])
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_only_resolves_the_listeners_own_storage() {
+        let first = Arc::new(InstanceContext::new());
+        let second = Arc::new(InstanceContext::new());
+        let dir = tempfile::tempdir().expect("local disk");
+        let id = Uuid::new_v4();
+        let disk = target_disk(&first, dir.path(), id).await;
+        for reference in [disk.endpoint().to_string(), id.to_string()] {
+            let found = super::external_rpc_disk(&first, &reference)
+                .await
+                .expect("first instance owns the disk");
+            assert!(Arc::ptr_eq(&found, &disk));
+            assert!(matches!(
+                super::external_rpc_disk(&second, &reference).await,
+                Err(DiskError::DiskNotFound)
+            ));
+        }
     }
 
     async fn target_disk(ctx: &Arc<InstanceContext>, root: &std::path::Path, id: Uuid) -> DiskStore {

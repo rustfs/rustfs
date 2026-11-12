@@ -611,6 +611,11 @@ pub(crate) mod prepare_rename_test_hooks {
             .push_back(Box::new(hook));
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_hooks() -> bool {
+        AFTER_COMPONENT_OPENED.lock().values().any(|q| !q.is_empty())
+    }
+
     pub(crate) fn run_after_component_opened(path: &Path) {
         let hook = AFTER_COMPONENT_OPENED.lock().get_mut(path).and_then(VecDeque::pop_front);
         if let Some(hook) = hook {
@@ -4060,7 +4065,8 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
     if let Some(check) = precondition {
         check()?;
     }
-    let preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
@@ -4080,10 +4086,10 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
         {
             let pinned = preparation
                 .parent_guard
-                .as_ref()
-                .and_then(|guard| guard.last())
+                .as_mut()
+                .and_then(Vec::pop)
                 .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
-            let opened = std::fs::File::from(pinned.try_clone()?);
+            let opened = std::fs::File::from(pinned);
             fsync_directory_handle_std(parent, Some(&opened))?;
         }
         #[cfg(not(unix))]
@@ -4359,21 +4365,27 @@ fn open_existing_directory_below_base_std(
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{ResolveFlags, openat2};
-        use std::os::fd::AsFd;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let owned_base;
-        let base_fd = if base == publication_root.io_path.as_path() || base == publication_root.path.as_path() {
-            publication_root.directory.as_fd()
-        } else {
-            owned_base = std::os::fd::OwnedFd::from(publication_root.open_directory(base)?);
-            owned_base.as_fd()
-        };
-        let target = if relative.as_os_str().is_empty() {
+        let base_relative = publication_root.relative_path(base)?;
+        if linux_relative_path_has_invalid_component(base_relative) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = publication_root.relative_path(directory)?;
+        if linux_relative_path_has_invalid_component(target) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = if target.as_os_str().is_empty() {
             Path::new(".")
         } else {
-            relative
+            target
         };
-        match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match openat2(
+            &*publication_root.directory,
+            target,
+            flags,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
             Ok(leaf) => return Ok(vec![leaf]),
             Err(rustix::io::Errno::NOSYS) => {}
             Err(err) => return Err(err.into()),
@@ -5244,7 +5256,23 @@ fn prepare_rename_with_retry(
 ) -> io::Result<RenamePreparation> {
     let parent_guard = dst_file_path
         .parent()
-        .map(|parent| prepare_destination_parent_with_retry(parent, base_dir, publication_root))
+        .map(|parent| {
+            #[cfg(target_os = "linux")]
+            {
+                #[cfg(test)]
+                let has_hooks = prepare_rename_test_hooks::has_hooks();
+                #[cfg(not(test))]
+                let has_hooks = false;
+                if !has_hooks
+                    && existing_base_directory_suffix(parent, base_dir)
+                        .is_ok_and(|rel| rel.as_os_str().as_encoded_bytes().contains(&b'/'))
+                    && let Ok(guard) = open_existing_directory_below_base_std(parent, base_dir, publication_root)
+                {
+                    return Ok(guard);
+                }
+            }
+            prepare_destination_parent_with_retry(parent, base_dir, publication_root)
+        })
         .transpose()?;
     Ok(RenamePreparation {
         parent_guard,
@@ -7315,7 +7343,7 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || reparse_tag == IO_REPARSE_TAG_DEDUP
 }
 
-fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
+pub(crate) fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
     #[cfg(target_os = "linux")]
     {
         let relative = rustfs_utils::path::unix_normalized_path_strip_prefix(dir_path, base_dir).ok_or_else(|| {
@@ -7478,16 +7506,45 @@ pub(crate) fn pin_multipart_source_directory(
 
 fn same_parent_commit_guard(
     parent: &Path,
+    create_base: Option<&Path>,
     base: &Path,
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
 ) -> io::Result<RenameCommitGuard> {
     #[cfg(target_os = "linux")]
-    if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+    let same_dir = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
         let dir = &directory_guard.directories.source;
+        Some((
+            directory_guard.directories.root.clone(),
+            LinuxCommitDirectory {
+                file: Arc::clone(&dir.file),
+                device: dir.device,
+                inode: dir.inode,
+            },
+        ))
+    } else if let Some(fd) = leaf_fd {
+        existing_base_directory_suffix(parent, base)?;
+        Some((publication_root.clone(), LinuxCommitDirectory::new(std::fs::File::from(fd))?))
+    } else if let Some(staging_base) = create_base {
+        existing_base_directory_suffix(parent, base)?;
+        let file = match publication_root.open_directory(parent) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut parents = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+                std::fs::File::from(parents.pop().ok_or_else(|| io::Error::other("missing directory guard"))?)
+            }
+            Err(err) => return Err(err),
+        };
+        Some((publication_root.clone(), LinuxCommitDirectory::new(file)?))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if let Some((root, dir)) = same_dir {
         return Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
-                root: directory_guard.directories.root.clone(),
+                root,
                 source_path: parent.to_path_buf(),
                 destination_path: parent.to_path_buf(),
                 source: LinuxCommitDirectory {
@@ -7495,18 +7552,21 @@ fn same_parent_commit_guard(
                     device: dir.device,
                     inode: dir.inode,
                 },
-                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                }),
+                destination: std::sync::OnceLock::from(dir),
                 destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: base.to_path_buf(),
             }),
         });
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = leaf_fd;
     #[cfg(not(target_os = "linux"))]
-    let _ = directory_guard;
+    {
+        if let Some(staging_base) = create_base {
+            let _ = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+        }
+        let _ = directory_guard;
+    }
     prepare_rename_commit_guard(parent, parent, base, publication_root)
 }
 
@@ -7518,7 +7578,54 @@ pub(crate) fn replace_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    replace_multipart_source_metadata_with_guard(path, bytes, base, publication_root, None)
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_creating_parent(
+    path: &Path,
+    bytes: &[u8],
+    create_base: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        Some(create_base),
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_with_leaf_fd(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        leaf_fd,
+    )
 }
 
 pub(crate) fn replace_multipart_source_metadata_with_guard(
@@ -7528,10 +7635,43 @@ pub(crate) fn replace_multipart_source_metadata_with_guard(
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
 ) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+fn replace_multipart_source_metadata_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_base: Option<&Path>,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
     #[cfg(not(target_os = "linux"))]
-    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let _pinned = if create_base.is_none() {
+        Some(pin_multipart_source_directory(parent, base, publication_root)?)
+    } else {
+        None
+    };
+    let guard = same_parent_commit_guard(
+        parent,
+        create_base,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        leaf_fd,
+    )?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
     let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
     prepared.write_all(bytes, true)?;
@@ -7708,7 +7848,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root, None)
 }
 
 pub(crate) fn sync_multipart_owned_record_parents_options(
@@ -7718,6 +7858,7 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
     sync_source_root: bool,
     base: &Path,
     publication_root: &PublicationRoot,
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))] mut pinned_parents: Option<ExistingBaseDirectoryGuard>,
 ) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
@@ -7729,6 +7870,9 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid native record parent depth"));
+    }
+    if depth == 0 && !include_leaf {
+        return Ok(());
     }
     let mut directory = if include_leaf {
         record_parent
@@ -7744,16 +7888,20 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
         if directory == source && !sync_source_root {
             return Ok(());
         }
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
-        {
+        if let Some(fd) = pinned_parents.as_mut().and_then(Vec::pop) {
+            let opened = std::fs::File::from(fd);
+            fsync_directory_handle_std(directory, Some(&opened))?;
+        } else {
+            let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
             let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty native directory guard"))?);
             fsync_directory_handle_std(directory, Some(&opened))?;
         }
         #[cfg(not(unix))]
-        fsync_dir_std(directory)?;
-        drop(pinned);
+        {
+            let _pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+            fsync_dir_std(directory)?;
+        }
         if directory == source {
             return Ok(());
         }
@@ -7782,7 +7930,15 @@ pub(crate) fn install_multipart_prepared_head(
     }
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let guard = same_parent_commit_guard(
+        parent,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;

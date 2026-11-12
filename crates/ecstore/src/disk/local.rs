@@ -4354,7 +4354,40 @@ fn open_lazy_local_file_std(
     Ok(file)
 }
 
-struct LazyLocalFileWriter {
+fn write_all_prefix_and_body_std(file: &mut std::fs::File, prefix: &[u8], body: &[u8]) -> std::io::Result<()> {
+    if prefix.is_empty() {
+        return std::io::Write::write_all(file, body);
+    }
+    let mut prefix_off = 0;
+    let mut body_off = 0;
+    while prefix_off < prefix.len() {
+        let slices = [
+            std::io::IoSlice::new(&prefix[prefix_off..]),
+            std::io::IoSlice::new(&body[body_off..]),
+        ];
+        let n = match std::io::Write::write_vectored(file, &slices) {
+            Ok(n) => n,
+            Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write whole buffer"));
+        }
+        let prefix_rem = prefix.len() - prefix_off;
+        if n < prefix_rem {
+            prefix_off += n;
+        } else {
+            prefix_off = prefix.len();
+            body_off += n - prefix_rem;
+        }
+    }
+    if body_off < body.len() {
+        std::io::Write::write_all(file, &body[body_off..])?;
+    }
+    Ok(())
+}
+
+pub(crate) struct LazyLocalFileWriter {
     file_path: PathBuf,
     volume_dir: PathBuf,
     reclaim_len: usize,
@@ -4363,12 +4396,15 @@ struct LazyLocalFileWriter {
     mark_dir_presynced: bool,
     parent_exists: bool,
     bytes_written: usize,
+    last_integrity_digest: Option<[u8; 32]>,
     state: LazyLocalFileWriterState,
 }
 
+type LazyWriteResult = std::io::Result<(Option<std::fs::File>, usize, Option<[u8; 32]>)>;
+
 enum LazyLocalFileWriterState {
     Unopened,
-    Writing(tokio::task::JoinHandle<std::io::Result<(Option<std::fs::File>, usize)>>),
+    Writing(tokio::task::JoinHandle<LazyWriteResult>),
     Open(std::fs::File),
     Closing(tokio::task::JoinHandle<std::io::Result<()>>),
     Closed,
@@ -4393,67 +4429,114 @@ impl LazyLocalFileWriter {
             mark_dir_presynced,
             parent_exists,
             bytes_written: 0,
+            last_integrity_digest: None,
             state: LazyLocalFileWriterState::Unopened,
         }
     }
 
-    fn start_write_payload(&mut self, payload: Vec<u8>) {
-        let len = payload.len();
-        let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(len) >= self.reclaim_len;
-        let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
+    fn start_write_payload(
+        &mut self,
+        payload: Bytes,
+        hash_algo: Option<rustfs_utils::HashAlgorithm>,
+        integrity_spec: Option<(rustfs_filemeta::shard_integrity::PartIntegrity, u32, usize)>,
+    ) {
+        let hash_len = hash_algo.as_ref().map_or(0, rustfs_utils::HashAlgorithm::size);
+        let wire_len = hash_len.saturating_add(payload.len());
+        let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(wire_len) >= self.reclaim_len;
+        let reclaim_len = self.bytes_written.saturating_add(wire_len).max(self.reclaim_len);
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
         let sync_on_close = self.sync_on_close;
         let mark_dir_presynced = self.mark_dir_presynced;
         let parent_exists = self.parent_exists;
+        self.last_integrity_digest = None;
+        let write_and_finish = move |mut file: std::fs::File, file_path: PathBuf| {
+            let digest = match integrity_spec {
+                Some((part, stripe, coding_index)) => {
+                    Some(part.shard_digest(stripe, coding_index, &payload).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "shard integrity verification failed")
+                    })?)
+                }
+                None => None,
+            };
+            if hash_len > 0
+                && let Some(algo) = hash_algo
+            {
+                let hash = algo.hash_encode(&payload);
+                if hash.as_ref().is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
+                }
+                write_all_prefix_and_body_std(&mut file, hash.as_ref(), &payload).map_err(to_file_error)?;
+            } else {
+                std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
+            }
+            if close_after {
+                if sync_on_close {
+                    file.sync_data().map_err(to_file_error)?;
+                }
+                reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
+                drop(file);
+                if sync_on_close {
+                    if mark_dir_presynced && let Some(parent) = file_path.parent() {
+                        mark_presynced_tmp_data_dir(parent);
+                    }
+                    mark_presynced_tmp_file(file_path);
+                }
+                Ok((None, wire_len, digest))
+            } else {
+                Ok((Some(file), wire_len, digest))
+            }
+        };
         match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
             LazyLocalFileWriterState::Unopened => {
                 let file_path = self.file_path.clone();
                 let volume_dir = self.volume_dir.clone();
                 self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
-                    let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown, parent_exists)?;
-                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
-                    if close_after {
-                        if sync_on_close {
-                            file.sync_data().map_err(to_file_error)?;
-                        }
-                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
-                        drop(file);
-                        if sync_on_close {
-                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent);
-                            }
-                            mark_presynced_tmp_file(file_path);
-                        }
-                        Ok((None, len))
-                    } else {
-                        Ok((Some(file), len))
-                    }
+                    let file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown, parent_exists)?;
+                    write_and_finish(file, file_path)
                 }));
             }
-            LazyLocalFileWriterState::Open(mut file) => {
+            LazyLocalFileWriterState::Open(file) => {
                 let file_path = self.file_path.clone();
-                self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
-                    std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
-                    if close_after {
-                        if sync_on_close {
-                            file.sync_data().map_err(to_file_error)?;
-                        }
-                        reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
-                        drop(file);
-                        if sync_on_close {
-                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent);
-                            }
-                            mark_presynced_tmp_file(file_path);
-                        }
-                        Ok((None, len))
-                    } else {
-                        Ok((Some(file), len))
-                    }
-                }));
+                self.state =
+                    LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || write_and_finish(file, file_path)));
             }
             other => self.state = other,
         }
+    }
+
+    pub(crate) async fn write_all_bytes(&mut self, payload: Bytes) -> std::io::Result<()> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::future::poll_fn(|cx| self.poll_in_flight_write(cx)).await?;
+        }
+        if payload.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local file writer is already closed"));
+        }
+        self.start_write_payload(payload, None, None);
+        std::future::poll_fn(|cx| self.poll_in_flight_write(cx)).await.map(|_| ())
+    }
+
+    pub(crate) async fn write_bitrot_shard(
+        &mut self,
+        shard: Bytes,
+        hash_algo: rustfs_utils::HashAlgorithm,
+        integrity_spec: Option<(rustfs_filemeta::shard_integrity::PartIntegrity, u32, usize)>,
+    ) -> std::io::Result<(usize, Option<[u8; 32]>)> {
+        if matches!(self.state, LazyLocalFileWriterState::Writing(_)) {
+            std::future::poll_fn(|cx| self.poll_in_flight_write(cx)).await?;
+        }
+        let shard_len = shard.len();
+        if shard_len == 0 {
+            return Ok((0, None));
+        }
+        if matches!(self.state, LazyLocalFileWriterState::Closed | LazyLocalFileWriterState::Closing(_)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "local file writer is already closed"));
+        }
+        self.start_write_payload(shard, Some(hash_algo), integrity_spec);
+        std::future::poll_fn(|cx| self.poll_in_flight_write(cx)).await?;
+        Ok((shard_len, self.last_integrity_digest.take()))
     }
 
     fn poll_in_flight_write(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<usize>> {
@@ -4470,8 +4553,9 @@ impl LazyLocalFileWriter {
                 self.state = LazyLocalFileWriterState::Closed;
                 std::task::Poll::Ready(Err(err))
             }
-            std::task::Poll::Ready(Ok(Ok((maybe_file, written)))) => {
+            std::task::Poll::Ready(Ok(Ok((maybe_file, written, digest)))) => {
                 self.bytes_written = self.bytes_written.saturating_add(written);
+                self.last_integrity_digest = digest;
                 self.state = maybe_file.map_or(LazyLocalFileWriterState::Closed, LazyLocalFileWriterState::Open);
                 std::task::Poll::Ready(Ok(written))
             }
@@ -4497,7 +4581,7 @@ impl AsyncWrite for LazyLocalFileWriter {
                 "local file writer is already closed",
             )));
         }
-        self.start_write_payload(buf.to_vec());
+        self.start_write_payload(Bytes::copy_from_slice(buf), None, None);
         self.poll_in_flight_write(cx)
     }
 
@@ -4523,7 +4607,7 @@ impl AsyncWrite for LazyLocalFileWriter {
         for slice in bufs {
             payload.extend_from_slice(slice);
         }
-        self.start_write_payload(payload);
+        self.start_write_payload(Bytes::from(payload), None, None);
         self.poll_in_flight_write(cx)
     }
 
@@ -38508,5 +38592,46 @@ mod test {
                 .is_err(),
             "cached child under renamed-from directory must be invalidated"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_store_create_file_downcasts_and_writes_bitrot_shard_with_integrity() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk_store = crate::disk::new_disk(&endpoint, &crate::disk::DiskOption::default())
+            .await
+            .expect("disk store");
+        let volume = "bitrot-fast-path-test";
+        disk_store.make_volume(volume).await.expect("make_volume");
+
+        let payload = Bytes::from(vec![0x5Au8; 4096]);
+        let algo = rustfs_utils::HashAlgorithm::HighwayHash256S;
+        let wire_len = (algo.size() + payload.len()) as i64;
+        let mut writer = disk_store
+            .create_file(volume, volume, "obj/part.1", wire_len)
+            .await
+            .expect("create_file");
+        let local = crate::disk::as_lazy_local_file_writer_mut(&mut *writer)
+            .expect("SlowDiskWriter wrapping LazyLocalFileWriter must downcast");
+
+        let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(4, 4, 16384, false).expect("layout");
+        let part = rustfs_filemeta::shard_integrity::PartIntegrity::new(layout, 1).expect("part");
+        let expected_digest = part.shard_digest(0, 2, &payload).expect("expected digest");
+
+        let (written, digest) = local
+            .write_bitrot_shard(payload.clone(), algo.clone(), Some((part, 0, 2)))
+            .await
+            .expect("write_bitrot_shard");
+        writer.shutdown().await.expect("shutdown");
+
+        assert_eq!(written, payload.len());
+        assert_eq!(digest, Some(expected_digest));
+
+        let on_disk = disk_store.read_all(volume, "obj/part.1").await.expect("read_all");
+        let expected_hash = algo.hash_encode(&payload);
+        assert_eq!(&on_disk[..expected_hash.as_ref().len()], expected_hash.as_ref());
+        assert_eq!(&on_disk[expected_hash.as_ref().len()..], payload.as_ref());
     }
 }

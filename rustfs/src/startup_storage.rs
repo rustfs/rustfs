@@ -479,6 +479,11 @@ mod tests {
         vec![format!("{root}/pool-a/disk{{1...4}}"), format!("{root}/pool-b/disk{{1...2}}")]
     }
 
+    // The pool directories are never created, and this test only covers
+    // storage-class validation order. Unix leaves missing paths out of the
+    // physical-disk independence check, but Windows resolves them to their
+    // volume, so every disk here would count as one shared device. The callers
+    // therefore bypass that check, which has its own tests in `layout::endpoints`.
     async fn assert_invalid_storage_class_fails_before_foundation_mutation(embedded: bool) {
         let temp_dir = tempfile::tempdir().expect("create topology root");
         let volumes = heterogeneous_volume_args(&temp_dir);
@@ -511,6 +516,7 @@ mod tests {
                 (OPTIMIZE_ENV, None),
                 (INLINE_BLOCK_ENV, None),
                 (ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, None),
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
             ],
             assert_invalid_storage_class_fails_before_foundation_mutation(false),
         )
@@ -527,6 +533,7 @@ mod tests {
                 (OPTIMIZE_ENV, None),
                 (INLINE_BLOCK_ENV, None),
                 (ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, None),
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true")),
             ],
             assert_invalid_storage_class_fails_before_foundation_mutation(true),
         )

@@ -945,6 +945,9 @@ pub struct GenerallyLockResult {
     /// Per-ID result for unlock batches.
     #[prost(enumeration = "LockReleaseStatus", tag = "4")]
     pub release_status: i32,
+    /// Only populated by lock batches.
+    #[prost(enumeration = "LockAcquireStatus", tag = "5")]
+    pub acquire_status: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BatchGenerallyLockResponse {
@@ -1912,6 +1915,36 @@ impl LockReleaseStatus {
             "LOCK_RELEASE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
             "LOCK_RELEASE_STATUS_RELEASED" => Some(Self::Released),
             "LOCK_RELEASE_STATUS_ALREADY_ABSENT" => Some(Self::AlreadyAbsent),
+            _ => None,
+        }
+    }
+}
+/// Only explicit no-grant results permit a caller to retry without grant cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LockAcquireStatus {
+    Unspecified = 0,
+    RetryableNoGrant = 1,
+    RejectedNoGrant = 2,
+}
+impl LockAcquireStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOCK_ACQUIRE_STATUS_UNSPECIFIED",
+            Self::RetryableNoGrant => "LOCK_ACQUIRE_STATUS_RETRYABLE_NO_GRANT",
+            Self::RejectedNoGrant => "LOCK_ACQUIRE_STATUS_REJECTED_NO_GRANT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOCK_ACQUIRE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOCK_ACQUIRE_STATUS_RETRYABLE_NO_GRANT" => Some(Self::RetryableNoGrant),
+            "LOCK_ACQUIRE_STATUS_REJECTED_NO_GRANT" => Some(Self::RejectedNoGrant),
             _ => None,
         }
     }
