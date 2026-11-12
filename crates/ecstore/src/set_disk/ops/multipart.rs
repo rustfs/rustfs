@@ -11560,7 +11560,7 @@ mod tests {
                 break;
             }
             key_marker = page.next_key_marker.clone();
-            upload_id_marker = page.next_upload_id_marker.clone();
+            upload_id_marker = page.next_upload_id_marker;
             assert!(key_marker.is_some(), "a truncated page must carry a next key marker");
             assert!(upload_id_marker.is_some(), "a truncated upload page must carry a next upload marker");
         }

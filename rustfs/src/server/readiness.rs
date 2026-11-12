@@ -177,7 +177,7 @@ fn readiness_pending_dependency(stage: rustfs_common::SystemStage) -> &'static s
 fn service_not_ready_response(stage: rustfs_common::SystemStage) -> Response<BoxBody> {
     let pending = readiness_pending_dependency(stage);
     let body: BoxBody = Full::new(Bytes::from(format!("Service not ready: waiting for {pending}")))
-        .map_err(|e| -> BoxError { Box::new(e) })
+        .map_err(|never| match never {})
         .boxed_unsync();
 
     let mut response = Response::new(body);

@@ -137,9 +137,7 @@ fn ssec_requires_tls_response(request_id: Option<&str>) -> Response<BoxBody> {
          <Message>Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.</Message>\
          {request_id_xml}</Error>"
     );
-    let body: BoxBody = Full::new(Bytes::from(body))
-        .map_err(|e| -> BoxError { Box::new(e) })
-        .boxed_unsync();
+    let body: BoxBody = Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync();
 
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::BAD_REQUEST;

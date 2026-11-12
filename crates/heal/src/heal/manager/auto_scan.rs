@@ -543,7 +543,7 @@ impl HealManager {
                                 .filter_map(|target| local_endpoints.get(target).cloned())
                                 .collect::<Vec<_>>();
                             if targets.len() != state.replacement_targets.len() {
-                                deferred_recovery_sets.insert(state.set_disk_id.clone());
+                                deferred_recovery_sets.insert(state.set_disk_id);
                                 continue;
                             }
                             // A pending handoff may resolve the predecessor to

@@ -93,7 +93,7 @@ use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -883,6 +883,8 @@ async fn retire_http12_children(
     unverified_tls_reloader: bool,
     active_connections: usize,
 ) -> Http12ShutdownOutcome {
+    let started = tokio::time::Instant::now();
+    let graceful_complete = AtomicBool::new(false);
     #[cfg(test)]
     if let Some(control) = tasks.test_control() {
         *control.deadline.lock() = Some(deadline);
@@ -890,6 +892,16 @@ async fn retire_http12_children(
     }
     let drain = async {
         graceful.await;
+        graceful_complete.store(true, Ordering::Relaxed);
+        debug!(
+            event = EVENT_HTTP_CONNECTION_DRAIN,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "graceful_retired",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            tracked_futures = tasks.0.tracker.len(),
+            "HTTP graceful shutdown retired"
+        );
         #[cfg(test)]
         if let Some(control) = tasks.test_control() {
             control.graceful_finished.cancel();
@@ -905,6 +917,16 @@ async fn retire_http12_children(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_TRANSPORT,
             state = "timeout",
+            phase = if observed.is_ok() {
+                "completion_observed"
+            } else if graceful_complete.load(Ordering::Relaxed) {
+                "child_join"
+            } else {
+                "graceful"
+            },
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            budget_ms = deadline.saturating_duration_since(started).as_secs_f64() * 1000.0,
+            tracked_futures = tasks.0.tracker.len(),
             active_connections,
             timeout_secs = 10,
             "HTTP connection drain timed out"
@@ -914,6 +936,16 @@ async fn retire_http12_children(
         Ok(result) => result,
         Err(_) => drain.as_mut().await,
     };
+    debug!(
+        event = EVENT_HTTP_CONNECTION_DRAIN,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        state = "children_retired",
+        deadline_missed,
+        child_failures,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "HTTP child tasks retired"
+    );
     Http12ShutdownOutcome {
         deadline_missed,
         first_child_error,
@@ -947,15 +979,38 @@ pub(super) async fn retire_tls_reloader(
     outcome: &mut Http12ShutdownOutcome,
     deadline: tokio::time::Instant,
 ) {
+    let started = tokio::time::Instant::now();
     let stop = task.wait_stopped();
     tokio::pin!(stop);
     let observed = tokio::time::timeout_at(deadline, stop.as_mut()).await;
-    outcome.deadline_missed |= observed.is_err() || tokio::time::Instant::now() >= deadline;
+    let deadline_missed = observed.is_err() || tokio::time::Instant::now() >= deadline;
+    outcome.deadline_missed |= deadline_missed;
+    if deadline_missed {
+        warn!(
+            event = EVENT_HTTP_CONNECTION_DRAIN,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "timeout",
+            phase = "tls_reloader",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            budget_ms = deadline.saturating_duration_since(started).as_secs_f64() * 1000.0,
+            "TLS reloader retirement timed out"
+        );
+    }
     outcome.unverified_tls_reloader = true;
     outcome.tls_reloader = Some(match observed {
         Ok(receipt) => receipt,
         Err(_) => stop.as_mut().await,
     });
+    debug!(
+        event = EVENT_HTTP_CONNECTION_DRAIN,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        state = "tls_reloader_retired",
+        deadline_missed,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "TLS reloader retired"
+    );
 }
 
 #[cfg(test)]
@@ -971,6 +1026,7 @@ pub(crate) async fn test_retire_http12_scope(
 #[cfg(test)]
 #[derive(Default)]
 struct HttpLeafTestControl {
+    tls_handshake_started: tokio_util::sync::CancellationToken,
     body_entered: tokio_util::sync::CancellationToken,
     body_release: tokio_util::sync::CancellationToken,
     drain_entered: tokio_util::sync::CancellationToken,
@@ -2627,6 +2683,7 @@ async fn start_http_server_inner(
 
         let http_server = Arc::new(conn_builder);
         let graceful = GracefulShutdown::new();
+        let tls_handshake_stop = tokio_util::sync::CancellationToken::new();
         debug!(
             event = EVENT_HTTP_ACCEPT_LOOP_STATE,
             component = LOG_COMPONENT_SERVER,
@@ -2795,6 +2852,7 @@ async fn start_http_server_inner(
                 rate_limit_layer: api_rate_limit_layer.clone(),
                 server_ctx: Arc::clone(&server_ctx),
                 tls_handshake_timeout: Duration::from_secs(http1_header_read_timeout),
+                tls_handshake_stop: tls_handshake_stop.clone(),
                 request_body_idle_timeout: http_request_body_read_timeout,
             };
 
@@ -2833,6 +2891,9 @@ async fn start_http_server_inner(
             );
         }
         drop(listener);
+        // Unestablished TLS peers cannot receive HTTP graceful shutdown yet, but
+        // already hold a watcher. Retire only that pre-request phase immediately.
+        tls_handshake_stop.cancel();
         drop(http_server);
         #[cfg(feature = "http3")]
         let unverified_h3 = http3_server.is_some();
@@ -2909,6 +2970,7 @@ struct ConnectionContext {
     /// the existing slow-client bound for the pre-request phase, and is pre-computed with the
     /// other transport parameters to avoid a per-connection env read.
     tls_handshake_timeout: Duration,
+    tls_handshake_stop: tokio_util::sync::CancellationToken,
     /// Inter-chunk timeout used while discarding a raw HTTP/1 request body
     /// after an S3 operation has already produced its response.
     request_body_idle_timeout: Duration,
@@ -3035,6 +3097,7 @@ fn process_connection(
             rate_limit_layer,
             server_ctx,
             tls_handshake_timeout,
+            tls_handshake_stop,
             request_body_idle_timeout,
         } = context;
 
@@ -3260,7 +3323,16 @@ fn process_connection(
                 .ok()
                 .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
             let acceptor = holder.get();
-            match accept_tls_with_deadline(&acceptor, socket, tls_handshake_timeout).await {
+            #[cfg(test)]
+            if let Some(control) = task_owner.test_control() {
+                control.tls_handshake_started.cancel();
+            }
+            let accepted = tokio::select! {
+                biased;
+                () = tls_handshake_stop.cancelled() => return,
+                accepted = accept_tls_with_deadline(&acceptor, socket, tls_handshake_timeout) => accepted,
+            };
+            match accepted {
                 Ok(tls_socket) => {
                     trace!("TLS handshake successful");
                     let stream = TokioIo::new(tls_socket);
@@ -4274,6 +4346,113 @@ mod tests {
         start_http_server_inner(&config, readiness, ServerContextSlot::new(), Some(control))
             .await
             .expect("actual production HTTP listener")
+    }
+
+    async fn http_tls_leaf_fixture(control: Arc<HttpLeafTestControl>) -> (ShutdownHandle, SocketAddr, tempfile::TempDir) {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+        let directory = tempfile::TempDir::new().expect("TLS fixture directory");
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("TLS fixture certificate");
+        std::fs::write(directory.path().join(rustfs_config::RUSTFS_TLS_CERT), pair.cert.pem())
+            .expect("TLS fixture certificate file");
+        std::fs::write(directory.path().join(rustfs_config::RUSTFS_TLS_KEY), pair.signing_key.serialize_pem())
+            .expect("TLS fixture key file");
+        let mut config = config::Config::new("127.0.0.1:0", Vec::new());
+        config.console_enable = false;
+        config.tls_path = Some(directory.path().to_str().expect("TLS fixture path").to_owned());
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        let (shutdown, address) = start_http_server_inner(&config, readiness, ServerContextSlot::new(), Some(control))
+            .await
+            .expect("actual production TLS listener");
+        (shutdown, address, directory)
+    }
+
+    #[tokio::test]
+    async fn http12_tls_stalled_handshake_retires_before_shutdown_deadline() {
+        let control = Arc::new(HttpLeafTestControl::default());
+        let (mut shutdown, address, _directory) = http_tls_leaf_fixture(control.clone()).await;
+        let socket = TcpStream::connect(address).await.expect("open TCP without a ClientHello");
+        let entered = tokio::time::timeout(Duration::from_secs(5), control.tls_handshake_started.cancelled()).await;
+        shutdown.signal();
+        let timely = tokio::time::timeout(Duration::from_secs(1), shutdown.wait_checked()).await;
+        // Always release the peer and join the original owner, including on a regression.
+        drop(socket);
+        let (timely, joined) = match timely {
+            Ok(joined) => (true, joined),
+            Err(_) => (false, shutdown.wait_checked().await),
+        };
+        entered.expect("accepted TLS handshake was actually polled");
+        joined.expect("original TLS owner remains joined");
+        assert!(timely, "an unestablished TLS peer must not hold the HTTP drain");
+        assert!(!control.body_entered.is_cancelled(), "no HTTP request reached a handler");
+    }
+
+    #[tokio::test]
+    async fn http12_tls_established_h2_response_keeps_graceful_drain() {
+        use rustls::pki_types::pem::PemObject;
+
+        let control = Arc::new(HttpLeafTestControl::default());
+        let (mut shutdown, address, directory) = http_tls_leaf_fixture(control.clone()).await;
+        let mut client = None;
+        let observations = async {
+            let mut roots = rustls::RootCertStore::empty();
+            let certificate =
+                rustls::pki_types::CertificateDer::from_pem_file(directory.path().join(rustfs_config::RUSTFS_TLS_CERT))
+                    .map_err(Error::other)?;
+            roots.add(certificate).map_err(Error::other)?;
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let stream = connector
+                .connect("localhost".try_into().map_err(Error::other)?, TcpStream::connect(address).await?)
+                .await?;
+            let (mut sender, connection) =
+                hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), TokioIo::new(stream))
+                    .await
+                    .map_err(Error::other)?;
+            client = Some(tokio::spawn(connection));
+            let request = HttpRequest::builder()
+                .uri("https://localhost/__http_leaf_hold")
+                .body(Empty::new())
+                .map_err(Error::other)?;
+            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                .await
+                .map_err(Error::other)?
+                .map_err(Error::other)?;
+            tokio::time::timeout(Duration::from_secs(5), control.body_entered.cancelled())
+                .await
+                .map_err(Error::other)?;
+            shutdown.signal();
+            let held = tokio::time::timeout(Duration::from_millis(100), shutdown.wait_checked())
+                .await
+                .is_err();
+            control.body_release.cancel();
+            tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+                .await
+                .map_err(Error::other)?
+                .map_err(Error::other)?;
+            drop(sender);
+            Ok::<_, Error>(held)
+        }
+        .await;
+        control.body_release.cancel();
+        shutdown.signal();
+        let joined = shutdown.wait_checked().await;
+        if let Some(client) = client {
+            client
+                .await
+                .expect("original TLS client task joined")
+                .expect("TLS H2 completed");
+        }
+        assert!(
+            observations.expect("verified TLS H2 observations"),
+            "established response must retain its graceful owner"
+        );
+        joined.expect("TLS response completed before the original shutdown deadline");
     }
 
     #[cfg(feature = "http3")]

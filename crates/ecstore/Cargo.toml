@@ -29,6 +29,10 @@ documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
 [lints]
 workspace = true
 
+[[example]]
+name = "internode_rpc_bench"
+test = true
+
 [features]
 internode-transport = []
 default = []

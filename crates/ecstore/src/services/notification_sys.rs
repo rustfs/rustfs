@@ -3168,7 +3168,7 @@ impl NotificationSys {
                     return Err(Error::other("scanner scoped dirty usage capability requires scoped acknowledgements"));
                 }
             };
-            if by_host.insert(host.clone(), acknowledgement).is_some() {
+            if by_host.insert(host, acknowledgement).is_some() {
                 return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
@@ -3218,7 +3218,7 @@ impl NotificationSys {
                 ScannerDirtyUsageAcknowledgement::Generation { host, .. }
                 | ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
             };
-            if by_host.insert(host.clone(), acknowledgement).is_some() {
+            if by_host.insert(host, acknowledgement).is_some() {
                 return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
