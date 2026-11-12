@@ -4366,15 +4366,19 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
 
-        // Pause eviction at the common map, then attempt publication. Publishing a replacement
-        // before the earlier eviction finishes must never leave that replacement unbound.
-        let connections = rustfs_common::GLOBAL_CONN_MAP.read().await;
+        // Pause eviction on generation metadata. It must retain the cached channel until it
+        // owns that metadata, then allow the queued replacement to publish a matching pair.
+        let generations = TLS_GENERATION_CACHE.read().await;
         let mut eviction = Box::pin(evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug));
         let mut replacement = Box::pin(cache_dialed_channel(addr, addr, &channel, Some(generation)));
         let mut context = Context::from_waker(Waker::noop());
         assert!(eviction.as_mut().poll(&mut context).is_pending());
         assert!(replacement.as_mut().poll(&mut context).is_pending());
-        drop(connections);
+        assert!(
+            rustfs_common::has_cached_connection(addr).await,
+            "eviction must acquire generation metadata before removing the channel"
+        );
+        drop(generations);
         let (_, published) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(eviction, replacement) })
             .await
             .expect("eviction and replacement must make progress");
