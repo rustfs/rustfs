@@ -52,9 +52,9 @@ use super::replication_resync_boundary::{
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX};
 use super::replication_storage_boundary::{
-    AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions,
-    ObjectToDelete, ReplicationObjectIO, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode, ReplicationStorage,
-    StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
+    EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
+    ReplicationObjectIO, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode, ReplicationStorage,
+    StorageObjectInfoOrErr, WalkOptions,
 };
 #[cfg(test)]
 use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
@@ -89,9 +89,9 @@ use rmp_serde;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_TAGGING_DIRECTIVE,
-    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX, has_internal_suffix,
-    insert_str, replication_target_versions,
+    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, SUFFIX_REPLICATION_RESET,
+    SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX,
+    has_internal_suffix, insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 use std::collections::{HashMap, HashSet};
@@ -4116,6 +4116,17 @@ fn replication_status_writeback_mode(state_update_needed: bool) -> ReplicationSt
     }
 }
 
+/// Source-object metadata a replication worker publishes with its terminal
+/// status.
+#[derive(Clone, Copy, Default)]
+struct ReplicationStatusWriteback<'a> {
+    replication_internal: Option<&'a String>,
+    /// `(arn, version id the target assigned)` for targets minting their own ids.
+    target_version_ledger: &'a [(String, String)],
+    /// `(arn, resync stamp)` for targets this attempt resynced.
+    resync_stamps: &'a [(String, String)],
+}
+
 /// Publish a worker's status with a storage-enforced compare-and-set token.
 /// `put_object_metadata` checks the token while it owns the object write lock,
 /// avoiding both a read/write race and any need to hold a hot object lock
@@ -4123,12 +4134,16 @@ fn replication_status_writeback_mode(state_update_needed: bool) -> ReplicationSt
 fn replication_status_writeback_options(
     roi: &ReplicateObjectInfo,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
-    new_replication_internal: Option<&String>,
-    target_version_ledger: &[(String, String)],
+    writeback: ReplicationStatusWriteback<'_>,
     mode: ReplicationStatusWritebackMode,
 ) -> ObjectOptions {
+    let ReplicationStatusWriteback {
+        replication_internal,
+        target_version_ledger,
+        resync_stamps,
+    } = writeback;
     let mut eval_metadata = HashMap::new();
-    if let Some(status) = new_replication_internal {
+    if let Some(status) = replication_internal {
         insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, status.clone());
     }
     // One durable key per drifting target: the version id it assigned to this
@@ -4140,6 +4155,12 @@ fn replication_status_writeback_options(
             &format!("{SUFFIX_REPLICATION_TARGET_VERSION_ARN_PREFIX}{arn}"),
             assigned_version_id.clone(),
         );
+    }
+    // The per-target existing-object resync stamp. Without it the object keeps
+    // answering "not yet resynced" for the target's reset id, and the scanner
+    // re-queues it on every cycle.
+    for (arn, stamp) in resync_stamps {
+        insert_str(&mut eval_metadata, &format!("{SUFFIX_REPLICATION_RESET_ARN_PREFIX}{arn}"), stamp.clone());
     }
     let mut write_opts = ObjectOptions {
         version_id: roi.version_id.map(|version_id| version_id.to_string()),
@@ -4162,13 +4183,11 @@ async fn persist_replication_state_if_current<S: ReplicationStorage>(
     roi: &ReplicateObjectInfo,
     storage: &Arc<S>,
     replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
-    new_replication_internal: Option<&String>,
-    target_version_ledger: &[(String, String)],
+    writeback: ReplicationStatusWriteback<'_>,
     mode: ReplicationStatusWritebackMode,
     object_info: &mut ObjectInfo,
 ) -> Result<ReplicationStatePersistOutcome> {
-    let write_opts =
-        replication_status_writeback_options(roi, replication_lock_guard, new_replication_internal, target_version_ledger, mode);
+    let write_opts = replication_status_writeback_options(roi, replication_lock_guard, writeback, mode);
     match storage.put_object_metadata(&roi.bucket, &roi.name, &write_opts).await {
         Ok(updated) => {
             *object_info = updated;
@@ -4334,6 +4353,12 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         .filter(|target| !target.is_empty())
         .filter_map(|target| Some((target.arn.clone(), target.target_version_id.clone()?)))
         .collect();
+    let resync_stamps: Vec<(String, String)> = rinfos
+        .targets
+        .iter()
+        .filter(|target| !target.is_empty() && !target.resync_timestamp.is_empty())
+        .map(|target| (target.arn.clone(), target.resync_timestamp.clone()))
+        .collect();
     let state_update_needed = roi.replication_status_internal != new_replication_internal
         || rinfos.replication_resynced()
         || !target_version_ledger.is_empty();
@@ -4343,8 +4368,11 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         &roi,
         &storage,
         &obj_lock_guard,
-        new_replication_internal.as_ref(),
-        &target_version_ledger,
+        ReplicationStatusWriteback {
+            replication_internal: new_replication_internal.as_ref(),
+            target_version_ledger: &target_version_ledger,
+            resync_stamps: &resync_stamps,
+        },
         writeback_mode,
         &mut object_info,
     )
@@ -5005,8 +5033,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let _sopts = replicate_all_stat_options(&object_info, &bucket, &tgt_client);
-
         let Some((replication_action, object_info)) = resolve_replicate_all_action(
             ReplicateAllActionContext {
                 siblings: &storage,
@@ -5088,6 +5114,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
             return rinfo;
+        }
+
+        // The transfer is this target's resync of the object. Stamp it like the
+        // already-converged outcome above, or the next scanner cycle admits the
+        // object for the same reset id again.
+        if self.op_type == ReplicationType::ExistingObject && !tgt_client.reset_id.is_empty() {
+            apply_replication_resync_timestamp(&mut rinfo, &tgt_client.reset_id);
         }
 
         rinfo
@@ -5236,34 +5269,6 @@ fn note_replicate_all_target_bucket_empty(bucket: &str, tgt_client: &TargetClien
         user_agent: "Internal: [Replication]".to_string(),
         ..Default::default()
     });
-}
-
-/// Build the stat options for the target metadata comparison, logging (without
-/// failing) when the tagging directive header cannot be set.
-fn replicate_all_stat_options(object_info: &ObjectInfo, bucket: &str, tgt_client: &TargetClient) -> StatObjectOptions {
-    let mut sopts = StatObjectOptions {
-        version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
-        internal: AdvancedGetOptions {
-            replication_proxy_request: "false".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    if let Err(err) = sopts.set(AMZ_TAGGING_DIRECTIVE, "ACCESS") {
-        debug!(
-            event = EVENT_RESYNC_RUNTIME_SKIPPED,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-            bucket = %bucket,
-            arn = %tgt_client.arn,
-            error = %err,
-            reason = "tagging_directive_header_invalid",
-            "Skipped replication tagging directive header detail"
-        );
-    }
-
-    sopts
 }
 
 /// Record a failed payload transfer: mark the outcome FAILED, log the target
@@ -6395,8 +6400,7 @@ mod tests {
         let opts = replication_status_writeback_options(
             &ReplicateObjectInfo::default(),
             &guard,
-            None,
-            &[],
+            ReplicationStatusWriteback::default(),
             ReplicationStatusWritebackMode::ValidateOnly,
         );
         forced_lost.store(true, std::sync::atomic::Ordering::Release);
@@ -6413,6 +6417,76 @@ mod tests {
             ReplicationTerminalPublication::default(),
             "a fenced writeback retry must not publish terminal events or statistics"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_writeback_persists_resync_stamp_that_ends_existing_object_resync() {
+        let lock = rustfs_lock::NamespaceLock::new(
+            "replication-status-writeback-resync-stamp".to_string(),
+            Arc::new(rustfs_lock::LocalClient::new()),
+        );
+        let guard = lock
+            .get_write_lock(
+                rustfs_lock::ObjectKey::new("bucket", "/[replicate]/object"),
+                "worker-a",
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replication lock should be acquired");
+        let arn = "arn:rustfs:replication::target:bucket";
+        let reset_before = OffsetDateTime::now_utc();
+        let mut rinfo = ReplicatedTargetInfo {
+            arn: arn.to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        apply_replication_resync_timestamp(&mut rinfo, "reset-1");
+        let resync_decision = |user_defined: &HashMap<String, String>, reset_id: &str| {
+            crate::bucket::replication::replication_object_decision_boundary::resync_target_for_object(
+                &crate::bucket::replication::replication_object_decision_boundary::ReplicationResyncTargetObject {
+                    mod_time: Some(reset_before - time::Duration::hours(1)),
+                    user_defined,
+                },
+                arn,
+                reset_id,
+                Some(reset_before),
+                ReplicationStatusType::Completed,
+            )
+            .replicate
+        };
+        let persisted = |resync_stamps: &[(String, String)]| {
+            replication_status_writeback_options(
+                &ReplicateObjectInfo::default(),
+                &guard,
+                ReplicationStatusWriteback {
+                    resync_stamps,
+                    ..Default::default()
+                },
+                ReplicationStatusWritebackMode::Update,
+            )
+            .eval_metadata
+            .expect("writeback always carries evaluated metadata")
+        };
+
+        let unstamped = persisted(&[]);
+        assert!(
+            resync_decision(&unstamped, "reset-1"),
+            "an object older than the reset date stays admitted until it carries the stamp"
+        );
+
+        let stamped = persisted(&[(rinfo.arn.clone(), rinfo.resync_timestamp.clone())]);
+        let suffix = format!("{SUFFIX_REPLICATION_RESET_ARN_PREFIX}{arn}");
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert_eq!(stamped.get(&format!("{prefix}{suffix}")), Some(&rinfo.resync_timestamp));
+        }
+        assert!(
+            !resync_decision(&stamped, "reset-1"),
+            "the persisted stamp must end the resync for the same reset id"
+        );
+        assert!(resync_decision(&stamped, "reset-2"), "a new reset id must admit the object again");
     }
 
     #[test]
