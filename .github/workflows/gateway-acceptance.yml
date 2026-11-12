@@ -17,12 +17,16 @@
 # Runs two suites of the rustfs/gateway repository against the candidate binary,
 # once per S3 stack (RUSTFS_S3_STACK=legacy and =gateway), one server per stack:
 #
-#   - the conformance corpus, `--profile rustfs`, judged per stack by
-#     scripts/check_conformance_rulings.py against .config/conformance-rulings.toml
-#     (an unruled failure and a stale ruling are both red);
+#   - the conformance corpus, `--profile rustfs`. That profile describes the
+#     gateway edge, so scripts/check_conformance_rulings.py judges the gateway
+#     stack against .config/conformance-rulings.toml (an unruled failure and a
+#     stale ruling are both red) and publishes the legacy run as a reference that
+#     is never judged: it only has to start and complete;
 #   - the client matrix, ci/compat/run_matrix.sh --external, judged per stack by
 #     scripts/compat_matrix_report.py (no `fail`, no `sut-unregistered`, every
 #     client ran; a client that could not be installed is reported as skipped).
+#     The legacy matrix is the baseline: every cell that passes on legacy must
+#     pass on gateway (`compare`).
 #
 # The suites are checked out at the rustfs/gateway rev Cargo.toml pins, so the
 # suite and the framework under test never drift apart. The verdict of each
@@ -32,7 +36,7 @@
 # The gateway stack is report-only until T2.10: its job may fail without failing
 # the workflow, and its summary says what it observed (did not start, or how many
 # cases ran, passed, failed and were answered 501). The stack comparison is
-# report-only for the same reason.
+# report-only for the same reason; its conformance half is information only.
 #
 # Not a pull-request gate. Scheduled failures are owned by the scheduled-validation
 # watchdog (.github/scheduled-validations.json).
@@ -40,6 +44,10 @@
 name: Gateway Acceptance
 
 on:
+  # TEMPORARY: removed before merge; it exists only to run this lane on its own pull request.
+  pull_request:
+    paths:
+      - ".github/workflows/gateway-acceptance.yml"
   schedule:
     - cron: "29 3 * * *"
   workflow_dispatch:

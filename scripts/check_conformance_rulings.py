@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Judge one stack's gateway conformance run against .config/conformance-rulings.toml.
+"""Judge the gateway stack's conformance run against .config/conformance-rulings.toml.
 
 Usage:
   check_conformance_rulings.py --stack <legacy|gateway> --run-dir <dir> [--rulings <toml>]
@@ -24,12 +24,15 @@ server did not start), `runner-exit.txt` (the conformance runner's exit code)
 and `report.json` (the runner's `--json` report). The verdict comes from those
 observations, never from the exit status of an earlier step.
 
-`--diff` lists every case whose verdict differs between the two stacks' reports.
+The `rustfs` profile describes the gateway edge, so only the gateway stack is
+judged: a failed case without a ruling and a ruling whose case no longer fails
+are both red. The legacy run is a reference: it must start and complete, and
+its cases are reported, never judged. `--diff` prints every case whose verdict
+differs between the two reports, as information.
 
-Exit codes: 0 every failed case has a ruling and every ruling still matches a
-failed case (or, for `--diff`, no case differs); 1 an unruled failure, a stale
-ruling, a stack that did not serve (or a difference); 2 a malformed ledger or
-report. The Markdown summary goes to stdout.
+Exit codes: 0 judged clean (legacy: the run completed; `--diff`: always); 1 an
+unruled failure, a stale ruling, or a run that did not complete; 2 a malformed
+ledger or report. The Markdown summary goes to stdout.
 """
 
 import argparse
@@ -48,7 +51,7 @@ LEDGER = ROOT / ".config/conformance-rulings.toml"
 STACKS = ("legacy", "gateway")
 # rustfs/backlog#2684 names its entries R-0xx (gateway ledger rows) and K-n (kept behaviour).
 LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+)")
-RULING_KEYS = {"stack", "case", "ledger", "reason"}
+RULING_KEYS = {"case", "ledger", "reason"}
 NOT_SERVED = "observed 501"
 
 
@@ -65,15 +68,14 @@ def load_rulings(path):
     for row in rows:
         if not isinstance(row, dict) or set(row) != RULING_KEYS:
             raise InputError(f"{path}: a ruling has exactly the keys {sorted(RULING_KEYS)}: {row}")
-        if row["stack"] not in STACKS or not LEDGER_ID.fullmatch(str(row["ledger"])):
-            raise InputError(f"{path}: unknown stack or ledger id in {row}")
+        if not LEDGER_ID.fullmatch(str(row["ledger"])):
+            raise InputError(f"{path}: unknown ledger id in {row}")
         reason = row["reason"]
         if not isinstance(reason, str) or not reason.strip() or "\n" in reason:
             raise InputError(f"{path}: the reason of {row['case']} must be one non-empty line")
-        key = (row["stack"], row["case"])
-        if key in rulings:
-            raise InputError(f"{path}: {row['case']} is ruled twice on {row['stack']}")
-        rulings[key] = row
+        if row["case"] in rulings:
+            raise InputError(f"{path}: {row['case']} is ruled twice")
+        rulings[row["case"]] = row
     return rulings
 
 
@@ -103,7 +105,7 @@ def read_run(run_dir):
 
 
 def judge(stack, rulings, startup, runner_exit, report):
-    """Return (summary lines, problems). No problems means the stack is judged clean."""
+    """Return (summary lines, problems). Rulings apply to the gateway stack only."""
     lines = [f"### Conformance, `{stack}` stack", ""]
     if startup != "ready":
         observed = startup or "no startup record"
@@ -117,16 +119,18 @@ def judge(stack, rulings, startup, runner_exit, report):
     cases = {case["id"]: case for case in report["cases"]}
     by_verdict = {verdict: sorted(i for i, c in cases.items() if c["verdict"] == verdict) for verdict in ("passed", "failed", "skipped")}
     failed = by_verdict["failed"]
-    ruled = {case for (ruled_stack, case) in rulings if ruled_stack == stack}
-    unruled = [case for case in failed if case not in ruled]
-    stale = sorted(case for case in ruled if cases.get(case, {}).get("verdict") != "failed")
+    reference = stack == "legacy"
+    unruled = [] if reference else [case for case in failed if case not in rulings]
+    stale = [] if reference else sorted(case for case in rulings if cases.get(case, {}).get("verdict") != "failed")
     not_served = [case for case in failed if any(NOT_SERVED in str(f) for f in cases[case].get("failures", []))]
     lines += [
         f"- target_build: `{report.get('target_build')}`, profile `{report.get('profile')}`",
         f"- cases: {len(cases)}; ran {len(failed) + len(by_verdict['passed'])}, passed {len(by_verdict['passed'])}, "
-        f"failed {len(failed)} (ruled {len(failed) - len(unruled)}, unruled {len(unruled)}, answered 501 {len(not_served)}), "
-        f"skipped {len(by_verdict['skipped'])}",
+        f"failed {len(failed)}" + ("" if reference else f" (ruled {len(failed) - len(unruled)}, unruled {len(unruled)})")
+        + f", answered 501 {len(not_served)}, skipped {len(by_verdict['skipped'])}",
     ]
+    if reference:
+        lines.append("- not judged: reference only (the `rustfs` profile describes the gateway edge)")
     if not cases:
         return lines, [f"{stack}: the report holds no case"]
     skip_reasons = {}
@@ -150,7 +154,7 @@ def judge(stack, rulings, startup, runner_exit, report):
 
 def diff(legacy, gateway):
     """Return (summary lines, differing cases) between two reports; None when one is missing."""
-    lines = ["### Conformance: legacy vs gateway", ""]
+    lines = ["### Conformance: legacy vs gateway (information, not judged)", ""]
     if legacy is None or gateway is None:
         missing = [name for name, report in (("legacy", legacy), ("gateway", gateway)) if report is None]
         return lines + [f"- no report from {', '.join(missing)}; nothing to compare"], None
@@ -178,9 +182,7 @@ def main(argv=None):
         parser.error("give either --stack and --run-dir, or --diff")
     try:
         if args.diff:
-            lines, differing = diff(read_run(args.diff[0])[2], read_run(args.diff[1])[2])
-            problems = ["the stacks were not both measured"] if differing is None else [
-                f"{d['case']}: legacy {d['a']}, gateway {d['b']}" for d in differing]
+            lines, problems = diff(read_run(args.diff[0])[2], read_run(args.diff[1])[2])[0], []
         else:
             lines, problems = judge(args.stack, load_rulings(args.rulings), *read_run(args.run_dir))
     except InputError as error:
@@ -207,10 +209,9 @@ class SelfTest(unittest.TestCase):
                 {"id": i, "verdict": v, "reason": "", "failures": [f] if f else []} for i, v, f in cases]}
             (self.dir / "report.json").write_text(json.dumps(report))
 
-    def ledger(self, *rows):
+    def ledger(self, *cases):
         path = self.dir / "rulings.toml"
-        path.write_text("".join(
-            f'[[ruling]]\nstack = "{s}"\ncase = "{c}"\nledger = "R-001"\nreason = "why"\n' for s, c in rows))
+        path.write_text("".join(f'[[ruling]]\ncase = "{c}"\nledger = "R-001"\nreason = "why"\n' for c in cases))
         return load_rulings(path)
 
     def run_judge(self, stack, rulings):
@@ -218,28 +219,34 @@ class SelfTest(unittest.TestCase):
 
     def test_every_failure_ruled_and_every_ruling_failing_is_clean(self):
         self.write_run([("c-a-0001", "passed", ""), ("c-a-0002", "failed", "[expect/status]: expected status 200, observed 403")])
-        lines, problems = self.run_judge("legacy", self.ledger(("legacy", "c-a-0002")))
+        lines, problems = self.run_judge("gateway", self.ledger("c-a-0002"))
         self.assertEqual(problems, [])
-        self.assertIn("ran 2, passed 1, failed 1 (ruled 1, unruled 0, answered 501 0)", "\n".join(lines))
+        self.assertIn("ran 2, passed 1, failed 1 (ruled 1, unruled 0), answered 501 0", "\n".join(lines))
 
     def test_an_unruled_failure_is_red(self):
         self.write_run([("c-a-0001", "failed", "[expect/status]: x")])
-        self.assertEqual(self.run_judge("legacy", {})[1], ["legacy: c-a-0001 failed without a ruling"])
+        self.assertEqual(self.run_judge("gateway", {})[1], ["gateway: c-a-0001 failed without a ruling"])
 
-    def test_a_ruling_for_another_stack_does_not_excuse(self):
-        self.write_run([("c-a-0001", "failed", "x")])
-        self.assertEqual(self.run_judge("gateway", self.ledger(("legacy", "c-a-0001")))[1],
-                         ["gateway: c-a-0001 failed without a ruling"])
+    def test_the_legacy_reference_is_reported_never_judged(self):
+        self.write_run([("c-a-0001", "failed", "x"), ("c-a-0002", "passed", "")])
+        lines, problems = self.run_judge("legacy", self.ledger("c-a-0002"))
+        self.assertEqual(problems, [])
+        self.assertIn("- not judged: reference only (the `rustfs` profile describes the gateway edge)", lines)
+        self.assertNotIn("unruled", "\n".join(lines))
+
+    def test_a_legacy_reference_that_did_not_complete_is_red(self):
+        self.write_run([("c-a-0001", "passed", "")], runner_exit="3")
+        self.assertEqual(self.run_judge("legacy", {})[1], ["legacy: the runner did not complete a run (exit 3)"])
 
     def test_a_ruling_on_a_passing_case_is_stale(self):
         self.write_run([("c-a-0001", "passed", "")])
-        self.assertEqual(self.run_judge("legacy", self.ledger(("legacy", "c-a-0001")))[1],
-                         ["legacy: the ruling on c-a-0001 is stale"])
+        self.assertEqual(self.run_judge("gateway", self.ledger("c-a-0001"))[1],
+                         ["gateway: the ruling on c-a-0001 is stale"])
 
     def test_a_ruling_on_a_skipped_or_absent_case_is_stale(self):
         self.write_run([("c-a-0001", "skipped", "")])
-        problems = self.run_judge("legacy", self.ledger(("legacy", "c-a-0001"), ("legacy", "c-gone-0001")))[1]
-        self.assertEqual(problems, ["legacy: the ruling on c-a-0001 is stale", "legacy: the ruling on c-gone-0001 is stale"])
+        problems = self.run_judge("gateway", self.ledger("c-a-0001", "c-gone-0001"))[1]
+        self.assertEqual(problems, ["gateway: the ruling on c-a-0001 is stale", "gateway: the ruling on c-gone-0001 is stale"])
 
     def test_a_server_that_did_not_start_is_red_and_says_why(self):
         self.write_run(None, startup="did not start: gateway stack is not assembled yet", runner_exit=None)
@@ -252,15 +259,15 @@ class SelfTest(unittest.TestCase):
 
     def test_a_missing_report_is_red_even_when_the_exit_was_swallowed(self):
         self.write_run(None, runner_exit="0")
-        self.assertEqual(self.run_judge("legacy", {})[1], ["legacy: the runner did not complete a run (exit 0)"])
+        self.assertEqual(self.run_judge("gateway", {})[1], ["gateway: the runner did not complete a run (exit 0)"])
 
     def test_a_swallowed_exit_cannot_hide_a_failed_case(self):
         self.write_run([("c-a-0001", "failed", "x")], runner_exit="0")
-        self.assertEqual(self.run_judge("legacy", {})[1], ["legacy: c-a-0001 failed without a ruling"])
+        self.assertEqual(self.run_judge("gateway", {})[1], ["gateway: c-a-0001 failed without a ruling"])
 
     def test_an_environment_exit_is_red(self):
         self.write_run([("c-a-0001", "passed", "")], runner_exit="3")
-        self.assertEqual(self.run_judge("legacy", {})[1], ["legacy: the runner did not complete a run (exit 3)"])
+        self.assertEqual(self.run_judge("gateway", {})[1], ["gateway: the runner did not complete a run (exit 3)"])
 
     def test_an_empty_report_is_red(self):
         self.write_run([], runner_exit="0")
@@ -273,12 +280,12 @@ class SelfTest(unittest.TestCase):
     def test_malformed_ledgers_are_refused(self):
         path = self.dir / "rulings.toml"
         for body in (
-            '[[ruling]]\nstack = "legacy"\ncase = "c"\nledger = "R-001"\n',
-            '[[ruling]]\nstack = "legacy"\ncase = "c"\nledger = "R-001"\nreason = "r"\nexpires = "x"\n',
-            '[[ruling]]\nstack = "both"\ncase = "c"\nledger = "R-001"\nreason = "r"\n',
-            '[[ruling]]\nstack = "legacy"\ncase = "c"\nledger = "2684"\nreason = "r"\n',
-            '[[ruling]]\nstack = "legacy"\ncase = "c"\nledger = "K-1"\nreason = ""\n',
-            '[[ruling]]\nstack = "legacy"\ncase = "c"\nledger = "K-1"\nreason = "r"\n' * 2,
+            '[[ruling]]\ncase = "c"\nledger = "R-001"\n',
+            '[[ruling]]\ncase = "c"\nledger = "R-001"\nreason = "r"\nexpires = "x"\n',
+            '[[ruling]]\nstack = "gateway"\ncase = "c"\nledger = "R-001"\nreason = "r"\n',
+            '[[ruling]]\ncase = "c"\nledger = "2684"\nreason = "r"\n',
+            '[[ruling]]\ncase = "c"\nledger = "K-1"\nreason = ""\n',
+            '[[ruling]]\ncase = "c"\nledger = "K-1"\nreason = "r"\n' * 2,
         ):
             path.write_text(body)
             with self.subTest(body=body), self.assertRaises(InputError):

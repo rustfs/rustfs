@@ -27,9 +27,11 @@ ci/compat/run_matrix.sh) and `compat/matrix.json` (its manifest).
 `check` is clean only when the server served, the matrix finished, every client
 ran, and no cell is `fail` or `sut-unregistered` (rustfs/backlog#2776). A
 `client-unsupported` cell is the client's gap, never a pass, and is counted.
-`diff` lists every (client, scenario) cell whose status differs between stacks.
+`diff` lists every (client, scenario) cell whose status differs between stacks
+and gates on the gateway matrix covering the legacy baseline: every cell that
+passes on legacy must pass on gateway. Other differences are information.
 
-Exit codes: 0 clean, or no difference; 1 otherwise; 2 malformed input.
+Exit codes: 0 clean (or the gateway covers the baseline); 1 otherwise; 2 malformed input.
 """
 
 import argparse
@@ -92,19 +94,21 @@ def check(stack, startup, skipped, matrix_exit, cells):
 
 
 def diff(legacy, gateway):
-    """Return (summary lines, differing cells) between two cell maps; a missing side is `absent`."""
-    lines = ["### Client matrix: legacy vs gateway", ""]
+    """Return (summary lines, problems): every legacy `pass` cell must pass on gateway."""
+    lines = ["### Client matrix: legacy vs gateway (gate: every legacy pass passes on gateway)", ""]
     if legacy is None or gateway is None:
         missing = [name for name, cells in (("legacy", legacy), ("gateway", gateway)) if cells is None]
-        return lines + [f"- no manifest from {', '.join(missing)}; nothing to compare"], None
+        return lines + [f"- no manifest from {', '.join(missing)}; nothing to compare"], ["the stacks were not both measured"]
     status = lambda cells, key: cells[key]["status"] if key in cells else "absent"
     differing = [(key, status(legacy, key), status(gateway, key))
                  for key in sorted(set(legacy) | set(gateway)) if status(legacy, key) != status(gateway, key)]
+    problems = [f"{client}/{scenario}: passes on legacy, {b} on gateway" for (client, scenario), a, b in differing if a == "pass"]
     if not differing:
-        return lines + ["- no cell differs"], differing
-    lines += [f"{len(differing)} cells differ.", "", "| client | scenario | legacy | gateway |", "| --- | --- | --- | --- |"]
+        return lines + ["- no cell differs"], problems
+    lines += [f"{len(differing)} cells differ, {len(problems)} of them legacy passes.", "",
+              "| client | scenario | legacy | gateway |", "| --- | --- | --- | --- |"]
     lines += [f"| {client} | {scenario} | {a} | {b} |" for (client, scenario), a, b in differing]
-    return lines, differing
+    return lines, problems
 
 
 def main(argv=None):
@@ -125,9 +129,7 @@ def main(argv=None):
         if args.command == "check":
             lines, problems = check(args.stack, *read_run(args.run_dir))
         else:
-            lines, differing = diff(read_run(args.legacy)[3], read_run(args.gateway)[3])
-            problems = ["the stacks were not both measured"] if differing is None else [
-                f"{client}/{scenario}: legacy {a}, gateway {b}" for (client, scenario), a, b in differing]
+            lines, problems = diff(read_run(args.legacy)[3], read_run(args.gateway)[3])
     except InputError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -196,14 +198,25 @@ class SelfTest(unittest.TestCase):
         with self.assertRaises(InputError):
             self.checked(cells={("boto3", "a"): "passed"})
 
-    def test_diff_lists_changed_and_absent_cells_only(self):
-        legacy = read_run(self.write_run(self.dir / "l", {("boto3", "a"): "pass", ("boto3", "b"): "pass", ("mc", "a"): "pass"}))[3]
-        gateway = read_run(self.write_run(self.dir / "g", {("boto3", "a"): "pass", ("boto3", "b"): "sut-unregistered"}))[3]
-        self.assertEqual(diff(legacy, gateway)[1], [(("boto3", "b"), "pass", "sut-unregistered"), (("mc", "a"), "pass", "absent")])
+    def cells(self, name, statuses):
+        return read_run(self.write_run(self.dir / name, statuses))[3]
 
-    def test_diff_without_both_manifests_compares_nothing(self):
-        lines, differing = diff({("boto3", "a"): {"status": "pass"}}, None)
-        self.assertIsNone(differing)
+    def test_a_legacy_pass_lost_or_absent_on_gateway_is_red(self):
+        legacy = self.cells("l", {("boto3", "a"): "pass", ("boto3", "b"): "pass", ("mc", "a"): "pass"})
+        gateway = self.cells("g", {("boto3", "a"): "pass", ("boto3", "b"): "sut-unregistered"})
+        self.assertEqual(diff(legacy, gateway)[1], ["boto3/b: passes on legacy, sut-unregistered on gateway",
+                                                    "mc/a: passes on legacy, absent on gateway"])
+
+    def test_a_gateway_superset_of_the_baseline_is_clean_and_its_extra_passes_are_listed(self):
+        legacy = self.cells("l", {("boto3", "a"): "pass", ("boto3", "b"): "client-unsupported"})
+        gateway = self.cells("g", {("boto3", "a"): "pass", ("boto3", "b"): "pass"})
+        lines, problems = diff(legacy, gateway)
+        self.assertEqual(problems, [])
+        self.assertIn("| boto3 | b | client-unsupported | pass |", lines)
+
+    def test_diff_without_both_manifests_is_red(self):
+        lines, problems = diff({("boto3", "a"): {"status": "pass"}}, None)
+        self.assertEqual(problems, ["the stacks were not both measured"])
         self.assertIn("- no manifest from gateway; nothing to compare", lines)
 
 
