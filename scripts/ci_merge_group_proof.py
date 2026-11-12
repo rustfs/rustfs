@@ -31,14 +31,22 @@ def lookup(repository: str, tree: str, branch: str, token: str, opener=None) -> 
     if not isinstance(runs, list):
         return None
     for run in runs:
-        if (isinstance(run, dict) and run.get("event") == "merge_group" and run.get("status") == "completed"
-                and run.get("conclusion") == "success" and isinstance(run.get("head_branch"), str)
-                and run["head_branch"].startswith(f"gh-readonly-queue/{branch}/")
-                and isinstance(run.get("head_commit"), dict) and run["head_commit"].get("tree_id") == tree
-                and type(run.get("id")) is int and run["id"] > 0 and isinstance(run.get("html_url"), str)
-                and run["html_url"] == f"https://github.com/{repository}/actions/runs/{run['id']}"):
+        if proves(run, repository, branch, tree):
             return {"run_id": run["id"], "url": run["html_url"], "tree": tree}
     return None
+
+
+def proves(run, repository: str, branch: str, tree: str) -> bool:
+    """Whether `run`, listed from ci.yml's runs, is a successful merge-queue run of `branch` in `repository` on `tree`.
+
+    The push plan and the release pipeline both accept a tree on this rule alone.
+    """
+    return (isinstance(run, dict) and run.get("event") == "merge_group" and run.get("status") == "completed"
+            and run.get("conclusion") == "success" and isinstance(run.get("head_branch"), str)
+            and run["head_branch"].startswith(f"gh-readonly-queue/{branch}/")
+            and isinstance(run.get("head_commit"), dict) and run["head_commit"].get("tree_id") == tree
+            and type(run.get("id")) is int and run["id"] > 0 and isinstance(run.get("html_url"), str)
+            and run["html_url"] == f"https://github.com/{repository}/actions/runs/{run['id']}")
 
 
 def main() -> int:

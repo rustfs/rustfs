@@ -12,12 +12,16 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import zipfile
 
 import candidate as c
 import release_gate
+
+sys.path.insert(0, str(c.ROOT / "scripts"))
+import ci_merge_group_proof as proof
 
 
 def current_run(workflow):
@@ -44,9 +48,26 @@ def output_inputs(inputs):
         c.emit_output(field, inputs[field])
 
 
+CI_GATE = ("Quick Checks", "Test and Lint", "End-to-End Tests (full merge gate)")
+
+
+def run_jobs(run):
+    jobs = []
+    for page in range(1, 11):
+        batch = c.github(f"repos/{c.REPOSITORY}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100&page={page}")["jobs"]
+        jobs.extend(batch)
+        if len(batch) < 100:
+            break
+    return jobs
+
+
+def succeeded(jobs, names):
+    selected = {name: [job for job in jobs if job.get("name") == name] for name in names}
+    return all(len(found) == 1 and found[0].get("status") == "completed" and found[0].get("conclusion") == "success" for found in selected.values())
+
+
 def source_ci(source, version):
     runs = c.github(f"repos/{c.REPOSITORY}/actions/workflows/ci.yml/runs?head_sha={source}&status=success&per_page=10")["workflow_runs"]
-    required = {"Quick Checks", "Test and Lint", "End-to-End Tests (full merge gate)"}
     for run in runs:
         if (run.get("head_sha") != source or run.get("path") != ".github/workflows/ci.yml"
                 or run.get("head_branch") not in ("main", f"release/{version}")
@@ -54,15 +75,17 @@ def source_ci(source, version):
                 or run.get("conclusion") != "success" or run.get("status") != "completed"
                 or (run.get("repository") or {}).get("full_name") != c.REPOSITORY):
             continue
-        jobs = []
-        for page in range(1, 11):
-            batch = c.github(f"repos/{c.REPOSITORY}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100&page={page}")["jobs"]
-            jobs.extend(batch)
-            if len(batch) < 100:
-                break
-        selected = {name: [job for job in jobs if job.get("name") == name] for name in required}
-        if all(len(found) == 1 and found[0].get("status") == "completed" and found[0].get("conclusion") == "success" for found in selected.values()):
+        jobs = run_jobs(run)
+        if succeeded(jobs, CI_GATE):
             return {"run_id": run["id"], "run_attempt": run["run_attempt"]}
+        # A queue-landed push skips its validation jobs as proven by the merge-group run of the same tree
+        # (scripts/ci_merge_group_proof.py); that run carries the full gate, so it is the evidence.
+        if run["event"] == "push" and succeeded(jobs, CI_GATE[:2]):
+            tree = c.command(["git", "rev-parse", "--verify", "--end-of-options", f"{source}^{{tree}}"], cwd=c.ROOT)
+            queued = c.github(f"repos/{c.REPOSITORY}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100")
+            for proving in queued["workflow_runs"]:
+                if proof.proves(proving, c.REPOSITORY, run["head_branch"], tree) and succeeded(run_jobs(proving), CI_GATE):
+                    return {"run_id": proving["id"], "run_attempt": proving["run_attempt"]}
     raise ValueError("no complete exact-source CI found; run ci.yml on main or the release branch before creating a candidate")
 
 
