@@ -488,6 +488,20 @@ macro_rules! gauge_set_cached {
     }};
 }
 
+macro_rules! gauge_update_cached {
+    ($name:literal, $operation:ident, $value:expr) => {{
+        #[cfg(not(test))]
+        {
+            static HANDLE: std::sync::LazyLock<metrics::Gauge> = std::sync::LazyLock::new(|| metrics::gauge!($name));
+            HANDLE.$operation($value);
+        }
+        #[cfg(test)]
+        {
+            metrics::gauge!($name).$operation($value);
+        }
+    }};
+}
+
 macro_rules! histogram_record_cached {
     ($name:literal, $value:expr) => {{
         #[cfg(not(test))]
@@ -2409,6 +2423,108 @@ pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
         return;
     }
     counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
+}
+
+#[derive(Default)]
+struct DiskFsyncWorkerMetricsState {
+    workers: AtomicU64,
+    workers_peak: AtomicU64,
+    spinning_workers: AtomicU64,
+    spinning_workers_peak: AtomicU64,
+}
+
+static DISK_FSYNC_WORKER_METRICS: LazyLock<DiskFsyncWorkerMetricsState> = LazyLock::new(DiskFsyncWorkerMetricsState::default);
+
+fn record_disk_fsync_worker_peak(peak: &AtomicU64, current: u64, increment_gauge: impl FnOnce(f64)) {
+    let previous = peak.fetch_max(current, Ordering::Relaxed);
+    if current > previous {
+        // Positive deltas commute even when workers publish their peaks out of order.
+        increment_gauge(f64::from(u32::try_from(current - previous).unwrap_or(u32::MAX)));
+    }
+}
+
+/// Tracks an executing fsync worker from closure entry through retirement.
+///
+/// Counts are aggregated across this process. Workers queued in a blocking pool
+/// are excluded. Enabled guards finish their accounting even if detailed PUT
+/// metrics are subsequently disabled. Peak gauges cover the process lifetime.
+#[must_use]
+pub struct DiskFsyncWorkerMetricsGuard<'a> {
+    state: &'a DiskFsyncWorkerMetricsState,
+}
+
+/// Start diagnostics when a native fsync worker actually enters its closure.
+///
+/// Call outside the disk queue lock. With detailed PUT metrics disabled, this
+/// performs only the gate check and allocates no guard or metric handles.
+#[inline]
+pub fn start_disk_fsync_worker_metrics() -> Option<DiskFsyncWorkerMetricsGuard<'static>> {
+    if !put_stage_metrics_enabled() {
+        return None;
+    }
+    Some(start_disk_fsync_worker_metrics_with_state(&DISK_FSYNC_WORKER_METRICS))
+}
+
+fn start_disk_fsync_worker_metrics_with_state(state: &DiskFsyncWorkerMetricsState) -> DiskFsyncWorkerMetricsGuard<'_> {
+    let current = state.workers.fetch_add(1, Ordering::Relaxed) + 1;
+    gauge_update_cached!("rustfs_disk_fsync_workers_current", increment, 1.0);
+    record_disk_fsync_worker_peak(&state.workers_peak, current, |delta| {
+        gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+    });
+    DiskFsyncWorkerMetricsGuard { state }
+}
+
+impl DiskFsyncWorkerMetricsGuard<'_> {
+    /// Start one idle-spin episode after releasing the disk queue lock.
+    ///
+    /// The returned guard borrows this worker so idle accounting finishes before
+    /// worker retirement. Its timer begins after publishing the entry metrics.
+    pub fn start_idle_spin(&self) -> DiskFsyncIdleSpinMetricsGuard<'_> {
+        let current = self.state.spinning_workers.fetch_add(1, Ordering::Relaxed) + 1;
+        gauge_update_cached!("rustfs_disk_fsync_spinning_workers_current", increment, 1.0);
+        record_disk_fsync_worker_peak(&self.state.spinning_workers_peak, current, |delta| {
+            gauge_update_cached!("rustfs_disk_fsync_spinning_workers_peak", increment, delta);
+        });
+        DiskFsyncIdleSpinMetricsGuard {
+            state: self.state,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for DiskFsyncWorkerMetricsGuard<'_> {
+    fn drop(&mut self) {
+        self.state.workers.fetch_sub(1, Ordering::Relaxed);
+        gauge_update_cached!("rustfs_disk_fsync_workers_current", decrement, 1.0);
+    }
+}
+
+/// Tracks actual idle-spin activity, excluding queued or executing operations.
+#[must_use]
+pub struct DiskFsyncIdleSpinMetricsGuard<'a> {
+    state: &'a DiskFsyncWorkerMetricsState,
+    started_at: std::time::Instant,
+}
+
+impl DiskFsyncIdleSpinMetricsGuard<'_> {
+    /// Finish an episode and report its loop count once, outside the spin loop.
+    ///
+    /// Duration is elapsed wall time, which can include descheduling. It ends
+    /// before metric publication and must be interpreted alongside CPU profiles.
+    pub fn finish(self, iterations: usize) {
+        let duration_ms = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        drop(self);
+        counter_increment_cached!("rustfs_disk_fsync_idle_spin_episodes", 1);
+        counter_increment_cached!("rustfs_disk_fsync_idle_spin_iterations", u64::try_from(iterations).unwrap_or(u64::MAX));
+        histogram_record_cached!("rustfs_disk_fsync_idle_spin_duration_ms", duration_ms);
+    }
+}
+
+impl Drop for DiskFsyncIdleSpinMetricsGuard<'_> {
+    fn drop(&mut self) {
+        self.state.spinning_workers.fetch_sub(1, Ordering::Relaxed);
+        gauge_update_cached!("rustfs_disk_fsync_spinning_workers_current", decrement, 1.0);
+    }
 }
 
 /// Observe a future's latency and wakeup behavior only while detailed PUT
@@ -4943,6 +5059,130 @@ mod tests {
             worker.join().expect("stage worker should not panic");
         }
         assert_eq!(current(), current_before);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_gate_and_finish_existing_guards() {
+        let _lock = METRICS_FLAG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            assert!(start_disk_fsync_worker_metrics().is_none());
+            assert!(snapshotter.snapshot().into_vec().is_empty());
+
+            set_put_stage_metrics_enabled(true);
+            let worker = start_disk_fsync_worker_metrics().expect("enabled worker diagnostics");
+            let spin = worker.start_idle_spin();
+            set_put_stage_metrics_enabled(false);
+            spin.finish(17);
+            drop(worker);
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_iterations"), Some(17));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), Some(1));
+        assert_eq!(DISK_FSYNC_WORKER_METRICS.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(DISK_FSYNC_WORKER_METRICS.spinning_workers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_record_concurrent_peaks_and_spin_iterations() {
+        const WORKERS: usize = 4;
+        let state = DiskFsyncWorkerMetricsState::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let entered = Barrier::new(WORKERS + 1);
+        let release = Barrier::new(WORKERS + 1);
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    metrics::with_local_recorder(&recorder, || {
+                        let worker = start_disk_fsync_worker_metrics_with_state(&state);
+                        let spin = worker.start_idle_spin();
+                        entered.wait();
+                        release.wait();
+                        spin.finish(256);
+                    });
+                });
+            }
+            entered.wait();
+            let observed = (
+                state.workers.load(Ordering::Relaxed),
+                state.spinning_workers.load(Ordering::Relaxed),
+                state.workers_peak.load(Ordering::Relaxed),
+                state.spinning_workers_peak.load(Ordering::Relaxed),
+            );
+            release.wait();
+            assert_eq!(observed, (4, 4, 4, 4));
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(state.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(state.spinning_workers.load(Ordering::Relaxed), 0);
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_peak"), Some(4.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_peak"), Some(4.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), Some(4));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_iterations"), Some(1024));
+        assert_eq!(histogram_samples(&rows, "rustfs_disk_fsync_idle_spin_duration_ms").len(), 4);
+        assert!(rows.iter().all(|(key, _, _, _)| key.key().labels().next().is_none()));
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_balance_panicking_workers() {
+        let state = DiskFsyncWorkerMetricsState::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            metrics::with_local_recorder(&recorder, || {
+                let worker = start_disk_fsync_worker_metrics_with_state(&state);
+                let _spin = worker.start_idle_spin();
+                panic!("worker unwound while idle diagnostics were active");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.workers.load(Ordering::Relaxed), 0);
+        assert_eq!(state.spinning_workers.load(Ordering::Relaxed), 0);
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_workers_current"), Some(0.0));
+        assert_eq!(gauge_value(&rows, "rustfs_disk_fsync_spinning_workers_current"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_disk_fsync_idle_spin_episodes"), None);
+    }
+
+    #[test]
+    fn disk_fsync_worker_metrics_keep_peak_when_publication_is_reordered() {
+        let peak = AtomicU64::new(0);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let peak = &peak;
+            let recorder = &recorder;
+            scope.spawn(move || {
+                record_disk_fsync_worker_peak(peak, 1, |delta| {
+                    first_tx.send(()).expect("first peak was observed");
+                    release_rx.recv().expect("allow delayed publication");
+                    metrics::with_local_recorder(recorder, || {
+                        gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+                    });
+                });
+            });
+            first_rx.recv().expect("first peak publication is delayed");
+            record_disk_fsync_worker_peak(peak, 2, |delta| {
+                metrics::with_local_recorder(recorder, || {
+                    gauge_update_cached!("rustfs_disk_fsync_workers_peak", increment, delta);
+                });
+            });
+            release_tx.send(()).expect("release first peak publication");
+        });
+        assert_eq!(peak.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            gauge_value(&snapshotter.snapshot().into_vec(), "rustfs_disk_fsync_workers_peak"),
+            Some(2.0)
+        );
     }
 
     #[test]
