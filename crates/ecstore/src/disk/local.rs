@@ -622,9 +622,45 @@ fn snapshot_part_transaction_file(
 #[cfg(unix)]
 fn open_dir_fd(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags, open};
-    open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(std::io::Error::from)
+    open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
+fn open_part_dir_fd(publication_root: &os::PublicationRoot, path: &Path) -> std::io::Result<std::fs::File> {
+    publication_root.open_directory(path)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_part_dir_fd(_publication_root: &os::PublicationRoot, _path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::from(ErrorKind::Unsupported))
+}
+
+#[cfg(unix)]
+fn create_and_open_part_dir_fd(publication_root: &os::PublicationRoot, path: &Path) -> std::io::Result<std::fs::File> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(std::io::Error::from(ErrorKind::NotFound));
+    };
+    let parent_fd = open_part_dir_fd(publication_root, parent)?;
+    os::record_native_publication(path);
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+    match mkdirat(&parent_fd, name, Mode::RWXU | Mode::RWXG | Mode::RWXO) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(mkdir_err) => return Err(std::io::Error::from(mkdir_err)),
+    }
+    openat(
+        &parent_fd,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]
@@ -636,10 +672,15 @@ fn mkdir_and_open_part_txn_dir(
     if let Some(p_fd) = parent_fd {
         use rustix::fs::{Mode, OFlags, mkdirat, openat};
         mkdirat(p_fd, dir_name, Mode::from_raw_mode(0o777)).map_err(std::io::Error::from)?;
-        let fd = openat(p_fd, dir_name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-            .ok()
-            .map(std::fs::File::from)
-            .map(Arc::new);
+        let fd = openat(
+            p_fd,
+            dir_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()
+        .map(std::fs::File::from)
+        .map(Arc::new);
         return Ok(fd);
     }
     std::fs::create_dir(dir_path)?;
@@ -827,6 +868,7 @@ struct PreparedPartTxnReceipt {
     meta: Bytes,
     had_old_data: bool,
     had_old_meta: bool,
+    src_parent_fd: Option<Arc<std::fs::File>>,
     txn_dir_fd: Option<Arc<std::fs::File>>,
     txn_parent_fd: Option<Arc<std::fs::File>>,
 }
@@ -15037,13 +15079,89 @@ impl DiskAPI for LocalDisk {
                 {
                     return Ok(Err(to_file_error(err).into()));
                 }
-                let source = match std::fs::symlink_metadata(&src_file_path) {
-                    Ok(source) => source,
+                let Some(transaction_parent) = transaction_path.parent() else {
+                    return Ok(Err(DiskError::InvalidPath));
+                };
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                let has_hooks = os::prepared_publication_test_hooks::has_any_hooks();
+                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
+                let has_hooks = false;
+                let precondition = has_hooks
+                    .then(|| admission.as_ref().map(|check| check.precondition()))
+                    .flatten();
+
+                #[cfg(unix)]
+                let src_parent_fd = (!has_hooks)
+                    .then(|| {
+                        src_file_path
+                            .parent()
+                            .and_then(|p| open_part_dir_fd(&publication_root, p).ok())
+                    })
+                    .flatten()
+                    .map(Arc::new);
+                #[cfg(not(unix))]
+                let src_parent_fd: Option<Arc<std::fs::File>> = None;
+
+                #[cfg(unix)]
+                let (mut txn_parent_fd, txn_parent_missing) = if !has_hooks {
+                    match open_part_dir_fd(&publication_root, transaction_parent) {
+                        Ok(fd) => (Some(Arc::new(fd)), false),
+                        Err(err) if err.kind() == ErrorKind::NotFound => (None, true),
+                        Err(_) => (None, false),
+                    }
+                } else {
+                    (None, false)
+                };
+                #[cfg(not(unix))]
+                let (txn_parent_fd, txn_parent_missing): (Option<Arc<std::fs::File>>, bool) = (None, false);
+
+                #[cfg(unix)]
+                let src_is_file = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), src_file_path.file_name())
+                {
+                    use rustix::fs::{AtFlags, FileType, statat};
+                    match statat(src_p_fd, src_name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(stat) => FileType::from_raw_mode(stat.st_mode).is_file(),
+                        Err(err) => return Ok(Err(to_file_error(std::io::Error::from(err)).into())),
+                    }
+                } else {
+                    match std::fs::symlink_metadata(&src_file_path) {
+                        Ok(source) => source.is_file(),
+                        Err(err) => return Ok(Err(to_file_error(err).into())),
+                    }
+                };
+                #[cfg(not(unix))]
+                let src_is_file = match std::fs::symlink_metadata(&src_file_path) {
+                    Ok(source) => source.is_file(),
                     Err(err) => return Ok(Err(to_file_error(err).into())),
                 };
-                if !source.is_file() {
+                if !src_is_file {
                     return Ok(Err(DiskError::FileAccessDenied));
                 }
+
+                #[cfg(unix)]
+                if !txn_parent_missing {
+                    if let (Some(txn_p_fd), Some(tx_name)) = (txn_parent_fd.as_deref(), transaction_path.file_name()) {
+                        use rustix::fs::{AtFlags, FileType, statat};
+                        match statat(txn_p_fd, tx_name, AtFlags::SYMLINK_NOFOLLOW) {
+                            Err(rustix::io::Errno::NOENT) => {}
+                            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink() => {
+                                return Ok(Err(DiskError::InvalidPath));
+                            }
+                            Ok(_) => return Ok(Err(DiskError::FileAccessDenied)),
+                            Err(err) => return Ok(Err(to_file_error(std::io::Error::from(err)).into())),
+                        }
+                    } else {
+                        match std::fs::symlink_metadata(&transaction_path) {
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Ok(m) if m.file_type().is_symlink() => return Ok(Err(DiskError::InvalidPath)),
+                            Ok(_) => return Ok(Err(DiskError::FileAccessDenied)),
+                            Err(err) => return Ok(Err(to_file_error(err).into())),
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = txn_parent_missing;
+                #[cfg(not(unix))]
                 match std::fs::symlink_metadata(&transaction_path) {
                     Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Ok(m) if m.file_type().is_symlink() => return Ok(Err(DiskError::InvalidPath)),
@@ -15052,16 +15170,43 @@ impl DiskAPI for LocalDisk {
                 }
                 let mut created_transaction_parent = false;
                 if let Some((integrity, source, destination, expected_len)) = integrity_prep {
-                    let stat = match std::fs::symlink_metadata(&source) {
-                        Ok(stat) => stat,
-                        Err(err) => return Ok(Err(to_file_error(err).into())),
-                    };
-                    if !stat.is_file() || stat.len() != expected_len {
-                        return Ok(Err(DiskError::FileCorrupt));
-                    }
                     let presynced_proof = take_presynced_tmp_file(&source);
                     let verify_and_sync = (|| -> std::io::Result<bool> {
-                        let mut file = os::open_file_for_sync_std(&source)?;
+                        #[cfg(unix)]
+                        let mut file = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
+                            use rustix::fs::{Mode, OFlags, openat};
+                            match openat(
+                                src_p_fd,
+                                src_name,
+                                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            ) {
+                                Ok(fd) => std::fs::File::from(fd),
+                                Err(rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR) => return Ok(false),
+                                Err(err) => return Err(std::io::Error::from(err)),
+                            }
+                        } else {
+                            let stat = std::fs::symlink_metadata(&source)?;
+                            if !stat.is_file() || stat.len() != expected_len {
+                                return Ok(false);
+                            }
+                            os::open_file_for_sync_std(&source)?
+                        };
+                        #[cfg(not(unix))]
+                        let mut file = {
+                            let stat = std::fs::symlink_metadata(&source)?;
+                            if !stat.is_file() || stat.len() != expected_len {
+                                return Ok(false);
+                            }
+                            os::open_file_for_sync_std(&source)?
+                        };
+                        #[cfg(unix)]
+                        if src_parent_fd.is_some() {
+                            let stat = file.metadata()?;
+                            if !stat.is_file() || stat.len() != expected_len {
+                                return Ok(false);
+                            }
+                        }
                         let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
                         std::io::Read::read_exact(&mut file, &mut header)?;
                         if header != integrity.index_header() {
@@ -15077,42 +15222,89 @@ impl DiskAPI for LocalDisk {
                         Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
                         Err(err) => return Ok(Err(to_file_error(err).into())),
                     }
-                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-                    let has_hooks = os::prepared_publication_test_hooks::has_any_hooks();
-                    #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                    let has_hooks = false;
-                    let precondition = has_hooks
-                        .then(|| admission.as_ref().map(|check| check.precondition()))
-                        .flatten();
                     // Publish the immutable generation before preparing the part switch.
                     // Rollback retains the old generation; an unreferenced new index is
                     // reclaimed with the upload directory if preparation is interrupted.
                     // Defer the parent directory fsync to the transaction_parent fsync
                     // below when both live in the same parent directory.
                     let same_parent = destination.parent() == transaction_path.parent();
-                    if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
-                        &source,
-                        &destination,
-                        &dst_volume_dir,
-                        &publication_root,
-                        precondition.as_deref(),
-                        durability.syncs_commit_metadata() && !same_parent,
-                    ) {
+                    #[cfg(unix)]
+                    if !has_hooks && same_parent && txn_parent_missing && txn_parent_fd.is_none() {
+                        txn_parent_fd = create_and_open_part_dir_fd(&publication_root, transaction_parent)
+                            .ok()
+                            .map(Arc::new);
+                    }
+                    #[cfg(unix)]
+                    let fast_idx_renamed = if !has_hooks
+                        && same_parent
+                        && let (Some(src_p_fd), Some(dst_p_fd), Some(src_name), Some(dst_name)) = (
+                            src_parent_fd.as_deref(),
+                            txn_parent_fd.as_deref(),
+                            source.file_name(),
+                            destination.file_name(),
+                        ) {
+                        #[cfg(test)]
+                        if let Err(err) = os::multipart_source_syscall_failures::check(
+                            os::multipart_source_syscall_failures::Stage::Rename,
+                            &destination,
+                        ) {
+                            return Ok(Err(to_file_error(err).into()));
+                        }
+                        os::record_native_publication(&destination);
+                        match rustix::fs::renameat(src_p_fd, src_name, dst_p_fd, dst_name) {
+                            Ok(()) => true,
+                            Err(err) => return Ok(Err(to_file_error(std::io::Error::from(err)).into())),
+                        }
+                    } else {
+                        false
+                    };
+                    #[cfg(not(unix))]
+                    let fast_idx_renamed = false;
+
+                    if !fast_idx_renamed
+                        && let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
+                            &source,
+                            &destination,
+                            &dst_volume_dir,
+                            &publication_root,
+                            precondition.as_deref(),
+                            durability.syncs_commit_metadata() && !same_parent,
+                        )
+                    {
                         return Ok(Err(to_file_error(err).into()));
                     }
                     created_transaction_parent = same_parent;
                 }
 
-                let Some(transaction_parent) = transaction_path.parent() else {
-                    return Ok(Err(DiskError::InvalidPath));
-                };
+                #[cfg(unix)]
+                if txn_parent_fd.is_none() {
+                    if !has_hooks && txn_parent_missing {
+                        txn_parent_fd = create_and_open_part_dir_fd(&publication_root, transaction_parent)
+                            .ok()
+                            .map(Arc::new);
+                    }
+                    if txn_parent_fd.is_none() {
+                        txn_parent_fd = match open_part_dir_fd(&publication_root, transaction_parent) {
+                            Ok(fd) => Some(Arc::new(fd)),
+                            Err(err) if err.kind() == ErrorKind::NotFound => {
+                                if let Err(err) = std::fs::create_dir_all(transaction_parent) {
+                                    return Ok(Err(to_file_error(err).into()));
+                                }
+                                open_part_dir_fd(&publication_root, transaction_parent).ok().map(Arc::new)
+                            }
+                            Err(_) => {
+                                if !created_transaction_parent && let Err(err) = std::fs::create_dir_all(transaction_parent) {
+                                    return Ok(Err(to_file_error(err).into()));
+                                }
+                                None
+                            }
+                        };
+                    }
+                }
+                #[cfg(not(unix))]
                 if !created_transaction_parent && let Err(err) = std::fs::create_dir_all(transaction_parent) {
                     return Ok(Err(to_file_error(err).into()));
                 }
-                #[cfg(unix)]
-                let txn_parent_fd = open_dir_fd(transaction_parent).ok().map(Arc::new);
-                #[cfg(not(unix))]
-                let txn_parent_fd: Option<Arc<std::fs::File>> = None;
                 let staging_name = format!(".part-txn-{}", Uuid::new_v4());
                 let staging_path = transaction_parent.join(&staging_name);
                 let txn_dir_fd = match mkdir_and_open_part_txn_dir(txn_parent_fd.as_deref(), &staging_name, &staging_path) {
@@ -15180,6 +15372,7 @@ impl DiskAPI for LocalDisk {
                 let (had_old_data, had_old_meta) = match prepare_result {
                     Ok(flags) => flags,
                     Err(err) => {
+                        drop(src_parent_fd);
                         drop(txn_dir_fd);
                         drop(txn_parent_fd);
                         let _ = remove_dir_all_if_exists(&staging_path);
@@ -15198,6 +15391,7 @@ impl DiskAPI for LocalDisk {
                         meta,
                         had_old_data,
                         had_old_meta,
+                        src_parent_fd,
                         txn_dir_fd,
                         txn_parent_fd,
                     },
@@ -15469,6 +15663,7 @@ impl DiskAPI for LocalDisk {
             dst_meta_path,
             transaction_path,
             preverified_meta_and_old_flags,
+            mut src_parent_fd,
             txn_dir_fd,
             txn_parent_fd,
         ) = match cached_prepared {
@@ -15480,6 +15675,7 @@ impl DiskAPI for LocalDisk {
                 Some(entry.dst_meta_path),
                 Some(entry.transaction_path),
                 Some((entry.had_old_data, entry.had_old_meta)),
+                entry.src_parent_fd,
                 entry.txn_dir_fd,
                 entry.txn_parent_fd,
             ),
@@ -15515,6 +15711,7 @@ impl DiskAPI for LocalDisk {
                     dst_file_path,
                     dst_meta_path,
                     transaction_path,
+                    None,
                     None,
                     None,
                     None,
@@ -15564,8 +15761,18 @@ impl DiskAPI for LocalDisk {
                         return Err(to_file_error(e));
                     }
                 } else {
-                    let meta_op = lstat_std(&src_file_path).map_err(to_file_error)?;
-                    if meta_op.is_dir() {
+                    #[cfg(unix)]
+                    let is_dir = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), src_file_path.file_name()) {
+                        use rustix::fs::{AtFlags, FileType, statat};
+                        let stat = statat(src_p_fd, src_name, AtFlags::SYMLINK_NOFOLLOW)
+                            .map_err(|e| to_file_error(std::io::Error::from(e)))?;
+                        FileType::from_raw_mode(stat.st_mode).is_dir()
+                    } else {
+                        lstat_std(&src_file_path).map_err(to_file_error)?.is_dir()
+                    };
+                    #[cfg(not(unix))]
+                    let is_dir = lstat_std(&src_file_path).map_err(to_file_error)?.is_dir();
+                    if is_dir {
                         warn!(
                             event = EVENT_DISK_LOCAL_RENAME_REJECTED,
                             component = LOG_COMPONENT_ECSTORE,
@@ -15638,15 +15845,62 @@ impl DiskAPI for LocalDisk {
                     .then(|| admission.as_ref().map(|check| check.precondition()))
                     .flatten();
 
-                os::rename_all_with_precondition_and_parent_sync_std(
-                    &src_file_path,
-                    &dst_file_path,
-                    &dst_volume_dir,
-                    &publication_root,
-                    precondition.as_deref(),
-                    durability.syncs_commit_metadata() && transaction_publish_meta.is_none(),
-                )
-                .map_err(to_file_error)?;
+                #[cfg(unix)]
+                if !has_hooks && !src_is_dir && src_parent_fd.is_none() {
+                    src_parent_fd = src_file_path
+                        .parent()
+                        .and_then(|src_parent_path| open_part_dir_fd(&publication_root, src_parent_path).ok())
+                        .map(Arc::new);
+                }
+
+                #[cfg(unix)]
+                let fast_data_renamed = if !has_hooks
+                    && !src_is_dir
+                    && let (Some(parent_fd), Some(src_p_fd), Some(src_name), Some(dst_name)) = (
+                        txn_parent_fd.as_deref(),
+                        src_parent_fd.as_deref(),
+                        src_file_path.file_name(),
+                        dst_file_path.file_name(),
+                    ) {
+                    #[cfg(test)]
+                    os::multipart_source_syscall_failures::check(
+                        os::multipart_source_syscall_failures::Stage::Rename,
+                        &dst_file_path,
+                    )
+                    .map_err(to_file_error)?;
+                    os::record_native_publication(&dst_file_path);
+                    let rename_started = rustfs_io_metrics::put_stage_timer();
+                    let rename_res = rustix::fs::renameat(src_p_fd, src_name, parent_fd, dst_name).map_err(std::io::Error::from);
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+                        rename_started,
+                    );
+                    rename_res.map_err(to_file_error)?;
+                    if durability.syncs_commit_metadata() && transaction_publish_meta.is_none() {
+                        let parent = dst_file_path
+                            .parent()
+                            .ok_or_else(|| std::io::Error::other("source metadata parent is missing"))
+                            .map_err(to_file_error)?;
+                        os::fsync_directory_handle_std(parent, Some(parent_fd)).map_err(to_file_error)?;
+                    }
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(unix))]
+                let fast_data_renamed = false;
+
+                if !fast_data_renamed {
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &src_file_path,
+                        &dst_file_path,
+                        &dst_volume_dir,
+                        &publication_root,
+                        precondition.as_deref(),
+                        durability.syncs_commit_metadata() && transaction_publish_meta.is_none(),
+                    )
+                    .map_err(to_file_error)?;
+                }
 
                 if cfg!(test) || src_is_dir {
                     let dst_meta = lstat_std(&dst_file_path).map_err(to_file_error)?;
@@ -15665,16 +15919,53 @@ impl DiskAPI for LocalDisk {
 
                 if let Some(transaction_publish_meta) = transaction_publish_meta {
                     let dst_meta_path = dst_meta_path.as_ref().ok_or(DiskError::InvalidPath)?;
-                    os::rename_all_with_precondition_and_parent_sync_std(
-                        &transaction_publish_meta,
-                        dst_meta_path,
-                        &dst_volume_dir,
-                        &publication_root,
-                        precondition.as_deref(),
-                        durability.syncs_commit_metadata(),
-                    )
-                    .map_err(to_file_error)?;
+                    #[cfg(unix)]
+                    let fast_meta_renamed = if !has_hooks
+                        && let (Some(dir_fd), Some(parent_fd), Some(dst_meta_name)) =
+                            (txn_dir_fd.as_deref(), txn_parent_fd.as_deref(), dst_meta_path.file_name())
+                    {
+                        #[cfg(test)]
+                        os::multipart_source_syscall_failures::check(
+                            os::multipart_source_syscall_failures::Stage::Rename,
+                            dst_meta_path,
+                        )
+                        .map_err(to_file_error)?;
+                        os::record_native_publication(dst_meta_path);
+                        let rename_started = rustfs_io_metrics::put_stage_timer();
+                        let rename_res = rustix::fs::renameat(dir_fd, PART_TRANSACTION_PUBLISH_META, parent_fd, dst_meta_name)
+                            .map_err(std::io::Error::from);
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+                            rename_started,
+                        );
+                        rename_res.map_err(to_file_error)?;
+                        if durability.syncs_commit_metadata() {
+                            let parent = dst_meta_path
+                                .parent()
+                                .ok_or_else(|| std::io::Error::other("source metadata parent is missing"))
+                                .map_err(to_file_error)?;
+                            os::fsync_directory_handle_std(parent, Some(parent_fd)).map_err(to_file_error)?;
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(unix))]
+                    let fast_meta_renamed = false;
 
+                    if !fast_meta_renamed {
+                        os::rename_all_with_precondition_and_parent_sync_std(
+                            &transaction_publish_meta,
+                            dst_meta_path,
+                            &dst_volume_dir,
+                            &publication_root,
+                            precondition.as_deref(),
+                            durability.syncs_commit_metadata(),
+                        )
+                        .map_err(to_file_error)?;
+                    }
+
+                    drop(src_parent_fd.take());
                     for dir in src_file_path.ancestors().skip(1) {
                         if dir == src_volume_dir.as_path() || !dir.starts_with(&src_volume_dir) || is_root_path(dir) {
                             break;

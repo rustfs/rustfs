@@ -4545,7 +4545,7 @@ pub(crate) mod multipart_source_syscall_failures {
         );
         FailureGuard { key, failure }
     }
-    pub(super) fn check(stage: Stage, path: &Path) -> io::Result<()> {
+    pub(crate) fn check(stage: Stage, path: &Path) -> io::Result<()> {
         if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
             failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
             return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
@@ -5840,7 +5840,7 @@ impl PublicationRoot {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
+    pub(crate) fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
         self.open_relative(
             path,
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
