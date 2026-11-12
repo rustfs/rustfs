@@ -38,6 +38,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_entrypoint_directories.sh
 	./scripts/test_internode_grpc_ab_bench.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_grpc_window.py
 	./scripts/test_object_batch_bench_enhanced.sh
 	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
@@ -82,6 +83,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_artifact.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_group_proof.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_shards.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'

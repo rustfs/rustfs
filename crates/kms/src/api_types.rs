@@ -1348,7 +1348,7 @@ mod tests {
             let summary = KmsConfigSummary::from(&config);
             let response = KmsStatusResponse {
                 status: KmsServiceStatus::Configured,
-                backend_type: Some(config.backend.clone()),
+                backend_type: Some(config.backend),
                 healthy: None,
                 config_summary: Some(summary),
             };
