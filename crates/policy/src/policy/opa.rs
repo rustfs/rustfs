@@ -102,7 +102,7 @@ fn check() -> Result<(), OpaConfigError> {
     let prefix = format!("{ENV_PREFIX}{POLICY_PLUGIN_SUB_SYS}").to_uppercase();
     for (key, value) in env_list {
         if key.starts_with(&prefix) {
-            candidate.insert(key.to_string(), value);
+            candidate.insert(key, value);
         }
     }
 

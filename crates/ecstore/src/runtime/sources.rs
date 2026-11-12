@@ -526,7 +526,7 @@ pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disk
     let mut global_local_disk_map = map.write().await;
     for disk in disks {
         let path = disk.endpoint().to_string();
-        global_local_disk_map.insert(path, Some(disk.clone()));
+        global_local_disk_map.insert(path, Some(disk));
     }
 }
 
@@ -625,7 +625,7 @@ pub(crate) async fn initialize_local_disk_maps(
             })?;
 
             global_local_disk_map.insert(path, Some(disk.clone()));
-            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk.clone());
+            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk);
         }
     }
 
