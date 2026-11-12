@@ -1106,7 +1106,7 @@ impl LocalDisk {
                     if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
                         staged_backup,
                         &backup_path,
-                        &dst_volume_dir_owned,
+                        &skip_parent,
                         &publication_root_owned,
                         None,
                         sync_commit_metadata,
@@ -1464,11 +1464,17 @@ impl LocalDisk {
                         }
                         if has_dst_buf_owned.is_none() {
                             let mut ancestor = dst_file_path_owned.parent().and_then(|object_dir| object_dir.parent());
+                            let mut ancestor_step = 0usize;
                             while let Some(dir) = ancestor {
                                 if !dir.starts_with(&dst_volume_dir_owned) {
                                     break;
                                 }
-                                if let Err(err) = os::fsync_dir_limited_std(dir) {
+                                if let Err(err) = os::fsync_commit_ancestor_directory_limited_std(
+                                    dir,
+                                    &dst_volume_dir_owned,
+                                    ancestor_step,
+                                    &directory_guard_owned,
+                                ) {
                                     return Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(
                                         to_file_error(err).into(),
                                         true,
@@ -1478,6 +1484,7 @@ impl LocalDisk {
                                     break;
                                 }
                                 ancestor = dir.parent();
+                                ancestor_step += 1;
                             }
                         }
                     }
