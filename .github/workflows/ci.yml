@@ -88,6 +88,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
       plan: ${{ steps.scope.outputs.plan }}
@@ -107,7 +110,14 @@ jobs:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_EVENT_ACTION: ${{ github.event.action }}
           CI_REHEARSE_SHARDS: ${{ inputs.rehearse_workspace_shards && 'true' || 'false' }}
+          # A push whose tree a successful merge-group run already passed skips
+          # the validation jobs; the lookup answers null on any doubt.
+          PROOF_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            CI_MERGE_GROUP_PROOF="$(GITHUB_TOKEN="$PROOF_TOKEN" python3 -I scripts/ci_merge_group_proof.py)" || CI_MERGE_GROUP_PROOF=null
+            export CI_MERGE_GROUP_PROOF
+          fi
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             python3 -I scripts/ci_gate.py select
           elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
@@ -116,7 +126,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=4$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=5$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
