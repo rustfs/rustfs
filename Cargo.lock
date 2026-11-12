@@ -10781,6 +10781,7 @@ dependencies = [
  "flatbuffers",
  "hotpath",
  "prost 0.14.4",
+ "rcgen",
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",

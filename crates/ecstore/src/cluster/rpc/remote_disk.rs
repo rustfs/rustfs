@@ -3725,13 +3725,17 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RpcStatus,
+                        );
                         return Err(err.into());
                     }
                 };
 
                 if !response.success {
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                        crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RemoteResponse,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -3750,7 +3754,9 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, decode_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::ResponseDecode,
+                        );
                         return Err(err);
                     }
                 };

@@ -85,6 +85,7 @@ uuid = { workspace = true }
 doctest = false
 
 [dev-dependencies]
+rcgen = { workspace = true }
 serde_json = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["macros"] }

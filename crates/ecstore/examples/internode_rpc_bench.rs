@@ -25,7 +25,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use uuid::Uuid;
 
 const MAX_PAYLOAD: usize = 8 * 1024 * 1024;
-const MAX_BULK_ROWS: usize = 1_000_000;
+const MAX_BULK_ROWS: usize = 4_000_000;
 const MAX_CONTROL_ROWS: u32 = 1_000_000;
 
 #[derive(Clone, Serialize, Deserialize)]

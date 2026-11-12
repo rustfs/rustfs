@@ -23,6 +23,7 @@ mod runtime_sources;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{cache_connection, cached_connection, evict_connection_with_log_level};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     error::Error,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
@@ -3295,22 +3296,25 @@ fn bulk_channel_pool_size() -> usize {
 /// Bounds peer-selection bookkeeping across topology changes. Evicting a cursor
 /// only resets its next slot; established channels keep their existing cache identity.
 const BULK_CHANNEL_CURSOR_CACHE_CAPACITY: usize = 512;
+// Cover the default pool and common tuning pools without allocating
+// from an arbitrarily large environment-configured pool size.
+const BULK_CHANNEL_CACHED_KEYS: usize = 4;
 static BULK_CHANNEL_CURSORS: LazyLock<BulkChannelCursors> = LazyLock::new(BulkChannelCursors::default);
 
 #[derive(Default)]
 struct BulkChannelCursors {
-    peers: StdRwLock<HashMap<String, Arc<AtomicUsize>>>,
+    peers: StdRwLock<HashMap<String, Arc<BulkChannelCursor>>>,
 }
 
 impl BulkChannelCursors {
-    fn next(&self, addr: &str, pool_size: usize) -> usize {
+    fn for_peer(&self, addr: &str) -> Arc<BulkChannelCursor> {
         let cached = self
             .peers
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(addr)
             .cloned();
-        let cursor = cached.unwrap_or_else(|| {
+        cached.unwrap_or_else(|| {
             let mut peers = self.peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cursor) = peers.get(addr) {
                 return Arc::clone(cursor);
@@ -3320,11 +3324,31 @@ impl BulkChannelCursors {
             {
                 peers.remove(&victim);
             }
-            let cursor = Arc::new(AtomicUsize::new(0));
+            let cursor = Arc::new(BulkChannelCursor {
+                next: AtomicUsize::new(0),
+                keys: std::array::from_fn(|index| bulk_cache_key(addr, index)),
+            });
             peers.insert(addr.to_owned(), Arc::clone(&cursor));
             cursor
-        });
-        cursor.fetch_add(1, Ordering::Relaxed) % pool_size
+        })
+    }
+}
+
+struct BulkChannelCursor {
+    next: AtomicUsize,
+    keys: [String; BULK_CHANNEL_CACHED_KEYS],
+}
+
+impl BulkChannelCursor {
+    fn next(&self, pool_size: usize) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % pool_size
+    }
+
+    fn cache_key(&self, addr: &str, index: usize) -> Cow<'_, str> {
+        match self.keys.get(index) {
+            Some(key) => Cow::Borrowed(key),
+            None => Cow::Owned(bulk_cache_key(addr, index)),
+        }
     }
 }
 
@@ -3438,8 +3462,9 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
         }
 
         let pool_size = bulk_channel_pool_size();
-        let idx = BULK_CHANNEL_CURSORS.next(addr, pool_size);
-        let cache_key = bulk_cache_key(addr, idx);
+        let cursor = BULK_CHANNEL_CURSORS.for_peer(addr);
+        let idx = cursor.next(pool_size);
+        let cache_key = cursor.cache_key(addr, idx);
         if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
             return Ok(channel);
         }
@@ -3602,26 +3627,13 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         generation = Some(outbound_tls.generation.0);
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
-            // Derive the hostname from the HTTPS URL for TLS hostname verification.
-            let domain = dial_addr
-                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
-            let tls = if !domain.is_empty() {
-                let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
-                    let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
-                    cfg = cfg.identity(identity);
-                }
-                cfg
-            } else {
-                // Fallback: configure TLS without explicit domain if parsing fails.
-                ClientTlsConfig::new().ca_certificate(ca)
-            };
+            // Tonic derives certificate verification and SNI from the endpoint URI,
+            // including bracketed IPv6 hosts.
+            let mut tls = ClientTlsConfig::new().ca_certificate(ca);
+            if let Some(id) = outbound_tls.mtls_identity.as_ref() {
+                let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
+                tls = tls.identity(identity);
+            }
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", dial_addr);
         } else {
@@ -3994,6 +4006,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls02_custom_ca_uses_ipv6_uri_and_rejects_wrong_certificate_names() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        use tonic::transport::ServerTlsConfig;
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let restore_generation = previous.generation.0.checked_add(3).expect("test generation capacity");
+        let mut observations = Vec::new();
+        for (offset, certificate_name) in [(1, "::1"), (2, "localhost")] {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec![certificate_name.to_owned()]).expect("ephemeral TLS test certificate");
+            let certificate_pem = certificate.cert.pem();
+            let server_tls = ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+                &certificate_pem,
+                certificate.signing_key.serialize_pem(),
+            ));
+            let listener = tokio::net::TcpListener::bind("[::1]:0")
+                .await
+                .expect("IPv6 loopback TLS listener");
+            let addr = format!("https://{}", listener.local_addr().expect("IPv6 test server address"));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                if stream.is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                stream
+            });
+            let mut server = tonic::transport::Server::builder()
+                .tls_config(server_tls)
+                .expect("valid TLS server configuration");
+            let server = tokio::spawn(async move {
+                server
+                    .add_routes(tonic::service::Routes::default())
+                    .serve_with_incoming(incoming)
+                    .await
+            });
+            let material = OutboundTlsMaterial {
+                root_ca_pem: certificate_pem.into_bytes(),
+                mtls_identity: None,
+            };
+            publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+            let mut results = Vec::new();
+            for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+                results.push(
+                    build_channel(&addr, &key)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                );
+                evict_cached_channel(&key, ConnectionEvictionLogLevel::Debug).await;
+            }
+            server.abort();
+            let _ = server.await;
+            observations.push((results, accepted.load(Ordering::SeqCst)));
+        }
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+
+        assert!(
+            observations[0].0.iter().all(Result::is_ok),
+            "IPv6 control and bulk channels must verify the URI host: {:?}",
+            observations[0].0
+        );
+        assert!(
+            observations[1].0.iter().all(Result::is_err),
+            "a trusted certificate for localhost must be rejected for ::1"
+        );
+        assert!(
+            observations.iter().all(|(_, accepted)| *accepted == 2),
+            "both certificate cases must exercise actual control and bulk TLS connections"
+        );
+    }
+
+    #[tokio::test]
     async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
         use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
         let _test_guard = TLS02_TEST_LOCK.lock().await;
@@ -4146,7 +4237,7 @@ mod tests {
         let cursors = BulkChannelCursors::default();
         for round in 0..12 {
             for peer in ["peer-a", "peer-b"] {
-                assert_eq!(cursors.next(peer, 2), round % 2, "each peer must use both slots");
+                assert_eq!(cursors.for_peer(peer).next(2), round % 2, "each peer must use both slots");
             }
         }
     }
@@ -4161,7 +4252,7 @@ mod tests {
                     let mut counts = [[0; 4]; 2];
                     for _ in 0..100 {
                         for (peer, counts) in ["peer-a", "peer-b"].into_iter().zip(&mut counts) {
-                            counts[cursors.next(peer, 4)] += 1;
+                            counts[cursors.for_peer(peer).next(4)] += 1;
                         }
                     }
                     counts
@@ -4183,11 +4274,33 @@ mod tests {
     fn bulk_round_robin_bounds_retired_peer_bookkeeping() {
         let cursors = BulkChannelCursors::default();
         for index in 0..BULK_CHANNEL_CURSOR_CACHE_CAPACITY * 3 {
-            assert_eq!(cursors.next(&format!("peer-{index}"), 2), 0);
+            assert_eq!(cursors.for_peer(&format!("peer-{index}")).next(2), 0);
         }
         assert_eq!(cursors.peers.read().expect("cursor cache").len(), BULK_CHANNEL_CURSOR_CACHE_CAPACITY);
-        assert_eq!(cursors.next("current-peer", 2), 0);
-        assert_eq!(cursors.next("current-peer", 2), 1);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 0);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 1);
+    }
+
+    #[test]
+    fn bulk_pool_hits_borrow_stable_keys_and_large_pools_remain_bounded() {
+        let cursors = BulkChannelCursors::default();
+        let peer = cursors.for_peer("https://peer.example:9000");
+        let same_peer = cursors.for_peer("https://peer.example:9000");
+        assert!(Arc::ptr_eq(&peer, &same_peer));
+        for index in 0..BULK_CHANNEL_CACHED_KEYS {
+            let first = peer.cache_key("https://peer.example:9000", index);
+            let second = same_peer.cache_key("https://peer.example:9000", index);
+            assert!(matches!(first, Cow::Borrowed(_)));
+            assert_eq!(first, bulk_cache_key("https://peer.example:9000", index));
+            assert_eq!(first.as_ptr(), second.as_ptr(), "cache hits reuse the established key allocation");
+        }
+        let key = peer.cache_key("https://peer.example:9000", usize::MAX - 1);
+        assert!(matches!(key, Cow::Owned(_)));
+        assert_eq!(key, bulk_cache_key("https://peer.example:9000", usize::MAX - 1));
+        assert_eq!(peer.keys.len(), BULK_CHANNEL_CACHED_KEYS);
+        for (sequence, size) in [1, 2, 4, usize::MAX, 2].into_iter().enumerate() {
+            assert_eq!(peer.next(size), sequence % size, "pool changes preserve the peer's selection sequence");
+        }
     }
 
     #[test]
