@@ -10048,11 +10048,13 @@ dependencies = [
 name = "rustfs-gateway-adapter"
 version = "1.0.5"
 dependencies = [
+ "bytes",
  "http 1.5.0",
  "rustfs-credentials",
  "rustfs-gateway",
  "rustfs-gateway-http",
  "rustfs-iam",
+ "rustfs-keystone",
  "rustfs-policy",
  "serde_json",
  "time",

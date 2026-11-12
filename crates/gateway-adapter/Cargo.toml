@@ -43,6 +43,9 @@ rustfs-policy = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 rustfs-gateway-http = { workspace = true }
+# Test-only: the Keystone layer's task-local, to show that it alone authenticates nothing.
+rustfs-keystone = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
