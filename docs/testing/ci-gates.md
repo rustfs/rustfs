@@ -39,6 +39,8 @@ The aggregate requires the validation lanes already selected by `ci.yml`; this c
 
 Superseded PR attempts are cancelled. A running main validation finishes, with only the newest pending main run retained, so frequent merges cannot continuously cancel the full baseline. Having a `merge_group` trigger does not itself require use of the merge queue.
 
+A push whose tree a successful `merge_group` run of `ci.yml` already validated does not validate it again. A merge-queue landing fast-forwards the branch to the group's commit, so `Select CI scope` looks that run up (`scripts/ci_merge_group_proof.py`, with the job's read-only Actions token) and plans mode `proven`: `Select CI scope`, `Typos` and `Quick Checks` run, every validation job is skipped, and `Test and Lint` passes only if each of them was skipped. The plan and the aggregate's summary name the proving run; a job skipped for any other reason keeps its own reason. A push that did not come through the queue, such as a direct administrator merge, has no such run, and any doubt about the lookup (no token, an API or network error, a rate limit, no matching successful run, a different tree) plans the full validation.
+
 Protocol matrix jobs finish independently when a sibling fails. Each executed protocol test step preserves its log and available JUnit under a separate, attempt-specific artifact; a skipped test step cannot upload a cached report.
 
 The four site-replication state-writer concurrency proofs reserve the available nextest slots in both local and CI profiles. This isolates their durable IO from unrelated test processes while retaining each proof's internal two-writer race, production five-second lock-acquisition limit, assertions, and zero retries.
