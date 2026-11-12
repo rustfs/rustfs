@@ -487,7 +487,7 @@ mod fast_lock_tests {
             // Waiter: starts a touch later so the holder wins the lock first, then
             // must survive the whole hold and acquire promptly after the release.
             let waiter_mgr = manager.clone();
-            let waiter_key = key.clone();
+            let waiter_key = key;
             handles.push(tokio::spawn(async move {
                 sleep(Duration::from_millis(10)).await;
                 let request = ObjectLockRequest::new_write(waiter_key, "waiter").with_acquire_timeout(Duration::from_secs(5));

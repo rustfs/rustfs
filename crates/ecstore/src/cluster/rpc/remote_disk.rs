@@ -55,6 +55,10 @@ use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, measure_client_rpc,
+};
+use rustfs_io_metrics::internode_metrics::{
     INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE,
     INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE,
     INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
@@ -3737,13 +3741,17 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RpcStatus,
+                        );
                         return Err(err.into());
                     }
                 };
 
                 if !response.success {
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                        crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RemoteResponse,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -3762,7 +3770,9 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, decode_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::ResponseDecode,
+                        );
                         return Err(err);
                     }
                 };
@@ -3824,12 +3834,8 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response_result = client.batch_read_version(request).await;
-                    if let Some(rpc_started) = rpc_started {
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
-                            rpc_started.elapsed(),
-                        );
-                    }
+                    let response_result =
+                        measure_client_rpc(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, client.batch_read_version(request)).await;
                     let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
@@ -4855,9 +4861,7 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let rpc_started = Instant::now();
-                let response = client.read_multiple(request).await;
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = measure_client_rpc(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, client.read_multiple(request)).await;
                 let response = response?.into_inner();
 
                 if !response.success {
@@ -4909,8 +4913,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
-                let rpc_started = Instant::now();
-                let response = match client.write_all(request).await {
+                let response = match measure_client_rpc(INTERNODE_OPERATION_GRPC_WRITE_ALL, client.write_all(request)).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
@@ -4918,7 +4921,6 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -5016,16 +5018,13 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
-                let rpc_started = Instant::now();
-                let response = match client.read_all(request).await {
+                let response = match measure_client_rpc(INTERNODE_OPERATION_GRPC_READ_ALL, client.read_all(request)).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                         return Err(err.into());
                     }
                 };
-
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();

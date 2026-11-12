@@ -2384,11 +2384,7 @@ fn should_buffer_get_object_in_memory_with_threshold(
         );
     }
 
-    if response_content_length > effective_threshold {
-        return false;
-    }
-
-    true
+    response_content_length <= effective_threshold
 }
 
 impl DefaultObjectUsecase {

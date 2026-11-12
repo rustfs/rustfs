@@ -33,7 +33,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "4"
+PLAN_CONTRACT = "5"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -311,7 +311,8 @@ def closure(seeds: set[str], graph: dict[str, set[str]], reverse: bool = False) 
 def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "", rehearse_shards: bool = False) -> dict[str, str]:
     if event not in EVENTS:
         raise ValueError(f"unsupported CI event: {event!r}")
-    if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
+    # `proven`: a push whose tree a successful merge-group run already validated.
+    if mode not in ("docs", "e2e", "full", "proven") or (mode != "full" and event != ("push" if mode == "proven" else "pull_request")):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
     if type(rehearse_shards) is not bool or (rehearse_shards and event != "workflow_dispatch"):
         raise ValueError("shard rehearsal requires an explicit manual event")
@@ -376,7 +377,8 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
              "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
 
 
-def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False) -> dict:
+def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False,
+                *, proof: dict | None = None) -> dict:
     if event not in EVENTS or not SHA.fullmatch(head):
         raise ValueError("unsupported event or missing candidate SHA")
     tree = git(root, "rev-parse", f"{head}^{{tree}}").strip()
@@ -473,6 +475,10 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
     effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
     effective_connect = mode == "full" if shadow else connect
     effective_full = mode == "full" if shadow else full
+    proven = event == "push" and mode == "full" and isinstance(proof, dict) and proof.get("tree") == tree
+    if proven:
+        mode = "proven"
+        reasons.append(f"merge_group run {proof['url']} already validated tree {tree}")
     jobs = expected_results(mode, event, ref, effective_connect, action, rehearse_shards)
     plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
@@ -481,7 +487,9 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
-            "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
+            "not_applicable": {job: f"proven by {proof['url']}" if proven else f"not required for {mode}/{event}"
+                               for job, result in jobs.items() if result == "skipped"},
+            "proven_by": proof if proven else None}
     return plan
 
 
@@ -513,6 +521,12 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
         raise ValueError("invalid plan packages")
     if plan.get("mode") != "docs" and not packages:
         raise ValueError("code validation plan must not be empty")
+    proof = plan.get("proven_by")
+    if (proof is not None or plan.get("mode") == "proven") and not (
+            isinstance(proof, dict) and plan.get("mode") == "proven" and proof.get("tree") == plan["tree"]
+            and type(proof.get("run_id")) is int and proof["run_id"] > 0
+            and re.fullmatch(rf"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/{proof['run_id']}", str(proof.get("url")))):
+        raise ValueError("a proven push requires the merge-group run that validated its tree")
     expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""), plan["rehearse_shards"])
     if plan.get("jobs") != expected:
         raise ValueError("plan job contract differs from selected responsibilities")
@@ -800,7 +814,7 @@ def check_workflow(root: Path) -> list[str]:
     # Truth tables protect behavior while allowing equivalent expression and YAML formatting.
     for event, rehearse_shards in [(event, rehearsal) for event in EVENTS
                                    for rehearsal in ((False, True) if event == "workflow_dispatch" else (False,))]:
-        for mode in (("docs", "e2e", "full") if event == "pull_request" else ("full",)):
+        for mode in {"pull_request": ("docs", "e2e", "full"), "push": ("full", "proven")}.get(event, ("full",)):
             for ref in ("refs/heads/main", "refs/heads/release"):
                 for connect in (True, False) if event == "pull_request" and mode == "full" else (mode == "full",):
                     for action in ("opened", "closed") if event == "pull_request" else ("",):
@@ -877,9 +891,14 @@ def main() -> int:
         return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
     if sys.argv[1:] == ["select"]:
         try:
+            # scripts/ci_merge_group_proof.py output; select_plan accepts it only for a push of the same tree.
+            try:
+                proof = json.loads(os.environ.get("CI_MERGE_GROUP_PROOF") or "null")
+            except ValueError:
+                proof = None
             plan = select_plan(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""),
-                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""),
-                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true")
+                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""), Path.cwd(),
+                               os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true", proof=proof)
             with open(os.environ["GITHUB_OUTPUT"], "a") as output:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
@@ -907,7 +926,16 @@ def main() -> int:
                 base = (payload["pull_request"]["base"]["sha"] if event == "pull_request" else
                         payload["merge_group"]["base_sha"] if event == "merge_group" else payload.get("before", ""))
                 action = payload.get("action", "")
-            errors = verify_results(json.loads(os.environ["CI_NEEDS"]), event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            needs = json.loads(os.environ["CI_NEEDS"])
+            errors = verify_results(needs, event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            plan = json.loads(needs["classify-changes"]["outputs"].get("plan") or "null")
+            if not errors and isinstance(plan, dict) and plan["mode"] == "proven":
+                # The check list shows these jobs as skipped like any other; say why.
+                note = f"Validation jobs were skipped as proven: merge_group run {plan['proven_by']['url']} passed tree {plan['tree']}."
+                print(note)
+                if os.environ.get("GITHUB_STEP_SUMMARY"):
+                    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                        summary.write(note + "\n")
         except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
             errors = [str(error)]
     elif sys.argv[1:] == ["--check-workflow"]:

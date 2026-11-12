@@ -104,6 +104,16 @@ const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
 ];
 
+const INTERNODE_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_system_network_internode_operation_duration_ms",
+    "rustfs_system_network_internode_operation_server_duration_ms",
+];
+// Internode instruments record milliseconds, including sub-millisecond control RPCs.
+const INTERNODE_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0, 250.0,
+    500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
+];
+
 const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
 const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
@@ -516,6 +526,8 @@ fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
         Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
     } else if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) {
         Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
+    } else if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS)
     } else {
         None
     }
@@ -1133,6 +1145,9 @@ mod tests {
         for name in OBJECT_LOCK_DURATION_HISTOGRAM_METRICS {
             assert_eq!(duration_histogram_buckets(name), Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS));
         }
+        for name in INTERNODE_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS));
+        }
         for name in [
             "rustfs_io_put_object_request_duration_seconds",
             "rustfs_io_get_object_response_size_bytes",
@@ -1164,6 +1179,8 @@ mod tests {
         for (name, observations) in [
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[0], [0.002, 0.004, 0.012]),
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[0], [0.04, 3.2, 31000.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[1], [0.02, 1.2, 1300.0]),
         ] {
             let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
             for seconds in observations {
@@ -1181,6 +1198,8 @@ mod tests {
             let expected = match metric.name() {
                 "rustfs_object_lock_diag_acquire_duration_seconds" => [(0.002, 1), (0.004, 1), (0.015, 1)],
                 "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
+                "rustfs_system_network_internode_operation_duration_ms" => [(0.05, 1), (4.0, 1), (60000.0, 1)],
+                "rustfs_system_network_internode_operation_server_duration_ms" => [(0.025, 1), (1.5, 1), (2500.0, 1)],
                 _ => continue,
             };
             let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
@@ -1196,7 +1215,7 @@ mod tests {
             assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
             checked += 1;
         }
-        assert_eq!(checked, 2, "both acquisition and hold histograms were exported");
+        assert_eq!(checked, 4, "lock and internode duration histograms were exported");
         provider.shutdown().expect("stop lock histogram test provider");
     }
 
