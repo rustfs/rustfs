@@ -209,13 +209,6 @@ ensure_local_directory() {
   fi
 }
 
-has_volume_range() {
-  case "$1" in
-    *'{'*) printf '%s\n' "$1" | grep -E -q '\{[0-9]+\.\.\.?[0-9]+\}' ;;
-    *) return 1 ;;
-  esac
-}
-
 has_local_pool_list() {
   pool_count=0
   for pool in $1; do
@@ -227,100 +220,81 @@ has_local_pool_list() {
   [ "$pool_count" -gt 1 ]
 }
 
-# 2) Process data volumes (separate from log directory)
+# RustFS pads every drive number in a padded pool expression. Legacy path
+# lists retain the shell's original numbering for existing drive directories.
+volume_range_numbers() {
+  if [ "$3" = true ]; then
+    case "$1" in
+      0?*) seq -f "%0${#2}.0f" "$1" "$2"; return ;;
+    esac
+  fi
+  number=$1
+  while [ "$number" -le "$2" ]; do
+    printf '%s\n' "$number"
+    number=$((number + 1))
+  done
+}
+
+# Expand the ranges in source order to preserve drive ordering in legacy lists.
+expand_volume_paths() {
+  expanded_paths=$1
+  case "$1" in
+    *'{'*'}'*) ;;
+    *) return 0 ;;
+  esac
+  # grep returns 1 for literal braces that contain no numeric range.
+  ranges=$(printf '%s\n' "$1" | grep -Eo '\{[0-9]+\.\.\.?[0-9]+\}') || [ "$?" -eq 1 ] || return 1
+  for range in $ranges; do
+    bounds=${range#\{}
+    bounds=${bounds%\}}
+    numbers=$(volume_range_numbers "${bounds%%.*}" "${bounds##*.}" "$2") || return 1
+    next_paths=""
+    for path in $expanded_paths; do
+      prefix=${path%%"$range"*}
+      suffix=${path#*"$range"}
+      for number in $numbers; do
+        next_paths="$next_paths $prefix$number$suffix"
+      done
+    done
+    expanded_paths=${next_paths# }
+  done
+}
+
 DATA_VOLUMES=""
 process_data_volumes() {
-  VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
-  # Normalize comma/tab delimiters only when present (the second pattern is a literal tab).
-  case "$VOLUME_RAW" in
-    *','*|*'	'*) VOLUME_LIST_RAW=$(printf '%s\n' "$VOLUME_RAW" | tr ',\t' ' ') ;;
-    *) VOLUME_LIST_RAW="$VOLUME_RAW" ;;
+  volumes="${RUSTFS_VOLUMES:-/data}"
+  case "$volumes" in
+    *','*|*'	'*) volumes=$(printf '%s\n' "$volumes" | tr ',\t' ' ') ;;
   esac
-  
-  # RustFS uses each local ellipsis argument as a pool boundary.
-  LOCAL_POOL_ARGS=""
-  if has_local_pool_list "$VOLUME_LIST_RAW"; then
-    LOCAL_POOL_ARGS="$VOLUME_LIST_RAW"
+  preserve_pools=false
+  if has_local_pool_list "$volumes"; then
+    preserve_pools=true
   fi
 
-  # Manually expand {N...M} ranges since sh doesn't support brace expansion on
-  # variables. A single token can carry MORE than one range — the distributed
-  # form "http://rustfs{1...4}:9000/data/rustfs{0...3}" has two — so expand the
-  # FIRST range in each token and re-scan until no ranges remain. Operating on
-  # only the first brace (via #*{ / %%}* rather than ##*} / %}) is what keeps
-  # multi-range tokens intact; the previous single-pass expander collapsed them
-  # to "http://rustfs1" and silently dropped the disk path.
-  VOLUME_LIST="$VOLUME_LIST_RAW"
-  while has_volume_range "$VOLUME_LIST"; do
-      NEXT_LIST=""
-      for vol in $VOLUME_LIST; do
-          if has_volume_range "$vol"; then
-               PREFIX=${vol%%\{*}
-               REST=${vol#*\}}
-               RANGE=${vol#*\{}
-               RANGE=${RANGE%%\}*}
-               RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
-               START=${RANGE%%..*}
-               END=${RANGE##*..}
-
-               # Check if START and END are numbers
-               if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" ] 2>/dev/null; then
-                   # Match RustFS padding when it expands the original pool arguments.
-                   case "${LOCAL_POOL_ARGS:+$START}" in
-                     0?*)
-                       for i in $(seq -f "%0${#END}.0f" "$START" "$END"); do
-                         NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
-                       done
-                       continue
-                       ;;
-                   esac
-                   i=$START
-                   while [ "$i" -le "$END" ]; do
-                     NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
-                     i=$((i+1))
-                   done
-               else
-                   # Fallback if not numbers
-                   NEXT_LIST="$NEXT_LIST $vol"
-               fi
-          else
-               NEXT_LIST="$NEXT_LIST $vol"
-          fi
-      done
-      VOLUME_LIST="$NEXT_LIST"
-  done
-
-  # CREATE_DIRS holds every local filesystem path that must exist before
-  # startup. DATA_VOLUMES holds only the paths that are also appended as CLI
-  # args (bare absolute paths). Distributed URL-form endpoints are read from
-  # RUSTFS_VOLUMES by rustfs directly, so they must NOT be appended as args,
-  # but their local path component still has to exist on disk — otherwise
-  # LocalDisk init aborts with VolumeNotFound (rustfs no longer auto-creates
-  # the disk root).
-  CREATE_DIRS=""
-  for vol in $VOLUME_LIST; do
-    case "$vol" in
+  create_dirs=""
+  for volume in $volumes; do
+    case "$volume" in
       /*)
-        DATA_VOLUMES="$DATA_VOLUMES $vol"
-        CREATE_DIRS="$CREATE_DIRS $vol"
+        expand_volume_paths "$volume" "$preserve_pools"
+        if [ "$preserve_pools" = true ]; then
+          DATA_VOLUMES="$DATA_VOLUMES $volume"
+        else
+          DATA_VOLUMES="$DATA_VOLUMES $expanded_paths"
+        fi
         ;;
-      *://*)
-        # e.g. http://node0:9000/data/rustfs0 -> /data/rustfs0
-        vol_rest=${vol#*://}
-        case "$vol_rest" in
-          */*) CREATE_DIRS="$CREATE_DIRS /${vol_rest#*/}" ;;
-          *)   : ;; # URL without a path component; nothing local to create
-        esac
+      *://*/*)
+        # RustFS reads URL endpoints from the environment. Prepare their local directories.
+        host_and_path=${volume#*://}
+        expand_volume_paths "/${host_and_path#*/}" false
         ;;
-      *)  : ;; # skip anything else we don't recognize
+      *) continue ;;
     esac
+    create_dirs="$create_dirs $expanded_paths"
   done
 
-  DATA_VOLUMES=${LOCAL_POOL_ARGS:-$DATA_VOLUMES}
-
-  echo "Initializing data directories:$CREATE_DIRS"
-  for vol in $CREATE_DIRS; do
-    ensure_local_directory "$vol" RUSTFS_VOLUMES
+  echo "Initializing data directories:$create_dirs"
+  for path in $create_dirs; do
+    ensure_local_directory "$path" RUSTFS_VOLUMES
   done
 }
 

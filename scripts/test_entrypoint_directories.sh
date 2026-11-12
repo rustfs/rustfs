@@ -168,6 +168,15 @@ $TMP_DIR/range${dots}1"
   [ -d "$TMP_DIR/range${dots}0" ] && [ -d "$TMP_DIR/range${dots}1" ]
 done
 
+# An existing path list keeps its drive order across repeated ranges.
+expect_volumes "$TMP_DIR/rack{0..1}/disk{0..1}" "$TMP_DIR/rack0/disk0
+$TMP_DIR/rack0/disk1
+$TMP_DIR/rack1/disk0
+$TMP_DIR/rack1/disk1"
+expect_volumes "$TMP_DIR/legacy{01...03}" "$TMP_DIR/legacy01
+$TMP_DIR/legacy2
+$TMP_DIR/legacy3"
+
 # Each local pool is one server argument, with all of its drive directories ready.
 pool0="$TMP_DIR/rustfs0/{0...3}"
 pool1="$TMP_DIR/rustfs1/{0...3}"
