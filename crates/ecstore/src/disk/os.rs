@@ -611,6 +611,7 @@ pub(crate) mod prepare_rename_test_hooks {
             .push_back(Box::new(hook));
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn has_hooks() -> bool {
         AFTER_COMPONENT_OPENED.lock().values().any(|q| !q.is_empty())
     }
