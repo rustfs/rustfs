@@ -143,6 +143,7 @@ pub(crate) async fn prepare_embedded_startup_config(
     mut volumes: Vec<String>,
     region: String,
 ) -> Result<EmbeddedStartupConfig> {
+    Config::validate_root_credentials(&access_key, &secret_key)?;
     let mut temp_dir_guard = None;
     if volumes.is_empty() {
         let dir = tempfile::tempdir().map_err(|err| Error::other(format!("failed to create temp dir: {err}")))?;
@@ -609,7 +610,7 @@ mod tests {
         let prepared = prepare_embedded_startup_config(
             "127.0.0.1:9000".to_string(),
             "access".to_string(),
-            "secret".to_string(),
+            "embedded-secret".to_string(),
             Vec::new(),
             "us-west-2".to_string(),
         )
@@ -618,15 +619,32 @@ mod tests {
 
         assert_eq!(prepared.config.address, "127.0.0.1:9000");
         assert_eq!(prepared.config.access_key, "access");
-        assert_eq!(prepared.config.secret_key, "secret");
+        assert_eq!(prepared.config.secret_key, "embedded-secret");
         assert_eq!(prepared.config.region.as_deref(), Some("us-west-2"));
         assert_eq!(prepared.identity.access_key, "access");
-        assert_eq!(prepared.identity.secret_key, "secret");
+        assert_eq!(prepared.identity.secret_key, "embedded-secret");
         assert_eq!(prepared.identity.region, "us-west-2");
         assert!(!prepared.config.console_enable);
         assert_eq!(prepared.config.volumes.len(), 1);
         assert!(std::path::Path::new(&prepared.config.volumes[0]).exists());
         assert!(prepared.temp_dir_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_rejects_short_keys_before_creating_volumes() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let volume = parent.path().join("data");
+        let result = prepare_embedded_startup_config(
+            "127.0.0.1:0".to_string(),
+            "root".to_string(),
+            "1234567".to_string(),
+            vec![volume.display().to_string()],
+            "us-east-1".to_string(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(err) if err.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(!volume.exists());
     }
 
     #[tokio::test]
@@ -637,7 +655,7 @@ mod tests {
         let prepared = prepare_embedded_startup_config(
             "127.0.0.1:9000".to_string(),
             "access".to_string(),
-            "secret".to_string(),
+            "embedded-secret".to_string(),
             vec![volume.display().to_string()],
             "us-east-1".to_string(),
         )

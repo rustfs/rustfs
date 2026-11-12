@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deployment
 
+- Before upgrading, verify that the configured root access key is at least 3 bytes and the root secret key is at least 8 bytes. RustFS now rejects shorter values at startup and identifies the setting to update. Version 1.0.5 accepted these settings at startup and returned HTTP 500 when root requested STS credentials. Coordinate root credential changes across all nodes and clients. See [root credential rotation considerations](docs/operations/two-factor-auth.md#root-credentials-cannot-be-changed-at-runtime).
+
 - Existing volumes created by older root-running container images must be writable by the non-root runtime identity before upgrading. The default container UID/GID is `10001:10001`; stop the affected instances, verify host mount paths, and for ordinary bind mounts run `sudo chown -R 10001:10001 /actual/data /actual/logs` on each RustFS data/log mount. Account for ACLs, NFS, Kubernetes, and rootless UID mappings. Image-build ownership changes do not migrate mounted data. See the Docker Quick Start in [README.md](README.md).
 - Local disk initialization now checks file creation, writing, and deletion in the data root and fixed internal metadata directories. Unwritable disks are rejected using existing startup/quorum rules, with filesystem errors and Unix runtime/owner IDs logged for permission failures, instead of admitting those disks and discovering the mismatch on a later write. Existing object trees are not scanned and volume ownership is never changed automatically.
 
