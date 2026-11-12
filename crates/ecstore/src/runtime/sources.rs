@@ -26,7 +26,7 @@ use crate::{
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, ReplicationStats},
     config::{get_global_storage_class, get_global_storage_class_snapshot, set_global_storage_class, storageclass},
-    disk::{DiskAPI, DiskOption, DiskStore, new_disk},
+    disk::{DiskAPI, DiskOption, DiskStore, error::DiskError, new_disk},
     error::{Error, Result},
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
@@ -53,6 +53,10 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use tonic::transport::Channel;
 use uuid::Uuid;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_RUNTIME_SOURCES: &str = "runtime_sources";
+const EVENT_LOCAL_DISK_REGISTRATION: &str = "local_disk_registration";
 
 #[cfg(test)]
 const TEST_RPC_SECRET: &str = "test-rpc-secret";
@@ -601,7 +605,7 @@ pub(crate) async fn initialize_local_disk_maps(
 
             let disk = match new_disk(ep, opt).await {
                 Ok(disk) => disk,
-                Err(crate::disk::error::DiskError::FileAccessDenied) => {
+                Err(DiskError::DiskNotFound | DiskError::FileAccessDenied) => {
                     // LocalDisk already logged the filesystem cause and repair
                     // hint. Keep this slot unavailable so ECStore initialization
                     // can apply its existing fatal-error and quorum rules.
@@ -627,6 +631,19 @@ pub(crate) async fn initialize_local_disk_maps(
             global_local_disk_map.insert(path, Some(disk.clone()));
             global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk.clone());
         }
+    }
+
+    let offline_disks = global_local_disk_map.values().filter(|disk| disk.is_none()).count();
+    if offline_disks > 0 {
+        tracing::warn!(
+            event = EVENT_LOCAL_DISK_REGISTRATION,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_RUNTIME_SOURCES,
+            state = "degraded",
+            configured_disks = global_local_disk_map.len(),
+            offline_disks,
+            "Local disk registration completed with unavailable slots"
+        );
     }
 
     Ok(())
@@ -655,7 +672,11 @@ mod tests {
         notify_scanner_dirty_usage_mutation, reconcile_local_disk_ids, replace_local_disk_id, set_local_node_name,
         set_scanner_dirty_usage_mutation_observer,
     };
-    use crate::disk::{DiskAPI, endpoint::Endpoint};
+    use crate::{
+        disk::{DiskAPI, DiskOption, endpoint::Endpoint},
+        layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+        runtime::instance::InstanceContext,
+    };
     use rustfs_lock::{LocalClient, LockClient};
     use std::{
         collections::HashMap,
@@ -671,6 +692,197 @@ mod tests {
             set_idx: 0,
             disk_idx: 0,
         }
+    }
+
+    fn distributed_startup_pools(directory: &std::path::Path) -> EndpointServerPools {
+        let mut endpoints = Vec::with_capacity(16);
+        for disk_index in 0..16 {
+            let mut endpoint = if disk_index < 4 {
+                let path = directory.join(format!("disk-{disk_index}"));
+                Endpoint::try_from(path.to_str().expect("startup disk path should be UTF-8"))
+                    .expect("local startup endpoint should parse")
+            } else {
+                url_endpoint(&format!("http://node-{}.invalid:9000/data/disk-{}", disk_index / 4, disk_index % 4))
+            };
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 16,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "degraded-startup-test".to_string(),
+            platform: "test".to_string(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn initializing_local_disk_maps_preserves_missing_drive_slots() {
+        for missing_index in 0..4 {
+            let directory = tempfile::tempdir().expect("startup test directory should be created");
+            let pools = distributed_startup_pools(directory.path());
+            let endpoints = pools.0[0].endpoints.as_ref();
+            for (index, endpoint) in endpoints.iter().take(4).enumerate() {
+                if index != missing_index {
+                    std::fs::create_dir(endpoint.get_file_path()).expect("healthy startup disk should be created");
+                }
+            }
+            let context = Arc::new(InstanceContext::new());
+            super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
+                .await
+                .expect("one missing local drive must not abort disk registration");
+
+            let entries = context.local_disk_map();
+            let entries = entries.read().await;
+            assert_eq!(entries.len(), 4, "every local endpoint must remain registered");
+            let slots = context.local_disk_set_drives();
+            let slots = slots.read().await;
+            assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
+            for (index, endpoint) in endpoints.iter().take(4).enumerate() {
+                let entry = entries
+                    .get(&endpoint.to_string())
+                    .expect("local endpoint must retain its registration");
+                let slot = &slots[0][0][index];
+                if index == missing_index {
+                    assert!(entry.is_none(), "the missing drive must remain unavailable");
+                    assert!(slot.is_none(), "the missing drive must retain its original slot");
+                    assert!(
+                        !std::path::Path::new(&endpoint.get_file_path()).exists(),
+                        "registration must not recreate a missing drive root"
+                    );
+                } else {
+                    let disk = entry.as_ref().expect("healthy local drive should be registered");
+                    assert_eq!(disk.endpoint(), *endpoint);
+                    assert!(Arc::ptr_eq(disk, slot.as_ref().expect("healthy slot should be populated")));
+                }
+            }
+            assert!(slots[0][0][4..].iter().all(Option::is_none));
+        }
+    }
+
+    #[tokio::test]
+    async fn initializing_local_disk_maps_allows_all_local_drives_to_be_missing() {
+        let directory = tempfile::tempdir().expect("startup test directory should be created");
+        let pools = distributed_startup_pools(directory.path());
+        let context = Arc::new(InstanceContext::new());
+
+        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
+            .await
+            .expect("missing local drives must allow subsequent cluster quorum evaluation");
+
+        let entries = context.local_disk_map();
+        let entries = entries.read().await;
+        assert_eq!(entries.len(), 4);
+        for endpoint in pools.0[0].endpoints.as_ref().iter().take(4) {
+            assert!(
+                entries
+                    .get(&endpoint.to_string())
+                    .expect("missing local endpoint must retain its registration")
+                    .is_none()
+            );
+        }
+        let slots = context.local_disk_set_drives();
+        let slots = slots.read().await;
+        assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
+        assert!(slots[0][0].iter().all(Option::is_none));
+        assert_eq!(std::fs::read_dir(directory.path()).expect("list startup directory").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reinitializing_local_disk_maps_registers_a_returned_drive() {
+        let directory = tempfile::tempdir().expect("startup test directory should be created");
+        let pools = distributed_startup_pools(directory.path());
+        let endpoints = pools.0[0].endpoints.as_ref();
+        for (index, endpoint) in endpoints.iter().take(4).enumerate() {
+            if index != 1 {
+                std::fs::create_dir(endpoint.get_file_path()).expect("healthy startup disk should be created");
+            }
+        }
+        let context = Arc::new(InstanceContext::new());
+        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
+            .await
+            .expect("missing local drive must allow registration");
+        assert!(
+            context
+                .local_disk_map()
+                .read()
+                .await
+                .get(&endpoints[1].to_string())
+                .expect("missing endpoint must retain its registration")
+                .is_none()
+        );
+
+        std::fs::create_dir(endpoints[1].get_file_path()).expect("returned disk root should be created");
+        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
+            .await
+            .expect("returned drive must register in the original topology");
+
+        let entries = context.local_disk_map();
+        let entries = entries.read().await;
+        assert_eq!(entries.len(), 4);
+        let slots = context.local_disk_set_drives();
+        let slots = slots.read().await;
+        assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
+        for (index, endpoint) in endpoints.iter().take(4).enumerate() {
+            let disk = entries
+                .get(&endpoint.to_string())
+                .expect("original endpoint must remain registered")
+                .as_ref()
+                .expect("returned and healthy drives should be online");
+            assert_eq!(disk.endpoint(), *endpoint);
+            assert!(Arc::ptr_eq(disk, slots[0][0][index].as_ref().expect("original slot must be populated")));
+        }
+    }
+
+    #[tokio::test]
+    async fn initializing_local_disk_maps_rejects_corrupt_format() {
+        let directory = tempfile::tempdir().expect("startup test directory should be created");
+        let pools = distributed_startup_pools(directory.path());
+        for endpoint in pools.0[0].endpoints.as_ref().iter().take(4) {
+            std::fs::create_dir(endpoint.get_file_path()).expect("startup disk should be created");
+        }
+        let metadata = directory.path().join("disk-1/.rustfs.sys");
+        std::fs::create_dir(&metadata).expect("metadata directory should be created");
+        let format_path = metadata.join("format.json");
+        std::fs::write(&format_path, b"invalid-format").expect("corrupt format should be written");
+        let context = Arc::new(InstanceContext::new());
+
+        super::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+            .await
+            .expect_err("corrupt format must remain a startup error");
+
+        assert_eq!(
+            std::fs::read(&format_path).expect("corrupt format should remain readable"),
+            b"invalid-format",
+            "disk registration must preserve the corrupt format for diagnosis"
+        );
+    }
+
+    #[tokio::test]
+    async fn initializing_local_disk_maps_rejects_nil_format_identity() {
+        let directory = tempfile::tempdir().expect("startup fixture");
+        let pools = distributed_startup_pools(directory.path());
+        let endpoint = &pools.0[0].endpoints.as_ref()[0];
+        let meta = std::path::PathBuf::from(endpoint.get_file_path()).join(crate::disk::RUSTFS_META_BUCKET);
+        std::fs::create_dir_all(&meta).expect("metadata fixture");
+        let format = crate::disk::format::FormatV3::new(1, 16);
+        let bytes = format.to_json().expect("format with nil disk identity");
+        let path = meta.join(crate::disk::FORMAT_CONFIG_FILE);
+        std::fs::write(&path, &bytes).expect("persist nil disk identity");
+        let instance = Arc::new(InstanceContext::new());
+
+        let error = super::initialize_local_disk_maps(&instance, pools, &DiskOption::default())
+            .await
+            .expect_err("a persisted nil identity is a fatal format error");
+
+        assert_eq!(
+            error.narrow_to_disk().expect("preserved disk error type"),
+            crate::disk::error::DiskError::CorruptedFormat
+        );
+        assert_eq!(std::fs::read_to_string(path).expect("preserved format"), bytes);
     }
 
     #[test]

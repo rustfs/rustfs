@@ -611,6 +611,19 @@ impl ECStore {
                     for disk in disks.iter().flatten() {
                         disk.reset_health_for_store_init_retry();
                     }
+                    tokio::select! {
+                        _ = ctx.cancelled() => {
+                            return Err(Error::other(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "storage format initialization cancelled",
+                            )));
+                        }
+                        refreshed = init_format::refresh_missing_local_disks(
+                            &instance_ctx,
+                            &pool_eps.endpoints,
+                            &mut disks,
+                        ) => refreshed?,
+                    }
                 }
             }?;
             // First-hand authority for this pool only: `Fresh` when this process

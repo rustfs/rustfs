@@ -1468,6 +1468,11 @@ async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
     fs::remove_dir(root).await
 }
 
+// Only bounds the legacy exception for an unformatted system-filesystem root.
+// Data filesystems retain the existing topology-derived migration limit.
+#[cfg(target_os = "linux")]
+const ROOT_LEGACY_FORMAT_MAX_BYTES: usize = 1024 * 1024;
+
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
 const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
@@ -7868,7 +7873,7 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
                 let absolute = match crate::disk::endpoint::windows_fallback_local_path(ep_path, &err, "local disk root") {
                     Ok(path) => path,
                     Err(_) => {
-                        return Err(DiskError::VolumeNotFound);
+                        return Err(DiskError::DiskNotFound);
                     }
                 };
 
@@ -7881,7 +7886,7 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
                     }
                     Err(meta_err) => {
                         if meta_err.kind() == ErrorKind::NotFound {
-                            return Err(DiskError::VolumeNotFound);
+                            return Err(DiskError::DiskNotFound);
                         }
                         return Err(to_file_error(meta_err).into());
                     }
@@ -7890,7 +7895,7 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
 
             #[cfg(not(windows))]
             {
-                Err(DiskError::VolumeNotFound)
+                Err(DiskError::DiskNotFound)
             }
         }
     }
@@ -8062,6 +8067,67 @@ impl LocalDisk {
         replacement_lease::acquire(root).await
     }
 
+    #[cfg(target_os = "linux")]
+    async fn unformatted_on_system_filesystem(publication_root: &os::PublicationRoot, ep: &Endpoint) -> Result<bool> {
+        let pinned_root = publication_root.clone();
+        let endpoint = ep.clone();
+        let legacy_format_path = publication_root
+            .io_path()
+            .join(super::MIGRATING_META_BUCKET)
+            .join(super::FORMAT_CONFIG_FILE);
+        spawn_blocking_with_disk_io_permit(None, move || {
+            let (device, _) = pinned_root.physical_identity()?;
+            if device != rustix::fs::stat(SLASH_SEPARATOR).map_err(IoError::from)?.st_dev {
+                return Ok(false);
+            }
+            let file = match pinned_root.open_readonly_nonblocking(&legacy_format_path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(true),
+                Err(err) => return Err(to_file_error(err).into()),
+            };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > u64::try_from(ROOT_LEGACY_FORMAT_MAX_BYTES).map_err(DiskError::other)? {
+                return Err(DiskError::CorruptedFormat);
+            }
+            let mut data = Vec::new();
+            let mut reader =
+                std::io::Read::take(file, u64::try_from(ROOT_LEGACY_FORMAT_MAX_BYTES + 1).map_err(DiskError::other)?);
+            std::io::Read::read_to_end(&mut reader, &mut data)?;
+            if data.is_empty() {
+                return Ok(true);
+            }
+            if data.len() > ROOT_LEGACY_FORMAT_MAX_BYTES {
+                return Err(DiskError::CorruptedFormat);
+            }
+            let format = FormatV3::try_from(data.as_slice()).map_err(|_| DiskError::CorruptedFormat)?;
+            crate::store::init_format::validate_format_erasure_layout(&format).map_err(|_| DiskError::CorruptedFormat)?;
+            let max_bytes =
+                crate::store::init_format::legacy_format_max_bytes(format.drives()).map_err(|_| DiskError::CorruptedFormat)?;
+            if data.len() > max_bytes || format.erasure.this.is_nil() || format.erasure.this == Uuid::max() {
+                return Err(DiskError::CorruptedFormat);
+            }
+            let (set_index, disk_index) = format
+                .find_disk_index_by_disk_id(format.erasure.this)
+                .map_err(|_| DiskError::CorruptedFormat)?;
+            if i32::try_from(set_index).ok() != Some(endpoint.set_idx)
+                || i32::try_from(disk_index).ok() != Some(endpoint.disk_idx)
+            {
+                return Err(DiskError::InconsistentDisk);
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(DiskError::other)?
+    }
+
+    /// Open an existing endpoint root and initialize its internal directories.
+    ///
+    /// # Errors
+    /// Returns [`DiskError::DiskNotFound`] when the root is missing. On Linux,
+    /// an unformatted URL endpoint on the system filesystem also stays offline
+    /// unless an explicit directory-mode override applies. Existing formats,
+    /// including the bounded legacy exception, retain identity validation.
+    /// Permission, format, and filesystem errors propagate to the caller.
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
@@ -8087,7 +8153,13 @@ impl LocalDisk {
         #[cfg(not(windows))]
         let publication_root_path = root.as_path();
         let publication_root = os::PublicationRoot::new(publication_root_path)
-            .map_err(DiskError::from)
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    DiskError::DiskNotFound
+                } else {
+                    DiskError::from(err)
+                }
+            })
             .inspect_err(|err| {
                 log_startup_disk_error("open_publication_root", publication_root_path, err);
             })?;
@@ -8105,6 +8177,75 @@ impl LocalDisk {
         );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
+
+        // Use optimized path resolution instead of absolutize_virtually
+        let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
+        let io_format_path = io_root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            root = ?root,
+            format_path = ?format_path,
+            state = "format_path_resolved",
+            "Local disk format path resolved"
+        );
+        let (format_data, format_meta) = read_file_exists(&io_format_path, &publication_root)
+            .await
+            .inspect_err(|err| {
+                log_startup_disk_error("read_format_json", &io_format_path, err);
+            })?;
+
+        let mut id = None;
+        // let mut format_legacy = false;
+        let mut format_last_check = None;
+
+        if !format_data.is_empty() {
+            let s = format_data.as_ref();
+            let fm = FormatV3::try_from(s).map_err(Error::other)?;
+            if fm.erasure.this.is_nil() {
+                return Err(DiskError::CorruptedFormat);
+            }
+            let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
+
+            if set_idx as i32 != ep.set_idx || disk_idx as i32 != ep.disk_idx {
+                return Err(DiskError::InconsistentDisk);
+            }
+
+            id = Some(fm.erasure.this);
+            // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
+            format_last_check = Some(OffsetDateTime::now_utc());
+        }
+
+        let format_info = FormatInfo {
+            id,
+            data: format_data,
+            file_info: format_meta,
+            last_check: format_last_check,
+        };
+        #[cfg(target_os = "linux")]
+        if format_info.data.is_empty()
+            && ep.get_type() == crate::disk::endpoint::EndpointType::Url
+            && !rustfs_utils::get_env_bool_with_aliases(
+                rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK,
+                &[rustfs_config::ENV_MINIO_CI],
+                rustfs_config::DEFAULT_UNSAFE_BYPASS_DISK_CHECK,
+            )
+        {
+            let unformatted_root_disk = Self::unformatted_on_system_filesystem(&publication_root, ep).await?;
+            if unformatted_root_disk {
+                warn!(
+                    event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    state = "offline",
+                    endpoint = %ep,
+                    reason = "unformatted_root_filesystem",
+                    "Local endpoint has no format on the system filesystem; restore its data mount"
+                );
+                return Err(DiskError::DiskNotFound);
+            }
+        }
 
         Self::check_startup_writable(&publication_root, &root).await?;
         multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
@@ -8147,48 +8288,6 @@ impl LocalDisk {
             );
         }
 
-        // Use optimized path resolution instead of absolutize_virtually
-        let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
-        let io_format_path = io_root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
-        debug!(
-            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-            root = ?root,
-            format_path = ?format_path,
-            state = "format_path_resolved",
-            "Local disk format path resolved"
-        );
-        let (format_data, format_meta) = read_file_exists(&io_format_path, &publication_root)
-            .await
-            .inspect_err(|err| {
-                log_startup_disk_error("read_format_json", &io_format_path, err);
-            })?;
-
-        let mut id = None;
-        // let mut format_legacy = false;
-        let mut format_last_check = None;
-
-        if !format_data.is_empty() {
-            let s = format_data.as_ref();
-            let fm = FormatV3::try_from(s).map_err(Error::other)?;
-            let (set_idx, disk_idx) = fm.find_disk_index_by_disk_id(fm.erasure.this)?;
-
-            if set_idx as i32 != ep.set_idx || disk_idx as i32 != ep.disk_idx {
-                return Err(DiskError::InconsistentDisk);
-            }
-
-            id = Some(fm.erasure.this);
-            // format_legacy = fm.erasure.distribution_algo == DistributionAlgoVersion::V1;
-            format_last_check = Some(OffsetDateTime::now_utc());
-        }
-
-        let format_info = FormatInfo {
-            id,
-            data: format_data,
-            file_info: format_meta,
-            last_check: format_last_check,
-        };
         let root_clone = root.clone();
         let update_fn: UpdateFn<DiskInfo> = Box::new(move || {
             let disk_id = id;
@@ -32124,14 +32223,228 @@ mod test {
     }
 
     #[test]
-    fn resolve_local_disk_root_reports_missing_path_as_volume_not_found() {
+    fn resolve_local_disk_root_reports_missing_path_as_disk_not_found() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let missing = dir.path().join("missing");
 
         let err = resolve_local_disk_root(missing.to_str().expect("temp path should be utf8"))
             .expect_err("missing disk root must be rejected");
 
-        assert!(matches!(err, DiskError::VolumeNotFound));
+        assert!(matches!(err, DiskError::DiskNotFound));
+    }
+
+    #[tokio::test]
+    async fn startup_corrupt_format_is_rejected_before_directory_writes() {
+        let dir = tempfile::tempdir().expect("startup disk directory");
+        let meta = dir.path().join(RUSTFS_META_BUCKET);
+        std::fs::create_dir(&meta).expect("existing metadata directory");
+        let format_path = meta.join(super::super::FORMAT_CONFIG_FILE);
+        std::fs::write(&format_path, b"invalid-format").expect("corrupt format fixture");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+
+        LocalDisk::new(&endpoint, true).await.expect_err("corrupt format must fail");
+
+        assert_eq!(std::fs::read(&format_path).expect("original format"), b"invalid-format");
+        assert_eq!(std::fs::read_dir(dir.path()).expect("disk inventory").count(), 1);
+        assert_eq!(std::fs::read_dir(meta).expect("metadata inventory").count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_url_root_guard_isolates_unformatted_system_filesystem_without_writes() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+                (rustfs_config::ENV_MINIO_CI, None),
+            ],
+            async {
+                let dir = tempfile::tempdir().expect("startup disk directory");
+                let endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000{}", dir.path().display()).as_str())
+                    .expect("URL disk endpoint");
+                let on_system_filesystem =
+                    rustfs_utils::os::same_disk(dir.path().to_str().expect("UTF-8 disk path"), SLASH_SEPARATOR)
+                        .expect("filesystem identity");
+                let result = LocalDisk::new(&endpoint, true).await;
+
+                if on_system_filesystem {
+                    assert!(matches!(result, Err(DiskError::DiskNotFound)));
+                    assert_eq!(std::fs::read_dir(dir.path()).expect("offline path inventory").count(), 0);
+                } else {
+                    result.expect("a separate data filesystem remains eligible for first bootstrap");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_url_root_guard_preserves_existing_and_legacy_formats() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+                (rustfs_config::ENV_MINIO_CI, None),
+            ],
+            async {
+                for bucket in [RUSTFS_META_BUCKET, super::super::MIGRATING_META_BUCKET] {
+                    let dir = tempfile::tempdir().expect("existing disk directory");
+                    let meta = dir.path().join(bucket);
+                    std::fs::create_dir(&meta).expect("existing metadata directory");
+                    let mut format = FormatV3::new(1, 4);
+                    format.erasure.this = format.erasure.sets[0][0];
+                    let mut bytes = format.to_json().expect("existing format bytes");
+                    if bucket == super::super::MIGRATING_META_BUCKET {
+                        let limit = crate::store::init_format::legacy_format_max_bytes(format.drives()).expect("legacy limit");
+                        bytes.extend(std::iter::repeat_n(' ', limit - bytes.len()));
+                    }
+                    let path = meta.join(super::super::FORMAT_CONFIG_FILE);
+                    std::fs::write(&path, &bytes).expect("seed existing format");
+                    let mut endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000{}", dir.path().display()).as_str())
+                        .expect("URL disk endpoint");
+
+                    endpoint.set_pool_index(0);
+                    endpoint.set_set_index(0);
+                    endpoint.set_disk_index(0);
+                    LocalDisk::new(&endpoint, false)
+                        .await
+                        .expect("existing format remains available for quorum validation");
+
+                    assert_eq!(std::fs::read(path).expect("preserved format"), bytes.as_bytes());
+                }
+            },
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_root_guard_rejects_invalid_legacy_candidates_before_writes() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>),
+                (rustfs_config::ENV_MINIO_CI, None),
+            ],
+            async {
+                let mut valid = FormatV3::new(1, 4);
+                valid.erasure.this = valid.erasure.sets[0][0];
+                let valid_bytes = valid.to_json().expect("legacy format bytes");
+                let max_bytes = crate::store::init_format::legacy_format_max_bytes(valid.drives()).expect("legacy limit");
+                let mut padded = valid_bytes.into_bytes();
+                padded.resize(max_bytes + 1, b' ');
+                let mut nil = valid.clone();
+                nil.erasure.this = Uuid::nil();
+                for bytes in [
+                    b"invalid-format".to_vec(),
+                    vec![b' '; ROOT_LEGACY_FORMAT_MAX_BYTES + 1],
+                    padded,
+                    nil.to_json().expect("nil identity format").into_bytes(),
+                ] {
+                    let dir = tempfile::tempdir().expect("legacy admission fixture");
+                    let metadata = dir.path().join(super::super::MIGRATING_META_BUCKET);
+                    std::fs::create_dir(&metadata).expect("legacy metadata directory");
+                    let path = metadata.join(super::super::FORMAT_CONFIG_FILE);
+                    std::fs::write(&path, &bytes).expect("legacy candidate");
+                    let mut endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000{}", dir.path().display()).as_str())
+                        .expect("URL endpoint");
+                    endpoint.set_pool_index(0);
+                    endpoint.set_set_index(0);
+                    endpoint.set_disk_index(0);
+                    if rustfs_utils::os::same_disk(dir.path().to_str().expect("UTF-8 path"), SLASH_SEPARATOR)
+                        .expect("filesystem identity")
+                    {
+                        assert!(matches!(LocalDisk::new(&endpoint, true).await, Err(DiskError::CorruptedFormat)));
+                        assert_eq!(std::fs::read_dir(dir.path()).expect("disk inventory").count(), 1);
+                        assert_eq!(std::fs::read_dir(&metadata).expect("metadata inventory").count(), 1);
+                        assert_eq!(std::fs::read(&path).expect("preserved candidate"), bytes);
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_root_guard_rejects_nonregular_legacy_files_without_blocking() {
+        for fifo in [false, true] {
+            let dir = tempfile::tempdir().expect("legacy file-type fixture");
+            let metadata = dir.path().join(super::super::MIGRATING_META_BUCKET);
+            std::fs::create_dir(&metadata).expect("legacy metadata directory");
+            let path = metadata.join(super::super::FORMAT_CONFIG_FILE);
+            if fifo {
+                rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::RWXU).expect("legacy FIFO");
+            } else {
+                std::fs::create_dir(&path).expect("legacy directory");
+            }
+            let root = os::PublicationRoot::new(dir.path()).expect("pinned legacy directory");
+            let endpoint =
+                Endpoint::try_from(format!("http://127.0.0.1:9000{}", dir.path().display()).as_str()).expect("URL endpoint");
+            if rustfs_utils::os::same_disk(dir.path().to_str().expect("UTF-8 path"), SLASH_SEPARATOR)
+                .expect("filesystem identity")
+            {
+                let result =
+                    tokio::time::timeout(Duration::from_secs(5), LocalDisk::unformatted_on_system_filesystem(&root, &endpoint))
+                        .await
+                        .expect("nonregular legacy metadata must not block startup");
+                assert!(matches!(result, Err(DiskError::CorruptedFormat)));
+                assert_eq!(std::fs::read_dir(dir.path()).expect("disk inventory").count(), 1);
+                assert_eq!(std::fs::read_dir(&metadata).expect("metadata inventory").count(), 1);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_url_root_guard_honors_explicit_directory_modes() {
+        for (canonical, legacy) in [(Some("true"), None), (None, Some("true"))] {
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, canonical),
+                    (rustfs_config::ENV_MINIO_CI, legacy),
+                ],
+                async {
+                    let dir = tempfile::tempdir().expect("directory deployment disk");
+                    let endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000{}", dir.path().display()).as_str())
+                        .expect("URL disk endpoint");
+                    let disk = LocalDisk::new(&endpoint, false).await.expect("explicit directory deployment");
+                    assert!(disk.path().join(RUSTFS_META_BUCKET).is_dir());
+                },
+            )
+            .await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_root_guard_keeps_the_opened_directory_identity_after_retarget() {
+        let dir = tempfile::tempdir().expect("root admission fixture");
+        let path = dir.path().join("disk");
+        std::fs::create_dir(&path).expect("initial disk directory");
+        let root = os::PublicationRoot::new(&path).expect("pin original disk");
+        let mut endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000{}", path.display()).as_str()).expect("URL endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let before = LocalDisk::unformatted_on_system_filesystem(&root, &endpoint)
+            .await
+            .expect("initial admission");
+        let retained = dir.path().join("retained");
+        std::fs::rename(&path, &retained).expect("retarget original endpoint");
+        std::fs::create_dir_all(path.join(super::super::MIGRATING_META_BUCKET)).expect("replacement metadata");
+        std::fs::write(
+            path.join(super::super::MIGRATING_META_BUCKET)
+                .join(super::super::FORMAT_CONFIG_FILE),
+            b"replacement",
+        )
+        .expect("replacement legacy candidate");
+
+        assert_eq!(
+            LocalDisk::unformatted_on_system_filesystem(&root, &endpoint)
+                .await
+                .expect("pinned admission"),
+            before
+        );
+        assert_eq!(std::fs::read_dir(retained).expect("original disk inventory").count(), 0);
     }
 
     #[tokio::test]

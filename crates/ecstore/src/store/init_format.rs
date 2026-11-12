@@ -91,6 +91,70 @@ pub async fn init_disks(
     (res, errors)
 }
 
+pub(crate) async fn refresh_missing_local_disks(
+    instance_ctx: &Arc<InstanceContext>,
+    eps: &Endpoints,
+    disks: &mut [Option<DiskStore>],
+) -> Result<()> {
+    if eps.as_ref().len() != disks.len() {
+        return Err(Error::CorruptedFormat);
+    }
+    let local_disk_map = instance_ctx.local_disk_map();
+    let local_set_drives = instance_ctx.local_disk_set_drives();
+    let multipart_authority = instance_ctx.multipart_proof_verification_context();
+    for (endpoint, slot) in eps.as_ref().iter().zip(disks) {
+        if slot.is_some() || !endpoint.is_local {
+            continue;
+        }
+        let registered = local_disk_map.read().await.get(&endpoint.to_string()).cloned().flatten();
+        let disk = match registered {
+            Some(disk) if disk.endpoint() == *endpoint => disk,
+            Some(_) => return Err(DiskError::InconsistentDisk.into()),
+            None => match new_disk(
+                endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: true,
+                },
+            )
+            .await
+            {
+                Ok(disk) => disk,
+                Err(DiskError::DiskNotFound | DiskError::FileAccessDenied) => continue,
+                Err(error) => return Err(error.into()),
+            },
+        };
+        if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
+            wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
+        }
+
+        // Match foundation registration's lock order. Publish the same handle
+        // into the inventory slot and bootstrap RPC route before the next format
+        // election; that election still validates membership and disk identity.
+        let mut set_drives = local_set_drives.write().await;
+        let mut local_disks = local_disk_map.write().await;
+        let disk = match local_disks.get(&endpoint.to_string()).cloned().flatten() {
+            Some(registered) if registered.endpoint() == *endpoint => registered,
+            Some(_) => return Err(DiskError::InconsistentDisk.into()),
+            None => disk,
+        };
+        if !set_drives.is_empty() {
+            let pool = usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?;
+            let set = usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?;
+            let index = usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?;
+            let registered_slot = set_drives
+                .get_mut(pool)
+                .and_then(|sets| sets.get_mut(set))
+                .and_then(|drives| drives.get_mut(index))
+                .ok_or(Error::CorruptedFormat)?;
+            *registered_slot = Some(disk.clone());
+        }
+        local_disks.insert(endpoint.to_string(), Some(disk.clone()));
+        *slot = Some(disk);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub async fn connect_load_init_formats(
     first_disk: bool,
@@ -603,7 +667,7 @@ fn select_persisted_migration_format(
     Err(write_error.map_or(quorum_error, Into::into))
 }
 
-fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
+pub(crate) fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
     disk_count
         .checked_mul(LEGACY_FORMAT_MAX_BYTES_PER_DISK)
         .and_then(|size| size.checked_add(LEGACY_FORMAT_BASE_MAX_BYTES))
@@ -819,7 +883,7 @@ fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     Ok(())
 }
 
-fn validate_format_erasure_layout(format: &FormatV3) -> Result<usize> {
+pub(crate) fn validate_format_erasure_layout(format: &FormatV3) -> Result<usize> {
     check_format_erasure_value(format)?;
 
     let set_drive_count = format
@@ -1068,6 +1132,137 @@ mod tests {
         disks.push(None);
 
         (temp_dir, disks)
+    }
+
+    #[tokio::test]
+    async fn refresh_missing_local_disks_restores_format_quorum_and_bootstrap_routes() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        let (directory, original_disks) = local_disks(4).await;
+        let format = FormatV3::new(1, 4);
+        for (index, disk) in original_disks.iter().enumerate() {
+            let mut disk_format = format.clone();
+            disk_format.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(disk_format))
+                .await
+                .expect("seed existing format");
+        }
+        let endpoints = Endpoints::from(
+            original_disks
+                .iter()
+                .flatten()
+                .map(|disk| disk.endpoint())
+                .collect::<Vec<_>>(),
+        );
+        drop(original_disks);
+        for index in 1..4 {
+            tokio::fs::rename(
+                directory.path().join(format!("disk-{index}")),
+                directory.path().join(format!("disk-{index}.offline")),
+            )
+            .await
+            .expect("take a startup drive offline");
+        }
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: true,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: endpoints.clone(),
+            cmd_line: "startup-format-retry".to_string(),
+            platform: String::new(),
+        }]);
+        let context = Arc::new(InstanceContext::new());
+        crate::runtime::sources::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+            .await
+            .expect("register the surviving local drive");
+        let (mut disks, _) = init_disks(&context, &endpoints, &DiskOption::default()).await;
+        let healthy = disks[0].clone().expect("surviving drive handle");
+        let staging = healthy.path().join(RUSTFS_META_BUCKET).join("tmp/live-startup-writer");
+        tokio::fs::write(&staging, b"live staging").await.expect("seed live staging");
+        assert!(matches!(
+            connect_load_init_formats_with_instance_ctx(&context, true, &mut disks, 1, 4, None).await,
+            Err(Error::ErasureReadQuorum)
+        ));
+
+        tokio::fs::rename(directory.path().join("disk-1.offline"), directory.path().join("disk-1"))
+            .await
+            .expect("restore a drive while startup waits for quorum");
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect("refresh returned local drives");
+        assert!(Arc::ptr_eq(&healthy, disks[0].as_ref().expect("preserved healthy handle")));
+        let returned = disks[1].as_ref().expect("returned drive handle").clone();
+        let registered = context.local_disk_map();
+        let registered = registered.read().await;
+        assert!(Arc::ptr_eq(
+            &returned,
+            registered
+                .get(&endpoints.as_ref()[1].to_string())
+                .and_then(Option::as_ref)
+                .expect("returned drive bootstrap route")
+        ));
+        drop(registered);
+        let registered_slots = context.local_disk_set_drives();
+        let registered_slots = registered_slots.read().await;
+        assert!(Arc::ptr_eq(
+            &returned,
+            registered_slots[0][0][1].as_ref().expect("returned drive original slot")
+        ));
+        drop(registered_slots);
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&context, true, &mut disks, 1, 4, None)
+            .await
+            .expect("returned drive restores existing-format read quorum");
+        assert_eq!(loaded.format.shared_identity(), format.shared_identity());
+        assert!(matches!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None));
+        assert!(disks[2..].iter().all(Option::is_none));
+        assert_eq!(tokio::fs::read(staging).await.expect("preserved staging"), b"live staging");
+    }
+
+    #[tokio::test]
+    async fn refresh_missing_local_disks_preserves_remote_slots_and_rejects_bad_local_format() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        let directory = tempfile::tempdir().expect("startup retry fixture");
+        let path = directory.path().join("disk-0");
+        let mut local = Endpoint::try_from(path.to_str().expect("UTF-8 local endpoint")).expect("local endpoint");
+        let mut remote = Endpoint::try_from("http://remote.invalid:9000/disk-1").expect("remote endpoint");
+        local.set_pool_index(0);
+        local.set_set_index(0);
+        local.set_disk_index(0);
+        remote.set_pool_index(0);
+        remote.set_set_index(0);
+        remote.set_disk_index(1);
+        let endpoints = Endpoints::from(vec![local, remote]);
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: true,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: endpoints.clone(),
+            cmd_line: "startup-format-retry".to_string(),
+            platform: String::new(),
+        }]);
+        let context = Arc::new(InstanceContext::new());
+        crate::runtime::sources::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+            .await
+            .expect("missing local drive remains registered offline");
+        let mut disks = vec![None, None];
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect("missing local and remote slots remain offline");
+        assert!(disks.iter().all(Option::is_none));
+
+        tokio::fs::create_dir_all(path.join(RUSTFS_META_BUCKET))
+            .await
+            .expect("restore metadata directory");
+        tokio::fs::write(path.join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE), b"invalid-format")
+            .await
+            .expect("corrupt returned format");
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect_err("returned corrupt format must retain its startup error");
+        assert!(disks.iter().all(Option::is_none));
+        assert!(context.local_disk_map().read().await[&endpoints.as_ref()[0].to_string()].is_none());
     }
 
     #[tokio::test]

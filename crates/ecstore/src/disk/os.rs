@@ -5781,6 +5781,11 @@ impl PublicationRoot {
         std::fs::File::open(path)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_readonly_nonblocking(&self, path: &Path) -> io::Result<std::fs::File> {
+        self.open_relative(path, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK, rustix::fs::Mode::empty())
+    }
+
     pub(crate) fn check_writable(&self, path: &Path) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         let directory = self.open_directory(path)?;
