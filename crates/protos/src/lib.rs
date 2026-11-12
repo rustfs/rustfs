@@ -3472,6 +3472,20 @@ async fn build_channel_until(
     .map_err(channel_acquisition_timeout)?
 }
 
+fn configure_custom_root_tls(
+    endpoint: Endpoint,
+    cert_pem: &[u8],
+    mtls_identity: Option<&rustfs_common::MtlsIdentityPem>,
+) -> Result<Endpoint, tonic::transport::Error> {
+    // Tonic derives the certificate identity from its parsed URI and normalizes IPv6 literals.
+    let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert_pem));
+    if let Some(id) = mtls_identity {
+        let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
+        tls = tls.identity(identity);
+    }
+    endpoint.tls_config(tls)
+}
+
 async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
@@ -3511,28 +3525,7 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         let outbound_tls = runtime_sources::outbound_tls_state().await;
         generation = Some(outbound_tls.generation.0);
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
-            let ca = Certificate::from_pem(cert_pem);
-            // Derive the hostname from the HTTPS URL for TLS hostname verification.
-            let domain = dial_addr
-                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
-            let tls = if !domain.is_empty() {
-                let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
-                    let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
-                    cfg = cfg.identity(identity);
-                }
-                cfg
-            } else {
-                // Fallback: configure TLS without explicit domain if parsing fails.
-                ClientTlsConfig::new().ca_certificate(ca)
-            };
-            connector = connector.tls_config(tls)?;
+            connector = configure_custom_root_tls(connector, cert_pem, outbound_tls.mtls_identity.as_ref())?;
             debug!("Configured TLS with custom root certificate for: {}", dial_addr);
         } else {
             // No custom root CA published — fall back to system roots.
@@ -3621,6 +3614,36 @@ mod tests {
     static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn grpc_custom_root_tls_accepts_dns_ipv4_and_ipv6_endpoints() {
+        // Public test CA certificate only. No matching private key is retained.
+        const CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIBaDCCAQ6gAwIBAgIJANiJCW2gV3/jMAoGCCqGSM49BAMCMCcxJTAjBgNVBAMM
+HFJ1c3RGUyBSUEMgVExTIHJlZ3Jlc3Npb24gQ0EwHhcNMjYxMTEyMTQ1NjI3WhcN
+MzYxMTA5MTQ1NjI3WjAnMSUwIwYDVQQDDBxSdXN0RlMgUlBDIFRMUyByZWdyZXNz
+aW9uIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErwWB2NMGc+H+1KmJtrQS
+uqwds7heNocXqxbA6n4gkf3Kk49s/B9MgLkYWsEZOYyTJPQ3uvAiL7sQyx2jEd3Y
+8aMjMCEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0E
+AwIDSAAwRQIgC6IxRaPimCEZ8Ylb0L3r+Bhyh36eAbv4jYkvmNs3PmYCIQDp5+iC
+ZavKi7apmtZC8VNFewgfLRkEy2Zm/VPx2CnXXw==
+-----END CERTIFICATE-----
+";
+        for address in [
+            "https://peer.example.com",
+            "https://peer.example.com:9000/data",
+            "https://127.0.0.1:9000/data",
+            "https://[::1]:9000/data",
+            "https://[2001:db8::1234]/data",
+            "https://[::ffff:192.0.2.1]:9000/data",
+        ] {
+            let endpoint = Endpoint::from_shared(address).expect("valid HTTPS endpoint");
+            let original_uri = endpoint.uri().clone();
+            let configured = configure_custom_root_tls(endpoint, CA_PEM, None)
+                .unwrap_or_else(|error| panic!("custom-root TLS must accept {address}: {error}"));
+            assert_eq!(configured.uri(), &original_uri, "TLS must preserve the dial endpoint");
+        }
+    }
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct BackgroundHealStatusRequestV1 {}
