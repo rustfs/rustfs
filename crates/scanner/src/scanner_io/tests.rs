@@ -544,6 +544,86 @@ async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> 
     (temp_dir, store)
 }
 
+#[tokio::test]
+async fn epoch_fenced_cache_save_uses_background_admission_on_every_disk() {
+    #[derive(Clone)]
+    struct AdmissionRecorder {
+        root: String,
+        counts: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    }
+    impl metrics::Recorder for AdmissionRecorder {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            if key.name() != "rustfs_disk_io_admission_total"
+                || !key
+                    .labels()
+                    .any(|label| label.key() == "class" && label.value() == "background")
+            {
+                return metrics::Counter::noop();
+            }
+            let Some(disk) = key
+                .labels()
+                .find(|label| label.key() == "disk" && label.value().starts_with(&self.root))
+            else {
+                return metrics::Counter::noop();
+            };
+            metrics::Counter::from_arc(
+                self.counts
+                    .lock()
+                    .expect("admission counters")
+                    .entry(disk.value().to_string())
+                    .or_default()
+                    .clone(),
+            )
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+    let (root, store) = setup_local_scanner_store(1, 4).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let epoch = scanner_publication_epoch(set.clone()).await.expect("publication epoch");
+    let cache_name = "background-admission/.usage-cache.bin";
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "background-admission".to_string();
+    let recorder = AdmissionRecorder {
+        root: root.path().to_str().expect("fixture path").to_string(),
+        counts: Arc::default(),
+    };
+    let counts = recorder.counts.clone();
+    // nextest runs this test in its own process; the recorder also observes the
+    // detached commit tasks and filters out every disk outside this fixture.
+    metrics::set_global_recorder(recorder).expect("native save recorder");
+    cache.save(set.clone(), cache_name).await.expect("unclassified control save");
+    assert!(counts.lock().expect("control counters").is_empty());
+    let revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+        .await
+        .expect("cache revisions");
+    cache.info.next_cycle = 7;
+    cache
+        .save_with_revisions_for_epoch(set.clone(), cache_name, &revisions, epoch, CancellationToken::new())
+        .await
+        .expect("background primary and backup save");
+    {
+        let counts = counts.lock().expect("background counters");
+        assert_eq!(counts.len(), 4, "every local disk must receive background cache I/O");
+        assert!(counts.values().all(|counter| counter.load(Ordering::Relaxed) > 0));
+    }
+    for name in [cache_name.to_string(), format!("{cache_name}.bkp")] {
+        let body = crate::read_config(set.clone(), &path_join_buf(&[crate::BUCKET_META_PREFIX, &name]))
+            .await
+            .expect("persisted cache copy");
+        let saved: DataUsageCache = rmp_serde::from_slice(&body).expect("decode persisted cache");
+        assert_eq!(saved.info.name, cache.info.name);
+        assert_eq!(saved.info.next_cycle, 7);
+    }
+}
+
 async fn open_local_scanner_store(
     root: &std::path::Path,
     pool_count: usize,

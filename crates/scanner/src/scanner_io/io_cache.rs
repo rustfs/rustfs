@@ -1631,6 +1631,7 @@ impl ScannerIOCache for SetDisks {
                                     cache_name.as_str(),
                                     &revisions,
                                     expected_publication_epoch_clone,
+                                    CancellationToken::new(),
                                 )
                                 .await
                             {
@@ -1713,6 +1714,7 @@ impl ScannerIOCache for SetDisks {
                             &cache_name,
                             &revisions,
                             expected_publication_epoch_clone,
+                            CancellationToken::new(),
                         )
                         .await
                     {

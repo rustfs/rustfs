@@ -1025,7 +1025,7 @@ async fn scan_and_persist_local_bucket(
     // the scan. A movement transition that starts and ends during the scan
     // therefore cannot admit the stale cache under the new epoch.
     let save_result = cache
-        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch)
+        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch, CancellationToken::new())
         .await;
     done_save();
     save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;

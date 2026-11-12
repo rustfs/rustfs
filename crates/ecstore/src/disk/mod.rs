@@ -44,7 +44,7 @@ pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFile
 pub(crate) use io_admission::{DiskIoClass, test_resource_units};
 pub(crate) use io_admission::{
     PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
-    with_optional_disk_io_context, with_optional_resource_unit,
+    with_detached_disk_io_context, with_optional_disk_io_context, with_optional_resource_unit,
 };
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";

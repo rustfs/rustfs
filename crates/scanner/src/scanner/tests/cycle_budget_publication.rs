@@ -390,7 +390,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
         progress.started_plan.0[0] ^= 1;
         let epoch = checkpoint.info.scan_identity.expect("checkpoint identity").publication_epoch;
         checkpoint
-            .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, epoch)
+            .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, epoch, CancellationToken::new())
             .await
             .expect("persist a prefix from a different process plan");
 

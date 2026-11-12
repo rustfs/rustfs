@@ -97,11 +97,15 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    let checkpoint_save = crate::storage_api::ecstore_with_background_disk_io(
-        context.ctx.clone(),
-        checkpoint.save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch),
-    )
-    .await;
+    let checkpoint_save = checkpoint
+        .save_with_revisions_for_epoch(
+            store.clone(),
+            cache_name,
+            revisions,
+            context.expected_publication_epoch,
+            context.ctx.clone(),
+        )
+        .await;
     if let Err(error) = checkpoint_save {
         record_checkpoint_save_failure(cache_name, checkpoint, &error);
         return if matches!(error, StorageError::PreconditionFailed) {
@@ -1333,7 +1337,13 @@ pub(super) async fn persist_scanner_service_ledger(
     ledger.leader_epoch = leader_epoch;
     persisted.info.scan_bucket_service = Some(ledger);
     match persisted
-        .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+        .save_with_revisions_for_epoch(
+            store,
+            DATA_USAGE_CACHE_NAME,
+            &revisions,
+            expected_publication_epoch,
+            CancellationToken::new(),
+        )
         .await
     {
         Ok(()) => true,
@@ -1515,7 +1525,13 @@ pub(super) async fn persist_and_publish_cache_snapshot(
 
         let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = cache_snapshot
-            .save_with_revisions_for_epoch(store.clone(), DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+            .save_with_revisions_for_epoch(
+                store.clone(),
+                DATA_USAGE_CACHE_NAME,
+                &revisions,
+                expected_publication_epoch,
+                CancellationToken::new(),
+            )
             .await
         {
             error!(

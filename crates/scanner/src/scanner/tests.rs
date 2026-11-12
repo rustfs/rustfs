@@ -898,7 +898,7 @@ async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
         .await
         .expect("initial cache revisions");
     checkpoint
-        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0, CancellationToken::new())
         .await
         .expect("publish the current checkpoint into the fenced store");
     let cache_path = rustfs_utils::path::path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name]);

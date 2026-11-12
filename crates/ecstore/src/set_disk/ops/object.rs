@@ -6274,7 +6274,7 @@ impl SetDisks {
                 let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
                     rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::PutCommitOwner,
                 );
-                let result = tokio::spawn(async move {
+                let result = tokio::spawn(crate::disk::with_detached_disk_io_context(async move {
                     let commit = Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token)));
                     #[cfg(feature = "diagnostic-read-version-caller")]
                     return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
@@ -6285,7 +6285,7 @@ impl SetDisks {
                     .await;
                     #[cfg(not(feature = "diagnostic-read-version-caller"))]
                     commit.await
-                })
+                }))
                 .await
                 .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -24190,6 +24190,64 @@ mod put_object_tmp_cleanup_tests {
                 .expect("caller cancellation must not interrupt committed receipt materialization");
         }
         wait_for_tmp_workspace_to_drain(&dirs, "cancelled full-tail commit should release staging ownership").await;
+    }
+
+    #[tokio::test]
+    async fn background_put_retains_disk_admission_across_owned_commit() {
+        use crate::disk::with_background_disk_io;
+
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let object = "background-cache-commit";
+        let barriers: Vec<_> = (0..disks.len())
+            .map(|index| rename_fanout_barrier::arm(object, index, rename_fanout_barrier::PHASE_RENAME))
+            .collect();
+        let writer = Arc::clone(&set);
+        let put = tokio::spawn(async move {
+            with_background_disk_io(CancellationToken::new(), async {
+                let mut reader = PutObjReader::from_vec(b"scanner checkpoint".to_vec());
+                writer
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+        });
+        for barrier in &barriers {
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("every disk reaches the commit boundary");
+        }
+        let local_disks: Vec<_> = disks
+            .iter()
+            .map(|disk| match disk.as_ref() {
+                disk::Disk::Local(local) => local,
+                disk::Disk::Remote(_) => panic!("hermetic fixture must use local disks"),
+            })
+            .collect();
+        let before: Vec<_> = local_disks
+            .iter()
+            .map(|disk| disk.background_io_admissions_for_tests())
+            .collect();
+        for barrier in barriers {
+            barrier.release();
+        }
+        put.await.expect("owned put task").expect("background checkpoint commits");
+        for ((disk, local), before) in disks.iter().zip(local_disks).zip(before) {
+            assert!(
+                local.background_io_admissions_for_tests() > before,
+                "the detached rename must retain background admission on every disk"
+            );
+            disk.read_version("", RUSTFS_META_BUCKET, object, "", &ReadOptions::default())
+                .await
+                .expect("committed checkpoint remains readable");
+        }
     }
 
     #[tokio::test]

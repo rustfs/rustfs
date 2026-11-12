@@ -4022,7 +4022,7 @@ impl SetDisks {
 
         let coordinator_failure_receipt = rollback_receipt.clone();
         let early_ack_spawn_to_quorum_wait_started = rustfs_io_metrics::put_stage_timer();
-        let tail_drain = tokio::spawn({
+        let tail_drain = tokio::spawn(crate::disk::with_detached_disk_io_context({
             let fanout_src_bucket = src_bucket.clone();
             let fanout_src_object = src_object.clone();
             let fanout_dst_bucket = dst_bucket.clone();
@@ -4044,7 +4044,7 @@ impl SetDisks {
                     let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let namespace_commit_guard = namespace_commit_guard.clone();
-                    tasks.spawn(async move {
+                    tasks.spawn(crate::disk::with_detached_disk_io_context(async move {
                         let _namespace_commit_guard = namespace_commit_guard.clone();
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
                         let result = std::panic::AssertUnwindSafe(async {
@@ -4131,7 +4131,7 @@ impl SetDisks {
                         .catch_unwind()
                         .await;
                         (i, dispatch_state, result)
-                    });
+                    }));
                 }
 
                 let mut commit_tx = Some(commit_tx);
@@ -4347,7 +4347,7 @@ impl SetDisks {
                     all_online_local_succeeded,
                 })
             }
-        });
+        }));
 
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_SPAWN_TO_QUORUM_WAIT,
@@ -4614,6 +4614,7 @@ impl SetDisks {
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
         };
+        let fanout_future = crate::disk::with_detached_disk_io_context(fanout_future);
         let fanout = if protected_multipart {
             tokio::spawn(crate::disk::with_optional_resource_unit(
                 crate::disk::current_resource_unit(),

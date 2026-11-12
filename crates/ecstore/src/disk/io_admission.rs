@@ -161,9 +161,22 @@ pub(crate) enum DiskIoClass {
 pub(crate) struct DiskIoContext {
     pub(crate) class: DiskIoClass,
     pub(crate) cancellation: CancellationToken,
+    pub(crate) admission_deadline: Option<Instant>,
     pub(crate) admission: Option<Arc<DiskIoAdmission>>,
     pub(crate) permit: Option<DiskIoPermit>,
     pub(crate) resource_unit: Option<ResourceIoUnit>,
+}
+
+impl DiskIoContext {
+    pub(crate) async fn background_permit(&self, admission: &Arc<DiskIoAdmission>) -> io::Result<DiskIoPermit> {
+        let acquire = admission.background_with_resource(&self.cancellation, self.resource_unit.clone());
+        match self.admission_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, acquire)
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "owned background disk admission timed out"))?,
+            None => acquire.await,
+        }
+    }
 }
 
 /// Mark disk I/O issued by `future` as background work for local-disk admission.
@@ -173,6 +186,7 @@ pub async fn with_background_disk_io<F: Future>(cancellation: CancellationToken,
         DiskIoContext {
             class: DiskIoClass::Background,
             cancellation,
+            admission_deadline: None,
             admission: None,
             permit: None,
             resource_unit: current_resource_unit(),
@@ -245,6 +259,7 @@ pub(crate) async fn with_disk_io_permit<F: Future>(permit: Option<DiskIoPermit>,
     let mut context = current_disk_io_context().unwrap_or_else(|| DiskIoContext {
         class: DiskIoClass::Foreground,
         cancellation: CancellationToken::new(),
+        admission_deadline: None,
         admission: None,
         permit: None,
         resource_unit: None,
@@ -279,6 +294,34 @@ pub(crate) fn with_optional_disk_io_context<F: Future>(
     }
 }
 
+/// An owned commit outlives its waiter. Retain an outer I/O class and physical
+/// ownership, but give admission its own cancellation lifetime. Leave per-disk
+/// scopes to the caller's existing ownership handoff: inheriting their class
+/// without a lease could wait behind the parent awaiting this commit.
+/// The drive timeout bounds only queued admission; an admitted mutation still
+/// drains to completion. Nested owners retain the original admission deadline.
+pub(crate) fn with_detached_disk_io_context<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let context = current_disk_io_context()
+        .filter(|context| context.admission.is_none() && context.permit.is_none())
+        .map(|mut context| {
+            context.cancellation = CancellationToken::new();
+            let timeout = super::disk_store::get_max_timeout_duration();
+            if context.class == DiskIoClass::Background
+                && !timeout.is_zero()
+                && let Some(deadline) = Instant::now().checked_add(timeout)
+            {
+                context.admission_deadline = Some(context.admission_deadline.map_or(deadline, |old| old.min(deadline)));
+            }
+            context
+        });
+    async move {
+        match context {
+            Some(context) => with_disk_io_context(context, future).await,
+            None => future.await,
+        }
+    }
+}
+
 pub(crate) fn current_disk_io_context() -> Option<DiskIoContext> {
     DISK_IO_CONTEXT
         .try_with(|context| {
@@ -297,17 +340,17 @@ pub(crate) async fn acquire_context_disk_io_permit() -> io::Result<Option<DiskIo
     let Some(context) = current_disk_io_context() else {
         return Ok(None);
     };
-    let Some(admission) = context.admission else {
+    let Some(admission) = context.admission.as_ref() else {
         return Ok(None);
     };
-    if let Some(permit) = context.permit
-        && permit.is_for(&admission)
+    if let Some(permit) = context.permit.as_ref()
+        && permit.is_for(admission)
     {
-        return Ok(Some(permit));
+        return Ok(Some(permit.clone()));
     }
     match context.class {
         DiskIoClass::Foreground => Ok(Some(admission.foreground())),
-        DiskIoClass::Background => Ok(Some(admission.background(&context.cancellation).await?)),
+        DiskIoClass::Background => Ok(Some(context.background_permit(admission).await?)),
     }
 }
 
@@ -381,6 +424,7 @@ impl DiskIoAdmission {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn background(self: &Arc<Self>, cancellation: &CancellationToken) -> std::io::Result<DiskIoPermit> {
         self.background_with_resource(cancellation, current_resource_unit()).await
     }
@@ -663,11 +707,8 @@ impl<R> AdmissionReader<R> {
         let mut wait = self.wait.lock().unwrap_or_else(|error| error.into_inner());
         if wait.is_none() {
             let admission = self.admission.clone();
-            let cancellation = self.context.cancellation.clone();
-            let resource_unit = self.context.resource_unit.clone();
-            *wait = Some(Box::pin(
-                async move { admission.background_with_resource(&cancellation, resource_unit).await },
-            ));
+            let context = self.context.clone();
+            *wait = Some(Box::pin(async move { context.background_permit(&admission).await }));
         }
         let Some(wait_future) = wait.as_mut() else {
             return Poll::Ready(Err(io::Error::other("background disk I/O admission waiter is missing")));
@@ -909,6 +950,7 @@ mod tests {
         let existing = DiskIoContext {
             class: DiskIoClass::Foreground,
             cancellation: cancellation.clone(),
+            admission_deadline: None,
             admission: None,
             permit: None,
             resource_unit: None,
@@ -952,6 +994,94 @@ mod tests {
             .expect("child preserves resource-only scope");
         assert_eq!(held, 1);
         assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_commit_keeps_background_admission_after_waiter_cancellation() {
+        let admission = DiskIoAdmission::new("detached-commit".to_string());
+        let foreground = admission.foreground();
+        let cancellation = CancellationToken::new();
+        let worker_admission = admission.clone();
+        with_background_disk_io(cancellation.clone(), async {
+            let worker = tokio::spawn(with_detached_disk_io_context(async move {
+                let context = current_disk_io_context().expect("owned commit retains its class");
+                assert_eq!(context.class, DiskIoClass::Background);
+                context.background_permit(&worker_admission).await
+            }));
+            wait_for_background_waiters(&admission, 1).await;
+            cancellation.cancel();
+            tokio::task::yield_now().await;
+            assert!(!worker.is_finished(), "caller cancellation must not abandon a queued commit");
+            drop(foreground);
+            let permit = tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .expect("commit admission should finish after foreground work")
+                .expect("owned worker joins")
+                .expect("owned commit survives waiter cancellation");
+            assert_eq!(admission.background_admissions_for_tests(), 1);
+            drop(permit);
+        })
+        .await;
+        assert!(!admission.background_active_for_tests());
+    }
+
+    #[tokio::test]
+    async fn detached_commit_does_not_inherit_a_parent_disk_lease() {
+        let admission = DiskIoAdmission::new("parent-lease".to_string());
+        let cancellation = CancellationToken::new();
+        let permit = admission.background(&cancellation).await.expect("parent disk admission");
+        with_background_disk_io(
+            cancellation,
+            with_disk_io_permit(Some(permit), async {
+                tokio::spawn(with_detached_disk_io_context(async {
+                    assert!(current_disk_io_context().is_none(), "do not queue behind the parent's disk lease");
+                }))
+                .await
+                .expect("resource-only commit joins while parent keeps its disk lease");
+                assert!(admission.background_active_for_tests());
+            }),
+        )
+        .await;
+        assert!(!admission.background_active_for_tests());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_commit_bounds_queued_admission_without_extending_an_existing_deadline() {
+        let admission = DiskIoAdmission::new("stalled-background-disk");
+        let held = admission
+            .background(&CancellationToken::new())
+            .await
+            .expect("existing native I/O");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let worker_admission = admission.clone();
+        let error = with_background_disk_io(CancellationToken::new(), async {
+            let mut context = current_disk_io_context().expect("background scope");
+            context.admission_deadline = Some(deadline);
+            with_disk_io_context(context, async {
+                let worker = tokio::spawn(with_detached_disk_io_context(async move {
+                    let context = current_disk_io_context().expect("owned scope");
+                    assert_eq!(
+                        context.admission_deadline,
+                        Some(deadline),
+                        "nested ownership must not reset admission time"
+                    );
+                    context.background_permit(&worker_admission).await
+                }));
+                wait_for_background_waiters(&admission, 1).await;
+                tokio::time::advance(Duration::from_secs(2)).await;
+                worker
+                    .await
+                    .expect("owned admission worker")
+                    .expect_err("stalled disk must not retain queued commit")
+            })
+            .await
+        })
+        .await;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(admission.background_waiters.load(Ordering::Acquire), 0);
+        assert!(admission.background_active_for_tests(), "timeout must not interrupt admitted native I/O");
+        drop(held);
+        assert!(!admission.background_active_for_tests());
     }
 
     struct BlockingWorker(tokio::task::JoinHandle<()>);
@@ -1072,6 +1202,7 @@ mod tests {
             DiskIoContext {
                 class: DiskIoClass::Foreground,
                 cancellation: CancellationToken::new(),
+                admission_deadline: None,
                 admission: None,
                 permit: None,
                 resource_unit: None,

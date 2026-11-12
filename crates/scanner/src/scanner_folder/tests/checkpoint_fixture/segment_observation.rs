@@ -303,7 +303,7 @@ async fn walk_and_save(observe: bool) -> (Vec<String>, serde_json::Value) {
         .expect("read empty fixture revisions");
     scanner
         .new_cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("save actual walker output through the cache codec and revision gate");
     let loaded = store.strict_load().await;
