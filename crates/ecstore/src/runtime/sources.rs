@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::{StreamExt, TryStreamExt, stream};
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock},
@@ -28,7 +30,10 @@ use crate::{
     config::{get_global_storage_class, get_global_storage_class_snapshot, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, error::DiskError, new_disk},
     error::{Error, Result},
-    layout::endpoints::{EndpointServerPools, SetupType},
+    layout::{
+        disks_layout::MAX_ERASURE_SET_DRIVE_COUNT,
+        endpoints::{EndpointServerPools, SetupType},
+    },
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
         TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
@@ -414,10 +419,6 @@ pub(crate) fn local_disk_id_map_handle() -> Arc<RwLock<HashMap<Uuid, String>>> {
     crate::runtime::global::current_ctx().local_disk_id_map()
 }
 
-pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrives>> {
-    crate::runtime::global::current_ctx().local_disk_set_drives()
-}
-
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     get_global_tier_config_mgr()
 }
@@ -489,49 +490,83 @@ pub(crate) async fn quarantine_local_disks_preserving_bootstrap_routes(
         return Err(Error::CorruptedFormat);
     }
     let bootstrap_routes = unformatted_bootstrap_routes.iter().collect::<HashSet<_>>();
-    let slots = endpoints
+    let targets = endpoints
         .iter()
         .map(|endpoint| {
             Ok((
-                usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
-                usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
-                usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
+                endpoint.to_string(),
+                (
+                    usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
+                    usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
+                    usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
+                ),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let local_disk_map = instance_ctx.local_disk_map();
-    let mut local_disks = local_disk_map.write().await;
-    for endpoint in endpoints {
-        if !bootstrap_routes.contains(endpoint) {
-            local_disks.insert(endpoint.to_string(), None);
+    // All registry writers follow registration -> set layout -> endpoint map.
+    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    let set_drives = instance_ctx.local_disk_set_drives();
+    let map = instance_ctx.local_disk_map();
+    let mut slots = set_drives.write().await;
+    let mut disks = map.write().await;
+    let standalone = slots.is_empty();
+    for (endpoint, (key, (pool, set, index))) in endpoints.iter().zip(&targets) {
+        if !disks.contains_key(key) && !standalone {
+            return Err(Error::CorruptedFormat);
+        }
+        if !slots.is_empty() {
+            let slot = slots
+                .get(*pool)
+                .and_then(|sets| sets.get(*set))
+                .and_then(|drives| drives.get(*index))
+                .ok_or(Error::CorruptedFormat)?;
+            if slot.as_ref().is_some_and(|disk| disk.endpoint() != *endpoint) {
+                return Err(DiskError::InconsistentDisk.into());
+            }
         }
     }
-    drop(local_disks);
-
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let mut local_set_drives = set_drives.write().await;
-    if local_set_drives.is_empty() {
-        return Ok(());
+    let mut displaced = Vec::new();
+    for (endpoint, (key, (pool, set, index))) in endpoints.iter().zip(targets) {
+        if !bootstrap_routes.contains(endpoint)
+            && let Some(Some(previous)) = disks.insert(key, None)
+        {
+            displaced.push(previous);
+        }
+        if !slots.is_empty()
+            && let Some(previous) = slots[pool][set][index].take()
+        {
+            displaced.push(previous);
+        }
     }
-    for (pool_idx, set_idx, disk_idx) in slots {
-        let disk = local_set_drives
-            .get_mut(pool_idx)
-            .and_then(|sets| sets.get_mut(set_idx))
-            .and_then(|disks| disks.get_mut(disk_idx))
-            .ok_or(Error::CorruptedFormat)?;
-        *disk = None;
-    }
+    drop(disks);
+    drop(slots);
+    drop(displaced);
     Ok(())
 }
 
 pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disks: Vec<DiskStore>) {
+    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    let set_drives = instance_ctx.local_disk_set_drives();
+    let standalone = set_drives.read().await.is_empty();
     let map = instance_ctx.local_disk_map();
-    let mut global_local_disk_map = map.write().await;
+    let mut registered = map.write().await;
+    let mut displaced = Vec::new();
     for disk in disks {
         let path = disk.endpoint().to_string();
-        global_local_disk_map.insert(path, Some(disk.clone()));
+        if !standalone {
+            match registered.get(&path) {
+                None => continue,
+                Some(Some(current)) if !Arc::ptr_eq(current, &disk) => continue,
+                _ => {}
+            }
+        }
+        if let Some(Some(previous)) = registered.insert(path, Some(disk)) {
+            displaced.push(previous);
+        }
     }
+    drop(registered);
+    drop(displaced);
 }
 
 pub(crate) async fn local_disk_set_drive(
@@ -571,81 +606,233 @@ pub(crate) async fn local_disk_entries() -> Vec<Option<DiskStore>> {
     local_disk_map_handle().read().await.values().cloned().collect()
 }
 
+pub(crate) const LOCAL_DISK_OPEN_CONCURRENCY: usize = MAX_ERASURE_SET_DRIVE_COUNT;
+
+pub(crate) struct PreparedLocalDisk {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) disk: Option<DiskStore>,
+    expected: Option<DiskStore>,
+    slot: (usize, usize, usize),
+}
+
+impl PreparedLocalDisk {
+    pub(crate) fn new(endpoint: &Endpoint, expected: Option<DiskStore>, disk: Option<DiskStore>) -> Result<Self> {
+        if !endpoint.is_local || disk.as_ref().is_some_and(|disk| disk.endpoint() != *endpoint) {
+            return Err(DiskError::InconsistentDisk.into());
+        }
+        Ok(Self {
+            endpoint: endpoint.clone(),
+            disk,
+            expected,
+            slot: (
+                usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
+            ),
+        })
+    }
+}
+
+/// Open or reuse one local endpoint while retaining its original disk error.
+/// Registry readers are never held across root validation or filesystem work.
+pub(crate) async fn prepare_local_disk(
+    instance_ctx: &InstanceContext,
+    endpoint: &Endpoint,
+    registered: Option<DiskStore>,
+    opt: &DiskOption,
+) -> crate::disk::error::Result<DiskStore> {
+    let reusable = match registered.as_ref() {
+        Some(disk) if disk.endpoint() != *endpoint => return Err(DiskError::InconsistentDisk),
+        Some(disk) => match disk.as_ref() {
+            crate::disk::Disk::Local(wrapper) => wrapper.get_disk().has_current_root().await,
+            crate::disk::Disk::Remote(_) => return Err(DiskError::InconsistentDisk),
+        },
+        None => false,
+    };
+    let disk = match registered {
+        Some(disk) if reusable => disk,
+        previous => {
+            // A registered root can still own live staging. A fresh handle
+            // for that endpoint must not run startup cleanup against it.
+            let options = DiskOption {
+                cleanup: opt.cleanup && previous.is_none(),
+                health_check: opt.health_check,
+            };
+            new_disk(endpoint, &options).await?
+        }
+    };
+    if let Some(authority) = instance_ctx.bound_multipart_proof_verification_context()
+        && let crate::disk::Disk::Local(wrapper) = disk.as_ref()
+    {
+        wrapper.get_disk().bind_multipart_proof_authority(&authority)?;
+    }
+    Ok(disk)
+}
+
+/// Prepare independent disks without holding either inventory lock. The caller
+/// holds the instance registration lock across preparation and publication.
+pub(crate) async fn prepare_local_disks(
+    instance_ctx: &InstanceContext,
+    endpoints: &[Endpoint],
+    opt: &DiskOption,
+) -> Result<Vec<PreparedLocalDisk>> {
+    let map = instance_ctx.local_disk_map();
+    let registered = {
+        let disks = map.read().await;
+        endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_local)
+            .map(|endpoint| PreparedLocalDisk::new(endpoint, disks.get(&endpoint.to_string()).cloned().flatten(), None))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut prepared = stream::iter(registered.into_iter().enumerate())
+        .map(|(index, mut registration)| async move {
+            registration.disk =
+                match prepare_local_disk(instance_ctx, &registration.endpoint, registration.expected.clone(), opt).await {
+                    Ok(disk) => Some(disk),
+                    Err(DiskError::DiskNotFound | DiskError::FileAccessDenied) => None,
+                    Err(error) => return Err(error.into()),
+                };
+            Ok::<_, Error>((index, registration))
+        })
+        .buffer_unordered(LOCAL_DISK_OPEN_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    prepared.sort_unstable_by_key(|(index, _)| *index);
+    Ok(prepared.into_iter().map(|(_, registration)| registration).collect())
+}
+
+pub(crate) fn same_local_disk(left: Option<&DiskStore>, right: Option<&DiskStore>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Publish a prepared batch while its caller holds the registration lock.
+/// Lock order is registration, set layout, then endpoint map. All validation
+/// precedes mutation, and displaced handles are dropped outside inventory locks.
+pub(crate) async fn publish_local_disks(
+    instance_ctx: &InstanceContext,
+    prepared: Vec<PreparedLocalDisk>,
+) -> Result<Vec<Option<DiskStore>>> {
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set_drives = instance_ctx.local_disk_set_drives();
+    let map = instance_ctx.local_disk_map();
+    let mut slots = set_drives.write().await;
+    let mut disks = map.write().await;
+    let standalone = slots.is_empty();
+    let mut accepted = Vec::with_capacity(prepared.len());
+    for registration in &prepared {
+        let key = registration.endpoint.to_string();
+        let current = disks.get(&key);
+        if !slots.is_empty() {
+            let (pool, set, index) = registration.slot;
+            let slot = slots
+                .get(pool)
+                .and_then(|sets| sets.get(set))
+                .and_then(|drives| drives.get(index))
+                .ok_or(Error::CorruptedFormat)?;
+            if slot.as_ref().is_some_and(|disk| disk.endpoint() != registration.endpoint) {
+                return Err(DiskError::InconsistentDisk.into());
+            }
+        }
+        if current
+            .and_then(Option::as_ref)
+            .is_some_and(|disk| disk.endpoint() != registration.endpoint)
+        {
+            return Err(DiskError::InconsistentDisk.into());
+        }
+        accepted.push(
+            (current.is_some() || standalone)
+                && same_local_disk(current.and_then(Option::as_ref), registration.expected.as_ref()),
+        );
+    }
+    let mut published = Vec::with_capacity(prepared.len());
+    let mut displaced = Vec::new();
+    for (registration, accept) in prepared.into_iter().zip(accepted) {
+        if !accept {
+            published.push(None);
+            continue;
+        }
+        if !slots.is_empty() {
+            let (pool, set, index) = registration.slot;
+            if let Some(previous) = std::mem::replace(&mut slots[pool][set][index], registration.disk.clone()) {
+                displaced.push(previous);
+            }
+        }
+        if let Some(Some(previous)) = disks.insert(registration.endpoint.to_string(), registration.disk.clone()) {
+            displaced.push(previous);
+        }
+        published.push(registration.disk);
+    }
+    drop(disks);
+    drop(slots);
+    drop(displaced);
+    Ok(published)
+}
+
 pub(crate) async fn initialize_local_disk_maps(
     instance_ctx: &Arc<InstanceContext>,
     endpoint_pools: EndpointServerPools,
     opt: &DiskOption,
 ) -> Result<()> {
-    let multipart_authority = instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
-    // Every caller passes the FULL topology, so (re)initialization must replace
-    // any previous registration wholesale: appending would leave the pool/set
-    // vectors sized for a stale topology and panic on wider disk indices (seen
-    // as cross-test contamination under single-process `cargo test`).
+    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
+    let endpoints = endpoint_pools
+        .as_ref()
+        .iter()
+        .flat_map(|pool| pool.endpoints.as_ref().iter())
+        .filter(|endpoint| endpoint.is_local)
+        .cloned()
+        .collect::<Vec<_>>();
+    let prepared = prepare_local_disks(instance_ctx, &endpoints, opt).await?;
+    let mut next_slots = endpoint_pools
+        .as_ref()
+        .iter()
+        .map(|pool| vec![vec![None; pool.drives_per_set]; pool.set_count])
+        .collect::<TypeLocalDiskSetDrives>();
+    let mut next_disks = HashMap::with_capacity(prepared.len());
+    for registration in prepared {
+        let (pool, set, index) = registration.slot;
+        let slot = next_slots
+            .get_mut(pool)
+            .and_then(|sets| sets.get_mut(set))
+            .and_then(|drives| drives.get_mut(index))
+            .ok_or(Error::CorruptedFormat)?;
+        *slot = registration.disk.clone();
+        next_disks.insert(registration.endpoint.to_string(), registration.disk);
+    }
+    let configured_disks = next_disks.len();
+    let offline_disks = next_disks.values().filter(|disk| disk.is_none()).count();
+
+    // Keep the existing snapshot readable during disk I/O. The replacement is
+    // published only after the complete validated topology has been prepared.
     let set_drives = instance_ctx.local_disk_set_drives();
-    let mut global_set_drives = set_drives.write().await;
-    global_set_drives.clear();
-    for pool_eps in endpoint_pools.as_ref().iter() {
-        let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
-        for _ in 0..pool_eps.set_count {
-            set_count_drives.push(vec![None; pool_eps.drives_per_set]);
-        }
-
-        global_set_drives.push(set_count_drives);
-    }
-
     let map = instance_ctx.local_disk_map();
-    let mut global_local_disk_map = map.write().await;
-    global_local_disk_map.clear();
+    let mut slots = set_drives.write().await;
+    let mut disks = map.write().await;
+    let previous_slots = std::mem::replace(&mut *slots, next_slots);
+    let previous_disks = std::mem::replace(&mut *disks, next_disks);
+    drop(disks);
+    drop(slots);
+    drop(previous_disks);
+    drop(previous_slots);
 
-    for pool_eps in endpoint_pools.as_ref().iter() {
-        for ep in pool_eps.endpoints.as_ref().iter() {
-            if !ep.is_local {
-                continue;
-            }
-
-            let disk = match new_disk(ep, opt).await {
-                Ok(disk) => disk,
-                Err(DiskError::DiskNotFound | DiskError::FileAccessDenied) => {
-                    // LocalDisk already logged the filesystem cause and repair
-                    // hint. Keep this slot unavailable so ECStore initialization
-                    // can apply its existing fatal-error and quorum rules.
-                    global_local_disk_map.insert(ep.to_string(), None);
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            };
-            if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
-                wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
-            }
-            let path = disk.endpoint().to_string();
-            let pool_idx = usize::try_from(ep.pool_idx).map_err(|err| {
-                crate::error::Error::other(format!("store init failed to convert pool index `{}`: {err}", ep.pool_idx))
-            })?;
-            let set_idx = usize::try_from(ep.set_idx).map_err(|err| {
-                crate::error::Error::other(format!("store init failed to convert set index `{}`: {err}", ep.set_idx))
-            })?;
-            let disk_idx = usize::try_from(ep.disk_idx).map_err(|err| {
-                crate::error::Error::other(format!("store init failed to convert disk index `{}`: {err}", ep.disk_idx))
-            })?;
-
-            global_local_disk_map.insert(path, Some(disk.clone()));
-            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk.clone());
-        }
-    }
-
-    let offline_disks = global_local_disk_map.values().filter(|disk| disk.is_none()).count();
     if offline_disks > 0 {
         tracing::warn!(
             event = EVENT_LOCAL_DISK_REGISTRATION,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_RUNTIME_SOURCES,
             state = "degraded",
-            configured_disks = global_local_disk_map.len(),
+            configured_disks,
             offline_disks,
             "Local disk registration completed with unavailable slots"
         );
     }
-
     Ok(())
 }
 
@@ -664,6 +851,10 @@ pub(crate) async fn init_tier_config_mgr_handle(handle: Arc<RwLock<TierConfigMgr
     initial_reload?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "local_disk_startup_tests.rs"]
+mod local_disk_startup_tests;
 
 #[cfg(test)]
 mod tests {

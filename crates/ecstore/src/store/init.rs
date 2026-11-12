@@ -3495,9 +3495,7 @@ mod tests {
         (instance_ctx, store, shutdown)
     }
 
-    #[tokio::test]
-    #[serial_test::serial(storage_class_env)]
-    async fn direct_local_constructor_multipart_binds_complete_topology_without_registry_preinit() {
+    async fn assert_direct_local_constructor_multipart(configure_endpoints: bool) {
         use crate::disk::DiskAPI;
         use crate::disk::multipart_source::ProofVerificationContext;
         use crate::layout::endpoints::SetupType;
@@ -3523,6 +3521,9 @@ mod tests {
         }]);
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         ctx.update_erasure_type(SetupType::Erasure).await;
+        if configure_endpoints {
+            ctx.set_endpoints(topology.clone());
+        }
         assert!(ctx.local_disk_map().read().await.is_empty());
         assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
         let shutdown = CancellationToken::new();
@@ -3574,11 +3575,20 @@ mod tests {
             .expect("the direct local constructor must support native multipart completion");
         assert!(completed.is_multipart());
         let disks = set.disks.read().await.clone();
+        let registered = ctx.local_disk_map().read().await.clone();
+        assert_eq!(disks.len(), 4, "direct construction keeps the configured set width");
+        assert_eq!(registered.len(), disks.len(), "direct construction publishes every local drive");
         for (slot, disk) in disks.iter().enumerate() {
+            let disk = disk.as_ref().expect("direct constructor populates the runtime slot");
             assert_eq!(
-                disk.as_ref().unwrap().get_disk_id().await.unwrap(),
+                disk.get_disk_id().await.expect("runtime slot disk identity"),
                 Some(set.format.erasure.sets[0][slot])
             );
+            let route = registered
+                .get(&disk.endpoint().to_string())
+                .and_then(Option::as_ref)
+                .expect("runtime slot has a local RPC route");
+            assert!(Arc::ptr_eq(disk, route), "runtime slot and RPC registry share their admitted handle");
         }
         let mut reader = set
             .get_object_reader(bucket, object, None, http::HeaderMap::new(), &opts)
@@ -3588,6 +3598,18 @@ mod tests {
         reader.stream.read_to_end(&mut body).await.unwrap();
         assert_eq!(body, payload);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn direct_local_constructor_multipart_binds_complete_topology_without_registry_preinit() {
+        assert_direct_local_constructor_multipart(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn direct_configured_local_constructor_preserves_registry_and_native_multipart() {
+        assert_direct_local_constructor_multipart(true).await;
     }
 
     /// CopyObject destinations and CreateMultipartUpload create keys, so they

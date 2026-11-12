@@ -20,8 +20,9 @@
 //! bounds are unchanged and helper access is via inherent calls.
 
 use super::super::{
-    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
-    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, load_format_erasure, warn,
+    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, LockResult, NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks,
+    StorageError, debug, disk, load_format_erasure, warn,
 };
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
@@ -36,6 +37,7 @@ use uuid::Uuid;
 
 // Bound batching when another reconnect is still pending.
 const REPLACEMENT_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const EVENT_SET_DISK_RECONNECT: &str = "set_disk_reconnect";
 
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
@@ -532,6 +534,12 @@ impl SetDisks {
                 .find(|disk| disk.endpoint() == *ep)
                 .cloned()
         };
+        let previous_registration = if ep.is_local {
+            let map = self.ctx.local_disk_map();
+            map.read().await.get(&ep.to_string()).cloned().flatten()
+        } else {
+            None
+        };
         let previous_health = previous_disk
             .as_ref()
             .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
@@ -607,26 +615,58 @@ impl SetDisks {
             return false;
         }
 
-        new_disk.enable_health_check();
-
-        if new_disk.is_local() {
-            let local_disk_map = runtime_sources::local_disk_map_handle();
-            let mut global_local_disk_map = local_disk_map.write().await;
-            let path = new_disk.endpoint().to_string();
-            global_local_disk_map.insert(path, Some(new_disk.clone()));
-
-            if runtime_sources::setup_is_dist_erasure().await {
-                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-                let mut local_set_drives = local_disk_set_drives.write().await;
-                local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
-            }
+        if let Err(error) = self
+            .publish_local_reconnect(disk_idx, previous_disk.as_ref(), previous_registration, new_disk, true)
+            .await
+        {
+            warn!(
+                event = EVENT_SET_DISK_RECONNECT,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "publication_failed",
+                endpoint = %ep,
+                error = %error,
+                "Local reconnect publication failed"
+            );
         }
-
-        debug!("renew_disk: update {:?}", fm.erasure.this);
-
-        let mut disk_lock = self.disks.write().await;
-        disk_lock[disk_idx] = Some(new_disk);
         false
+    }
+
+    async fn publish_local_reconnect(
+        &self,
+        disk_index: usize,
+        expected_set_disk: Option<&DiskStore>,
+        expected_registration: Option<DiskStore>,
+        candidate: DiskStore,
+        enable_health_check: bool,
+    ) -> disk::error::Result<bool> {
+        let endpoint = candidate.endpoint();
+        let registration = runtime_sources::PreparedLocalDisk::new(&endpoint, expected_registration, Some(candidate))
+            .map_err(|error| error.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        // Registration writers precede the set inventory and global inventories.
+        // Filesystem preparation completes before these publication locks.
+        let _registration = self.ctx.local_disk_registration_lock().lock().await;
+        let mut disks = self.disks.write().await;
+        let Some(slot) = disks.get_mut(disk_index) else {
+            return Err(DiskError::InconsistentDisk);
+        };
+        if slot.as_ref().is_some_and(|current| current.endpoint() != endpoint) {
+            return Err(DiskError::InconsistentDisk);
+        }
+        if !runtime_sources::same_local_disk(slot.as_ref(), expected_set_disk) {
+            return Ok(false);
+        }
+        let published = runtime_sources::publish_local_disks(&self.ctx, vec![registration])
+            .await
+            .map_err(|error| error.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        let Some(disk) = published.into_iter().next().flatten() else {
+            return Ok(false);
+        };
+        if enable_health_check {
+            disk.enable_health_check();
+        }
+        *slot = Some(disk);
+        Ok(true)
     }
 
     /// Attach a replacement target only after proving that the exact local slot
@@ -645,6 +685,9 @@ impl SetDisks {
             return Ok(false);
         };
 
+        let previous_disk = self.disks.read().await.get(disk_idx).cloned().flatten();
+        let map = self.ctx.local_disk_map();
+        let previous_registration = map.read().await.get(&ep.to_string()).cloned().flatten();
         let replacement = new_disk(
             ep,
             &DiskOption {
@@ -659,28 +702,8 @@ impl SetDisks {
             Err(err) => return Err(err),
         }
 
-        {
-            let mut disks = self.disks.write().await;
-            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
-                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
-                return Ok(false);
-            }
-            disks[disk_idx] = Some(replacement.clone());
-        }
-
-        let local_disk_map = runtime_sources::local_disk_map_handle();
-        local_disk_map
-            .write()
+        self.publish_local_reconnect(disk_idx, previous_disk.as_ref(), previous_registration, replacement, false)
             .await
-            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
-
-        if runtime_sources::setup_is_dist_erasure().await {
-            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-            let mut local_set_drives = local_disk_set_drives.write().await;
-            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
-        }
-
-        Ok(true)
     }
 
     pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
@@ -1459,6 +1482,24 @@ mod tests {
             Vec::new(),
         )
         .await;
+
+        let foreign = set_disks.get_disks_internal().await[0]
+            .as_ref()
+            .expect("existing disk in another slot")
+            .clone();
+        set_disks.disks.write().await[disk_count - 1] = Some(foreign.clone());
+        let result = set_disks.attach_unformatted_replacement_disk(&replacement_endpoint).await;
+        assert!(
+            matches!(result, Err(DiskError::InconsistentDisk)),
+            "an occupied foreign slot must be rejected"
+        );
+        assert!(Arc::ptr_eq(
+            set_disks.get_disks_internal().await[disk_count - 1]
+                .as_ref()
+                .expect("foreign slot remains occupied"),
+            &foreign,
+        ));
+        set_disks.disks.write().await[disk_count - 1] = None;
 
         assert!(
             set_disks
