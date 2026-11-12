@@ -311,7 +311,8 @@ jobs:
       # comparison reports "no result" for it instead of failing to find it.
       - name: Compare the failing sets
         run: |
-          set -uo pipefail
+          # The shell runs with -e; a failing profile or diff is data to report, not a stop.
+          set +e -u -o pipefail
           mkdir -p legs/mint-legacy legs/mint-gateway
           python3 scripts/mint_stack_diff.py legs/mint-legacy legs/mint-gateway | tee report.txt
           status="${PIPESTATUS[0]}"

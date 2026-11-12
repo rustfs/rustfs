@@ -246,7 +246,8 @@ jobs:
           RUSTFS_ODM_INTEROP_BACKFILL_OBJECTS: "5000"
           RUSTFS_ODM_INTEROP_REPORT_DIR: ${{ github.workspace }}/leg/odm-cases
         run: |
-          set -uo pipefail
+          # The shell runs with -e; a failing profile or diff is data to report, not a stop.
+          set +e -u -o pipefail
           mkdir -p "$RUSTFS_E2E_LOG_DIR"
           junit="target/nextest/${PROFILE}/junit.xml"
           rm -f "$junit"
@@ -309,7 +310,8 @@ jobs:
       - name: Diff every profile and write the summary
         id: summary
         run: |
-          set -uo pipefail
+          # The shell runs with -e; a failing profile or diff is data to report, not a stop.
+          set +e -u -o pipefail
           date="$(date -u +%F)"
           echo "date=${date}" >> "$GITHUB_OUTPUT"
           mkdir -p legs
