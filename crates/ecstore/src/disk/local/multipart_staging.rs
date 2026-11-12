@@ -444,7 +444,6 @@ impl LocalDisk {
             {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart source layout changed"));
             }
-            let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             if incoming.data.is_none() && !incoming.is_remote() {
                 let source_data_dir = source_object.join(source_dir.to_string());
                 let mut pinned_source_data = None;
@@ -509,6 +508,8 @@ impl LocalDisk {
                     sync_directory,
                     cancelled,
                 )?;
+            } else {
+                let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             }
             let has_state = !from_active_cache
                 && (source_object.join(".mpu-source-state").exists()

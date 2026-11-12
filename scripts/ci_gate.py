@@ -53,6 +53,9 @@ NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-fai
 # Report-only lanes stay outside the aggregate until their milestone makes them
 # required. Each reruns a required job's suite with one environment change, so
 # the named steps must stay identical to that job's and the change must stay.
+# The last field names the `select` output that scopes the lane on pull
+# requests: it runs wherever its required job runs, except on a pull request
+# whose selection is the literal `false`. Every other event runs it.
 REPORT_ONLY_JOBS = {
     # rustfs/backlog#2734: required at T2.10.
     "e2e-tests-gateway": (
@@ -65,8 +68,34 @@ REPORT_ONLY_JOBS = {
             "Verify e2e smoke execution completeness",
         ),
         "RUSTFS_S3_STACK: gateway",
+        "gateway_smoke",
     ),
 }
+# Inputs that decide what the gateway S3 stack serves or how the lane starts
+# it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that stack,
+# so a pull request that changes none of these learns nothing from the lane
+# and is not shown its failure. The suite's own contents (crates/e2e_test, the
+# nextest profile, the smoke selection) are deliberately not inputs: feature
+# pull requests change them constantly, and what the suite contains carries no
+# signal while the stack cannot serve it. fnmatch's `*` also matches `/`. Some
+# of these paths exist only on branches that are still assembling the stack.
+#
+# At T2.10, when the lane becomes required, it must run on every pull request
+# again — delete this selection, do not extend it.
+GATEWAY_SMOKE_PATHS = (
+    "crates/gateway-adapter/*",
+    "rustfs/src/server/gateway_stack.rs", "rustfs/src/server/gateway_stack/*",
+    "rustfs/src/server/gateway_handlers.rs", "rustfs/src/server/gateway_handlers/*",
+    "rustfs/src/server/stack.rs", "rustfs/src/server/stack/*",
+    "rustfs/src/config/config_struct.rs",  # parses RUSTFS_S3_STACK
+    "rustfs/Cargo.toml",
+    ".github/workflows/ci.yml", ".github/actions/test-runtime/*",
+    "scripts/ci_gate.py", "scripts/e2e_binary.py",
+)
+# Shared manifests change in most dependency updates; only their gateway pins
+# are inputs of the lane.
+GATEWAY_PIN_FILES = ("Cargo.toml", "Cargo.lock")
+GATEWAY_PACKAGE_PREFIX = "rustfs-gateway"
 INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
@@ -148,6 +177,40 @@ def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
         return normalized[0] == normalized[1]
     except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
         return False
+
+
+def gateway_pins(root: Path, revision: str, path: str) -> list:
+    """The entries of a shared manifest that pin a gateway crate, in file order."""
+    document = tomllib.loads(git_file(root, revision, path))
+    if path == "Cargo.lock":
+        return [package for package in document.get("package", []) if str(package.get("name", "")).startswith(GATEWAY_PACKAGE_PREFIX)]
+    tables = {"workspace.dependencies": document.get("workspace", {}).get("dependencies", {}), "replace": document.get("replace", {})}
+    tables.update({f"patch.{source}": table for source, table in document.get("patch", {}).items()})
+    return [(table, name, spec) for table, entries in tables.items() for name, spec in entries.items()
+            if GATEWAY_PACKAGE_PREFIX in name or (isinstance(spec, dict) and str(spec.get("package", "")).startswith(GATEWAY_PACKAGE_PREFIX))]
+
+
+def gateway_smoke_selection(root: Path, event: str, base: str, head: str, changed: list[str]) -> dict:
+    """Decide whether the report-only gateway lane has anything to say about this run.
+
+    Only a pull request with a known change set that touches no gateway-stack
+    input is skipped; an unreadable manifest or lockfile counts as touched.
+    """
+    if event != "pull_request":
+        return {"run": True, "reason": f"{event} validates the complete candidate"}
+    if not changed or changed == [""]:
+        return {"run": True, "reason": "change set unavailable"}
+    for path in changed:
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in GATEWAY_SMOKE_PATHS):
+            return {"run": True, "reason": f"gateway-stack input changed: {path}"}
+        if path in GATEWAY_PIN_FILES:
+            try:
+                same = gateway_pins(root, base, path) == gateway_pins(root, head, path)
+            except (OSError, subprocess.CalledProcessError, UnicodeError, AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                return {"run": True, "reason": f"gateway pin changed: {path}"}
+    return {"run": False, "reason": "no gateway-stack input changed"}
 
 
 def dependency_tables(document: dict):
@@ -407,6 +470,7 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
             "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
             "rehearse_shards": rehearse_shards,
+            "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
             "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
@@ -613,11 +677,28 @@ def check_workflow(root: Path) -> list[str]:
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
     if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
-    for job, (mirror, steps, env) in REPORT_ONLY_JOBS.items():
+    for job, (mirror, steps, env, selection) in REPORT_ONLY_JOBS.items():
         block, mirrored = jobs.get(job), jobs.get(mirror)
         if not isinstance(block, dict) or not isinstance(mirrored, dict):
             errors.append(f"report-only {job} and its required {mirror} must both exist")
             continue
+        # A failed suite must render as a failed, non-blocking job: never as a
+        # blocking one, and never as a green one behind a tolerated step.
+        if block.get("continue-on-error") != "true":
+            errors.append(f"{job} must stay report-only with job-level continue-on-error")
+        if any(isinstance(item, dict) and "continue-on-error" in item for item in block.get("steps") or []):
+            errors.append(f"{job} cannot hide a failed step behind continue-on-error")
+        # The selection reaches the job's condition only through a declared
+        # output of a job it needs; otherwise the expression reads an empty
+        # string and the lane silently runs everywhere.
+        dependencies = block.get("needs", [])
+        if "classify-changes" not in ([dependencies] if isinstance(dependencies, str) else dependencies):
+            errors.append(f"{job} must need classify-changes to read {selection}")
+        published = (jobs.get("classify-changes", {}).get("outputs") or {}).get(selection, "")
+        if not isinstance(published, str) or f"steps.scope.outputs.{selection}" not in published:
+            errors.append(f"classify-changes must publish {selection} from the scope step")
+        if re.search(r"\b(always|success|failure|cancelled)\s*\(", re.sub(r"'(?:[^']|'')*'", "", str(block.get("if", "")))):
+            errors.append(f"{job} must not override its prerequisites with a status function")
         key, _, value = env.partition(": ")
         if (block.get("env") or {}).get(key) != value:
             errors.append(f"{job} must set {env}")
@@ -711,6 +792,27 @@ def check_workflow(root: Path) -> list[str]:
                                 continue
                             if actual != should_run:
                                 errors.append(f"{job} condition differs from plan for {event}/{mode}/{connect}/{action}/{ref}")
+                        for job, (mirror, _, _, selection) in REPORT_ONLY_JOBS.items():
+                            block = jobs.get(job)
+                            if not isinstance(block, dict) or mirror not in jobs:
+                                continue
+                            for selected in ("true", "false", ""):
+                                try:
+                                    dependencies = block.get("needs", [])
+                                    ready = all(scheduled(dependency) for dependency in ([dependencies] if isinstance(dependencies, str) else dependencies))
+                                    actual = ready and condition(block.get("if", "success()"), dict(
+                                        context, **{f"needs.classify-changes.outputs.{selection}": selected}))
+                                except (KeyError, TypeError, ValueError) as error:
+                                    errors.append(f"{job}: {error}")
+                                    continue
+                                wanted = scheduled(mirror) and (event != "pull_request" or selected != "false")
+                                if actual and not wanted:
+                                    errors.append(f"{job} runs on pull requests that change no gateway-stack input" if scheduled(mirror)
+                                                  else f"{job} runs where {mirror} does not")
+                                elif wanted and not actual:
+                                    errors.append(f"{job} is skipped on {event}" if event != "pull_request" else
+                                                  f"{job} is skipped on a pull request " + (
+                                                      "that changes a gateway-stack input" if selected == "true" else "whose selection is unknown"))
                         for status in ("failure", "cancelled"):
                             context.update(success=False, failure=status == "failure", cancelled=status == "cancelled")
                             try:
@@ -735,6 +837,7 @@ def main() -> int:
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
                                     ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("gateway_smoke", str(plan["gateway_smoke"]["run"]).lower()),
                                     ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))

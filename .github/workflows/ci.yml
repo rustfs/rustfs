@@ -95,6 +95,7 @@ jobs:
       packages: ${{ steps.scope.outputs.packages }}
       full_validation: ${{ steps.scope.outputs.full_validation || 'true' }}
       rehearse_shards: ${{ steps.scope.outputs.rehearse_shards || 'false' }}
+      gateway_smoke: ${{ steps.scope.outputs.gateway_smoke || 'true' }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
@@ -116,7 +117,7 @@ jobs:
             echo "Base CI policy unavailable; running the full matrix."
           fi
           if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=3$' "$GITHUB_OUTPUT"; then
-            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
+            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
       - name: Retain verification plan
@@ -1098,9 +1099,24 @@ jobs:
   # Test and Lint aggregate and becomes required at T2.10. The test-binary
   # download, identity, membership, run and completeness steps must stay
   # identical to e2e-tests; scripts/ci_gate.py enforces that.
+  #
+  # When it runs: every push to main or gateway/integration, merge group,
+  # nightly schedule and manual dispatch, and every pull request that changes a
+  # gateway-stack input (GATEWAY_SMOKE_PATHS and the rustfs-gateway pins in
+  # scripts/ci_gate.py, published by Select CI scope as gateway_smoke).
+  # Why it is skipped on every other pull request: until T2.10 the gateway
+  # stack does not serve the whole smoke suite, so the lane fails on any
+  # revision. A pull request that touches none of its inputs can neither cause
+  # nor fix that failure, and a red check there says nothing about the change.
+  # Skipped is the honest state; a failure must never be rendered green, so no
+  # step here may carry continue-on-error. A selection that is missing or
+  # unreadable runs the lane. At T2.10, when the lane becomes required, it
+  # must run on every pull request again: delete the selection, do not extend
+  # it.
   e2e-tests-gateway:
     name: e2e-smoke (gateway, report-only until T2.10)
-    needs: [ build-rustfs-debug-binary ]
+    needs: [ classify-changes, build-rustfs-debug-binary ]
+    if: github.event_name != 'pull_request' || needs.classify-changes.outputs.gateway_smoke != 'false'
     runs-on: sm-standard-2
     timeout-minutes: 30
     continue-on-error: true

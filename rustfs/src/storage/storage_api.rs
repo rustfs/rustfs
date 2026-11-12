@@ -147,17 +147,34 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
-        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo,
+        AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
+        MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
+        PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold,
+        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
         TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_copy_object_tags, authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation,
+        authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
         delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
         prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
         set_requested_object_lock_retain_until,
     };
+    pub(crate) use super::super::denial_audit::DenialAuditor;
+    pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
+}
+
+#[cfg(test)]
+pub(crate) mod owned_parity_consumer {
+    pub(crate) use super::super::access::{
+        ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
+        RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
+        TableDataPlanePublicationGuards, authorize_request, parity_test_support,
+    };
+    pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
+    pub(crate) use super::super::ecfs::FS;
+    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
+    pub(crate) use super::super::request_context::RequestContext;
 }
 
 pub(crate) mod concurrency_consumer {
@@ -589,10 +606,10 @@ pub(crate) mod ecstore_metrics {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
     pub(crate) use rustfs_ecstore::api::notification::{
-        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch, new_global_notification_sys,
-        start_remote_version_state_fleet_probe,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys,
+        acquire_cross_pool_fence_fleet_proof, configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches,
+        get_global_notification_sys, ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch,
+        new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::notification::{

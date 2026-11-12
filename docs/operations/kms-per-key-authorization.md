@@ -14,7 +14,7 @@ KMS resources use the same empty-account ARN form as S3 resources:
 | `arn:aws:kms:::key/<key_id>` | exactly that key |
 | `arn:aws:kms:::key/app-*` | every key whose id starts with `app-` |
 | `arn:aws:kms:::*` | every key |
-| `arn:aws:kms:::alias/<name>` | reserved; matches nothing until alias resolution ships |
+| `arn:aws:kms:::alias/<name>` | reserved; matches nothing, including a request that names that alias |
 
 Rules worth knowing before writing a policy:
 
@@ -24,7 +24,8 @@ Rules worth knowing before writing a policy:
 - A KMS statement whose resources are S3 ARNs predates KMS resources. It is still loadable, but the S3 patterns never constrained key access, so evaluation ignores them, treats the statement as unscoped, and logs a warning. Rewrite these with real KMS resources.
 - `PutBucketPolicy` rejects any statement carrying a `kms:` action or a KMS resource. KMS grants belong to identities. Bucket policies stored before this check still load; evaluation skips their pure-KMS statements and warns.
 - `Deny` wins, as everywhere else: a `Deny` on `arn:aws:kms:::key/payroll-*` overrides an `Allow` on `arn:aws:kms:::*`.
-- The key identifier matched is the one the request names, before any alias resolution.
+- Write a key pattern with the **key id**. A request may name an AWS key by its id or by its ARN (`arn:<partition>:kms:<region>:<account>:key/<key_id>`); both are matched as that key id, so one statement covers either spelling. An ARN cannot be written as a pattern, because a key pattern may not contain `/`.
+- A request that names a key by **alias** (`alias/<name>` or an alias ARN) names a key only the backend can resolve, so it fails closed against key-scoped statements: every `Deny` that carries a KMS resource applies to it, and only an `Allow` on every key (`arn:aws:kms:::*`, or a statement with no resource) covers it. Name keys by id or ARN wherever a key-scoped policy is in force.
 
 ## Built-in role templates
 
@@ -84,6 +85,8 @@ Scope and exemptions:
 - **The resolved key**, not the header. A bucket default encryption rule naming a KMS key is authorized the same way an explicit `x-amz-server-side-encryption-aws-kms-key-id` header is.
 - **Anonymous requests are denied.** An anonymous caller has no identity policy and therefore no `kms` grants, so under enforcement every anonymous read or write of an SSE-KMS object fails with `AccessDenied`, even on a bucket a bucket policy makes public (matching AWS, and closing the bypass of dropping credentials on a public bucket). **A public bucket serving SSE-KMS objects is incompatible with enforcement** — serve public content unencrypted or under SSE-S3. With enforcement off (the default), anonymous access to SSE-KMS objects is governed by bucket policy alone. The server warns once per process on the first anonymous denial; per-request denials appear on audit entries (`kmsOutcome=failure`, `kmsErrorClass=access_denied`, empty requester identity) and at debug level.
 - **Internal work is exempt.** Replication, lifecycle transitions, healing and the scanner run as the system principal.
+- **Replication is authorized on the receiving side.** The source reads as the system principal, but the destination sees an ordinary `PUT` from the replication credentials and authorizes it against the key it resolves to. Under site replication the managed `site-replicator-0` account holds `kms:GenerateDataKey` on every key for this purpose and nothing else in the `kms:` namespace. For bucket replication through a remote target, grant `kms:GenerateDataKey` on the destination keys to the identity whose credentials the target uses; without it SSE-KMS objects stay `FAILED` on the source with `AccessDenied` from the destination.
+- **Reads proxied to a replication peer are not served for SSE-KMS objects.** While a site does not yet hold an object it asks a peer for it using the replication credentials, which carry no `kms:Decrypt`. Under enforcement the peer refuses, and the caller gets the local `NoSuchKey` until the replica lands, rather than an object their own identity was never checked against.
 - **Authorization runs before key state is checked**, so a denial cannot be used to probe whether a key exists, is disabled, or is pending deletion. The response is always `AccessDenied`.
 - **Multipart uploads are authorized at create time**, where the session data key is generated. Part uploads and completion reuse that envelope and are not re-authorized against the destination key.
 - **Copies are checked on both ends**: `kms:Decrypt` on the source object's key and `kms:GenerateDataKey` on the destination key. `UploadPartCopy` authorizes its source read the same way.

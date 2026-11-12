@@ -11541,11 +11541,14 @@ impl LocalDisk {
     ) -> Result<()> {
         multipart_staging::reject_reserved_anchor(path)?;
         let fuse_with_admission = admission.is_some() && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, path);
+        // Held until the staging root is published, by the filesystem work
+        // itself, so a concurrent listing cannot prune the marker in between.
+        let mut index_pin = None;
         let prepared_index = if volume == RUSTFS_META_MULTIPART_BUCKET {
             if fuse_with_admission {
                 self.multipart_index.prepare_record_head(path, &buf).await
             } else {
-                self.multipart_index.record_head(path, &buf).await?;
+                index_pin = self.multipart_index.record_head(path, &buf).await?;
                 None
             }
         } else {
@@ -11571,8 +11574,10 @@ impl LocalDisk {
             let root = self.publication_root.clone();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
             os::run_blocking_namespace_operation_with_sync(lease, do_sync, move || {
-                if let Some(record) = prepared_index {
-                    record.run_std()?;
+                let _index_pin = prepared_index.map(|record| record.run_std()).transpose()?;
+                #[cfg(test)]
+                if let Some(pin) = &_index_pin {
+                    pin.pause_for_test();
                 }
                 super::fs::create_dir_all_std(&tmp_volume_dir)?;
                 #[cfg(test)]
@@ -11616,12 +11621,16 @@ impl LocalDisk {
             return Err(DiskError::Unexpected);
         }
 
+        let publication_owner: Option<Arc<dyn Send + Sync>> = match index_pin {
+            Some(pin) => Some(Arc::new((namespace_owner.clone(), pin))),
+            None => namespace_owner.clone(),
+        };
         os::rename_all_with_precondition_and_parent_sync(
             &tmp_file_path,
             &file_path,
             &volume_dir,
             &self.publication_root,
-            namespace_owner.clone(),
+            publication_owner,
             admission.as_ref().map(|admission| admission.precondition()),
             admission.is_some() && sync && durability.syncs_commit_metadata(),
         )

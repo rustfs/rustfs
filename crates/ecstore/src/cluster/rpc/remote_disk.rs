@@ -169,6 +169,72 @@ fn decode_delete_recovery_batch_errors(codes: Vec<Option<u32>>, expected_len: us
         .collect()
 }
 
+fn log_delete_recovery_batch_result(
+    endpoint: &Endpoint,
+    expected_len: usize,
+    started: Instant,
+    result: &Result<Vec<Option<DiskError>>>,
+) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let mut disk_error_counts = std::collections::BTreeMap::<u32, usize>::new();
+    let (failure_scope, rpc_status) = match result {
+        Ok(errors) => {
+            for error in errors.iter().flatten() {
+                *disk_error_counts.entry(error.to_u32()).or_default() += 1;
+            }
+            ("object_group", None)
+        }
+        Err(error) => {
+            disk_error_counts.insert(error.to_u32(), expected_len);
+            let rpc_status = match error {
+                DiskError::Io(source) => crate::cluster::rpc::client::embedded_tonic_status(source).map(tonic::Status::code),
+                _ => None,
+            };
+            ("rpc_or_reply", rpc_status)
+        }
+    };
+    let failed_group_count = disk_error_counts.values().sum::<usize>();
+    let result = if result.is_err() || failed_group_count > 0 {
+        "failed"
+    } else {
+        "ok"
+    };
+    if result == "failed" || elapsed_ms >= 1_000 {
+        warn!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            result,
+            operation = "apply_versions",
+            failure_scope,
+            pool_index = endpoint.pool_idx,
+            set_index = endpoint.set_idx,
+            disk_index = endpoint.disk_idx,
+            attempted_group_count = expected_len,
+            failed_group_count,
+            disk_error_counts = ?disk_error_counts,
+            rpc_status = ?rpc_status,
+            elapsed_ms,
+            "Recoverable batch delete RPC completed"
+        );
+    } else {
+        debug!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            result,
+            operation = "apply_versions",
+            pool_index = endpoint.pool_idx,
+            set_index = endpoint.set_idx,
+            disk_index = endpoint.disk_idx,
+            attempted_group_count = expected_len,
+            failed_group_count,
+            elapsed_ms,
+            "Recoverable batch delete RPC completed"
+        );
+    }
+}
+
 fn validate_delete_recovery_inspection(
     volume: &str,
     object: &str,
@@ -933,7 +999,15 @@ pub struct RemoteDisk {
     data_transport: Arc<dyn InternodeDataTransport>,
     #[cfg(feature = "internode-transport")]
     external_streams: bool,
+    /// Bound the per-operation failure warnings of this peer. An unreachable
+    /// peer fails every in-flight shard operation; the counters keep the exact
+    /// numbers per operation. Per handle, so one peer cannot hide another's.
+    timeout_logs: rustfs_utils::LogThrottle,
+    network_error_logs: rustfs_utils::LogThrottle,
 }
+
+/// Shortest gap between two failure warnings of one kind from one remote disk.
+const REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS: u64 = 5_000;
 
 struct RecoveryMonitorLease {
     active: Arc<AtomicBool>,
@@ -1368,6 +1442,8 @@ impl RemoteDisk {
             data_transport,
             #[cfg(feature = "internode-transport")]
             external_streams: false,
+            timeout_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
+            network_error_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -2106,17 +2182,20 @@ impl RemoteDisk {
             "op" => op.to_string()
         )
         .increment(1);
-        warn!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            addr = %self.addr,
-            op,
-            timeout_ms = timeout_duration.as_millis(),
-            state = "timeout",
-            "Remote disk operation timed out"
-        );
+        if let Some(suppressed) = self.timeout_logs.claim() {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %self.endpoint,
+                addr = %self.addr,
+                op,
+                timeout_ms = timeout_duration.as_millis(),
+                suppressed,
+                state = "timeout",
+                "Remote disk operation timed out"
+            );
+        }
     }
 
     async fn handle_network_like_error<T>(
@@ -2136,17 +2215,20 @@ impl RemoteDisk {
                 "op" => op.to_string()
             )
             .increment(1);
-            warn!(
-                event = EVENT_REMOTE_DISK_RPC,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                endpoint = %self.endpoint,
-                addr = %self.addr,
-                op,
-                timeout_ms = timeout_duration.as_millis(),
-                state = "network_like_error",
-                "Remote disk operation returned network-like error"
-            );
+            if let Some(suppressed) = self.network_error_logs.claim() {
+                warn!(
+                    event = EVENT_REMOTE_DISK_RPC,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                    endpoint = %self.endpoint,
+                    addr = %self.addr,
+                    op,
+                    timeout_ms = timeout_duration.as_millis(),
+                    suppressed,
+                    state = "network_like_error",
+                    "Remote disk operation returned network-like error"
+                );
+            }
             if failure_health_action == FailureHealthAction::MarkFailure {
                 self.mark_faulty_and_evict("operation_network_error").await;
             }
@@ -4397,6 +4479,7 @@ impl DiskAPI for RemoteDisk {
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         let expected_len = versions.len();
+        let started = Instant::now();
         let result = match self
             .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::ApplyVersions { versions, opts })
             .await
@@ -4405,6 +4488,7 @@ impl DiskAPI for RemoteDisk {
             Ok(_) => Err(Error::other("unexpected recoverable batch delete reply")),
             Err(error) => Err(error),
         };
+        log_delete_recovery_batch_result(&self.endpoint, expected_len, started, &result);
         match result {
             Ok(errors) => errors,
             Err(error) => vec![Some(error); expected_len],
@@ -5695,6 +5779,62 @@ mod tests {
         assert!(decode_delete_recovery_batch_errors(vec![None], 2).is_err());
         assert!(decode_delete_recovery_batch_errors(vec![Some(0)], 1).is_err());
         assert!(decode_delete_recovery_batch_errors(vec![Some(u32::MAX)], 1).is_err());
+    }
+
+    #[test]
+    fn recoverable_batch_delete_diagnostics_preserve_context_and_redact_error_details() {
+        let logs = CapturedLogs::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_span_list(true),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://127.0.0.1:9000/private-disk-path").expect("valid diagnostic endpoint"),
+            is_local: false,
+            pool_idx: 1,
+            set_idx: 2,
+            disk_idx: 3,
+        };
+        let rpc_failure = Err(DiskError::from(Status::deadline_exceeded("private-error-detail")));
+        let group_failures = Ok(vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)]);
+        tracing::info_span!("request-span", request_id = "req-batch-delete-diagnostics").in_scope(|| {
+            log_delete_recovery_batch_result(&endpoint, 1000, Instant::now(), &rpc_failure);
+            log_delete_recovery_batch_result(&endpoint, 3, Instant::now(), &group_failures);
+        });
+        let entries = logs.lines();
+        assert_eq!(entries.len(), 2, "one summary per disk batch, never per object");
+        assert_eq!(entries[0]["failure_scope"], "rpc_or_reply");
+        assert_eq!(entries[0]["failed_group_count"], 1000);
+        assert_eq!(entries[0]["rpc_status"], "Some(DeadlineExceeded)");
+        assert_eq!(entries[1]["failure_scope"], "object_group");
+        assert_eq!(entries[1]["failed_group_count"], 2);
+        for entry in entries {
+            assert_eq!(entry["pool_index"], 1);
+            assert_eq!(entry["set_index"], 2);
+            assert_eq!(entry["disk_index"], 3);
+            assert!(
+                entry["spans"]
+                    .as_array()
+                    .expect("request spans recorded")
+                    .iter()
+                    .any(|span| { span["request_id"] == "req-batch-delete-diagnostics" })
+            );
+            let text = entry.to_string();
+            assert!(!text.contains("private-error-detail"));
+            assert!(!text.contains("private-disk-path"));
+        }
+        assert!(rpc_failure.is_err(), "diagnostics borrow and preserve the original failure");
+        assert_eq!(
+            group_failures,
+            Ok(vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)])
+        );
     }
 
     #[test]
@@ -11785,6 +11925,66 @@ mod tests {
             runtime_sources::test_node_channel_is_cached(&addr).await,
             "ignored network-like error should not evict cached connection"
         );
+    }
+
+    /// A peer that fails every operation logs one warning per interval, each
+    /// operation still gets its own error, and another peer's first warning is
+    /// not held back by the noisy one.
+    #[tokio::test]
+    async fn rpc_failure_warnings_are_bounded_per_remote_disk() {
+        async fn remote_disk(port: u16) -> RemoteDisk {
+            let url = url::Url::parse(&format!("http://127.0.0.1:{port}/data")).expect("endpoint url");
+            let endpoint = Endpoint {
+                url,
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            };
+            RemoteDisk::new(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+                Arc::new(TcpHttpInternodeDataTransport),
+            )
+            .await
+            .expect("remote disk handle")
+        }
+        let noisy = remote_disk(59981).await;
+        let quiet = remote_disk(59982).await;
+
+        for _ in 0..50 {
+            let error = noisy
+                .execute_with_timeout_for_op_and_health_action(
+                    "read_all",
+                    || async {
+                        Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "connection refused",
+                        )))
+                    },
+                    Duration::from_secs(1),
+                    FailureHealthAction::IgnoreFailure,
+                )
+                .await
+                .expect_err("every failing operation still fails");
+            assert!(matches!(error, DiskError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused));
+            noisy.record_timeout("read_all", Duration::from_secs(1));
+        }
+
+        assert!(
+            noisy.network_error_logs.claim().is_none(),
+            "the burst used this peer's network-error window"
+        );
+        assert!(noisy.timeout_logs.claim().is_none(), "the burst used this peer's timeout window");
+        assert_eq!(
+            quiet.network_error_logs.claim(),
+            Some(0),
+            "another peer's first warning is not suppressed"
+        );
+        assert_eq!(quiet.timeout_logs.claim(), Some(0));
     }
 
     #[tokio::test]
