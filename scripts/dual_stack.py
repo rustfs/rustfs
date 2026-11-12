@@ -173,8 +173,9 @@ def evidence_state(directory, stack):
     if evidence["foreign_starts"]:
         return {"status": "wrong_stack", "detail": f"{evidence['foreign_starts']} server(s) started on another stack"}
     if evidence["verdict"] != "ok":
-        reasons = "; ".join(item["message"] + (f" ({item['logs']} logs)" if item["logs"] > 1 else "") for item in evidence["not_started"] if item["message"])
-        return {"status": "not_started", "detail": f"server did not start: {reasons or 'its logs show no start'}"}
+        top = next((item for item in evidence["not_started"] if item["message"]), None)
+        why = f"{top['message']} ({evidence['logs_without_start']} server logs without a start)" if top else "its logs show no start"
+        return {"status": "not_started", "detail": f"server did not start: {why}"}
     return {"status": "ok", "detail": f"ran; {evidence['started'][stack]} server start(s) on {stack}"}
 
 

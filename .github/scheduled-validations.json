@@ -773,8 +773,7 @@
       ],
       "events": [
         "workflow_dispatch",
-        "schedule",
-        "pull_request"
+        "schedule"
       ],
       "cadence": "nightly",
       "timezone": "UTC",
@@ -1102,8 +1101,7 @@
       ],
       "events": [
         "workflow_dispatch",
-        "schedule",
-        "pull_request"
+        "schedule"
       ],
       "cadence": "nightly",
       "timezone": "UTC",

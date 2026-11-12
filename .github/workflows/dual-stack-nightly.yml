@@ -54,10 +54,6 @@ on:
     # 03:13 UTC nightly, clear of e2e-nightly (04:29), the ODM lane (05:23) and
     # e2e-distributed (05:53).
     - cron: "13 3 * * *"
-  # TRIAL ONLY: removed in the final commit of the pull request.
-  pull_request:
-    paths:
-      - ".github/workflows/dual-stack-nightly.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

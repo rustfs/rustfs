@@ -85,10 +85,6 @@ on:
     # Nightly during the migration window, at the slot the weekly run had: after
     # the Sunday s3-tests full sweep (starts 02:00 UTC, up to 3h) has finished.
     - cron: "41 6 * * *"
-  # TRIAL ONLY: removed in the final commit of the pull request.
-  pull_request:
-    paths:
-      - ".github/workflows/mint.yml"
 
 env:
   S3_ACCESS_KEY: rustfsadmin-ci
