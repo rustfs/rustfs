@@ -14,7 +14,7 @@
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
 use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
-use crate::storage::access::{ReqInfo, request_context_from_req};
+use crate::storage::access::ReqInfo;
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -172,9 +172,55 @@ where
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    let mut resp_elements = extract_params_header(&response.headers);
+    event_resp_elements(&response.headers, request_id)
+}
+
+fn event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
+    let mut resp_elements = extract_params_header(response_headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
+}
+
+/// What an operation answered, as its audit entry and notification event record it.
+#[derive(Clone, Copy)]
+pub(crate) enum OperationOutcome<'a> {
+    /// `headers` are the response headers the operation adds beyond its output.
+    Success {
+        status: StatusCode,
+        headers: &'a HeaderMap,
+    },
+    Failure {
+        status: StatusCode,
+        message: Option<&'a str>,
+    },
+}
+
+impl<'a> OperationOutcome<'a> {
+    /// The outcome of an owned operation that answers success with `status` and `headers`.
+    pub(crate) fn of<T>(result: &'a rustfs_s3_types::S3Result<T>, status: StatusCode, headers: &'a HeaderMap) -> Self {
+        match result {
+            Ok(_) => Self::Success { status, headers },
+            Err(err) => Self::failure(err.status_code(), err.message()),
+        }
+    }
+
+    fn legacy<T>(result: &'a S3Result<S3Response<T>>) -> Self {
+        match result {
+            Ok(res) => Self::Success {
+                status: res.status.unwrap_or(StatusCode::OK),
+                headers: &res.headers,
+            },
+            Err(err) => Self::failure(err.status_code(), err.message()),
+        }
+    }
+
+    /// An error without a status is audited as `400`.
+    fn failure(status: Option<StatusCode>, message: Option<&'a str>) -> Self {
+        Self::Failure {
+            status: status.unwrap_or(StatusCode::BAD_REQUEST),
+            message,
+        }
+    }
 }
 
 /// Builds the audit entry shared by every request-scoped audit source: caller identity,
@@ -323,6 +369,12 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        Self::from_view(&AuditRequestView::legacy(req), event, op)
+    }
+
+    /// [`Self::new`] for a request whose audit facts an owned edge decoded
+    /// (`RequestEnvelope::audit_view`).
+    pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
 
@@ -333,11 +385,16 @@ impl OperationHelper {
     /// Unlike `new` it does not call `record_s3_op`, so per-operation metrics stay as the
     /// handlers already report them.
     pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
+        Self::audit_only_from_view(&AuditRequestView::legacy(req), op)
+    }
+
+    /// [`Self::audit_only`] for a request whose audit facts an owned edge decoded.
+    pub(crate) fn audit_only_from_view(req: &AuditRequestView<'_>, op: S3Operation) -> Self {
         let event = op.to_event_name().unwrap_or(EventName::AuditS3Operation);
         Self::build(req, event, op, true)
     }
 
-    fn build(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation, audit_only: bool) -> Self {
+    fn build(req: &AuditRequestView<'_>, event: EventName, op: S3Operation, audit_only: bool) -> Self {
         // `audit_only` derives the event from the operation, so there is nothing to cross-check.
         let op_event_matches = audit_only || operation_matches_event_name(op, event);
         debug_assert!(op_event_matches, "operation/event mismatch: op={} event={}", op.as_str(), event.as_str());
@@ -357,8 +414,7 @@ impl OperationHelper {
 
         #[cfg(test)]
         let probe_enabled = completion_probe(
-            req.extensions
-                .get::<ReqInfo>()
+            req.req_info
                 .and_then(|info| info.bucket.as_deref())
                 .unwrap_or_else(|| req.uri.path().trim_start_matches('/').split('/').next().unwrap_or_default()),
         )
@@ -378,7 +434,7 @@ impl OperationHelper {
         let mut segs = path.splitn(2, '/');
         let path_bucket = segs.next().unwrap_or("").to_string();
         let path_object_key = segs.next().unwrap_or("").to_string();
-        let req_info = req.extensions.get::<ReqInfo>();
+        let req_info = req.req_info;
         let bucket = req_info
             .and_then(|info| info.bucket.clone())
             .filter(|value| !value.is_empty())
@@ -414,16 +470,15 @@ impl OperationHelper {
         }
         // Audit builder
         // Resolve the canonical request context once for both output chains.
-        let request_context = request_context_from_req(req);
+        let request_context = req.request_context();
         if request_context.is_none() {
             counter!("rustfs_log_chain_orphan_total", "component" => "operation_helper").increment(1);
         }
-        let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
+        let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(req.headers));
         let request_id = request_context.request_id.clone();
 
-        let audit_builder = audit_enabled.then(|| {
-            request_audit_builder(&AuditRequestView::legacy(req), event, trigger, api_builder.clone().build(), &request_id)
-        });
+        let audit_builder =
+            audit_enabled.then(|| request_audit_builder(req, event, trigger, api_builder.clone().build(), &request_id));
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -431,7 +486,7 @@ impl OperationHelper {
             ..Default::default()
         };
 
-        let mut req_params = extract_params_header(&req.headers);
+        let mut req_params = extract_params_header(req.headers);
         if let Some(principal_id) = req_info
             .and_then(|info| info.cred.as_ref())
             .map(|cred| cred.access_key.clone())
@@ -444,9 +499,9 @@ impl OperationHelper {
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
             let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
-                .host(get_request_host(&req.headers))
-                .port(get_request_port(&req.headers))
-                .user_agent(get_request_user_agent(&req.headers))
+                .host(get_request_host(req.headers))
+                .port(get_request_port(req.headers))
+                .user_agent(get_request_user_agent(req.headers))
                 .req_params(req_params);
             if let Some(version_id) = req_info
                 .and_then(|info| info.version_id.clone())
@@ -542,18 +597,21 @@ impl OperationHelper {
     /// Complete operational details from S3 results.
     /// This method should be called immediately before the function returns.
     /// It consumes and prepares auxiliary structures for use during `drop`.
-    pub fn complete<T>(mut self, result: &S3Result<S3Response<T>>) -> Self {
+    pub fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
+        self.complete_with(OperationOutcome::legacy(result))
+    }
+
+    /// [`Self::complete`] for an owned operation's outcome.
+    pub(crate) fn complete_with(mut self, outcome: OperationOutcome<'_>) -> Self {
         let Self::Enabled(state) = &mut self else {
             return self;
         };
 
-        let (status, status_code, error_msg) = match result {
-            Ok(res) => ("success".to_string(), res.status.unwrap_or(StatusCode::OK).as_u16() as i32, None),
-            Err(e) => (
-                "failure".to_string(),
-                e.status_code().unwrap_or(StatusCode::BAD_REQUEST).as_u16() as i32,
-                e.message().map(|s| s.to_string()),
-            ),
+        let (status, status_code, error_msg) = match outcome {
+            OperationOutcome::Success { status, .. } => ("success".to_string(), status.as_u16() as i32, None),
+            OperationOutcome::Failure { status, message } => {
+                ("failure".to_string(), status.as_u16() as i32, message.map(str::to_string))
+            }
         };
         state.api_builder = state.api_builder.clone().status(status.clone()).status_code(status_code);
 
@@ -572,8 +630,8 @@ impl OperationHelper {
                 .build();
 
             let mut final_builder = builder.api(api_details.clone());
-            if let Ok(res) = result {
-                final_builder = final_builder.resp_header(extract_params_header(&res.headers));
+            if let OperationOutcome::Success { headers, .. } = outcome {
+                final_builder = final_builder.resp_header(extract_params_header(headers));
             }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
@@ -603,9 +661,9 @@ impl OperationHelper {
 
         // Completion event notification (only on success)
         if state.notify_enabled
-            && let (Some(builder), Ok(res)) = (state.event_builder.take(), result)
+            && let (Some(builder), OperationOutcome::Success { headers, .. }) = (state.event_builder.take(), outcome)
         {
-            state.event_builder = Some(builder.resp_elements(build_event_resp_elements(res, &state.request_context.request_id)));
+            state.event_builder = Some(builder.resp_elements(event_resp_elements(headers, &state.request_context.request_id)));
         }
 
         self
@@ -622,11 +680,16 @@ impl OperationHelper {
     /// Returns the operation's canonical context, reading the ingress extension
     /// when the disabled fast path holds no request state.
     pub(crate) fn request_context_or_from_request<T>(&self, req: &S3Request<T>) -> RequestContext {
+        self.request_context_or_from_view(&AuditRequestView::legacy(req))
+    }
+
+    /// [`Self::request_context_or_from_request`] for a request whose audit facts an owned edge decoded.
+    pub(crate) fn request_context_or_from_view(&self, req: &AuditRequestView<'_>) -> RequestContext {
         match self {
             Self::Enabled(state) => state.request_context.clone(),
-            Self::Disabled => {
-                request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers))
-            }
+            Self::Disabled => req
+                .request_context()
+                .unwrap_or_else(|| RequestContext::from_external_headers(req.headers)),
         }
     }
 }

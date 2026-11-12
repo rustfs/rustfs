@@ -238,6 +238,7 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
+    pub(crate) use super::super::helper::OperationOutcome;
     #[cfg(test)]
     pub(crate) use super::super::helper::{
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,

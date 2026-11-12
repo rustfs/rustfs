@@ -1605,6 +1605,7 @@ pub(crate) mod head_prefix {
 }
 
 pub(crate) mod helper {
+    pub(crate) use crate::storage::storage_api::helper_consumer::OperationOutcome;
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::helper_consumer::{
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
@@ -1842,6 +1843,7 @@ pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
+    pub(crate) use super::helper::{OperationHelper, OperationOutcome};
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
