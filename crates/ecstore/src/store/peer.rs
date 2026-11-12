@@ -243,6 +243,7 @@ impl ECStore {
     }
 
     /// Execute on this instance's active local disk through the physical owner.
+    /// A verified scanner publication uses the receiver's background disk admission.
     pub async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -260,7 +261,7 @@ impl ECStore {
         } else {
             None
         };
-        rename_local_data_with_ctx(
+        let rename = rename_local_data_with_ctx(
             &self.ctx,
             disk_ref,
             source,
@@ -271,8 +272,12 @@ impl ECStore {
                 external_guard,
                 namespace_owner: None,
             },
-        )
-        .await
+        );
+        if scanner_token.is_some() {
+            crate::disk::with_background_disk_io(tokio_util::sync::CancellationToken::new(), rename).await
+        } else {
+            rename.await
+        }
     }
 
     /// Recovery stays bound to this admitted instance even after RPC cancellation.
@@ -1311,6 +1316,10 @@ mod tests {
             .await
             .expect("bounded physical entry");
             let at_entry = (ctx.namespace_commits_pending(), ctx.namespace_commit_generation());
+            let Disk::Local(wrapper) = disk.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
+            assert!(!wrapper.background_io_active_for_tests(), "an ordinary rename stays foreground");
             assert!(!rename.is_finished(), "caller must still await the paused physical rename");
             rename.abort();
             let cancelled = tokio::time::timeout(Duration::from_secs(5), &mut rename)
@@ -1429,7 +1438,18 @@ mod tests {
         })
         .await
         .expect("bounded physical entry");
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        assert!(
+            wrapper.background_io_active_for_tests(),
+            "a verified scanner publication must retain background admission on the receiving disk"
+        );
         drop(rename);
+        assert!(
+            wrapper.background_io_active_for_tests(),
+            "native publication keeps admission after RPC cancellation"
+        );
         assert!(
             !store.scanner_data_usage_publication_blocked().await,
             "a pending namespace commit is not a local publication barrier"
