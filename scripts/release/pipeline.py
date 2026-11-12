@@ -78,8 +78,9 @@ def source_ci(source, version):
         jobs = run_jobs(run)
         if succeeded(jobs, CI_GATE):
             return {"run_id": run["id"], "run_attempt": run["run_attempt"]}
-        # A queue-landed push skips its validation jobs as proven by the merge-group run of the same tree
-        # (scripts/ci_merge_group_proof.py); that run carries the full gate, so it is the evidence.
+        # The full gate of a queue-landed commit may have run only in the merge-group run of its tree, which
+        # its push run skips as proven. That run is found again here (scripts/ci_merge_group_proof.py) and,
+        # if it passed the whole gate itself, is the evidence.
         if run["event"] == "push" and succeeded(jobs, CI_GATE[:2]):
             tree = c.command(["git", "rev-parse", "--verify", "--end-of-options", f"{source}^{{tree}}"], cwd=c.ROOT)
             queued = c.github(f"repos/{c.REPOSITORY}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100")
