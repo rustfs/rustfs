@@ -83,10 +83,15 @@ mod tests {
 
     #[test]
     fn names_rustfs_creates_and_aws_refuses_are_represented_unchanged() {
-        for name in RUSTFS_ONLY_NAMES.into_iter().chain(["256.1.1.1", "sftp_host_keys", "UPPER"]) {
+        for name in RUSTFS_ONLY_NAMES.into_iter().chain(["sftp_host_keys", "UPPER"]) {
             assert!(BucketName::new(name).is_err(), "{name} must be outside the AWS grammar for this test");
             let materialized = stored_bucket_name(name).unwrap_or_else(|error| panic!("{name}: {error:?}"));
             assert_eq!(materialized.as_str(), name);
+        }
+        // Dotted quads the standard address parser refuses. RustFS's create rule refuses every
+        // dotted quad, so none is stored, but the floor would not drop one either.
+        for name in ["256.1.1.1", "01.2.3.4"] {
+            assert_eq!(stored_bucket_name(name).map(|name| name.as_str().to_owned()).ok().as_deref(), Some(name));
         }
     }
 

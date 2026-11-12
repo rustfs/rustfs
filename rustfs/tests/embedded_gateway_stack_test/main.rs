@@ -152,19 +152,15 @@ where
 {
     temp_env::with_vars(environment, || {
         common::run_embedded_test(move || async move {
-            let Some(started) = start_server().await else { return };
-            test(started.expect("start embedded server")).await;
+            test(start_server().await.expect("start embedded server")).await;
         });
     });
 }
 
-/// Starts an embedded server on a free port; `None` when the sandbox allows no port at all.
-async fn start_server() -> Option<Result<RustFSServer, String>> {
-    let port = match find_available_port() {
-        Ok(port) => port,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
-        Err(err) => panic!("find free port: {err}"),
-    };
+/// Starts an embedded server on a free port. A host without a free port fails the test rather
+/// than passing it unobserved.
+async fn start_server() -> Result<RustFSServer, String> {
+    let port = find_available_port().expect("a free local port");
     let started = RustFSServerBuilder::new()
         .address(format!("127.0.0.1:{port}"))
         .access_key(ROOT_ACCESS_KEY)
@@ -172,7 +168,7 @@ async fn start_server() -> Option<Result<RustFSServer, String>> {
         .build()
         .await;
     // Both renderings: the refusal's text may be in either.
-    Some(started.map_err(|error| format!("{error} {error:?}")))
+    started.map_err(|error| format!("{error} {error:?}"))
 }
 
 /// The S3 error code and HTTP status an SDK call was refused with.
@@ -397,8 +393,7 @@ fn the_gateway_stack_refuses_to_start_with_keystone_enabled() {
     ];
     temp_env::with_vars(environment, || {
         common::run_embedded_test(|| async {
-            let Some(started) = start_server().await else { return };
-            let refusal = match started {
+            let refusal = match start_server().await {
                 Ok(server) => {
                     server.shutdown().await;
                     panic!("the gateway stack started with Keystone enabled");
