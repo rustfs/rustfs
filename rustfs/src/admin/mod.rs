@@ -100,6 +100,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     plugins_instances::register_plugin_instance_route(r)?;
 
     replication_handler::register_replication_route(r)?;
+    handlers::s3_extension::register_s3_extension_routes(r)?;
     batch_job::register_batch_job_route(r)?;
     integrity::register_integrity_routes(r)?;
     site_replication::register_site_replication_route(r)?;

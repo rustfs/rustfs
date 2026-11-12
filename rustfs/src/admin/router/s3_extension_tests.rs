@@ -146,10 +146,15 @@ async fn install_identities() -> (Callers, String) {
         if let Some(actions) = actions {
             let policy = serde_json::json!({"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":actions,"Resource":"arn:aws:s3:::*"}]});
-            iam.set_policy(user, Policy::parse_config(&serde_json::to_vec(&policy).expect("policy JSON")).expect("policy"))
+            iam.set_policy(
+                user,
+                Policy::parse_config(&serde_json::to_vec(&policy).expect("policy JSON")).expect("policy"),
+            )
+            .await
+            .expect("set policy");
+            iam.policy_db_set(user, UserType::Reg, false, user)
                 .await
-                .expect("set policy");
-            iam.policy_db_set(user, UserType::Reg, false, user).await.expect("attach policy");
+                .expect("attach policy");
         }
     }
     let bucket = format!("ext-routes-{suffix}");
@@ -237,8 +242,16 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             (Method::GET, "/?events=s3:ObjectCreated:*", S3ErrorCode::InternalError),
             (Method::GET, "/{b}?events=s3:ObjectCreated:*", S3ErrorCode::AccessDenied),
             (Method::GET, "/{b}?replication-reset-status", S3ErrorCode::AccessDenied),
-            (Method::GET, "/{b}?replication-metrics=2", S3ErrorCode::ReplicationConfigurationNotFoundError),
-            (Method::GET, "/{b}?replication-metrics", S3ErrorCode::ReplicationConfigurationNotFoundError),
+            (
+                Method::GET,
+                "/{b}?replication-metrics=2",
+                S3ErrorCode::ReplicationConfigurationNotFoundError,
+            ),
+            (
+                Method::GET,
+                "/{b}?replication-metrics",
+                S3ErrorCode::ReplicationConfigurationNotFoundError,
+            ),
         ] {
             let uri = uri_for(template, &bucket);
             let result = send(&router, request(method.clone(), &uri, Some(&callers.reader))).await;
@@ -248,9 +261,21 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
         // The fully permitted caller reaches each handler's first decision.
         for (method, template, expected) in [
             (Method::PUT, "/{b}?replication-reset", S3ErrorCode::ReplicationConfigurationNotFoundError),
-            (Method::GET, "/{b}?replication-reset-status", S3ErrorCode::ReplicationConfigurationNotFoundError),
-            (Method::GET, "/{b}?replication-metrics=2", S3ErrorCode::ReplicationConfigurationNotFoundError),
-            (Method::GET, "/{b}?replication-metrics", S3ErrorCode::ReplicationConfigurationNotFoundError),
+            (
+                Method::GET,
+                "/{b}?replication-reset-status",
+                S3ErrorCode::ReplicationConfigurationNotFoundError,
+            ),
+            (
+                Method::GET,
+                "/{b}?replication-metrics=2",
+                S3ErrorCode::ReplicationConfigurationNotFoundError,
+            ),
+            (
+                Method::GET,
+                "/{b}?replication-metrics",
+                S3ErrorCode::ReplicationConfigurationNotFoundError,
+            ),
             (Method::GET, "/{b}?replication-check", S3ErrorCode::InvalidRequest),
             (Method::GET, "/missing-{b}?replication-metrics", S3ErrorCode::NoSuchBucket),
             (Method::GET, "/missing-{b}?events=s3:ObjectCreated:*", S3ErrorCode::NoSuchBucket),
@@ -261,7 +286,11 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             assert_eq!(error_code(result, &format!("full {method} {uri}")), expected, "full {method} {uri}");
         }
 
-        for template in ["/?events=s3:ObjectCreated:*", "/{b}?events=s3:ObjectCreated:*", "/{b}/?events=s3:ObjectCreated:*"] {
+        for template in [
+            "/?events=s3:ObjectCreated:*",
+            "/{b}?events=s3:ObjectCreated:*",
+            "/{b}/?events=s3:ObjectCreated:*",
+        ] {
             let uri = uri_for(template, &bucket);
             let response = send(&router, request(Method::GET, &uri, Some(&callers.full)))
                 .await
