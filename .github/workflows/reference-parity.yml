@@ -116,7 +116,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
@@ -284,7 +284,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 

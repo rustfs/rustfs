@@ -6045,14 +6045,10 @@ fn should_use_inline_fast_path_with_plan(
     // a stale/corrupt marker cannot route an oversized payload into the
     // in-memory decoder. The independent direct-memory reader remains capped
     // at 128 KiB below.
-    if !plan.is_plain()
-        || shape.object_size > usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
-        || fi.erasure.data_blocks == 0
-        || fi.erasure.block_size == 0
-    {
-        return false;
-    }
-    true
+    plan.is_plain()
+        && shape.object_size <= usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
+        && fi.erasure.data_blocks != 0
+        && fi.erasure.block_size != 0
 }
 
 enum SmallWritePath {
