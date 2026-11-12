@@ -15,6 +15,11 @@
 //! UploadPart.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    ChecksumAlgorithm, ServerSideEncryption, StreamingBlob, UploadPartInput, UploadPartOutput,
+};
+use crate::app::storage_api::s3::stream::ByteStream;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&StreamingBlob>) -> rustfs_s3_types::S3Result<Option<i64>> {
     if let Some(length) = content_length {

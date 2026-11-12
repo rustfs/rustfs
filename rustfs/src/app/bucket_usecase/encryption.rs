@@ -15,6 +15,11 @@
 //! Bucket default-encryption use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, GetBucketEncryptionInput, PutBucketEncryptionInput,
+    PutBucketEncryptionOutput, ServerSideEncryption,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 /// Refuse a default-encryption configuration the write path could not honour
 /// as written. `bucket_default_write_sse` falls back to AES256 for any
@@ -189,6 +194,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::storage_api::s3 as s3s_crate;
     use http::Method;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,

@@ -17,6 +17,10 @@
 use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
 use super::*;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
+use crate::app::storage_api::s3::dto::{
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use s3s::dto::ObjectIdentifier;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -1670,6 +1674,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::app::storage_api::s3::dto::{ETag, GetObjectInput, HeadObjectInput};
     use http::{HeaderMap, HeaderValue, Method};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
