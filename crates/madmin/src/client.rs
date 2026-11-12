@@ -603,8 +603,10 @@ impl AdminClient {
         if let Some(content_type) = content_type {
             builder = builder.header(http::header::CONTENT_TYPE, content_type);
         }
+        // Only the signed head is used: its headers are copied onto the reqwest
+        // request below, which carries the real body, so no body is attached.
         let unsigned = builder
-            .body(s3s::Body::empty())
+            .body(())
             .map_err(|err| AdminClientError::InvalidEndpoint(format!("build request failed: {err}")))?;
         let signed = rustfs_signer::sign_v4(
             unsigned,

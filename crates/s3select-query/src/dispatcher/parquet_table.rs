@@ -49,13 +49,13 @@ use datafusion::{
     },
 };
 use futures::{FutureExt, TryFutureExt, TryStreamExt, future::BoxFuture, stream};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{
     QueryResult,
     object_store::{SelectScanRange, scan_range_from_bounds},
     parquet_budget::{ParquetBudgetError, page_decode_budget, validate_footer},
     query::session::QueryExecutionGuard,
 };
-use s3s::dto::SelectObjectContentInput;
 
 #[derive(Clone)]
 pub struct ParquetSelectTable {
@@ -639,8 +639,8 @@ mod tests {
         prelude::SessionContext,
     };
     use rustfs_s3select_api::SelectError;
-    use s3s::dto::{
-        CSVOutput, ExpressionType, InputSerialization, OutputSerialization, ParquetInput, ScanRange, SelectObjectContentRequest,
+    use rustfs_s3select_api::request::{
+        CsvOutput, ExpressionType, InputSerialization, OutputSerialization, ParquetInput, ScanRange, SelectObjectContentRequest,
     };
     use std::{
         fs::File,
@@ -1107,6 +1107,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parquet_legacy_lz4_checks_native_scratch_before_query_decode() {
+        use datafusion::parquet::{basic::Compression, file::metadata::ParquetMetaDataWriter};
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(datafusion::arrow::array::Int32Array::from(vec![42]))])
+                .expect("one integer row");
+        let properties = datafusion::parquet::file::properties::WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let mut original = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut original, schema, Some(properties)).expect("writer");
+        writer.write(&batch).expect("row");
+        writer.close().expect("footer");
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(original))
+            .expect("metadata")
+            .metadata()
+            .clone();
+        // A valid legacy frame encoding the four little-endian bytes for 42.
+        let payload = [2, 33, 76, 24, 5, 0, 0, 0, 0x40, 42, 0, 0, 0];
+        let mut page = vec![0x15, 0, 0x15, 8, 0x15, 26, 0x2c, 0x15, 2, 0x15, 0, 0x15, 6, 0x15, 6, 0, 0];
+        page.extend(payload);
+        let column = metadata
+            .row_group(0)
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_compression(Compression::LZ4)
+            .set_data_page_offset(4)
+            .set_total_compressed_size(i64::try_from(page.len()).expect("small page"))
+            .build()
+            .expect("legacy column");
+        let group = metadata
+            .row_group(0)
+            .clone()
+            .into_builder()
+            .set_column_metadata(vec![column])
+            .build()
+            .expect("row group");
+        let metadata = metadata.as_ref().clone().into_builder().set_row_groups(vec![group]).build();
+        let mut encoded = b"PAR1".to_vec();
+        encoded.extend(page);
+        ParquetMetaDataWriter::new(&mut encoded, &metadata)
+            .finish()
+            .expect("legacy footer");
+        assert!(encoded.len() < 4096);
+        let mut native = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(encoded.clone()))
+            .expect("legacy metadata")
+            .build()
+            .expect("native reader");
+        let decoded = native.next().expect("one batch").expect("legacy fallback decode");
+        assert_eq!(
+            decoded
+                .column(0)
+                .as_primitive::<datafusion::arrow::datatypes::Int32Type>()
+                .value(0),
+            42
+        );
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("legacy.parquet"), Bytes::from(encoded).into())
+            .await
+            .expect("fixture");
+        let tight = parquet_session_with_memory(store.clone(), 2 * 1024 * 1024);
+        let result = ParquetSelectTable::try_new(&tight.state(), &parquet_input("legacy.parquet"), None).await;
+        let error = match result {
+            Ok(_) => panic!("legacy decoder scratch exceeds the query budget"),
+            Err(error) => error,
+        };
+        assert_eq!(error.select_error(), SelectError::ResourceExhausted);
+        let roomy = parquet_session_with_memory(store, 128 * 1024 * 1024);
+        let table = ParquetSelectTable::try_new(&roomy.state(), &parquet_input("legacy.parquet"), None)
+            .await
+            .expect("admitted legacy file");
+        roomy.register_table("source", table).expect("table");
+        let rows = roomy
+            .sql("SELECT v FROM source")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("query");
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_primitive::<datafusion::arrow::datatypes::Int32Type>()
+                .value(0),
+            42
+        );
+    }
+
+    #[tokio::test]
     async fn parquet_nested_views_decode_through_the_actual_file_schema() {
         use datafusion::arrow::array::{ListArray, StringArray};
         use datafusion::arrow::buffer::OffsetBuffer;
@@ -1195,13 +1287,13 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
                     parquet: Some(ParquetInput::default()),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,

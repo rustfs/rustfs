@@ -1,0 +1,415 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+
+# Manual packaging of the current origin/main tip. Workflow artifacts only.
+# Dispatch uses this file from the selected branch. The build fetches
+# refs/heads/main and checks out that commit, not the dispatch ref or a tag.
+
+name: Manual main packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: "Linux targets: x86 (x86_64 musl+gnu), arm (aarch64 musl+gnu), or all"
+        required: true
+        type: choice
+        options:
+          - x86
+          - arm
+          - all
+        default: all
+      version:
+        description: "Binary and package version: MAJOR.MINOR.PATCH, or MAJOR.MINOR.PATCH-(alpha|beta|rc).N. No leading v."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  prepare:
+    name: Resolve main tip and version
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      source_sha: ${{ steps.pin.outputs.source_sha }}
+      version: ${{ steps.version.outputs.version }}
+      toolchain: ${{ steps.inputs.outputs.toolchain }}
+      console: ${{ steps.inputs.outputs.console }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin the tip of origin/main
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main
+          sha=$(git rev-parse FETCH_HEAD)
+          git checkout --detach "$sha"
+          test "$(git rev-parse HEAD)" = "$sha"
+          printf 'source_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'Pinned origin/main %s\n' "$sha"
+
+      - name: Validate package version
+        id: version
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/package_manual_artifacts.sh validate \
+            --version "$PACKAGE_VERSION" \
+            --arch x86_64 \
+            --libc gnu | tee "$RUNNER_TEMP/package-version.txt"
+          printf 'version=%s\n' "$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Resolve console assets and toolchain
+        id: inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          toolchain=$(rustc --version | awk '{print $2}')
+          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh api repos/rustfs/console/releases/latest > console-release.json
+          TOOLCHAIN="$toolchain" python3 - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, "scripts/release")
+          import candidate
+          console = candidate.console_asset(candidate.read_json("console-release.json"))
+          candidate.emit_output("console", json.dumps(console, separators=(",", ":")))
+          candidate.emit_output("toolchain", os.environ["TOOLCHAIN"])
+          print(f"toolchain={os.environ['TOOLCHAIN']}")
+          print(f"console={console['tag']} {console['name']}")
+          PY
+
+      - name: Select Linux targets
+        id: matrix
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ inputs.architecture }}
+        run: |
+          set -euo pipefail
+          matrix=$(bash scripts/release/package_manual_artifacts.sh matrix "$ARCHITECTURE")
+          count=$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$matrix")
+          [[ "$count" -gt 0 ]]
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'Selected %s target(s) for %s\n' "$count" "$ARCHITECTURE"
+
+  package:
+    name: Package RustFS (${{ matrix.target_id }})
+    needs: prepare
+    if: github.repository == 'rustfs/rustfs'
+    # x86_64 uses sm-standard-4, the official release compile pool: the workspace
+    # release build needs that disk (placement rule: disk) and reads build.yml's
+    # cache without writing it. aarch64 uses ubicloud-standard-16-arm so the
+    # packaged binary and console smoke execute natively (placement rule: hardware).
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 210
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTUP_TOOLCHAIN: ${{ needs.prepare.outputs.toolchain }}
+      RUSTFLAGS: "${{ matrix.rustflags }}"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout the pinned origin/main commit
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm the checkout is that main commit
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main
+          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: ${{ needs.prepare.outputs.toolchain }}
+          target: ${{ matrix.target }}
+          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}${{ matrix.os == 'ubicloud-standard-16-arm' && '-ubicloud-arm' || '' }}
+          # build.yml owns this key. This job only restores it.
+          cache-save-if: 'false'
+          install-cross-tools: ${{ matrix.cross }}
+          install-build-packaging-tools: 'true'
+          install-test-tools: 'false'
+
+      - name: Download static console assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONSOLE_IDENTITY: ${{ needs.prepare.outputs.console }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCONSOLE'
+          import json, os, pathlib, subprocess, zipfile
+          value = json.loads(os.environ["CONSOLE_IDENTITY"])
+          subprocess.run(["python3", ".github/actions/setup/download_release_asset.py",
+              "--repository", "rustfs/console", "--tag", value["tag"], "--asset", value["name"],
+              "--sha256", value["sha256"], "--output", "console.zip"], check=True)
+          destination = pathlib.Path("rustfs/static")
+          destination.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile("console.zip") as archive:
+              for member in archive.infolist():
+                  path = pathlib.PurePosixPath(member.filename)
+                  if path.is_absolute() or ".." in path.parts or "\\" in member.filename:
+                      raise SystemExit("unsafe Console archive member")
+              archive.extractall(destination)
+          if not (destination / "index.html").is_file():
+              raise SystemExit("Console archive has no index.html")
+          PYCONSOLE
+          rm -f console.zip
+
+      - name: Build RustFS
+        shell: bash
+        env:
+          RUSTFS_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.build_os }}
+          BUILD_FEATURES: ${{ matrix.features }}
+          BUILD_GLIBC: ${{ matrix.glibc }}
+          BUILD_CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          touch rustfs/build.rs
+
+          feature_args=()
+          if [[ -n "$BUILD_FEATURES" ]]; then
+            feature_args=(--features "$BUILD_FEATURES")
+          fi
+
+          # gnu targets pin glibc 2.31 through cargo-zigbuild (<target>.<glibc>).
+          target_arg="$BUILD_TARGET"
+          if [[ -n "$BUILD_GLIBC" ]]; then
+            target_arg="${target_arg}.${BUILD_GLIBC}"
+          fi
+
+          profile_args=()
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "$BUILD_FEATURES" == pyroscope ]]; then
+            profile_args=(--config 'profile.release.strip="none"')
+          fi
+
+          case "$BUILD_CROSS" in
+            true)
+              cargo zigbuild --release --locked --target "$target_arg" "${feature_args[@]}" "${profile_args[@]}" -p rustfs --bin rustfs
+              ;;
+            false)
+              cargo build --release --locked --target "$target_arg" "${feature_args[@]}" "${profile_args[@]}" -p rustfs --bin rustfs
+              ;;
+            *)
+              printf 'unexpected cross flag: %q\n' "$BUILD_CROSS" >&2
+              exit 1
+              ;;
+          esac
+
+          bin="target/${BUILD_TARGET}/release/rustfs"
+          version_output=$("$bin" --version)
+          first=${version_output%%$'\n'*}
+          if [[ "$first" != "rustfs ${RUSTFS_BUILD_VERSION}" ]]; then
+            printf 'binary version line is %q, expected %q\n' "$first" "rustfs ${RUSTFS_BUILD_VERSION}" >&2
+            printf '%s\n' "$version_output" >&2
+            exit 1
+          fi
+          if ! grep -Fxq "build target : ${BUILD_TARGET}" <<< "$version_output" || \
+             ! grep -Fxq "build os     : ${BUILD_OS}" <<< "$version_output" || \
+             ! grep -Fxq "rust channel : stable-${BUILD_TARGET}" <<< "$version_output"; then
+            printf 'release binary reports an unexpected compile target\n' >&2
+            printf '%s\n' "$version_output" >&2
+            exit 1
+          fi
+          if [[ -n "$BUILD_GLIBC" ]]; then
+            python3 scripts/release/check_glibc.py "$BUILD_GLIBC" "$bin"
+          fi
+
+      - name: Generate the CPU symbol catalog
+        if: endsWith(matrix.target, '-linux-gnu') && matrix.features == 'pyroscope'
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 --filter-platform "$BUILD_TARGET" \
+            --features rustfs/pyroscope > "$RUNNER_TEMP/cpu-catalog-metadata.json"
+          features=$(jq -ce '
+            (.packages[] | select(.name == "rustfs") | .id) as $id |
+            .resolve.nodes[] | select(.id == $id) | .features | map(select(. != "default")) | sort
+          ' "$RUNNER_TEMP/cpu-catalog-metadata.json")
+          release_dir="target/${BUILD_TARGET}/release"
+          rm -f "$release_dir/rustfs.cpu-symbol-catalog.json" "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+          cargo run --locked -p rustfs-connect-symbol-catalog -- \
+            "$release_dir/rustfs" "$(git rev-parse HEAD)" "$BUILD_TARGET" "$features" \
+            "$release_dir/rustfs.cpu-symbol-catalog.json" > "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+
+      - name: Install DEB and RPM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm fakeroot cpio
+          sudo gem install fpm --version 1.17.0 --no-document
+
+      - name: Package zip, deb, and rpm
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_FEATURES: ${{ matrix.features }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          binary="target/${BUILD_TARGET}/release/rustfs"
+          extra=()
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "$BUILD_FEATURES" == pyroscope ]]; then
+            extra=(
+              --zip-extra "target/${BUILD_TARGET}/release/rustfs.cpu-symbol-catalog.json"
+              --zip-extra "target/${BUILD_TARGET}/release/rustfs.cpu-symbol-catalog.sha256"
+            )
+          fi
+          bash scripts/release/package_manual_artifacts.sh package \
+            --version "$PACKAGE_VERSION" \
+            --arch "$ARCH" \
+            --libc "$LIBC" \
+            --binary "$binary" \
+            --output dist \
+            "${extra[@]}"
+          printf 'Packaged %s from origin/main %s\n' "$PACKAGE_VERSION" "$SOURCE_SHA"
+
+      - name: Verify the packaged binary
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.build_os }}
+          BUILD_FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          stem="rustfs-linux-${ARCH}-${LIBC}-v${PACKAGE_VERSION}"
+          package_file="dist/${stem}.zip"
+          [[ -f "$package_file" && -f "dist/${stem}.deb" && -f "dist/${stem}.rpm" ]]
+          [[ "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3 ]]
+          archive_members=$(unzip -Z1 "$package_file" | sort)
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "$BUILD_FEATURES" == pyroscope ]]; then
+            expected_members=$(printf '%s\n' rustfs rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256 | sort)
+          else
+            expected_members=$(printf '%s\n' rustfs)
+          fi
+          if [[ "$archive_members" != "$expected_members" ]]; then
+            printf 'Linux package does not contain the expected files\n' >&2
+            printf '%s\n' "$archive_members" >&2
+            exit 1
+          fi
+          binary_dir=$(mktemp -d)
+          trap 'rm -rf "$binary_dir"' EXIT
+          unzip -q "$package_file" rustfs -d "$binary_dir"
+          version_output=$("$binary_dir/rustfs" --version)
+          first=${version_output%%$'\n'*}
+          if [[ "$first" != "rustfs ${PACKAGE_VERSION}" ]]; then
+            printf 'packaged binary version line is %q, expected %q\n' "$first" "rustfs ${PACKAGE_VERSION}" >&2
+            exit 1
+          fi
+          if ! grep -Fxq "build target : ${BUILD_TARGET}" <<< "$version_output" || \
+             ! grep -Fxq "build os     : ${BUILD_OS}" <<< "$version_output"; then
+            printf 'packaged binary reports an unexpected compile target\n' >&2
+            exit 1
+          fi
+
+      - name: Verify packaged console
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+        run: |
+          set -euo pipefail
+          package_file="dist/rustfs-linux-${ARCH}-${LIBC}-v${PACKAGE_VERSION}.zip"
+
+          find_free_port() {
+            python3 - <<'PY'
+          import socket
+
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          }
+
+          package_dir=$(mktemp -d)
+          data_dir=$(mktemp -d)
+          log_file="${RUNNER_TEMP}/rustfs-console-smoke.log"
+          server_pid=""
+          trap '
+            if [[ -n "${server_pid:-}" ]]; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            rm -rf "$package_dir" "$data_dir"
+          ' EXIT
+
+          unzip -q "$package_file" -d "$package_dir"
+          api_port=$(find_free_port)
+          console_port=$(find_free_port)
+          console_url="http://127.0.0.1:${console_port}/rustfs/console/"
+
+          "$package_dir/rustfs" server \
+            --address "127.0.0.1:${api_port}" \
+            --console-enable \
+            --console-address "127.0.0.1:${console_port}" \
+            --access-key console-smoke \
+            --secret-key console-smoke-secret \
+            "$data_dir" >"$log_file" 2>&1 &
+          server_pid=$!
+
+          for _ in {1..40}; do
+            response=$(curl --silent --output /dev/null --write-out '%{http_code} %{content_type}' "$console_url" || true)
+            if [[ "$response" == 200\ text/html* ]]; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+
+          printf 'Console endpoint did not return 200 text/html: %s\n' "$response" >&2
+          cat "$log_file"
+          exit 1
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-${{ matrix.target_id }}-v${{ needs.prepare.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

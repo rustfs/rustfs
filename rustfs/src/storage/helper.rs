@@ -19,7 +19,7 @@ use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use hashbrown::HashMap;
-use http::StatusCode;
+use http::{HeaderMap, StatusCode, Uri};
 use metrics::counter;
 use rustfs_audit::{
     ApiDetails, AuditEntry, ObjectVersion,
@@ -32,19 +32,69 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
-use rustfs_targets::{
-    extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-};
+use rustfs_targets::{extract_params_header, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
+use std::net::SocketAddr;
 use tokio::runtime::{Builder, Handle};
 
 /// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
 pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
+
+/// The request fields used to build an audit entry, shared by both request edges.
+pub(crate) struct AuditRequestView<'a> {
+    headers: &'a HeaderMap,
+    uri: &'a Uri,
+    pub(crate) req_info: Option<&'a ReqInfo>,
+    client_info: Option<&'a ClientInfo>,
+    remote_addr: Option<SocketAddr>,
+    request_context: Option<&'a RequestContext>,
+}
+
+impl<'a> AuditRequestView<'a> {
+    pub(crate) fn legacy<T>(req: &'a S3Request<T>) -> Self {
+        Self {
+            headers: &req.headers,
+            uri: &req.uri,
+            req_info: req.extensions.get::<ReqInfo>(),
+            client_info: req.extensions.get::<ClientInfo>(),
+            remote_addr: req
+                .extensions
+                .get::<Option<RemoteAddr>>()
+                .and_then(|addr| addr.map(|addr| addr.0)),
+            request_context: req.extensions.get::<RequestContext>(),
+        }
+    }
+
+    /// The view of a request whose facts an owned edge already decoded.
+    pub(crate) fn from_facts(
+        headers: &'a HeaderMap,
+        uri: &'a Uri,
+        req_info: Option<&'a ReqInfo>,
+        client_info: Option<&'a ClientInfo>,
+        remote_addr: Option<SocketAddr>,
+        request_context: Option<&'a RequestContext>,
+    ) -> Self {
+        Self {
+            headers,
+            uri,
+            req_info,
+            client_info,
+            remote_addr,
+            request_context,
+        }
+    }
+
+    pub(crate) fn request_context(&self) -> Option<RequestContext> {
+        self.request_context
+            .cloned()
+            .or_else(|| self.req_info.and_then(|info| info.request_context.clone()))
+    }
+}
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 use super::storage_api::ecstore_diagnostic;
@@ -122,39 +172,34 @@ where
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    let mut resp_elements = extract_resp_elements(response);
+    let mut resp_elements = extract_params_header(&response.headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
 }
 
 /// Builds the audit entry shared by every request-scoped audit source: caller identity,
 /// client address and the request line, without any outcome.
-fn request_audit_builder<T>(
-    req: &S3Request<T>,
-    req_info: Option<&ReqInfo>,
+fn request_audit_builder(
+    req: &AuditRequestView<'_>,
     event: EventName,
     trigger: &str,
     api: ApiDetails,
     request_id: &str,
 ) -> AuditEntryBuilder {
     let remote_host = req
-        .extensions
-        .get::<ClientInfo>()
+        .client_info
         .map(|info| info.real_ip.to_string())
-        .or_else(|| {
-            req.extensions
-                .get::<Option<RemoteAddr>>()
-                .and_then(|addr| addr.map(|addr| addr.0.ip().to_string()))
-        })
+        .or_else(|| req.remote_addr.map(|addr| addr.ip().to_string()))
         .unwrap_or_default();
     let mut builder = AuditEntryBuilder::new("1.0", event, trigger, api)
         .remote_host(remote_host)
-        .user_agent(get_request_user_agent(&req.headers))
-        .req_host(get_request_host(&req.headers))
+        .user_agent(get_request_user_agent(req.headers))
+        .req_host(get_request_host(req.headers))
         .req_path(req.uri.path().to_string())
-        .req_query(extract_req_params(req))
+        .req_query(extract_params_header(req.headers))
         .request_id(request_id);
-    if let Some(cred) = req_info
+    if let Some(cred) = req
+        .req_info
         .and_then(|info| info.cred.as_ref())
         .filter(|cred| !cred.access_key.is_empty())
     {
@@ -376,8 +421,9 @@ impl OperationHelper {
         let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
         let request_id = request_context.request_id.clone();
 
-        let audit_builder =
-            audit_enabled.then(|| request_audit_builder(req, req_info, event, trigger, api_builder.clone().build(), &request_id));
+        let audit_builder = audit_enabled.then(|| {
+            request_audit_builder(&AuditRequestView::legacy(req), event, trigger, api_builder.clone().build(), &request_id)
+        });
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -527,7 +573,7 @@ impl OperationHelper {
 
             let mut final_builder = builder.api(api_details.clone());
             if let Ok(res) = result {
-                final_builder = final_builder.resp_header(extract_resp_elements(res));
+                final_builder = final_builder.resp_header(extract_params_header(&res.headers));
             }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
@@ -604,7 +650,16 @@ pub(crate) fn authorization_denial_entry<T>(
     reason: &'static str,
     scope: DenialScope,
 ) -> AuditEntry {
-    let req_info = req.extensions.get::<ReqInfo>();
+    authorization_denial_entry_for_view(&AuditRequestView::legacy(req), action, reason, scope)
+}
+
+pub(crate) fn authorization_denial_entry_for_view(
+    req: &AuditRequestView<'_>,
+    action: &Action,
+    reason: &'static str,
+    scope: DenialScope,
+) -> AuditEntry {
+    let req_info = req.req_info;
     let path = req.uri.path().trim_start_matches('/');
     let mut segs = path.splitn(2, '/');
     let path_bucket = segs.next().unwrap_or("");
@@ -633,23 +688,18 @@ pub(crate) fn authorization_denial_entry<T>(
         api = api.object(object);
     }
 
-    let request_context = request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
+    let request_context = req
+        .request_context()
+        .unwrap_or_else(|| RequestContext::from_external_headers(req.headers));
     let mut tags = HashMap::new();
     tags.insert("denialReason".to_string(), Value::String(reason.to_string()));
     if let DenialScope::Keys(denied) = scope {
         tags.insert("deniedKeys".to_string(), Value::from(denied));
     }
-    request_audit_builder(
-        req,
-        req_info,
-        EventName::AuditS3Operation,
-        action_name,
-        api.build(),
-        &request_context.request_id,
-    )
-    .error("Access Denied")
-    .tags(tags)
-    .build()
+    request_audit_builder(req, EventName::AuditS3Operation, action_name, api.build(), &request_context.request_id)
+        .error("Access Denied")
+        .tags(tags)
+        .build()
 }
 
 /// Runs `handler` on `req` and records the outcome as an audit-only entry for `op`.
@@ -1437,8 +1487,7 @@ mod tests {
                 ..Default::default()
             });
             let entry = super::request_audit_builder(
-                &req,
-                req.extensions.get::<ReqInfo>(),
+                &super::AuditRequestView::legacy(&req),
                 EventName::ObjectAccessedGet,
                 "GetObject",
                 rustfs_audit::ApiDetails::default(),

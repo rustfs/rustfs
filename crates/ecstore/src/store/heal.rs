@@ -527,7 +527,7 @@ impl ECStore {
     async fn acquire_heal_format_fence(
         &self,
     ) -> Result<(
-        tokio::sync::MutexGuard<'_, PoolMetaWriteState>,
+        crate::core::pools::PoolMetaSaveGateWriteGuard<'_>,
         NamespaceLockGuard,
         NamespaceLockGuard,
         PoolMeta,
@@ -538,7 +538,7 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("heal format requires at least one storage pool"))?;
-        let mut write_state = self.pool_meta_save_gate.lock().await;
+        let mut write_state = self.pool_meta_save_gate.write().await;
         write_state.ensure_write_safe("heal format fence failed")?;
 
         // Metadata fence order is part of the decommission/rebalance protocol:
@@ -1079,7 +1079,7 @@ impl ECStore {
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.read().await;
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.write().await;
         save_guard.ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")?;
         let mut fenced_pools = BTreeSet::new();
         {
@@ -2527,7 +2527,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -3550,10 +3550,14 @@ mod tests {
     async fn full_format_heal_preblocked_pool_metadata_never_writes_format() {
         let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
         remove_heal_test_format(&temp_dir, &store, 0, 3).await;
-        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
-            needs_repair: true,
-            repair_write_safe: false,
-        });
+        store
+            .pool_meta_save_gate
+            .write()
+            .await
+            .observe_replicas(PoolMetaReplicaState {
+                needs_repair: true,
+                repair_write_safe: false,
+            });
 
         let err = store
             .handle_heal_format(false)
@@ -3688,7 +3692,7 @@ mod tests {
         let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
         store.pools[0].disk_set[0].disks.write().await[3] = None;
         let barrier = HealFormatAfterSaveBarrier::install(&store.pools[0], 3);
-        let recovery_latch = store.pool_meta_save_gate.lock().await.aborted_transaction_latch_for_test();
+        let recovery_latch = store.pool_meta_save_gate.write().await.aborted_transaction_latch_for_test();
         let mut heal = tokio::spawn({
             let store = Arc::clone(&store);
             async move { store.handle_heal_format(false).await }
@@ -3848,7 +3852,7 @@ mod tests {
             }
         }
         let endpoints: EndpointServerPools = pools.iter().map(|pool| pool.endpoints.clone()).collect::<Vec<_>>().into();
-        let state = source.pool_meta_save_gate.lock().await.independent_clone_for_test();
+        let state = source.pool_meta_save_gate.write().await.independent_clone_for_test();
         Arc::new(ECStore {
             id: Uuid::new_v4(),
             disk_map: Default::default(),
@@ -3858,7 +3862,7 @@ mod tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(vec![None; 2]),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(state),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(state),
             ctx: Arc::clone(&source.ctx),
             bucket_fence_registry: Arc::default(),
         })
@@ -4040,7 +4044,7 @@ mod tests {
         let missing = remove_pool_meta_shard(&store, 0).await;
         let (guard, admissions, mut state) = store.acquire_pool_meta_object_heal_fence(&[0]).await.expect("heal authority");
         assert!(admissions.into_iter().all(|admission| admission.is_ok()));
-        assert!(store.pool_meta_save_gate.try_lock().is_err(), "heal must retain the earlier save gate");
+        assert!(store.pool_meta_save_gate.try_write().is_err(), "heal must retain the earlier save gate");
         let writer_store = Arc::clone(&store);
         let writer = tokio::spawn(async move { writer_store.save_current_pool_meta_for_test(&[0]).await });
         tokio::task::yield_now().await;
@@ -4687,10 +4691,14 @@ mod tests {
     #[tokio::test]
     async fn bucket_heal_blocks_before_dispatch_after_unreadable_pool_meta_replica() {
         let store = minimal_heal_store().await;
-        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
-            needs_repair: true,
-            repair_write_safe: false,
-        });
+        store
+            .pool_meta_save_gate
+            .write()
+            .await
+            .observe_replicas(PoolMetaReplicaState {
+                needs_repair: true,
+                repair_write_safe: false,
+            });
 
         let err = store
             .handle_heal_bucket("bucket", &HealOpts::default())
@@ -4724,7 +4732,7 @@ mod tests {
             .await
             .expect("peer dispatch should start");
         assert!(
-            store.pool_meta_save_gate.try_lock().is_ok(),
+            store.pool_meta_save_gate.try_write().is_ok(),
             "coordinator must release its local save gate before waiting for peers"
         );
         assert!(
@@ -5116,7 +5124,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         };
@@ -5136,7 +5144,7 @@ mod tests {
             .save_for_startup(store.pools.clone())
             .await
             .expect("pool metadata should be persisted before format heal");
-        *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
+        *store.pool_meta_save_gate.write().await = crate::core::pools::PoolMetaWriteState::default();
 
         let replacement_endpoint = store.pools[1].endpoints.endpoints.as_ref()[2].clone();
         tokio::fs::remove_file(

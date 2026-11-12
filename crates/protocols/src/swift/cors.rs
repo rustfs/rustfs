@@ -53,7 +53,7 @@
 use super::{SwiftError, SwiftResult, container};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use tracing::debug;
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";

@@ -496,24 +496,30 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: &[u8]) {
+    async fn write_shard_bytes(
+        writer_opt: &mut Option<BitrotWriterWrapper>,
+        err: &mut Option<Error>,
+        digest_slot: &mut Option<[u8; 32]>,
+        shard: Bytes,
+        integrity_spec: Option<(rustfs_filemeta::shard_integrity::PartIntegrity, u32, usize)>,
+    ) {
+        let shard_len = shard.len();
         match writer_opt {
-            Some(writer) => {
-                match writer.write(shard).await {
-                    Ok(n) => {
-                        if n < shard.len() {
-                            *err = Some(Error::ShortWrite);
-                            *writer_opt = None; // Mark as failed
-                        } else {
-                            *err = None;
-                        }
-                    }
-                    Err(e) => {
-                        *err = Some(Error::from(e));
-                        *writer_opt = None; // Mark as failed so the caller drops this disk before commit
+            Some(writer) => match writer.write_shard_bytes(shard, integrity_spec).await {
+                Ok((n, digest)) => {
+                    *digest_slot = digest;
+                    if n < shard_len {
+                        *err = Some(Error::ShortWrite);
+                        *writer_opt = None; // Mark as failed
+                    } else {
+                        *err = None;
                     }
                 }
-            }
+                Err(e) => {
+                    *err = Some(Error::from(e));
+                    *writer_opt = None; // Mark as failed so the caller drops this disk before commit
+                }
+            },
             None => {
                 *err = Some(Error::DiskNotFound);
             }
@@ -521,19 +527,39 @@ impl<'a> MultiWriter<'a> {
     }
 
     pub async fn write(&mut self, data: Vec<Bytes>) -> std::io::Result<()> {
-        self.write_shards(data.iter().map(Bytes::as_ref)).await
+        let mut digests = vec![None; self.writers.len()];
+        self.write_shards_bytes(data.into_iter(), &mut digests, None).await
     }
 
     async fn write_block(&mut self, block: &EncodedBlock) -> std::io::Result<()> {
+        if let Some(integrity) = &self.integrity
+            && block.shards().len() != integrity.part().layout.shards()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "shard integrity verification failed",
+            ));
+        }
+        let mut digests = vec![None; self.writers.len()];
+        let integrity_part = self.integrity.as_ref().map(|b| b.part().clone());
+        let write_res = self
+            .write_shards_bytes(block.shards_bytes(), &mut digests, integrity_part.as_ref())
+            .await;
         if let Some(integrity) = &mut self.integrity {
             // Commit every coding index, including disks absent from the write.
-            integrity.push(block.shards()).await?;
+            integrity.push_with_precomputed(block.shards(), &digests).await?;
         }
-        self.write_shards(block.shards()).await
+        write_res
     }
 
-    async fn write_shards<'b>(&mut self, shards: impl ExactSizeIterator<Item = &'b [u8]>) -> std::io::Result<()> {
+    async fn write_shards_bytes(
+        &mut self,
+        shards: impl ExactSizeIterator<Item = Bytes>,
+        digests: &mut [Option<[u8; 32]>],
+        integrity_part: Option<&rustfs_filemeta::shard_integrity::PartIntegrity>,
+    ) -> std::io::Result<()> {
         assert_eq!(shards.len(), self.writers.len());
+        assert_eq!(digests.len(), self.writers.len());
 
         let budget = self.next_progress_budget();
         let stall_timeout = self.policy.stall_timeout;
@@ -541,10 +567,18 @@ impl<'a> MultiWriter<'a> {
         let slot_count = self.writers.len();
         let saw = {
             let futures = FuturesUnordered::new();
-            for (index, ((writer_opt, err), shard)) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(shards).enumerate() {
+            for (index, (((writer_opt, err), digest_slot), shard)) in self
+                .writers
+                .iter_mut()
+                .zip(self.errs.iter_mut())
+                .zip(digests.iter_mut())
+                .zip(shards)
+                .enumerate()
+            {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
+                let integrity_spec = integrity_part.map(|part| (part.clone(), part.stripes, index));
                 // A shard write that makes no forward progress within `budget` is
                 // failed and its disk dropped, so a stalled peer cannot pin an
                 // otherwise-healthy write quorum (rustfs/backlog#1319). `budget`
@@ -553,14 +587,21 @@ impl<'a> MultiWriter<'a> {
                 // post-quorum grace; multipart preserves this operation budget.
                 futures.push(async move {
                     match budget {
-                        Some(budget) => match tokio::time::timeout(budget, Self::write_shard(writer_opt, err, shard)).await {
-                            Ok(()) => {}
-                            Err(_elapsed) => {
-                                *err = Some(Error::Timeout);
-                                *writer_opt = None;
+                        Some(budget) => {
+                            match tokio::time::timeout(
+                                budget,
+                                Self::write_shard_bytes(writer_opt, err, digest_slot, shard, integrity_spec),
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(_elapsed) => {
+                                    *err = Some(Error::Timeout);
+                                    *writer_opt = None;
+                                }
                             }
-                        },
-                        None => Self::write_shard(writer_opt, err, shard).await,
+                        }
+                        None => Self::write_shard_bytes(writer_opt, err, digest_slot, shard, integrity_spec).await,
                     }
                     let succeeded = err.is_none() && writer_opt.is_some();
                     (index, succeeded)
@@ -866,13 +907,14 @@ impl Erasure {
         if let Some(integrity) = integrity {
             integrity.push(block.shards()).await?;
         }
-        let mut inline_shards = Vec::with_capacity(block.shards().len());
+        let shard_count = block.shards().len();
+        let mut encoded = BytesMut::with_capacity(shard_count * 32 + block.queued_bytes());
+        let mut inline_shards = Vec::with_capacity(shard_count);
         for shard in block.shards() {
             let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
-            let mut encoded = BytesMut::with_capacity(hash.as_ref().len() + shard.len());
             encoded.extend_from_slice(hash.as_ref());
             encoded.extend_from_slice(shard);
-            inline_shards.push(encoded.freeze());
+            inline_shards.push(encoded.split().freeze());
         }
 
         Ok((reader, total, inline_shards))

@@ -247,6 +247,7 @@ pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 // newly validated request semantics during a rolling upgrade.
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
+pub const RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-restore-copyback-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
 pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
@@ -289,6 +290,18 @@ pub fn remote_version_state_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
 pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
     command.len() == REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn restore_copyback_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_restore_copyback_capability_probe(command: &[u8]) -> bool {
+    command.len() == RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX)
 }
 
 pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
@@ -2723,14 +2736,16 @@ mod heal_control_tests {
     use super::{
         CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
         ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
-        TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack,
-        canonical_heal_control_request_body, canonical_heal_control_response_body, decode_remote_version_state_capability,
-        encode_cross_pool_fence_capability, encode_remote_version_state_capability, heal_control_capability_probe,
-        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        ilm_recovery_export_capability_probe, internode_rpc_timeout, is_cross_pool_fence_capability_probe,
-        is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe, is_remote_version_state_capability_probe,
+        RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX, TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
+        decode_remote_version_state_capability, encode_cross_pool_fence_capability, encode_remote_version_state_capability,
+        heal_control_capability_probe, heal_control_coordinator_epoch, heal_control_execution_timeout,
+        heal_control_execution_timeout_for, ilm_recovery_export_capability_probe, internode_rpc_timeout,
+        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe,
+        is_remote_version_state_capability_probe, is_restore_copyback_capability_probe,
         is_transition_transaction_compaction_capability_probe, normalize_internode_rpc_timeout,
-        remote_version_state_capability_probe, transition_transaction_compaction_capability_probe,
+        remote_version_state_capability_probe, restore_copyback_capability_probe,
+        transition_transaction_compaction_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -2827,6 +2842,19 @@ mod heal_control_tests {
         let probe = remote_version_state_capability_probe(&[7; 16]);
         assert!(is_remote_version_state_capability_probe(&probe));
         assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn restore_copyback_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = restore_copyback_capability_probe(&[7; 16]);
+        assert!(is_restore_copyback_capability_probe(&probe));
+        assert!(!is_restore_copyback_capability_probe(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_restore_copyback_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_restore_copyback_capability_probe(&extra));
     }
 
     #[test]
@@ -4413,7 +4441,7 @@ mod tests {
 
 #[cfg(test)]
 mod lock_release_tests {
-    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockReleaseStatus};
+    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockAcquireStatus, LockReleaseStatus};
     use prost::Message;
 
     /// The release response schema before structured outcomes were added.
@@ -4460,6 +4488,7 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                ..Default::default()
             };
             for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
                 let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive outcome");
@@ -4468,5 +4497,44 @@ mod lock_release_tests {
                 assert!(legacy.lock_info.is_none());
             }
         }
+    }
+
+    #[test]
+    fn batch_acquire_outcomes_are_additive_and_preserve_legacy_grants() {
+        for success in [false, true] {
+            let legacy = LegacyReleaseResponse {
+                success,
+                error_info: (!success).then(|| "legacy failure".to_string()),
+                lock_info: None,
+            };
+            let result = GenerallyLockResult::decode(legacy.encode_to_vec().as_slice()).expect("decode legacy acquire");
+            assert_eq!(result.success, success);
+            assert_eq!(result.acquire_status(), LockAcquireStatus::Unspecified);
+        }
+        for status in [LockAcquireStatus::RetryableNoGrant, LockAcquireStatus::RejectedNoGrant] {
+            let result = GenerallyLockResult {
+                success: false,
+                error_info: Some("not granted".to_string()),
+                acquire_status: status.into(),
+                ..Default::default()
+            };
+            let legacy = LegacyReleaseResponse::decode(result.encode_to_vec().as_slice()).expect("decode additive acquire");
+            assert!(!legacy.success);
+            assert_eq!(legacy.error_info, result.error_info);
+            let single =
+                GenerallyLockResponse::decode(result.encode_to_vec().as_slice()).expect("single schema ignores batch field");
+            assert_eq!(single.release_status(), LockReleaseStatus::Unspecified);
+        }
+    }
+
+    #[test]
+    fn batch_acquire_unknown_status_is_preserved_for_conservative_classification() {
+        let result = GenerallyLockResult {
+            acquire_status: 99,
+            ..Default::default()
+        };
+        let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
+        assert_eq!(decoded.acquire_status, 99);
+        assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
     }
 }

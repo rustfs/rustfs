@@ -22,7 +22,7 @@ find crates/ecstore/src/bucket/replication -name '*.rs' | xargs wc -l | tail -1
 
 Rule for new code: in a domain that already has a contract crate, new logic that does not need ECStore runtime state lands in that crate (`rustfs-lifecycle`, `rustfs-replication`), not under `crates/ecstore/src/bucket/`.
 
-The S3 client extraction is complete: the former `client/` directory moved to `crates/s3-client`, its two server-side modules moved to `crates/ecstore/src/object_api/object_api_utils.rs` and `crates/ecstore/src/bucket/lifecycle/object_handlers_common.rs`, and the remaining serving-side `s3s` references in ECStore are ratcheted shrink-only by `S3S_ECSTORE_FILES_BASELINE` in `scripts/check_s3s_footprint.sh`.
+The S3 client extraction is complete: the former `client/` directory moved to `crates/s3-client`, its two server-side modules moved to `crates/ecstore/src/object_api/object_api_utils.rs` and `crates/ecstore/src/bucket/lifecycle/object_handlers_common.rs`, and the remaining serving-side `s3s` references in ECStore are ratcheted shrink-only by the `ecstore_files` line of `.config/s3s-footprint-baseline.txt`, enforced by `scripts/check_s3s_footprint.sh`.
 
 ## Non-Negotiable Rules
 

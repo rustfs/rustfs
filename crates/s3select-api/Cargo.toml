@@ -64,20 +64,24 @@ async-compression = { workspace = true, features = ["tokio", "gzip", "bzip2"] }
 async-trait.workspace = true
 arc-swap.workspace = true
 bytes = { workspace = true, features = ["serde"] }
+base64-simd.workspace = true
+flatbuffers.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 crc-fast.workspace = true
 rustfs-common.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 rustfs-ecstore.workspace = true
+rustfs-gateway-types.workspace = true
+rustfs-s3-types = { workspace = true }
 rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
 flate2.workspace = true
 brotli.workspace = true
 lz4.workspace = true
+lz4_flex.workspace = true
 http.workspace = true
 memchr.workspace = true
-s3s = { workspace = true, features = ["minio"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 parking_lot.workspace = true

@@ -428,7 +428,6 @@ impl LocalDisk {
                 let root = store.publication_root.clone();
                 let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, Some(store.lease.clone())).await;
                 os::run_blocking_namespace_operation_with_sync(lease, true, move || {
-                    permit.validate()?;
                     os::rename_multipart_source_owned_std(&source, &destination, &base, &root, || permit.validate())
                 })
                 .await?;

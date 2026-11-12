@@ -114,16 +114,36 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
     drives_per_set: usize,
     preinitialize_disks: bool,
 ) -> Arc<ECStore> {
+    setup_scanner_cycle_store_with_pool_order(
+        root,
+        seed_usage_baseline,
+        &(0..pool_count).collect::<Vec<_>>(),
+        sets_per_pool,
+        drives_per_set,
+        preinitialize_disks,
+    )
+    .await
+}
+
+pub(super) async fn setup_scanner_cycle_store_with_pool_order(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_order: &[usize],
+    sets_per_pool: usize,
+    drives_per_set: usize,
+    preinitialize_disks: bool,
+) -> Arc<ECStore> {
     init_ecstore_config_for_scanner_tests();
+    let pool_count = pool_order.len();
     let mut pools = Vec::with_capacity(pool_count);
-    for pool_index in 0..pool_count {
+    for (pool_index, physical_pool) in pool_order.iter().enumerate() {
         let mut endpoints = Vec::new();
         for set_index in 0..sets_per_pool {
             for disk_index in 0..drives_per_set {
                 let disk_path = if sets_per_pool == 1 {
-                    root.join(format!("pool{pool_index}/disk{disk_index}"))
+                    root.join(format!("pool{physical_pool}/disk{disk_index}"))
                 } else {
-                    root.join(format!("pool{pool_index}/set{set_index}/disk{disk_index}"))
+                    root.join(format!("pool{physical_pool}/set{set_index}/disk{disk_index}"))
                 };
                 tokio::fs::create_dir_all(&disk_path)
                     .await
@@ -144,7 +164,7 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
             cmd_line: if pool_count == 1 && sets_per_pool == 1 {
                 "scanner-cycle-metrics".to_string()
             } else {
-                format!("scanner-cycle-metrics-pool-{pool_index}")
+                format!("scanner-cycle-metrics-pool-{physical_pool}")
             },
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
         });

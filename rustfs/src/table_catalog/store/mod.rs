@@ -40,7 +40,7 @@ pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatu
 use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
-pub(super) use object::{bounded_table_entry_objects_for_data_plane_scan, maintenance_subtree_skip_cursor};
+pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
 
 struct PeriodicTableMaintenanceQueueGuard<'a> {
     table_id: &'a str,
@@ -1055,6 +1055,20 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         ))
     }
 
+    /// GET-equivalent table ownership entries, selected before metadata reads.
+    /// Report history must not consume pages. No ordinary S3 list fallback is safe.
+    async fn list_table_entry_objects_page(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _start_after: Option<&str>,
+        _limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+        Err(TableCatalogStoreError::Unsupported(
+            "authoritative table-entry pagination is not supported by this backend".to_string(),
+        ))
+    }
+
     /// GET-equivalent, bounded enumeration for publishing authoritative indexes.
     /// Backends without this contract must not fall back to an ordinary S3 list.
     async fn list_catalog_objects_page(
@@ -1359,6 +1373,41 @@ impl TableCatalogObjectPaths {
             table.as_str(),
             table_catalog_path_hash(table_id)
         )
+    }
+
+    /// Returns the table maintenance directory and record name for a canonical catalog path.
+    fn historical_table_maintenance_path<'a>(&self, table_bucket: &str, object: &'a str) -> Option<(&'a str, &'a str)> {
+        let namespace_prefix = self.namespace_entries_prefix(table_bucket);
+        let relative = object.strip_prefix(&namespace_prefix)?;
+        let (head, tail) = relative.rsplit_once(&format!("/{MAINTENANCE_ROOT}/"))?;
+        let (namespace_path, table) = head.rsplit_once(&format!("/{TABLE_ROOT}/"))?;
+        if table.contains('/')
+            || IdentifierSegment::parse(table).is_err()
+            || Namespace::from_segments(namespace_path.split('/').map(str::to_string).collect()).is_err()
+        {
+            return None;
+        }
+        let (identity_hash, suffix) = tail.split_once('/')?;
+        if identity_hash.len() != 64
+            || !identity_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let is_known = matches!(
+            suffix,
+            MAINTENANCE_CONFIG_FILE | MAINTENANCE_CURRENT_JOB_FILE | MAINTENANCE_LATEST_JOB_FILE
+        ) || suffix
+            .strip_prefix(&format!("{MAINTENANCE_JOB_ROOT}/"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        is_known.then(|| (&object[..object.len() - suffix.len()], suffix))
     }
 
     pub fn table_maintenance_job_path(
@@ -2612,6 +2661,33 @@ where
         Ok(TableCatalogObjectListPage {
             objects: objects.into_iter().collect(),
             is_truncated,
+        })
+    }
+
+    async fn list_table_entry_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+        let max_keys = i32::try_from(limit.get())
+            .map_err(|_| TableCatalogStoreError::Invalid("catalog page size exceeds storage API range".to_string()))?;
+        let page = self
+            .store
+            .clone()
+            .list_identifier_tree_leaves_authoritative(
+                bucket,
+                prefix,
+                TABLE_ENTRY_FILE,
+                start_after.map(str::to_string),
+                max_keys,
+            )
+            .await
+            .map_err(|err| storage_error_to_catalog("list authoritative table entries", err))?;
+        Ok(TableCatalogObjectListPage {
+            objects: page.objects.into_iter().map(|object| object.name).collect(),
+            is_truncated: page.is_truncated,
         })
     }
 

@@ -182,15 +182,27 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 /// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
 /// one-time consumption of authenticated RPC signatures.
 ///
-/// The cache retains each nonce for the ~10-minute signature freshness envelope. Once peers use
-/// replay-scoped v3 authentication, every authenticated RPC consumes one entry, so the steady
-/// state holds roughly `authenticated RPC RPS x 601s` entries. This default is the minimum floor:
-/// explicit operator values and resource-aware auto sizing both clamp upward to at least this
-/// value. Overflow fails closed — legitimate signed traffic is the only thing that can fill the
-/// cache (replays are rejected before insertion, and an attacker cannot mint valid nonces without
-/// the shared secret) — and increments
-/// `rustfs_system_network_internode_replay_cache_overflow_total`, so a sustained non-zero overflow
-/// counter means this capacity is undersized for the node's peak authenticated RPC rate.
+/// Nonces remain protected until their signed timestamp is outside the observed wall-clock
+/// validity window, including after clock rollback. Current-time signatures live about five
+/// minutes; the maximum accepted forward clock skew can extend that to ten minutes. A body-bound
+/// v3 request consumes both its v3 and compatibility-v2 nonces, so size for receiver nonce intake,
+/// not S3 request rate or CPU count.
+///
+/// Automatic admission budgets 13% of effective process memory for signed-time
+/// hash tables, allocator overhead and simultaneous old/new tables during growth.
+/// The reported count is an absolute UUID payload ceiling, not guaranteed throughput:
+/// actual byte admission can reject earlier depending on timestamp distribution.
+/// Tables grow with demand and are released together when their signed time expires.
+/// CPU count, a historical minimum, and a fixed 32M ceiling do not constrain this budget.
+/// If memory detection fails, the historical default remains a bounded count fallback.
+///
+/// Explicit values remain count ceilings with the historical minimum of 1,048,576
+/// for configuration compatibility, and bypass automatic byte admission. That
+/// compatibility floor does not apply to the automatically detected memory budget.
+/// Zero never disables replay protection.
+/// Overflow rejects the request without evicting a still-valid identity, increments
+/// `rustfs_system_network_internode_replay_cache_overflow_total`, and returns resource
+/// exhaustion rather than invalid credentials. Measure headroom before overriding.
 pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
 pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
 

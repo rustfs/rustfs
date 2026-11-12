@@ -27,6 +27,10 @@ use rustfs_notify::NotifyObjectInfo;
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);
 
+/// Set only by the listener stack; proxy assertions do not establish it.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTlsTransport(pub(crate) bool);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DependencyReadiness {
     pub storage_ready: bool,
@@ -44,7 +48,6 @@ pub enum ReadinessDegradedReason {
     ObjectReadStalled,
     ObjectWriteStalled,
     PoolMetaWriteBlocked,
-    PoolMetadataCheckTimeout,
     StorageReadinessCheckTimeout,
     ClusterHealthTimeout,
     PeerHealthUnavailable,
@@ -65,7 +68,6 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::ObjectReadStalled => "object_read_stalled",
             ReadinessDegradedReason::ObjectWriteStalled => "object_write_stalled",
             ReadinessDegradedReason::PoolMetaWriteBlocked => "pool_meta_write_blocked",
-            ReadinessDegradedReason::PoolMetadataCheckTimeout => "pool_metadata_check_timeout",
             ReadinessDegradedReason::StorageReadinessCheckTimeout => "storage_readiness_check_timeout",
             ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
             ReadinessDegradedReason::PeerHealthUnavailable => "peer_health_unavailable",

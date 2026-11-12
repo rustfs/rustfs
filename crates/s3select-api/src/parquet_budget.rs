@@ -221,7 +221,7 @@ struct ThriftCompactCursor<'a> {
     remaining: usize,
 }
 
-impl ThriftCompactCursor<'_> {
+impl<'a> ThriftCompactCursor<'a> {
     fn error() -> ParquetBudgetError {
         ParquetBudgetError::Invalid("Parquet thrift metadata is malformed".to_owned())
     }
@@ -239,6 +239,14 @@ impl ThriftCompactCursor<'_> {
             .filter(|end| *end <= self.bytes.len())
             .ok_or_else(Self::error)?;
         Ok(())
+    }
+
+    fn binary(&mut self) -> Result<&'a [u8]> {
+        let len = usize::try_from(self.varint()?).map_err(|_| Self::error())?;
+        self.charge(len.checked_mul(2).ok_or_else(budget_error)?)?;
+        let start = self.pos;
+        self.skip_bytes(len)?;
+        Ok(&self.bytes[start..self.pos])
     }
 
     fn varint(&mut self) -> Result<u64> {
@@ -335,11 +343,7 @@ impl ThriftCompactCursor<'_> {
             THRIFT_COMPACT_BYTE => self.skip_bytes(1),
             THRIFT_COMPACT_I16 | THRIFT_COMPACT_I32 | THRIFT_COMPACT_I64 => self.varint().map(drop),
             THRIFT_COMPACT_DOUBLE => self.skip_bytes(8),
-            THRIFT_COMPACT_BINARY => {
-                let len = usize::try_from(self.varint()?).map_err(|_| Self::error())?;
-                self.charge(len.checked_mul(2).ok_or_else(budget_error)?)?;
-                self.skip_bytes(len)
-            }
+            THRIFT_COMPACT_BINARY => self.binary().map(drop),
             THRIFT_COMPACT_LIST | THRIFT_COMPACT_SET => {
                 let (element, count) = self.list_header()?;
                 for _ in 0..count {
@@ -586,21 +590,98 @@ impl ThriftCompactCursor<'_> {
         Ok(())
     }
 
+    fn arrow_schema_metadata(&mut self) -> Result<Option<&'a [u8]>> {
+        let (element, count) = self.list_header()?;
+        if element != THRIFT_COMPACT_STRUCT {
+            return Err(Self::error());
+        }
+        let mut arrow_schema = None;
+        for _ in 0..count {
+            let mut field = 0;
+            let mut key = None;
+            let mut value = None;
+            loop {
+                let header = self.byte()?;
+                if header == THRIFT_COMPACT_STOP {
+                    break;
+                }
+                field = self.field_id(field, header)?;
+                let kind = header & 0x0f;
+                if matches!(field, 1 | 2) && kind == THRIFT_COMPACT_BINARY {
+                    let bytes = self.binary()?;
+                    if field == 1 {
+                        key = Some(bytes);
+                    } else {
+                        value = Some(bytes);
+                    }
+                } else {
+                    self.skip_field(MetadataStruct::KeyValue, field, kind, 1)?;
+                }
+            }
+            // Match the reader's last key with a value; absent values are ignored.
+            if key == Some(b"ARROW:schema".as_slice()) && value.is_some() {
+                arrow_schema = value;
+            }
+        }
+        Ok(arrow_schema)
+    }
+
+    fn validate_arrow_schema(&mut self, encoded: &[u8]) -> Result<()> {
+        use datafusion::arrow::ipc;
+        let invalid = || ParquetBudgetError::Invalid("Parquet Arrow schema metadata is malformed".to_owned());
+        // This reservation precedes base64 allocation. The binary field has
+        // already reserved its owned metadata copies; decoding needs another buffer.
+        self.charge(encoded.len())?;
+        let bytes = base64_simd::STANDARD.decode_to_vec(encoded).map_err(|_| invalid())?;
+        let message = if bytes.len() > 8 && bytes.starts_with(&[255; 4]) {
+            &bytes[8..]
+        } else {
+            bytes.as_slice()
+        };
+        // The verifier visits shared offsets for every occurrence, before the
+        // reader expands them into owned fields and metadata. Split the remaining
+        // allowance between string/buffer copies and per-table Rust containers:
+        // four owned copies per apparent byte and 1 KiB per visited table.
+        let defaults = flatbuffers::VerifierOptions::default();
+        let options = flatbuffers::VerifierOptions {
+            max_apparent_size: defaults.max_apparent_size.min(self.remaining / 8),
+            max_tables: defaults.max_tables.min(self.remaining / (2 * 1024)),
+            ..defaults
+        };
+        let message = ipc::root_as_message_with_opts(&options, message).map_err(|error| match error {
+            flatbuffers::InvalidFlatbuffer::TooManyTables
+            | flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge
+            | flatbuffers::InvalidFlatbuffer::DepthLimitReached => budget_error(),
+            _ => invalid(),
+        })?;
+        let schema = message.header_as_schema().ok_or_else(invalid)?;
+        if schema.fields().is_none() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Walk the footer's `FileMetaData`. The pinned parquet reserves the
     /// declared `row_groups` capacity before reading one element; charge that
     /// reservation to the budget so a small footer cannot request gigabytes.
     fn file_metadata(&mut self, limit: usize) -> Result<()> {
         let mut field_id = 0_i16;
         let mut reserved = 0_usize;
+        let mut arrow_schema = None;
         loop {
             let header = self.byte()?;
             if header == THRIFT_COMPACT_STOP {
+                if let Some(encoded) = arrow_schema {
+                    self.validate_arrow_schema(encoded)?;
+                }
                 return Ok(());
             }
             let kind = header & 0x0f;
             field_id = self.field_id(field_id, header)?;
             if field_id == 2 && kind == THRIFT_COMPACT_LIST {
                 self.schema()?;
+            } else if field_id == 5 && kind == THRIFT_COMPACT_LIST {
+                arrow_schema = self.arrow_schema_metadata()?;
             } else if field_id == FILE_METADATA_FIELD_ROW_GROUPS && kind == THRIFT_COMPACT_LIST {
                 let (element, count) = self.list_header()?;
                 if element != THRIFT_COMPACT_STRUCT {
@@ -760,21 +841,34 @@ fn validate_compressed_page(payload: &[u8], sizes: PageHeaderSizes, codec: Compr
             bounded_stream_size(brotli::Decompressor::new(payload, 4096), expanded)?;
             Ok(window)
         }
-        Compression::LZ4 if payload.starts_with(&[4, 34, 77, 24]) => {
-            let descriptor = *payload.get(5).ok_or_else(ThriftCompactCursor::error)?;
-            let block = match (descriptor >> 4) & 7 {
-                4 => 64 * 1024,
-                5 => 256 * 1024,
-                6 => 1024 * 1024,
-                7 => 4 * 1024 * 1024,
-                _ => return Err(ThriftCompactCursor::error()),
+        Compression::LZ4 if payload.starts_with(&[4, 34, 77, 24]) || payload.starts_with(&[2, 33, 76, 24]) => {
+            let (block, linked) = if payload.starts_with(&[2, 33, 76, 24]) {
+                (8 * 1024 * 1024, false)
+            } else {
+                let descriptor = *payload.get(5).ok_or_else(ThriftCompactCursor::error)?;
+                let block = match (descriptor >> 4) & 7 {
+                    4 => 64 * 1024,
+                    5 => 256 * 1024,
+                    6 => 1024 * 1024,
+                    7 => 4 * 1024 * 1024,
+                    _ => return Err(ThriftCompactCursor::error()),
+                };
+                (block, payload[4] & 0x20 == 0)
             };
-            let working = block * 2;
+            // Match parquet's pinned fallback decoder: compressed input plus
+            // output, with an extra output block and 64 KiB history when linked.
+            let working = if linked { block * 3 + 64 * 1024 } else { block * 2 };
             if working > limit {
                 return Err(budget_error());
             }
-            bounded_stream_size(lz4::Decoder::new(payload)?, expanded)?;
-            Ok(working)
+            match bounded_stream_size(lz4_flex::frame::FrameDecoder::new(payload), expanded) {
+                // Hadoop data can share the magic prefix, and parquet also
+                // tries bounded RAW decoding after a frame error. The bounded
+                // sink proved the frame produced no more than `expanded` bytes
+                // before that error; let the actual reader select its fallback.
+                Err(ParquetBudgetError::Codec(_)) => Ok(working),
+                result => result.map(|()| working),
+            }
         }
         _ => Ok(0),
     }
@@ -849,6 +943,49 @@ mod tests {
         validate_compressed_page(&payload, compressed_page(&payload, bytes.len()), Compression::LZ4, 1024 * 1024)
             .expect("valid compressed page");
         assert!(validate_compressed_page(&payload, compressed_page(&payload, 64), Compression::LZ4, 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn legacy_lz4_scratch_is_admitted_before_the_fallback_decoder() {
+        let payload = [2, 33, 76, 24, 5, 0, 0, 0, 0x40, 42, 0, 0, 0];
+        let header = compressed_page(&payload, 4);
+        assert!(matches!(
+            validate_compressed_page(&payload, header, Compression::LZ4, 1024 * 1024),
+            Err(ParquetBudgetError::Exceeded)
+        ));
+        let admitted = validate_compressed_page(&payload, header, Compression::LZ4, 32 * 1024 * 1024)
+            .expect("legacy LZ4 remains supported with enough scratch memory");
+        assert!(admitted >= 16 * 1024 * 1024);
+        assert!(validate_compressed_page(&payload, compressed_page(&payload, 1), Compression::LZ4, 32 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn hadoop_lz4_can_share_the_legacy_magic_without_becoming_a_frame() {
+        let size = usize::try_from(u32::from_be_bytes([2, 33, 76, 24])).expect("Hadoop size");
+        let bytes = vec![b'x'; size];
+        let block = lz4_flex::block::compress(&bytes);
+        let mut payload = vec![2, 33, 76, 24];
+        payload.extend(u32::try_from(block.len()).expect("compressed block").to_be_bytes());
+        payload.extend(block);
+        validate_compressed_page(&payload, compressed_page(&payload, size), Compression::LZ4, 64 * 1024 * 1024)
+            .expect("Hadoop framing takes priority over the frame fallback");
+    }
+
+    #[test]
+    fn linked_lz4_accounts_for_the_history_and_both_block_buffers() {
+        use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+        let frame = FrameInfo::new().block_mode(BlockMode::Linked).block_size(BlockSize::Max64KB);
+        let mut encoder = FrameEncoder::with_frame_info(frame, Vec::new());
+        encoder.write_all(&vec![b'x'; 256 * 1024]).expect("linked input");
+        let payload = encoder.finish().expect("linked frame");
+        let header = compressed_page(&payload, 256 * 1024);
+        assert!(matches!(
+            validate_compressed_page(&payload, header, Compression::LZ4, 192 * 1024),
+            Err(ParquetBudgetError::Exceeded)
+        ));
+        let admitted = validate_compressed_page(&payload, header, Compression::LZ4, 1024 * 1024)
+            .expect("linked frame with enough scratch memory");
+        assert!(admitted >= 256 * 1024);
     }
 
     #[test]
@@ -939,6 +1076,170 @@ mod tests {
         writer.write(&batch).expect("logical type data");
         writer.close().expect("Parquet footer");
         validate_file_footer(&bytes, 1024 * 1024).expect("valid logical annotations remain accepted");
+    }
+
+    fn shared_arrow_metadata_file(entries: usize) -> Vec<u8> {
+        use datafusion::{
+            arrow::ipc,
+            parquet::{
+                file::{properties::WriterProperties, writer::SerializedFileWriter},
+                schema::parser::parse_message_type,
+            },
+        };
+        use std::sync::Arc;
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let name = builder.create_string("v");
+        let value = builder.create_string(&"x".repeat(64 * 1024));
+        let data_type = ipc::Int::create(
+            &mut builder,
+            &ipc::IntArgs {
+                bitWidth: 32,
+                is_signed: true,
+            },
+        );
+        let field = ipc::Field::create(
+            &mut builder,
+            &ipc::FieldArgs {
+                name: Some(name),
+                nullable: true,
+                type_type: ipc::Type::Int,
+                type_: Some(data_type.as_union_value()),
+                ..Default::default()
+            },
+        );
+        let fields = builder.create_vector(&[field]);
+        let mut metadata = Vec::new();
+        for n in 0..entries {
+            let key = builder.create_string(&format!("key-{n}"));
+            metadata.push(ipc::KeyValue::create(
+                &mut builder,
+                &ipc::KeyValueArgs {
+                    key: Some(key),
+                    value: Some(value),
+                },
+            ));
+        }
+        let metadata = builder.create_vector(&metadata);
+        let schema = ipc::Schema::create(
+            &mut builder,
+            &ipc::SchemaArgs {
+                fields: Some(fields),
+                custom_metadata: Some(metadata),
+                ..Default::default()
+            },
+        );
+        let message = ipc::Message::create(
+            &mut builder,
+            &ipc::MessageArgs {
+                version: ipc::MetadataVersion::V5,
+                header_type: ipc::MessageHeader::Schema,
+                header: Some(schema.as_union_value()),
+                ..Default::default()
+            },
+        );
+        builder.finish(message, None);
+        let encoded = base64_simd::STANDARD.encode_to_string(builder.finished_data());
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![datafusion::parquet::file::metadata::KeyValue::new(
+                "ARROW:schema".to_owned(),
+                Some(encoded),
+            )]))
+            .build();
+        let schema = Arc::new(parse_message_type("message root { OPTIONAL INT32 v; }").expect("physical schema"));
+        let mut bytes = Vec::new();
+        SerializedFileWriter::new(&mut bytes, schema, Arc::new(properties))
+            .expect("writer")
+            .close()
+            .expect("footer");
+        bytes
+    }
+
+    #[test]
+    fn shared_arrow_metadata_is_admitted_before_owned_schema_conversion() {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let bytes = shared_arrow_metadata_file(256);
+        assert!(bytes.len() < 100 * 1024, "shared offsets keep the encoded file small");
+        let native = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.clone())).expect("valid Arrow metadata");
+        assert_eq!(native.schema().metadata().len(), 256);
+        assert!(
+            matches!(validate_file_footer(&bytes, 2 * 1024 * 1024), Err(ParquetBudgetError::Exceeded)),
+            "32 MiB of owned metadata must not pass a 2 MiB preflight"
+        );
+        validate_file_footer(&bytes, 512 * 1024 * 1024).expect("sufficient budget preserves shared metadata");
+    }
+
+    fn arrow_hint_footer(entries: &[(&[u8], Option<&[u8]>)]) -> Vec<u8> {
+        let count = u8::try_from(entries.len()).expect("small key/value fixture");
+        assert!(count < 15);
+        let mut bytes = vec![0x59, (count << 4) | THRIFT_COMPACT_STRUCT];
+        for (key, value) in entries {
+            bytes.push(0x18);
+            bytes.extend(varint(u64::try_from(key.len()).expect("key length")));
+            bytes.extend(*key);
+            if let Some(value) = value {
+                bytes.push(0x18);
+                bytes.extend(varint(u64::try_from(value.len()).expect("value length")));
+                bytes.extend(*value);
+            }
+            bytes.push(0);
+        }
+        bytes.push(0);
+        bytes
+    }
+
+    #[test]
+    fn arrow_hint_framing_and_duplicate_keys_match_the_reader() {
+        use datafusion::arrow::{
+            datatypes::{DataType, Field, Schema},
+            ipc,
+        };
+        let schema = Schema::new(vec![Field::new("v", DataType::Int32, true)]);
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let schema = ipc::convert::schema_to_fb_offset(&mut builder, &schema);
+        let message = ipc::Message::create(
+            &mut builder,
+            &ipc::MessageArgs {
+                header_type: ipc::MessageHeader::Schema,
+                header: Some(schema.as_union_value()),
+                ..Default::default()
+            },
+        );
+        builder.finish(message, None);
+        let raw = builder.finished_data();
+        let mut framed = vec![255; 4];
+        framed.extend(u32::try_from(raw.len()).expect("small schema").to_le_bytes());
+        framed.extend(raw);
+        for message in [raw, framed.as_slice()] {
+            let encoded = base64_simd::STANDARD.encode_to_string(message);
+            let footer = arrow_hint_footer(&[
+                (b"ARROW:schema", Some(b"invalid")),
+                (b"ARROW:schema", Some(encoded.as_bytes())),
+                (b"ARROW:schema", None),
+            ]);
+            validate_footer(&footer, 1024 * 1024).expect("last present Arrow metadata wins, both IPC framings are supported");
+            assert!(matches!(
+                validate_footer(
+                    &arrow_hint_footer(&[
+                        (b"ARROW:schema", Some(encoded.as_bytes())),
+                        (b"ARROW:schema", Some(b"invalid"))
+                    ]),
+                    1024 * 1024
+                ),
+                Err(ParquetBudgetError::Invalid(_))
+            ));
+        }
+        validate_footer(&arrow_hint_footer(&[(b"other", Some(b"invalid"))]), 1024 * 1024).expect("other metadata is opaque");
+    }
+
+    #[test]
+    fn arrow_hint_value_before_key_is_still_admitted() {
+        // Compact struct fields are identified by ID, not required to be ordered.
+        let mut bytes = vec![0x59, 0x1c, 0x28, 3];
+        bytes.extend(b"%%%");
+        bytes.extend([0x08, 2, 12]);
+        bytes.extend(b"ARROW:schema");
+        bytes.extend([0, 0]);
+        assert!(matches!(validate_footer(&bytes, 1024 * 1024), Err(ParquetBudgetError::Invalid(_))));
     }
 
     #[test]

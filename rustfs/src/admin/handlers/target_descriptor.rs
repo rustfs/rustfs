@@ -14,13 +14,14 @@
 
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{
     AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, SharedTarget, TargetAdminMetadata, TargetDomain, TargetError, TargetHealthReason,
     TargetHealthState, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
@@ -35,7 +36,6 @@ use rustfs_targets::{
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use rustfs_utils::egress::OutboundPolicy;
-use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -288,17 +288,20 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
-pub(crate) fn build_json_response(
+/// Wrap an already-serialized JSON `body` as an admin response: `Content-Type:
+/// application/json`, plus the caller's `x-request-id` echoed back when the
+/// request carried one.
+pub(crate) fn owned_build_json_response(
     status: StatusCode,
-    body: Body,
+    body: rustfs_s3_types::Body,
     request_id: Option<&HeaderValue>,
-) -> S3Response<(StatusCode, Body)> {
+) -> crate::admin::operation::AdminResponse {
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
-    S3Response::with_headers((status, body), header)
+    crate::admin::operation::AdminResponse::with_headers(status, body, header)
 }
 
 pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, RuntimeHealthStatus>
@@ -560,6 +563,8 @@ where
 }
 
 pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
+    let queue_dir = rustfs_targets::store::resolve_queue_dir(queue_dir);
+    let queue_dir = queue_dir.as_ref();
     if !queue_dir.is_empty() {
         if !Path::new(queue_dir).is_absolute() {
             return Err(s3_error!(InvalidArgument, "queue_dir must be an absolute path"));
@@ -1022,6 +1027,29 @@ mod webhook_request_tests {
 }
 
 #[cfg(test)]
+mod owned_response_tests {
+    use super::owned_build_json_response;
+
+    #[tokio::test]
+    async fn owned_build_json_response_sets_json_content_type_and_echoes_the_request_id() {
+        let request_id = http::HeaderValue::from_static("req-42");
+        for id in [None, Some(&request_id)] {
+            let (status, headers, mut body) =
+                owned_build_json_response(http::StatusCode::ACCEPTED, rustfs_s3_types::Body::from("{\"ok\":true}"), id)
+                    .into_parts();
+            assert_eq!(status, http::StatusCode::ACCEPTED);
+            assert_eq!(
+                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(headers.len(), 1 + usize::from(id.is_some()));
+            assert_eq!(body.store_all_limited(64).await.expect("body reads").as_ref(), b"{\"ok\":true}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod instance_runtime_status_tests {
     use super::{admin_target_spec_from_builtin, collect_instance_runtime_statuses};
     use rustfs_targets::{
@@ -1072,5 +1100,60 @@ mod instance_runtime_status_tests {
         assert_eq!(statuses.len(), 2);
         assert!(statuses.contains_key(&("Primary".into(), "custom-one".into())));
         assert!(statuses.contains_key(&("PRIMARY".into(), "custom-two".into())));
+    }
+}
+
+#[cfg(test)]
+mod queue_dir_resolution_tests {
+    use super::validate_queue_dir;
+    use rustfs_config::server_config::KVS;
+    use rustfs_config::{AUDIT_DEFAULT_DIR, ENV_TARGET_STORE_DIR, EVENT_DEFAULT_DIR, REDIS_QUEUE_DIR, REDIS_URL};
+    use rustfs_targets::{config::build_redis_args, target::TargetType};
+    use serial_test::serial;
+
+    fn redis_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/".to_string());
+        config
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_queue_dirs_follow_the_target_store_root() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let notify = build_redis_args(&redis_config(), EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent)
+                .expect("default notify queue");
+            assert_eq!(notify.queue_dir, root.path().join("events").to_string_lossy());
+            let audit =
+                build_redis_args(&redis_config(), AUDIT_DEFAULT_DIR, "audit", TargetType::AuditLog).expect("default audit queue");
+            assert_eq!(audit.queue_dir, root.path().join("audit").to_string_lossy());
+
+            let explicit = root.path().join("operator-queue").to_string_lossy().into_owned();
+            let mut config = redis_config();
+            config.insert(REDIS_QUEUE_DIR.to_string(), explicit.clone());
+            let args = build_redis_args(&config, EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent).expect("explicit queue");
+            assert_eq!(args.queue_dir, explicit, "an operator path must not be relocated");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_logical_default_is_validated_at_its_resolved_directory() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let missing = validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect_err("the resolved queue directory does not exist yet");
+            assert!(missing.message().is_some_and(|message| message.contains("does not exist")));
+            std::fs::create_dir(root.path().join("events")).expect("resolved queue directory");
+            validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect("the logical default must be checked where this node stores it");
+        })
+        .await;
     }
 }

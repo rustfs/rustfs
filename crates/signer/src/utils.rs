@@ -14,8 +14,6 @@
 
 use http::request;
 
-use s3s::Body;
-
 #[derive(Debug, thiserror::Error)]
 pub enum HostAddrError {
     #[error("invalid UTF-8 header value for `host`")]
@@ -24,7 +22,7 @@ pub enum HostAddrError {
     MissingUriHost,
 }
 
-pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAddrError> {
+pub fn try_get_host_addr<B>(req: &request::Request<B>) -> Result<String, HostAddrError> {
     let host = req.headers().get("host");
     let req_host = uri_host_addr(req).ok_or(HostAddrError::MissingUriHost)?;
 
@@ -38,7 +36,7 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
     Ok(req_host)
 }
 
-pub fn get_host_addr(req: &request::Request<Body>) -> String {
+pub fn get_host_addr<B>(req: &request::Request<B>) -> String {
     match try_get_host_addr(req) {
         Ok(host) => host,
         Err(HostAddrError::MissingUriHost) => req
@@ -51,7 +49,7 @@ pub fn get_host_addr(req: &request::Request<Body>) -> String {
     }
 }
 
-fn uri_host_addr(req: &request::Request<Body>) -> Option<String> {
+fn uri_host_addr<B>(req: &request::Request<B>) -> Option<String> {
     let uri = req.uri();
     let uri_host = uri.host()?;
 
@@ -79,7 +77,7 @@ mod tests {
     use super::{HostAddrError, get_host_addr, try_get_host_addr};
     use http::HeaderValue;
     use http::request;
-    use s3s::Body;
+    use rustfs_s3_types::Body;
 
     #[test]
     fn try_get_host_addr_prefers_explicit_host_header_when_it_differs_from_uri() {

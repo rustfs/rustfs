@@ -125,6 +125,7 @@ test-util = []
 e2e-test-hooks = []
 
 [dependencies]
+hashbrown.workspace = true
 hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
@@ -144,6 +145,7 @@ rustfs-lifecycle.workspace = true
 rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
+rustfs-gateway-types.workspace = true
 rustfs-object-capacity.workspace = true
 rustfs-object-data-cache = { workspace = true, features = ["runtime-memory"] }
 arc-swap.workspace = true
@@ -162,7 +164,6 @@ serde = { workspace = true, features = ["derive"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-s3s = { workspace = true, features = ["minio"] }
 http.workspace = true
 opentelemetry.workspace = true
 http-body = { workspace = true }
@@ -256,6 +257,7 @@ windows-sys = { workspace = true, features = [
 windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
+s3s = { workspace = true, features = ["minio"] }
 aws-smithy-async.workspace = true
 rustfs-s3-ops.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }

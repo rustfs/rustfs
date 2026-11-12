@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use s3s::dto::BucketLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +52,7 @@ pub(crate) fn deployment_id() -> Option<String> {
     sources::deployment_id()
 }
 
-pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<BucketLifecycleConfiguration> {
+pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<PersistedLifecycleConfiguration> {
     sources::bucket_lifecycle_config(bucket).await
 }
 

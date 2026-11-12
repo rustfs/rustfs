@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <BlockPublicAcls>TRUE</BlockPublicAcls>
+  <IgnorePublicAcls>TRUE</IgnorePublicAcls>
+  <BlockPublicPolicy>TRUE</BlockPublicPolicy>
+  <RestrictPublicBuckets>TRUE</RestrictPublicBuckets>
+</PublicAccessBlockConfiguration>

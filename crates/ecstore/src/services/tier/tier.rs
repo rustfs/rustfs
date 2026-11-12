@@ -79,10 +79,11 @@ use crate::{
     store::ECStore,
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_rio::HashReader;
 use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
-use s3s::{S3ErrorCode, dto::BucketLifecycleConfiguration};
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
@@ -93,6 +94,7 @@ use super::{
         delete_tier_mutation_intent_record_if_current, list_tier_coordinator_mutation_intent_records,
         list_tier_mutation_intent_records, load_tier_coordinator_mutation_intent_record_with_etag,
         load_tier_mutation_intent_record_with_etag, save_tier_coordinator_mutation_intent_record_if_absent,
+        save_tier_mutation_intent_record_if_current,
     },
     warm_backend::WarmBackendImpl,
 };
@@ -620,7 +622,11 @@ struct CommittedMutationRecoveryPlan {
 
 impl TierMutationRecoverySnapshot {
     fn requires_config_lock(&self) -> bool {
-        self.has_committed_mutation_blocks || self.intents.iter().any(|recovered| recovered.has_coordinator_record)
+        self.has_committed_mutation_blocks
+            || self.intents.iter().any(|recovered| {
+                recovered.has_coordinator_record
+                    || (recovered.has_peer_record && recovered.intent.state == TierMutationIntentState::Prepared)
+            })
     }
 
     fn allowance(&self) -> MutationBlockAllowance {
@@ -1102,7 +1108,7 @@ trait TierReferenceProofStore:
         .await
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>>;
 
     async fn walk_bucket_for_deletion_check(
         self: Arc<Self>,
@@ -1155,7 +1161,7 @@ impl TierReferenceProofStore for ECStore {
         Ok(buckets.into_values().collect())
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
         match get_lifecycle_config(bucket).await {
             Ok((config, _updated_at)) => Ok(Some(config)),
             Err(Error::ConfigNotFound) => Ok(None),
@@ -1634,7 +1640,7 @@ struct TierLifecycleReference<'a> {
 }
 
 fn lifecycle_config_target_reference<'a>(
-    config: &'a BucketLifecycleConfiguration,
+    config: &'a PersistedLifecycleConfiguration,
     targets: &[TierMutationIntentTarget],
 ) -> Option<TierLifecycleReference<'a>> {
     for rule in &config.rules {
@@ -5102,6 +5108,9 @@ impl TierConfigMgr {
 
             Self::reconcile_terminal_dual_prefix_mutation_intents(api.clone(), &mut snapshot).await?;
             Self::recover_prepared_coordinator_mutation_intents(api.clone(), &mut snapshot.coordinator_intents).await?;
+            if config_lock.is_some() {
+                Self::recover_expired_peer_only_prepares(api.clone(), &snapshot).await?;
+            }
 
             snapshot = Self::load_and_reconcile_mutation_recovery_snapshot(handle, api.clone(), true).await?;
             if snapshot.requires_config_lock() && config_lock.is_none() {
@@ -5500,6 +5509,58 @@ impl TierConfigMgr {
             })?;
             marker = Some(next_marker);
         }
+    }
+
+    async fn recover_expired_peer_only_prepares<S>(api: Arc<S>, snapshot: &TierMutationRecoverySnapshot) -> io::Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX);
+        let orphaned = snapshot
+            .intents
+            .iter()
+            .filter(|recovered| {
+                recovered.has_peer_record
+                    && !recovered.has_coordinator_record
+                    && recovered.intent.state == TierMutationIntentState::Prepared
+                    && Self::tier_mutation_tombstone_retention_elapsed(&recovered.intent, now)
+            })
+            .map(|recovered| recovered.intent.clone())
+            .collect::<Vec<_>>();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        // The caller holds the tier-config namespace lock. Only the exact
+        // persisted candidate proves a commit; an old or different config
+        // leaves the peer fence intact.
+        let loaded = load_tier_config_for_recovery(api.clone()).await?;
+        let Some(config_etag) = loaded.etag else {
+            return Ok(());
+        };
+        for intent in orphaned {
+            if loaded.persisted_digest != Some(intent.candidate_digest) {
+                continue;
+            }
+            let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
+            let (mut current, record_etag) =
+                match load_tier_mutation_intent_record_with_etag(api.clone(), intent.mutation_id).await {
+                    Ok(record) => record,
+                    Err(Error::ConfigNotFound) => continue,
+                    Err(err) => return Err(tier_mutation_replay_error(err)),
+                };
+            if current != intent {
+                continue;
+            }
+            current
+                .advance(TierMutationIntentState::Committed, Some(config_etag.clone()))
+                .map_err(io::Error::other)?;
+            match save_tier_mutation_intent_record_if_current(api.clone(), &current, &record_etag).await {
+                Ok(()) | Err(Error::PreconditionFailed) => {}
+                Err(err) => return Err(tier_mutation_replay_error(err)),
+            }
+        }
+        Ok(())
     }
 
     async fn recover_prepared_coordinator_mutation_intents<S>(api: Arc<S>, intents: &mut [TierMutationIntent]) -> io::Result<()>
@@ -7308,9 +7369,8 @@ mod tests {
         endpoints::{Endpoints, PoolEndpoints, SetupType},
     };
     use crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, NoncurrentVersionTransition, Transition,
-        TransitionStorageClass,
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedNoncurrentVersionTransition, PersistedTransition,
     };
 
     #[test]
@@ -8137,7 +8197,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for LockingTierConfigStore {
-        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             Ok(None)
         }
     }
@@ -10871,6 +10931,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intent_advance_retries_cas_conflict_reload_lock_timeout() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(39);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let committed = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+        let committed_bytes = committed.encode().expect("committed intent fixture should encode");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        let winning_etag = format!("etag-{}", store.next_etag.load(Ordering::SeqCst) + 1);
+        store.rewrite_on_next_if_match(object.clone(), committed_bytes.clone()).await;
+        *store.read_timeout_after_if_match_race.lock().await = Some(object.clone());
+
+        let (observed, applied) = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect("CAS conflict reload should retry its typed lock timeout");
+
+        assert!(!applied);
+        assert_eq!(observed, committed);
+        assert!(store.read_timeout_after_if_match_race.lock().await.is_none());
+        assert_eq!(
+            store.objects.lock().await.get(&object).cloned(),
+            Some((committed_bytes, winning_etag)),
+            "retry must preserve the complete winning record and its object ETag"
+        );
+    }
+
+    #[tokio::test]
     async fn intent_advance_reconciles_matching_commit_after_final_cas_race() {
         let store = Arc::new(CasConfigStore::default());
         let mutation_id = uuid::Uuid::from_u128(37);
@@ -13380,6 +13476,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_recovers_expired_peer_only_prepare_for_persisted_add() {
+        use crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record;
+
+        let store = Arc::new(CasConfigStore::default());
+        let previous = empty_mgr();
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        let targets = build_tier_mutation_affected_targets(
+            TierMutationIntentKind::Add,
+            HashSet::from(["COLD-A".to_string()]),
+            &previous,
+            &candidate,
+        )
+        .expect("added tier should have a target");
+        let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+            .expect("intent should build")
+            .expect("add should require an intent");
+        intent.expires_at_unix_nanos = 1;
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("candidate should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("peer prepare should persist without a coordinator record");
+
+        let manager = TierConfigMgr::new();
+        TIER_MUTATION_TEST_PEERS
+            .scope(Vec::new(), async {
+                TIER_DRIVER_TEST_FACTORY
+                    .scope(healthy_driver_factory(), async {
+                        TierConfigMgr::reload_handle_with(&manager, store.clone())
+                            .await
+                            .expect("matching saved candidate should recover");
+                        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+                            .await
+                            .expect("recovered tier should be readable");
+                    })
+                    .await;
+            })
+            .await;
+        assert!(
+            TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("peer scan should succeed")
+                .iter()
+                .all(|record| record.state != TierMutationIntentState::Prepared),
+            "the orphaned prepare must no longer block later reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_peer_only_prepare_without_commit_proof() {
+        use crate::services::tier::tier_mutation_intent::{
+            save_tier_mutation_intent_record, tier_mutation_intent_record_object_name,
+        };
+
+        for case in [
+            "unexpired",
+            "recently_expired",
+            "different_candidate",
+            "missing_config",
+            "concurrent_change",
+        ] {
+            let store = Arc::new(CasConfigStore::default());
+            let previous = empty_mgr();
+            let mut candidate = empty_mgr();
+            candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+            let targets = build_tier_mutation_affected_targets(
+                TierMutationIntentKind::Add,
+                HashSet::from(["COLD-A".to_string()]),
+                &previous,
+                &candidate,
+            )
+            .expect("added tier should have a target");
+            let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+                .expect("intent should build")
+                .expect("add should require an intent");
+            intent.expires_at_unix_nanos = match case {
+                "unexpired" => tier_mutation_intent_expiry_unix_nanos(),
+                "recently_expired" => {
+                    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).expect("test clock should fit")
+                        - 1_000_000_000
+                }
+                _ => 1,
+            };
+            if case == "different_candidate" {
+                intent.candidate_digest = [0x51; 32];
+            }
+            if case != "missing_config" {
+                candidate
+                    .save_tiering_config_if_current(store.clone(), None)
+                    .await
+                    .expect("candidate should persist");
+            }
+            save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("peer prepare should persist");
+            let expected = if case == "concurrent_change" {
+                let mut changed = intent.clone();
+                changed.candidate_digest = [0x52; 32];
+                let object = tier_mutation_intent_record_object_name(intent.mutation_id).expect("record path should build");
+                store
+                    .rewrite_on_next_if_match(object, changed.encode().expect("changed intent should encode"))
+                    .await;
+                changed
+            } else {
+                intent
+            };
+
+            let manager = TierConfigMgr::new();
+            TIER_MUTATION_TEST_PEERS
+                .scope(Vec::new(), async {
+                    TierConfigMgr::reload_handle_with(&manager, store.clone())
+                        .await
+                        .expect("unproven prepare should remain fenced");
+                })
+                .await;
+            let error = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+                Ok(_) => panic!("{case}: unproven prepare must block reads"),
+                Err(error) => error,
+            };
+            assert!(error.message.contains("being replaced"), "{case}: {error}");
+            let records = TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("peer scan should succeed");
+            assert_eq!(records, vec![expected], "{case}: prepared evidence must remain unchanged");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_only_prepare_recovery_retains_fence_until_peer_commit_succeeds() {
+        use crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record;
+
+        let store = Arc::new(CasConfigStore::default());
+        let previous = empty_mgr();
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        let targets = build_tier_mutation_affected_targets(
+            TierMutationIntentKind::Add,
+            HashSet::from(["COLD-A".to_string()]),
+            &previous,
+            &candidate,
+        )
+        .expect("added tier should have a target");
+        let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+            .expect("intent should build")
+            .expect("add should require an intent");
+        intent.expires_at_unix_nanos = 1;
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("candidate should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("peer prepare should persist");
+
+        let manager = TierConfigMgr::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        TIER_MUTATION_TEST_PEERS
+            .scope(vec![FakeTierMutationPeer::boxed("peer-a", calls.clone(), Err("offline"))], async {
+                TierConfigMgr::reload_handle_with(&manager, store.clone())
+                    .await
+                    .expect_err("failed peer commit must leave recovery incomplete");
+            })
+            .await;
+        let retained = TierConfigMgr::load_tier_mutation_intents(store.clone())
+            .await
+            .expect("peer scan should succeed");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, TierMutationIntentState::Committed);
+        let error = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Ok(_) => panic!("failed peer commit must retain the fence"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("being replaced"), "{error}");
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async {
+                    TIER_DRIVER_TEST_FACTORY
+                        .scope(healthy_driver_factory(), async {
+                            TierConfigMgr::reload_handle_with(&manager, store.clone())
+                                .await
+                                .expect("peer commit retry should recover");
+                            TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+                                .await
+                                .expect("tier should be readable after the retry");
+                        })
+                        .await;
+                },
+            )
+            .await;
+        assert_eq!(lock_unpoisoned(&calls).len(), 2, "recovery should retry the peer commit");
+    }
+
+    #[tokio::test]
     async fn coordinator_mutation_recovery_scan_blocks_new_operation_lease() {
         let store = Arc::new(CasConfigStore::default());
         let mutation_id = uuid::Uuid::from_u128(23);
@@ -15370,6 +15668,7 @@ mod tests {
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
+        read_timeout_after_if_match_race: tokio::sync::Mutex<Option<String>>,
         next_etag: AtomicUsize,
         content_derived_etags: AtomicBool,
         fail_put: AtomicBool,
@@ -15388,7 +15687,7 @@ mod tests {
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
-        lifecycle_configs: Mutex<HashMap<String, BucketLifecycleConfiguration>>,
+        lifecycle_configs: Mutex<HashMap<String, PersistedLifecycleConfiguration>>,
     }
 
     impl Default for CasConfigStore {
@@ -15399,6 +15698,7 @@ mod tests {
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
                 if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                read_timeout_after_if_match_race: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 content_derived_etags: AtomicBool::new(false),
                 fail_put: AtomicBool::new(false),
@@ -15451,7 +15751,7 @@ mod tests {
                 .retain(|version| version.bucket != bucket || version.name != object);
         }
 
-        fn add_lifecycle_config(&self, bucket: &str, config: BucketLifecycleConfiguration) {
+        fn add_lifecycle_config(&self, bucket: &str, config: PersistedLifecycleConfiguration) {
             self.lifecycle_configs
                 .lock()
                 .expect("tier reference fixture should not poison")
@@ -15560,6 +15860,19 @@ mod tests {
                 crate::api::diagnostic::current_read_version_entry_source(),
                 rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
             ));
+            {
+                // The queued rewrite keeps the initial read successful. Only
+                // the first target read after that CAS race consumes the fault.
+                let race_completed = self.if_match_race_rewrite.lock().await.is_empty();
+                let mut timeout = self.read_timeout_after_if_match_race.lock().await;
+                if race_completed && timeout.as_deref() == Some(object) {
+                    timeout.take();
+                    return Err(Error::Lock(rustfs_lock::LockError::Timeout {
+                        resource: format!("{bucket}/{object}@latest"),
+                        timeout: std::time::Duration::from_secs(5),
+                    }));
+                }
+            }
             let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
             let (data, etag) = if object == legacy_config_path {
                 let state = self.legacy_state.lock().await;
@@ -16188,7 +16501,7 @@ mod tests {
             .await
         }
 
-        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             if self.reference_lifecycle_error.load(Ordering::SeqCst) {
                 return Err(Error::CorruptedFormat);
             }
@@ -16323,10 +16636,10 @@ mod tests {
         });
         store.add_lifecycle_config(
             "photos",
-            BucketLifecycleConfiguration {
+            PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -16335,10 +16648,10 @@ mod tests {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    transitions: Some(vec![Transition {
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(1),
                         date: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                        storage_class: Some("COLD-A".to_owned()),
                     }]),
                 }],
             },
@@ -16991,10 +17304,10 @@ mod tests {
             .save_tiering_config_if_current(store.clone(), None)
             .await
             .expect("reference proof fixture should persist");
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -17003,10 +17316,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -17436,23 +17749,23 @@ mod tests {
             });
             store.add_lifecycle_config(
                 "private-bucket",
-                BucketLifecycleConfiguration {
+                rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                     expiry_updated_at: None,
-                    rules: vec![LifecycleRule {
-                        status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                        status: "Enabled".to_string(),
                         id: Some("private-rule".to_string()),
                         noncurrent_version_transitions: noncurrent.then(|| {
-                            vec![NoncurrentVersionTransition {
+                            vec![rustfs_gateway_types::persistence::PersistedNoncurrentVersionTransition {
                                 noncurrent_days: Some(1),
                                 newer_noncurrent_versions: None,
-                                storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                                storage_class: Some("COLD-A".to_string()),
                             }]
                         }),
                         transitions: (!noncurrent).then(|| {
-                            vec![Transition {
+                            vec![rustfs_gateway_types::persistence::PersistedTransition {
                                 days: Some(1),
                                 date: None,
-                                storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                                storage_class: Some("COLD-A".to_string()),
                             }]
                         }),
                         expiration: None,
@@ -17855,10 +18168,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -17867,10 +18180,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -17900,20 +18213,20 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("move-noncurrent".to_string()),
                 noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -17949,10 +18262,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -17961,10 +18274,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };

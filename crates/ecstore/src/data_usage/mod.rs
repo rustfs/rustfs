@@ -685,12 +685,8 @@ async fn clear_bucket_usage_memory(bucket: &str, guard: Option<&rustfs_lock::Nam
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    remove_bucket_usage_for_namespace_change(store.as_ref(), bucket).await
-}
-
-pub(crate) async fn remove_bucket_usage_for_namespace_change(store: &ECStore, bucket: &str) -> Result<(), Error> {
     prepare_bucket_usage_for_namespace_change(bucket, None).await?;
-    remove_bucket_usage_from_backend_with_guard_fenced(store, bucket, None).await
+    remove_bucket_usage_with_owned_namespace(store, bucket, None).await
 }
 
 pub(crate) async fn prepare_bucket_usage_for_namespace_change(
@@ -730,11 +726,37 @@ where
 pub(crate) async fn remove_bucket_usage_from_backend_with_guard_fenced(
     store: &ECStore,
     bucket: &str,
-    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>,
 ) -> Result<(), Error> {
-    let result = remove_bucket_usage_from_backend_with_store_and_guard_and_publication(store, bucket, guard, Some(store)).await;
-    invalidate_bucket_usage_snapshot_caches(guard, bucket).await?;
-    result
+    let owned_store = crate::bucket::metadata_sys::object_store_in(&store.ctx).await?;
+    if !std::ptr::eq(store, owned_store.as_ref()) {
+        return Err(Error::other("usage cleanup requires its own metadata store"));
+    }
+    remove_bucket_usage_with_owned_namespace(owned_store, bucket, guard.cloned()).await
+}
+
+async fn remove_bucket_usage_with_owned_namespace(
+    store: Arc<ECStore>,
+    bucket: &str,
+    guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+) -> Result<(), Error> {
+    let bucket = bucket.to_owned();
+    let ctx = Arc::clone(&store.ctx);
+    // Retain the bucket generation and movement/object guards through every
+    // physical commit even when the namespace request stops waiting.
+    ctx.run_detached_mutation(async move {
+        let result = remove_bucket_usage_from_backend_with_store_and_guard_and_publication(
+            store.as_ref(),
+            &bucket,
+            guard.as_deref(),
+            Some(store.as_ref()),
+        )
+        .await;
+        invalidate_bucket_usage_snapshot_caches(guard.as_deref(), &bucket).await?;
+        result
+    })
+    .await
+    .map_err(Error::from)?
 }
 
 async fn invalidate_bucket_usage_snapshot_caches(
@@ -849,9 +871,9 @@ where
     let primary_seed_epoch = match publication_store {
         Some(publication_store) => Some(
             publication_store
-                .scanner_data_usage_publication_epoch()
+                .data_usage_namespace_cleanup_epoch()
                 .await
-                .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?,
+                .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?,
         ),
         None => None,
     };
@@ -871,9 +893,9 @@ where
     let backup_seed_epoch = match publication_store {
         Some(publication_store) => Some(
             publication_store
-                .scanner_data_usage_publication_epoch()
+                .data_usage_namespace_cleanup_epoch()
                 .await
-                .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?,
+                .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?,
         ),
         None => None,
     };
@@ -985,9 +1007,9 @@ where
         let read_epoch = match publication {
             Some((publication_store, expected_publication_epoch)) => {
                 let epoch = publication_store
-                    .scanner_data_usage_publication_epoch()
+                    .data_usage_namespace_cleanup_epoch()
                     .await
-                    .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?;
+                    .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?;
                 if expected_publication_epoch.is_some_and(|expected| expected != epoch) {
                     return Err(Error::other("data usage publication epoch changed before snapshot read"));
                 }
@@ -1022,9 +1044,8 @@ where
         ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot commit")?;
         let publication_guard = match publication {
             Some((publication_store, expected_publication_epoch)) => {
-                let Some((guard, publication_epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await
-                else {
-                    return Err(Error::other("data usage publication is blocked by data movement"));
+                let Some((guard, publication_epoch)) = publication_store.data_usage_namespace_cleanup_guard().await else {
+                    return Err(Error::other("data usage namespace cleanup epoch is unavailable"));
                 };
                 if expected_publication_epoch
                     .or(read_epoch)
@@ -1036,18 +1057,27 @@ where
             }
             None => None,
         };
-        let save_result = store
-            .put_object(
-                RUSTFS_META_BUCKET,
-                object,
-                &mut put_data,
-                &ObjectOptions {
-                    max_parity: true,
-                    http_preconditions: Some(http_preconditions),
-                    ..Default::default()
-                },
-            )
-            .await;
+        let save_result = match publication {
+            Some((publication_store, _)) => {
+                publication_store
+                    .put_usage_snapshot_for_namespace_cleanup(object, revision.as_deref(), &mut put_data, guard)
+                    .await
+            }
+            None => {
+                store
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut put_data,
+                        &ObjectOptions {
+                            max_parity: true,
+                            http_preconditions: Some(http_preconditions),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        };
         drop(publication_guard);
         match save_result.map_err(|err| crate::config::com::map_system_metadata_write_error(err, object)) {
             Ok(_) => return Ok(()),
@@ -3436,7 +3466,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: TokioMutex::new(()),
-            pool_meta_save_gate: TokioMutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

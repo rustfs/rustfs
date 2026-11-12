@@ -286,12 +286,15 @@ pub(super) fn fsync_inline_commit_std(
 
     if destination_was_absent {
         let mut ancestor = dst.parent().and_then(Path::parent);
+        let mut ancestor_step = 0usize;
         while let Some(ancestor_dir) = ancestor {
             if !ancestor_dir.starts_with(dst_volume_dir) {
                 break;
             }
             let fsync_started = rustfs_io_metrics::put_stage_timer();
-            if let Err(err) = os::fsync_dir_limited_std(ancestor_dir) {
+            if let Err(err) =
+                os::fsync_commit_ancestor_directory_limited_std(ancestor_dir, dst_volume_dir, ancestor_step, commit_guard)
+            {
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
                     fsync_started,
@@ -310,6 +313,7 @@ pub(super) fn fsync_inline_commit_std(
                 break;
             }
             ancestor = ancestor_dir.parent();
+            ancestor_step += 1;
         }
     }
     Ok(())
@@ -517,8 +521,12 @@ impl LocalDisk {
             state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
         })?;
         crate::hp_guard!("LocalDisk::rename_data");
-        if dst_volume == super::super::RUSTFS_META_MULTIPART_BUCKET {
-            self.multipart_index.record_info(dst_path, &fi).await?;
+        if dst_volume == super::super::RUSTFS_META_MULTIPART_BUCKET
+            && let Some(pin) = self.multipart_index.record_info(dst_path, &fi).await?
+        {
+            // The owner chain reaches every lease this rename publishes under,
+            // so the index marker stays pinned until that work has returned.
+            state.namespace_owner = Some(Arc::new((state.namespace_owner.take(), pin)));
         }
         #[cfg(feature = "e2e-test-hooks")]
         if fi.is_healing() {
@@ -752,8 +760,20 @@ impl LocalDisk {
         };
         let dst_file_path = self.io_get_object_open_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
+        // Multipart restore completion has validated staged local parts,
+        // while its public status stays pending until finalization.
+        let pending_multipart_restore = src_volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET
+            && fi
+                .metadata
+                .get(rustfs_filemeta::metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true));
+        if pending_multipart_restore && fi.data_dir.is_none_or(|dir| dir.is_nil()) {
+            return Err(DiskError::FileCorrupt);
+        }
+
         // data_dir path (only used by the non-inline commit branch)
-        let has_data_dir_path = if no_inline && !fi.is_remote() {
+        let has_data_dir_path = if no_inline && (!fi.is_remote() || pending_multipart_restore) {
             if let Some(data_dir) = fi
                 .data_dir
                 .map(|dir| rustfs_utils::path::retain_slash(dir.to_string().as_str()))
@@ -1086,7 +1106,7 @@ impl LocalDisk {
                     if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
                         staged_backup,
                         &backup_path,
-                        &dst_volume_dir_owned,
+                        &skip_parent,
                         &publication_root_owned,
                         None,
                         sync_commit_metadata,
@@ -1444,11 +1464,17 @@ impl LocalDisk {
                         }
                         if has_dst_buf_owned.is_none() {
                             let mut ancestor = dst_file_path_owned.parent().and_then(|object_dir| object_dir.parent());
+                            let mut ancestor_step = 0usize;
                             while let Some(dir) = ancestor {
                                 if !dir.starts_with(&dst_volume_dir_owned) {
                                     break;
                                 }
-                                if let Err(err) = os::fsync_dir_limited_std(dir) {
+                                if let Err(err) = os::fsync_commit_ancestor_directory_limited_std(
+                                    dir,
+                                    &dst_volume_dir_owned,
+                                    ancestor_step,
+                                    &directory_guard_owned,
+                                ) {
                                     return Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(
                                         to_file_error(err).into(),
                                         true,
@@ -1458,10 +1484,16 @@ impl LocalDisk {
                                     break;
                                 }
                                 ancestor = dir.parent();
+                                ancestor_step += 1;
                             }
                         }
                     }
-                    match publication_owned.finish_on_thread(sync_commit_metadata, !cfg!(test), staging_cleanup) {
+                    match publication_owned.finish_on_thread(
+                        sync_commit_metadata,
+                        !cfg!(test),
+                        staging_cleanup,
+                        Some(&directory_guard_owned),
+                    ) {
                         Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(Box::new(RenameDataResp {
                             multipart_source: Some(Box::new(result)),
                             old_data_dir: has_old_data_dir,

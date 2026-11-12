@@ -975,9 +975,11 @@ pub struct DeleteRecoveryWorkBudget {
     remaining: std::sync::atomic::AtomicU32,
 }
 
-/// Entries one disk may visit per recovery step (discovery plus inspection).
-/// Every disk of every set a request fans out to is admitted up to this much
-/// and charged on completion, so a budget must cover that many disks.
+/// Per-drive unit a request budget is sized by (a typical discovery plus one
+/// inspection). Admission charges what a call visited, not this unit, so it only
+/// scales the request total with the drives a request can reach; it is kept
+/// independent of the per-call caps, which may let one key's probe use more of
+/// the same total on a large folder.
 const DELETE_RECOVERY_RESERVATION_PER_DISK: u32 = 4096 + 65_536;
 
 impl Default for DeleteRecoveryWorkBudget {
@@ -1128,6 +1130,10 @@ pub struct ObjectOptions {
     /// `ecstore` must leave it unset.
     #[doc(hidden)]
     pub data_movement_transferred_tier_versions: Option<crate::data_movement::TransferredTierVersions>,
+    /// Marks the physical copy-back write of a RestoreObject operation. This
+    /// is in-memory request context and must not be copied into object metadata.
+    #[doc(hidden)]
+    pub restore_copyback: bool,
     /// Internal, in-memory protection context. Never populated from S3 metadata.
     /// None selects the rollout default only for a new write, not for a rewrite.
     #[doc(hidden)]

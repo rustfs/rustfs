@@ -350,10 +350,10 @@
       "roles": [
         "periodic",
         "manual",
-        "release"
+        "reusable"
       ],
       "events": [
-        "push",
+        "workflow_call",
         "schedule",
         "workflow_dispatch"
       ],
@@ -367,7 +367,7 @@
       "monitor": "workflow",
       "max_age_hours": 36,
       "result_owner": "build.yml",
-      "disposition": "retained independent entry",
+      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
       "failure_owner": "workflow",
       "origin": "baseline",
       "alert_contract": "scheduled-validation"
@@ -745,14 +745,13 @@
     },
     {
       "workflow": ".github/workflows/docker.yml",
-      "name": "Docker Images",
+      "name": "Build candidate images",
       "roles": [
-        "manual",
-        "release"
+        "release",
+        "reusable"
       ],
       "events": [
-        "workflow_run",
-        "workflow_dispatch"
+        "workflow_call"
       ],
       "cadence": "event",
       "timezone": "UTC",
@@ -761,7 +760,7 @@
       "policy": "active",
       "monitor": "none",
       "result_owner": "docker.yml",
-      "disposition": "retained independent entry",
+      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "origin": "baseline"
     },
@@ -871,6 +870,33 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/reference-parity.yml",
+      "name": "Reference Parity",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 1 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "reference-parity.yml",
+      "disposition": "s3-tests per-node-id parity of branch candidates against the pinned reference release",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/functional-chain-health.yml",
       "name": "Functional chain health",
       "roles": [
@@ -954,14 +980,13 @@
     },
     {
       "workflow": ".github/workflows/helm-package.yml",
-      "name": "Publish helm chart to artifacthub",
+      "name": "Build candidate Helm chart",
       "roles": [
-        "manual",
-        "release"
+        "release",
+        "reusable"
       ],
       "events": [
-        "workflow_run",
-        "workflow_dispatch"
+        "workflow_call"
       ],
       "cadence": "event",
       "timezone": "UTC",
@@ -970,7 +995,7 @@
       "policy": "active",
       "monitor": "none",
       "result_owner": "helm-package.yml",
-      "disposition": "retained independent entry",
+      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "origin": "baseline"
     },
@@ -995,6 +1020,26 @@
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
       "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/manual-main-packages.yml",
+      "name": "Manual main packages",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "manual-main-packages.yml",
+      "disposition": "Packages the origin/main tip as workflow artifacts only. No GitHub Release or download-channel writes.",
+      "monitor_reason": "Operator-requested packaging has no periodic freshness obligation.",
+      "origin": "manual-main-packages"
     },
     {
       "workflow": ".github/workflows/minio-interop.yml",
@@ -1182,14 +1227,13 @@
     },
     {
       "workflow": ".github/workflows/package.yml",
-      "name": "Package DEB/RPM",
+      "name": "Build candidate packages",
       "roles": [
-        "manual",
-        "release"
+        "release",
+        "reusable"
       ],
       "events": [
-        "workflow_run",
-        "workflow_dispatch"
+        "workflow_call"
       ],
       "cadence": "event",
       "timezone": "UTC",
@@ -1198,7 +1242,7 @@
       "policy": "active",
       "monitor": "none",
       "result_owner": "package.yml",
-      "disposition": "retained independent entry",
+      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "origin": "baseline"
     },
@@ -1727,6 +1771,69 @@
       "disposition": "retained independent entry",
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/release-candidate.yml",
+      "name": "Release candidate (Linux)",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "release-candidate.yml",
+      "disposition": "Explicit immutable candidate stage",
+      "monitor_reason": "Operator-requested release stage has no periodic freshness obligation.",
+      "origin": "release-candidate-migration"
+    },
+    {
+      "workflow": ".github/workflows/release-complete.yml",
+      "name": "Release candidate (complete)",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "release-complete.yml",
+      "disposition": "Explicit immutable candidate stage",
+      "monitor_reason": "Operator-requested release stage has no periodic freshness obligation.",
+      "origin": "release-candidate-migration"
+    },
+    {
+      "workflow": ".github/workflows/release-publish.yml",
+      "name": "Publish accepted release",
+      "roles": [
+        "manual",
+        "release"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "release-publish.yml",
+      "disposition": "Explicit immutable candidate stage",
+      "monitor_reason": "Operator-requested release stage has no periodic freshness obligation.",
+      "origin": "release-candidate-migration"
     }
   ]
 }

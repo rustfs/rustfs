@@ -101,6 +101,16 @@ pub(super) fn parse_s3_path(input: &str) -> Result<(String, Option<String>), Sft
     Ok((bucket, key))
 }
 
+/// Describes an S3 copy source by its literal bucket and object key, with no version.
+/// The key is carried verbatim; the storage client renders the copy-source header from it.
+pub(super) fn copy_source_value(bucket: &str, key: &str) -> rustfs_gateway_types::CopySourceValue {
+    rustfs_gateway_types::CopySourceValue::Bucket {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        version_id: None,
+    }
+}
+
 /// Replace C0 control bytes (other than tab) with the literal byte 0x3F
 /// ("?"). POSIX filenames and S3 keys permit CR, LF, BEL, ESC, and the
 /// other low-ASCII control bytes, but echoing them verbatim into the
@@ -128,6 +138,20 @@ pub(super) fn sanitise_control_bytes(input: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use russh_sftp::protocol::StatusCode;
+
+    #[test]
+    fn copy_source_value_keeps_encoded_and_query_like_keys_literal() {
+        for key in ["%2F", "foo?versionId=1", "a/b", "plain"] {
+            assert_eq!(
+                copy_source_value("bucket", key),
+                rustfs_gateway_types::CopySourceValue::Bucket {
+                    bucket: "bucket".to_owned(),
+                    key: key.to_owned(),
+                    version_id: None,
+                }
+            );
+        }
+    }
 
     #[test]
     fn parse_s3_path_root() {

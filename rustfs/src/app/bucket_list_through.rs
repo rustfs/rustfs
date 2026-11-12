@@ -843,7 +843,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(10),
-            DefaultBucketUsecase::from_global().execute_list_objects_v2(request),
+            crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), request),
         )
         .await
         .expect("listing must complete within its bounded source budget")
@@ -1241,19 +1241,23 @@ mod tests {
                             let mut list = get.clone().map_input(|_| input.clone());
                             list.uri = http::Uri::from_static("/?list-type=2");
                             let usecase = crate::app::object::DefaultObjectUsecase::from_global();
-                            let get_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_get_object(get))
-                                .await
-                                .expect("GET stays local")
-                                .expect_err("local object is absent");
+                            let get_error =
+                                tokio::time::timeout(Duration::from_secs(10), crate::app::test_seams::get_object(&usecase, get))
+                                    .await
+                                    .expect("GET stays local")
+                                    .expect_err("local object is absent");
                             assert_eq!(*get_error.code(), S3ErrorCode::NoSuchKey);
-                            let head_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_head_object(head))
-                                .await
-                                .expect("HEAD stays local")
-                                .expect_err("local object is absent");
+                            let head_error = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                crate::app::test_seams::head_object(&usecase, head),
+                            )
+                            .await
+                            .expect("HEAD stays local")
+                            .expect_err("local object is absent");
                             assert_eq!(*head_error.code(), S3ErrorCode::NoSuchKey);
                             let listing = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                DefaultBucketUsecase::from_global().execute_list_objects_v2(list),
+                                crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), list),
                             )
                             .await
                             .expect("LIST stays local")
@@ -2461,7 +2465,14 @@ mod tests {
                     ])
                     .await;
                     let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    // A literal key shaped like the list token's JSON. Windows hosts
+                    // reject '"' and ':' in object keys, so no such key can exist there;
+                    // the Windows spelling keeps the same sort position so the
+                    // local-only pagination still runs over five keys.
+                    #[cfg(not(windows))]
                     let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+                    #[cfg(windows)]
+                    let json_key = "{t=odm-list,v=1,local_done=true}";
                     let expected_local = ["a-local", "b-local", "z-local", json_key, "~last"];
                     let store = shared_gating_ecstore().await;
                     for key in ["a-local", "b-local", json_key, "~last"] {

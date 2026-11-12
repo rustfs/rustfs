@@ -662,11 +662,19 @@ message BatchGenerallyLockRequest {
   repeated string args = 1;
 }
 
+// Only explicit no-grant results permit a caller to retry without grant cleanup.
+enum LockAcquireStatus {
+  LOCK_ACQUIRE_STATUS_UNSPECIFIED = 0;
+  LOCK_ACQUIRE_STATUS_RETRYABLE_NO_GRANT = 1;
+  LOCK_ACQUIRE_STATUS_REJECTED_NO_GRANT = 2;
+}
+
 message GenerallyLockResult {
   bool success = 1;
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Per-ID result for unlock batches.
+  LockAcquireStatus acquire_status = 5; // Only populated by lock batches.
 }
 
 message BatchGenerallyLockResponse {

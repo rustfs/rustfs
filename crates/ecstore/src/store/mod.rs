@@ -34,7 +34,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaWriteState};
+use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaSaveGate};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -67,11 +67,13 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_config::server_config::Config;
 use rustfs_filemeta::{FileInfo, FileMeta};
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::{HealItemType, HealOpts};
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
-use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
 use std::process::exit;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -480,9 +482,13 @@ pub struct ECStore {
     /// Serializes full-document pool metadata saves and retains a fail-closed
     /// write block after startup observes an unreadable replica.
     ///
+    /// Immutable admission proofs share authority; publication, recovery and
+    /// authority changes retain exclusive access through their existing I/O.
+    /// Each writer publishes its final state on release, and health
+    /// inspection reads that committed state without acquiring the gate.
     /// Lock order: acquire `pool_meta_save_gate`, then the distributed
     /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
-    pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
+    pub(crate) pool_meta_save_gate: PoolMetaSaveGate,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -555,7 +561,6 @@ impl Default for ScannerDataMovementPauseStatus {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PoolMetaWriteGateStatus {
     pub writes_ready: bool,
-    pub check_timed_out: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
     pub pool_meta_absent: bool,
@@ -571,7 +576,6 @@ impl Default for PoolMetaWriteGateStatus {
     fn default() -> Self {
         Self {
             writes_ready: true,
-            check_timed_out: false,
             write_blocked: false,
             transaction_aborted: false,
             pool_meta_absent: false,
@@ -838,7 +842,7 @@ impl ECStore {
     }
 
     /// Get this store instance's configured region.
-    pub fn region(&self) -> Option<s3s::region::Region> {
+    pub fn region(&self) -> Option<rustfs_s3_types::Region> {
         self.ctx.region()
     }
 
@@ -1116,6 +1120,20 @@ impl ECStore {
         let (operation_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         drop(operation_guard);
         Some(epoch)
+    }
+
+    /// Namespace cleanup edits an existing usage baseline; it does not certify
+    /// a scan. Retain the movement fence without requiring scanning to resume.
+    pub(crate) async fn data_usage_namespace_cleanup_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_guard = self.ctx.data_movement_operation_gate().read_owned().await;
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
+            return None;
+        }
+        Some((operation_guard, self.ctx.data_movement_operation_epoch()))
+    }
+
+    pub(crate) async fn data_usage_namespace_cleanup_epoch(&self) -> Option<u64> {
+        self.data_usage_namespace_cleanup_guard().await.map(|(_, epoch)| epoch)
     }
 
     /// Acquire a storage-owned read admission for a coordinator's final
@@ -1455,11 +1473,11 @@ impl ECStore {
 
 lazy_static! {
     static ref ENABLED_OBJECT_LOCK_CONFIG: ObjectLockConfiguration = ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     };
     static ref ENABLED_VERSIONING_CONFIG: VersioningConfiguration = VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        status: Some("Enabled".to_owned()),
         ..Default::default()
     };
 }
@@ -1936,7 +1954,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         };
@@ -2011,7 +2029,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

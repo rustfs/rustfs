@@ -50,6 +50,53 @@ E2E_SELECTION_FILES = {
 SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
+# Report-only lanes stay outside the aggregate until their milestone makes them
+# required. Each reruns a required job's suite with one environment change, so
+# the named steps must stay identical to that job's and the change must stay.
+# The last field names the `select` output that scopes the lane on pull
+# requests: it runs wherever its required job runs, except on a pull request
+# whose selection is the literal `false`. Every other event runs it.
+REPORT_ONLY_JOBS = {
+    # rustfs/backlog#2734: required at T2.10.
+    "e2e-tests-gateway": (
+        "e2e-tests",
+        (
+            "Download E2E test binaries",
+            "Verify E2E archive identity",
+            "Verify e2e smoke test membership",
+            "Run e2e smoke suite",
+            "Verify e2e smoke execution completeness",
+        ),
+        "RUSTFS_S3_STACK: gateway",
+        "gateway_smoke",
+    ),
+}
+# Inputs that decide what the gateway S3 stack serves or how the lane starts
+# it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that stack,
+# so a pull request that changes none of these learns nothing from the lane
+# and is not shown its failure. The suite's own contents (crates/e2e_test, the
+# nextest profile, the smoke selection) are deliberately not inputs: feature
+# pull requests change them constantly, and what the suite contains carries no
+# signal while the stack cannot serve it. fnmatch's `*` also matches `/`. Some
+# of these paths exist only on branches that are still assembling the stack.
+#
+# At T2.10, when the lane becomes required, it must run on every pull request
+# again — delete this selection, do not extend it.
+GATEWAY_SMOKE_PATHS = (
+    "crates/gateway-adapter/*",
+    "rustfs/src/server/gateway_stack.rs", "rustfs/src/server/gateway_stack/*",
+    "rustfs/src/server/gateway_handlers.rs", "rustfs/src/server/gateway_handlers/*",
+    "rustfs/src/server/stack.rs", "rustfs/src/server/stack/*",
+    "rustfs/src/config/config_struct.rs",  # parses RUSTFS_S3_STACK
+    "rustfs/Cargo.toml",
+    ".github/workflows/ci.yml", ".github/actions/test-runtime/*",
+    "scripts/ci_gate.py", "scripts/e2e_binary.py",
+)
+# Shared manifests change in most dependency updates; only their gateway pins
+# are inputs of the lane.
+GATEWAY_PIN_FILES = ("Cargo.toml", "Cargo.lock")
+GATEWAY_PACKAGE_PREFIX = "rustfs-gateway"
+INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
 def documentation_path(path: str) -> bool:
@@ -78,6 +125,92 @@ def git_file(root: Path, revision: str, path: str) -> str:
     if not SHA.fullmatch(revision):
         raise ValueError("revision must be a full commit SHA")
     return git(root, "show", f"{revision}:{path}")
+
+
+def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
+    """Recognize literal stable-version edits, never general packaging changes."""
+    stable = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    marker = "<version>"
+    patterns = {
+        "flake.nix": [rf'(?m)^([ \t]*pname = "rustfs";\n[ \t]*version = ")({stable})(";)$'],
+        "helm/rustfs/Chart.yaml": [rf'(?m)^({key}: ")({stable})(")$' for key in ("version", "appVersion")],
+        "rustfs.spec": [rf'(?m)^(Version:[ \t]+)({stable})()$'],
+    }
+    if path not in patterns or not SHA.fullmatch(base) or not SHA.fullmatch(head):
+        return False
+    try:
+        normalized, versions = [], []
+        for revision in (base, head):
+            # A symlink, added/deleted file or executable-mode change is a
+            # build input even if its apparent text resembles metadata.
+            entry = git(root, "ls-tree", "-z", revision, "--", path)
+            if not re.fullmatch(rf"100644 blob [0-9a-f]{{40}}\t{re.escape(path)}\x00", entry):
+                return False
+            content, values = git_file(root, revision, path), []
+            # Existing markers could make edits to distinct fields collapse
+            # to identical normalized text.
+            if marker in content:
+                return False
+            for pattern in patterns[path]:
+                matches = list(re.finditer(pattern, content))
+                if len(matches) != 1:
+                    return False
+                values.append(matches[0][2])
+                content = re.sub(pattern, lambda match: match[1] + marker + match[3], content)
+            if len(set(values)) != 1:
+                return False
+            normalized.append(content)
+            versions.append(values[0])
+        if path == "rustfs.spec":
+            old, new = (content.split("%changelog\n") for content in normalized)
+            if len(old) != 2 or len(new) != 2 or old[0] != new[0]:
+                return False
+            if old[1] == new[1]:
+                return True
+            # Only the standard prepended release note is non-executable;
+            # RPM macro syntax and edits to older history retain the full gate.
+            note = (r"\* (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{2} [0-9]{4} "
+                    r"[A-Za-z0-9 ._-]+ <[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+>\n"
+                    rf"- Update RPM package to RustFS {re.escape(versions[1])}\n\n")
+            return re.fullmatch(note + re.escape(old[1]), new[1]) is not None
+        return normalized[0] == normalized[1]
+    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
+        return False
+
+
+def gateway_pins(root: Path, revision: str, path: str) -> list:
+    """The entries of a shared manifest that pin a gateway crate, in file order."""
+    document = tomllib.loads(git_file(root, revision, path))
+    if path == "Cargo.lock":
+        return [package for package in document.get("package", []) if str(package.get("name", "")).startswith(GATEWAY_PACKAGE_PREFIX)]
+    tables = {"workspace.dependencies": document.get("workspace", {}).get("dependencies", {}), "replace": document.get("replace", {})}
+    tables.update({f"patch.{source}": table for source, table in document.get("patch", {}).items()})
+    return [(table, name, spec) for table, entries in tables.items() for name, spec in entries.items()
+            if GATEWAY_PACKAGE_PREFIX in name or (isinstance(spec, dict) and str(spec.get("package", "")).startswith(GATEWAY_PACKAGE_PREFIX))]
+
+
+def gateway_smoke_selection(root: Path, event: str, base: str, head: str, changed: list[str]) -> dict:
+    """Decide whether the report-only gateway lane has anything to say about this run.
+
+    Only a pull request with a known change set that touches no gateway-stack
+    input is skipped; an unreadable manifest or lockfile counts as touched.
+    """
+    if event != "pull_request":
+        return {"run": True, "reason": f"{event} validates the complete candidate"}
+    if not changed or changed == [""]:
+        return {"run": True, "reason": "change set unavailable"}
+    for path in changed:
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in GATEWAY_SMOKE_PATHS):
+            return {"run": True, "reason": f"gateway-stack input changed: {path}"}
+        if path in GATEWAY_PIN_FILES:
+            try:
+                same = gateway_pins(root, base, path) == gateway_pins(root, head, path)
+            except (OSError, subprocess.CalledProcessError, UnicodeError, AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                return {"run": True, "reason": f"gateway pin changed: {path}"}
+    return {"run": False, "reason": "no gateway-stack input changed"}
 
 
 def dependency_tables(document: dict):
@@ -180,7 +313,7 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
     expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
     expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
     expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
     expected["e2e-full"] = "success" if full else "skipped"
     expected.update({job: "success" if rehearse_shards else "skipped" for job in SHARD_JOBS})
     if event == "pull_request" and action == "closed":
@@ -265,10 +398,17 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
         base_packages, base_graph = head_packages, head_graph
         reasons.append(f"conservative fallback: {type(error).__name__}")
     graph = {name: head_graph.get(name, set()) | base_graph.get(name, set()) for name in set(head_graph) | set(base_graph)}
-    affected = set()
+    affected, non_runtime = set(), set()
     if not full and policy is not None:
         for path in changed:
             if documentation_path(path):
+                non_runtime.add(path)
+                continue
+            if (policy["rollout"] == "enforced"
+                    and not any(fnmatch.fnmatchcase(path, pattern) for pattern in policy["full_paths"])
+                    and release_metadata_only(root, base, head, path)):
+                non_runtime.add(path)
+                reasons.append(f"literal stable release metadata: {path}")
                 continue
             if path in E2E_SELECTION_FILES:
                 affected.add("e2e_test")
@@ -290,9 +430,9 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             affected.update(owners)
         if not affected and not full:
             mode = "docs"
-            reasons.append("all changes are documentation")
+            reasons.append("all changes are documentation or literal stable release metadata")
         elif affected == {"e2e_test"} and not full and not (closure({"e2e_test"}, graph, reverse=True) - {"e2e_test"}) and all(
-                documentation_path(path) or path in E2E_SELECTION_FILES or
+                path in non_runtime or path in E2E_SELECTION_FILES or
                 (path.startswith("crates/e2e_test/src/") and path.endswith(".rs")) for path in changed):
             mode = "e2e"
             reasons.append("isolated E2E harness changes")
@@ -330,6 +470,7 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
             "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
             "rehearse_shards": rehearse_shards,
+            "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
             "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
@@ -534,8 +675,42 @@ def check_workflow(root: Path) -> list[str]:
         return [str(error)]
     errors = []
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
-    if set(jobs) - NON_VALIDATION_JOBS != required:
+    if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
+    for job, (mirror, steps, env, selection) in REPORT_ONLY_JOBS.items():
+        block, mirrored = jobs.get(job), jobs.get(mirror)
+        if not isinstance(block, dict) or not isinstance(mirrored, dict):
+            errors.append(f"report-only {job} and its required {mirror} must both exist")
+            continue
+        # A failed suite must render as a failed, non-blocking job: never as a
+        # blocking one, and never as a green one behind a tolerated step.
+        if block.get("continue-on-error") != "true":
+            errors.append(f"{job} must stay report-only with job-level continue-on-error")
+        if any(isinstance(item, dict) and "continue-on-error" in item for item in block.get("steps") or []):
+            errors.append(f"{job} cannot hide a failed step behind continue-on-error")
+        # The selection reaches the job's condition only through a declared
+        # output of a job it needs; otherwise the expression reads an empty
+        # string and the lane silently runs everywhere.
+        dependencies = block.get("needs", [])
+        if "classify-changes" not in ([dependencies] if isinstance(dependencies, str) else dependencies):
+            errors.append(f"{job} must need classify-changes to read {selection}")
+        published = (jobs.get("classify-changes", {}).get("outputs") or {}).get(selection, "")
+        if not isinstance(published, str) or f"steps.scope.outputs.{selection}" not in published:
+            errors.append(f"classify-changes must publish {selection} from the scope step")
+        if re.search(r"\b(always|success|failure|cancelled)\s*\(", re.sub(r"'(?:[^']|'')*'", "", str(block.get("if", "")))):
+            errors.append(f"{job} must not override its prerequisites with a status function")
+        key, _, value = env.partition(": ")
+        if (block.get("env") or {}).get(key) != value:
+            errors.append(f"{job} must set {env}")
+
+        def named(job_block, step):
+            matches = [item for item in job_block.get("steps") or [] if isinstance(item, dict) and item.get("name") == step]
+            return matches[0] if len(matches) == 1 else None
+
+        for step in steps:
+            ours, theirs = named(block, step), named(mirrored, step)
+            if ours is None or theirs is None or ours != theirs:
+                errors.append(f"{job} step {step!r} must match {mirror}")
     for job in required | {"required-checks"}:
         block = jobs.get(job, {})
         for item in [block, *block.get("steps", [])]:
@@ -616,6 +791,27 @@ def check_workflow(root: Path) -> list[str]:
                                 continue
                             if actual != should_run:
                                 errors.append(f"{job} condition differs from plan for {event}/{mode}/{connect}/{action}/{ref}")
+                        for job, (mirror, _, _, selection) in REPORT_ONLY_JOBS.items():
+                            block = jobs.get(job)
+                            if not isinstance(block, dict) or mirror not in jobs:
+                                continue
+                            for selected in ("true", "false", ""):
+                                try:
+                                    dependencies = block.get("needs", [])
+                                    ready = all(scheduled(dependency) for dependency in ([dependencies] if isinstance(dependencies, str) else dependencies))
+                                    actual = ready and condition(block.get("if", "success()"), dict(
+                                        context, **{f"needs.classify-changes.outputs.{selection}": selected}))
+                                except (KeyError, TypeError, ValueError) as error:
+                                    errors.append(f"{job}: {error}")
+                                    continue
+                                wanted = scheduled(mirror) and (event != "pull_request" or selected != "false")
+                                if actual and not wanted:
+                                    errors.append(f"{job} runs on pull requests that change no gateway-stack input" if scheduled(mirror)
+                                                  else f"{job} runs where {mirror} does not")
+                                elif wanted and not actual:
+                                    errors.append(f"{job} is skipped on {event}" if event != "pull_request" else
+                                                  f"{job} is skipped on a pull request " + (
+                                                      "that changes a gateway-stack input" if selected == "true" else "whose selection is unknown"))
                         for status in ("failure", "cancelled"):
                             context.update(success=False, failure=status == "failure", cancelled=status == "cancelled")
                             try:
@@ -640,6 +836,7 @@ def main() -> int:
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
                                     ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("gateway_smoke", str(plan["gateway_smoke"]["run"]).lower()),
                                     ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))

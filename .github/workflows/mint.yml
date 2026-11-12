@@ -112,9 +112,11 @@ jobs:
     # GitHub-hosted: reliably provides a running Docker daemon + buildx +
     # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
     # label was abandoned (no docker.sock on the pod its only run landed on).
+    # sm-standard-2 has no docker.sock either (weekly runs failed at "Enable
+    # buildx" from 2026-09-27 to 2026-11-08), so keep this job on ubuntu-latest.
     # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
     # run) is added by the ci-8 composite action; do not implement it here.
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7

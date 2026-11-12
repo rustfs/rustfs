@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 use rustfs_utils::string::match_simple;
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
 pub trait VersioningApi {
     fn enabled(&self) -> bool;
@@ -28,10 +28,10 @@ pub trait VersioningApi {
 
 impl VersioningApi for VersioningConfiguration {
     fn enabled(&self) -> bool {
-        self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED))
+        self.status.as_deref() == Some("Enabled")
     }
     fn prefix_enabled(&self, prefix: &str) -> bool {
-        if self.status != Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)) {
+        if self.status.as_deref() != Some("Enabled") {
             return false;
         }
 
@@ -44,12 +44,10 @@ impl VersioningApi for VersioningConfiguration {
         }
 
         if let Some(ref excluded_prefixes) = self.excluded_prefixes {
-            for p in excluded_prefixes.iter() {
-                if let Some(ref sprefix) = p.prefix {
-                    let pattern = format!("{sprefix}*");
-                    if match_simple(&pattern, prefix) {
-                        return false;
-                    }
+            for sprefix in excluded_prefixes.iter().flatten() {
+                let pattern = format!("{sprefix}*");
+                if match_simple(&pattern, prefix) {
+                    return false;
                 }
             }
         }
@@ -58,11 +56,11 @@ impl VersioningApi for VersioningConfiguration {
     }
 
     fn prefix_suspended(&self, prefix: &str) -> bool {
-        if self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)) {
+        if self.status.as_deref() == Some("Suspended") {
             return true;
         }
 
-        if self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)) {
+        if self.status.as_deref() == Some("Enabled") {
             if prefix.is_empty() {
                 return false;
             }
@@ -75,12 +73,10 @@ impl VersioningApi for VersioningConfiguration {
             }
 
             if let Some(ref excluded_prefixes) = self.excluded_prefixes {
-                for p in excluded_prefixes.iter() {
-                    if let Some(ref sprefix) = p.prefix {
-                        let pattern = format!("{sprefix}*");
-                        if match_simple(&pattern, prefix) {
-                            return true;
-                        }
+                for sprefix in excluded_prefixes.iter().flatten() {
+                    let pattern = format!("{sprefix}*");
+                    if match_simple(&pattern, prefix) {
+                        return true;
                     }
                 }
             }
@@ -92,14 +88,12 @@ impl VersioningApi for VersioningConfiguration {
         self.prefix_enabled(prefix) || self.prefix_suspended(prefix)
     }
     fn suspended(&self) -> bool {
-        self.status == Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED))
+        self.status.as_deref() == Some("Suspended")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix};
-
     use super::*;
 
     struct LegacyVersioning;
@@ -134,10 +128,8 @@ mod tests {
     #[test]
     fn delete_state_treats_excluded_prefixes_as_unversioned() {
         let config = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("archive/".to_string()),
-            }]),
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(vec![Some("archive/".to_string())]),
             ..Default::default()
         };
 
@@ -146,7 +138,7 @@ mod tests {
         assert_eq!(config.delete_state("live/object"), (true, false));
 
         let suspended = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+            status: Some("Suspended".to_owned()),
             ..Default::default()
         };
         assert_eq!(suspended.delete_state("archive/object"), (false, true));

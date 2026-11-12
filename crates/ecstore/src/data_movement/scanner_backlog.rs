@@ -85,6 +85,7 @@ impl ScannerPauseBacklogRetirementPhase {
 pub struct ScannerPauseBacklogRetirementReplica {
     pub pool_index: usize,
     pub set_index: usize,
+    pub set_id: Option<uuid::Uuid>,
     /// False for retiring members retained only to verify the old commit proof.
     pub writable: bool,
     pub data: Option<Vec<u8>>,
@@ -140,6 +141,7 @@ async fn read_replica((set, writable): (Arc<SetDisks>, bool)) -> Result<ScannerP
     let mut replica = ScannerPauseBacklogRetirementReplica {
         pool_index: set.pool_index,
         set_index: set.set_index,
+        set_id: Some(set.persistent_set_id()?),
         writable,
         data: None,
     };
@@ -222,6 +224,7 @@ pub(crate) fn plan_scanner_pause_backlog_retirement(
         .map(|read| ScannerPauseBacklogRetirementReplica {
             pool_index: read.replica.pool_index,
             set_index: read.replica.set_index,
+            set_id: read.replica.set_id,
             writable: read.replica.writable,
             data: read.replica.data.clone(),
         })

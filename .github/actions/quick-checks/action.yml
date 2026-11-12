@@ -97,6 +97,14 @@ runs:
       shell: bash
       run: ./scripts/check_s3s_footprint.sh
 
+    - name: Check per-crate test-count ratchet
+      shell: bash
+      run: ./scripts/check_test_count_ratchet.sh
+
+    - name: Check cross-owner tests use test seams
+      shell: bash
+      run: python3 ./scripts/check_test_seams.py
+
     - name: Check cryptographic capability wording
       shell: bash
       run: ./scripts/check_fips_wording.sh

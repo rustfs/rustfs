@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use rustfs_credentials::Credentials;
-use s3s::dto::*;
+use rustfs_gateway_types::dto::*;
 
 use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
@@ -71,7 +71,7 @@ pub trait StorageBackend: Send + Sync {
         session: &SessionContext,
         input: &ListObjectsV2Input,
     ) -> Result<(), AuthorizationError> {
-        self.authorize_operation(session, &S3Action::ListBucket, &input.bucket, input.prefix.as_deref())
+        self.authorize_operation(session, &S3Action::ListBucket, input.bucket.as_str(), input.prefix.as_deref())
             .await
     }
 
@@ -117,9 +117,9 @@ pub trait StorageBackend: Send + Sync {
         _session_context: &SessionContext,
         _request_headers: &http::HeaderMap,
         _secure_transport: bool,
-    ) -> s3s::S3Result<ListBucketsOutput> {
-        Err(s3s::S3Error::with_message(
-            s3s::S3ErrorCode::AccessDenied,
+    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
+        Err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::AccessDenied,
             "Session-aware bucket listing is not supported",
         ))
     }
@@ -134,7 +134,7 @@ pub trait StorageBackend: Send + Sync {
         _session_context: &SessionContext,
         _request_headers: &http::HeaderMap,
         _secure_transport: bool,
-    ) -> s3s::S3Result<Option<SessionCapacityView>> {
+    ) -> rustfs_s3_types::S3Result<Option<SessionCapacityView>> {
         Ok(None)
     }
     /// Create a new bucket

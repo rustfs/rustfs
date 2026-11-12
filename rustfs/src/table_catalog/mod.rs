@@ -181,10 +181,6 @@ const WAREHOUSE_INDEX_STATE_FILE: &str = "state.json";
 const TABLE_RENAME_ROOT: &str = "renames";
 const WAREHOUSE_INDEX_MAX_PREFIX_DEPTH: usize = 64;
 const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS: usize = 4096;
-/// Listing pages an index-miss scan may consume before failing closed. Only
-/// table entries count toward the object limit, so maintenance reports and
-/// other catalog objects cannot trip it; this bounds the listing work itself.
-const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES: usize = 64;
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";

@@ -594,6 +594,29 @@ impl TestCatalogObjectBackend {
         state.list_calls = 0;
     }
 
+    async fn overridden_list_page(&self, bucket: &str, prefix: &str) -> Option<TableCatalogObjectListPage> {
+        let pause = self
+            .state
+            .lock()
+            .await
+            .list_page_pauses
+            .get_mut(&(bucket.to_string(), prefix.to_string()))
+            .and_then(std::collections::VecDeque::pop_front);
+        if let Some(pause) = pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
+        let mut state = self.state.lock().await;
+        let page = state
+            .list_page_overrides
+            .get_mut(&(bucket.to_string(), prefix.to_string()))
+            .and_then(std::collections::VecDeque::pop_front);
+        if page.is_some() {
+            state.list_calls += 1;
+        }
+        page
+    }
+
     pub(crate) async fn write_lock_acquisition_count(&self, bucket: &str, object: &str) -> usize {
         self.state
             .lock()
@@ -1231,29 +1254,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         start_after: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
-        let pause = self
-            .state
-            .lock()
-            .await
-            .list_page_pauses
-            .get_mut(&(bucket.to_string(), prefix.to_string()))
-            .and_then(std::collections::VecDeque::pop_front);
-        if let Some(pause) = pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
-        let injected = {
-            let mut state = self.state.lock().await;
-            let page = state
-                .list_page_overrides
-                .get_mut(&(bucket.to_string(), prefix.to_string()))
-                .and_then(std::collections::VecDeque::pop_front);
-            if page.is_some() {
-                state.list_calls += 1;
-            }
-            page
-        };
-        if let Some(page) = injected {
+        if let Some(page) = self.overridden_list_page(bucket, prefix).await {
             return Ok(page);
         }
         let mut objects = self.list_objects(bucket, prefix).await?;
@@ -1262,6 +1263,34 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             objects.retain(|object| object.as_str() > start_after);
         }
         let is_truncated = objects.len() > limit.get();
+        objects.truncate(limit.get());
+        Ok(TableCatalogObjectListPage { objects, is_truncated })
+    }
+
+    async fn list_table_entry_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogObjectListPage> {
+        if let Some(page) = self.overridden_list_page(bucket, prefix).await {
+            return Ok(page);
+        }
+        // This in-memory backend has no erasure replicas. Production selects
+        // candidates before metadata I/O and then proves each key at read quorum.
+        let mut inventory = self.list_objects_for_cleanup(bucket, prefix).await?;
+        inventory.retain(|object| object.key.rsplit('/').next() == Some(TABLE_ENTRY_FILE));
+        if inventory
+            .iter()
+            .any(|object| object.version_id.is_some() || object.delete_marker)
+        {
+            return Err(TableCatalogStoreError::Unavailable("versioned table ownership entry".to_string()));
+        }
+        let mut objects = inventory.into_iter().map(|object| object.key).collect::<Vec<_>>();
+        objects.sort();
+        objects.retain(|object| start_after.is_none_or(|after| object.as_str() > after));
+        let is_truncated = objects.len() >= limit.get();
         objects.truncate(limit.get());
         Ok(TableCatalogObjectListPage { objects, is_truncated })
     }

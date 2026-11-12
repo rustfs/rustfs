@@ -66,6 +66,8 @@ pub mod bucket {
         }
 
         pub mod bucket_lifecycle_ops {
+            pub use rustfs_lifecycle::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
+
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
@@ -137,7 +139,7 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::lifecycle::{
                 Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
                 ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
-                object_opts_from_object_info,
+                format_lifecycle_date, object_opts_from_object_info, parse_lifecycle_date,
             };
         }
 
@@ -240,7 +242,7 @@ pub mod bucket {
     }
 
     pub mod object_lock {
-        pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+        pub use crate::bucket::object_lock::ObjectLockApi;
 
         pub mod types {
             pub use crate::bucket::object_lock::types::{
@@ -335,9 +337,9 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
-            check_valid_bucket_name_strict, deserialize, has_bad_path_component, has_xml_invalid_control_characters,
-            is_meta_bucketname, is_valid_object_prefix, serialize,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
+            has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 
@@ -364,7 +366,7 @@ pub mod capacity {
 }
 
 pub mod object_api_utils {
-    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader};
 }
 
 pub mod cluster {
@@ -640,17 +642,17 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
-        PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement, ScannerPeerActivity,
-        ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, ScannerScopedDirtyUsageAckEntry,
-        TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers,
-        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, rpc_background_admission,
-        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_ns_scanner_capability_with_checkpoint_coverage,
-        sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
-        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-        verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
+        PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, RpcReplayCacheAdmissionError, S3PeerSys,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement,
+        ScannerPeerActivity, ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease,
+        ScannerScopedDirtyUsageAckEntry, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
+        check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_tier_registry_generation,
+        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
         verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer, verify_put_file_capability,
         verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,

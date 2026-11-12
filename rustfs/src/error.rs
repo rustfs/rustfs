@@ -28,6 +28,19 @@ const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the nu
 const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
 const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
 const NAMESPACE_LOCK_TIMEOUT_CAUSE: &str = "namespace_lock_timeout";
+const RPC_ADMISSION_METADATA_KEY: &str = "x-rustfs-rpc-admission";
+const RPC_REPLAY_ADMISSION_METADATA_VALUE: &str = "replay-cache";
+
+/// Preserve temporary replay admission refusal through the RPC and S3 boundaries.
+pub(crate) fn rpc_replay_admission_exhausted_status() -> tonic::Status {
+    let mut status = tonic::Status::resource_exhausted("RPC replay admission exhausted");
+    status.metadata_mut().insert(
+        RPC_ADMISSION_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(RPC_REPLAY_ADMISSION_METADATA_VALUE),
+    );
+    status
+}
+
 /// Public message for `StorageError::UnsupportedDisk` on a request path. The
 /// only request-time producer is the delete-transaction protocol when a
 /// participant answers Unimplemented (a peer still on a release without the
@@ -588,9 +601,14 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
             return Some(S3ErrorCode::BadDigest);
         }
 
-        rpc_unavailable |= error
-            .downcast_ref::<tonic::Status>()
-            .is_some_and(|status| status.code() == tonic::Code::Unavailable);
+        rpc_unavailable |= error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+            status.code() == tonic::Code::Unavailable
+                || (status.code() == tonic::Code::ResourceExhausted
+                    && status
+                        .metadata()
+                        .get(RPC_ADMISSION_METADATA_KEY)
+                        .is_some_and(|value| value.as_encoded_bytes() == RPC_REPLAY_ADMISSION_METADATA_VALUE.as_bytes()))
+        });
         upload_limit_exceeded |= error.is::<UploadLimitExceeded>();
         server_source_failed |= error.is::<ServerSideSourceReadError>();
         client_body_timed_out |= error.is::<ClientBodyReadTimeout>();
@@ -685,7 +703,7 @@ fn service_unavailable_cause(source: &(dyn std::error::Error + 'static)) -> Opti
     timeout.or(cause)
 }
 
-impl From<ApiError> for S3Error {
+impl From<ApiError> for rustfs_s3_types::S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
         let cause = if err.code == S3ErrorCode::ServiceUnavailable {
@@ -693,7 +711,7 @@ impl From<ApiError> for S3Error {
         } else {
             None
         };
-        let mut s3e = S3Error::with_message(err.code, err.message);
+        let mut s3e = rustfs_s3_types::S3Error::with_message(err.code.into(), err.message);
         if let Some(cause) = cause {
             let mut headers = http::HeaderMap::new();
             // s3s replaces the generated headers when a custom map is supplied.
@@ -711,6 +729,16 @@ impl From<ApiError> for S3Error {
             s3e.set_source(source);
         }
         s3e
+    }
+}
+
+/// The s3s error for the legacy edge: the conversion above carried across
+/// with `From`, which yields field for field what the s3s constructor builds
+/// (code, message, explicit status, the cause itself), so both error types
+/// come from one mapping.
+impl From<ApiError> for S3Error {
+    fn from(err: ApiError) -> Self {
+        rustfs_s3_types::S3Error::from(err).into()
     }
 }
 
@@ -1740,6 +1768,50 @@ mod tests {
             let s3_error = S3Error::from(error);
             assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
         }
+    }
+
+    #[test]
+    fn replay_admission_refusal_preserves_retryable_status_across_io_boundaries() {
+        let status = rpc_replay_admission_exhausted_status;
+        let original = StorageError::from(status());
+        let cloned = original.clone();
+        let wire = status().into_http::<()>();
+        let received = tonic::Status::from_header_map(wire.headers()).expect("replay admission status on the wire");
+        for error in [
+            ApiError::from(original),
+            ApiError::from(cloned),
+            ApiError::from(StorageError::from(received)),
+            ApiError::from(StorageError::Io(IoError::other(IoError::other(status())))),
+            ApiError::from(IoError::other(status())),
+            ApiError::from(IoError::other(StorageError::from(status()))),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.diagnostic().rpc_code, Some(tonic::Code::ResourceExhausted));
+            assert_eq!(S3Error::from(error).status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        }
+    }
+
+    #[test]
+    fn replay_admission_marker_requires_its_exact_value_and_resource_code() {
+        for code in [
+            tonic::Code::Unauthenticated,
+            tonic::Code::Internal,
+            tonic::Code::ResourceExhausted,
+        ] {
+            for marker in ["replay-cache", "unknown-admission"] {
+                if code == tonic::Code::ResourceExhausted && marker == "replay-cache" {
+                    continue;
+                }
+                let mut status = tonic::Status::new(code, "RPC replay admission exhausted");
+                status
+                    .metadata_mut()
+                    .insert(RPC_ADMISSION_METADATA_KEY, marker.parse().expect("valid test marker"));
+                let error = ApiError::from(StorageError::from(status));
+                assert_eq!(error.code, S3ErrorCode::InternalError);
+            }
+        }
+        let error = ApiError::from(IoError::other("RPC replay admission exhausted"));
+        assert_eq!(error.code, S3ErrorCode::InternalError);
     }
 
     #[test]

@@ -18,9 +18,10 @@ use super::{
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
     decode_tags_to_map, delete_bucket_metadata_config_if_incarnation, encode_tags, get_bucket_accelerate_config,
     get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_request_payment_config, get_bucket_website_config,
-    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy,
     update_bucket_metadata_config_if_incarnation,
 };
+use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::{ApiError, ApiErrorDiagnostic};
 use crate::storage::access::{
@@ -29,6 +30,8 @@ use crate::storage::access::{
 use crate::storage::helper::{OperationHelper, audit_only_operation};
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
+use crate::storage::s3_compat::lifecycle::{lifecycle_configuration_from_s3s, lifecycle_configuration_to_s3s};
+use crate::storage::s3_compat::replication::{replication_configuration_from_s3s, replication_configuration_to_s3s};
 use crate::storage::storage_api::ecfs_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
     object::{ObjectLockRetentionOptions, ObjectOperations as _},
@@ -36,6 +39,7 @@ use crate::storage::storage_api::ecfs_consumer::contract::{
 use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
+use crate::storage::storage_api::ecstore_bucket::utils::serialize as serialize_bucket_config;
 use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
 use crate::storage::validate_website_configuration;
 use crate::table_catalog;
@@ -108,7 +112,9 @@ async fn site_replication_gate_enabled() -> S3Result<bool> {
         SITE_REPLICATION_GATE_FORCE_ENABLED => return Ok(true),
         _ => {}
     }
-    crate::admin::handlers::site_replication::site_replication_enabled().await
+    crate::admin::handlers::site_replication::site_replication_enabled()
+        .await
+        .map_err(Into::into)
 }
 
 /// Remote site-replication peer deployment ids and the operator-rule contract
@@ -124,7 +130,9 @@ async fn site_replication_edit_context() -> S3Result<(std::collections::HashSet<
     if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
         return Ok((std::collections::HashSet::new(), OperatorRuleContract::Derived));
     }
-    crate::admin::handlers::site_replication::site_replication_edit_context().await
+    crate::admin::handlers::site_replication::site_replication_edit_context()
+        .await
+        .map_err(Into::into)
 }
 
 /// MinIO `ErrReplicationDenyEditError`.
@@ -552,12 +560,16 @@ impl FS {
 
     async fn put_bucket_replication_inner(
         &self,
-        req: S3Request<PutBucketReplicationInput>,
+        mut req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         deny_replication_config_edit_for_non_owner(&req).await?;
         let (site_peers, contract) = site_replication_edit_context().await?;
+        let replication_configuration =
+            replication_configuration_from_s3s(std::mem::take(&mut req.input.replication_configuration));
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_replication(req, site_peers, contract).await
+        usecase
+            .execute_put_bucket_replication(req, replication_configuration, site_peers, contract)
+            .await
     }
 
     async fn put_bucket_acl_inner(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
@@ -601,7 +613,10 @@ impl FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        let logging_config = serialize(&req.input.bucket_logging_status)
+        let bucket_logging_status = persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedBucketLoggingStatus>(
+            &req.input.bucket_logging_status,
+        )?;
+        let logging_config = serialize_bucket_config(&bucket_logging_status)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
@@ -659,7 +674,10 @@ impl FS {
             }
         };
 
-        let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+        let persisted_cfg =
+            persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedObjectLockConfiguration>(&input_cfg)?;
+        let data = serialize_bucket_config(&persisted_cfg)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
         let object_lock_config =
             String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
@@ -671,11 +689,11 @@ impl FS {
         // This matches S3-compatible behavior.
         let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
         if !versioning_config.enabled() {
-            let enable_versioning_config = VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            let enable_versioning_config = rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             };
-            let versioning_data = serialize(&enable_versioning_config)
+            let versioning_data = serialize_bucket_config(&enable_versioning_config)
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
             update_bucket_metadata_config_if_incarnation(
                 &bucket,
@@ -1040,7 +1058,7 @@ impl S3 for FS {
 
         match get_bucket_accelerate_config(&req.input.bucket).await {
             Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
-                status: accelerate.status,
+                status: accelerate.status.map(s3s::dto::BucketAccelerateStatus::from),
                 ..Default::default()
             })),
             Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default())),
@@ -1052,7 +1070,11 @@ impl S3 for FS {
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
         record_s3_op(S3Operation::GetBucketCors);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_cors(req).await
+        let cors_configuration = usecase.execute_get_bucket_cors(req).await?;
+        let cors_configuration: s3s::dto::CORSConfiguration = persisted_to_s3s(&cors_configuration)?;
+        Ok(S3Response::new(GetBucketCorsOutput {
+            cors_rules: Some(cors_configuration.cors_rules),
+        }))
     }
 
     async fn get_bucket_encryption(
@@ -1061,7 +1083,15 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
         record_s3_op(S3Operation::GetBucketEncryption);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_encryption(req).await
+        let server_side_encryption_configuration = usecase
+            .execute_get_bucket_encryption(req)
+            .await?
+            .as_ref()
+            .map(persisted_to_s3s::<_, s3s::dto::ServerSideEncryptionConfiguration>)
+            .transpose()?;
+        Ok(S3Response::new(GetBucketEncryptionOutput {
+            server_side_encryption_configuration,
+        }))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1071,7 +1101,13 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
         record_s3_op(S3Operation::GetBucketLifecycleConfiguration);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_lifecycle_configuration(req).await
+        let config = usecase.execute_get_bucket_lifecycle_configuration(req).await?;
+        let config = lifecycle_configuration_to_s3s(config)
+            .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, error.to_string()))?;
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
+            rules: Some(config.rules),
+            ..Default::default()
+        }))
     }
 
     /// Get bucket location
@@ -1088,7 +1124,26 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
         record_s3_op(S3Operation::GetBucketNotificationConfiguration);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_notification_configuration(req).await
+        let notification_configuration = usecase
+            .execute_get_bucket_notification_configuration(req)
+            .await?
+            .as_ref()
+            .map(persisted_to_s3s::<_, s3s::dto::NotificationConfiguration>)
+            .transpose()?;
+        match notification_configuration {
+            Some(s3s::dto::NotificationConfiguration {
+                event_bridge_configuration,
+                lambda_function_configurations,
+                queue_configurations,
+                topic_configurations,
+            }) => Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
+                event_bridge_configuration,
+                lambda_function_configurations,
+                queue_configurations,
+                topic_configurations,
+            })),
+            None => Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default())),
+        }
     }
 
     async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
@@ -1112,7 +1167,10 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
         record_s3_op(S3Operation::GetBucketReplication);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_replication(req).await
+        let replication_configuration = usecase.execute_get_bucket_replication(req).await?;
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(replication_configuration_to_s3s(replication_configuration)),
+        }))
     }
 
     async fn get_bucket_request_payment(
@@ -1130,7 +1188,7 @@ impl S3 for FS {
 
         match get_bucket_request_payment_config(&req.input.bucket).await {
             Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
-                payer: Some(payment.payer),
+                payer: Some(Payer::from(payment.payer)),
             })),
             Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
                 payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
@@ -1143,7 +1201,10 @@ impl S3 for FS {
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         record_s3_op(S3Operation::GetBucketTagging);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_tagging(req).await
+        let tagging = usecase.execute_get_bucket_tagging(req).await?;
+        Ok(S3Response::new(GetBucketTaggingOutput {
+            tag_set: tagging_to_s3s(&tagging).tag_set,
+        }))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1153,7 +1214,10 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
         record_s3_op(S3Operation::GetPublicAccessBlock);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_public_access_block(req).await
+        let config = usecase.execute_get_public_access_block(req).await?;
+        Ok(S3Response::new(GetPublicAccessBlockOutput {
+            public_access_block_configuration: Some(persisted_to_s3s(&config)?),
+        }))
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1163,7 +1227,11 @@ impl S3 for FS {
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         record_s3_op(S3Operation::GetBucketVersioning);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_versioning(req).await
+        let config = usecase.execute_get_bucket_versioning(req).await?;
+        Ok(S3Response::new(GetBucketVersioningOutput {
+            status: config.status.map(BucketVersioningStatus::from),
+            ..Default::default()
+        }))
     }
 
     async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
@@ -1177,12 +1245,15 @@ impl S3 for FS {
             .map_err(crate::error::ApiError::from)?;
 
         match get_bucket_website_config(&req.input.bucket).await {
-            Ok((website, _)) => Ok(S3Response::new(GetBucketWebsiteOutput {
-                error_document: website.error_document,
-                index_document: website.index_document,
-                redirect_all_requests_to: website.redirect_all_requests_to,
-                routing_rules: website.routing_rules,
-            })),
+            Ok((website, _)) => {
+                let website: s3s::dto::WebsiteConfiguration = persisted_to_s3s(&website)?;
+                Ok(S3Response::new(GetBucketWebsiteOutput {
+                    error_document: website.error_document,
+                    index_document: website.index_document,
+                    redirect_all_requests_to: website.redirect_all_requests_to,
+                    routing_rules: website.routing_rules,
+                }))
+            }
             Err(StorageError::ConfigNotFound) => Err(s3_error!(NoSuchWebsiteConfiguration)),
             Err(err) => Err(crate::error::ApiError::from(err).into()),
         }
@@ -1317,7 +1388,7 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let object_lock_configuration = match get_bucket_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => Some(cfg),
+            Ok((cfg, _created)) => Some(persisted_to_s3s::<_, s3s::dto::ObjectLockConfiguration>(&cfg)?),
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
                     return Err(S3Error::with_message(
@@ -1585,7 +1656,11 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        let accelerate_config = serialize(&req.input.accelerate_configuration)
+        let accelerate_configuration = persisted_from_s3s::<
+            _,
+            rustfs_gateway_types::persistence::PersistedAccelerateConfiguration,
+        >(&req.input.accelerate_configuration)?;
+        let accelerate_config = serialize_bucket_config(&accelerate_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
@@ -1601,8 +1676,9 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let prepared = persisted_from_s3s(&req.input.cors_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req)).await
+        audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req, prepared)).await
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
@@ -1616,9 +1692,12 @@ impl S3 for FS {
             .map_err(crate::error::ApiError::from)?;
 
         match get_bucket_logging_config(&req.input.bucket).await {
-            Ok((logging, _)) => Ok(S3Response::new(GetBucketLoggingOutput {
-                logging_enabled: logging.logging_enabled,
-            })),
+            Ok((logging, _)) => {
+                let logging: s3s::dto::BucketLoggingStatus = persisted_to_s3s(&logging)?;
+                Ok(S3Response::new(GetBucketLoggingOutput {
+                    logging_enabled: logging.logging_enabled,
+                }))
+            }
             Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketLoggingOutput::default())),
             Err(err) => Err(crate::error::ApiError::from(err).into()),
         }
@@ -1632,8 +1711,12 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let prepared = persisted_from_s3s(&req.input.server_side_encryption_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketEncryption, |req| usecase.execute_put_bucket_encryption(req)).await
+        audit_only_operation(req, S3Operation::PutBucketEncryption, |req| {
+            usecase.execute_put_bucket_encryption(req, prepared)
+        })
+        .await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1642,8 +1725,14 @@ impl S3 for FS {
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
+        let prepared = req
+            .input
+            .lifecycle_configuration
+            .clone()
+            .map(lifecycle_configuration_from_s3s)
+            .transpose();
         audit_only_operation(req, S3Operation::PutBucketLifecycleConfiguration, |req| {
-            usecase.execute_put_bucket_lifecycle_configuration(req)
+            usecase.execute_put_bucket_lifecycle_configuration(req, prepared)
         })
         .await
     }
@@ -1652,9 +1741,10 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        let prepared = persisted_from_s3s(&req.input.notification_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::PutBucketNotificationConfiguration, |req| {
-            usecase.execute_put_bucket_notification_configuration(req)
+            usecase.execute_put_bucket_notification_configuration(req, prepared)
         })
         .await
     }
@@ -1684,7 +1774,11 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        let payment_config = serialize(&req.input.request_payment_configuration)
+        let request_payment_configuration = persisted_from_s3s::<
+            _,
+            rustfs_gateway_types::persistence::PersistedRequestPaymentConfiguration,
+        >(&req.input.request_payment_configuration)?;
+        let payment_config = serialize_bucket_config(&request_payment_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
@@ -1703,14 +1797,19 @@ impl S3 for FS {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        let prepared = persisted_from_s3s(&req.input.public_access_block_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutPublicAccessBlock, |req| usecase.execute_put_public_access_block(req)).await
+        audit_only_operation(req, S3Operation::PutPublicAccessBlock, |req| {
+            usecase.execute_put_public_access_block(req, prepared)
+        })
+        .await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let tagging = tagging_from_s3s(&req.input.tagging);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketTagging, |req| usecase.execute_put_bucket_tagging(req)).await
+        audit_only_operation(req, S3Operation::PutBucketTagging, |req| usecase.execute_put_bucket_tagging(req, tagging)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1718,8 +1817,12 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let prepared = persisted_from_s3s(&req.input.versioning_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketVersioning, |req| usecase.execute_put_bucket_versioning(req)).await
+        audit_only_operation(req, S3Operation::PutBucketVersioning, |req| {
+            usecase.execute_put_bucket_versioning(req, prepared)
+        })
+        .await
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
@@ -1732,9 +1835,12 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        validate_website_configuration(&req.input.website_configuration)?;
+        let website_configuration = persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedWebsiteConfiguration>(
+            &req.input.website_configuration,
+        )?;
+        validate_website_configuration(&website_configuration)?;
 
-        let website_config = serialize(&req.input.website_configuration)
+        let website_config = serialize_bucket_config(&website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
@@ -2170,12 +2276,12 @@ impl S3 for FS {
 
 /// Every mutating S3 operation that has no bucket notification event reaches the audit
 /// stream only through `audit_only_operation`; a new such operation, or a dropped
-/// wrapper, must fail here rather than silently go unaudited.
+/// wrapper, must fail here rather than silently go unaudited. The wrappers are looked
+/// up in this file and in `legacy_edge/`, where a split of this file moves them.
 #[cfg(test)]
 mod audit_coverage_tests {
+    use crate::guard_sources::SourceSet;
     use rustfs_s3_ops::S3Operation;
-
-    const SOURCE: &str = include_str!("ecfs.rs");
 
     fn is_read_only(op: S3Operation) -> bool {
         let name = op.as_str().trim_start_matches("s3:");
@@ -2194,9 +2300,15 @@ mod audit_coverage_tests {
         expected.push(S3Operation::AbortMultipartUpload);
         assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
 
+        let source = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
         for op in expected {
             let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
-            assert!(SOURCE.contains(&wrapper), "{} is not run through audit_only_operation", op.as_str());
+            assert!(
+                source.contains(&wrapper),
+                "{} is not run through audit_only_operation in {}",
+                op.as_str(),
+                source.describe()
+            );
         }
     }
 }
@@ -2210,10 +2322,11 @@ mod tests {
     use crate::storage::validate_website_configuration;
     use http::Method;
     use http::StatusCode;
-    use s3s::dto::{
-        Condition, DeleteBucketReplicationInput, IndexDocument, PutBucketReplicationInput, Redirect, ReplicationConfiguration,
-        RoutingRule, WebsiteConfiguration,
+    use rustfs_gateway_types::persistence::{
+        PersistedIndexDocument as IndexDocument, PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule,
+        PersistedRoutingRuleCondition as Condition, PersistedWebsiteConfiguration as WebsiteConfiguration,
     };
+    use s3s::dto::{DeleteBucketReplicationInput, PutBucketReplicationInput, ReplicationConfiguration};
     use s3s::{S3, S3Error, S3ErrorCode, S3Request};
     use std::sync::atomic::Ordering;
 
@@ -2309,7 +2422,7 @@ mod tests {
                 ..Default::default()
             }),
             redirect: Redirect {
-                protocol: Some("ftp".to_owned().into()),
+                protocol: Some("ftp".to_owned()),
                 ..Default::default()
             },
         }]);

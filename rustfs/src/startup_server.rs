@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    config::Config,
+    config::{Config, S3Stack},
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
     storage_api::server::http::ServerContextSlot,
@@ -41,6 +41,7 @@ const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
+const GATEWAY_STACK_NOT_ASSEMBLED: &str = "gateway stack is not assembled yet (rustfs/backlog#2734 T2.5)";
 
 pub(crate) struct StartupListenContext {
     pub(crate) readiness: Arc<GlobalReadiness>,
@@ -81,6 +82,12 @@ pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
 ) -> Result<StartupListenContext> {
+    match config.s3_stack {
+        S3Stack::Legacy => {}
+        // REPLACED BY T2.5
+        // Refuse before any listener or storage exists; never fall back to legacy.
+        S3Stack::Gateway => return Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_ASSEMBLED)),
+    }
     crate::server::init_console_prefix()?;
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
@@ -138,6 +145,7 @@ pub(crate) async fn prepare_embedded_startup_config(
     mut volumes: Vec<String>,
     region: String,
 ) -> Result<EmbeddedStartupConfig> {
+    Config::validate_root_credentials(&access_key, &secret_key)?;
     let mut temp_dir_guard = None;
     if volumes.is_empty() {
         let dir = tempfile::tempdir().map_err(|err| Error::other(format!("failed to create temp dir: {err}")))?;
@@ -227,7 +235,7 @@ pub(crate) async fn init_embedded_startup_listen_context(
         // The instance context is per-server, so region publication cannot
         // panic on a second embedded server; the process still has one region
         // for legacy ambient readers.
-        instance_ctx.set_region(region);
+        instance_ctx.set_region(region.into());
     }
 
     startup_runtime_sources::publish_server_port(server_addr.port());
@@ -569,7 +577,7 @@ mod tests {
         let prepared = prepare_embedded_startup_config(
             "127.0.0.1:9000".to_string(),
             "access".to_string(),
-            "secret".to_string(),
+            "embedded-secret".to_string(),
             Vec::new(),
             "us-west-2".to_string(),
         )
@@ -578,15 +586,32 @@ mod tests {
 
         assert_eq!(prepared.config.address, "127.0.0.1:9000");
         assert_eq!(prepared.config.access_key, "access");
-        assert_eq!(prepared.config.secret_key, "secret");
+        assert_eq!(prepared.config.secret_key, "embedded-secret");
         assert_eq!(prepared.config.region.as_deref(), Some("us-west-2"));
         assert_eq!(prepared.identity.access_key, "access");
-        assert_eq!(prepared.identity.secret_key, "secret");
+        assert_eq!(prepared.identity.secret_key, "embedded-secret");
         assert_eq!(prepared.identity.region, "us-west-2");
         assert!(!prepared.config.console_enable);
         assert_eq!(prepared.config.volumes.len(), 1);
         assert!(std::path::Path::new(&prepared.config.volumes[0]).exists());
         assert!(prepared.temp_dir_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_rejects_short_keys_before_creating_volumes() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let volume = parent.path().join("data");
+        let result = prepare_embedded_startup_config(
+            "127.0.0.1:0".to_string(),
+            "root".to_string(),
+            "1234567".to_string(),
+            vec![volume.display().to_string()],
+            "us-east-1".to_string(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(err) if err.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(!volume.exists());
     }
 
     #[tokio::test]
@@ -597,7 +622,7 @@ mod tests {
         let prepared = prepare_embedded_startup_config(
             "127.0.0.1:9000".to_string(),
             "access".to_string(),
-            "secret".to_string(),
+            "embedded-secret".to_string(),
             vec![volume.display().to_string()],
             "us-east-1".to_string(),
         )

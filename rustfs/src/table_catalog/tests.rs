@@ -1815,43 +1815,6 @@ fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
 }
 
 #[test]
-fn table_data_plane_index_miss_scan_skips_only_a_table_maintenance_subtree() {
-    let prefix = "catalog/namespaces/";
-    let skip = |object: &str| maintenance_subtree_skip_cursor(prefix, &format!("{prefix}{object}"));
-    assert_eq!(
-        skip("sales/tables/orders/maintenance/hash/jobs/job.json").as_deref(),
-        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
-    );
-    assert_eq!(
-        skip("sales/tables/orders/maintenance/hash/config.json").as_deref(),
-        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
-    );
-    // A table or namespace literally named "maintenance" is not a subtree.
-    assert_eq!(skip("sales/tables/maintenance/table-entry.json"), None);
-    assert_eq!(skip("maintenance/tables/orders/table-entry.json"), None);
-    assert_eq!(
-        skip("maintenance/tables/maintenance/maintenance/hash/jobs/job.json").as_deref(),
-        Some("catalog/namespaces/maintenance/tables/maintenance/maintenance/\u{10ffff}")
-    );
-    // Entries, bridges, views and a bare file named maintenance never jump.
-    assert_eq!(skip("sales/tables/orders/table-entry.json"), None);
-    assert_eq!(skip("sales/tables/orders/external-catalog/bridge.json"), None);
-    assert_eq!(skip("sales/views/report/maintenance/hash/jobs/job.json"), None);
-    assert_eq!(skip("sales/tables/orders/maintenance"), None);
-    assert_eq!(skip("sales/namespace.json"), None);
-    assert_eq!(maintenance_subtree_skip_cursor(prefix, "other/sales/tables/orders/maintenance/x/y"), None);
-    // The jump lands before the entry that follows the subtree.
-    assert!(
-        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
-            < "catalog/namespaces/sales/tables/orders/table-entry.json"
-    );
-    assert!(
-        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
-            < "catalog/namespaces/sales/tables/orders0/table-entry.json"
-    );
-}
-
-#[test]
 fn catalog_lock_authority_failures_are_typed_as_unavailable() {
     for error in [
         rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
@@ -6880,39 +6843,123 @@ async fn seed_noise_table_with_job_reports(
 
 #[tokio::test]
 async fn table_data_plane_index_miss_scan_pages_scale_with_entries_not_job_reports() {
+    let mut baseline_pages = None;
+    for reports in [0, 80] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let object = "tables/table-id/data/part-00001.parquet";
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+            .await
+            .expect("warehouse index entry should be removed");
+        // Keep the same table inventory with and without historical job reports.
+        let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
+        for index in 0..1000 {
+            let noise_table = IdentifierSegment::parse(format!("noise-{index:04}")).expect("table should parse");
+            seed_noise_table_with_job_reports(&store, bucket, &noise_namespace, &noise_table, &format!("noise-{index}"), reports)
+                .await;
+        }
+        backend.reset_call_counts().await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, object)
+            .await
+            .expect("job history must not exhaust the index-miss listing budget")
+            .expect("the scan must retain table-aware protection");
+        assert_eq!(resource.table, "orders");
+        let pages = backend.list_call_count().await;
+        assert!(pages > 0, "the missing index must exercise enumeration");
+        if let Some(expected) = baseline_pages {
+            assert_eq!(pages, expected, "job history must not consume ownership listing pages");
+        } else {
+            baseline_pages = Some(pages);
+        }
+    }
+}
+
+#[tokio::test]
+async fn table_entry_scan_preserves_nested_namespaces_named_like_maintenance() {
+    for name in ["sales", "sales.tables.orders.maintenance"] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse(name).expect("namespace should parse");
+        let owner = IdentifierSegment::parse("zz-owner").expect("owner should parse");
+        let current = default_table_metadata_file_path(&namespace, &owner, "00001.metadata.json");
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &owner, current).await;
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+            .await
+            .expect("remove the owner index to exercise catalog fallback");
+        for index in 0..1000 {
+            let table = IdentifierSegment::parse(format!("table-{index:04}")).expect("table should parse");
+            seed_noise_table_with_job_reports(&store, bucket, &namespace, &table, &format!("id-{index}"), 0).await;
+        }
+        let resource = store
+            .resolve_table_data_plane_resource_for_authorization(bucket, "tables/table-id/data/part.parquet")
+            .await
+            .expect("registered table entries must remain enumerable")
+            .unwrap_or_else(|| panic!("namespace {name} lost its table owner across a page boundary"));
+        assert_eq!(resource.namespace, name);
+        assert_eq!(resource.table, "zz-owner");
+    }
+}
+
+#[tokio::test]
+async fn object_maintenance_preserves_an_owner_after_nested_namespace_page_boundary() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
-    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-    let object = "tables/table-id/data/part-00001.parquet";
-
-    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object(bucket, &orphan, br#"{"metadata-log":[]}"#.to_vec()).await;
+    let report = store
+        .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
         .await
-        .expect("warehouse index entry should be removed");
-    // 1000 honest tables with 80 historical job reports each: ~80 pages of
-    // objects, beyond the fixed page budget on its own, yet well within one
-    // extra page per table entry.
-    let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
-    for index in 0..1000 {
-        let noise_table = IdentifierSegment::parse(format!("noise-{index:04}")).expect("table should parse");
-        seed_noise_table_with_job_reports(&store, bucket, &noise_namespace, &noise_table, &format!("noise-{index}"), 80).await;
-    }
-    backend.reset_call_counts().await;
+        .expect("the unowned old metadata should initially be a cleanup candidate");
+    assert_eq!(report.deletable_metadata_locations, vec![orphan.clone()]);
 
-    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+    let nested = Namespace::parse("sales.tables.orders.maintenance").expect("nested namespace should parse");
+    store
+        .create_namespace(test_namespace_entry(bucket, &nested))
         .await
-        .expect("job history must not exhaust the index-miss listing budget")
-        .expect("the scan must retain table-aware protection");
-    assert_eq!(resource.table, "orders");
-    let pages = backend.list_call_count().await;
+        .expect("nested namespace should be created");
+    for index in 0..1100 {
+        let noise = IdentifierSegment::parse(format!("table-{index:04}")).expect("table should parse");
+        seed_noise_table_with_job_reports(&store, bucket, &nested, &noise, &format!("noise-{index}"), 0).await;
+    }
+    let owner = IdentifierSegment::parse("zz-owner").expect("owner should parse");
+    let mut other = test_table_entry(bucket, &nested, &owner, orphan.clone());
+    other.table_id = "other-id".to_string();
+    other.table_uuid = "other-uuid".to_string();
+    other.warehouse_location = format!("s3://{bucket}/tables/other-id");
+    store
+        .create_table(other)
+        .await
+        .expect("another table may adopt the metadata before cleanup");
+    let deletes_before = backend.state.lock().await.delete_attempts.clone();
+    let result = store
+        .delete_table_metadata_maintenance_report(bucket, "sales", "orders", report)
+        .await;
     assert!(
-        pages > TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES && pages <= TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES + 1001,
-        "the honest catalog needs {pages} pages: more than the fixed budget, at most one extra per entry"
+        backend
+            .object_exists(bucket, &orphan)
+            .await
+            .expect("read back the current owner's metadata")
     );
+    assert_eq!(backend.state.lock().await.delete_attempts, deletes_before);
+    assert_matches!(result, Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
 }
 
 #[tokio::test]
@@ -6930,8 +6977,7 @@ async fn table_data_plane_index_miss_scan_bounds_a_job_report_flood_under_one_ta
         .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
         .await
         .expect("warehouse index entry should be removed");
-    // A table-scoped principal floods one table's job history: 70 reports per
-    // page budget would have exhausted the old fixed budget bucket-wide.
+    // Historical report volume must not consume ownership pagination.
     for job in 0..70_000 {
         backend
             .seed_object(
@@ -6951,7 +6997,7 @@ async fn table_data_plane_index_miss_scan_bounds_a_job_report_flood_under_one_ta
         .expect("the scan must retain table-aware protection");
     assert_eq!(resource.table, "orders");
     let pages = backend.list_call_count().await;
-    assert!(pages <= 2, "the page that ends inside the flood skips the rest of it, not {pages} pages");
+    assert!(pages <= 2, "report history must not consume {pages} ownership pages");
 }
 
 #[tokio::test]
@@ -8264,6 +8310,13 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
     let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .put_table_maintenance_config(bucket, "sales", "orders", TableMaintenanceConfig::default())
+        .await
+        .unwrap();
+    let config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "table-id");
     backend.fail_delete_attempt(RUSTFS_META_BUCKET, &table_path, 1).await;
 
     assert_matches!(
@@ -8276,6 +8329,7 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
         .expect("retained table lookup should succeed")
         .expect("table entry should remain present");
     assert_eq!(retained.table_id, "table-id");
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
     let (restored_index, _) = store
         .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
         .await
@@ -8288,6 +8342,12 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
         .expect("restored index lookup should succeed")
         .expect("restored index should keep data-plane protection");
     assert_eq!(resource.table, "orders");
+
+    store
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
+        .await
+        .unwrap();
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
 }
 
 #[tokio::test]
@@ -8342,6 +8402,19 @@ async fn object_table_catalog_store_accepts_ambiguous_delete_when_table_is_absen
     let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .put_table_maintenance_config(bucket, "sales", "orders", TableMaintenanceConfig::default())
+        .await
+        .unwrap();
+    let config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "table-id");
+    let previous_config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "previous-id");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &previous_config, b"previous config".to_vec())
+        .await;
     backend.fail_after_next_delete(RUSTFS_META_BUCKET, &table_path).await;
 
     store
@@ -8355,6 +8428,8 @@ async fn object_table_catalog_store_accepts_ambiguous_delete_when_table_is_absen
             .expect("dropped table lookup should succeed")
             .is_none()
     );
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &previous_config).await.unwrap());
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
         .await
         .expect("dropped table data-plane lookup should succeed")
@@ -8872,26 +8947,25 @@ async fn maintenance_config_rejects_unsupported_config_version() {
 #[tokio::test]
 async fn maintenance_config_inherits_bucket_default_and_tracks_override_source() {
     let backend = TestCatalogObjectBackend::default();
-    let store = ObjectTableCatalogStore::new(backend);
+    let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-    store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 3,
-                delete_enabled: true,
-                background_enabled: false,
-                ..Default::default()
-            },
+    let bucket_config = TableMaintenanceConfig {
+        retain_recent_metadata_files: 3,
+        delete_enabled: true,
+        ..Default::default()
+    };
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.table_bucket_maintenance_config_path(bucket),
+            serde_json::to_vec(&bucket_config).unwrap(),
         )
-        .await
-        .expect("bucket default maintenance config should persist");
+        .await;
 
     let inherited = store
         .get_effective_table_maintenance_config(bucket, "sales", "orders")
@@ -8940,25 +9014,6 @@ async fn maintenance_config_accepts_background_enabled_worker_runtime_controls()
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-
-    let bucket_config = store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 1,
-                delete_enabled: false,
-                background_enabled: true,
-                worker_paused: true,
-                worker_lease_timeout_seconds: 60,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("background maintenance bucket config should persist");
-    assert!(bucket_config.background_enabled);
-    assert!(bucket_config.worker_paused);
-    assert_eq!(bucket_config.worker_lease_timeout_seconds, 60);
 
     let table_config = store
         .put_table_maintenance_config(
@@ -9124,19 +9179,6 @@ async fn maintenance_run_persists_latest_job_alias_with_worker_and_lease_context
     let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
-    store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 0,
-                delete_enabled: false,
-                background_enabled: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("bucket default maintenance config should persist");
     backend.seed_object(bucket, &old, b"{}".to_vec()).await;
     backend
         .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
@@ -9148,7 +9190,7 @@ async fn maintenance_run_persists_latest_job_alias_with_worker_and_lease_context
         .expect("metadata maintenance run should succeed");
 
     assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
-    assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableBucketDefault);
+    assert_eq!(report.job.config_source, TableMaintenanceConfigSource::Default);
     assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
     assert!(!report.job.lease_id.is_empty());
     assert_eq!(report.job.attempt, 1);
@@ -12717,13 +12759,6 @@ async fn object_only_catalog_mutations_hold_the_migration_read_permit() {
     assert_eq!(backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await, expected);
 
     store
-        .put_table_bucket_maintenance_config(bucket, TableMaintenanceConfig::default())
-        .await
-        .expect("table-bucket maintenance config should persist");
-    expected += 1;
-    assert_eq!(backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await, expected);
-
-    store
         .put_table_maintenance_config(bucket, &namespace.public_name(), table.as_str(), TableMaintenanceConfig::default())
         .await
         .expect("table maintenance config should persist");
@@ -14414,8 +14449,8 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     assert_ordered(
         method(delete, "fn execute_delete_objects_owned("),
         &[
-            "validate_object_key(&obj_id.key, \"DeleteObjects\")",
-            "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {",
+            "validate_object_key(&key, \"DeleteObjects\")",
+            "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &key).await {",
             "continue;\n            }",
             "authorized_deletes.push(AuthorizedDelete { idx, object });",
         ],
@@ -14430,34 +14465,165 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     );
 }
 
-#[test]
-fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../app/multipart_usecase.rs");
+const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
+const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
 
+fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        4
+        source.count(MULTIPART_KEY_GUARD),
+        4,
+        "reserved-prefix guard calls across {}",
+        source.describe()
+    );
+}
+
+fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
+    assert_eq!(
+        source.count(OBJECT_METADATA_OBJECT_GUARD),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
+    );
+    assert_eq!(
+        source.count(OBJECT_METADATA_KEY_GUARD),
+        2,
+        "reserved-prefix guard calls across {}",
+        source.describe()
     );
 }
 
 #[test]
-fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../storage/ecfs.rs");
+fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_multipart_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    ));
+}
 
-    assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &object).await?;")
-            .count(),
-        2
+#[test]
+fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_object_metadata_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    ));
+}
+
+/// `count` production calls of `guard`, one per method, for count-guard fixtures.
+fn guarded_methods(guard: &str, count: usize) -> String {
+    let methods: String = (0..count)
+        .map(|index| format!("    async fn guarded_{index}(&self) {{\n        {guard}\n    }}\n"))
+        .collect();
+    format!("impl Usecase {{\n{methods}}}\n")
+}
+
+fn guard_fixture(files: &[(&str, &str)], file: &str, split_dir: &str) -> crate::guard_sources::SourceSet {
+    let root = crate::guard_sources::fixture_root(files);
+    crate::guard_sources::SourceSet::production_under(root.path(), file, split_dir)
+}
+
+#[test]
+fn multipart_count_guard_fails_when_a_dropped_production_call_is_replaced_by_test_mentions() {
+    let parent = format!(
+        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_KEY_GUARD}\n    }}\n}}\n",
+        guarded_methods(MULTIPART_KEY_GUARD, 2)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", parent.as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
     );
     assert_eq!(
-        source
-            .matches("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-            .count(),
-        2
+        source.count(MULTIPART_KEY_GUARD),
+        3,
+        "fixture: three production calls and one test mention"
     );
+
+    let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
+}
+
+#[test]
+fn multipart_count_guard_passes_when_calls_move_into_the_split_directory() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 3).as_str()),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_fails_when_a_moved_call_is_broken() {
+    let moved_and_broken = guarded_methods(MULTIPART_KEY_GUARD, 1).replace("&key)", "key.as_str())");
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            ("src/storage/legacy_edge/object_write.rs", moved_and_broken.as_str()),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("src/storage/legacy_edge/object_write.rs"), "{message}");
+}
+
+#[test]
+fn object_metadata_key_count_guard_passes_when_a_call_moves_intact() {
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            (
+                "src/storage/legacy_edge/object_write.rs",
+                guarded_methods(OBJECT_METADATA_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_count_guard_fails_when_a_legacy_edge_test_replaces_a_production_call() {
+    let parent = format!(
+        "{}{}",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 1),
+        guarded_methods(OBJECT_METADATA_KEY_GUARD, 2)
+    );
+    let source = guard_fixture(
+        &[
+            ("src/storage/ecfs.rs", parent.as_str()),
+            ("src/storage/legacy_edge/tests/object_meta.rs", OBJECT_METADATA_OBJECT_GUARD),
+        ],
+        "src/storage/ecfs.rs",
+        "src/storage/legacy_edge",
+    );
+
+    let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
 }
 
 #[test]

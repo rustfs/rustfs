@@ -39,7 +39,10 @@ where
             .filter(|object| {
                 object.bucket == self.catalog_bucket()
                     && (object.object == config
-                        || backup_historical_maintenance_path(&self.paths, table_bucket, &object.object).is_some())
+                        || self
+                            .paths
+                            .historical_table_maintenance_path(table_bucket, &object.object)
+                            .is_some())
             })
             .count()
     }
@@ -106,7 +109,7 @@ where
                 .filter(|prefix| object.object.starts_with(prefix.as_str()));
             let path = match owned_prefix {
                 Some(prefix) => Some((prefix.as_str(), &object.object[prefix.len()..])),
-                None => backup_historical_maintenance_path(&self.paths, table_bucket, &object.object),
+                None => self.paths.historical_table_maintenance_path(table_bucket, &object.object),
             };
             let Some((prefix, suffix)) = path else {
                 continue;
@@ -215,46 +218,6 @@ fn validate_backup_maintenance_config(data: &[u8]) -> TableCatalogStoreResult<()
     let config: TableMaintenanceConfig = serde_json::from_slice(data)
         .map_err(|_| TableCatalogStoreError::Invalid("invalid maintenance config in backup".to_string()))?;
     validate_table_maintenance_config(&config)
-}
-
-/// Recognizes canonical, known-format sidecars from superseded incarnations.
-/// Their embedded reports still undergo the ordinary owner/path validation.
-fn backup_historical_maintenance_path<'a>(
-    paths: &TableCatalogObjectPaths,
-    table_bucket: &str,
-    object: &'a str,
-) -> Option<(&'a str, &'a str)> {
-    let namespace_prefix = paths.namespace_entries_prefix(table_bucket);
-    let relative = object.strip_prefix(&namespace_prefix)?;
-    let (head, tail) = relative.rsplit_once(&format!("/{MAINTENANCE_ROOT}/"))?;
-    let (namespace_path, table) = head.rsplit_once(&format!("/{TABLE_ROOT}/"))?;
-    if table.contains('/')
-        || IdentifierSegment::parse(table).is_err()
-        || Namespace::from_segments(namespace_path.split('/').map(str::to_string).collect()).is_err()
-    {
-        return None;
-    }
-    let (identity_hash, suffix) = tail.split_once('/')?;
-    if identity_hash.len() != 64
-        || !identity_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let is_known = matches!(
-        suffix,
-        MAINTENANCE_CONFIG_FILE | MAINTENANCE_CURRENT_JOB_FILE | MAINTENANCE_LATEST_JOB_FILE
-    ) || suffix
-        .strip_prefix(&format!("{MAINTENANCE_JOB_ROOT}/"))
-        .and_then(|name| name.strip_suffix(".json"))
-        .is_some_and(|hash| {
-            hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        });
-    is_known.then(|| (&object[..object.len() - suffix.len()], suffix))
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ use crate::storage_api_contracts::internode::{
     PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
 
+use hashbrown::HashSet;
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 #[cfg(test)]
@@ -50,9 +51,10 @@ use rustfs_utils::crypto::{HmacSha256, KeyInit, Mac};
 use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, hash_map::RandomState};
 use std::sync::{LazyLock, Mutex, Once};
 use std::thread;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
@@ -127,18 +129,15 @@ const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capab
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
-// Timestamp validity and the wall-clock high-water mark still gate eviction,
-// including future-dated signatures and replay attempts after clock rollback.
+// Keep old monotonic test fixtures independent of signed-time expiration.
+#[cfg(test)]
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(301);
 // Preserve capacity for the full validity window at maximum accepted clock skew.
 const REPLAY_CACHE_CAPACITY_WINDOW_SECS: usize = 601;
-// A reserved index avoids overlapping old/new tables during a rehash. Include
-// index slack, compact expiry storage, and page/allocator bookkeeping.
-const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: usize = 2 * std::mem::size_of::<Uuid>() + std::mem::size_of::<RpcNonceExpiration>() + 16;
-// Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
+// Policy budget, not a throughput estimate. Account growth before allocating.
 const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
-const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
-const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
+const REPLAY_CACHE_METADATA_BYTES: u64 = 1024 * 1024;
+const REPLAY_CACHE_TABLE_OVERHEAD_BYTES: u64 = 512;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 const NS_SCANNER_CHECKPOINT_COVERAGE_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-checkpoint-coverage-v1";
 const NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-generation-v1";
@@ -165,11 +164,9 @@ static INTERNODE_RPC_REPLAY_SCOPE_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT,
     )
 });
-// Sized for peak legitimate authenticated RPC RPS x the retention window once replay scope is
-// active; overflow fails closed and increments the replay-cache overflow counter. Explicit operator
-// values and auto-sizing are both floored at the historical default so under-sizing cannot turn
-// legitimate high-throughput traffic into `No valid auth token` failures.
-static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(resolve_replay_cache_capacity);
+// Automatic admission budgets physical table storage and growth peaks. An
+// explicit operator count retains its compatibility floor and bypasses that policy.
+static REPLAY_CACHE_CAPACITY: LazyLock<ReplayCacheCapacityDecision> = LazyLock::new(resolve_replay_cache_capacity);
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 static RPC_BOOT_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
@@ -178,9 +175,7 @@ enum ReplayCacheCapacitySource {
     Env,
     EnvClampedToDefault,
     Auto,
-    AutoClampedToDefault,
     AutoInvalidEnv,
-    AutoInvalidEnvClampedToDefault,
 }
 
 impl ReplayCacheCapacitySource {
@@ -189,9 +184,7 @@ impl ReplayCacheCapacitySource {
             Self::Env => "env",
             Self::EnvClampedToDefault => "env_clamped_to_default",
             Self::Auto => "auto",
-            Self::AutoClampedToDefault => "auto_clamped_to_default",
             Self::AutoInvalidEnv => "auto_invalid_env",
-            Self::AutoInvalidEnvClampedToDefault => "auto_invalid_env_clamped_to_default",
         }
     }
 
@@ -204,7 +197,7 @@ impl ReplayCacheCapacitySource {
     }
 
     fn is_invalid_env(self) -> bool {
-        matches!(self, Self::AutoInvalidEnv | Self::AutoInvalidEnvClampedToDefault)
+        matches!(self, Self::AutoInvalidEnv)
     }
 }
 
@@ -216,28 +209,12 @@ struct ReplayCacheCapacityDecision {
     memory_limit_bytes: Option<u64>,
     memory_basis: Option<MemoryBasis>,
     memory_based_capacity: usize,
-    cpu_based_capacity: usize,
+    memory_budget_bytes: Option<u64>,
 }
 
-fn saturating_usize_from_u64(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
-}
-
-fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Option<u64>) -> (usize, usize, usize) {
-    let cpu_count = cpu_count.max(1);
-    let cpu_based_capacity = cpu_count
-        .saturating_mul(REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU)
-        .saturating_mul(REPLAY_CACHE_CAPACITY_WINDOW_SECS);
-    let memory_based_capacity = memory_limit_bytes
-        .map(|bytes| {
-            let budget = bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
-            saturating_usize_from_u64(budget / u64::try_from(REPLAY_CACHE_ENTRY_BYTES_ESTIMATE).unwrap_or(u64::MAX))
-        })
-        .unwrap_or(REPLAY_CACHE_AUTO_MAX_CAPACITY);
-    let capacity = memory_based_capacity
-        .min(cpu_based_capacity)
-        .clamp(rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, REPLAY_CACHE_AUTO_MAX_CAPACITY);
-    (capacity, memory_based_capacity, cpu_based_capacity)
+fn replay_cache_memory_budget(memory: u64) -> u64 {
+    // Divide before multiplying so even an extreme reported limit cannot wrap.
+    memory / 100 * REPLAY_CACHE_AUTO_MEMORY_PERCENT + memory % 100 * REPLAY_CACHE_AUTO_MEMORY_PERCENT / 100
 }
 
 fn replay_cache_capacity_decision(
@@ -246,47 +223,53 @@ fn replay_cache_capacity_decision(
     memory_limit_bytes: Option<u64>,
     memory_basis: Option<MemoryBasis>,
 ) -> ReplayCacheCapacityDecision {
-    let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
-    match env {
-        rustfs_utils::EnvParseOutcome::Parsed(configured) => {
-            let capacity = configured.max(default);
-            let source = if configured < default {
+    let memory_budget_bytes = memory_limit_bytes.map(replay_cache_memory_budget);
+    // This is only the absolute payload ceiling. Actual layout and growth
+    // admission may reject earlier, depending on the signed-time distribution.
+    let memory_based_capacity = memory_budget_bytes
+        .map(|bytes| usize::try_from(bytes.saturating_sub(REPLAY_CACHE_METADATA_BYTES) / 16).unwrap_or(usize::MAX))
+        .unwrap_or(rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
+    let (capacity, source, memory_budget_bytes) = match env {
+        rustfs_utils::EnvParseOutcome::Parsed(configured) => (
+            configured.max(rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY),
+            if configured < rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY {
                 ReplayCacheCapacitySource::EnvClampedToDefault
             } else {
                 ReplayCacheCapacitySource::Env
-            };
-            ReplayCacheCapacityDecision {
-                capacity,
-                source,
-                cpu_count: cpu_count.max(1),
-                memory_limit_bytes,
-                memory_basis,
-                memory_based_capacity: 0,
-                cpu_based_capacity: 0,
-            }
+            },
+            None,
+        ),
+        rustfs_utils::EnvParseOutcome::Absent => (memory_based_capacity, ReplayCacheCapacitySource::Auto, memory_budget_bytes),
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            (memory_based_capacity, ReplayCacheCapacitySource::AutoInvalidEnv, memory_budget_bytes)
         }
-        rustfs_utils::EnvParseOutcome::Absent | rustfs_utils::EnvParseOutcome::Invalid => {
-            let (capacity, memory_based_capacity, cpu_based_capacity) =
-                replay_cache_capacity_from_resources(cpu_count, memory_limit_bytes);
-            let clamped_to_default = capacity == default && memory_based_capacity.min(cpu_based_capacity) < default;
-            let invalid_env = matches!(env, rustfs_utils::EnvParseOutcome::Invalid);
-            let source = match (invalid_env, clamped_to_default) {
-                (true, true) => ReplayCacheCapacitySource::AutoInvalidEnvClampedToDefault,
-                (true, false) => ReplayCacheCapacitySource::AutoInvalidEnv,
-                (false, true) => ReplayCacheCapacitySource::AutoClampedToDefault,
-                (false, false) => ReplayCacheCapacitySource::Auto,
-            };
-            ReplayCacheCapacityDecision {
-                capacity,
-                source,
-                cpu_count: cpu_count.max(1),
-                memory_limit_bytes,
-                memory_basis,
-                memory_based_capacity,
-                cpu_based_capacity,
-            }
-        }
+    };
+    ReplayCacheCapacityDecision {
+        capacity,
+        source,
+        cpu_count: cpu_count.max(1),
+        memory_limit_bytes,
+        memory_basis,
+        memory_based_capacity,
+        memory_budget_bytes,
     }
+}
+
+// hashbrown rounds 7/8 occupancy to a power of two. Include conservative
+// control-byte alignment before charging the production allocator allowance.
+fn replay_cache_table_growth_bytes(entries: usize) -> Option<u64> {
+    let entries = u64::try_from(entries).ok()?;
+    let buckets = entries.checked_mul(8)?.div_ceil(7).max(4).checked_next_power_of_two()?;
+    replay_cache_table_charge(buckets.checked_mul(17)?.checked_add(64)?)
+}
+
+fn replay_cache_table_charge(bytes: u64) -> Option<u64> {
+    if bytes == 0 {
+        return Some(0);
+    }
+    bytes
+        .checked_add(bytes.div_ceil(4))?
+        .checked_add(REPLAY_CACHE_TABLE_OVERHEAD_BYTES)
 }
 
 fn detected_replay_cache_resources() -> (usize, Option<u64>, Option<MemoryBasis>) {
@@ -335,8 +318,7 @@ fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
             memory_limit_bytes = decision.memory_limit_bytes,
             memory_basis = decision.memory_basis.map(MemoryBasis::as_str),
             memory_based_capacity = decision.memory_based_capacity,
-            cpu_based_capacity = decision.cpu_based_capacity,
-            auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
+            memory_budget_bytes = decision.memory_budget_bytes,
             env = rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
             "internode rpc replay cache capacity auto-sized after invalid env"
         );
@@ -352,13 +334,12 @@ fn log_replay_cache_capacity_decision(decision: ReplayCacheCapacityDecision) {
         memory_limit_bytes = decision.memory_limit_bytes,
         memory_basis = decision.memory_basis.map(MemoryBasis::as_str),
         memory_based_capacity = decision.memory_based_capacity,
-        cpu_based_capacity = decision.cpu_based_capacity,
-        auto_max_capacity = REPLAY_CACHE_AUTO_MAX_CAPACITY,
+        memory_budget_bytes = decision.memory_budget_bytes,
         "internode rpc replay cache capacity resolved"
     );
 }
 
-fn resolve_replay_cache_capacity() -> usize {
+fn resolve_replay_cache_capacity() -> ReplayCacheCapacityDecision {
     let (cpu_count, memory_limit_bytes, memory_basis) = detected_replay_cache_resources();
     let decision = replay_cache_capacity_decision(
         rustfs_utils::get_env_parse_outcome(rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY),
@@ -368,88 +349,56 @@ fn resolve_replay_cache_capacity() -> usize {
     );
     global_internode_metrics().record_replay_cache_state(0, decision.capacity);
     log_replay_cache_capacity_decision(decision);
-    decision.capacity
+    decision
 }
 
-const RPC_NONCE_EXPIRATIONS_PER_PAGE: usize = 1_024;
-
-struct RpcNonceExpiration {
-    nonce: Uuid,
-    expiry_offset_ns: u32,
-    valid_until_offset_secs: i32,
+/// Resource limits reached after request authentication; no request was admitted.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcReplayCacheAdmissionError {
+    /// The configured count ceiling has been reached.
+    #[error("RPC replay cache capacity exceeded")]
+    Capacity,
+    /// The next allocation would exceed the automatic byte budget.
+    #[error("RPC replay cache memory budget exceeded")]
+    MemoryBudget,
 }
 
-struct RpcNonceExpirationPage {
-    expires_at: Instant,
-    valid_until: i64,
-    entries: VecDeque<RpcNonceExpiration>,
+/// Whether an RPC verifier failed because replay admission exhausted resources.
+///
+/// Invalid credentials, replayed requests and arbitrary I/O failures remain
+/// authentication failures. Allocation errors preserve their concrete source.
+pub fn rpc_auth_is_resource_exhausted(error: &std::io::Error) -> bool {
+    error.get_ref().is_some_and(|source| {
+        source.is::<RpcReplayCacheAdmissionError>()
+            || (error.kind() == std::io::ErrorKind::OutOfMemory && source.is::<hashbrown::TryReserveError>())
+    })
 }
 
+// Timestamp is HMAC-bound together with the nonce in every supported replay
+// scope. Re-signing the same UUID at another time requires the signing secret;
+// it is a new authorization, not replay of the old wire request.
 #[derive(Default)]
-struct RpcNonceExpirations {
-    pages: VecDeque<RpcNonceExpirationPage>,
+struct RpcNonceBucket {
+    nonces: HashSet<Uuid, RandomState>,
+    charged_bytes: u64,
 }
 
-impl RpcNonceExpirations {
-    fn push_back(&mut self, expires_at: Instant, valid_until: i64, nonce: Uuid) {
-        // Use exact offsets and start another page if either offset is too large.
-        // Fully drained pages can be freed while newer nonces are still valid.
-        if let Some(page) = self.pages.back_mut()
-            && page.entries.len() < RPC_NONCE_EXPIRATIONS_PER_PAGE
-            && let Some(offset) = expires_at.checked_duration_since(page.expires_at)
-            && let Ok(expiry_offset_ns) = u32::try_from(offset.as_nanos())
-            && let Some(offset) = valid_until.checked_sub(page.valid_until)
-            && let Ok(valid_until_offset_secs) = i32::try_from(offset)
-        {
-            page.entries.push_back(RpcNonceExpiration {
-                nonce,
-                expiry_offset_ns,
-                valid_until_offset_secs,
-            });
-        } else {
-            self.pages.push_back(RpcNonceExpirationPage {
-                expires_at,
-                valid_until,
-                entries: VecDeque::from([RpcNonceExpiration {
-                    nonce,
-                    expiry_offset_ns: 0,
-                    valid_until_offset_secs: 0,
-                }]),
-            });
-        }
-    }
-
-    fn pop_expired(&mut self, now: Instant, wall_time: i64) -> Option<Uuid> {
-        let page = self.pages.front_mut()?;
-        let entry = page.entries.front()?;
-        let elapsed = now.checked_duration_since(page.expires_at)?;
-        let valid_until = page.valid_until + i64::from(entry.valid_until_offset_secs);
-        if elapsed <= Duration::from_nanos(u64::from(entry.expiry_offset_ns)) || wall_time <= valid_until {
-            return None;
-        }
-
-        let nonce = entry.nonce;
-        page.entries.pop_front();
-        if page.entries.is_empty() {
-            self.pages.pop_front();
-            if self.pages.is_empty() {
-                self.pages.shrink_to_fit();
-            }
-        }
-        Some(nonce)
-    }
-
-    #[cfg(test)]
-    fn capacity(&self) -> usize {
-        self.pages.iter().map(|page| page.entries.capacity()).sum()
-    }
-}
-
-#[derive(Default)]
 struct RpcNonceCache {
-    nonces: HashSet<Uuid>,
-    expirations: RpcNonceExpirations,
+    signed_times: BTreeMap<i64, RpcNonceBucket>,
+    entries: usize,
+    table_bytes: u64,
     max_wall_time: i64,
+}
+
+impl Default for RpcNonceCache {
+    fn default() -> Self {
+        Self {
+            signed_times: BTreeMap::new(),
+            entries: 0,
+            table_bytes: 0,
+            max_wall_time: i64::MIN,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -462,16 +411,17 @@ struct RpcReplayCacheMetricScope<'a> {
 #[derive(Clone, Copy)]
 struct RpcNonceRecord<'a> {
     nonce: Uuid,
+    compatibility_nonce: Option<Uuid>,
     signed_at: i64,
-    now: Instant,
     wall_time: i64,
-    expires_at: Instant,
     capacity: usize,
+    memory_budget_bytes: Option<u64>,
     metric_scope: RpcReplayCacheMetricScope<'a>,
 }
 
 struct RpcNonceCacheMetrics<'a> {
     expired: usize,
+    recorded: usize,
     entries: usize,
     capacity: usize,
     record_scope: Option<RpcReplayCacheMetricScope<'a>>,
@@ -486,11 +436,13 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
     internode_metrics.record_replay_cache_evictions("expired", metrics.expired);
     internode_metrics.record_replay_cache_state(metrics.entries, metrics.capacity);
     if let Some(scope) = metrics.record_scope {
-        internode_metrics.record_replay_cache_record_for_operation_and_backend_path(
-            scope.operation,
-            scope.backend,
-            scope.rpc_path,
-        );
+        for _ in 0..metrics.recorded {
+            internode_metrics.record_replay_cache_record_for_operation_and_backend_path(
+                scope.operation,
+                scope.backend,
+                scope.rpc_path,
+            );
+        }
     }
     if let Some(scope) = metrics.overflow_scope {
         internode_metrics.record_replay_cache_overflow_for_operation_and_backend_path(
@@ -502,22 +454,74 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
 }
 
 impl RpcNonceCache {
-    fn reserve_index(&mut self, capacity: usize) -> std::io::Result<()> {
-        self.nonces
-            .try_reserve(capacity)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+    #[cfg(test)]
+    fn contains_nonce(&self, nonce: &Uuid) -> bool {
+        self.signed_times.values().any(|bucket| bucket.nonces.contains(nonce))
     }
 
-    fn remove_expired(&mut self, now: Instant, wall_time: i64) -> usize {
+    fn remove_expired(&mut self, wall_time: i64) -> usize {
+        self.max_wall_time = self.max_wall_time.max(wall_time);
+        let first_valid = self.max_wall_time.saturating_sub(SIGNATURE_VALID_DURATION);
         let mut removed = 0;
-        while let Some(nonce) = self.expirations.pop_expired(now, wall_time) {
-            self.nonces.remove(&nonce);
-            removed += 1;
+        while self
+            .signed_times
+            .first_key_value()
+            .is_some_and(|(signed, _)| *signed < first_valid)
+        {
+            if let Some((_, nonces)) = self.signed_times.pop_first() {
+                removed += nonces.nonces.len();
+                self.table_bytes -= nonces.charged_bytes;
+            }
         }
-        if removed > 0 && self.nonces.is_empty() {
-            self.nonces.shrink_to_fit();
-        }
+        self.entries -= removed;
         removed
+    }
+
+    fn reserve_nonces(&mut self, record: &RpcNonceRecord<'_>) -> std::io::Result<()> {
+        let bucket = self.signed_times.get(&record.signed_at);
+        let (len, capacity) = bucket.map_or((0, 0), |bucket| (bucket.nonces.len(), bucket.nonces.capacity()));
+        let additional = 1 + usize::from(record.compatibility_nonce.is_some());
+        let needed = len
+            .checked_add(additional)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow))?;
+        if needed > capacity {
+            let growth = replay_cache_table_growth_bytes(needed).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow)
+            })?;
+            // The old table stays live until growth completes. Do not subtract
+            // it here, even though it will be replaced immediately afterwards.
+            let peak = self
+                .table_bytes
+                .checked_add(growth)
+                .and_then(|bytes| bytes.checked_add(REPLAY_CACHE_METADATA_BYTES))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow)
+                })?;
+            if record.memory_budget_bytes.is_some_and(|limit| peak > limit) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    RpcReplayCacheAdmissionError::MemoryBudget,
+                ));
+            }
+        }
+        let bucket = self.signed_times.entry(record.signed_at).or_default();
+        bucket
+            .nonces
+            .try_reserve(additional)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        let after = u64::try_from(bucket.nonces.allocation_size())
+            .ok()
+            .and_then(replay_cache_table_charge)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow))?;
+        self.table_bytes = self.table_bytes - bucket.charged_bytes + after;
+        bucket.charged_bytes = after;
+        bucket.nonces.insert(record.nonce);
+        if let Some(nonce) = record.compatibility_nonce {
+            bucket.nonces.insert(nonce);
+        }
+        self.entries += additional;
+        debug_assert!(self.signed_times.len() <= REPLAY_CACHE_CAPACITY_WINDOW_SECS);
+        Ok(())
     }
 
     fn check_and_record<'a>(&mut self, record: RpcNonceRecord<'a>) -> (std::io::Result<()>, Option<RpcNonceCacheMetrics<'a>>) {
@@ -525,41 +529,58 @@ impl RpcNonceCache {
         if self.max_wall_time.saturating_sub(record.signed_at) > SIGNATURE_VALID_DURATION {
             return (Err(std::io::Error::other("RPC request timestamp expired after clock regression")), None);
         }
-        let expired = self.remove_expired(record.now, self.max_wall_time);
+        if record.signed_at.saturating_sub(self.max_wall_time) > SIGNATURE_VALID_DURATION {
+            return (Err(std::io::Error::other("Request timestamp expired")), None);
+        }
+        let expired = self.remove_expired(self.max_wall_time);
         let metrics = RpcNonceCacheMetrics {
             expired,
-            entries: self.nonces.len(),
+            recorded: 0,
+            entries: self.entries,
             capacity: record.capacity,
             record_scope: None,
             overflow_scope: None,
         };
-        if self.nonces.contains(&record.nonce) {
+        if record.compatibility_nonce == Some(record.nonce)
+            || self.signed_times.get(&record.signed_at).is_some_and(|bucket| {
+                bucket.nonces.contains(&record.nonce)
+                    || record.compatibility_nonce.is_some_and(|nonce| bucket.nonces.contains(&nonce))
+            })
+        {
             return (Err(std::io::Error::other("RPC request replay detected")), Some(metrics));
         }
-        if self.nonces.len() >= record.capacity {
-            // Fail closed and alert: only legitimately signed traffic can fill the cache, so a
-            // sustained overflow means RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY is undersized
-            // for this node's peak mutation rate and writes are being refused.
+        let additional = 1 + usize::from(record.compatibility_nonce.is_some());
+        if self
+            .entries
+            .checked_add(additional)
+            .is_none_or(|entries| entries > record.capacity)
+        {
             return (
-                Err(std::io::Error::other("RPC replay cache capacity exceeded")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    RpcReplayCacheAdmissionError::Capacity,
+                )),
                 Some(RpcNonceCacheMetrics {
                     overflow_scope: Some(record.metric_scope),
                     ..metrics
                 }),
             );
         }
-        if self.nonces.is_empty()
-            && let Err(error) = self.reserve_index(record.capacity.min(REPLAY_CACHE_AUTO_MAX_CAPACITY))
-        {
-            return (Err(error), Some(metrics));
+        if let Err(error) = self.reserve_nonces(&record) {
+            let overflow_scope = (error.kind() == std::io::ErrorKind::WouldBlock).then_some(record.metric_scope);
+            return (
+                Err(error),
+                Some(RpcNonceCacheMetrics {
+                    overflow_scope,
+                    ..metrics
+                }),
+            );
         }
-        self.nonces.insert(record.nonce);
-        self.expirations
-            .push_back(record.expires_at, record.signed_at.saturating_add(SIGNATURE_VALID_DURATION), record.nonce);
         (
             Ok(()),
             Some(RpcNonceCacheMetrics {
-                entries: self.nonces.len(),
+                entries: self.entries,
+                recorded: additional,
                 record_scope: Some(record.metric_scope),
                 ..metrics
             }),
@@ -1302,6 +1323,7 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
 
 fn check_and_record_nonce_with_scope(
     nonce: Uuid,
+    compatibility_nonce: Option<Uuid>,
     signed_at: i64,
     rpc_path: &str,
     operation: &'static str,
@@ -1312,19 +1334,13 @@ fn check_and_record_nonce_with_scope(
         let mut cache = LOCAL_RPC_NONCE_CACHE
             .lock()
             .map_err(|_| std::io::Error::other("RPC replay cache unavailable"))?;
-        // Take the monotonic timestamp after acquiring the lock so expiration
-        // entries remain ordered by the same serialization point as insertion.
-        let now = Instant::now();
-        let expires_at = now
-            .checked_add(REPLAY_CACHE_RETENTION)
-            .ok_or_else(|| std::io::Error::other("RPC replay expiry overflow"))?;
         cache.check_and_record(RpcNonceRecord {
             nonce,
+            compatibility_nonce,
             signed_at,
-            now,
             wall_time,
-            expires_at,
-            capacity: *REPLAY_CACHE_CAPACITY,
+            capacity: REPLAY_CACHE_CAPACITY.capacity,
+            memory_budget_bytes: REPLAY_CACHE_CAPACITY.memory_budget_bytes,
             metric_scope: RpcReplayCacheMetricScope {
                 operation,
                 backend,
@@ -1336,9 +1352,15 @@ fn check_and_record_nonce_with_scope(
     result
 }
 
-fn check_and_record_tonic_nonce(nonce: Uuid, signed_at: i64, rpc_path: &str) -> std::io::Result<()> {
+fn check_and_record_tonic_nonce(
+    nonce: Uuid,
+    compatibility_nonce: Option<Uuid>,
+    signed_at: i64,
+    rpc_path: &str,
+) -> std::io::Result<()> {
     check_and_record_nonce_with_scope(
         nonce,
+        compatibility_nonce,
         signed_at,
         rpc_path,
         tonic_rpc_metric_operation(rpc_path),
@@ -1364,7 +1386,7 @@ pub fn check_and_record_signed_rpc_nonce(
         .parse::<i64>()
         .map_err(|_| std::io::Error::other("Invalid timestamp format"))?;
     check_timestamp(timestamp)?;
-    check_and_record_nonce_with_scope(nonce, timestamp, rpc_path, operation, backend)
+    check_and_record_nonce_with_scope(nonce, None, timestamp, rpc_path, operation, backend)
 }
 
 /// Build headers with authentication signature
@@ -1675,13 +1697,18 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     if boot_epoch != tonic_rpc_boot_epoch() {
         return Err(std::io::Error::other("RPC boot epoch is stale"));
     }
-    check_and_record_tonic_nonce(nonce, signed_at, path)?;
-    // A body-bound request also carries a usable v2 signature. Consume both
-    // nonces so stripping the replay-scope headers cannot authorize it again.
-    if content_sha256 != UNSIGNED_PAYLOAD {
-        verify_tonic_rpc_signature_with_strictness(audience, path, headers, true)?;
-    }
-    Ok(())
+    // Verify both usable authorizations before reserving either identity. A
+    // resource or signature failure must not leave a partially admitted RPC.
+    let compatibility_nonce = if content_sha256 != UNSIGNED_PAYLOAD {
+        Some(
+            verified_tonic_rpc_nonce(audience, path, headers, true)?
+                .ok_or_else(|| std::io::Error::other("Invalid RPC nonce"))?
+                .0,
+        )
+    } else {
+        None
+    };
+    check_and_record_tonic_nonce(nonce, compatibility_nonce, signed_at, path)
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
@@ -1733,6 +1760,7 @@ pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
         "RPC boot epoch is stale" => "stale_boot_epoch",
         "RPC request replay detected" => "replay_detected",
         "RPC replay cache capacity exceeded" => "replay_cache_capacity",
+        "RPC replay cache memory budget exceeded" => "replay_cache_memory",
         "RPC replay cache unavailable" => "replay_cache_unavailable",
         "RPC replay expiry overflow" => "replay_expiry_overflow",
         "RPC request timestamp expired after clock regression" => "timestamp_expired_after_clock_regression",
@@ -1793,6 +1821,18 @@ fn verify_tonic_rpc_signature_with_strictness(
     headers: &HeaderMap,
     strict: bool,
 ) -> std::io::Result<()> {
+    if let Some((nonce, signed_at)) = verified_tonic_rpc_nonce(audience, path, headers, strict)? {
+        check_and_record_tonic_nonce(nonce, None, signed_at, path)?;
+    }
+    Ok(())
+}
+
+fn verified_tonic_rpc_nonce(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    strict: bool,
+) -> std::io::Result<Option<(Uuid, i64)>> {
     if !has_v2_auth_headers(headers) {
         if rpc_background_admission(headers)? {
             return Err(std::io::Error::other("RPC background admission requires v2 authentication"));
@@ -1807,7 +1847,7 @@ fn verify_tonic_rpc_signature_with_strictness(
         // read zero fleet-wide across a release window before
         // `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT` may be enabled.
         global_internode_metrics().record_signature_v1_fallback();
-        return Ok(());
+        return Ok(None);
     }
 
     let path = path
@@ -1880,10 +1920,7 @@ fn verify_tonic_rpc_signature_with_strictness(
     ) {
         return Err(std::io::Error::other("Invalid RPC v2 signature"));
     }
-    if let Some(nonce) = parsed_nonce {
-        check_and_record_tonic_nonce(nonce, timestamp, path)?;
-    }
-    Ok(())
+    Ok(parsed_nonce.map(|nonce| (nonce, timestamp)))
 }
 
 /// Verify the request signature for RPC requests
@@ -3127,89 +3164,77 @@ mod tests {
     }
 
     #[test]
-    fn replay_cache_capacity_uses_env_with_default_floor() {
-        let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
+    fn replay_cache_preserves_explicit_count_compatibility_without_an_auto_budget() {
+        for capacity in [1, 16_777_216, usize::MAX] {
+            let decision = replay_cache_capacity_decision(
+                rustfs_utils::EnvParseOutcome::Parsed(capacity),
+                2,
+                Some(512 * 1024 * 1024),
+                Some(MemoryBasis::Cgroup),
+            );
+            let default = rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY;
+            assert_eq!(decision.capacity, capacity.max(default));
+            assert_eq!(
+                decision.source,
+                if capacity < default {
+                    ReplayCacheCapacitySource::EnvClampedToDefault
+                } else {
+                    ReplayCacheCapacitySource::Env
+                }
+            );
+            assert_eq!(decision.memory_budget_bytes, None);
+        }
+        let zero = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Parsed(0), 2, None, None);
+        assert_eq!(zero.capacity, rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
+        assert_eq!(zero.source, ReplayCacheCapacitySource::EnvClampedToDefault);
+    }
 
-        let high = replay_cache_capacity_decision(
-            rustfs_utils::EnvParseOutcome::Parsed(default * 16),
-            2,
-            Some(512 * 1024 * 1024),
-            Some(MemoryBasis::Host),
+    #[test]
+    fn replay_cache_auto_admission_uses_memory_without_cpu_or_32m_limits() {
+        for memory in [128_u64, 512, 2800, 8192, 32_768, 524_288] {
+            let memory = memory * 1024 * 1024;
+            let a =
+                replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 1, Some(memory), Some(MemoryBasis::Cgroup));
+            let b = replay_cache_capacity_decision(
+                rustfs_utils::EnvParseOutcome::Absent,
+                128,
+                Some(memory),
+                Some(MemoryBasis::Cgroup),
+            );
+            assert_eq!(a.capacity, b.capacity);
+            assert_eq!(a.memory_budget_bytes, Some(replay_cache_memory_budget(memory)));
+            assert_eq!(
+                u64::try_from(a.capacity).expect("capacity") * 16,
+                replay_cache_memory_budget(memory).saturating_sub(REPLAY_CACHE_METADATA_BYTES) / 16 * 16
+            );
+            assert_eq!(a.source, ReplayCacheCapacitySource::Auto);
+        }
+        let tiny = replay_cache_capacity_decision(
+            rustfs_utils::EnvParseOutcome::Absent,
+            128,
+            Some(16 * 1024 * 1024),
+            Some(MemoryBasis::Cgroup),
         );
-        assert_eq!(high.capacity, default * 16);
-        assert_eq!(high.source, ReplayCacheCapacitySource::Env);
-
-        let low = replay_cache_capacity_decision(
-            rustfs_utils::EnvParseOutcome::Parsed(1),
-            64,
-            Some(128 * 1024 * 1024 * 1024),
-            Some(MemoryBasis::Host),
+        assert!(
+            tiny.capacity < rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+            "a historical floor must not exceed the detected memory budget"
         );
-        assert_eq!(low.capacity, default);
-        assert_eq!(low.source, ReplayCacheCapacitySource::EnvClampedToDefault);
-    }
-
-    #[test]
-    fn replay_cache_capacity_auto_sizes_from_cpu_and_memory() {
-        let gib = 1024_u64 * 1024 * 1024;
-        let decision =
-            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 8, Some(16 * gib), Some(MemoryBasis::Host));
-
-        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 31_019_208);
-        assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 19_693_568);
-    }
-
-    #[test]
-    fn replay_cache_capacity_auto_uses_32m_on_field_sized_nodes() {
-        let gib = 1024_u64 * 1024 * 1024;
-        let decision =
-            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
-
-        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 62_038_416);
-        assert_eq!(decision.cpu_based_capacity, 39_387_136);
-        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
-
-        let observed_field_node =
-            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
-        assert_eq!(observed_field_node.memory_based_capacity, 60_099_715);
-        assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
-        assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
-    }
-
-    #[test]
-    fn replay_cache_capacity_auto_caps_extreme_nodes() {
-        let gib = 1024_u64 * 1024 * 1024;
-        let decision =
-            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 128, Some(512 * gib), Some(MemoryBasis::Host));
-
-        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
-    }
-
-    #[test]
-    fn replay_cache_capacity_auto_keeps_default_floor_for_small_nodes() {
-        let decision = replay_cache_capacity_decision(
+        let large = replay_cache_capacity_decision(
             rustfs_utils::EnvParseOutcome::Absent,
             1,
-            Some(512 * 1024 * 1024),
-            Some(MemoryBasis::Host),
+            Some(512 * 1024_u64.pow(3)),
+            Some(MemoryBasis::Cgroup),
         );
-
-        assert_eq!(decision.capacity, rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
-        assert_eq!(decision.source, ReplayCacheCapacitySource::AutoClampedToDefault);
-        assert!(decision.memory_based_capacity < rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
+        assert!(large.capacity > 33_554_432, "a fixed historical count is not a memory limit");
     }
 
     #[test]
-    fn replay_cache_capacity_invalid_env_uses_auto_sizing() {
-        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 8, None, None);
-
+    fn replay_cache_unknown_memory_retains_a_bounded_fallback() {
+        let decision = replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Invalid, 128, None, None);
+        assert_eq!(decision.capacity, rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY);
         assert_eq!(decision.source, ReplayCacheCapacitySource::AutoInvalidEnv);
-        assert_eq!(decision.capacity, 19_693_568);
+        assert_eq!(decision.memory_budget_bytes, None);
+        assert_eq!(replay_cache_memory_budget(u64::MAX), u64::MAX / 100 * 13 + u64::MAX % 100 * 13 / 100);
     }
 
     fn check_test_nonce_record(cache: &mut RpcNonceCache, record: RpcNonceRecord<'_>) -> std::io::Result<()> {
@@ -3228,23 +3253,270 @@ mod tests {
     fn test_nonce_record(
         nonce: Uuid,
         signed_at: i64,
-        now: Instant,
+        _now: Instant,
         wall_time: i64,
-        expires_at: Instant,
+        _expires_at: Instant,
         capacity: usize,
     ) -> RpcNonceRecord<'static> {
         RpcNonceRecord {
             nonce,
+            compatibility_nonce: None,
             signed_at,
-            now,
             wall_time,
-            expires_at,
             capacity,
+            memory_budget_bytes: None,
             metric_scope: RpcReplayCacheMetricScope {
                 operation: INTERNODE_OPERATION_GRPC_READ_ALL,
                 backend: INTERNODE_TRANSPORT_BACKEND_GRPC,
                 rpc_path: "/node_service.NodeService/ReadAll",
             },
+        }
+    }
+
+    #[test]
+    fn nonce_pair_count_admission_is_atomic_and_recovers_after_expiration() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        cache
+            .check_and_record(test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, now, 2))
+            .0
+            .expect("existing identity");
+        let mut pair = test_nonce_record(Uuid::from_u128(2), 1000, now, 1000, now, 2);
+        pair.compatibility_nonce = Some(Uuid::from_u128(3));
+        let (result, metrics) = cache.check_and_record(pair);
+        assert!(rpc_auth_is_resource_exhausted(
+            &result.expect_err("one remaining slot cannot admit a pair")
+        ));
+        assert_eq!(cache.entries, 1);
+        assert!(!cache.contains_nonce(&pair.nonce));
+        assert!(!cache.contains_nonce(&pair.compatibility_nonce.expect("alias")));
+        assert_eq!(metrics.expect("rejection metrics").recorded, 0);
+        pair.signed_at = 1301;
+        pair.wall_time = 1301;
+        let (result, metrics) = cache.check_and_record(pair);
+        result.expect("expired history releases both required slots");
+        assert_eq!(cache.entries, 2);
+        assert_eq!(metrics.expect("success metrics").recorded, 2);
+        assert!(cache.contains_nonce(&pair.nonce));
+        assert!(cache.contains_nonce(&pair.compatibility_nonce.expect("alias")));
+    }
+
+    #[test]
+    fn nonce_pair_reserves_the_growth_peak_before_consuming_either_identity() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        for nonce in 1..=2 {
+            let mut record = test_nonce_record(Uuid::from_u128(nonce), 1000, now, 1000, now, 10);
+            record.memory_budget_bytes = Some(REPLAY_CACHE_METADATA_BYTES + 1000);
+            cache.check_and_record(record).0.expect("small table");
+        }
+        let bytes = cache.table_bytes;
+        let mut pair = test_nonce_record(Uuid::from_u128(3), 1000, now, 1000, now, 10);
+        pair.compatibility_nonce = Some(Uuid::from_u128(4));
+        pair.memory_budget_bytes = Some(REPLAY_CACHE_METADATA_BYTES + 1000);
+        let error = cache
+            .check_and_record(pair)
+            .0
+            .expect_err("the first identity fits the old table but the complete pair needs growth");
+        assert_eq!(tonic_rpc_auth_failure_reason(&error), "replay_cache_memory");
+        assert_eq!(cache.entries, 2);
+        assert_eq!(cache.table_bytes, bytes);
+        assert!(!cache.contains_nonce(&pair.nonce));
+        assert!(!cache.contains_nonce(&pair.compatibility_nonce.expect("alias")));
+    }
+
+    #[test]
+    fn nonce_pair_replay_or_duplicate_does_not_consume_a_fresh_identity() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let mut pair = test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, now, 10);
+        pair.compatibility_nonce = Some(pair.nonce);
+        assert_eq!(
+            cache
+                .check_and_record(pair)
+                .0
+                .expect_err("duplicate aliases are not a valid pair")
+                .to_string(),
+            "RPC request replay detected"
+        );
+        assert!(cache.signed_times.is_empty());
+        pair.compatibility_nonce = Some(Uuid::from_u128(2));
+        cache.check_and_record(pair).0.expect("first complete pair");
+        pair.nonce = Uuid::from_u128(3);
+        assert_eq!(
+            cache
+                .check_and_record(pair)
+                .0
+                .expect_err("a consumed v2 alias must reject the whole new pair")
+                .to_string(),
+            "RPC request replay detected"
+        );
+        assert_eq!(cache.entries, 2);
+        assert!(!cache.contains_nonce(&pair.nonce));
+    }
+
+    #[test]
+    fn concurrent_nonce_pairs_admit_one_complete_request_without_partial_reservations() {
+        let now = Instant::now();
+        let cache = std::sync::Mutex::new(RpcNonceCache::default());
+        let outcomes = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for index in 0..16 {
+                let cache = &cache;
+                joins.push(scope.spawn(move || {
+                    let mut pair = test_nonce_record(Uuid::from_u128(100 + index * 2), 1000, now, 1000, now, 2);
+                    pair.compatibility_nonce = Some(Uuid::from_u128(101 + index * 2));
+                    let accepted = cache.lock().expect("cache lock").check_and_record(pair).0.is_ok();
+                    (pair, accepted)
+                }));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("admission task"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes.iter().filter(|(_, accepted)| *accepted).count(), 1);
+        let cache = cache.lock().expect("final cache state");
+        assert_eq!(cache.entries, 2);
+        for (pair, accepted) in outcomes {
+            assert_eq!(cache.contains_nonce(&pair.nonce), accepted);
+            assert_eq!(cache.contains_nonce(&pair.compatibility_nonce.expect("alias")), accepted);
+        }
+    }
+
+    #[test]
+    fn malformed_compatibility_signature_does_not_consume_valid_replay_scope() {
+        ensure_test_rpc_secret();
+        let audience = "atomic-admission-test:9000";
+        let path = "/node_service.NodeService/ReadAll";
+        let body = "cd".repeat(32);
+        let mut headers = gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", Some(&body))
+            .expect("body-bound v2 authorization");
+        let timestamp = headers[TIMESTAMP_HEADER].to_str().expect("timestamp").to_owned();
+        headers.extend(
+            gen_tonic_replay_scope_headers(audience, path, &timestamp, &body, tonic_rpc_boot_epoch()).expect("v3 authorization"),
+        );
+        let mut malformed = headers.clone();
+        malformed.insert(RPC_SIGNATURE_V2_HEADER, HeaderValue::from_static("invalid"));
+        assert_eq!(
+            verify_tonic_rpc_signature(audience, path, &malformed)
+                .expect_err("malformed alias must be rejected")
+                .to_string(),
+            "Invalid RPC v2 signature"
+        );
+        verify_tonic_rpc_signature(audience, path, &headers)
+            .expect("a failed signature check must not consume either valid authorization");
+        assert_eq!(
+            verify_tonic_rpc_signature(audience, path, &headers)
+                .expect_err("the valid request remains single-use")
+                .to_string(),
+            "RPC request replay detected"
+        );
+    }
+
+    #[test]
+    fn timestamp_bucket_identity_requires_a_fresh_valid_signature() {
+        ensure_test_rpc_secret();
+        let audience = "time-bucket-test:9000";
+        let service = "node_service.NodeService";
+        let method = "ReadAll";
+        let path = "/node_service.NodeService/ReadAll";
+        let body = "ab".repeat(32);
+        for replay_scoped in [false, true] {
+            let mut headers = gen_tonic_signature_headers(audience, service, method, Some(&body)).expect("body-bound v2 headers");
+            let first_time = headers[TIMESTAMP_HEADER].to_str().expect("time").to_owned();
+            if replay_scoped {
+                headers.extend(
+                    gen_tonic_replay_scope_headers(audience, path, &first_time, &body, tonic_rpc_boot_epoch())
+                        .expect("v3 headers"),
+                );
+            }
+            verify_tonic_rpc_signature(audience, path, &headers).expect("first authorization");
+            let second_time = (first_time.parse::<i64>().expect("numeric time") + 1).to_string();
+            headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&second_time).expect("new time header"));
+            assert!(
+                verify_tonic_rpc_signature(audience, path, &headers).is_err(),
+                "a captured authorization cannot be moved to another bucket without signing it again"
+            );
+            let secret = get_shared_secret().expect("test signing key");
+            let signature = generate_signature_v2(
+                &secret,
+                SignatureV2Scope {
+                    background: false,
+                    audience,
+                    service,
+                    rpc_method: method,
+                    timestamp: &second_time,
+                    nonce: headers[RPC_NONCE_HEADER].to_str().expect("nonce"),
+                    content_sha256: &body,
+                },
+            )
+            .expect("fresh v2 authorization");
+            headers.insert(RPC_SIGNATURE_V2_HEADER, HeaderValue::from_str(&signature).expect("new v2 MAC"));
+            if replay_scoped {
+                let nonce = headers[RPC_REPLAY_SCOPE_NONCE_HEADER]
+                    .to_str()
+                    .expect("v3 nonce")
+                    .parse()
+                    .expect("UUID");
+                let signature = generate_replay_scope_signature(
+                    &secret,
+                    ReplayScope {
+                        background: false,
+                        audience,
+                        path,
+                        timestamp: &second_time,
+                        nonce,
+                        content_sha256: &body,
+                        boot_epoch: tonic_rpc_boot_epoch(),
+                    },
+                )
+                .expect("fresh v3 authorization");
+                headers.insert(RPC_REPLAY_SCOPE_SIGNATURE_HEADER, HeaderValue::from_str(&signature).expect("new v3 MAC"));
+            }
+            verify_tonic_rpc_signature(audience, path, &headers).expect("independently signed time is a new authorization");
+            assert_eq!(
+                verify_tonic_rpc_signature(audience, path, &headers)
+                    .expect_err("new authorization remains single-use")
+                    .to_string(),
+                "RPC request replay detected"
+            );
+            if replay_scoped {
+                headers.remove(RPC_REPLAY_SCOPE_VERSION_HEADER);
+                headers.remove(RPC_REPLAY_SCOPE_SIGNATURE_HEADER);
+                headers.remove(RPC_REPLAY_SCOPE_NONCE_HEADER);
+                headers.remove(RPC_BOOT_EPOCH_HEADER);
+                assert_eq!(
+                    verify_tonic_rpc_signature(audience, path, &headers)
+                        .expect_err("stripping v3 must not resurrect its consumed v2 alias")
+                        .to_string(),
+                    "RPC request replay detected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_resource_classification_preserves_identity_failures() {
+        for source in [
+            RpcReplayCacheAdmissionError::Capacity,
+            RpcReplayCacheAdmissionError::MemoryBudget,
+        ] {
+            assert!(rpc_auth_is_resource_exhausted(&std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                source
+            )));
+        }
+        assert!(rpc_auth_is_resource_exhausted(&std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            hashbrown::TryReserveError::CapacityOverflow
+        )));
+        for error in [
+            std::io::Error::other("RPC request replay detected"),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "unrelated failure"),
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "unrelated failure"),
+        ] {
+            assert!(!rpc_auth_is_resource_exhausted(&error));
         }
     }
 
@@ -3270,8 +3542,8 @@ mod tests {
             .check_and_record(test_nonce_record(replacement, 1_302, later, 1_302, later + REPLAY_CACHE_RETENTION, 1))
             .0
             .expect("an expired signature must release bounded cache capacity");
-        assert!(!cache.nonces.contains(&nonce));
-        assert!(cache.nonces.contains(&replacement));
+        assert!(!cache.contains_nonce(&nonce));
+        assert!(cache.contains_nonce(&replacement));
 
         let rollback = cache
             .check_and_record(test_nonce_record(nonce, 1_000, later, 1_000, later + REPLAY_CACHE_RETENTION, 1))
@@ -3316,72 +3588,253 @@ mod tests {
     }
 
     #[test]
-    fn nonce_index_rejects_unallocatable_capacity_with_typed_error() {
+    fn future_signed_nonce_does_not_block_expired_ordinary_capacity() {
+        let start = Instant::now();
         let mut cache = RpcNonceCache::default();
-        let error = cache
-            .reserve_index(usize::MAX)
-            .expect_err("unallocatable capacity must fail without a panic");
-        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
-        assert!(
-            error
-                .get_ref()
-                .is_some_and(|source| source.is::<std::collections::TryReserveError>())
-        );
-        assert_eq!(tonic_rpc_auth_failure_reason(&error), "replay_cache_allocation");
-        assert!(cache.nonces.is_empty());
-        assert!(cache.expirations.pages.is_empty());
+        let future = Uuid::from_u128(1);
+        let ordinary = Uuid::from_u128(2);
+        cache
+            .check_and_record(test_nonce_record(future, 1300, start, 1000, start + REPLAY_CACHE_RETENTION, 2))
+            .0
+            .expect("accepted forward timestamp");
+        let next = start + Duration::from_secs(1);
+        cache
+            .check_and_record(test_nonce_record(ordinary, 1001, next, 1001, next + REPLAY_CACHE_RETENTION, 2))
+            .0
+            .expect("ordinary timestamp");
+        let later = start + Duration::from_secs(303);
+        cache
+            .check_and_record(test_nonce_record(
+                Uuid::from_u128(3),
+                1303,
+                later,
+                1303,
+                later + REPLAY_CACHE_RETENTION,
+                2,
+            ))
+            .0
+            .expect("the expired ordinary signature must release capacity despite the future signature");
+        assert!(cache.contains_nonce(&future), "the future signature is still replay-protected");
+        assert!(!cache.contains_nonce(&ordinary));
+        let replay = cache
+            .check_and_record(test_nonce_record(future, 1300, later, 1303, later + REPLAY_CACHE_RETENTION, 2))
+            .0
+            .expect_err("the future signature cannot be reused");
+        assert_eq!(replay.to_string(), "RPC request replay detected");
     }
 
     #[test]
-    fn nonce_cache_reserves_the_bounded_index_before_sustained_traffic() {
-        let now = Instant::now();
-        let expiry = now + REPLAY_CACHE_RETENTION;
+    fn nonce_cache_byte_budget_stays_bounded_during_expiry_churn() {
+        let start = Instant::now();
+        let budget = REPLAY_CACHE_METADATA_BYTES + 600_000;
         let mut cache = RpcNonceCache::default();
-        let capacity = 4096;
+        for n in 0..32_768 {
+            let signed = 1000 + i64::from(n / 13);
+            let mut record =
+                test_nonce_record(Uuid::from_u128(u128::try_from(n + 1).expect("nonce")), signed, start, signed, start, 4096);
+            record.memory_budget_bytes = Some(budget);
+            cache.check_and_record(record).0.expect("bounded live window should fit");
+            assert!(cache.table_bytes + REPLAY_CACHE_METADATA_BYTES <= budget);
+            assert!(cache.entries <= 4096);
+            assert!(cache.signed_times.len() <= REPLAY_CACHE_CAPACITY_WINDOW_SECS);
+        }
+        let remaining = cache.entries;
+        assert_eq!(cache.remove_expired(10_000), remaining);
+        assert_eq!(cache.entries, 0);
+        assert_eq!(cache.table_bytes, 0);
+    }
+
+    #[test]
+    fn explicit_expiration_keeps_the_clock_rollback_fence() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let nonce = Uuid::from_u128(1);
         cache
-            .check_and_record(test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, expiry, capacity))
+            .check_and_record(test_nonce_record(nonce, 1000, now, 1000, now, 1))
             .0
-            .expect("record first nonce");
-        let allocated = cache.nonces.capacity();
-        assert!(allocated >= capacity, "the hash index must not rehash while serving the bounded window");
-        for n in 2..=capacity {
+            .expect("initial signature");
+        assert_eq!(cache.remove_expired(1301), 1);
+        let error = cache
+            .check_and_record(test_nonce_record(nonce, 1000, now, 1000, now, 1))
+            .0
+            .expect_err("cleanup must preserve the admission fence when the wall clock rolls back");
+        assert_eq!(error.to_string(), "RPC request timestamp expired after clock regression");
+    }
+
+    #[test]
+    fn nonce_cache_large_logical_capacity_does_not_eagerly_allocate_it() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        cache
+            .check_and_record(test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, now, usize::MAX))
+            .0
+            .expect("one nonce under a large operator ceiling");
+        assert_eq!(cache.entries, 1);
+        assert!(cache.table_bytes < 4096);
+        assert!(replay_cache_table_growth_bytes(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn nonce_cache_checks_old_and_new_table_peak_before_growth() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        for nonce in 1..=3 {
+            let mut record = test_nonce_record(Uuid::from_u128(nonce), 1000, now, 1000, now, 4096);
+            record.memory_budget_bytes = Some(REPLAY_CACHE_METADATA_BYTES + 1000);
+            cache.check_and_record(record).0.expect("small table fits");
+        }
+        let retained = cache.table_bytes;
+        let mut fourth = test_nonce_record(Uuid::from_u128(4), 1000, now, 1000, now, 4096);
+        fourth.memory_budget_bytes = Some(REPLAY_CACHE_METADATA_BYTES + 1000);
+        let error = cache
+            .check_and_record(fourth)
+            .0
+            .expect_err("old plus new table exceeds budget even though the replacement alone fits");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(tonic_rpc_auth_failure_reason(&error), "replay_cache_memory");
+        assert!(rpc_auth_is_resource_exhausted(&error));
+        assert_eq!(cache.entries, 3);
+        assert_eq!(cache.table_bytes, retained);
+        assert!(!cache.contains_nonce(&fourth.nonce));
+        let mut replay = fourth;
+        replay.nonce = Uuid::from_u128(1);
+        assert_eq!(
+            cache
+                .check_and_record(replay)
+                .0
+                .expect_err("budget rejection must preserve earlier replay identities")
+                .to_string(),
+            "RPC request replay detected"
+        );
+        fourth.signed_at = 1301;
+        fourth.wall_time = 1301;
+        cache
+            .check_and_record(fourth)
+            .0
+            .expect("natural expiration releases budget without evicting valid identities");
+        assert_eq!(cache.entries, 1);
+    }
+
+    #[test]
+    fn replay_cache_empty_budget_rejects_without_allocating_or_consuming_a_nonce() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let mut record = test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, now, 4096);
+        record.memory_budget_bytes = Some(REPLAY_CACHE_METADATA_BYTES);
+        assert_eq!(
+            cache.check_and_record(record).0.expect_err("no payload budget").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(cache.signed_times.is_empty());
+        assert_eq!(cache.table_bytes, 0);
+        assert_eq!(cache.entries, 0);
+        record.memory_budget_bytes = None;
+        cache
+            .check_and_record(record)
+            .0
+            .expect("rejected record must not burn its identity");
+    }
+
+    #[test]
+    fn nonce_cache_same_uuid_with_new_authenticated_time_is_a_new_authorization() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let nonce = Uuid::from_u128(1);
+        for signed in [1000, 1001] {
+            let record = test_nonce_record(nonce, signed, now, 1000, now, 2);
+            cache
+                .check_and_record(record)
+                .0
+                .expect("freshly signed time creates a distinct authorization");
+            assert_eq!(
+                cache
+                    .check_and_record(record)
+                    .0
+                    .expect_err("each authorization is one-use")
+                    .to_string(),
+                "RPC request replay detected"
+            );
+        }
+        assert_eq!(cache.entries, 2);
+    }
+
+    #[test]
+    fn nonce_cache_rechecks_forward_skew_when_recording_after_clock_rollback() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let nonce = Uuid::from_u128(1);
+        // A timestamp checked at wall time 1000 can reach the cache after a
+        // rollback. It must not create an expiry bucket beyond the bounded window.
+        let error = cache
+            .check_and_record(test_nonce_record(nonce, 1300, now, 600, now, 2))
+            .0
+            .expect_err("recording must recheck the forward validity bound");
+        assert_eq!(error.to_string(), "Request timestamp expired");
+        assert_eq!(cache.entries, 0);
+        assert!(cache.signed_times.is_empty());
+        cache
+            .check_and_record(test_nonce_record(nonce, 900, now, 600, now, 2))
+            .0
+            .expect("maximum valid forward skew must remain accepted");
+    }
+
+    #[test]
+    fn replay_cache_growth_estimate_covers_hashbrown_layouts() {
+        for entries in [1, 3, 4, 7, 8, 14, 15, 1024, 1_048_576, 3_670_016, 3_670_017, 7_340_032] {
+            let mut set: HashSet<Uuid, RandomState> = HashSet::with_hasher(RandomState::new());
+            set.try_reserve(entries).expect("test table allocation");
+            let actual = replay_cache_table_charge(u64::try_from(set.allocation_size()).expect("layout bytes"))
+                .expect("allocator allowance");
+            assert!(replay_cache_table_growth_bytes(entries).expect("growth estimate") >= actual);
+        }
+    }
+
+    #[test]
+    fn nonce_cache_signed_time_extremes_keep_inclusive_validity() {
+        let now = Instant::now();
+        for time in [i64::MIN, i64::MIN + 300, -1000, 0, i64::MAX - 300, i64::MAX] {
+            let mut cache = RpcNonceCache::default();
+            let record = test_nonce_record(Uuid::from_u128(1), time, now, time, now, 1);
+            cache.check_and_record(record).0.expect("valid extreme signed timestamp");
+            assert_eq!(
+                cache
+                    .check_and_record(record)
+                    .0
+                    .expect_err("repeat extreme timestamp")
+                    .to_string(),
+                "RPC request replay detected"
+            );
+        }
+    }
+
+    #[test]
+    fn nonce_cache_retains_all_601_signed_seconds_and_expires_only_invalid_buckets() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        for n in 0..601 {
             cache
                 .check_and_record(test_nonce_record(
-                    Uuid::from_u128(u128::try_from(n).expect("nonce index")),
-                    1000,
+                    Uuid::from_u128(u128::try_from(n + 1).expect("nonce")),
+                    700 + i64::from(n),
                     now,
                     1000,
-                    expiry,
-                    capacity,
+                    now,
+                    601,
                 ))
                 .0
-                .expect("record within bounded capacity");
+                .expect("entire signed validity window");
         }
-        assert_eq!(cache.nonces.capacity(), allocated);
-        let full = cache
-            .check_and_record(test_nonce_record(Uuid::from_u128(9999), 1000, now, 1000, expiry, capacity))
-            .0
-            .expect_err("preallocation must not relax the logical capacity fence");
-        assert_eq!(full.to_string(), "RPC replay cache capacity exceeded");
-        assert_eq!(cache.nonces.len(), capacity);
+        assert_eq!(cache.signed_times.len(), 601);
+        assert_eq!(cache.remove_expired(1000), 0);
+        assert_eq!(cache.remove_expired(1001), 1);
+        assert_eq!(cache.entries, 600);
+        assert_eq!(cache.remove_expired(1601), 600);
+        assert!(cache.signed_times.is_empty());
+        assert_eq!(cache.table_bytes, 0);
     }
 
     #[test]
-    fn replay_cache_compact_storage_fits_two_cpu_window_in_2800_mib() {
-        let decision = replay_cache_capacity_decision(
-            rustfs_utils::EnvParseOutcome::Absent,
-            2,
-            Some(2800 * 1024 * 1024),
-            Some(MemoryBasis::Cgroup),
-        );
-        assert_eq!(decision.cpu_based_capacity, 4_923_392);
-        assert_eq!(decision.capacity, decision.cpu_based_capacity);
-        assert!(decision.memory_based_capacity >= decision.capacity);
-        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-    }
-
-    #[test]
-    fn nonce_cache_expires_by_monotonic_deadline_and_fails_closed_at_capacity() {
+    fn nonce_cache_expires_by_signed_validity_and_fails_closed_at_capacity() {
         let now = Instant::now();
         let expiry = now.checked_add(REPLAY_CACHE_RETENTION).expect("test expiry should fit");
         let after_expiry = expiry.checked_add(Duration::from_secs(1)).expect("test expiry should fit");
@@ -3396,8 +3849,8 @@ mod tests {
         assert_eq!(capacity.to_string(), "RPC replay cache capacity exceeded");
         check_test_nonce_record(&mut cache, test_nonce_record(nonce_b, 702, after_expiry, 702, after_expiry, 1))
             .expect("expired nonce should release capacity");
-        assert!(!cache.nonces.contains(&nonce_a));
-        assert!(cache.nonces.contains(&nonce_b));
+        assert!(!cache.contains_nonce(&nonce_a));
+        assert!(cache.contains_nonce(&nonce_b));
     }
 
     #[test]
@@ -3410,39 +3863,49 @@ mod tests {
             let record = test_nonce_record(Uuid::from_u128(nonce), 100, start, 100, expiry, 4_096);
             cache.check_and_record(record).0.expect("first use of nonce");
         }
-        assert!(cache.expirations.capacity() >= 4_096);
-        assert_eq!(cache.remove_expired(expiry, 701), 0);
-        assert_eq!(cache.remove_expired(expiry + Duration::from_nanos(1), 400), 0);
-        assert_eq!(cache.remove_expired(expiry + Duration::from_nanos(1), 701), 4_096);
-        assert!(cache.nonces.is_empty());
-        assert_eq!(cache.nonces.capacity(), 0);
-        assert_eq!(cache.expirations.capacity(), 0, "expired entries must release their expiration storage");
+        assert_eq!(cache.entries, 4_096);
+        assert!(cache.table_bytes > 0);
+        assert_eq!(cache.remove_expired(400), 0, "inclusive signed validity stays protected");
+        assert_eq!(cache.remove_expired(401), 4_096, "invalid signatures release capacity immediately");
+        assert_eq!(cache.entries, 0);
+        assert!(cache.signed_times.is_empty());
+        assert_eq!(cache.table_bytes, 0, "expired entries must release their expiration storage");
     }
 
     #[test]
-    fn nonce_expirations_preserve_exact_deadlines_across_pages() {
-        let expiry = Instant::now();
-        let first = Uuid::from_u128(1);
-        let second = Uuid::from_u128(2);
-        let third = Uuid::from_u128(3);
-        let fourth = Uuid::from_u128(4);
-        let mut queue = super::RpcNonceExpirations::default();
-        let next = expiry + Duration::from_nanos(1);
-        let later = expiry + Duration::from_secs(5);
+    fn nonce_cache_releases_expired_bucket_without_touching_future_identities() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        for n in 1..=2048 {
+            let signed = if n % 2 == 0 { 1300 } else { 1000 };
+            cache
+                .check_and_record(test_nonce_record(Uuid::from_u128(n), signed, now, 1000, now, 4096))
+                .0
+                .expect("two validity buckets");
+        }
+        let before = cache.table_bytes;
+        assert_eq!(cache.remove_expired(1301), 1024);
+        assert!(cache.table_bytes < before);
+        for n in 2049..=3072 {
+            cache
+                .check_and_record(test_nonce_record(Uuid::from_u128(n), 1301, now, 1301, now, 4096))
+                .0
+                .expect("new time bucket");
+        }
+        for n in 1..=3072 {
+            assert_eq!(cache.contains_nonce(&Uuid::from_u128(n)), n > 2048 || n % 2 == 0);
+        }
+        assert_eq!(cache.entries, 2048);
+    }
 
-        queue.push_back(expiry, 501, first);
-        queue.push_back(next, 500, second);
-        queue.push_back(later, 505, third);
-        queue.push_back(later, i64::MAX, fourth);
-        assert_eq!(queue.pages.len(), 3);
-        assert_eq!(queue.pop_expired(next, 501), None);
-        assert_eq!(queue.pop_expired(next, 502), Some(first));
-        assert_eq!(queue.pop_expired(next, 502), None);
-        assert_eq!(queue.pop_expired(later, 502), Some(second));
-        assert_eq!(queue.pages.len(), 2);
-        assert_eq!(queue.pop_expired(later, 506), None);
-        assert_eq!(queue.pop_expired(later + Duration::from_nanos(1), 506), Some(third));
-        assert_eq!(queue.pop_expired(later + Duration::from_nanos(1), i64::MAX), None);
+    #[test]
+    fn replay_cache_field_budget_is_not_a_promise_of_fixed_entry_throughput() {
+        let memory = 31_u64 * 1024 * 1024 * 1024 / 4;
+        let decision =
+            replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 4, Some(memory), Some(MemoryBasis::Cgroup));
+        assert_eq!(decision.memory_budget_bytes, Some(replay_cache_memory_budget(memory)));
+        assert!(decision.capacity >= 40_000 * 301);
+        assert_eq!(decision.capacity, decision.memory_based_capacity);
     }
 
     #[test]
