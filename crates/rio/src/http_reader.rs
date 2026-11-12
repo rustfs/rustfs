@@ -606,7 +606,7 @@ fn apply_http_data_plane_liveness(builder: reqwest::ClientBuilder) -> reqwest::C
         .http2_keep_alive_interval(None::<std::time::Duration>)
 }
 
-async fn build_http_client(
+async fn build_http_client<const DIRECT: bool>(
     disable_proxy: bool,
     tuning: InternodeHttpClientTuning,
     outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
@@ -614,6 +614,11 @@ async fn build_http_client(
     let mut builder = apply_http_data_plane_liveness(Client::builder().connect_timeout(std::time::Duration::from_secs(5)));
     builder = apply_http_client_tuning(builder, tuning);
 
+    if DIRECT {
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+    }
     if disable_proxy {
         builder = builder.no_proxy();
     }
@@ -692,7 +697,16 @@ fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) ->
     }
 }
 
-async fn get_http_client(url: &str) -> io::Result<Client> {
+const fn http_client_cache<const DIRECT: bool>() -> &'static arc_swap::ArcSwapOption<CachedClients> {
+    #[cfg(feature = "internode-transport")]
+    if DIRECT {
+        static DIRECT_CLIENT_CACHE: arc_swap::ArcSwapOption<CachedClients> = arc_swap::ArcSwapOption::const_empty();
+        return &DIRECT_CLIENT_CACHE;
+    }
+    &CLIENT_CACHE
+}
+
+async fn get_http_client<const DIRECT: bool>(url: &str) -> io::Result<Client> {
     let tuning = internode_http_client_tuning();
     // Reuse HTTP connection pools while honoring the configured internode proxy
     // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
@@ -702,7 +716,8 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
     // the full PEM + identity bytes when the TLS state hasn't changed.
     let generation = crate::http_runtime_sources::outbound_tls_generation();
 
-    let previous = CLIENT_CACHE.load_full();
+    let cache = const { http_client_cache::<DIRECT>() };
+    let previous = cache.load_full();
     if let Some(cached) = previous.as_ref() {
         if cached.generation == generation {
             return Ok(cached.client_for(disable_proxy));
@@ -713,8 +728,8 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
     // Cache miss or stale generation — load full outbound TLS state.
     let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
-    let built = match build_http_client(false, tuning, &outbound_tls).await {
-        Ok(client) => match build_http_client(true, tuning, &outbound_tls).await {
+    let built = match build_http_client::<DIRECT>(false, tuning, &outbound_tls).await {
+        Ok(client) => match build_http_client::<DIRECT>(true, tuning, &outbound_tls).await {
             Ok(no_proxy_client) => Ok((client, no_proxy_client)),
             Err(err) => Err(err),
         },
@@ -725,7 +740,7 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
         Err(err) => {
             // Prefer serving with the previous TLS generation over failing the
             // request outright; the stale-generation metric already fired above.
-            if let Some(cached) = previous {
+            if !DIRECT && let Some(cached) = previous {
                 warn!(
                     error = %err,
                     stale_generation = cached.generation,
@@ -746,7 +761,7 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
     // Guard against races: only overwrite the cache if it is empty or contains an
     // older generation, so a slower task cannot regress the TLS state after a
     // faster task already cached a newer generation.
-    CLIENT_CACHE.rcu(|current| match current {
+    cache.rcu(|current| match current {
         Some(existing) if existing.generation > generation => Some(existing.clone()),
         _ => Some(cached.clone()),
     });
@@ -757,7 +772,7 @@ async fn get_fresh_http_client(url: &str) -> io::Result<Client> {
     let tuning = internode_http_client_tuning();
     let disable_proxy = should_disable_proxy_for_url(url, tuning);
     let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
-    build_http_client(disable_proxy, tuning, &outbound_tls).await
+    build_http_client::<false>(disable_proxy, tuning, &outbound_tls).await
 }
 
 fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
@@ -999,6 +1014,14 @@ pin_project! {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReaderConnection {
+    Pooled,
+    Fresh,
+    #[cfg(feature = "internode-transport")]
+    Direct,
+}
+
 impl HttpReader {
     pub async fn new(url: String, method: Method, headers: HeaderMap, body: Option<Vec<u8>>) -> io::Result<Self> {
         // http_log!("[HttpReader::new] url: {url}, method: {method:?}, headers: {headers:?}");
@@ -1015,15 +1038,22 @@ impl HttpReader {
         Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, stall_timeout).await
     }
 
-    pub async fn new_fresh_connection_with_stall_timeout(
+    /// Send one authenticated POST without HTTP redirects or automatic resubmission.
+    /// Uses the current internode TLS configuration and a pooled connection for the selected peer.
+    #[cfg(feature = "internode-transport")]
+    pub async fn post_without_redirects(
         url: String,
-        method: Method,
         headers: HeaderMap,
-        body: Option<Vec<u8>>,
-        stall_timeout: Option<Duration>,
+        body: Vec<u8>,
+        stall_timeout: Duration,
     ) -> io::Result<Self> {
-        let init = Self::open(&url, &method, &headers, body, stall_timeout, true).await?;
-        Ok(Self {
+        let method = Method::POST;
+        let init = Self::open(&url, &method, &headers, Some(body), Some(stall_timeout), ReaderConnection::Direct).await?;
+        Ok(Self::from_response(url, method, headers, init))
+    }
+
+    fn from_response(url: String, method: Method, headers: HeaderMap, init: HttpReaderInit) -> Self {
+        Self {
             inner: StreamReader::new(init.stream),
             url,
             method,
@@ -1034,7 +1064,18 @@ impl HttpReader {
             stall_timeout: init.stall_timeout,
             request_started: init.request_started,
             duration_recorded: false,
-        })
+        }
+    }
+
+    pub async fn new_fresh_connection_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Fresh).await?;
+        Ok(Self::from_response(url, method, headers, init))
     }
 
     /// Create a new HttpReader from a URL. The request is performed immediately.
@@ -1056,19 +1097,8 @@ impl HttpReader {
         _read_buf_size: usize,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let init = Self::open(&url, &method, &headers, body, stall_timeout, false).await?;
-        Ok(Self {
-            inner: StreamReader::new(init.stream),
-            url,
-            method,
-            headers,
-            track_internode_metrics: init.track_internode_metrics,
-            internode_operation: init.internode_operation,
-            stall_timer: None,
-            stall_timeout: init.stall_timeout,
-            request_started: init.request_started,
-            duration_recorded: false,
-        })
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Pooled).await?;
+        Ok(Self::from_response(url, method, headers, init))
     }
 
     async fn open(
@@ -1077,14 +1107,15 @@ impl HttpReader {
         headers: &HeaderMap,
         body: Option<Vec<u8>>,
         stall_timeout: Option<Duration>,
-        force_fresh_connection: bool,
+        connection: ReaderConnection,
     ) -> io::Result<HttpReaderInit> {
         let track_internode_metrics = is_internode_rpc_url(url);
         let internode_operation = internode_rpc_operation(url);
-        let client = if force_fresh_connection {
-            get_fresh_http_client(url).await
-        } else {
-            get_http_client(url).await
+        let client = match connection {
+            ReaderConnection::Fresh => get_fresh_http_client(url).await,
+            ReaderConnection::Pooled => get_http_client::<false>(url).await,
+            #[cfg(feature = "internode-transport")]
+            ReaderConnection::Direct => get_http_client::<true>(url).await,
         }
         .inspect_err(|_| {
             record_internode_error(track_internode_metrics, internode_operation);
@@ -1221,7 +1252,7 @@ impl HttpChunkReader {
         body: Option<Vec<u8>>,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, false).await?;
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Pooled).await?;
         Ok(Self {
             inner: init.stream,
             current: None,
@@ -1242,7 +1273,7 @@ impl HttpChunkReader {
         body: Option<Vec<u8>>,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, true).await?;
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Fresh).await?;
         Ok(Self {
             inner: init.stream,
             current: None,
@@ -1505,7 +1536,7 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = match get_http_client(&url_clone).await {
+            let client = match get_http_client::<false>(&url_clone).await {
                 Ok(client) => client,
                 Err(err) => {
                     record_internode_error(track_internode_metrics, internode_operation);

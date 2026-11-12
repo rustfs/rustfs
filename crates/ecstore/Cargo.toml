@@ -34,6 +34,7 @@ name = "internode_rpc_bench"
 test = true
 
 [features]
+internode-transport = []
 default = []
 fips = ["rustfs-s3-client/fips", "rustfs-utils/fips", "rustfs-tls-runtime/fips"]
 diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]

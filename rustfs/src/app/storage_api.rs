@@ -1854,6 +1854,8 @@ pub(crate) mod context {
         TableDataPlanePublicationGuards,
     };
     pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use crate::storage::storage_api::rpc_consumer::InstalledControlService;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
