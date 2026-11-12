@@ -1626,7 +1626,7 @@ mod tests {
 
         for disk_error in disk_errors {
             let original_message = disk_error.to_string();
-            let io_error: std::io::Error = disk_error.clone().into();
+            let io_error: std::io::Error = disk_error.into();
 
             // The io::Error should contain the original error message
             assert!(io_error.to_string().contains(&original_message));
