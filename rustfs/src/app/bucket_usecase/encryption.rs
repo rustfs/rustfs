@@ -194,7 +194,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
-    use crate::app::storage_api::s3 as s3s_crate;
+    use crate::app::storage_api::s3::dto;
     use http::Method;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
@@ -275,9 +275,9 @@ mod tests {
         // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(s3s_crate::dto::ServerSideEncryptionConfiguration {
-                rules: vec![s3s_crate::dto::ServerSideEncryptionRule {
-                    apply_server_side_encryption_by_default: Some(s3s_crate::dto::ServerSideEncryptionByDefault {
+            .server_side_encryption_configuration(dto::ServerSideEncryptionConfiguration {
+                rules: vec![dto::ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(dto::ServerSideEncryptionByDefault {
                         sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
                         kms_master_key_id: None,
                     }),

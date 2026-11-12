@@ -19,9 +19,9 @@ use crate::app::storage_api::s3::dto::{
     ChecksumAlgorithm, ChecksumType, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
     ObjectLockRetentionMode, Range, SSEKMSKeyId, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
 };
+use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
-use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 

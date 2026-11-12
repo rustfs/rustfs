@@ -55,8 +55,6 @@ pub(crate) mod s3 {
     pub(crate) use s3s::S3Response;
     pub(crate) use s3s::StdError;
     #[cfg(test)]
-    pub(crate) use s3s::access;
-    #[cfg(test)]
     pub(crate) use s3s::access::S3Access;
     #[cfg(test)]
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};

@@ -15,7 +15,7 @@
 //! Bucket tagging use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3 as s3s_crate;
+use crate::app::storage_api::s3::dto;
 use crate::app::storage_api::s3::dto::{
     DeleteBucketTaggingInput, DeleteBucketTaggingOutput, GetBucketTaggingInput, PutBucketTaggingInput, PutBucketTaggingOutput,
 };
@@ -92,10 +92,10 @@ impl DefaultBucketUsecase {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, .. } = req.input;
-        let s3_tag_set: Vec<s3s_crate::dto::Tag> = tagging
+        let s3_tag_set: Vec<dto::Tag> = tagging
             .tag_set
             .iter()
-            .map(|tag| s3s_crate::dto::Tag {
+            .map(|tag| dto::Tag {
                 key: tag.key.clone(),
                 value: tag.value.clone(),
             })
@@ -157,9 +157,9 @@ mod tests {
     fn put_bucket_tagging_rejects_invalid_shapes_before_storage_mutation() {
         crate::app::gating_test_env::run_large_stack_test("bucket-tag-validation", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
+            use crate::app::storage_api::s3::S3Access as _;
             use crate::app::storage_api::test::ReqInfo;
             use crate::app::storage_api::test::ecfs::FS;
-            use s3s_crate::access::S3Access as _;
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
@@ -181,14 +181,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let tag = s3s_crate::dto::Tag {
+            let tag = dto::Tag {
                 key: Some("team".to_owned()),
                 value: Some("storage".to_owned()),
             };
             for (tag_set, valid) in [
                 (vec![tag.clone()], true),
                 (
-                    vec![s3s_crate::dto::Tag {
+                    vec![dto::Tag {
                         key: Some("team".to_owned()),
                         value: None,
                     }],
@@ -207,7 +207,7 @@ mod tests {
                 };
                 let input = PutBucketTaggingInput::builder()
                     .bucket(bucket.clone())
-                    .tagging(s3s_crate::dto::Tagging { tag_set })
+                    .tagging(dto::Tagging { tag_set })
                     .build()
                     .unwrap();
                 let mut req = build_request(input, Method::PUT);

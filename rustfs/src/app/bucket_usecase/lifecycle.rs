@@ -341,7 +341,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
-    use crate::app::storage_api::s3 as s3s_crate;
+    use crate::app::storage_api::s3::dto;
     use crate::app::storage_api::s3::dto::{
         BucketLifecycleConfiguration, LifecycleExpiration, NoncurrentVersionTransition, Transition, TransitionStorageClass,
     };
@@ -551,7 +551,7 @@ mod tests {
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s_crate::dto::AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: Some(dto::AbortIncompleteMultipartUpload {
                     days_after_initiation: Some(0),
                 }),
                 del_marker_expiration: None,
