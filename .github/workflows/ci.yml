@@ -552,7 +552,7 @@ jobs:
       # hold. `cargo check --release` is metadata-only and needs no
       # link-concurrency limit; it is cold because ci-dev holds no release
       # artifacts.
-      - name: Reject short credentials in release builds
+      - name: Reject debug-only features in release builds
         run: python3 scripts/check_connect_release_boundary.py
 
       - name: Check offline enrollment E2E root boundary
@@ -764,9 +764,9 @@ jobs:
     # The gateway S3 stack (rustfs/backlog#2734) sits behind the rustfs
     # `gateway-stack` feature, which no other pull-request lane lints or tests.
     # Unlike the dormant feature lanes above, this one runs for every code
-    # change: each operation slice puts its handler tests, its authorization
-    # census and its end-to-end refusal test behind the feature, and a lane that
-    # ran only on demand would let them rot behind a green pull request.
+    # change: each operation slice puts its handler tests and its refusal-matrix
+    # row behind the feature, and a lane that ran only on demand would let them
+    # rot behind a green pull request.
     if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     # Self-hosted for build scale and cache ownership: a workspace-scale Cargo
@@ -794,9 +794,10 @@ jobs:
       - name: Run clippy with gateway-stack
         run: cargo clippy --locked -p rustfs --all-targets --features gateway-stack -- -D warnings
 
-      # The gateway stack's own tests: the assembly, the authorizer table and
-      # its census, the handler template, the migrated use cases, and the
-      # embedded server driven through the whole middleware stack.
+      # The gateway stack's own tests: the assembly, the operation table and
+      # its completeness, the shared handler sequence, the stack selection, and
+      # the embedded server driven through the whole middleware stack. The
+      # filter names modules, never operations.
       - name: Run tests with gateway-stack
         env:
           # The same bounded link concurrency as the other feature lanes.
@@ -804,7 +805,7 @@ jobs:
         run: |
           cargo nextest run --profile ci --locked -p rustfs --features gateway-stack --no-tests fail \
             --status-level all --final-status-level all \
-            -E 'test(/gateway_stack|gateway_handlers|server::stack::|list_buckets|legacy_stack_is_always_selectable/) | binary(embedded_gateway_stack_test)'
+            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | binary(embedded_gateway_stack_test)'
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary

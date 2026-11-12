@@ -97,9 +97,9 @@ runs:
       shell: bash
       run: ./scripts/check_s3s_footprint.sh
 
-    - name: Check gateway-stack release boundary
+    - name: Check release feature boundaries
       shell: bash
-      run: ./scripts/check_gateway_stack_release_boundary.sh
+      run: python3 scripts/check_connect_release_boundary.py --features-only
 
     - name: Check per-crate test-count ratchet
       shell: bash
