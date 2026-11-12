@@ -6538,6 +6538,8 @@ mod tests {
         temp_env::async_with_vars(
             [
                 ("RUSTFS_INTERNODE_PREWARM", Some("false")),
+                // The transport fixture uses the existing directory deployment test mode.
+                ("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", Some("true")),
                 ("RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES", Some("0")),
             ],
             async {
