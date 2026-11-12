@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::route_table::{RouteTable, canonicalize_admin_path, is_admin_v4_fallback_path, route_key_canonical};
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
@@ -27,7 +28,7 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::admin::operation::{AdminRequest, Operation as OwnedOperation};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -39,8 +40,8 @@ use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_u
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
-    is_sts_query_request, is_table_catalog_path,
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path, is_sts_query_request,
+    is_table_catalog_path,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -55,7 +56,6 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
-use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
@@ -3373,15 +3373,13 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
 }
 
 pub struct S3Router<T> {
-    router: Router<T>,
+    table: RouteTable<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
     /// This server's request-path context slot (backlog#1052 S2). Injected
     /// into every request's extensions at dispatch so the static admin
     /// operations can resolve their server's store.
     server_ctx: Option<Arc<ServerContextSlot>>,
-    #[cfg(test)]
-    registered_routes: Vec<String>,
 }
 
 fn is_public_health_path(path: &str) -> bool {
@@ -3435,26 +3433,8 @@ fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
         && query_value_exact(uri, "token").is_some_and(|token| !token.is_empty())
 }
 
-fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if is_admin_path(path)
-        && let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX)
-    {
-        return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
-    }
-
-    std::borrow::Cow::Borrowed(path)
-}
-
-fn is_admin_v4_fallback_path(path: &str) -> bool {
-    path.strip_prefix(ADMIN_PREFIX)
-        .or_else(|| path.strip_prefix(MINIO_ADMIN_PREFIX))
-        .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
-}
-
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
-        let router = Router::new();
-
         let console_router = if console_enabled {
             Some(make_console_server().into_service::<Body>())
         } else {
@@ -3462,12 +3442,10 @@ impl<T: Operation> S3Router<T> {
         };
 
         Self {
-            router,
+            table: RouteTable::new(),
             console_enabled,
             console_router,
             server_ctx: None,
-            #[cfg(test)]
-            registered_routes: Vec::new(),
         }
     }
 
@@ -3478,45 +3456,26 @@ impl<T: Operation> S3Router<T> {
     }
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
-        let path = Self::make_route_str(method, path);
-        #[cfg(test)]
-        let registered_path = path.clone();
-
-        // warn!("set uri {}", &path);
-
-        self.router.insert(path, operation).map_err(std::io::Error::other)?;
-
-        #[cfg(test)]
-        self.registered_routes.push(registered_path);
-
-        Ok(())
-    }
-
-    fn make_route_str(method: Method, path: &str) -> String {
-        format!("{}|{}", method.as_str(), path)
+        self.table.insert(method, path, operation)
     }
 }
 
 #[cfg(test)]
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
-        let route = Self::make_route_str(method, path);
-        self.router.at(&route).is_ok()
+        self.table.contains_route(method, path)
     }
 
     pub(crate) fn contains_compatible_route(&self, method: Method, path: &str) -> bool {
-        let canonical_path = canonicalize_admin_path(path);
-        let route = Self::make_route_str(method, canonical_path.as_ref());
-        self.router.at(&route).is_ok()
+        self.table.contains_compatible_route(method, path)
     }
 
-    #[cfg(test)]
     pub(crate) fn registered_routes(&self) -> &[String] {
-        &self.registered_routes
+        self.table.registered_routes()
     }
 }
 
-impl<T: Operation> Default for S3Router<T> {
+impl<T> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
     }
@@ -3525,7 +3484,7 @@ impl<T: Operation> Default for S3Router<T> {
 #[async_trait::async_trait]
 impl<T> S3Route for S3Router<T>
 where
-    T: Operation,
+    T: OwnedOperation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, extensions: &mut Extensions) -> bool {
         if parse_replication_extension_request(method, uri).is_some() || parse_misc_extension_request(method, uri).is_some() {
@@ -3648,14 +3607,15 @@ where
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
         }
 
-        let canonical_path = canonicalize_admin_path(req.uri.path());
-        let uri = format!("{}|{}", req.method, canonical_path.as_ref());
+        let key = route_key_canonical(&req.method, req.uri.path());
 
-        if let Ok(mat) = self.router.at(&uri) {
+        if let Ok(mat) = self.table.at(&key) {
             let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            let response = resp.map_output(|x| x.1);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+            let request = AdminRequest::new(envelope, req.input.into());
+            let (status, headers, body) = op.call(request, mat.params).await?.into_parts();
+            let mut response = S3Response::with_headers(body.into(), headers);
+            response.status = Some(status);
 
             return Ok(response);
         }
@@ -3670,45 +3630,15 @@ where
     }
 }
 
-#[async_trait::async_trait]
-pub trait Operation: Send + Sync + 'static {
-    // fn method() -> Method;
-    // fn uri() -> &'static str;
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>>;
-}
-
-pub struct AdminOperation(pub &'static dyn Operation);
+/// Registers one owned admin operation with the legacy router. The router
+/// converts the request and response at its edge, so the operation never sees
+/// an s3s type.
+pub struct AdminOperation(pub(crate) &'static dyn OwnedOperation);
 
 #[async_trait::async_trait]
-impl Operation for AdminOperation {
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
+impl OwnedOperation for AdminOperation {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
         self.0.call(req, params).await
-    }
-}
-
-/// Every owned admin operation also serves the legacy router. The request
-/// and response are converted at this edge, so handlers that implement the
-/// owned [`OwnedOperation`] trait register with `AdminOperation(&Handler {})`
-/// exactly like legacy ones and never see an s3s type.
-#[async_trait::async_trait]
-impl<T: OwnedOperation> Operation for T {
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        let request = AdminRequest::new(envelope, req.input.into());
-        let (status, headers, body) = OwnedOperation::call(self, request, params).await?.into_parts();
-        Ok(S3Response::with_headers((status, body.into()), headers))
     }
 }
 
@@ -3863,13 +3793,9 @@ mod tests {
     struct StatusOperation(StatusCode);
 
     #[async_trait::async_trait]
-    impl Operation for StatusOperation {
-        async fn call(
-            &self,
-            _req: S3Request<Body>,
-            _params: Params<'_, '_>,
-        ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
-            Ok(S3Response::new((self.0, Body::empty())))
+    impl OwnedOperation for StatusOperation {
+        async fn call(&self, _req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            Ok(AdminResponse::new(self.0, OwnedBody::empty()))
         }
     }
 
@@ -3923,7 +3849,7 @@ mod tests {
     static IDENTITY_OPERATION: IdentityOperation = IdentityOperation;
     static ECHO_OPERATION: EchoOperation = EchoOperation;
 
-    fn owned_router(path: &str, operation: &'static dyn Operation) -> S3Router<AdminOperation> {
+    fn owned_router(path: &str, operation: &'static dyn OwnedOperation) -> S3Router<AdminOperation> {
         let mut router = S3Router::new(false);
         router
             .insert(Method::GET, path, AdminOperation(operation))

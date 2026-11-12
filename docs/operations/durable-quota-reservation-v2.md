@@ -171,6 +171,37 @@ Each attempt logs one `quota_reservation_protocol_migration` event
 `failed`) and increments
 `rustfs_quota_reservation_protocol_migrations_total` with the same labels.
 
+## Quota changes and peer reload reports
+
+For both reservation protocols v1 and v2, native `PUT /rustfs/admin/v3/quota/{bucket}` and `DELETE /rustfs/admin/v3/quota/{bucket}` include `metadata_reload` in the existing JSON response. The configuration is committed before peer reloads begin. A failed or unavailable reload report preserves HTTP `200` and the committed configuration; it does not turn the save or clear into a failure. The [quota handlers](../../rustfs/src/admin/handlers/quota.rs), including `notify_quota_metadata_reload`, own this response contract.
+
+For example, a successful save with one unconfirmed peer returns:
+
+```json
+{
+  "bucket": "photos",
+  "quota": 8192,
+  "size": null,
+  "quota_type": "HARD",
+  "metadata_reload": {
+    "status": "incomplete",
+    "unconfirmed_peers": ["node-b:9000"]
+  }
+}
+```
+
+| `metadata_reload.status` | `metadata_reload.unconfirmed_peers` | Meaning |
+| --- | --- | --- |
+| `complete` | `[]` | Every targeted peer acknowledged this reload request. |
+| `incomplete` | A nonempty array, such as `["node-b:9000"]` | The report is complete, and the array names every peer whose reload was not confirmed; this can include all targeted peers. |
+| `unknown` | `null` | A complete report could not be obtained; no complete list of unconfirmed peers is available. |
+
+Peer identifiers are configured cluster host identifiers, not guaranteed client-accessible URLs. The report describes acknowledgements collected for this request, without binding them to a particular quota revision or bucket incarnation. A peer may have completed its reload before a timeout prevented confirmation. Concurrent quota changes can supersede the saved value. The report does not describe current quota enforcement or site-replication outcomes.
+
+Reloads retain the existing parallel RPCs and per-peer timeout and retry budget in `PeerRestClient::load_bucket_metadata` in the [peer RPC client](../../crates/ecstore/src/cluster/rpc/peer_rest_client.rs). Reporting adds no new retry loop and does not change object PUT admission. Unconfirmed peers can converge through `refresh_buckets_metadata_loop` in the [bucket metadata service](../../crates/ecstore/src/bucket/metadata_sys.rs); its 15-minute refresh interval is a scheduling period, not an upper bound on convergence when reloads continue to fail.
+
+Read-only quota GET responses and the MinIO-compatible quota endpoints retain their existing formats, including the empty body from compatible SET. A response from an older server without `metadata_reload` means that no report was provided; clients must not interpret the missing field as confirmation from all peers. The existing Console and rc quota flows ignore the added field and require client support to display it. Clients consuming the report should keep save or clear success separate from a warning about unconfirmed or unknown reload outcomes.
+
 ## Usage reporting for durable quotas
 
 For a bucket on protocol v1 or v2 the request-path quota check and the admin

@@ -14,7 +14,7 @@ KMS resources use the same empty-account ARN form as S3 resources:
 | `arn:aws:kms:::key/<key_id>` | exactly that key |
 | `arn:aws:kms:::key/app-*` | every key whose id starts with `app-` |
 | `arn:aws:kms:::*` | every key |
-| `arn:aws:kms:::alias/<name>` | reserved; matches nothing until alias resolution ships |
+| `arn:aws:kms:::alias/<name>` | reserved; matches nothing, including a request that names that alias |
 
 Rules worth knowing before writing a policy:
 
@@ -24,7 +24,8 @@ Rules worth knowing before writing a policy:
 - A KMS statement whose resources are S3 ARNs predates KMS resources. It is still loadable, but the S3 patterns never constrained key access, so evaluation ignores them, treats the statement as unscoped, and logs a warning. Rewrite these with real KMS resources.
 - `PutBucketPolicy` rejects any statement carrying a `kms:` action or a KMS resource. KMS grants belong to identities. Bucket policies stored before this check still load; evaluation skips their pure-KMS statements and warns.
 - `Deny` wins, as everywhere else: a `Deny` on `arn:aws:kms:::key/payroll-*` overrides an `Allow` on `arn:aws:kms:::*`.
-- The key identifier matched is the one the request names, before any alias resolution.
+- Write a key pattern with the **key id**. A request may name an AWS key by its id or by its ARN (`arn:<partition>:kms:<region>:<account>:key/<key_id>`); both are matched as that key id, so one statement covers either spelling. An ARN cannot be written as a pattern, because a key pattern may not contain `/`.
+- A request that names a key by **alias** (`alias/<name>` or an alias ARN) names a key only the backend can resolve, so it fails closed against key-scoped statements: every `Deny` that carries a KMS resource applies to it, and only an `Allow` on every key (`arn:aws:kms:::*`, or a statement with no resource) covers it. Name keys by id or ARN wherever a key-scoped policy is in force.
 
 ## Built-in role templates
 

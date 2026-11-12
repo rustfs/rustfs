@@ -12,7 +12,7 @@
 # Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	1026	20
-rustfs	6440	64
+rustfs	6449	64
 rustfs-audit	70	0
 rustfs-checksums	28	1
 rustfs-common	36	0

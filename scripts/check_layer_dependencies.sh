@@ -22,7 +22,8 @@ classify_source_layer() {
     printf 'composition'
   elif [[ "$file" == rustfs/src/app/* ]]; then
     printf 'app'
-  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]] ||
+  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] ||
+    [[ "$file" == rustfs/src/storage/legacy_edge/* ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]] ||
     [[ "$file" == rustfs/src/storage/s3_compat/* ]]; then
     printf 'interface'
   elif [[ "$file" == rustfs/src/* ]]; then
@@ -55,6 +56,7 @@ classify_target_layer() {
     storage)
       storage_path="${path#storage::}"
       if [[ "$storage_path" == "ecfs" ]] || [[ "$storage_path" == ecfs::* ]] ||
+        [[ "$storage_path" == "legacy_edge" ]] || [[ "$storage_path" == legacy_edge::* ]] ||
         [[ "$storage_path" == "s3_api" ]] || [[ "$storage_path" == s3_api::* ]] ||
         [[ "$storage_path" == "s3_compat" ]] || [[ "$storage_path" == s3_compat::* ]]; then
         printf 'interface'
@@ -137,6 +139,60 @@ run_layer_model_self_tests() {
   assert_dependency_direction 'allowed' "$s3_compat_source" "$app_target"
   assert_dependency_direction 'reverse' "$app_source" "$s3_compat_target"
   assert_dependency_direction 'reverse' "$storage_source" "$s3_compat_target"
+
+  # A mechanical split moves ecfs.rs code into storage/legacy_edge/ and the
+  # usecase files' code into same-named directories; each keeps its layer.
+  assert_source_layer 'interface' rustfs/src/storage/ecfs.rs
+  assert_source_layer 'interface' rustfs/src/storage/legacy_edge/bucket_core.rs
+  assert_source_layer 'interface' rustfs/src/storage/legacy_edge/tests/object_meta.rs
+  assert_source_layer 'infra' rustfs/src/storage/legacy_edge.rs
+  assert_source_layer 'infra' rustfs/src/storage/legacy_edge_helper.rs
+  assert_source_layer 'app' rustfs/src/app/bucket_usecase/cors.rs
+  assert_source_layer 'app' rustfs/src/app/multipart_usecase/complete.rs
+  assert_target_layer 'interface' storage::legacy_edge
+  assert_target_layer 'interface' storage::legacy_edge::object_meta
+  assert_target_layer 'infra' storage::legacy_edge_helper
+  assert_dependency_direction 'allowed' "$(classify_source_layer rustfs/src/storage/legacy_edge/bucket_core.rs)" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$(classify_target_layer storage::legacy_edge::bucket_core)"
+  assert_dependency_direction 'reverse' "$storage_source" "$(classify_target_layer storage::legacy_edge)"
+  assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test.rs
+  assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test/put.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api_test_support.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/bucket_usecase/cors.rs
+  assert_dedicated_test_file 'no' rustfs/src/storage/legacy_edge/bucket_core.rs
+}
+
+assert_source_layer() {
+  local expected="$1" file="$2" actual
+
+  actual="$(classify_source_layer "$file")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s classified as %s (expected %s)\n' "$file" "$actual" "$expected" >&2
+    exit 1
+  fi
+}
+
+assert_target_layer() {
+  local expected="$1" path="$2" actual
+
+  actual="$(classify_target_layer "$path")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: crate::%s classified as %s (expected %s)\n' "$path" "$actual" "$expected" >&2
+    exit 1
+  fi
+}
+
+assert_dedicated_test_file() {
+  local expected="$1" file="$2" actual='no'
+
+  if is_dedicated_test_file "$file"; then
+    actual='yes'
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s dedicated test file = %s (expected %s)\n' "$file" "$actual" "$expected" >&2
+    exit 1
+  fi
 }
 
 normalize_import_group_item() {
@@ -251,11 +307,20 @@ normalize_import_path() {
   printf '%s\n' "$path"
 }
 
+# The guard is file-scoped: dedicated test modules are excluded, while inline
+# #[cfg(test)] imports remain subject to the source file's layer. The
+# lifecycle_transition_api_test/ directory is where a mechanical split of
+# lifecycle_transition_api_test.rs moves its tests (rustfs/backlog#2765).
+is_dedicated_test_file() {
+  local file="$1"
+
+  [[ "$file" == *_test.rs ]] || [[ "$file" == */tests/* ]] ||
+    [[ "$file" == rustfs/src/app/lifecycle_transition_api_test/* ]]
+}
+
 emit_crate_use_statements() {
   (cd "$ROOT_DIR" && rg --files -g '*.rs' rustfs/src | while IFS= read -r file; do
-    # The guard is file-scoped: dedicated test modules are excluded, while
-    # inline #[cfg(test)] imports remain subject to the source file's layer.
-    if [[ "$file" == *_test.rs ]] || [[ "$file" == */tests/* ]]; then
+    if is_dedicated_test_file "$file"; then
       continue
     fi
     perl -0777 -ne '

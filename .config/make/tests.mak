@@ -62,8 +62,11 @@ script-tests: ## Run shell script tests
 	./scripts/check_embedded_secrets.sh --self-test
 	./scripts/check_s3s_footprint.sh --self-test
 	./scripts/test_check_test_count_ratchet.sh
+	./scripts/test_guard_source_set.sh
+	./scripts/test_split_guard_rules.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_bucket_usecase.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_lifecycle_transition_api_test.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
@@ -95,6 +98,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_junit_diff.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_api_coverage.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_reference_parity.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
