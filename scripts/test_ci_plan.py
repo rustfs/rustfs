@@ -535,6 +535,13 @@ class GateTests(unittest.TestCase):
             with self.subTest(event=event), self.assertRaises(ValueError):
                 gate.expected_results('proven', event, 'refs/heads/main')
 
+    def test_the_queue_run_that_proves_a_push_validates_everything_that_push_would(self):
+        queued = {job for job, result in gate.expected_results('full', 'merge_group', 'refs/heads/main').items() if result == 'success'}
+        for ref in gate.INTEGRATION_PUSH_REFS:
+            pushed = {job for job, result in gate.expected_results('full', 'push', ref).items() if result == 'success'}
+            with self.subTest(ref=ref):
+                self.assertLessEqual(pushed, queued)
+
     def test_legacy_base_cannot_authorize_skipped_new_jobs(self):
         expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
         needs = {job: {'result': result} for job, result in expected.items()}
