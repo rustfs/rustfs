@@ -8144,9 +8144,9 @@ mod tests {
                     assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 4);
                     assert_eq!(setup.available_shards(), 4);
                     assert_eq!(setup.deferred_shards(), 4);
-                    for index in 4..8 {
+                    for (index, attempted) in setup.attempted.iter().enumerate().take(8).skip(4) {
                         assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
-                        assert!(!setup.attempted[index], "parity must stay unopened until needed");
+                        assert!(!attempted, "parity must stay unopened until needed");
                     }
                     let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
                     assert!(error.is_none(), "healthy decode failed: {error:?}");

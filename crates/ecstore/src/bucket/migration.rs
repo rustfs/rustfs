@@ -580,7 +580,7 @@ mod tests {
             let first: Error = make_error("buckets/first/.metadata.bin".into()).into();
             let second: Error = make_error("buckets/second/.metadata.bin".into()).into();
             assert_eq!(first, second, "record paths must not fragment error grouping");
-            assert_eq!(first.clone(), second, "cloning must preserve error grouping");
+            assert_eq!(first, second, "cloning must preserve error grouping");
 
             let io_error = std::io::Error::from(first);
             let detail = io_error

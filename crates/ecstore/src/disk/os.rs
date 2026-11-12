@@ -392,14 +392,11 @@ pub(crate) mod prepared_publication_test_hooks {
     }
 
     pub(crate) fn has_any_hooks() -> bool {
-        if !BEFORE_PUBLICATION.lock().is_empty() {
-            return true;
-        }
         #[cfg(test)]
         if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
             return true;
         }
-        false
+        !BEFORE_PUBLICATION.lock().is_empty()
     }
 
     #[cfg(test)]

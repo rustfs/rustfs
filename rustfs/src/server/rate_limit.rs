@@ -455,9 +455,7 @@ fn s3_too_many_requests_response(request_id: Option<&str>, limit_rpm: u32, throt
          <Message>Request rate limit exceeded. Reduce your request rate and retry after the indicated delay.</Message>\
          {request_id_xml}</Error>"
     );
-    let body: BoxBody = Full::new(Bytes::from(body))
-        .map_err(|e| -> BoxError { Box::new(e) })
-        .boxed_unsync();
+    let body: BoxBody = Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync();
 
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
@@ -951,7 +949,7 @@ mod tests {
 
         fn call(&mut self, _req: Request<ReqBody>) -> Self::Future {
             let body: BoxBody = Full::new(Bytes::from_static(b"ok"))
-                .map_err(|e| -> BoxError { Box::new(e) })
+                .map_err(|never| match never {})
                 .boxed_unsync();
             ready(Ok(Response::new(body)))
         }

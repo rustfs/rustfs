@@ -2132,7 +2132,7 @@ mod tests {
                 normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
                     .expect_err("the request cannot select an arbitrary server file");
                 if variant != "TokenFile" {
-                    let mut changed = value.clone();
+                    let mut changed = value;
                     changed["auth_method"][variant]["mount"] = serde_json::json!("attacker-auth");
                     normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
                         .expect_err("file contents cannot be sent to a different authentication mount");
