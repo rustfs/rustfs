@@ -46,6 +46,8 @@ For A2 versus A1, the ABBA runner passes `--baseline-drift` to compare the absol
 
 In external mode (`--endpoint <host:port>`) the rig never starts or restarts RustFS. Before each phase or leg it runs `--deploy-hook <cmd>` with the context below in the environment, then waits for `http://<endpoint><health-path>` (default `/health`). A non-zero hook exit aborts the run.
 
+A non-zero load-driver exit aborts the runner with the same exit code before any later leg is deployed or measured. The local-mode EXIT handler stops its server. External service restoration remains the responsibility of the deploy hook's caller or an outer lifecycle wrapper. The schedule retains the attempted leg, and a failed measurement produces no completed-run summary or gate report.
+
 For container-based experiments, pass a repeatable `--node-docker-container node=container` mapping. The runner forwards every mapping to the load driver for before/after Docker CPU, memory, network and block I/O snapshots in each leg's `node_resources/` directory and `node_resource_captures.csv`. Use container names that the deploy hook recreates consistently across legs; the driver records the resolved container and image identities per leg. Node names must be unique.
 
 Docker snapshots expose instantaneous CPU percentages and resource samples. Computing CPU/object requires cumulative process or cgroup CPU counters aligned with the Warp measurement window and its completed object count. The current `--require-node-telemetry` failure gate applies to SSH snapshots; inspect Docker capture statuses explicitly because Docker snapshot failures are reported as warnings. A container lab's shared host and storage topology must be recorded with the results.

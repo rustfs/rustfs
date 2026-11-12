@@ -478,7 +478,8 @@ measure() {
     args+=(--extra-args "--objects $((CONCURRENCY * DATASET_OBJECTS_PER_WORKER)) --noclear")
   fi
   [[ -n "$baseline_csv" ]] && args+=(--baseline-csv "$baseline_csv")
-  run "$ENHANCED_BENCH" "${args[@]}" >&2
+  # Command substitution may clear errexit; emit a cell path only after success.
+  run "$ENHANCED_BENCH" "${args[@]}" >&2 || return $?
   echo "$cell"
 }
 
@@ -614,7 +615,7 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
         baseline_csv="$OUT_DIR/$workload/$sync_label/A1/median_summary.csv"
       fi
 
-      cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")"
+      cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")" || exit $?
       case "$leg" in
         B1|B2)
           CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv")

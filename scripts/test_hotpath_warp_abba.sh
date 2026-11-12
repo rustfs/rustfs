@@ -6,8 +6,12 @@ RUNNER="${SCRIPT_DIR}/run_hotpath_warp_abba.sh"
 TMP_DIR="$(mktemp -d)"
 OUT_DIR="${TMP_DIR}/abba"
 TRACE_FILE="${TMP_DIR}/abba-trace.log"
+FAILURE_SERVER_PID=""
 
 cleanup() {
+  if [[ -n "$FAILURE_SERVER_PID" ]]; then
+    kill "$FAILURE_SERVER_PID" 2>/dev/null || true
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -316,6 +320,117 @@ for bad_field in leg phase bucket binary_sha256 dataset_reset; do
   rg -qx 'evidence_mode=external-deploy-hook-attested' "$bad_out_dir/manifest.env"
   rg -qx 'formal_evidence=true' "$bad_out_dir/manifest.env"
   rg -qx 'performance_conclusion=not_claimed_gate_and_artifacts_required' "$bad_out_dir/manifest.env"
+done
+
+# Exercise the actual command-substitution path with a failing load driver.
+FAILURE_REPO="$TMP_DIR/failed-driver-repo"
+mkdir -p "$FAILURE_REPO/scripts" "$FAILURE_REPO/bin"
+git init -q "$FAILURE_REPO"
+cat >"$FAILURE_REPO/scripts/run_object_batch_bench_enhanced.sh" <<'DRIVER'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == --out-dir ]]; then
+    printf 'measure:%s\n' "${2##*/}" >>"$FAILURE_TRACE"
+    break
+  fi
+  shift
+done
+exit 42
+DRIVER
+cat >"$FAILURE_REPO/scripts/hotpath_warp_ab_gate.sh" <<'GATE'
+#!/usr/bin/env bash
+echo gate >>"$FAILURE_TRACE"
+exit 0
+GATE
+cat >"$FAILURE_REPO/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -z "${SERVER_PID_FILE:-}" ]]; then
+  exit 0
+fi
+for ((i = 0; i < 500; i++)); do
+  [[ -s "$SERVER_PID_FILE" ]] && exit 0
+  sleep 0.01
+done
+exit 1
+CURL
+cat >"$FAILURE_REPO/bin/rustfs" <<'SERVER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --version ]]; then
+  echo 'test server'
+  exit 0
+fi
+echo "$$" >"$SERVER_PID_FILE"
+exec sleep 60
+SERVER
+cat >"$FAILURE_REPO/deploy.sh" <<'DEPLOY'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "deploy:$HOTPATH_ABBA_LEG" >>"$FAILURE_TRACE"
+cat >"$HOTPATH_ABBA_DEPLOY_EVIDENCE_FILE" <<EOF
+leg=$HOTPATH_ABBA_LEG
+phase=$HOTPATH_ABBA_PHASE
+bucket=$HOTPATH_ABBA_BUCKET
+binary_sha256=$HOTPATH_ABBA_BINARY_SHA256
+dataset_reset=true
+EOF
+DEPLOY
+chmod +x "$FAILURE_REPO/scripts/"*.sh "$FAILURE_REPO/bin/"* "$FAILURE_REPO/deploy.sh"
+
+for failure_mode in external local; do
+  FAILURE_OUT_DIR="$TMP_DIR/failed-driver-$failure_mode"
+  failure_trace="$TMP_DIR/failed-driver-$failure_mode.trace"
+  failure_args=(--endpoint 127.0.0.1:9000 --deploy-hook "$FAILURE_REPO/deploy.sh")
+  server_pid_file=""
+  if [[ "$failure_mode" == local ]]; then
+    failure_args=(--data-root "$FAILURE_REPO/data")
+    server_pid_file="$FAILURE_REPO/server.pid"
+  fi
+  if (
+    cd "$FAILURE_REPO"
+    PATH="$FAILURE_REPO/bin:$PATH" FAILURE_TRACE="$failure_trace" SERVER_PID_FILE="$server_pid_file" \
+      "$RUNNER" \
+        --baseline-bin "$FAILURE_REPO/bin/rustfs" \
+        --candidate-bin "$FAILURE_REPO/bin/rustfs" \
+        --baseline-revision baseline-test \
+        --candidate-revision candidate-test \
+        --warp-bin /usr/bin/true \
+        --workload 'put-100kib|put|100KiB' \
+        --drive-sync 'sync-on|true' \
+        --health-timeout 1 \
+        --out-dir "$FAILURE_OUT_DIR" \
+        "${failure_args[@]}"
+  ) >"$TMP_DIR/failed-driver-$failure_mode.log" 2>&1; then
+    echo "expected failing load driver to abort the $failure_mode run" >&2
+    exit 1
+  else
+    failure_status=$?
+  fi
+  if [[ "$failure_mode" == local && -s "$server_pid_file" ]]; then
+    FAILURE_SERVER_PID="$(cat "$server_pid_file")"
+  fi
+  [[ "$failure_status" == 42 ]]
+  if [[ "$failure_mode" == external ]]; then
+    [[ "$(cat "$failure_trace")" == $'deploy:A1\nmeasure:A1' ]]
+  else
+    [[ "$(cat "$failure_trace")" == 'measure:A1' ]]
+    [[ -n "$FAILURE_SERVER_PID" ]]
+    for ((i = 0; i < 500; i++)); do
+      kill -0 "$FAILURE_SERVER_PID" 2>/dev/null || break
+      sleep 0.01
+    done
+    if kill -0 "$FAILURE_SERVER_PID" 2>/dev/null; then
+      echo "expected EXIT cleanup to stop the local server after driver failure" >&2
+      exit 1
+    fi
+    FAILURE_SERVER_PID=""
+  fi
+  awk -F, 'NR == 2 { if ($6 != "A1") exit 1 } END { if (NR != 2) exit 1 }' "$FAILURE_OUT_DIR/abba_schedule.csv"
+  [[ ! -e "$FAILURE_OUT_DIR/summary.md" ]]
+  [[ ! -e "$FAILURE_OUT_DIR/candidate_gate.md" ]]
+  [[ ! -e "$FAILURE_OUT_DIR/baseline_drift_gate.md" ]]
 done
 
 echo "hotpath warp ABBA tests passed"
