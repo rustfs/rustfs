@@ -300,6 +300,43 @@ fn create_test_object_key(bucket: &str, object: &str) -> ObjectKey {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn distributed_namespace_shared_readers_exceed_255() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager(Arc::clone(manager))) as Arc<dyn LockClient>)
+        .collect();
+    let lock = NamespaceLock::with_clients("shared-reader-capacity".to_string(), clients);
+    let resource = create_test_object_key(".rustfs.sys", "bucket-targets/bucket/transaction.lock");
+    let mut guards = Vec::with_capacity(512);
+
+    for reader in 0..512 {
+        let guard = lock
+            .get_read_lock(resource.clone(), &format!("reader-{reader}"), Duration::from_secs(1))
+            .await
+            .unwrap_or_else(|error| panic!("shared reader {reader} must reach quorum: {error}"));
+        guards.push(guard);
+    }
+    assert_eq!(guards.len(), 512);
+    assert!(guards.iter().all(|guard| !guard.is_lock_lost()));
+    let contended_writer = lock
+        .lock_guard(resource.clone(), "blocked-writer", Duration::from_millis(100), Duration::from_secs(30))
+        .await
+        .expect("writer contention must preserve the acquisition result");
+    assert!(
+        contended_writer.is_none(),
+        "a writer must remain excluded while shared readers hold quorum"
+    );
+
+    drop(guards);
+    wait_until_all_managers_can_write(&managers, resource.clone()).await;
+    let _writer = lock
+        .get_write_lock(resource, "writer-after-readers", Duration::from_secs(1))
+        .await
+        .expect("all reader grants must drain before the next writer acquires quorum");
+}
+
 async fn wait_until_all_managers_can_write(managers: &[Arc<GlobalLockManager>], resource: ObjectKey) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::object::validate_table_maintenance_report_owner;
+use super::super::object::validate_table_maintenance_report_path;
 use super::*;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -121,46 +121,14 @@ where
             }
             let report: TableMetadataMaintenanceReport = serde_json::from_slice(&object.data)
                 .map_err(|_| TableCatalogStoreError::Invalid("invalid maintenance report in backup".to_string()))?;
-            if report.job.table_id.is_empty() {
-                return Err(TableCatalogStoreError::Invalid(
-                    "backup maintenance report has no table identity".to_string(),
-                ));
-            }
-            let namespace = parse_namespace_for_store(&report.job.namespace)?;
-            let table = parse_table_for_store(&report.job.table)?;
-            validate_table_maintenance_report_owner(&report, table_bucket, &namespace, &table, &report.job.table_id)?;
+            validate_table_maintenance_report_path(&self.paths, table_bucket, &object.object, suffix, &report)?;
             let owner = reports.entry(prefix.to_string()).or_default();
-            let expected = match suffix {
-                MAINTENANCE_CURRENT_JOB_FILE => {
-                    owner.current = Some(report.clone());
-                    self.paths
-                        .table_maintenance_current_job_path(table_bucket, &namespace, &table, &report.job.table_id)
-                }
-                MAINTENANCE_LATEST_JOB_FILE => {
-                    owner.latest = Some(report.clone());
-                    self.paths
-                        .table_maintenance_latest_job_path(table_bucket, &namespace, &table, &report.job.table_id)
-                }
-                _ if suffix.starts_with(&format!("{MAINTENANCE_JOB_ROOT}/")) => {
-                    owner.named.insert(report.job.job_id.clone(), report.clone());
-                    self.paths.table_maintenance_job_path(
-                        table_bucket,
-                        &namespace,
-                        &table,
-                        &report.job.table_id,
-                        &report.job.job_id,
-                    )
-                }
+            match suffix {
+                MAINTENANCE_CURRENT_JOB_FILE => owner.current = Some(report),
+                MAINTENANCE_LATEST_JOB_FILE => owner.latest = Some(report),
                 _ => {
-                    return Err(TableCatalogStoreError::Invalid(
-                        "unexpected maintenance object path in backup".to_string(),
-                    ));
+                    owner.named.insert(report.job.job_id.clone(), report);
                 }
-            };
-            if object.object != expected {
-                return Err(TableCatalogStoreError::Invalid(
-                    "backup maintenance report does not match its object path".to_string(),
-                ));
             }
         }
 
