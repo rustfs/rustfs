@@ -17,7 +17,9 @@
 //! Responsible for: [`S3StackService`], the service mounted where the legacy S3 service used to
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
-//! refuses is answered by that refusal and never retried on the legacy stack.
+//! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
+//! selected, the legacy service receives only what the legacy router claims (the RustFS extension
+//! routes and the control plane), so no S3 request reaches the legacy S3 implementation.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
 //! Upstream: `server/http.rs`. Downstream: the legacy S3 service and the gateway stack.
@@ -25,18 +27,13 @@
 //! This file names neither stack's types: it is generic over two services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
-use super::layer::is_sts_query_request;
-use super::prefix::{HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, has_path_prefix, is_admin_path};
-use crate::admin::console::is_console_path;
+use crate::admin::router::claims_route;
 use crate::config::S3Stack;
-use http::{HeaderMap, Method, Request, Uri};
+use http::Request;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tower::Service;
-
-/// The MinIO-compatible health probes share this prefix.
-const MINIO_HEALTH_PREFIX: &str = "/minio/health";
 
 /// The S3 service of one server: the legacy stack, or the gateway stack with the legacy router
 /// kept for the routes that are not S3 operations.
@@ -76,20 +73,6 @@ pub(crate) fn select_stack<L, G, E>(
     Ok(S3StackService { legacy, gateway })
 }
 
-/// Whether the legacy router answers this request while the gateway stack is selected: the admin
-/// and table-catalog APIs, the console, STS, health and profiling, none of which is an S3
-/// operation. Every other request is the gateway's, whatever it answers.
-fn is_legacy_only_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
-    let path = uri.path();
-    is_admin_path(path)
-        || is_console_path(path)
-        || has_path_prefix(path, HEALTH_PREFIX)
-        || has_path_prefix(path, MINIO_HEALTH_PREFIX)
-        || path == PROFILE_CPU_PATH
-        || path == PROFILE_MEMORY_PATH
-        || is_sts_query_request(method, uri, headers)
-}
-
 impl<L, G, B, R, E> Service<Request<B>> for S3StackService<L, G>
 where
     L: Service<Request<B>, Response = http::Response<R>, Error = E>,
@@ -111,9 +94,7 @@ where
     fn call(&mut self, request: Request<B>) -> Self::Future {
         match &mut self.gateway {
             // REMOVED BY T2.11: the gateway serves these routes itself once they are migrated.
-            Some(gateway) if !is_legacy_only_route(request.method(), request.uri(), request.headers()) => {
-                Box::pin(gateway.call(request))
-            }
+            Some(gateway) if !claims_route(request.method(), request.uri(), request.headers()) => Box::pin(gateway.call(request)),
             _ => Box::pin(self.legacy.call(request)),
         }
     }
@@ -122,7 +103,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Response, StatusCode};
+    use http::{Method, Response, StatusCode};
     use std::convert::Infallible;
     use std::future::{Ready, ready as ready_future};
 
@@ -206,6 +187,13 @@ mod tests {
             (Method::GET, "/rustfs/administrator"),
             (Method::GET, "/minio/healthcheck"),
             (Method::GET, "/profile/cpus"),
+            // The control-plane paths under a method or a suffix the legacy router does not answer.
+            (Method::PUT, "/health/x"),
+            (Method::GET, "/health/x"),
+            (Method::PUT, "/profile/cpu"),
+            (Method::DELETE, "/health"),
+            (Method::GET, "/minio/health/x"),
+            (Method::GET, "/minio/health/live"),
         ] {
             assert_eq!(
                 answered_by(&mut service, request(method.clone(), target)).await,
@@ -216,20 +204,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_gateway_stack_leaves_the_non_s3_routes_to_the_legacy_router() {
+    async fn the_gateway_stack_leaves_the_routes_the_legacy_router_claims_to_it() {
         let mut service = gateway_stack();
 
-        for target in [
-            "/rustfs/admin/v3/info",
-            "/minio/admin/v3/info",
-            "/iceberg/v1/config",
-            "/health",
-            "/health/ready",
-            "/minio/health/live",
-            "/profile/cpu",
-            "/profile/memory",
+        for (method, target) in [
+            (Method::GET, "/rustfs/admin/v3/info"),
+            (Method::PUT, "/rustfs/admin/v3/add-user"),
+            (Method::GET, "/minio/admin/v3/info"),
+            (Method::GET, "/iceberg/v1/config"),
+            (Method::GET, "/health"),
+            (Method::HEAD, "/health/ready"),
+            (Method::GET, "/profile/cpu"),
+            (Method::GET, "/profile/memory"),
+            (Method::GET, "/bucket?replication-metrics"),
         ] {
-            assert_eq!(answered_by(&mut service, request(Method::GET, target)).await, "legacy", "{target}");
+            assert_eq!(
+                answered_by(&mut service, request(method.clone(), target)).await,
+                "legacy",
+                "{method} {target}"
+            );
         }
     }
 
@@ -243,10 +236,6 @@ mod tests {
             .body(())
             .expect("static request");
 
-        assert!(
-            is_sts_query_request(sts.method(), sts.uri(), sts.headers()),
-            "the fixture is an STS request"
-        );
         assert_eq!(answered_by(&mut service, sts).await, "legacy");
         assert_eq!(answered_by(&mut service, request(Method::POST, "/")).await, "gateway");
     }

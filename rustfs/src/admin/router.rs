@@ -40,8 +40,7 @@ use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_u
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path, is_sts_query_request,
-    is_table_catalog_path,
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, is_control_plane_route, is_sts_query_request, is_table_catalog_path,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -3382,6 +3381,15 @@ pub struct S3Router<T> {
     server_ctx: Option<Arc<ServerContextSlot>>,
 }
 
+/// Whether this router answers the request itself rather than an S3 operation: the RustFS extension
+/// routes and every control-plane route.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    parse_replication_extension_request(method, uri).is_some()
+        || parse_misc_extension_request(method, uri).is_some()
+        || is_control_plane_route(method, uri, headers)
+}
+
 fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
@@ -3497,22 +3505,7 @@ where
             return true;
         }
 
-        // Profiling endpoints
-        if method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
-            return true;
-        }
-
-        // Health check
-        if (method == Method::HEAD || method == Method::GET) && is_public_health_path(path) {
-            return true;
-        }
-
-        // AssumeRole
-        if is_sts_query_request(method, uri, headers) {
-            return true;
-        }
-
-        is_admin_path(path) || is_console_path(path)
+        is_control_plane_route(method, uri, headers)
     }
 
     // check_access before call
@@ -3715,6 +3708,7 @@ mod tests {
     use super::*;
     use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
     use crate::auth::constant_time_eq;
+    use crate::server::{PROFILE_CPU_PATH, is_admin_path};
     use bytes::Bytes;
     use http::HeaderMap;
     use http::Method;
