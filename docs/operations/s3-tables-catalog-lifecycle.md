@@ -13,7 +13,7 @@ The server persists an inactive catalog entry before clearing the bucket marker.
 
 ## Clean Up Deleted Empty Tables
 
-`DELETE /iceberg/v1/buckets/{warehouse}?cleanup=true` removes recognized metadata and internal records left by deleted empty tables, then disables the catalog. Ordinary table deletion continues to preserve files. Cleanup preserves the existing table-record formats and accepts eligible empty tables deleted before the server upgrade.
+`DELETE /iceberg/v1/buckets/{warehouse}?cleanup=true` removes recognized metadata and internal records left by deleted empty tables, then disables the catalog. Ordinary table deletion removes the table-specific maintenance configuration after removing the table entry. It preserves Iceberg data and metadata files. Bucket cleanup also accepts valid table-specific configurations left by earlier releases or interrupted drops. Remaining table entries and maintenance job records block bucket cleanup.
 
 Complete the upgrade across all serving nodes and set `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` before cleanup. Delete the empty tables and namespaces through catalog APIs. The cleanup principal needs `admin:SetTableBucket` and `s3:GetObject`/`s3:DeleteObject` permissions for the target metadata objects. Omitting `cleanup` or setting it to `false` keeps ordinary disablement; repeated or invalid values are rejected.
 

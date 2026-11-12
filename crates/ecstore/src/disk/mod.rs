@@ -223,8 +223,21 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
+impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
-pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn DiskFileWriter>;
+
+pub(crate) fn as_lazy_local_file_writer_mut(writer: &mut dyn DiskFileWriter) -> Option<&mut local::LazyLocalFileWriter> {
+    let any: &mut dyn std::any::Any = writer;
+    if any.is::<local::LazyLocalFileWriter>() {
+        return any.downcast_mut::<local::LazyLocalFileWriter>();
+    }
+    let slow = any.downcast_mut::<disk_store::SlowDiskWriter>()?;
+    let inner_any: &mut dyn std::any::Any = slow.inner_mut();
+    inner_any.downcast_mut::<local::LazyLocalFileWriter>()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotLeaseToken(Uuid);

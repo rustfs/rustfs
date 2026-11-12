@@ -2686,9 +2686,7 @@ mod tests {
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let metadata_get = tokio::spawn(async move {
-            metadata_usecase
-                .execute_get_object(build_request(metadata_input, Method::GET))
-                .await
+            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
         });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
@@ -2717,7 +2715,10 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get = tokio::spawn(async move { get_usecase.execute_get_object(build_request(get_input, Method::GET)).await });
+        let get =
+            tokio::spawn(
+                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
+            );
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -4237,7 +4238,7 @@ mod tests {
                 .expect("SSE-C HEAD input must build");
             let mut head_request = build_request(head_input, Method::HEAD);
             head_request.headers = read_headers.clone();
-            let head = Box::pin(usecase.execute_head_object(head_request))
+            let head = Box::pin(crate::app::test_seams::head_object(&usecase, head_request))
                 .await
                 .expect("matching SSE-C key must authorize HEAD");
             assert_eq!(head.output.server_side_encryption, None);
@@ -4254,7 +4255,7 @@ mod tests {
                 .expect("SSE-C GET input must build");
             let mut get_request = build_request(get_input, Method::GET);
             get_request.headers = read_headers;
-            let get = Box::pin(usecase.execute_get_object(get_request))
+            let get = Box::pin(crate::app::test_seams::get_object(&usecase, get_request))
                 .await
                 .expect("matching SSE-C key must authorize GET");
             assert_eq!(get.output.server_side_encryption, None);

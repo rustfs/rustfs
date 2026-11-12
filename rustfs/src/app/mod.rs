@@ -36,6 +36,7 @@ pub(crate) mod trailer_adapter;
 // from here rather than through `app::context`.
 pub(crate) use context::RequestHead;
 pub use context::{RequestCredentials, RequestEnvelope};
+pub(crate) use context::{authorize_owned_internal_object_request, authorize_owned_request};
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;
@@ -48,4 +49,8 @@ pub(crate) mod gating_test_env;
 #[cfg(test)]
 mod lifecycle_transition_api_test;
 #[cfg(test)]
+mod owned_authorization_test;
+#[cfg(test)]
 mod put_prelookup_gating_test;
+#[cfg(test)]
+pub(crate) mod test_seams;

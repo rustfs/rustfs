@@ -25,11 +25,14 @@ impl RequestEnvelope {
     /// Copies every request fact of `req` the app layer reads.
     pub fn from_s3s<T>(req: &S3Request<T>) -> Self {
         let credentials = req.credentials.as_ref().map(|credentials| {
+            let session_token = get_session_token(&req.uri, &req.headers).map(str::to_owned);
+            // An empty secret is not a key: carry it as absent so every reader fails closed.
             RequestCredentials::new(
                 credentials.access_key.clone(),
                 credentials.secret_key.expose().to_owned(),
-                get_session_token(&req.uri, &req.headers).map(str::to_owned),
+                session_token.clone(),
             )
+            .unwrap_or_else(|_| RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
         });
         let head = RequestHead {
             method: req.method.clone(),
@@ -178,7 +181,7 @@ mod tests {
         assert_eq!(envelope.headers(), &req.headers);
         let credentials = envelope.credentials().expect("credentials");
         assert_eq!(credentials.access_key(), "AKIAENVELOPE");
-        assert_eq!(credentials.secret_key(), "envelope-secret");
+        assert_eq!(credentials.secret_key(), Some("envelope-secret"));
         assert_eq!(credentials.session_token(), Some("header-token"));
         assert_eq!(envelope.region(), Some("eu-west-3"));
         assert_eq!(envelope.service(), Some("s3"));
