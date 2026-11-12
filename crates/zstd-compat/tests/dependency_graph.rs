@@ -59,7 +59,7 @@ fn legacy_constraints_resolve_only_to_the_fixed_registry_implementation() {
             adapters += 1;
             assert_eq!(version, Version::new(0, 13, 4));
             let runtime = package["dependencies"].as_array().expect("adapter dependency edges");
-            assert!(runtime.iter().any(|value| value.as_str() == Some("zstd 0.14.3")));
+            assert!(runtime.iter().any(|value| value.as_str() == Some("zstd 0.14.4")));
         } else {
             let source = package["source"].as_str().expect("registry codec source");
             assert!(source.starts_with("registry+"), "codec implementation must remain a registry package");
