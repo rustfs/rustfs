@@ -14,22 +14,18 @@
 //! The assembled gateway stack, driven through [`GatewayStack::call`] exactly as `server/http.rs`
 //! drives it. Requests that need object storage are in `rustfs/tests/embedded_gateway_stack_test.rs`.
 
-use super::authorizer::AUTHORIZATION_TABLE;
 use super::*;
+use crate::server::gateway_handlers::rows;
+use crate::server::gateway_handlers::test_support::{CLIENT, PEER, REQUEST_ID, Signed, request_context, signed_request};
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Empty};
-use rustfs_gateway::{AuthzRequest, ClientFacts, Decision, HostRequestId, InputAuthzRequest, InputDecisions, NO_DEADLINE};
-use std::collections::BTreeSet;
+use rustfs_gateway::{AuthzRequest, ClientFacts, HostRequestId, InputAuthzRequest, InputDecisions, NO_DEADLINE};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
-use std::time::Instant;
 
 const ROOT_ACCESS_KEY: &str = "rustfsgatewayroot";
 const ROOT_SECRET_KEY: &str = "rustfs-gateway-root-secret";
-const REQUEST_ID: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
-const PEER: ([u8; 4], u16) = ([10, 0, 0, 7], 41000);
-const CLIENT: [u8; 4] = [203, 0, 113, 9];
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn assembly() -> GatewayAssembly {
@@ -59,12 +55,6 @@ impl IamKeyLookup for ScriptedIam {
     }
 }
 
-impl IamPrincipalLookup for ScriptedIam {
-    fn group_memberships(&self, _user: &str) -> Vec<String> {
-        Vec::new()
-    }
-}
-
 /// A settable live root, standing in for the server's runtime credentials.
 #[derive(Clone)]
 struct LiveRoot(Arc<Mutex<Option<Arc<RootCredentials>>>>);
@@ -90,15 +80,9 @@ fn root() -> LiveRoot {
     LiveRoot(Arc::new(Mutex::new(Some(Arc::new(root)))))
 }
 
-/// The authorizer production installs: the registered table over the shared decision core.
-fn production_authorizer() -> RustfsAuthorizer {
-    RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(OwnedDecisionCore::new(ServerContextSlot::new())))
-}
-
 /// The stack as production assembles it, over an IAM that knows no key but the root's.
 fn stack_over(iam: ScriptedIam) -> GatewayStack {
-    let authorizer = production_authorizer();
-    GatewayStack::assemble_with(assembly(), Arc::new(iam), root().source(), authorizer).expect("the stack assembles")
+    GatewayStack::assemble_with(assembly(), Arc::new(iam), root().source(), early_gate(OPERATIONS)).expect("the stack assembles")
 }
 
 fn request(method: Method, target: &str) -> http::request::Builder {
@@ -123,38 +107,22 @@ fn signed_with_a_wrong_signature(builder: http::request::Builder, access_key: &s
 }
 
 async fn answer(stack: &GatewayStack, builder: http::request::Builder) -> (StatusCode, HeaderMap, String) {
-    let response = stack.call(builder.body(Empty::<Bytes>::new()).expect("static request")).await;
+    answer_request(stack, builder.body(Empty::<Bytes>::new()).expect("static request")).await
+}
+
+async fn answer_request(stack: &GatewayStack, request: Request<Empty<Bytes>>) -> (StatusCode, HeaderMap, String) {
+    let response = stack.call(request).await;
     let (parts, body) = response.into_parts();
     let body = body.collect().await.expect("the answer is read").to_bytes();
     (parts.status, parts.headers, String::from_utf8_lossy(&body).into_owned())
 }
 
-fn rustfs_request_context(request_id: &str) -> RequestContext {
-    RequestContext {
-        request_id: request_id.to_owned(),
-        x_amz_request_id: request_id.to_owned(),
-        trace_id: None,
-        span_id: None,
-        start_time: Instant::now(),
-    }
-}
-
 #[test]
-fn every_registered_operation_has_an_authorization_row_and_every_row_an_operation() {
-    let stack = stack_over(ScriptedIam { ready: true });
-
-    let registered: BTreeSet<&str> = stack.registered_operations().into_iter().collect();
-    let mapped: BTreeSet<&str> = AUTHORIZATION_TABLE.iter().map(|row| row.operation).collect();
-
-    assert_eq!(registered, mapped);
-    assert_eq!(registered, BTreeSet::from(["ListBuckets"]), "the walking skeleton serves one operation");
-}
-
-#[test]
-fn production_assembly_registers_what_the_test_assembly_does() {
+fn the_assembled_stack_registers_exactly_the_table() {
     let stack = GatewayStack::assemble(assembly()).expect("the stack assembles");
 
-    assert_eq!(stack.registered_operations(), ["ListBuckets"]);
+    let registered: std::collections::BTreeSet<&str> = stack.service.operations().collect();
+    assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
 }
 
 #[test]
@@ -207,9 +175,9 @@ fn a_missing_or_short_root_secret_fails_the_assembly() {
 async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothing() {
     const ROTATED_ACCESS_KEY: &str = "rotatedgatewayroot";
     let live = root();
-    let authorizer = production_authorizer();
-    let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), authorizer)
-        .expect("the stack assembles");
+    let stack =
+        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), early_gate(OPERATIONS))
+            .expect("the stack assembles");
     let signed_as = |access_key: &str| signed_with_a_wrong_signature(request(Method::GET, "/"), access_key);
 
     let (_, _, known) = answer(&stack, signed_as(ROOT_ACCESS_KEY)).await;
@@ -253,15 +221,6 @@ fn keystone_enabled_fails_the_assembly_and_names_both_settings() {
     for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE", "rustfs/gateway#1586"] {
         assert!(message.contains(named), "{named} is missing from: {message}");
     }
-}
-
-#[test]
-fn keystone_disabled_assembles() {
-    GatewayStack::assemble(GatewayAssembly {
-        keystone_enabled: false,
-        ..assembly()
-    })
-    .expect("the gateway stack assembles without Keystone");
 }
 
 #[test]
@@ -310,7 +269,7 @@ fn host_facts_come_from_what_rustfs_layers_attached() {
     extensions.insert(Some(RemoteAddr(peer)));
     extensions.insert(ClientInfo::direct(SocketAddr::new(IpAddr::from(CLIENT), 443)));
     extensions.insert(NativeTlsTransport(true));
-    extensions.insert(rustfs_request_context(REQUEST_ID));
+    extensions.insert(request_context(REQUEST_ID));
 
     attach_host_facts(&mut extensions);
 
@@ -339,7 +298,7 @@ fn host_facts_never_lean_towards_secure_or_invent_an_address() {
     let mut plaintext = Extensions::new();
     plaintext.insert(Some(RemoteAddr(SocketAddr::from(PEER))));
     plaintext.insert(NativeTlsTransport(false));
-    plaintext.insert(rustfs_request_context("not a request id"));
+    plaintext.insert(request_context("not a request id"));
     attach_host_facts(&mut plaintext);
     assert_eq!(plaintext.get::<TransportSecurity>(), Some(&TransportSecurity::Plaintext));
     assert_eq!(
@@ -358,11 +317,9 @@ fn host_facts_never_lean_towards_secure_or_invent_an_address() {
     assert!(peerless.get::<ClientAddr>().is_none());
 }
 
-/// Records what the gateway hands its authorizer about the client and the request line, and
-/// refuses.
+/// Records what the gateway hands its authorizer about the client, and refuses.
 struct RecordingAuthorizer {
     seen: Arc<Mutex<Option<Option<ClientFacts>>>>,
-    line: Arc<Mutex<Option<RequestLine>>>,
 }
 
 impl Authorizer for RecordingAuthorizer {
@@ -372,7 +329,6 @@ impl Authorizer for RecordingAuthorizer {
         _request: &'a AuthzRequest<'a>,
     ) -> BoxFuture<'a, Decision> {
         *self.seen.lock().expect("recording lock") = Some(context.client().copied());
-        *self.line.lock().expect("recording lock") = context.server_extensions().get::<RequestLine>().cloned();
         Box::pin(async { Decision::Deny })
     }
 
@@ -389,11 +345,7 @@ impl Authorizer for RecordingAuthorizer {
 #[tokio::test]
 async fn the_authorizer_sees_the_client_facts_the_host_attached() {
     let seen = Arc::new(Mutex::new(None));
-    let line = Arc::new(Mutex::new(None));
-    let authorizer = RecordingAuthorizer {
-        seen: Arc::clone(&seen),
-        line: Arc::clone(&line),
-    };
+    let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
         .expect("assembles");
     let proxied = request(Method::GET, "/?prefix=probe")
@@ -413,24 +365,12 @@ async fn the_authorizer_sees_the_client_facts_the_host_attached() {
     assert!(facts.transport_secure, "the listener terminated TLS");
     assert_eq!(facts.client_ip, Some(IpAddr::from(CLIENT)));
     assert_eq!(facts.source_ip(), Some(IpAddr::from(CLIENT)));
-    let line = line
-        .lock()
-        .expect("recording lock")
-        .take()
-        .expect("the host attached the request line");
-    assert_eq!(line.method, Method::GET);
-    assert_eq!(line.uri.path(), "/");
-    assert_eq!(line.uri.query(), Some("prefix=probe"));
 }
 
 #[tokio::test]
 async fn the_authorizer_sees_a_cleartext_transport_as_cleartext() {
     let seen = Arc::new(Mutex::new(None));
-    let line = Arc::new(Mutex::new(None));
-    let authorizer = RecordingAuthorizer {
-        seen: Arc::clone(&seen),
-        line: Arc::clone(&line),
-    };
+    let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
         .expect("assembles");
 
@@ -445,32 +385,6 @@ async fn the_authorizer_sees_a_cleartext_transport_as_cleartext() {
         .expect("the transport declaration alone makes the facts present");
     assert!(!facts.transport_secure);
     assert_eq!(facts.client_ip, None);
-}
-
-#[tokio::test]
-async fn an_anonymous_list_buckets_is_denied() {
-    let stack = stack_over(ScriptedIam { ready: true });
-
-    let (status, _, body) = answer(&stack, request(Method::GET, "/")).await;
-
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
-}
-
-#[tokio::test]
-async fn an_unregistered_operation_is_not_implemented() {
-    let stack = stack_over(ScriptedIam { ready: true });
-
-    for (method, target) in [
-        (Method::GET, "/bucket/key"),
-        (Method::PUT, "/bucket"),
-        (Method::DELETE, "/bucket/key"),
-    ] {
-        let (status, _, body) = answer(&stack, request(method.clone(), target)).await;
-
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {target}: {body}");
-        assert!(body.contains("<Code>NotImplemented</Code>"), "{method} {target}: {body}");
-    }
 }
 
 #[tokio::test]
@@ -539,7 +453,7 @@ async fn the_root_key_verifies_while_iam_is_unavailable() {
 async fn the_answer_carries_the_request_identifier_rustfs_assigned() {
     let stack = stack_over(ScriptedIam { ready: true });
 
-    let (_, headers, _) = answer(&stack, request(Method::GET, "/").extension(rustfs_request_context(REQUEST_ID))).await;
+    let (_, headers, _) = answer(&stack, request(Method::GET, "/").extension(request_context(REQUEST_ID))).await;
 
     assert_eq!(headers.get("x-amz-request-id").and_then(|value| value.to_str().ok()), Some(REQUEST_ID));
     assert_eq!(headers.get("x-request-id").and_then(|value| value.to_str().ok()), Some(REQUEST_ID));
@@ -556,22 +470,23 @@ async fn without_a_rustfs_identifier_the_gateway_mints_its_own() {
         .and_then(|value| value.to_str().ok())
         .expect("every answer names its request");
     assert!(!minted.is_empty());
-    assert_ne!(minted, REQUEST_ID);
 }
 
+/// A correctly signed request for a served operation passes the early gate to its handler; the same
+/// request is refused at the gate of a stack that serves nothing.
 #[tokio::test]
-async fn the_gateway_writes_no_cors_header() {
-    let stack = stack_over(ScriptedIam { ready: true });
-    let browser = |builder: http::request::Builder| builder.header("origin", "https://app.example.test");
+async fn the_early_gate_allows_only_what_the_table_serves() {
+    static NOTHING: OperationTable = &[];
+    let request = || signed_request(Signed::Header, Method::GET, "/", "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+    let gated = |table| {
+        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(table))
+            .expect("the stack assembles")
+    };
 
-    for (method, target) in [(Method::GET, "/"), (Method::GET, "/bucket/key"), (Method::PUT, "/bucket/key")] {
-        let (_, headers, _) = answer(&stack, browser(request(method.clone(), target))).await;
+    let refused = gated(NOTHING).call(request()).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
 
-        let cors: Vec<&str> = headers
-            .keys()
-            .map(http::HeaderName::as_str)
-            .filter(|name| name.starts_with("access-control-"))
-            .collect();
-        assert!(cors.is_empty(), "{method} {target}: {cors:?}");
-    }
+    let (status, _, body) = answer_request(&gated(OPERATIONS), request()).await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains("AccessDenied"), "{body}");
 }

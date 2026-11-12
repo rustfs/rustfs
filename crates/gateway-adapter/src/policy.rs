@@ -20,8 +20,9 @@
 //! NOT responsible for: evaluating any policy, choosing which policy documents apply (that stays
 //! in `IamSys::is_allowed`, which owns the STS, OIDC, session-policy and service-account rules), or
 //! verifying the signature or the session token (the gateway did both before calling this).
-//! Upstream: the gateway's verified [`Identity`]. Downstream: the RustFS authorizer, which reads
-//! the payload back with `PolicySnapshot::get::<RustfsPrincipal>()`.
+//! Upstream: the gateway's verified [`Identity`]. Downstream: an authorizer that reads the payload
+//! back with `PolicySnapshot::get::<RustfsPrincipal>()`. The RustFS gateway assembly installs no
+//! policy source: its handlers resolve the caller through the legacy access phase.
 //!
 //! # Failure classes
 //!

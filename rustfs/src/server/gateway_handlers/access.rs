@@ -12,50 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The access phase of a gateway handler: the legacy access hooks in their owned form.
+//! The shared access phase of the gateway edge: what the legacy `S3Access::check` runs for every
+//! operation, fed from the gateway's verdict.
 //!
-//! Responsible for: [`check`], what the legacy access phase runs once per request before any
-//! operation hook. Per-operation hooks join it here as their operations are registered.
-//! NOT responsible for: the decisions themselves. Every function here calls the function the
-//! legacy access phase calls (`storage/access.rs`), so the two stacks cannot answer differently.
-//! Upstream: each `impl Handler`. Downstream: the storage layer's access functions.
-//!
-//! The caller is resolved here on every request, and again by the gateway's `Authorizer` before
-//! it: the pinned gateway hands a handler no policy snapshot, so one resolution cannot be carried
-//! from the authorization stages to the handler.
+//! Responsible for: [`admit`], which builds the envelope with the access markers, installs the
+//! caller and runs the operation-aware admission, each through the function the legacy check
+//! calls (`storage/access.rs`).
+//! NOT responsible for: an operation's own authorization (`Served::authorize`), or verifying the
+//! signature (the gateway did, and only a verified caller has a principal).
+//! Upstream: `GatewayBackend::serve`. Downstream: the storage layer's access functions.
 
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
-use crate::storage_api::server::http::access::{admit_operation, resolve_req_info};
+use crate::storage_api::server::http::access::{VerifiedSignature, admit_operation, resolve_req_info};
+use rustfs_gateway::sig::{SigFamily, SigLocation};
+use rustfs_gateway::{RequestContextView, RequestPrincipal};
 use rustfs_s3_types::S3Result;
 use std::sync::Arc;
 
-/// Runs the per-request access check for `operation` and installs the caller in `envelope`.
-///
-/// The caller is the credential IAM holds for the access key the gateway verified, checked
-/// against the presented session token; an anonymous request resolves to no caller. The signed
-/// upload-size capabilities are then refused on any operation but their own, and the license is
-/// checked.
+/// Runs the shared access phase for one accepted request and returns its envelope.
 ///
 /// # Errors
 ///
-/// What the legacy access phase answers: the credential refusals of the key lookup,
+/// What the legacy access check answers: the credential refusals of the key lookup,
 /// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
-/// `InternalError` when IAM or the license cannot be read.
-pub(crate) async fn check(
-    server_ctx: &Arc<ServerContextSlot>,
-    envelope: &mut RequestEnvelope,
-    operation: &'static str,
-) -> S3Result<()> {
+/// `InternalError` when IAM or the license cannot be read or the request cannot be read back.
+pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &RequestContextView) -> S3Result<RequestEnvelope> {
+    let signature = verified_signature(context);
+    let mut envelope = RequestEnvelope::from_gateway(context, server_ctx, signature)?;
     let credentials = envelope.credentials();
     let access_key = credentials.map(|credentials| credentials.access_key().to_owned());
     let session_token = credentials
         .and_then(|credentials| credentials.session_token())
         .unwrap_or_default()
         .to_owned();
-    let request_context = envelope.request_context().cloned();
-    let req_info = resolve_req_info(server_ctx, access_key.as_deref(), &session_token, request_context).await?;
+    let req_info =
+        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?;
     envelope.install_req_info(req_info);
-    admit_operation(envelope.headers(), envelope.uri().query(), operation)?;
-    Ok(())
+    admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
+    Ok(envelope)
+}
+
+/// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
+/// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
+pub(super) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
+    match context.principal().map(RequestPrincipal::scheme) {
+        Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
+            sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),
+            presigned: scheme.location() == SigLocation::Query,
+        },
+        _ => VerifiedSignature::default(),
+    }
 }

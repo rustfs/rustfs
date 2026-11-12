@@ -15,9 +15,9 @@
 //! (rustfs/backlog#2734 T2.5).
 //!
 //! Responsible for: [`GatewayStack::assemble`], the one place the `rustfs-gateway` service is
-//! built for RustFS — the RustFS profile, signature verification against RustFS IAM, the RustFS
-//! authorizer, explicit deadlines, and the registered handlers — and [`GatewayStack::call`],
-//! which attaches the host's facts to a request before the gateway accepts it.
+//! built for RustFS — the RustFS profile, signature verification against RustFS IAM, the early
+//! gate, explicit deadlines, and the registered handlers — and [`GatewayStack::call`], which
+//! attaches the host's facts to a request before the gateway accepts it.
 //! NOT responsible for: choosing the stack (`server/stack.rs`), the middleware around it
 //! (`server/http.rs`), or any S3 behaviour (`server/gateway_handlers` and the use cases).
 //! Upstream: `server/http.rs`. Downstream: `rustfs-gateway`, `rustfs-gateway-adapter`.
@@ -30,30 +30,36 @@
 //! gateway's own strict gate stays behind it; and the request identifier is the one
 //! `ExternalRequestContextLayer` assigned, handed over as the gateway's `HostRequestId`, so an
 //! answer and RustFS's logs name a request identically.
+//!
+//! # Authorization
+//!
+//! The gateway's `Authorizer` is only the early gate: it allows an operation the table serves and
+//! denies every other. Every authorization decision, an anonymous caller's included, is the
+//! handler's, made by the function the legacy access hook calls (`server/gateway_handlers`), which
+//! also writes its denial audit record. No policy source and no authorization audit sink is
+//! installed: nothing reads a policy snapshot, and the gate's only refusal is an operation without
+//! a handler, which the gateway answers `501 NotImplemented`.
 
 // The stack is under construction, so a build without debug assertions must not carry it. The
-// message is checked by `scripts/check_gateway_stack_release_boundary.sh`.
+// message is checked by `scripts/check_connect_release_boundary.py`.
 #[cfg(not(debug_assertions))]
 compile_error!("gateway-stack is restricted to debug builds");
 
-mod authorizer;
-
-use self::authorizer::{AUTHORIZATION_TABLE, OwnedDecisionCore, RequestLine, RustfsAuthorizer};
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
-use crate::server::gateway_handlers::{GatewayBackend, register};
+use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
 use crate::server::ssec_transport::is_secure_transport;
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
-    AssemblyError, Authorizer, BoxFuture, ClientAddr, DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass,
+    AssemblyError, Authorizer, BoxFuture, ClientAddr, DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass,
     HandlerDeadlineConfig, MintedTraces, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator,
-    SseConfig, TransportSecurity,
+    SseConfig, TransportSecurity, decide_with,
 };
 use rustfs_gateway_adapter::{
-    IamAdapters, IamKeyLookup, IamPrincipalLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource,
-    host_request_id, rustfs_host_resolver,
+    IamCredentials, IamKeyLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource, host_request_id,
+    rustfs_host_resolver,
 };
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::manager::get_token_signing_key;
@@ -126,14 +132,12 @@ impl GatewayStack {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
         let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
-        let core = OwnedDecisionCore::new(Arc::clone(&assembly.server_ctx));
-        let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(core));
-        Self::assemble_with(assembly, iam, root, authorizer)
+        Self::assemble_with(assembly, iam, root, early_gate(OPERATIONS))
     }
 
     fn assemble_with(
         assembly: GatewayAssembly,
-        iam: Arc<dyn IamPrincipalLookup>,
+        iam: Arc<dyn IamKeyLookup>,
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
@@ -156,13 +160,11 @@ impl GatewayStack {
         let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
 
         // Every legacy RustFS reading of a request, a credential scope and an answer, in the
-        // gateway's one reviewable preset; its other half is on the authenticator below.
-        let builder = ServiceBuilder::new().rustfs_profile();
-        // The credential provider and the policy source go in together, over one IAM and one
-        // live root, so a key cannot be root to one and an ordinary user to the other.
-        let builder = IamAdapters::new(iam, root)
-            .install(builder, |credentials| SigV4Authenticator::new(credentials, regions).rustfs_profile());
-        let builder = builder
+        // gateway's one reviewable preset; its other half is on the authenticator.
+        let credentials = Arc::new(IamCredentials::new(iam, root));
+        let builder = ServiceBuilder::new()
+            .rustfs_profile()
+            .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
             .authorizer(authorizer)
             // The outer SSE-C transport layer answers first; the gateway's own gate stays strict
             // behind it.
@@ -171,14 +173,10 @@ impl GatewayStack {
             // The fallback only: `attach_host_facts` hands RustFS's own identifier over.
             .trace_source(MintedTraces::with_uuid_request_ids());
         let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout));
-        let service = register(builder, &backend).build().map_err(GatewayAssemblyError::Service)?;
+        let service = register(OPERATIONS, builder, &backend)
+            .build()
+            .map_err(GatewayAssemblyError::Service)?;
         Ok(Self { service })
-    }
-
-    /// The operations the assembled service answers, read from its registry. Everything else is
-    /// answered `501 NotImplemented`.
-    pub(crate) fn registered_operations(&self) -> Vec<&'static str> {
-        self.service.operations().collect()
     }
 
     /// Answers one request on the gateway stack, with the host's facts attached.
@@ -188,13 +186,6 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        // The authorizer is handed the headers and the query but not the request line, and the
-        // shared decision core is asked about the request as it arrived.
-        let line = RequestLine {
-            method: request.method().clone(),
-            uri: request.uri().clone(),
-        };
-        request.extensions_mut().insert(line);
         attach_host_facts(request.extensions_mut());
         let mut service = self.service.clone();
         let answer = tower::Service::call(&mut service, request);
@@ -205,6 +196,18 @@ impl GatewayStack {
             }
         }
     }
+}
+
+/// The early gate over `table`: an operation it serves is allowed on to its handler, which decides;
+/// every other operation is denied.
+fn early_gate(table: OperationTable) -> impl Authorizer {
+    decide_with(move |request| {
+        if serves(table, request.operation) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        }
+    })
 }
 
 /// The gateway's request settings for RustFS, every deadline stated instead of inherited.
@@ -310,12 +313,6 @@ impl IamKeyLookup for ServerIam {
             };
             iam.check_key(access_key).await
         })
-    }
-}
-
-impl IamPrincipalLookup for ServerIam {
-    fn group_memberships(&self, user: &str) -> Vec<String> {
-        self.ready().map(|iam| iam.user_group_memberships(user)).unwrap_or_default()
     }
 }
 
