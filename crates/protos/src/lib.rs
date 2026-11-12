@@ -4051,9 +4051,20 @@ mod tests {
 
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let previous = runtime_sources::outbound_tls_state().await;
-        let restore_generation = previous.generation.0.checked_add(3).expect("test generation capacity");
+        let cases = [
+            ("DNS", "127.0.0.1:0", "localhost", "localhost", true),
+            ("IPv4", "127.0.0.1:0", "127.0.0.1", "127.0.0.1", true),
+            ("IPv6", "[::1]:0", "[::1]", "::1", true),
+            ("IPv6 name mismatch", "[::1]:0", "[::1]", "localhost", false),
+        ];
+        let restore_offset = u64::try_from(cases.len() + 1).expect("bounded TLS case count");
+        let restore_generation = previous
+            .generation
+            .0
+            .checked_add(restore_offset)
+            .expect("test generation capacity");
         let mut observations = Vec::new();
-        for (offset, certificate_name) in [(1, "::1"), (2, "localhost")] {
+        for (index, (case, listen_addr, dial_host, certificate_name, expected)) in cases.into_iter().enumerate() {
             let certificate =
                 rcgen::generate_simple_self_signed(vec![certificate_name.to_owned()]).expect("ephemeral TLS test certificate");
             let certificate_pem = certificate.cert.pem();
@@ -4061,10 +4072,11 @@ mod tests {
                 &certificate_pem,
                 certificate.signing_key.serialize_pem(),
             ));
-            let listener = tokio::net::TcpListener::bind("[::1]:0")
+            let listener = tokio::net::TcpListener::bind(listen_addr)
                 .await
-                .expect("IPv6 loopback TLS listener");
-            let addr = format!("https://{}", listener.local_addr().expect("IPv6 test server address"));
+                .expect("loopback TLS listener");
+            let port = listener.local_addr().expect("TLS test server address").port();
+            let addr = format!("https://{dial_host}:{port}/data");
             let accepted = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&accepted);
             let incoming = TcpListenerStream::new(listener).map(move |stream| {
@@ -4086,20 +4098,30 @@ mod tests {
                 root_ca_pem: certificate_pem.into_bytes(),
                 mtls_identity: None,
             };
+            let offset = u64::try_from(index + 1).expect("bounded generation offset");
             publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
             let mut results = Vec::new();
             for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
-                results.push(
-                    build_channel(&addr, &key)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                );
+                let (connected, reached_rpc) = match build_channel(&addr, &key).await {
+                    Ok(channel) => {
+                        let mut client = NodeServiceClient::new(channel);
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client.ping(proto_gen::node_service::PingRequest::default()),
+                        )
+                        .await;
+                        // The empty router answers only after TLS and HTTP/2 reach the server.
+                        let reached_rpc = matches!(response, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented);
+                        (Ok(()), reached_rpc)
+                    }
+                    Err(error) => (Err(error.to_string()), false),
+                };
+                results.push((connected, reached_rpc));
                 evict_cached_channel(&key, ConnectionEvictionLogLevel::Debug).await;
             }
             server.abort();
             let _ = server.await;
-            observations.push((results, accepted.load(Ordering::SeqCst)));
+            observations.push((case, expected, results, accepted.load(Ordering::SeqCst)));
         }
         let restore = OutboundTlsMaterial {
             root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
@@ -4107,19 +4129,31 @@ mod tests {
         };
         publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
 
-        assert!(
-            observations[0].0.iter().all(Result::is_ok),
-            "IPv6 control and bulk channels must verify the URI host: {:?}",
-            observations[0].0
+        let restored = runtime_sources::outbound_tls_state().await;
+        assert_eq!(restored.root_ca_pem.as_deref().unwrap_or_default(), restore.root_ca_pem.as_slice());
+        assert_eq!(
+            restored
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
+            restore
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
         );
-        assert!(
-            observations[1].0.iter().all(Result::is_err),
-            "a trusted certificate for localhost must be rejected for ::1"
-        );
-        assert!(
-            observations.iter().all(|(_, accepted)| *accepted == 2),
-            "both certificate cases must exercise actual control and bulk TLS connections"
-        );
+        assert!(restored.generation.0 > previous.generation.0);
+
+        for (case, expected, results, accepted) in observations {
+            for (connected, reached_rpc) in results {
+                assert_eq!(
+                    connected.is_ok(),
+                    expected,
+                    "{case} must verify the URI certificate identity: {connected:?}"
+                );
+                assert_eq!(reached_rpc, expected, "{case} must reach the RPC service only after successful TLS");
+            }
+            assert_eq!(accepted, 2, "{case} must exercise actual control and bulk connections");
+        }
     }
 
     #[tokio::test]

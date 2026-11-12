@@ -20975,12 +20975,12 @@ impl ECStore {
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut proof = None::<DecommissionDurableIlmReceipt>;
         let mut nonterminal_receipt_found = false;
-        for pool_idx in 0..self.pools.len() {
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
             if pool_idx == source_pool_idx {
                 continue;
             }
             let data = match read_config_limited_preserve_empty(
-                self.pools[pool_idx].clone(),
+                pool.clone(),
                 &receipt_path,
                 DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
             )
@@ -28443,7 +28443,7 @@ mod tests {
             for wrapped in [
                 err.clone(),
                 data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "b", "o", err.clone()),
-                with_decommission_entry_context("migrate_object", "b", "o", err.clone()),
+                with_decommission_entry_context("migrate_object", "b", "o", err),
             ] {
                 assert_eq!(
                     classify_decommission_capacity_failure(&wrapped),
@@ -40311,7 +40311,7 @@ mod pools_tests {
             )
             .expect("finalize records the completion");
 
-            let mut adopted = meta.clone();
+            let mut adopted = meta;
             let plan = decommission_capacity_intent_adoption_plan(&adopted, 0, generation)
                 .expect("plan adoption")
                 .expect("the interrupted completion should be planned");

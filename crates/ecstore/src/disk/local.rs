@@ -559,16 +559,262 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> std::io::Result<bool> {
+#[expect(clippy::too_many_arguments)]
+fn snapshot_part_transaction_file(
+    src: &Path,
+    src_parent_fd: Option<&std::fs::File>,
+    backup: &Path,
+    txn_dir_fd: Option<&std::fs::File>,
+    backup_name: &str,
+    absent: &Path,
+    absent_name: &str,
+    link_absent_from: Option<(&str, &Path)>,
+) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    if let (Some(p_fd), Some(d_fd), Some(src_name)) = (src_parent_fd, txn_dir_fd, src.file_name().and_then(|n| n.to_str())) {
+        use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, statat};
+        return match statat(p_fd, src_name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
+            Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFREG => linkat(p_fd, src_name, d_fd, backup_name, AtFlags::empty())
+                .map(|()| true)
+                .map_err(std::io::Error::from),
+            Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK => {
+                Err(std::io::Error::new(ErrorKind::InvalidInput, "multipart transaction source is a symlink"))
+            }
+            Ok(_) => Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction source is not a file")),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some((from_name, _)) = link_absent_from
+                    && linkat(d_fd, from_name, d_fd, absent_name, AtFlags::empty()).is_ok()
+                {
+                    return Ok(false);
+                }
+                openat(
+                    d_fd,
+                    absent_name,
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o666),
+                )
+                .map(|_| false)
+                .map_err(std::io::Error::from)
+            }
+            Err(err) => Err(err),
+        };
+    }
+    #[cfg(not(unix))]
+    let _ = (src_parent_fd, txn_dir_fd, backup_name, absent_name);
     match std::fs::symlink_metadata(src) {
         Ok(metadata) if metadata.is_file() => std::fs::hard_link(src, backup).map(|()| true),
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(std::io::Error::new(ErrorKind::InvalidInput, "multipart transaction source is a symlink"))
         }
         Ok(_) => Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction source is not a file")),
-        Err(err) if err.kind() == ErrorKind::NotFound => std::fs::write(absent, []).map(|()| false),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            if let Some((_, from_path)) = link_absent_from
+                && std::fs::hard_link(from_path, absent).is_ok()
+            {
+                return Ok(false);
+            }
+            std::fs::write(absent, []).map(|()| false)
+        }
         Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn open_dir_fd(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn mkdir_and_open_part_txn_dir(
+    parent_fd: Option<&std::fs::File>,
+    dir_name: &str,
+    dir_path: &Path,
+) -> std::io::Result<Option<Arc<std::fs::File>>> {
+    if let Some(p_fd) = parent_fd {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        mkdirat(p_fd, dir_name, Mode::from_raw_mode(0o777)).map_err(std::io::Error::from)?;
+        let fd = openat(p_fd, dir_name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+            .ok()
+            .map(std::fs::File::from)
+            .map(Arc::new);
+        return Ok(fd);
+    }
+    std::fs::create_dir(dir_path)?;
+    Ok(open_dir_fd(dir_path).ok().map(Arc::new))
+}
+
+#[cfg(not(unix))]
+fn mkdir_and_open_part_txn_dir(
+    _parent_fd: Option<&std::fs::File>,
+    _dir_name: &str,
+    dir_path: &Path,
+) -> std::io::Result<Option<Arc<std::fs::File>>> {
+    std::fs::create_dir(dir_path)?;
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn link_in_same_dir_fd(
+    dir_fd: Option<&std::fs::File>,
+    src_name: &str,
+    src_fallback: &Path,
+    dst_name: &str,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    if let Some(d_fd) = dir_fd {
+        return rustix::fs::linkat(d_fd, src_name, d_fd, dst_name, rustix::fs::AtFlags::empty()).map_err(std::io::Error::from);
+    }
+    std::fs::hard_link(src_fallback, dst_fallback)
+}
+
+#[cfg(not(unix))]
+fn link_in_same_dir_fd(
+    _dir_fd: Option<&std::fs::File>,
+    _src_name: &str,
+    src_fallback: &Path,
+    _dst_name: &str,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    std::fs::hard_link(src_fallback, dst_fallback)
+}
+
+#[cfg(unix)]
+fn create_new_in_dir_fd(dir_fd: Option<&std::fs::File>, name: &str, fallback_path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(d_fd) = dir_fd {
+        use rustix::fs::{Mode, OFlags, openat};
+        let fd = openat(
+            d_fd,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+        .map_err(std::io::Error::from)?;
+        return Ok(std::fs::File::from(fd));
+    }
+    std::fs::OpenOptions::new().create_new(true).write(true).open(fallback_path)
+}
+
+#[cfg(not(unix))]
+fn create_new_in_dir_fd(_dir_fd: Option<&std::fs::File>, _name: &str, fallback_path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create_new(true).write(true).open(fallback_path)
+}
+
+#[cfg(unix)]
+fn rename_in_same_dir_fd(
+    parent_fd: Option<&std::fs::File>,
+    src_name: Option<&str>,
+    src_fallback: &Path,
+    dst_name: Option<&str>,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    if let (Some(p_fd), Some(s_name), Some(d_name)) = (parent_fd, src_name, dst_name) {
+        return rustix::fs::renameat(p_fd, s_name, p_fd, d_name).map_err(std::io::Error::from);
+    }
+    std::fs::rename(src_fallback, dst_fallback)
+}
+
+#[cfg(not(unix))]
+fn rename_in_same_dir_fd(
+    _parent_fd: Option<&std::fs::File>,
+    _src_name: Option<&str>,
+    src_fallback: &Path,
+    _dst_name: Option<&str>,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    std::fs::rename(src_fallback, dst_fallback)
+}
+
+#[cfg(unix)]
+fn part_txn_files_ready(
+    txn_dir_fd: Option<&std::fs::File>,
+    publish_meta_path: &Path,
+    transaction_meta_path: &Path,
+    expected_len: u64,
+) -> bool {
+    if let Some(d_fd) = txn_dir_fd {
+        use rustix::fs::{AtFlags, statat};
+        let pub_ok = statat(d_fd, PART_TRANSACTION_PUBLISH_META, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
+        let new_ok = statat(d_fd, PART_TRANSACTION_NEW_META, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG && st.st_size as u64 == expected_len);
+        return pub_ok && new_ok;
+    }
+    publish_meta_path.is_file() && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len)
+}
+
+#[cfg(not(unix))]
+fn part_txn_files_ready(
+    _txn_dir_fd: Option<&std::fs::File>,
+    publish_meta_path: &Path,
+    transaction_meta_path: &Path,
+    expected_len: u64,
+) -> bool {
+    publish_meta_path.is_file() && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len)
+}
+
+#[cfg(unix)]
+fn check_part_txn_dir_in_parent_fd(
+    parent_fd: Option<&std::fs::File>,
+    dir_name: Option<&str>,
+    fallback_path: &Path,
+) -> std::io::Result<Result<bool>> {
+    if let (Some(p_fd), Some(name)) = (parent_fd, dir_name) {
+        return match rustix::fs::statat(p_fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
+            Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR => Ok(Ok(true)),
+            Ok(_) => Ok(Err(DiskError::FileCorrupt)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(Ok(false)),
+            Err(err) => Ok(Err(to_file_error(err).into())),
+        };
+    }
+    match std::fs::symlink_metadata(fallback_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(Ok(true)),
+        Ok(_) => Ok(Err(DiskError::FileCorrupt)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Ok(false)),
+        Err(err) => Ok(Err(to_file_error(err).into())),
+    }
+}
+
+#[cfg(not(unix))]
+fn check_part_txn_dir_in_parent_fd(
+    _parent_fd: Option<&std::fs::File>,
+    _dir_name: Option<&str>,
+    fallback_path: &Path,
+) -> std::io::Result<Result<bool>> {
+    match std::fs::symlink_metadata(fallback_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(Ok(true)),
+        Ok(_) => Ok(Err(DiskError::FileCorrupt)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Ok(false)),
+        Err(err) => Ok(Err(to_file_error(err).into())),
+    }
+}
+
+#[cfg(unix)]
+fn unlink_in_dir_fd(dir_fd: Option<&std::fs::File>, name: &str, fallback_path: &Path) -> std::io::Result<()> {
+    if let Some(d_fd) = dir_fd {
+        return rustix::fs::unlinkat(d_fd, name, rustix::fs::AtFlags::empty()).map_err(std::io::Error::from);
+    }
+    std::fs::remove_file(fallback_path)
+}
+
+#[cfg(not(unix))]
+fn unlink_in_dir_fd(_dir_fd: Option<&std::fs::File>, _name: &str, fallback_path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(fallback_path)
+}
+
+#[cfg(unix)]
+fn rmdir_in_dir_fd(dir_fd: Option<&std::fs::File>, name: &str, fallback_path: &Path) -> std::io::Result<()> {
+    if let Some(d_fd) = dir_fd {
+        return rustix::fs::unlinkat(d_fd, name, rustix::fs::AtFlags::REMOVEDIR).map_err(std::io::Error::from);
+    }
+    std::fs::remove_dir(fallback_path)
+}
+
+#[cfg(not(unix))]
+fn rmdir_in_dir_fd(_dir_fd: Option<&std::fs::File>, _name: &str, fallback_path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(fallback_path)
 }
 
 struct PreparedPartTxnReceipt {
@@ -581,6 +827,8 @@ struct PreparedPartTxnReceipt {
     meta: Bytes,
     had_old_data: bool,
     had_old_meta: bool,
+    txn_dir_fd: Option<Arc<std::fs::File>>,
+    txn_parent_fd: Option<Arc<std::fs::File>>,
 }
 
 struct PublishedPartTxnReceipt {
@@ -589,6 +837,8 @@ struct PublishedPartTxnReceipt {
     transaction_path: PathBuf,
     had_old_data: bool,
     had_old_meta: bool,
+    txn_dir_fd: Option<Arc<std::fs::File>>,
+    txn_parent_fd: Option<Arc<std::fs::File>>,
 }
 
 const PART_TXN_RECEIPTS_PER_SHARD: usize = 64;
@@ -613,6 +863,13 @@ fn put_published_part_txn_receipt(transaction_path: &Path, entry: PublishedPartT
 
 fn take_published_part_txn_receipt(transaction_path: &Path) -> Option<PublishedPartTxnReceipt> {
     PUBLISHED_PART_TXN_RECEIPTS.remove(transaction_path)
+}
+
+fn clear_part_txn_receipts_under(io_root: &Path, root: &Path) {
+    for prefix in [io_root, root] {
+        PREPARED_PART_TXN_RECEIPTS.retain_outside_prefix(prefix);
+        PUBLISHED_PART_TXN_RECEIPTS.retain_outside_prefix(prefix);
+    }
 }
 
 fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, restore: &Path) -> std::io::Result<()> {
@@ -3346,11 +3603,7 @@ pub(crate) fn has_delete_version_test_failpoints() -> bool {
     if os::prepared_publication_test_hooks::has_any_hooks() {
         return true;
     }
-    #[cfg(feature = "e2e-test-hooks")]
-    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
-        return true;
-    }
-    false
+    cfg!(feature = "e2e-test-hooks") && std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
 }
 
 #[cfg(test)]
@@ -7912,6 +8165,9 @@ impl Drop for SnapshotLeaseDeleteClaim {
 
 impl Drop for LocalDisk {
     fn drop(&mut self) {
+        let io_root = self.io_root();
+        clear_part_txn_receipts_under(io_root, &self.root);
+        delete_recovery::clear_delete_receipts_under(io_root, &self.root);
         if let Some(exit_signal) = self.exit_signal.take() {
             let _ = exit_signal.send(());
         }
@@ -14377,6 +14633,9 @@ impl DiskAPI for LocalDisk {
         if let Some(history) = self.publication_history.as_ref() {
             history.invalidate();
         }
+        let io_root = self.io_root();
+        clear_part_txn_receipts_under(io_root, &self.root);
+        delete_recovery::clear_delete_receipts_under(io_root, &self.root);
         // This disk instance is being retired (e.g. replaced by renew_disk on
         // reconnect). Drop its cached descriptors so a replacement instance's
         // invalidations are never defeated by this one continuing to serve stale
@@ -15050,175 +15309,196 @@ impl DiskAPI for LocalDisk {
         }
         os::record_native_publication(&transaction_path);
         let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
-        let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
-            if let Some(ref admission) = admission
-                && let Err(err) = admission.validate()
-            {
-                return Ok(Err(to_file_error(err).into()));
-            }
-            let source = match std::fs::symlink_metadata(&src_file_path) {
-                Ok(source) => source,
-                Err(err) => return Ok(Err(to_file_error(err).into())),
-            };
-            if !source.is_file() {
-                return Ok(Err(DiskError::FileAccessDenied));
-            }
-            match std::fs::symlink_metadata(&transaction_path) {
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Ok(m) if m.file_type().is_symlink() => return Ok(Err(DiskError::InvalidPath)),
-                Ok(_) => return Ok(Err(DiskError::FileAccessDenied)),
-                Err(err) => return Ok(Err(to_file_error(err).into())),
-            }
-            let mut created_transaction_parent = false;
-            if let Some((integrity, source, destination, expected_len)) = integrity_prep {
-                let stat = match std::fs::symlink_metadata(&source) {
-                    Ok(stat) => stat,
-                    Err(err) => return Ok(Err(to_file_error(err).into())),
-                };
-                if !stat.is_file() || stat.len() != expected_len {
-                    return Ok(Err(DiskError::FileCorrupt));
-                }
-                let presynced_proof = take_presynced_tmp_file(&source);
-                let verify_and_sync = (|| -> std::io::Result<bool> {
-                    let mut file = os::open_file_for_sync_std(&source)?;
-                    let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
-                    std::io::Read::read_exact(&mut file, &mut header)?;
-                    if header != integrity.index_header() {
-                        return Ok(false);
-                    }
-                    if durability.syncs_data_shards() && !presynced_proof {
-                        file.sync_all()?;
-                    }
-                    Ok(true)
-                })();
-                match verify_and_sync {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
-                    Err(err) => return Ok(Err(to_file_error(err).into())),
-                }
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-                let has_hooks = os::prepared_publication_test_hooks::has_any_hooks();
-                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                let has_hooks = false;
-                let precondition = has_hooks
-                    .then(|| admission.as_ref().map(|check| check.precondition()))
-                    .flatten();
-                // Publish the immutable generation before preparing the part switch.
-                // Rollback retains the old generation; an unreferenced new index is
-                // reclaimed with the upload directory if preparation is interrupted.
-                // Defer the parent directory fsync to the transaction_parent fsync
-                // below when both live in the same parent directory.
-                let same_parent = destination.parent() == transaction_path.parent();
-                if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
-                    &source,
-                    &destination,
-                    &dst_volume_dir,
-                    &publication_root,
-                    precondition.as_deref(),
-                    durability.syncs_commit_metadata() && !same_parent,
-                ) {
+        let res = os::run_blocking_namespace_operation_with_sync(
+            lease,
+            sync,
+            move || -> std::io::Result<Result<(PathBuf, PreparedPartTxnReceipt)>> {
+                if let Some(ref admission) = admission
+                    && let Err(err) = admission.validate()
+                {
                     return Ok(Err(to_file_error(err).into()));
                 }
-                created_transaction_parent = same_parent;
-            }
-
-            let Some(transaction_parent) = transaction_path.parent() else {
-                return Ok(Err(DiskError::InvalidPath));
-            };
-            if !created_transaction_parent && let Err(err) = std::fs::create_dir_all(transaction_parent) {
-                return Ok(Err(to_file_error(err).into()));
-            }
-            let staging_path = transaction_parent.join(format!(".part-txn-{}", Uuid::new_v4()));
-            if let Err(err) = std::fs::create_dir(&staging_path) {
-                return Ok(Err(to_file_error(err).into()));
-            }
-
-            let prepare_result = (|| -> std::io::Result<(bool, bool)> {
-                let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
-                let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
-                let had_old_data = snapshot_part_transaction_file(
-                    &dst_file_path,
-                    &staging_path.join(PART_TRANSACTION_OLD_DATA),
-                    &old_data_absent,
-                )?;
-                let had_old_meta = match std::fs::symlink_metadata(&dst_meta_path) {
-                    Ok(metadata) if metadata.is_file() => {
-                        std::fs::hard_link(&dst_meta_path, staging_path.join(PART_TRANSACTION_OLD_META))?;
-                        true
+                let source = match std::fs::symlink_metadata(&src_file_path) {
+                    Ok(source) => source,
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                };
+                if !source.is_file() {
+                    return Ok(Err(DiskError::FileAccessDenied));
+                }
+                match std::fs::symlink_metadata(&transaction_path) {
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Ok(m) if m.file_type().is_symlink() => return Ok(Err(DiskError::InvalidPath)),
+                    Ok(_) => return Ok(Err(DiskError::FileAccessDenied)),
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                }
+                let mut created_transaction_parent = false;
+                if let Some((integrity, source, destination, expected_len)) = integrity_prep {
+                    let stat = match std::fs::symlink_metadata(&source) {
+                        Ok(stat) => stat,
+                        Err(err) => return Ok(Err(to_file_error(err).into())),
+                    };
+                    if !stat.is_file() || stat.len() != expected_len {
+                        return Ok(Err(DiskError::FileCorrupt));
                     }
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(std::io::Error::new(ErrorKind::InvalidInput, "multipart transaction source is a symlink"));
-                    }
-                    Ok(_) => {
-                        return Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction source is not a file"));
-                    }
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
-                        if !had_old_data && std::fs::hard_link(&old_data_absent, &old_meta_absent).is_ok() {
-                            false
-                        } else {
-                            std::fs::write(&old_meta_absent, [])?;
-                            false
+                    let presynced_proof = take_presynced_tmp_file(&source);
+                    let verify_and_sync = (|| -> std::io::Result<bool> {
+                        let mut file = os::open_file_for_sync_std(&source)?;
+                        let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        std::io::Read::read_exact(&mut file, &mut header)?;
+                        if header != integrity.index_header() {
+                            return Ok(false);
                         }
+                        if durability.syncs_data_shards() && !presynced_proof {
+                            file.sync_all()?;
+                        }
+                        Ok(true)
+                    })();
+                    match verify_and_sync {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
+                        Err(err) => return Ok(Err(to_file_error(err).into())),
                     }
-                    Err(err) => return Err(err),
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    let has_hooks = os::prepared_publication_test_hooks::has_any_hooks();
+                    #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
+                    let has_hooks = false;
+                    let precondition = has_hooks
+                        .then(|| admission.as_ref().map(|check| check.precondition()))
+                        .flatten();
+                    // Publish the immutable generation before preparing the part switch.
+                    // Rollback retains the old generation; an unreferenced new index is
+                    // reclaimed with the upload directory if preparation is interrupted.
+                    // Defer the parent directory fsync to the transaction_parent fsync
+                    // below when both live in the same parent directory.
+                    let same_parent = destination.parent() == transaction_path.parent();
+                    if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
+                        &source,
+                        &destination,
+                        &dst_volume_dir,
+                        &publication_root,
+                        precondition.as_deref(),
+                        durability.syncs_commit_metadata() && !same_parent,
+                    ) {
+                        return Ok(Err(to_file_error(err).into()));
+                    }
+                    created_transaction_parent = same_parent;
+                }
+
+                let Some(transaction_parent) = transaction_path.parent() else {
+                    return Ok(Err(DiskError::InvalidPath));
                 };
-
-                let new_meta_path = staging_path.join(PART_TRANSACTION_NEW_META);
-                let mut new_meta = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&new_meta_path)?;
-                std::io::Write::write_all(&mut new_meta, &meta)?;
-                if durability.syncs_commit_metadata() {
-                    new_meta.sync_data()?;
-                }
-                // Windows rejects renaming a directory while one of its children is
-                // still open, even when the child handle shares delete access.
-                drop(new_meta);
-                let _ = std::fs::hard_link(&new_meta_path, staging_path.join(PART_TRANSACTION_PUBLISH_META));
-                let sync_overwrite_backup = durability.syncs_commit_metadata() && (had_old_data || had_old_meta);
-                if sync_overwrite_backup {
-                    os::fsync_dir_std(&staging_path)?;
-                }
-                std::fs::rename(&staging_path, &transaction_path)?;
-                if sync_overwrite_backup {
-                    os::fsync_dir_std(transaction_parent)?;
-                }
-                Ok((had_old_data, had_old_meta))
-            })();
-
-            let (had_old_data, had_old_meta) = match prepare_result {
-                Ok(flags) => flags,
-                Err(err) => {
-                    let _ = remove_dir_all_if_exists(&staging_path);
+                if !created_transaction_parent && let Err(err) = std::fs::create_dir_all(transaction_parent) {
                     return Ok(Err(to_file_error(err).into()));
                 }
-            };
-            put_prepared_part_txn_receipt(
-                &transaction_path,
-                PreparedPartTxnReceipt {
-                    src_volume_dir,
-                    dst_volume_dir,
-                    src_file_path,
-                    dst_file_path,
-                    dst_meta_path,
-                    transaction_path: transaction_path.clone(),
-                    meta,
-                    had_old_data,
-                    had_old_meta,
-                },
-            );
+                #[cfg(unix)]
+                let txn_parent_fd = open_dir_fd(transaction_parent).ok().map(Arc::new);
+                #[cfg(not(unix))]
+                let txn_parent_fd: Option<Arc<std::fs::File>> = None;
+                let staging_name = format!(".part-txn-{}", Uuid::new_v4());
+                let staging_path = transaction_parent.join(&staging_name);
+                let txn_dir_fd = match mkdir_and_open_part_txn_dir(txn_parent_fd.as_deref(), &staging_name, &staging_path) {
+                    Ok(fd) => fd,
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                };
 
-            Ok(Ok(()))
-        })
+                let prepare_result = (|| -> std::io::Result<(bool, bool)> {
+                    let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
+                    let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
+                    let had_old_data = snapshot_part_transaction_file(
+                        &dst_file_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_DATA),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_DATA,
+                        &old_data_absent,
+                        PART_TRANSACTION_OLD_DATA_ABSENT,
+                        None,
+                    )?;
+                    let had_old_meta = snapshot_part_transaction_file(
+                        &dst_meta_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_META),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_META,
+                        &old_meta_absent,
+                        PART_TRANSACTION_OLD_META_ABSENT,
+                        (!had_old_data).then_some((PART_TRANSACTION_OLD_DATA_ABSENT, old_data_absent.as_path())),
+                    )?;
+
+                    let new_meta_path = staging_path.join(PART_TRANSACTION_NEW_META);
+                    let mut new_meta = create_new_in_dir_fd(txn_dir_fd.as_deref(), PART_TRANSACTION_NEW_META, &new_meta_path)?;
+                    std::io::Write::write_all(&mut new_meta, &meta)?;
+                    if durability.syncs_commit_metadata() {
+                        new_meta.sync_data()?;
+                    }
+                    // Windows rejects renaming a directory while one of its children is
+                    // still open, even when the child handle shares delete access.
+                    drop(new_meta);
+                    let _ = link_in_same_dir_fd(
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_NEW_META,
+                        &new_meta_path,
+                        PART_TRANSACTION_PUBLISH_META,
+                        &staging_path.join(PART_TRANSACTION_PUBLISH_META),
+                    );
+                    let sync_overwrite_backup = durability.syncs_commit_metadata() && (had_old_data || had_old_meta);
+                    if sync_overwrite_backup {
+                        os::fsync_directory_handle_std(&staging_path, txn_dir_fd.as_deref())?;
+                    }
+                    rename_in_same_dir_fd(
+                        txn_parent_fd.as_deref(),
+                        Some(&staging_name),
+                        &staging_path,
+                        transaction_path.file_name().and_then(|n| n.to_str()),
+                        &transaction_path,
+                    )?;
+                    if sync_overwrite_backup {
+                        os::fsync_directory_handle_std(transaction_parent, txn_parent_fd.as_deref())?;
+                    }
+                    Ok((had_old_data, had_old_meta))
+                })();
+
+                let (had_old_data, had_old_meta) = match prepare_result {
+                    Ok(flags) => flags,
+                    Err(err) => {
+                        drop(txn_dir_fd);
+                        drop(txn_parent_fd);
+                        let _ = remove_dir_all_if_exists(&staging_path);
+                        return Ok(Err(to_file_error(err).into()));
+                    }
+                };
+                Ok(Ok((
+                    transaction_path.clone(),
+                    PreparedPartTxnReceipt {
+                        src_volume_dir,
+                        dst_volume_dir,
+                        src_file_path,
+                        dst_file_path,
+                        dst_meta_path,
+                        transaction_path,
+                        meta,
+                        had_old_data,
+                        had_old_meta,
+                        txn_dir_fd,
+                        txn_parent_fd,
+                    },
+                )))
+            },
+        )
         .await
         .map_err(to_file_error)?;
-        if res.is_err()
-            && let Some(ref source) = admission_source
-        {
-            multipart_source_state::invalidate_active_multipart_source_head(source);
+        match res {
+            Ok((txn_path, entry)) => {
+                put_prepared_part_txn_receipt(&txn_path, entry);
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(ref source) = admission_source {
+                    multipart_source_state::invalidate_active_multipart_source_head(source);
+                }
+                Err(err)
+            }
         }
-        res
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -15227,29 +15507,41 @@ impl DiskAPI for LocalDisk {
         let admission = self.multipart_source_admission(volume, path, true, false)?;
         let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         let txn_rel_path = crate::disk::part_transaction_path(path);
-        let cached_published = self
-            .io_get_object_open_path(volume, &txn_rel_path)
-            .ok()
-            .and_then(|txn_open| take_published_part_txn_receipt(&txn_open));
-        let (current_data_path, current_meta_path, transaction_path, skip_obsolete_read_on_commit, cached_old_flags) =
-            match cached_published {
-                Some(entry) => (
-                    entry.current_data_path,
-                    entry.current_meta_path,
-                    entry.transaction_path,
-                    !entry.had_old_meta,
-                    Some((entry.had_old_data, entry.had_old_meta)),
-                ),
-                None => {
-                    let (_, current_data_path) = self.io_get_bucket_and_object_path(volume, path)?;
-                    let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
-                    let transaction_path = self.io_get_object_path(volume, &txn_rel_path)?;
-                    for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
-                        check_path_length(candidate.to_string_lossy().as_ref())?;
-                    }
-                    (current_data_path, current_meta_path, transaction_path, false, None)
+        let txn_open_path = self.io_get_object_open_path(volume, &txn_rel_path).ok();
+        let cached_published = txn_open_path.as_deref().and_then(take_published_part_txn_receipt);
+        if cached_published.is_none()
+            && let Some(ref txn_open) = txn_open_path
+        {
+            let _ = take_prepared_part_txn_receipt(txn_open);
+        }
+        let (
+            current_data_path,
+            current_meta_path,
+            transaction_path,
+            skip_obsolete_read_on_commit,
+            cached_old_flags,
+            mut txn_dir_fd,
+            mut txn_parent_fd,
+        ) = match cached_published {
+            Some(entry) => (
+                entry.current_data_path,
+                entry.current_meta_path,
+                entry.transaction_path,
+                !entry.had_old_meta,
+                Some((entry.had_old_data, entry.had_old_meta)),
+                entry.txn_dir_fd,
+                entry.txn_parent_fd,
+            ),
+            None => {
+                let (_, current_data_path) = self.io_get_bucket_and_object_path(volume, path)?;
+                let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
+                let transaction_path = self.io_get_object_path(volume, &txn_rel_path)?;
+                for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
+                    check_path_length(candidate.to_string_lossy().as_ref())?;
                 }
-            };
+                (current_data_path, current_meta_path, transaction_path, false, None, None, None)
+            }
+        };
         let durability = effective_durability(volume);
         let sync = durability.syncs_commit_metadata();
         let part_number = current_data_path
@@ -15261,11 +15553,14 @@ impl DiskAPI for LocalDisk {
 
         os::record_native_publication(&current_data_path);
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<bool>> {
-            match std::fs::symlink_metadata(&transaction_path) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Ok(Err(DiskError::FileCorrupt)),
-                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(false)),
-                Err(err) => return Ok(Err(to_file_error(err).into())),
+            match check_part_txn_dir_in_parent_fd(
+                txn_parent_fd.as_deref(),
+                transaction_path.file_name().and_then(|n| n.to_str()),
+                &transaction_path,
+            )? {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(false)),
+                Err(err) => return Ok(Err(err)),
             }
 
             if let Some(admission) = admission
@@ -15278,7 +15573,7 @@ impl DiskAPI for LocalDisk {
                     return Ok(Err(to_file_error(err).into()));
                 }
                 if durability.syncs_commit_metadata()
-                    && let Err(err) = os::fsync_dir_std(&transaction_path)
+                    && let Err(err) = os::fsync_directory_handle_std(&transaction_path, txn_dir_fd.as_deref())
                 {
                     return Ok(Err(to_file_error(err).into()));
                 }
@@ -15300,7 +15595,7 @@ impl DiskAPI for LocalDisk {
                 }
                 if durability.syncs_commit_metadata()
                     && let Some(parent) = current_data_path.parent()
-                    && let Err(err) = os::fsync_dir_std(parent)
+                    && let Err(err) = os::fsync_directory_handle_std(parent, txn_parent_fd.as_deref())
                 {
                     return Ok(Err(to_file_error(err).into()));
                 }
@@ -15334,18 +15629,25 @@ impl DiskAPI for LocalDisk {
                     != Some(&integrity)
             {
                 let obsolete_path = parent.join(integrity.file_name());
-                match std::fs::remove_file(&obsolete_path) {
+                match unlink_in_dir_fd(txn_parent_fd.as_deref(), &integrity.file_name(), &obsolete_path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Ok(Err(to_file_error(error).into())),
                 }
             }
-            let cleanup_path = parent.join(format!(".part-txn-settled-{}", Uuid::new_v4()));
-            if let Err(err) = std::fs::rename(&transaction_path, &cleanup_path) {
+            let cleanup_name = format!(".part-txn-settled-{}", Uuid::new_v4());
+            let cleanup_path = parent.join(&cleanup_name);
+            if let Err(err) = rename_in_same_dir_fd(
+                txn_parent_fd.as_deref(),
+                transaction_path.file_name().and_then(|n| n.to_str()),
+                &transaction_path,
+                Some(&cleanup_name),
+                &cleanup_path,
+            ) {
                 return Ok(Err(to_file_error(err).into()));
             }
             if durability.syncs_commit_metadata()
-                && let Err(err) = os::fsync_dir_std(parent)
+                && let Err(err) = os::fsync_directory_handle_std(parent, txn_parent_fd.as_deref())
             {
                 return Ok(Err(to_file_error(err).into()));
             }
@@ -15361,15 +15663,22 @@ impl DiskAPI for LocalDisk {
                     PART_TRANSACTION_OLD_META_ABSENT
                 };
                 for name in [PART_TRANSACTION_NEW_META, old_data_name, old_meta_name] {
-                    let _ = std::fs::remove_file(cleanup_path.join(name));
+                    let _ = unlink_in_dir_fd(txn_dir_fd.as_deref(), name, &cleanup_path.join(name));
                 }
-                if std::fs::remove_dir(&cleanup_path).is_err()
+                drop(txn_dir_fd.take());
+                let rmdir_res = rmdir_in_dir_fd(txn_parent_fd.as_deref(), &cleanup_name, &cleanup_path);
+                drop(txn_parent_fd.take());
+                if rmdir_res.is_err()
                     && let Err(err) = remove_dir_all_if_exists(&cleanup_path)
                 {
                     return Ok(Err(to_file_error(err).into()));
                 }
-            } else if let Err(err) = remove_dir_all_if_exists(&cleanup_path) {
-                return Ok(Err(to_file_error(err).into()));
+            } else {
+                drop(txn_dir_fd.take());
+                drop(txn_parent_fd.take());
+                if let Err(err) = remove_dir_all_if_exists(&cleanup_path) {
+                    return Ok(Err(to_file_error(err).into()));
+                }
             }
             Ok(Ok(true))
         })
@@ -15441,6 +15750,8 @@ impl DiskAPI for LocalDisk {
             dst_meta_path,
             transaction_path,
             preverified_meta_and_old_flags,
+            txn_dir_fd,
+            txn_parent_fd,
         ) = match cached_prepared {
             Some(entry) => (
                 entry.src_volume_dir,
@@ -15450,6 +15761,8 @@ impl DiskAPI for LocalDisk {
                 Some(entry.dst_meta_path),
                 Some(entry.transaction_path),
                 Some((entry.had_old_data, entry.had_old_meta)),
+                entry.txn_dir_fd,
+                entry.txn_parent_fd,
             ),
             None => {
                 let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
@@ -15484,6 +15797,8 @@ impl DiskAPI for LocalDisk {
                     dst_meta_path,
                     transaction_path,
                     None,
+                    None,
+                    None,
                 )
             }
         };
@@ -15499,8 +15814,10 @@ impl DiskAPI for LocalDisk {
         let meta_for_legacy = meta.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_file_path, source_owner.clone()).await;
 
-        let published_transaction_meta =
-            os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<bool> {
+        let published_transaction_meta = os::run_blocking_namespace_operation_with_sync(
+            lease,
+            sync,
+            move || -> std::io::Result<(bool, Option<(PathBuf, PublishedPartTxnReceipt)>)> {
                 if let Some(check) = &admission {
                     check.validate().map_err(to_file_error)?;
                 }
@@ -15547,8 +15864,12 @@ impl DiskAPI for LocalDisk {
                     let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
                     if !cfg!(test)
                         && preverified_meta_and_old_flags.is_some()
-                        && publish_meta_path.is_file()
-                        && std::fs::metadata(&transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == meta.len() as u64)
+                        && part_txn_files_ready(
+                            txn_dir_fd.as_deref(),
+                            &publish_meta_path,
+                            &transaction_meta_path,
+                            meta.len() as u64,
+                        )
                     {
                         Some(publish_meta_path)
                     } else {
@@ -15651,29 +15972,39 @@ impl DiskAPI for LocalDisk {
                             }
                         }
                     }
-                    if let (Some((had_old_data, had_old_meta)), Some(txn_path), Some(meta_path)) =
-                        (preverified_meta_and_old_flags, transaction_path.as_ref(), dst_meta_path.as_path().into())
+                    let published_entry = if let (Some((had_old_data, had_old_meta)), Some(txn_path), Some(meta_path)) =
+                        (preverified_meta_and_old_flags, transaction_path, dst_meta_path.as_path().into())
                     {
-                        put_published_part_txn_receipt(
-                            txn_path,
+                        Some((
+                            txn_path.clone(),
                             PublishedPartTxnReceipt {
                                 current_data_path: dst_file_path,
                                 current_meta_path: meta_path.to_path_buf(),
-                                transaction_path: txn_path.clone(),
+                                transaction_path: txn_path,
                                 had_old_data,
                                 had_old_meta,
+                                txn_dir_fd,
+                                txn_parent_fd,
                             },
-                        );
-                    }
-                    Ok(true)
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok((true, published_entry))
                 } else {
-                    Ok(false)
+                    Ok((false, None))
                 }
-            })
-            .await
-            .map_err(DiskError::from);
+            },
+        )
+        .await
+        .map_err(DiskError::from);
         let published_transaction_meta = match published_transaction_meta {
-            Ok(published) => published,
+            Ok((published, maybe_entry)) => {
+                if let Some((txn_path, entry)) = maybe_entry {
+                    put_published_part_txn_receipt(&txn_path, entry);
+                }
+                published
+            }
             Err(err) => {
                 if let Some(ref source) = admission_source {
                     multipart_source_state::invalidate_active_multipart_source_head(source);
@@ -39467,5 +39798,75 @@ mod test {
         let expected_hash = algo.hash_encode(&payload);
         assert_eq!(&on_disk[..expected_hash.as_ref().len()], expected_hash.as_ref());
         assert_eq!(&on_disk[expected_hash.as_ref().len()..], payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn part_txn_files_ready_and_receipt_cache_eviction_on_close_and_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+
+        let payload = Bytes::from_static(b"part payload");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all("tmp", "upload/part.1", payload.clone())
+            .await
+            .expect("stage part");
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("prepare part transaction");
+
+        let txn_rel = crate::disk::part_transaction_path("object/part.1");
+        let txn_open = disk
+            .io_get_object_open_path("bucket", &txn_rel)
+            .expect("transaction open path");
+        let publish_meta = txn_open.join(PART_TRANSACTION_PUBLISH_META);
+        let new_meta = txn_open.join(PART_TRANSACTION_NEW_META);
+        let entry_fd = PREPARED_PART_TXN_RECEIPTS
+            .with_get(&txn_open, |entry| entry.txn_dir_fd.clone())
+            .expect("prepared receipt should be cached");
+        assert!(part_txn_files_ready(entry_fd.as_deref(), &publish_meta, &new_meta, meta.len() as u64,));
+        assert!(!part_txn_files_ready(
+            entry_fd.as_deref(),
+            &publish_meta,
+            &new_meta,
+            (meta.len() + 1) as u64,
+        ));
+        drop(entry_fd);
+
+        disk.close().await.expect("close disk");
+        assert!(
+            take_prepared_part_txn_receipt(&txn_open).is_none(),
+            "LocalDisk::close must purge cached part transaction receipts"
+        );
+
+        disk.write_all("tmp", "upload2/part.2", payload)
+            .await
+            .expect("stage second part");
+        disk.prepare_part_transaction("tmp", "upload2/part.2", "bucket", "object/part.2", meta)
+            .await
+            .expect("prepare second part transaction");
+        let txn2_rel = crate::disk::part_transaction_path("object/part.2");
+        let txn2_open = disk
+            .io_get_object_open_path("bucket", &txn2_rel)
+            .expect("second transaction open path");
+        assert!(
+            PREPARED_PART_TXN_RECEIPTS.with_get(&txn2_open, |_| ()).is_some(),
+            "second prepared receipt should be cached before drop"
+        );
+        drop(disk);
+        assert!(
+            take_prepared_part_txn_receipt(&txn2_open).is_none(),
+            "Drop for LocalDisk must purge cached part transaction receipts"
+        );
     }
 }

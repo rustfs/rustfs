@@ -44,8 +44,8 @@ class Repository:
         self.git('commit', '-qm', 'fixture')
         return self.git('rev-parse', 'HEAD')
 
-    def plan(self, head=None, event='pull_request', base=None, action='opened'):
-        return gate.select_plan(event, base or self.base, head or self.git('rev-parse', 'HEAD'), 'refs/heads/main', self.root, action)
+    def plan(self, head=None, event='pull_request', base=None, action='opened', proof=None):
+        return gate.select_plan(event, base or self.base, head or self.git('rev-parse', 'HEAD'), 'refs/heads/main', self.root, action, proof=proof)
 
 
 class PlannerTests(unittest.TestCase):
@@ -181,6 +181,24 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(gate.validate_plan(plan, 'pull_request', 'refs/heads/main', head, plan['tree']), plan['jobs'])
         for event in ('push', 'merge_group', 'schedule', 'workflow_dispatch'):
             self.assertTrue(self.repo.plan(head, event=event, base=baseline)['full_validation'])
+
+    def test_push_skips_validation_only_for_the_tree_a_merge_group_run_proved(self):
+        head, tree = self.repo.git('rev-parse', 'HEAD'), self.repo.git('rev-parse', 'HEAD^{tree}')
+        proof = {'run_id': 7, 'url': 'https://github.com/rustfs/rustfs/actions/runs/7', 'tree': tree}
+        plan = self.repo.plan(head, event='push', proof=proof)
+        self.assertEqual((plan['mode'], plan['proven_by']), ('proven', proof))
+        self.assertEqual({job for job, state in plan['jobs'].items() if state == 'success'}, set(gate.ALWAYS_JOBS))
+        self.assertTrue(all(proof['url'] in plan['not_applicable'][job] for job in gate.CODE_JOBS))
+        self.assertEqual(gate.validate_plan(plan, 'push', 'refs/heads/main', head, tree), plan['jobs'])
+        # A direct push has no proving run; a proof of another tree, or on any other event, proves nothing.
+        for event, candidate in [('push', None), ('push', dict(proof, tree='0' * 40)), ('merge_group', proof),
+                                 ('schedule', proof), ('workflow_dispatch', proof), ('pull_request', proof)]:
+            with self.subTest(event=event, proof=candidate):
+                other = self.repo.plan(head, event=event, proof=candidate)
+                self.assertNotEqual(other['mode'], 'proven')
+                self.assertIsNone(other['proven_by'])
+                if event != 'pull_request':
+                    self.assertTrue(all(other['jobs'][job] == 'success' for job in (gate.LINT_JOB, gate.ARCHIVE_PRODUCER, 'workspace-tests')))
 
     def test_individual_stable_version_fields_without_new_rpm_history_are_metadata(self):
         baseline, files = self.release_metadata_base()
@@ -464,7 +482,8 @@ class GateTests(unittest.TestCase):
                 'base': 'c' * 40, 'action': '', 'mode': mode, 'connect': connect, 'full_validation': mode == 'full', 'packages': ['rustfs'] if mode != 'docs' else [],
                 'rehearse_shards': False,
                 'policy': {'revision': 'c' * 40, 'rollout': 'enforced'}, 'jobs': jobs, 'configurations': gate.configurations(jobs),
-                'reasons': ['fixture'], 'not_applicable': {job: 'fixture' for job, state in jobs.items() if state == 'skipped'}}
+                'reasons': ['fixture'], 'not_applicable': {job: 'fixture' for job, state in jobs.items() if state == 'skipped'},
+                'proven_by': {'run_id': 7, 'url': 'https://github.com/rustfs/rustfs/actions/runs/7', 'tree': 'b' * 40} if mode == 'proven' else None}
 
     def needs(self, plan):
         needs = {job: {'result': state} for job, state in plan['jobs'].items()}
@@ -472,7 +491,7 @@ class GateTests(unittest.TestCase):
         return needs
 
     def test_failure_cancel_missing_extra_or_unexpected_skip_is_rejected(self):
-        for event, mode in [('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'), ('push', 'full'), ('merge_group', 'full'), ('schedule', 'full'), ('workflow_dispatch', 'full')]:
+        for event, mode in [('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'), ('push', 'full'), ('push', 'proven'), ('merge_group', 'full'), ('schedule', 'full'), ('workflow_dispatch', 'full')]:
             plan = self.plan(event, mode)
             good = self.needs(plan)
             self.assertEqual(gate.verify_results(good, event, plan['ref'], plan['head'], plan['tree']), [])
@@ -501,6 +520,28 @@ class GateTests(unittest.TestCase):
         self.assertTrue(gate.verify_results(good, plan['event'], plan['ref'], plan['head'], 'c' * 40))
         self.assertTrue(gate.verify_results(good, plan['event'], plan['ref'], base='d' * 40))
         self.assertTrue(gate.verify_results(good, plan['event'], plan['ref'], action='closed'))
+
+    def test_a_proven_push_needs_its_own_tree_proof_and_nothing_else_may_carry_one(self):
+        proven, full = self.plan('push', 'proven'), self.plan('push', 'full')
+        self.assertEqual(gate.verify_results(self.needs(proven), 'push', proven['ref'], proven['head'], proven['tree']), [])
+        proof = proven['proven_by']
+        bad = [dict(proven, proven_by=None), dict(proven, proven_by=dict(proof, tree='c' * 40)),
+               dict(proven, proven_by=dict(proof, run_id='7')), dict(proven, proven_by=dict(proof, run_id=0)),
+               dict(proven, proven_by=dict(proof, url='https://example.invalid/7')), dict(proven, proven_by={}),
+               dict(full, proven_by=proof)]
+        for plan in bad:
+            with self.subTest(plan=plan['proven_by']), self.assertRaises(ValueError):
+                gate.validate_plan(plan, 'push', plan['ref'])
+        for event in ('pull_request', 'merge_group', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event), self.assertRaises(ValueError):
+                gate.expected_results('proven', event, 'refs/heads/main')
+
+    def test_the_queue_run_that_proves_a_push_validates_everything_that_push_would(self):
+        queued = {job for job, result in gate.expected_results('full', 'merge_group', 'refs/heads/main').items() if result == 'success'}
+        for ref in gate.INTEGRATION_PUSH_REFS:
+            pushed = {job for job, result in gate.expected_results('full', 'push', ref).items() if result == 'success'}
+            with self.subTest(ref=ref):
+                self.assertLessEqual(pushed, queued)
 
     def test_legacy_base_cannot_authorize_skipped_new_jobs(self):
         expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
@@ -544,11 +585,11 @@ class GateTests(unittest.TestCase):
             elif job in gate.OPTIONAL_JOBS[:2]:
                 expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
-                expression = "github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')"
+                expression = "needs.classify-changes.outputs.mode == 'full' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))"
             elif job in gate.SHARD_JOBS:
                 expression = "needs.classify-changes.outputs.rehearse_shards == 'true'"
             elif job in gate.E2E_JOBS:
-                expression = "needs.classify-changes.outputs.mode != 'docs'"
+                expression = "contains(fromJSON('[\"full\",\"e2e\"]'), needs.classify-changes.outputs.mode)"
             else:
                 expression = "needs.classify-changes.outputs.mode == 'full'"
             expression = f"({expression}) && (github.event_name != 'pull_request' || github.event.action != 'closed')"

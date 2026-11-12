@@ -127,11 +127,7 @@ impl ValidationUtils {
             }
         }
 
-        if value.len() > 8192 {
-            return false;
-        }
-
-        true
+        value.len() <= 8192
     }
 
     /// Validates an entire HeaderMap for security.

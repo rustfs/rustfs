@@ -13,14 +13,33 @@
 // limitations under the License.
 
 use rustfs_iam::sys::SESSION_POLICY_NAME;
-use rustfs_policy::policy::Policy;
+use rustfs_policy::policy::{ID, Policy, Statement};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPolicyInput {
+    #[serde(default, rename = "Id", alias = "ID")]
+    id: ID,
+    #[serde(default, rename = "Version")]
+    version: String,
+    #[serde(default, rename = "Statement")]
+    statements: Vec<Statement>,
+}
+
+fn parse_session_policy(input: &str) -> rustfs_policy::error::Result<Policy> {
+    let SessionPolicyInput { id, version, statements } = serde_json::from_str(input)?;
+    let policy = Policy { id, version, statements };
+    policy.validate()?;
+    Ok(policy)
+}
+
 pub(crate) fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
     if !policy.is_empty() {
-        let session_policy = Policy::parse_config(policy.as_bytes()).map_err(|e| {
+        let session_policy = parse_session_policy(policy).map_err(|e| {
             let error_msg = format!(
                 "Failed to parse session policy: {}. Please check that the policy is valid JSON format with standard brackets [] for arrays.",
                 e
@@ -59,27 +78,50 @@ mod tests {
     }
 
     #[test]
-    fn valid_policy_is_encoded_in_the_session_claim() {
-        let mut claims = HashMap::new();
-        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"]}]}"#;
+    fn session_policy_claim_preserves_the_iam_policy_format() {
+        for id_key in [Some("Id"), Some("ID"), None] {
+            let mut input = serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::bucket/*"]}]
+            });
+            if let Some(key) = id_key {
+                input[key] = "read-objects".into();
+            }
+            if id_key == Some("Id") {
+                assert!(Policy::parse_config(input.to_string().as_bytes()).is_err());
+            }
+            let mut claims = HashMap::new();
+            populate_session_policy(&mut claims, &input.to_string()).expect("valid session policy");
 
-        populate_session_policy(&mut claims, policy).expect("valid policy should be accepted");
-
-        let encoded = claims
-            .get(SESSION_POLICY_NAME)
-            .and_then(Value::as_str)
-            .expect("session policy claim should be present");
-        let decoded = base64_simd::URL_SAFE_NO_PAD
-            .decode_to_vec(encoded.as_bytes())
-            .expect("session policy claim should be base64url encoded");
-        let decoded_policy: Value = serde_json::from_slice(&decoded).expect("session policy claim should contain JSON");
-        assert_eq!(decoded_policy["Version"], "2012-10-17");
+            let encoded = claims[SESSION_POLICY_NAME].as_str().expect("encoded session policy");
+            let decoded = base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(encoded.as_bytes())
+                .expect("base64url claim");
+            let json: Value = serde_json::from_slice(&decoded).expect("JSON claim");
+            assert!(json.get("Id").is_none());
+            assert_eq!(json.get("ID").and_then(Value::as_str), id_key.map(|_| "read-objects"));
+            let policy = Policy::parse_config(&decoded).expect("claim must be readable by the IAM policy parser");
+            assert_eq!(policy.version, "2012-10-17");
+            assert_eq!(policy.statements.len(), 1);
+        }
     }
 
     #[test]
     fn invalid_policy_is_rejected_as_invalid_request() {
-        let mut claims = HashMap::new();
-        let error = populate_session_policy(&mut claims, "not-json").expect_err("invalid policy should fail");
-        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        for input in [
+            "not-json",
+            r#"{"Id":"a","ID":"b","Version":"2012-10-17"}"#,
+            r#"{"Id":"a","Id":"b","Version":"2012-10-17"}"#,
+            r#"{"id":"a","Version":"2012-10-17"}"#,
+            r#"{"Id":42,"Version":"2012-10-17"}"#,
+            r#"{"Id":"a"}"#,
+            r#"{"Id":"a","Version":"invalid"}"#,
+            r#"{"Id":"a","Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
+        ] {
+            let mut claims = HashMap::new();
+            let error = populate_session_policy(&mut claims, input).expect_err("invalid session policy");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest, "{input}");
+            assert!(claims.is_empty());
+        }
     }
 }
