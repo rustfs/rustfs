@@ -390,7 +390,7 @@ rustfs-mimalloc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 rustfs-mimalloc = { workspace = true, features = ["no_thp"] }
-rustfs-mimalloc-sys = "0.7.3"
+rustfs-mimalloc-sys = "0.7.4"
 
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
 pyroscope = { workspace = true, optional = true, features = ["backend-pprof-rs"] }
