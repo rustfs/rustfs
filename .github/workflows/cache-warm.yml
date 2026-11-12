@@ -115,7 +115,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          # Digest of the build steps below; scripts/ci_gate.py --check-workflow
+          # names the new key when they change, and every reader must follow.
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 

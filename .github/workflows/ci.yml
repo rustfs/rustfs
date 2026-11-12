@@ -206,7 +206,7 @@ jobs:
           rust-version: stable
           # Read-only, like every other ci-dev reader; cache-warm.yml warms the
           # check artifacts of this exact invocation.
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
@@ -259,7 +259,7 @@ jobs:
           # Every lane reads its cache; cache-warm.yml remains the sole writer
           # with the matching feature closure. Tests never compete to replace
           # shared caches, including when a PR attempt is cancelled.
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
@@ -444,7 +444,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
@@ -695,7 +695,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import posixpath
 import os
@@ -54,6 +55,9 @@ E2E_SELECTION_FILES = {
 LINT_JOB = "workspace-clippy"
 ARCHIVE_PRODUCER = "workspace-lint-and-build"
 ARCHIVE_CONSUMERS = ("workspace-tests",)
+SETUP = "./.github/actions/setup"
+# The condition every cache-warm.yml build carries: Rust-cache does not save over an exact key match.
+HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
 LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
@@ -715,23 +719,44 @@ def check_lint_lane(jobs: dict) -> list[str]:
     return errors
 
 
-def cache_warm_errors(ci_jobs: dict, warm_jobs: dict) -> list[str]:
-    """Keep ci-dev holding the readers' own builds, and stop warm jobs from rebuilding a stored key."""
+def ci_dev_workflows(root: Path) -> tuple[dict[str, dict], dict]:
+    """The jobs of every workflow that reads ci-dev, by file name, and cache-warm.yml's jobs."""
+    readers = {name: workflow_document((root / ".github/workflows" / name).read_text())["jobs"] for name in ("ci.yml", "reference-parity.yml")}
+    return readers, workflow_document((root / ".github/workflows/cache-warm.yml").read_text())["jobs"]
+
+
+def cache_warm_errors(readers: dict[str, dict], warm_jobs: dict) -> list[str]:
+    """Keep ci-dev holding the readers' own builds under a key they share, and stop warm jobs rebuilding a stored key.
+
+    `readers` maps each workflow that reads ci-dev to its jobs; ci.yml's archive builds define the selections.
+    """
     errors = []
-    dev = "\n".join(step.get("run", "") for step in warm_jobs.get("warm-ci-dev", {}).get("steps", []))
-    archived = {match for block in ci_jobs.values() for step in block.get("steps", [])
-                for match in re.findall(r"scripts/ci_test_artifact\.py build --configuration (\S+)", step.get("run", ""))}
-    for configuration in sorted(archived):
-        if f"python3 scripts/ci_test_artifact.py cargo warm --configuration {configuration}" not in dev:
-            errors.append(f"warm-ci-dev must build the {configuration} archive selection")
-    if LINT_COMMANDS[1] not in dev:
+    # Only the steps that run whenever the key is written count; the --timings step runs on request.
+    builds = [step.get("run", "") for step in warm_jobs.get("warm-ci-dev", {}).get("steps", []) if step.get("if") == HIT_SKIP]
+
+    def selections(command: str, text: str) -> set[str]:
+        return set(re.findall(rf"scripts/ci_test_artifact\.py {command} --configuration[= ](\S+)", text))
+
+    archived = {name for block in readers["ci.yml"].values() for step in block.get("steps", []) for name in selections("build", step.get("run", ""))}
+    warmed = selections("cargo warm", "\n".join(builds))
+    errors += [f"warm-ci-dev must build the {name} archive selection" for name in sorted(archived - warmed)]
+    errors += [f"warm-ci-dev builds the {name} selection, which no ci.yml job archives" for name in sorted(warmed - archived)]
+    if not any(LINT_COMMANDS[1] in run for run in builds):
         errors.append("warm-ci-dev must run the workspace lint command")
+    # Rust-cache keeps an entry until its key changes. The key names a digest of the warm commands, so changing
+    # what is warmed writes a new entry instead of leaving readers on the old one; every reader names the same key.
+    key = "ci-dev-" + hashlib.sha256(json.dumps(builds).encode()).hexdigest()[:12]
+    for workflow, jobs in {"cache-warm.yml": {"warm-ci-dev": warm_jobs.get("warm-ci-dev", {})}, **readers}.items():
+        for job, block in jobs.items():
+            used = next((step.get("with", {}).get("cache-shared-key") for step in block.get("steps", []) if step.get("uses") == SETUP), None)
+            if (job == "warm-ci-dev" or str(used).startswith("ci-dev")) and used != key:
+                errors.append(f"{workflow} {job} uses cache key {used}; the ci-dev key for these warm commands is {key}")
     # Rust-cache does not save over an exact key match, so such a build is lost.
     for job, block in warm_jobs.items():
         steps = block.get("steps", [])
-        restored = any(step.get("id") == "setup" and step.get("uses") == "./.github/actions/setup" for step in steps)
+        restored = any(step.get("id") == "setup" and step.get("uses") == SETUP for step in steps)
         if any(re.search(r"(^|\s)cargo\s|ci_test_artifact\.py", step.get("run", ""), re.M) and step.get("if") != "inputs.emit_timings"
-               and (not restored or step.get("if") != "steps.setup.outputs.cache-hit != 'true'") for step in steps):
+               and (not restored or step.get("if") != HIT_SKIP) for step in steps):
             errors.append(f"{job} builds after an exact cache hit")
     return errors
 
@@ -953,10 +978,9 @@ def main() -> int:
     elif sys.argv[1:] == ["--check-workflow"]:
         errors = check_workflow(ROOT)
         try:
-            warm = workflow_document((ROOT / ".github/workflows/cache-warm.yml").read_text())["jobs"]
-            errors += cache_warm_errors(workflow_document((ROOT / ".github/workflows/ci.yml").read_text())["jobs"], warm)
+            errors += cache_warm_errors(*ci_dev_workflows(ROOT))
         except (OSError, KeyError, TypeError, ValueError) as error:
-            errors.append(f"cache-warm.yml: {error}")
+            errors.append(f"ci-dev cache: {error}")
     else:
         print("usage: ci_gate.py {select|verify|--check-workflow|--self-test}", file=sys.stderr)
         return 2

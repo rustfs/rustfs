@@ -617,37 +617,72 @@ class GateTests(unittest.TestCase):
 
     def test_cache_warm_builds_each_reader_selection_and_skips_exact_hits(self):
         root = Path(gate.__file__).resolve().parent.parent
-        ci = gate.workflow_document((root / '.github/workflows/ci.yml').read_text())['jobs']
-        warm = gate.workflow_document((root / '.github/workflows/cache-warm.yml').read_text())['jobs']
-        self.assertEqual(gate.cache_warm_errors(ci, warm), [])
-        dev = warm['warm-ci-dev']['steps']
-        build = next(step for step in dev if 'cargo warm --configuration e2e' in step.get('run', ''))
-        lint = next(step for step in dev if gate.LINT_COMMANDS[1] in step.get('run', ''))
+        readers, warm = gate.ci_dev_workflows(root)
+        original = json.dumps({**readers, 'cache-warm.yml': warm})
+
+        def errors(documents):
+            warm = documents.pop('cache-warm.yml')
+            return gate.cache_warm_errors(documents, warm)
+
+        def step(jobs, job, text):
+            return next(item for item in jobs[job]['steps'] if text in item.get('run', item.get('uses', '')))
+
+        def rewrite(item, old, new):
+            item['run'] = item['run'].replace(old, new)
+
+        def key(jobs, job):
+            return step(jobs, job, './.github/actions/setup')['with']
+
+        e2e = 'python3 scripts/ci_test_artifact.py cargo warm --configuration e2e'
+        self.assertEqual(errors(json.loads(original)), [])
         mutations = [
-            (lambda: build.update(run=build['run'].replace('cargo warm --configuration e2e', 'cargo warm --configuration workspace')),
+            (lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), e2e, e2e.replace('e2e', 'workspace')),
              'warm-ci-dev must build the e2e archive selection'),
-            (lambda: build.update(run=build['run'].replace('python3 scripts/ci_test_artifact.py cargo warm --configuration workspace', 'cargo build --workspace --all-targets')),
+            (lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), e2e, e2e + '-foo'),
+             'warm-ci-dev must build the e2e archive selection'),
+            (lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), e2e, e2e + '-foo'),
+             'warm-ci-dev builds the e2e-foo selection, which no ci.yml job archives'),
+            (lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), 'python3 scripts/ci_test_artifact.py cargo warm --configuration workspace',
+                               'cargo build --workspace --all-targets'),
              'warm-ci-dev must build the workspace archive selection'),
-            (lambda: lint.update(run=lint['run'].replace(gate.LINT_COMMANDS[1], 'cargo clippy --all-targets -- -D warnings')),
-             'warm-ci-dev must run the workspace lint command'),
-            (lambda: build.pop('if'), 'warm-ci-dev builds after an exact cache hit'),
-            (lambda: lint.update({'if': "always()"}), 'warm-ci-dev builds after an exact cache hit'),
-            (lambda: next(step for step in warm['warm-ci-uring']['steps'] if 'cargo build' in step.get('run', '')).pop('if'),
-             'warm-ci-uring builds after an exact cache hit'),
-            (lambda: next(step for step in warm['warm-ci-feat-rio']['steps'] if step.get('id') == 'setup').pop('id'),
-             'warm-ci-feat-rio builds after an exact cache hit'),
-            (lambda: ci['build-rustfs-debug-binary']['steps'].append({'run': 'python3 scripts/ci_test_artifact.py build --configuration other --archive x'}),
+            # The --timings step runs only on request, so a selection moved into it is not warmed.
+            (lambda d: (rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), e2e, ''),
+                        rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', '--timings'), 'cargo build', e2e + '\ncargo build')),
+             'warm-ci-dev must build the e2e archive selection'),
+            (lambda d: d['ci.yml']['build-rustfs-debug-binary']['steps'].remove(
+                step(d['ci.yml'], 'build-rustfs-debug-binary', 'ci_test_artifact.py build --configuration e2e')),
+             'warm-ci-dev builds the e2e selection, which no ci.yml job archives'),
+            (lambda d: d['ci.yml']['build-rustfs-debug-binary']['steps'].append({'run': 'python3 scripts/ci_test_artifact.py build --configuration other --archive x'}),
              'warm-ci-dev must build the other archive selection'),
+            (lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', gate.LINT_COMMANDS[1]), gate.LINT_COMMANDS[1], 'cargo clippy --all-targets -- -D warnings'),
+             'warm-ci-dev must run the workspace lint command'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', e2e).pop('if'), 'warm-ci-dev builds after an exact cache hit'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', gate.LINT_COMMANDS[1]).update({'if': 'always()'}), 'warm-ci-dev builds after an exact cache hit'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-uring', 'cargo build').pop('if'), 'warm-ci-uring builds after an exact cache hit'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-feat-rio', './.github/actions/setup').pop('id'),
+             'warm-ci-feat-rio builds after an exact cache hit'),
         ]
+        warm_key = key(json.loads(original)['cache-warm.yml'], 'warm-ci-dev')['cache-shared-key']
+        readers = [(workflow, job) for workflow in ('ci.yml', 'reference-parity.yml') for job, block in json.loads(original)[workflow].items()
+                   if any(item.get('with', {}).get('cache-shared-key') == warm_key for item in block.get('steps', []))]
+        self.assertEqual(len(readers), 6)
+        for workflow, job in (('cache-warm.yml', 'warm-ci-dev'), ('ci.yml', 'workspace-clippy'), ('reference-parity.yml', 'build-candidate')):
+            mutations.append((lambda d, workflow=workflow, job=job: key(d[workflow], job).update({'cache-shared-key': 'ci-dev-0'}),
+                              f'{workflow} {job} uses cache key ci-dev-0; the ci-dev key for these warm commands is {warm_key}'))
+        # A changed warm command without a new key leaves readers on the old artifacts.
+        mutations.append((lambda d: rewrite(step(d['cache-warm.yml'], 'warm-ci-dev', e2e), '--features e2e-test-hooks', '--features e2e-test-hooks,x'),
+                          f'cache-warm.yml warm-ci-dev uses cache key {warm_key}; the ci-dev key for these warm commands is '))
+        # Either spelling of the option names the same selection; only the digest notices the edit.
+        documents = json.loads(original)
+        rewrite(step(documents['cache-warm.yml'], 'warm-ci-dev', e2e), '--configuration e2e', '--configuration=e2e')
+        self.assertEqual([error.split(';')[0] for error in errors(documents)], [f'cache-warm.yml warm-ci-dev uses cache key {warm_key}'] +
+                         [f'{workflow} {job} uses cache key {warm_key}' for workflow, job in readers])
         for mutate, message in mutations:
-            original = json.dumps([ci, warm])
+            documents = json.loads(original)
+            mutate(documents)
+            found = errors(documents)
             with self.subTest(message=message):
-                mutate()
-                self.assertIn(message, gate.cache_warm_errors(ci, warm))
-            ci, warm = json.loads(original)
-            dev = warm['warm-ci-dev']['steps']
-            build = next(step for step in dev if 'cargo warm --configuration e2e' in step.get('run', ''))
-            lint = next(step for step in dev if gate.LINT_COMMANDS[1] in step.get('run', ''))
+                self.assertTrue(any(error.startswith(message) for error in found), found)
 
     def test_ignored_ilm_archive_execution_preserves_failure_and_core_report(self):
         workflow = gate.workflow_document((Path(gate.__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text())
