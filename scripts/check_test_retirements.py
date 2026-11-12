@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard: every test a migration slice retires names a replacement that exists.
+"""Guard: every test a migration slice retires exists and names a replacement that exists.
 
 The operation slices of the s3s-to-gateway migration (rustfs/backlog#2765) port
 legacy tests rather than delete them; when a legacy test is scheduled to die
@@ -9,18 +9,25 @@ the same file. Each entry line is
 
     <crate> | <module path>::<test fn> | <kind> | <replacement> | <reason>
 
-and <kind> says what <replacement> names:
+The retired test must exist when the entry is added: `<crate>` is a workspace
+package and a file under its src/ or tests/ declares `fn <test fn>` under a
+test attribute. The task that deletes retired tests deletes their entries in
+the same change. <kind> says what <replacement> names:
 
-    test          <repo path>::<fn>; that file declares `fn <fn>`
-    differential  <Operation>/<case>; a recorder step for that operation and
-                  case exists under crates/e2e_test/src/dual_stack_differential/
+    test          <repo path>::<fn>; the file lies under src/ or tests/ of a
+                  workspace package and declares `fn <fn>` under a test attribute
+    differential  <Operation>/<case>; a recorder `step("<Operation>", "<case>"`
+                  call exists under crates/e2e_test/src/dual_stack_differential/
     e2e           <fn>; a file under crates/e2e_test/src/ declares `fn <fn>`
+                  under a test attribute
 
-Lines starting with '#' and blank lines are ignored. The guard fails when a
-table file is missing or unknown, an entry does not have five non-empty fields,
-its kind is unknown, the same retired test is listed twice (in any table), or
-its replacement does not exist. An entry whose retired test still exists
-passes: it is scheduled to die with its subject. Tying the per-crate test-count
+A test attribute is `#[test]`, `#[tokio::test…]` or `#[test_case…]` (the forms
+this repository uses), possibly among other attributes directly above the fn.
+Comments never count, and string literals do not count for a fn. Lines
+starting with '#' and blank lines are ignored. The guard fails when a table
+file is missing or unknown, an entry does not have five non-empty fields, its
+kind is unknown, the same retired test is listed twice (in any table), or the
+retired test or its replacement does not exist. Tying the per-crate test-count
 floor to these entries is deliberately not done here.
 
 Usage:
@@ -36,6 +43,7 @@ import argparse
 import re
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -59,38 +67,121 @@ DIFFERENTIAL_DIR = "crates/e2e_test/src/dual_stack_differential"
 E2E_DIR = "crates/e2e_test/src"
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 CRATE = re.compile(r"[A-Za-z0-9_-]+")
-TEST_PATH = re.compile(rf"{IDENT}(::{IDENT})*")
+TEST_PATH = re.compile(rf"{IDENT}(::{IDENT})+")
+TEST_ATTRIBUTE = re.compile(r"#\[\s*(test|tokio::test|test_case(::test_case)?)\s*[\](]")
 
 
-def rust_text(root: Path, directory: str) -> str:
-    return "\n".join(path.read_text() for path in sorted((root / directory).rglob("*.rs")))
+RAW_STRING = re.compile(r'r(#*)"')
+CHAR_LITERAL = re.compile(r"'(?:[^'\\\n]|\\[^\n]+?)'")
 
 
-def declares_fn(text: str, name: str) -> bool:
-    return re.search(rf"\bfn\s+{re.escape(name)}\b", text) is not None
+def blank(text: str, strings: bool) -> str:
+    """`text` with comments (and, with `strings`, string literals) replaced by spaces."""
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        literal = True
+        if text.startswith("//", i):
+            end, literal = text.find("\n", i) % (n + 1), False
+        elif text.startswith("/*", i):
+            depth, end, literal = 1, i + 2, False
+            while end < n and depth:
+                depth += {"/*": 1, "*/": -1}.get(text[end : end + 2], 0)
+                end += 2 if text[end : end + 2] in ("/*", "*/") else 1
+        elif (raw := RAW_STRING.match(text, i)) and (i == 0 or not text[i - 1].isalnum()):
+            close = text.find('"' + raw.group(1), raw.end())
+            end = n if close < 0 else close + 1 + len(raw.group(1))
+        elif text[i] == '"':
+            end = i + 1
+            while end < n and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end += 1
+        elif char := CHAR_LITERAL.match(text, i):
+            end = char.end()
+        else:
+            i += 1
+            continue
+        if strings or not literal:
+            out[i:end] = [ch if ch == "\n" else " " for ch in text[i:end]]
+        i = end
+    return "".join(out)
 
 
-def replacement_error(root: Path, kind: str, replacement: str, cache: dict[str, str]) -> str | None:
+def declares_test_fn(code: str, name: str) -> bool:
+    """Whether `code` (comments and strings blanked) declares `fn <name>` under a test attribute."""
+    for match in re.finditer(rf"\bfn\s+{re.escape(name)}\b", code):
+        head = re.sub(r"(\s*\b(pub(\([^)]*\))?|async|const|unsafe))*\s*$", "", code[max(0, match.start() - 4000) : match.start()])  # attributes sit right above
+        while head.endswith("]"):
+            depth, k = 0, len(head) - 1
+            while k >= 0:
+                depth += {"]": 1, "[": -1}.get(head[k], 0)
+                if depth == 0:
+                    break
+                k -= 1
+            if k < 1 or head[k - 1] != "#":
+                break
+            if TEST_ATTRIBUTE.match(head[k - 1 :]):
+                return True
+            head = head[: k - 1].rstrip()
+    return False
+
+
+class Tree:
+    """Cached reads of the repository: package directories and blanked Rust sources."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.cache: dict[tuple[Path, bool], str] = {}
+        self.packages: dict[str, Path] = {}
+        for manifest in [root / "rustfs" / "Cargo.toml", *sorted(root.glob("crates/*/Cargo.toml"))]:
+            if manifest.is_file():
+                name = tomllib.loads(manifest.read_text()).get("package", {}).get("name")
+                if isinstance(name, str):
+                    self.packages[name] = manifest.parent
+
+    def code(self, path: Path, strings: bool = True) -> str:
+        key = (path, strings)
+        if key not in self.cache:
+            files = sorted(path.rglob("*.rs")) if path.is_dir() else [path]
+            self.cache[key] = "\n".join(blank(file.read_text(), strings) for file in files if file.is_file())
+        return self.cache[key]
+
+    def in_package_sources(self, path: Path) -> bool:
+        return any(path.is_relative_to(d / "src") or path.is_relative_to(d / "tests") for d in self.packages.values())
+
+
+def retired_error(tree: Tree, crate: str, test: str) -> str | None:
+    directory = tree.packages.get(crate)
+    if directory is None:
+        return f"`{crate}` is not a workspace package"
+    name = test.rpartition("::")[2]
+    if any(declares_test_fn(tree.code(directory / sub), name) for sub in ("src", "tests")):
+        return None
+    return f"retired test `fn {name}` is not a test function under {directory.relative_to(tree.root)}/src or tests"
+
+
+def replacement_error(tree: Tree, kind: str, replacement: str) -> str | None:
     """Why `replacement` of `kind` does not exist, or None when it does."""
     if kind == "test":
         path, sep, name = replacement.rpartition("::")
         if not sep or not re.fullmatch(IDENT, name) or Path(path).is_absolute() or ".." in Path(path).parts:
             return f"test replacement `{replacement}` is not <repo path>::<fn>"
-        file = root / path
+        file = tree.root / path
         if not file.is_file():
             return f"test replacement file `{path}` does not exist"
-        return None if declares_fn(file.read_text(), name) else f"`{path}` declares no `fn {name}`"
+        if not tree.in_package_sources(file):
+            return f"test replacement file `{path}` is not under src/ or tests/ of a workspace package"
+        return None if declares_test_fn(tree.code(file), name) else f"`{path}` declares no test `fn {name}`"
     if kind == "differential":
         operation, sep, case = replacement.partition("/")
         if not sep or not re.fullmatch(IDENT, operation) or not case:
             return f"differential replacement `{replacement}` is not <Operation>/<case>"
-        text = cache.setdefault(DIFFERENTIAL_DIR, rust_text(root, DIFFERENTIAL_DIR))
         step = rf'\bstep\(\s*"{re.escape(operation)}",\s*"{re.escape(case)}"'
-        return None if re.search(step, text) else f"no differential step `{operation}`/`{case}` under {DIFFERENTIAL_DIR}"
+        found = re.search(step, tree.code(tree.root / DIFFERENTIAL_DIR, strings=False))
+        return None if found else f"no differential step `{operation}`/`{case}` under {DIFFERENTIAL_DIR}"
     if not re.fullmatch(IDENT, replacement):
         return f"e2e replacement `{replacement}` is not a function name"
-    text = cache.setdefault(E2E_DIR, rust_text(root, E2E_DIR))
-    return None if declares_fn(text, replacement) else f"no `fn {replacement}` under {E2E_DIR}"
+    found = declares_test_fn(tree.code(tree.root / E2E_DIR), replacement)
+    return None if found else f"no test `fn {replacement}` under {E2E_DIR}"
 
 
 def check(root: Path) -> list[str]:
@@ -101,7 +192,7 @@ def check(root: Path) -> list[str]:
     errors += [f"{TABLE_DIR}/{name}: missing" for name in sorted(expected - present)]
     errors += [f"{TABLE_DIR}/{name}: not a retirement table (known: {', '.join(STEMS)})" for name in sorted(present - expected)]
     seen: dict[tuple[str, str], str] = {}
-    cache: dict[str, str] = {}
+    tree = Tree(root)
     for name in sorted(expected & present):
         for number, line in enumerate((table / name).read_text().splitlines(), 1):
             where = f"{TABLE_DIR}/{name}:{number}"
@@ -112,7 +203,7 @@ def check(root: Path) -> list[str]:
                 errors.append(f"{where}: expected 5 non-empty fields separated by '|', found {len(fields)}")
                 continue
             crate, test, kind, replacement, _reason = fields
-            if not CRATE.fullmatch(crate) or not TEST_PATH.fullmatch(test) or "::" not in test:
+            if not CRATE.fullmatch(crate) or not TEST_PATH.fullmatch(test):
                 errors.append(f"{where}: `{crate} | {test}` is not <crate> | <module path>::<test fn>")
                 continue
             if kind not in ("test", "differential", "e2e"):
@@ -122,9 +213,9 @@ def check(root: Path) -> list[str]:
                 errors.append(f"{where}: `{crate} {test}` is already retired at {seen[(crate, test)]}")
                 continue
             seen[(crate, test)] = where
-            problem = replacement_error(root, kind, replacement, cache)
-            if problem:
-                errors.append(f"{where}: {problem}")
+            for problem in (retired_error(tree, crate, test), replacement_error(tree, kind, replacement)):
+                if problem:
+                    errors.append(f"{where}: {problem}")
     return errors
 
 
@@ -145,15 +236,25 @@ def main(argv: list[str]) -> int:
 
 
 class SelfTest(unittest.TestCase):
+    SEAM = "rustfs/src/app/test_seams/get_object.rs"
+    TEST = f"rustfs | app::object::get::tests::legacy_get | test | {SEAM}::get_object_ported | ported"
+
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         for stem in STEMS:
             self.write(f"{TABLE_DIR}/{stem}.txt", "# <crate> | <module path>::<test fn> | <kind> | <replacement> | <reason>\n")
-        self.write("rustfs/src/app/test_seams/get_object.rs", "#[test]\nfn get_object_ported() {}\n")
+        self.write("rustfs/Cargo.toml", '[package]\nname = "rustfs"\n')
+        self.write("crates/e2e_test/Cargo.toml", '[package]\nname = "e2e_test"\n')
+        self.write(
+            "rustfs/src/app/object/get.rs",
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn legacy_get() {}\n    #[tokio::test]\n    #[serial_test::serial]\n"
+            "    async fn legacy_get_normal() {}\n    #[test_case(1)]\n    fn legacy_get_range(_: u8) {}\n}\n",
+        )
+        self.write(self.SEAM, "#[test]\nfn get_object_ported() {}\n")
         self.write(f"{DIFFERENTIAL_DIR}/scenarios/mod.rs", 's.step(\n    "GetObject",\n    "normal",\n    c.get_object().send(),\n)\n')
-        self.write(f"{E2E_DIR}/get_object_test.rs", "#[tokio::test]\nasync fn get_object_range_e2e() {}\n")
+        self.write(f"{E2E_DIR}/get_object_test.rs", '#[tokio::test(flavor = "multi_thread")]\nasync fn get_object_range_e2e() {}\n')
 
     def write(self, path: str, text: str) -> None:
         (self.root / path).parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +265,8 @@ class SelfTest(unittest.TestCase):
             table.write("".join(line + "\n" for line in lines))
         return check(self.root)
 
-    TEST = "rustfs | app::object::get::tests::legacy_get | test | rustfs/src/app/test_seams/get_object.rs::get_object_ported | ported"
+    def assertFails(self, errors: list[str], pattern: str) -> None:
+        self.assertRegex(" ".join(errors), pattern)
 
     # -- negative cases: each must fail --
 
@@ -180,53 +282,83 @@ class SelfTest(unittest.TestCase):
 
     def test_unknown_table_fails(self) -> None:
         self.write(f"{TABLE_DIR}/object_reads.txt", "")
-        self.assertRegex(" ".join(check(self.root)), "object_reads.txt: not a retirement table")
+        self.assertFails(check(self.root), "object_reads.txt: not a retirement table")
 
     def test_four_fields_fail(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST.rsplit(" | ", 1)[0])), "expected 5 non-empty fields.*found 4")
+        self.assertFails(self.retire(self.TEST.rsplit(" | ", 1)[0]), "expected 5 non-empty fields.*found 4")
 
     def test_six_fields_fail(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST + " | extra")), "expected 5 non-empty fields.*found 6")
+        self.assertFails(self.retire(self.TEST + " | extra"), "expected 5 non-empty fields.*found 6")
 
     def test_empty_field_fails(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST.rsplit("|", 1)[0] + "| ")), "expected 5 non-empty fields")
+        self.assertFails(self.retire(self.TEST.rsplit("|", 1)[0] + "| "), "expected 5 non-empty fields")
 
     def test_test_path_without_module_fails(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST.replace("app::object::get::tests::legacy_get", "legacy_get"))), "is not <crate>")
+        self.assertFails(self.retire(self.TEST.replace("app::object::get::tests::legacy_get", "legacy_get")), "is not <crate>")
 
     def test_unknown_kind_fails(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST.replace("| test |", "| unit |"))), "unknown kind `unit`")
+        self.assertFails(self.retire(self.TEST.replace("| test |", "| unit |")), "unknown kind `unit`")
 
     def test_duplicate_in_one_table_fails(self) -> None:
-        self.assertRegex(" ".join(self.retire(self.TEST, self.TEST)), r"object_read.txt:3: .* already retired at .*object_read.txt:2")
+        self.assertFails(self.retire(self.TEST, self.TEST), r"object_read.txt:3: .* already retired at .*object_read.txt:2")
 
     def test_duplicate_across_tables_fails(self) -> None:
         self.retire(self.TEST, stem="object_meta")
-        self.assertRegex(" ".join(self.retire(self.TEST)), r"object_read.txt:2: .* already retired at .*object_meta.txt:2")
+        self.assertFails(self.retire(self.TEST), r"object_read.txt:2: .* already retired at .*object_meta.txt:2")
+
+    def test_retired_test_that_never_existed_fails(self) -> None:
+        self.assertFails(self.retire(self.TEST.replace("::legacy_get |", "::legacy_gone |")), "retired test `fn legacy_gone` is not a test")
+
+    def test_retired_test_in_unknown_crate_fails(self) -> None:
+        self.assertFails(self.retire(self.TEST.replace("rustfs |", "rustfs-gone |", 1)), "`rustfs-gone` is not a workspace package")
 
     def test_test_replacement_file_missing_fails(self) -> None:
-        line = self.TEST.replace("get_object.rs", "head_object.rs")
-        self.assertRegex(" ".join(self.retire(line)), "replacement file `rustfs/src/app/test_seams/head_object.rs` does not exist")
+        self.assertFails(self.retire(self.TEST.replace("get_object.rs", "head_object.rs")), "file `.*head_object.rs` does not exist")
 
     def test_test_replacement_fn_missing_fails(self) -> None:
-        line = self.TEST.replace("::get_object_ported", "::get_object_renamed")
-        self.assertRegex(" ".join(self.retire(line)), "declares no `fn get_object_renamed`")
+        self.assertFails(self.retire(self.TEST.replace("::get_object_ported", "::get_object_renamed")), "no test `fn get_object_renamed`")
+
+    def test_test_replacement_fn_in_a_comment_fails(self) -> None:
+        self.write(self.SEAM, "// #[test]\n// fn get_object_ported() {}\n/* #[test] fn get_object_ported() {} */\n")
+        self.assertFails(self.retire(self.TEST), "no test `fn get_object_ported`")
+
+    def test_test_replacement_fn_in_a_string_fails(self) -> None:
+        self.write(self.SEAM, 'const S: &str = "#[test]\nfn get_object_ported() {}";\n')
+        self.assertFails(self.retire(self.TEST), "no test `fn get_object_ported`")
+
+    def test_test_replacement_fn_without_test_attribute_fails(self) -> None:
+        self.write(self.SEAM, "#[cfg(test)]\nfn get_object_ported() {}\n")
+        self.assertFails(self.retire(self.TEST), "no test `fn get_object_ported`")
+
+    def test_test_replacement_outside_package_sources_fails(self) -> None:
+        self.write("scripts/fixtures/get_object.rs", "#[test]\nfn get_object_ported() {}\n")
+        line = self.TEST.replace(self.SEAM, "scripts/fixtures/get_object.rs")
+        self.assertFails(self.retire(line), "not under src/ or tests/ of a workspace package")
 
     def test_test_replacement_outside_repository_fails(self) -> None:
-        line = self.TEST.replace("rustfs/src/app/test_seams/get_object.rs", "../outside.rs")
-        self.assertRegex(" ".join(self.retire(line)), "is not <repo path>::<fn>")
+        self.assertFails(self.retire(self.TEST.replace(self.SEAM, "../outside.rs")), "is not <repo path>::<fn>")
 
     def test_differential_case_missing_fails(self) -> None:
         line = "rustfs | app::object::get::tests::legacy_get | differential | GetObject/negative | ported"
-        self.assertRegex(" ".join(self.retire(line)), "no differential step `GetObject`/`negative`")
+        self.assertFails(self.retire(line), "no differential step `GetObject`/`negative`")
 
     def test_differential_operation_missing_fails(self) -> None:
         line = "rustfs | app::object::get::tests::legacy_get | differential | HeadObject/normal | ported"
-        self.assertRegex(" ".join(self.retire(line)), "no differential step `HeadObject`/`normal`")
+        self.assertFails(self.retire(line), "no differential step `HeadObject`/`normal`")
+
+    def test_differential_step_in_a_comment_fails(self) -> None:
+        self.write(f"{DIFFERENTIAL_DIR}/scenarios/extra/object_read.rs", '// s.step("HeadObject", "normal", c.head_object().send(), none)\n')
+        line = "rustfs | app::object::get::tests::legacy_get | differential | HeadObject/normal | ported"
+        self.assertFails(self.retire(line), "no differential step `HeadObject`/`normal`")
 
     def test_e2e_fn_missing_fails(self) -> None:
         line = "rustfs | app::object::get::tests::legacy_get | e2e | get_object_range | ported"
-        self.assertRegex(" ".join(self.retire(line)), "no `fn get_object_range` under")
+        self.assertFails(self.retire(line), "no test `fn get_object_range` under")
+
+    def test_e2e_fn_without_test_attribute_fails(self) -> None:
+        self.write(f"{E2E_DIR}/helpers.rs", "pub async fn get_object_helper() {}\n")
+        line = "rustfs | app::object::get::tests::legacy_get | e2e | get_object_helper | ported"
+        self.assertFails(self.retire(line), "no test `fn get_object_helper` under")
 
     # -- positive cases: each must pass --
 
