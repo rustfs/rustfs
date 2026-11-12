@@ -3625,23 +3625,17 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         let outbound_tls = runtime_sources::outbound_tls_state().await;
         generation = Some(outbound_tls.generation.0);
-        if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
-            let ca = Certificate::from_pem(cert_pem);
-            // Tonic derives certificate verification and SNI from the endpoint URI,
-            // including bracketed IPv6 hosts.
-            let mut tls = ClientTlsConfig::new().ca_certificate(ca);
-            if let Some(id) = outbound_tls.mtls_identity.as_ref() {
-                let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
-                tls = tls.identity(identity);
-            }
-            connector = connector.tls_config(tls)?;
-            debug!("Configured TLS with custom root certificate for: {}", dial_addr);
+        let mut tls = if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert_pem))
         } else {
-            // No custom root CA published — fall back to system roots.
-            // This is the expected path when no TLS path is configured.
-            debug!("No custom root certificate configured; using system roots for TLS: {}", dial_addr);
-            connector = connector.tls_config(ClientTlsConfig::new())?;
+            ClientTlsConfig::new().with_native_roots()
+        };
+        if let Some(id) = outbound_tls.mtls_identity.as_ref() {
+            tls = tls.identity(tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone()));
         }
+        // Tonic derives certificate names and SNI from the URI, including IPv6. Native-root
+        // loading and certificate parsing run off the async workers under the same deadline.
+        connector = tokio::task::spawn_blocking(move || connector.tls_config(tls)).await??;
     }
 
     let channel = match connector.connect().await {
@@ -4081,6 +4075,180 @@ mod tests {
         assert!(
             observations.iter().all(|(_, accepted)| *accepted == 2),
             "both certificate cases must exercise actual control and bulk TLS connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls02_native_roots_preserve_mtls_identity_and_private_ca_scope() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::{Identity, ServerTlsConfig};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA parameters");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let server_key = rcgen::KeyPair::generate().expect("server key");
+        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .expect("server parameters")
+            .signed_by(&server_key, &issuer)
+            .expect("server certificate");
+        let mut client_params = rcgen::CertificateParams::new(vec!["client.example".into()]).expect("client parameters");
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = rcgen::KeyPair::generate().expect("client key");
+        let client_cert = client_params.signed_by(&client_key, &issuer).expect("client certificate");
+        let identity = MtlsIdentityPem {
+            cert_pem: client_cert.pem().into_bytes(),
+            key_pem: client_key.serialize_pem().into_bytes(),
+        };
+        let other_ca = rcgen::generate_simple_self_signed(vec!["other-ca.example".into()]).expect("other CA");
+        let directory = tempfile::tempdir().expect("native root fixture directory");
+        let roots_file = directory.path().join("roots.pem");
+        let roots_directory = directory.path().join("empty");
+        std::fs::write(&roots_file, ca.pem()).expect("native trust fixture");
+        std::fs::create_dir(&roots_directory).expect("empty native trust directory");
+
+        temp_env::async_with_vars(
+            [
+                ("SSL_CERT_FILE", roots_file.to_str()),
+                ("SSL_CERT_DIR", roots_directory.to_str()),
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("1")),
+            ],
+            async {
+                let previous = runtime_sources::outbound_tls_state().await;
+                let restore_generation = previous.generation.0.checked_add(5).expect("test generation capacity");
+                let cases = [
+                    ("native server trust", false, false, false, true),
+                    ("native mTLS identity", true, true, false, true),
+                    ("required client identity", true, false, false, false),
+                    ("explicit private trust", false, false, true, false),
+                ];
+                let mut observations = Vec::new();
+                for (index, (case, require_identity, send_identity, private_root, expected)) in cases.into_iter().enumerate() {
+                    let mut tls =
+                        ServerTlsConfig::new().identity(Identity::from_pem(server_cert.pem(), server_key.serialize_pem()));
+                    if require_identity {
+                        tls = tls
+                            .client_ca_root(Certificate::from_pem(ca.pem()))
+                            .client_auth_optional(false);
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("TLS listener");
+                    let addr = format!("https://{}", listener.local_addr().expect("TLS test address"));
+                    let mut server = tonic::transport::Server::builder()
+                        .tls_config(tls)
+                        .expect("TLS server configuration");
+                    let server = tokio::spawn(async move {
+                        server
+                            .add_routes(tonic::service::Routes::default())
+                            .serve_with_incoming(TcpListenerStream::new(listener))
+                            .await
+                    });
+                    let material = OutboundTlsMaterial {
+                        root_ca_pem: if private_root {
+                            other_ca.cert.pem().into_bytes()
+                        } else {
+                            Vec::new()
+                        },
+                        mtls_identity: send_identity.then(|| identity.clone()),
+                    };
+                    let offset = u64::try_from(index + 1).expect("bounded generation offset");
+                    publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+                    for class in [ChannelClass::Control, ChannelClass::Bulk] {
+                        let reached_rpc = match get_channel_for_class(&addr, class).await {
+                            Ok(channel) => {
+                                let mut client = NodeServiceClient::new(channel);
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    client.ping(proto_gen::node_service::PingRequest::default()),
+                                )
+                                .await;
+                                // The empty router returns Unimplemented only after the peer completes TLS.
+                                matches!(result, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented)
+                            }
+                            Err(_) => false,
+                        };
+                        observations.push((case, class, reached_rpc, expected));
+                    }
+                    evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+                    evict_cached_channel(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+                    server.abort();
+                    let _ = server.await;
+                }
+                let restore = OutboundTlsMaterial {
+                    root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                    mtls_identity: previous.mtls_identity,
+                };
+                publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+                for (case, class, actual, expected) in observations {
+                    assert_eq!(actual, expected, "{case} on {class:?}");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn tls02_queued_tls_configuration_obeys_acquisition_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single blocking-worker runtime");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("connection observation listener");
+        listener.set_nonblocking(true).expect("nonblocking connection observation");
+        let addr = format!("https://{}", listener.local_addr().expect("observation address"));
+        runtime.block_on(async {
+            use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+            let _test_guard = TLS02_TEST_LOCK.lock().await;
+            let previous = runtime_sources::outbound_tls_state().await;
+            let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+            let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).expect("test certificate");
+            publish_global_outbound_tls_state(
+                TlsGeneration(generation - 1),
+                &OutboundTlsMaterial {
+                    root_ca_pem: certificate.cert.pem().into_bytes(),
+                    mtls_identity: None,
+                },
+            )
+            .await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report occupied blocking worker");
+                release_rx.recv().expect("release occupied blocking worker");
+            });
+            started_rx.await.expect("blocking worker is occupied");
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let result = build_channel_until(&addr, &addr, deadline, internode_rpc_timeout()).await;
+            let timed_out = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<std::io::Error>())
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
+            let cached = rustfs_common::has_cached_connection(&addr).await;
+            let registered = DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&addr);
+            release_tx.send(()).expect("release blocking worker before assertions");
+            blocker.await.expect("original blocking worker joined");
+            let restore = OutboundTlsMaterial {
+                root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                mtls_identity: previous.mtls_identity,
+            };
+            publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+            assert!(timed_out, "queued TLS configuration shares the original acquisition deadline");
+            assert!(!cached, "timed-out TLS setup leaves no published channel");
+            assert!(!registered, "timed-out TLS setup releases its dial registry entry");
+        });
+        // Runtime retirement joins the queued certificate work before inspecting its side effects.
+        drop(runtime);
+        let accepted = listener.accept();
+        assert!(
+            matches!(accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a timed-out queued TLS configuration must retire before opening a connection"
         );
     }
 

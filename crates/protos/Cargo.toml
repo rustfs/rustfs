@@ -88,4 +88,5 @@ doctest = false
 rcgen = { workspace = true }
 serde_json = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
