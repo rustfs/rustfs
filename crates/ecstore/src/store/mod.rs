@@ -435,6 +435,7 @@ pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
 mod heal_walk;
 pub use heal_walk::HealWalkVersion;
+mod format_bootstrap;
 mod init;
 pub(crate) mod init_format;
 pub(crate) mod list_objects;

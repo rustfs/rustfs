@@ -11847,6 +11847,65 @@ impl LocalDisk {
         Ok(f)
     }
 
+    async fn open_format_bootstrap_reader(&self, offset: usize, length: usize) -> Result<FileReader> {
+        use tokio::io::AsyncReadExt;
+
+        let file_path = self.io_get_object_open_path(RUSTFS_META_BUCKET, super::FORMAT_BOOTSTRAP_FILE)?;
+        let base = self.io_root().to_path_buf();
+        let root = self.publication_root.clone();
+        let offset = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+        let length = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        self.blocking_queue
+            .run_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(IoError::new(ErrorKind::Interrupted, "format bootstrap read cancelled"));
+                }
+                #[cfg(unix)]
+                let (reader, size) = {
+                    use rustix::fs::{Mode, OFlags, openat};
+
+                    let parent = file_path.parent().ok_or(DiskError::InvalidPath)?;
+                    let name = file_path.file_name().ok_or(DiskError::InvalidPath)?;
+                    let parents = os::pin_multipart_source_directory(parent, &base, &root)?;
+                    let directory = parents.last().ok_or(DiskError::InvalidPath)?;
+                    // Validate the opened inode before returning a reader. NONBLOCK
+                    // keeps a corrupt FIFO from occupying a native worker forever.
+                    let mut file = std::fs::File::from(openat(
+                        directory,
+                        name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )?);
+                    let metadata = file.metadata()?;
+                    if !metadata.is_file() {
+                        return Err(DiskError::FileCorrupt.into());
+                    }
+                    std::io::Seek::seek(&mut file, SeekFrom::Start(offset))?;
+                    (Box::new(File::from_std(file)) as FileReader, metadata.len())
+                };
+                #[cfg(not(unix))]
+                let (reader, size) = {
+                    let bytes = os::read_multipart_source_metadata(&file_path, &base, &root)?;
+                    let size = u64::try_from(bytes.len()).map_err(|_| DiskError::FileCorrupt)?;
+                    let mut cursor = std::io::Cursor::new(bytes);
+                    cursor.set_position(offset);
+                    (Box::new(cursor) as FileReader, size)
+                };
+                if size < end_offset {
+                    return Err(DiskError::FileCorrupt.into());
+                }
+                if length == 0 {
+                    Ok(reader)
+                } else {
+                    Ok(Box::new(reader.take(length)) as FileReader)
+                }
+            })
+            .await
+            .map_err(to_file_error)
+            .map_err(DiskError::from)
+    }
+
     #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
@@ -15614,12 +15673,18 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file");
+        if volume == RUSTFS_META_BUCKET && path == super::FORMAT_BOOTSTRAP_FILE {
+            return self.open_format_bootstrap_reader(0, 0).await;
+        }
         self.io_backend.open_full_read(volume, path).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file_stream");
+        if volume == RUSTFS_META_BUCKET && path == super::FORMAT_BOOTSTRAP_FILE {
+            return self.open_format_bootstrap_reader(offset, length).await;
+        }
         self.io_backend.open_read_stream(volume, path, offset, length).await
     }
 
@@ -19153,6 +19218,102 @@ mod test {
         file.read_to_end(&mut payload).await.expect("read-only file should read");
 
         assert_eq!(payload, b"read-only-payload");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_control_read_preserves_regular_payload_and_missing_error() {
+        let directory = tempfile::tempdir().expect("bootstrap control fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("bootstrap control endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("bootstrap control disk");
+        let path = "format.json.bootstrap";
+        assert!(matches!(disk.read_file(RUSTFS_META_BUCKET, path).await, Err(DiskError::FileNotFound)));
+
+        disk.write_all(RUSTFS_META_BUCKET, path, Bytes::from_static(b"bootstrap-plan"))
+            .await
+            .expect("write regular bootstrap control");
+        let mut reader = disk.read_file(RUSTFS_META_BUCKET, path).await.expect("open regular control");
+        let mut payload = Vec::new();
+        reader.read_to_end(&mut payload).await.expect("read regular control");
+        assert_eq!(payload, b"bootstrap-plan");
+        for (offset, length, expected) in [
+            (0, 0, b"bootstrap-plan".as_slice()),
+            (1, 2, b"oo".as_slice()),
+            (1, 0, b"ootstrap-plan".as_slice()),
+        ] {
+            let mut stream = disk
+                .read_file_stream(RUSTFS_META_BUCKET, path, offset, length)
+                .await
+                .expect("open regular control stream");
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.expect("read control range");
+            assert_eq!(payload, expected);
+        }
+        assert!(matches!(
+            disk.read_file_stream(RUSTFS_META_BUCKET, path, 0, 100).await,
+            Err(DiskError::FileCorrupt)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_control_read_rejects_nonregular_entries_without_blocking() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().expect("nonregular bootstrap control fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("bootstrap control endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("bootstrap control disk");
+        let meta = directory.path().join(RUSTFS_META_BUCKET);
+        fs::create_dir_all(&meta).await.expect("bootstrap metadata directory");
+        let path = meta.join("format.json.bootstrap");
+        let target = directory.path().join("outside-control");
+        fs::write(&target, b"foreign-bootstrap-plan").await.expect("symlink target");
+
+        for entry in ["directory", "symlink", "fifo"] {
+            match entry {
+                "directory" => std::fs::create_dir(&path).expect("directory control entry"),
+                "symlink" => std::os::unix::fs::symlink(&target, &path).expect("symlink control entry"),
+                "fifo" => assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(&path)
+                        .status()
+                        .expect("create POSIX FIFO control entry")
+                        .success()
+                ),
+                _ => unreachable!("fixture entries are enumerated"),
+            }
+            for stream in [false, true] {
+                let mut pending = Box::pin(async {
+                    if stream {
+                        disk.read_file_stream(RUSTFS_META_BUCKET, "format.json.bootstrap", 0, 0).await
+                    } else {
+                        disk.read_file(RUSTFS_META_BUCKET, "format.json.bootstrap").await
+                    }
+                });
+                let result = match timeout(Duration::from_secs(2), &mut pending).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Release a regressed blocking FIFO open before failing.
+                        let _release = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&path)
+                            .expect("release blocked control reader");
+                        let _ = pending.await;
+                        panic!("{entry} bootstrap control must fail without blocking");
+                    }
+                };
+                assert!(result.is_err(), "{entry} must never supply bootstrap authority");
+            }
+            if entry == "directory" {
+                std::fs::remove_dir(&path).expect("remove directory entry");
+            } else {
+                std::fs::remove_file(&path).expect("remove nonregular entry");
+            }
+        }
+        assert_eq!(fs::read(&target).await.expect("unchanged symlink target"), b"foreign-bootstrap-plan");
     }
 
     #[tokio::test]

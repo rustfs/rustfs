@@ -613,8 +613,8 @@ impl ECStore {
                     }
                 }
             }?;
-            // First-hand authority for this pool only: `Fresh` when this process
-            // formatted it, `LegacyAdoption` when it verified the migration, and
+            // Creator authority for this pool only: `Fresh` when this process
+            // formatted it or resumed its durable plan, `LegacyAdoption` for migration, and
             // `None` when it merely read a format another node created.
             pool_meta_bootstrap_authorities.push(loaded_format.pool_meta_bootstrap_authority);
             let fm = loaded_format.format;
@@ -811,6 +811,20 @@ impl ECStore {
             installed_pool_meta = persist.await?;
         }
 
+        // Retire durable creator authority under the metadata writer fence before
+        // any node can serve or launch background mutations. Followers wait until
+        // every pool's complete intent set has been broken by the elected writer.
+        for pool in &self.pools {
+            let mut disks = Vec::with_capacity(pool.set_count * pool.set_drive_count);
+            for set in &pool.disk_set {
+                disks.extend(set.disk_inventory().await);
+            }
+            if should_persist_pool_meta {
+                super::format_bootstrap::clear_format_bootstrap_intents(&disks).await?;
+            } else {
+                super::format_bootstrap::ensure_format_bootstrap_consumed(&disks).await?;
+            }
+        }
         if startup_pool_meta_guard
             .as_ref()
             .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
@@ -3480,6 +3494,118 @@ mod tests {
         set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn interrupted_format_bootstrap_recovers_two_pools_through_store_init() {
+        use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET};
+        use crate::store::init_format;
+        let directory = tempfile::tempdir().expect("create interrupted-bootstrap deployment");
+        let deployment_id = Uuid::new_v4();
+        let mut plans = Vec::new();
+        for pool_index in 0..2 {
+            let mut endpoints = Vec::new();
+            for index in 0..4 {
+                let path = directory.path().join(format!("pool{pool_index}/set0/disk{index}"));
+                tokio::fs::create_dir_all(&path).await.expect("create bootstrap disk");
+                let mut endpoint = Endpoint::try_from(path.to_str().expect("UTF-8 path")).expect("disk endpoint");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(index);
+                endpoints.push(endpoint);
+            }
+            let (disks, errors) = init_format::init_disks(
+                &crate::runtime::instance::InstanceContext::new(),
+                &Endpoints::from(endpoints),
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await;
+            assert!(errors.iter().all(Option::is_none), "open bootstrap disks: {errors:?}");
+            let mut reference = crate::disk::format::FormatV3::new(1, 4);
+            reference.id = deployment_id;
+            let formats = (0..4)
+                .map(|index| {
+                    let mut format = reference.clone();
+                    format.erasure.this = reference.erasure.sets[0][index];
+                    Some(format)
+                })
+                .collect::<Vec<_>>();
+            super::super::format_bootstrap::write_format_bootstrap_intents(&disks, &formats)
+                .await
+                .expect("persist creator plan");
+            for (disk, format) in disks.iter().zip(&formats).take(3) {
+                disk.as_ref()
+                    .expect("fixture disk")
+                    .write_all(
+                        RUSTFS_META_BUCKET,
+                        FORMAT_CONFIG_FILE,
+                        format
+                            .as_ref()
+                            .expect("planned format")
+                            .to_json()
+                            .expect("encode format")
+                            .into_bytes()
+                            .into(),
+                    )
+                    .await
+                    .expect("publish first three formats");
+            }
+            plans.push(formats);
+        }
+        // A new context and new disk handles exercise the normal constructor's
+        // format recovery, pool identity transaction, and publication barrier.
+        let (_, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(directory.path(), "interrupted-bootstrap", &[4, 4])).await;
+        assert_eq!(store.id, deployment_id);
+        for (pool, expected) in store.pools.iter().zip(&plans) {
+            for set in &pool.disk_set {
+                let disks = set.disk_inventory().await;
+                let (formats, errors) = init_format::load_format_erasure_all(&disks, false).await;
+                assert!(errors.iter().all(Option::is_none), "recovered formats: {errors:?}");
+                assert_eq!(&formats, expected);
+                for disk in disks.iter().flatten() {
+                    assert!(matches!(
+                        disk.read_all(RUSTFS_META_BUCKET, "format.json.bootstrap").await,
+                        Err(crate::disk::error::DiskError::FileNotFound)
+                    ));
+                    assert!(disk.read_all(RUSTFS_META_BUCKET, "format.json.bootstrap.done").await.is_ok());
+                }
+            }
+        }
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket("bootstrap-recovered", &MakeBucketOptions::default())
+            .await
+            .expect("create bucket after recovered startup");
+        store
+            .put_object(
+                "bootstrap-recovered",
+                "payload",
+                &mut PutObjReader::from_vec(b"preserved".to_vec()),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write after recovered startup");
+        let info = store
+            .get_object_info("bootstrap-recovered", "payload", &ObjectOptions::default())
+            .await
+            .expect("read committed object metadata");
+        assert_eq!(info.size, 9);
+        let mut reader = store
+            .get_object_reader("bootstrap-recovered", "payload", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read object after recovered startup");
+        let mut payload = Vec::new();
+        reader.stream.read_to_end(&mut payload).await.expect("read recovered payload");
+        assert_eq!(payload, b"preserved");
+        shutdown.cancel();
     }
 
     #[tokio::test]

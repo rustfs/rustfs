@@ -58,6 +58,7 @@ pub const BUCKET_META_PREFIX: &str = "buckets";
 /// a user bucket of the same name, so bucket deletion must leave it in place.
 pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+pub(crate) const FORMAT_BOOTSTRAP_FILE: &str = "format.json.bootstrap";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";

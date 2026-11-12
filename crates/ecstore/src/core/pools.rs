@@ -6400,7 +6400,7 @@ pub(crate) struct PoolMetaWriteState {
     pool_meta_absent: bool,
     bootstrap_authority: PoolMetaBootstrapAuthority,
     /// First-hand bootstrap authority this process holds for each pool
-    /// (index = pool index): `Fresh` only for pools it formatted itself,
+    /// (index = pool index): `Fresh` for pools it formatted or resumed from a complete durable plan,
     /// `LegacyAdoption` only for pools whose migration it verified. Empty when
     /// the caller tracks deployment-wide authority only.
     pool_bootstrap_authorities: Vec<PoolMetaBootstrapAuthority>,
@@ -6478,8 +6478,7 @@ impl PoolMetaWriteState {
     }
 
     /// Startup state for a process that loaded every pool format itself and
-    /// remembers, per pool, whether it created (or adopted) that pool
-    /// first-hand. Deployment-wide authority is the conjunction across pools:
+    /// remembers, per pool, whether it created, durably resumed, or adopted that pool. Deployment-wide authority is the conjunction across pools:
     /// any pool this process merely read yields `None`, exactly as before.
     pub(crate) fn for_startup_with_pool_bootstrap_authorities(
         cluster_id: uuid::Uuid,
@@ -6510,7 +6509,7 @@ impl PoolMetaWriteState {
             .is_some_and(|authority| authority.is_proven())
     }
 
-    /// Pools this process formatted or adopted first-hand during this startup.
+    /// Pools this process formatted, durably resumed, or adopted during startup.
     pub(crate) fn attested_pool_indices(&self) -> Vec<usize> {
         self.pool_bootstrap_authorities
             .iter()
@@ -6527,7 +6526,7 @@ impl PoolMetaWriteState {
     /// [`PoolMetaIdentityWriteScope::Pools`]), so a complete, agreeing pending
     /// set proves that every pool joined this bootstrap fresh. A missing,
     /// corrupt, or disagreeing replica keeps the writer fail-closed, and a
-    /// restart without first-hand proof never reopens bootstrap on its own.
+    /// restart requires a complete durable format plan to recover creator proof.
     fn pending_identity_attested_by_every_pool(&self) -> bool {
         self.elected_bootstrap_writer == Some(true)
             && self.pool_bootstrap_authority_proven(0)

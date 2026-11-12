@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use super::format_bootstrap::{FORMAT_BOOTSTRAP_FILE, clear_format_bootstrap_intents, ensure_format_bootstrap_consumed};
+use super::format_bootstrap::{resume_format_bootstrap, write_format_bootstrap_intents};
 use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
 use crate::core::pools::PoolMetaBootstrapAuthority;
@@ -120,6 +123,17 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     let (formats, errs, unformatted_bootstrap_routes) = load_format_erasure_all_observing_bootstrap_routes(disks, false).await;
 
     check_disk_fatal_errs(&errs)?;
+    // Only the elected pool creator may replay a complete durable format plan.
+    // Absence of pool metadata or an orphaned format temp file grants no authority.
+    if first_disk
+        && let Some(format) =
+            resume_format_bootstrap(instance_ctx, disks, &formats, &errs, set_count, set_drive_count, deployment_id).await?
+    {
+        return Ok(LoadedFormat {
+            format,
+            pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::Fresh,
+        });
+    }
 
     // Transient network errors still follow the first-node wait path so peers
     // can come online, but they are never fresh-cluster authority below.
@@ -270,7 +284,7 @@ async fn verified_legacy_adoption_source(
     }
 }
 
-async fn retain_format_quorum_members(
+pub(super) async fn retain_format_quorum_members(
     instance_ctx: &Arc<InstanceContext>,
     disks: &mut [Option<DiskStore>],
     format: &FormatV3,
@@ -418,6 +432,7 @@ async fn init_format_erasure(
         }
     }
 
+    write_format_bootstrap_intents(disks, &fms).await?;
     write_format_file_all(disks, &fms).await?;
     let format = get_format_erasure_in_quorum(&fms, 0)?;
     let quorum_members = vec![true; disks.len()];
@@ -602,14 +617,17 @@ fn select_persisted_migration_format(
     Err(write_error.map_or(quorum_error, Into::into))
 }
 
-fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
+pub(super) fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
     disk_count
         .checked_mul(LEGACY_FORMAT_MAX_BYTES_PER_DISK)
         .and_then(|size| size.checked_add(LEGACY_FORMAT_BASE_MAX_BYTES))
         .ok_or_else(|| Error::other("legacy format size limit overflow"))
 }
 
-async fn read_legacy_format_bytes(reader: impl tokio::io::AsyncRead + Unpin, max_bytes: usize) -> disk::error::Result<Vec<u8>> {
+pub(super) async fn read_legacy_format_bytes(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    max_bytes: usize,
+) -> disk::error::Result<Vec<u8>> {
     let read_limit = max_bytes.checked_add(1).ok_or(DiskError::CorruptedFormat)?;
     let mut data = Vec::with_capacity(read_limit.min(64 * 1024));
     reader
@@ -999,7 +1017,7 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
     Ok(())
 }
 
-async fn write_format_file(disk: &DiskStore, format: &FormatV3) -> disk::error::Result<()> {
+pub(super) async fn write_format_file(disk: &DiskStore, format: &FormatV3) -> disk::error::Result<()> {
     let json_data = format.to_json()?;
 
     let tmpfile = Uuid::new_v4().to_string();
@@ -1007,7 +1025,7 @@ async fn write_format_file(disk: &DiskStore, format: &FormatV3) -> disk::error::
     disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
         .await?;
 
-    disk.rename_file(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+    disk.rename_file_durable(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
         .await?;
 
     Ok(())
@@ -1028,7 +1046,7 @@ mod tests {
     use crate::store::peer::{find_local_disk_by_ref, prewarm_local_disk_id_map_with_instance_ctx};
     use serial_test::serial;
 
-    async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
+    pub(super) async fn local_disks(count: usize) -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
         local_disks_with_set_width(count, count).await
     }
 
@@ -2649,3 +2667,7 @@ mod tests {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+#[path = "init_format_bootstrap_tests.rs"]
+mod bootstrap_tests;
