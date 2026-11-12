@@ -3643,6 +3643,9 @@ impl OwnedOperation for AdminOperation {
 }
 
 #[cfg(test)]
+mod s3_extension_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn object_lambda_bridge_enforces_version_read_permissions() {
