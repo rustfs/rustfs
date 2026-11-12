@@ -33,7 +33,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "5"
+PLAN_CONTRACT = "6"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
