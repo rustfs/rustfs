@@ -257,8 +257,8 @@ impl HealManager {
                 let notify_clone = notify.clone();
                 let root_recovery_clone = root_recovery.clone();
                 let manager_cancel_token = cancel_token.clone();
-                let task_type_label_for_spawn = task_type_label.clone();
-                let task_set_label_for_spawn = task_set_label.clone();
+                let task_type_label_for_spawn = task_type_label;
+                let task_set_label_for_spawn = task_set_label;
                 let config_for_spawn = config.clone();
 
                 // start heal task

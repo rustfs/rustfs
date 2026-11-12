@@ -1332,7 +1332,7 @@ mod tests {
                 .collect();
             assert_eq!(confirmed.len(), 1);
             let mut receivers = Vec::new();
-            for drive in 0..phase.disks.get(1).map_or(0, Vec::len) {
+            for (drive, _) in phase.disks.get(1).into_iter().flatten().enumerate() {
                 for cas in [prepares[1], commits[1]] {
                     let matching: Vec<_> = events[1]
                         .iter()

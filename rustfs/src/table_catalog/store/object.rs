@@ -2567,8 +2567,7 @@ where
                     TableCatalogEntryState::Active => &mut active,
                     TableCatalogEntryState::Deleted => {
                         if let Some(current) = deleted.as_ref() {
-                            deleted_overlap =
-                                Some((current.warehouse_object_prefix.clone(), resource.warehouse_object_prefix.clone()));
+                            deleted_overlap = Some((current.warehouse_object_prefix.clone(), resource.warehouse_object_prefix));
                             continue;
                         }
                         &mut deleted

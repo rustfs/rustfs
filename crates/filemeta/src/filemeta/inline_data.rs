@@ -908,7 +908,7 @@ mod tests {
                     assert_indexed_matches_scalar(&original, selected);
                 }
                 if inline_mode > 0 {
-                    let mut legacy_null = original.clone();
+                    let mut legacy_null = original;
                     let payload = legacy_null
                         .data
                         .find(NULL_VERSION_ID)

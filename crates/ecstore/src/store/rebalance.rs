@@ -1722,20 +1722,19 @@ mod tests {
             .await
             .expect("bucket should be created in both pools");
 
-        for pool_index in 0..2 {
+        for (pool_index, pool) in store.pools[..2].iter().enumerate() {
             let mut reader = PutObjReader::from_vec(format!("pool-{pool_index}-history").into_bytes());
-            store.pools[pool_index]
-                .put_object(
-                    &bucket,
-                    object,
-                    &mut reader,
-                    &ObjectOptions {
-                        versioned: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("historical version should be stored");
+            pool.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("historical version should be stored");
         }
         let marker = store.pools[0]
             .delete_object(

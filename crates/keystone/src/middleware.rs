@@ -181,7 +181,7 @@ where
                         );
 
                         let body: BoxBody = Full::new(Bytes::from(error_xml))
-                            .map_err(|e| -> BoxError { Box::new(e) })
+                            .map_err(|never| -> BoxError { match never {} })
                             .boxed_unsync();
 
                         let response = Response::builder()

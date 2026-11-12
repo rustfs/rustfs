@@ -3343,14 +3343,17 @@ pub(crate) fn has_delete_version_test_failpoints() -> bool {
 #[cfg(not(test))]
 pub(crate) fn has_delete_version_test_failpoints() -> bool {
     #[cfg(all(feature = "test-util", not(windows)))]
-    if os::prepared_publication_test_hooks::has_any_hooks() {
-        return true;
-    }
+    let prepared_hooks = os::prepared_publication_test_hooks::has_any_hooks();
+    #[cfg(not(all(feature = "test-util", not(windows))))]
+    let prepared_hooks = false;
     #[cfg(feature = "e2e-test-hooks")]
-    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
-        return true;
+    {
+        prepared_hooks || std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
     }
-    false
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    {
+        prepared_hooks
+    }
 }
 
 #[cfg(test)]

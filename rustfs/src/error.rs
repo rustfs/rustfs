@@ -2418,7 +2418,7 @@ mod tests {
             StorageError::PartMissingOrCorrupt,
         ] {
             assert!(is_object_read_unavailable(&source));
-            let api_error = slow_down_read_api_error(source.clone());
+            let api_error = slow_down_read_api_error(source);
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
         }

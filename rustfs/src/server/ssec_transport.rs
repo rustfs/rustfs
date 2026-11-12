@@ -138,7 +138,7 @@ fn ssec_requires_tls_response(request_id: Option<&str>) -> Response<BoxBody> {
          {request_id_xml}</Error>"
     );
     let body: BoxBody = Full::new(Bytes::from(body))
-        .map_err(|e| -> BoxError { Box::new(e) })
+        .map_err(|never| -> BoxError { match never {} })
         .boxed_unsync();
 
     let mut response = Response::new(body);

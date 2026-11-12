@@ -766,9 +766,9 @@ impl Run {
             || async {
                 let mut ready = true;
                 let mut observations = Vec::with_capacity(4);
-                for node in 0..4 {
+                for (node, coordinator) in self.dist.cluster.nodes[..4].iter().enumerate() {
                     match http
-                        .get(format!("{}/health/ready", self.dist.cluster.nodes[node].url))
+                        .get(format!("{}/health/ready", coordinator.url))
                         .timeout(Duration::from_secs(3))
                         .send()
                         .await
