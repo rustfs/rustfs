@@ -14,11 +14,17 @@
 
 //! Application layer module entry.
 //! Concrete use-case modules will be introduced incrementally in Phase 3.
+//!
+//! A use case that answers in the gateway's types materialises every stored name under the
+//! gateway's floor only: the strict wire grammar applies to names a client sends, never to names
+//! the store returns. A stored value is never dropped or rewritten to fit a stricter scalar
+//! ([`dto_values`]).
 
 pub mod admin_usecase;
 pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;
+pub(crate) mod dto_values;
 pub(crate) mod metadata_route;
 pub mod multipart_usecase;
 pub mod object;

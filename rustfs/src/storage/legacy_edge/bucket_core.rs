@@ -33,6 +33,7 @@ use crate::storage::{
     get_bucket_request_payment_config, get_bucket_website_config, update_bucket_metadata_config_if_incarnation,
 };
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_bucket;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -208,8 +209,12 @@ impl FS {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        record_s3_op(S3Operation::HeadBucket);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_head_bucket(req).await
+        through_gateway_seam(req, head_bucket::input_from_s3s, head_bucket::output_to_s3s, |_, input| {
+            usecase.execute_head_bucket(input)
+        })
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_accelerate_configuration_edge(

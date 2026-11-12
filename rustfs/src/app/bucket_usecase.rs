@@ -58,9 +58,9 @@ use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
-    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
-    parse_list_object_versions_params, parse_list_objects_v2_params, rustfs_owner,
+    ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
+    build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+    parse_list_objects_v2_params, rustfs_owner,
 };
 use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
@@ -68,7 +68,9 @@ use super::storage_api::bucket_usecase::{
 };
 #[cfg(feature = "diagnostic-read-version-caller")]
 use super::storage_api::diagnostic;
+use crate::app::RequestEnvelope;
 use crate::app::bucket_list_through as list_through;
+use crate::app::dto_values;
 use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
@@ -89,6 +91,7 @@ use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
+use rustfs_gateway_types::dto as gateway_dto;
 use rustfs_gateway_types::persistence::{
     PersistedBucketEncryptionConfiguration, PersistedNotificationConfiguration,
     PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedPublicAccessBlockConfiguration,
@@ -118,15 +121,15 @@ use s3s::dto::{
     GetBucketCorsInput, GetBucketEncryptionInput, GetBucketLifecycleConfigurationInput, GetBucketLocationInput,
     GetBucketLocationOutput, GetBucketNotificationConfigurationInput, GetBucketPolicyInput, GetBucketPolicyOutput,
     GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput, GetBucketTaggingInput,
-    GetBucketVersioningInput, GetPublicAccessBlockInput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
-    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration, NotificationConfigurationFilter, Object,
-    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
-    PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
-    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput,
-    PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput,
-    PutPublicAccessBlockOutput, ServerSideEncryption, Timestamp, UserMetadata,
+    GetBucketVersioningInput, GetPublicAccessBlockInput, LifecycleRule, ListObjectVersionsInput, ListObjectVersionsOutput,
+    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration,
+    NotificationConfigurationFilter, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput,
+    PutBucketNotificationConfigurationOutput, PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput, ServerSideEncryption, Timestamp,
+    UserMetadata,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -431,21 +434,40 @@ impl DefaultBucketUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+    /// Lists the buckets the caller of `envelope` may see, for either edge.
+    ///
+    /// The access phase must have installed the caller's `ReqInfo`. A caller allowed
+    /// `s3:ListAllMyBuckets` sees every bucket; any other caller sees the buckets it may list or
+    /// locate. `_input` is not read: RustFS answers one unpaginated listing and ignores `prefix`,
+    /// `max-buckets`, `continuation-token` and `bucket-region`.
+    ///
+    /// # Errors
+    ///
+    /// `AccessDenied` for an anonymous caller and for one that may see no bucket; `InternalError`
+    /// when the store or IAM is not initialized or the access phase did not run; otherwise the
+    /// storage error of the listing.
+    #[instrument(level = "debug", skip(self, envelope, _input))]
+    pub async fn execute_list_buckets(
+        &self,
+        envelope: RequestEnvelope,
+        _input: gateway_dto::ListBucketsInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::ListBucketsOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
-        if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        if envelope
+            .credentials()
+            .is_none_or(|credentials| credentials.access_key().is_empty())
+        {
+            return Err(rustfs_s3_types::s3_error!(AccessDenied, "Access Denied"));
         }
 
-        let iam_authorization = prepare_list_buckets_iam_authorization(&req).await?;
+        let iam_authorization = prepare_list_buckets_iam_authorization(&envelope).await?;
         let bucket_infos = if iam_authorization.is_allowed("", S3Action::ListAllMyBucketsAction).await {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
         } else {
-            log_list_buckets_iam_implicit_deny(&req)?;
+            log_list_buckets_iam_implicit_deny(&envelope)?;
             let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
             let mut visible_bucket_infos = Vec::new();
             for info in bucket_infos {
@@ -464,7 +486,22 @@ impl DefaultBucketUsecase {
             visible_bucket_infos
         };
 
-        Ok(S3Response::new(build_list_buckets_output(&bucket_infos)))
+        let buckets = bucket_infos
+            .iter()
+            .map(|info| {
+                Ok(gateway_dto::Bucket {
+                    name: dto_values::stored_bucket_name(&info.name)?,
+                    creation_date: dto_values::timestamp(info.created.unwrap_or(time::OffsetDateTime::UNIX_EPOCH)),
+                    ..Default::default()
+                })
+            })
+            .collect::<rustfs_s3_types::S3Result<_>>()?;
+        Ok(gateway_dto::ListBucketsOutput {
+            buckets,
+            owner: dto_values::owner(),
+            continuation_token: None,
+            prefix: None,
+        })
     }
 }
 
@@ -965,12 +1002,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
-        let input = ListBucketsInput::builder().build().unwrap();
-
-        let req = build_request(input, Method::GET);
+        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_list_buckets(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase
+            .execute_list_buckets(RequestEnvelope::from_s3s(&req), gateway_dto::ListBucketsInput::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 }
