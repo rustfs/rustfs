@@ -17932,7 +17932,8 @@ mod tests {
             .expect("shared-tuple recursive prefix delete should commit");
 
         assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             assert!(
                 pool.get_disks_by_key(object)
                     .load_file_info_versions_exact(bucket, object)
@@ -19767,7 +19768,8 @@ mod tests {
         }
         wait_for_expiry_workers_idle(&store).await;
         let mut free_version_ids = Vec::new();
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             let retained = pool
                 .get_disks_by_key(object)
                 .load_file_info_versions_exact(&bucket, object)
@@ -19804,7 +19806,8 @@ mod tests {
         );
         wait_for_expiry_workers_idle(&store).await;
         assert_eq!(backend.remove_count().await, 1, "shared remote tuple should be deleted exactly once");
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             assert!(
                 pool.get_disks_by_key(object)
                     .load_file_info_versions_exact(&bucket, object)
@@ -19856,7 +19859,8 @@ mod tests {
             .expect("multi-pool source bucket should be created");
 
         let mut remote_tuples = Vec::new();
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             let mut reader = PutObjReader::from_vec(vec![b'a' + pool_idx as u8; 1024 * 1024]);
             let source = pool
                 .put_object(
@@ -19900,7 +19904,8 @@ mod tests {
             .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
             .await
             .expect("store-level delete should remove both pool copies");
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             let retained = pool
                 .get_disks_by_key(object)
                 .load_file_info_versions_exact(bucket, object)
@@ -19940,7 +19945,8 @@ mod tests {
         removed.sort();
         remote_tuples.sort();
         assert_eq!(removed, remote_tuples, "recovery must use each pool's exact remote tuple");
-        for (pool_idx, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_idx, pool) in store.pools.iter().enumerate().take(2) {
             assert!(
                 pool.get_disks_by_key(object)
                     .load_file_info_versions_exact(bucket, object)

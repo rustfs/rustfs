@@ -496,7 +496,8 @@ impl Cluster {
             locks,
             _root: root,
         };
-        for (index, client) in cluster.clients[..4].iter().enumerate().skip(1) {
+        assert!(cluster.clients.len() >= 4);
+        for (index, client) in cluster.clients.iter().enumerate().skip(1).take(3) {
             let peer = DistributedLock::new("warmup".to_owned(), vec![Arc::clone(client)], 1);
             drop(holder(&peer, keys(&format!("warmup-{index}"), 1).remove(0), "warmup-holder").await);
         }

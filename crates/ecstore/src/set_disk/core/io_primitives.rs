@@ -8145,7 +8145,8 @@ mod tests {
                     assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 4);
                     assert_eq!(setup.available_shards(), 4);
                     assert_eq!(setup.deferred_shards(), 4);
-                    for (index, attempted) in setup.attempted[..8].iter().enumerate().skip(4) {
+                    assert!(setup.attempted.len() >= 8);
+                    for (index, attempted) in setup.attempted.iter().enumerate().take(8).skip(4) {
                         assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
                         assert!(!attempted, "parity must stay unopened until needed");
                     }

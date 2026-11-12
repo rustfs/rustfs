@@ -88,6 +88,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
       plan: ${{ steps.scope.outputs.plan }}
@@ -107,7 +110,14 @@ jobs:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_EVENT_ACTION: ${{ github.event.action }}
           CI_REHEARSE_SHARDS: ${{ inputs.rehearse_workspace_shards && 'true' || 'false' }}
+          # A push whose tree a successful merge-group run already passed skips
+          # the validation jobs; the lookup answers null on any doubt.
+          PROOF_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            CI_MERGE_GROUP_PROOF="$(GITHUB_TOKEN="$PROOF_TOKEN" python3 -I scripts/ci_merge_group_proof.py)" || CI_MERGE_GROUP_PROOF=null
+            export CI_MERGE_GROUP_PROOF
+          fi
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             python3 -I scripts/ci_gate.py select
           elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
@@ -116,7 +126,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=3$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=5$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -171,6 +181,67 @@ jobs:
       - name: Run shared quick checks
         uses: ./.github/actions/quick-checks
 
+  # Clippy runs beside the test-binary build instead of in front of it. The two
+  # share no compiler output: Clippy writes check-mode metadata, the archive
+  # needs codegen and linked test binaries, and both restore the third-party
+  # artifacts of their own mode from ci-dev. As one job the lint held the
+  # archive, and every test that consumes it, back by its whole duration.
+  # scripts/ci_gate.py keeps this job in the Test and Lint aggregate and out
+  # of the archive consumer's dependency chain.
+  workspace-clippy:
+    name: Workspace Clippy
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
+    # Reads the ci-dev cache that cache-warm.yml writes on this image, and the
+    # all-targets check of the workspace does not fit a hosted runner's disk.
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          # Checkout otherwise writes the token into .git/config, where a PR's
+          # own build.rs or proc-macro could read it back out.
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          # Read-only, like every other ci-dev reader; cache-warm.yml warms the
+          # check artifacts of this exact invocation.
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      # Clippy gates every event, pull requests included. When it ran only after
+      # merge, a lint regression merged freely and then failed every main run
+      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
+      # writes the same invocation's check artifacts into ci-dev, so a pull
+      # request re-checks only the crates its diff touches. Main keeps the step
+      # because pull requests can merge without being up to date with main.
+      - name: Run clippy lints
+        run: |
+          ./scripts/ci/resource_sampler.sh start clippy
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          python3 scripts/ci_test_artifact.py cargo lint --configuration workspace
+
+      - name: Upload lint diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-clippy-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/workspace
+          retention-days: 3
+          if-no-files-found: error
+
+  # Keeps its job ID and check name: it is the archive producer that
+  # workspace-tests and scripts/check_test_wiring.py bind to. The lint half
+  # is workspace-clippy above; this job builds the test archive, then runs
+  # the doctests and the log-analyzer anchor check on the same build output.
   workspace-lint-and-build:
     name: Workspace Lint and Build
     if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
@@ -211,18 +282,6 @@ jobs:
             echo "runner=${RUNNER_NAME}"
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/workspace/run-metadata.txt
-
-      # Clippy gates every event, pull requests included. When it ran only after
-      # merge, a lint regression merged freely and then failed every main run
-      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
-      # writes the same invocation's check artifacts into ci-dev, so a pull
-      # request re-checks only the crates its diff touches. Main keeps the step
-      # because pull requests can merge without being up to date with main.
-      - name: Run clippy lints
-        run: |
-          ./scripts/ci/resource_sampler.sh start clippy
-          trap './scripts/ci/resource_sampler.sh stop' EXIT
-          python3 scripts/ci_test_artifact.py cargo lint --configuration workspace
 
       - name: Archive workspace test binaries
         env:
@@ -274,7 +333,7 @@ jobs:
       # rustfs/backlog#1289: fail if a seed rule's log anchor no longer exists
       # verbatim in the source tree (log message drifted without updating the
       # rule). Placed here where the workspace — including the la-dump-anchors
-      # bin — is already built by the clippy/test steps above.
+      # bin's dependencies — is already built by the test archive step above.
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
 
@@ -1590,6 +1649,7 @@ jobs:
       - classify-changes
       - typos
       - quick-checks
+      - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
       - workspace-shards
@@ -1628,6 +1688,7 @@ jobs:
       - required-checks
       - typos
       - quick-checks
+      - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
       - core-contract

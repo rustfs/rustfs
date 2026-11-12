@@ -257,8 +257,6 @@ impl HealManager {
                 let notify_clone = notify.clone();
                 let root_recovery_clone = root_recovery.clone();
                 let manager_cancel_token = cancel_token.clone();
-                let task_type_label_for_spawn = task_type_label;
-                let task_set_label_for_spawn = task_set_label;
                 let config_for_spawn = config.clone();
 
                 // start heal task
@@ -270,8 +268,8 @@ impl HealManager {
                         subsystem = LOG_SUBSYSTEM_MANAGER,
                         task_id,
                         priority = ?task_priority,
-                        heal_type = %task_type_label_for_spawn,
-                        set = %task_set_label_for_spawn,
+                        heal_type = %task_type_label,
+                        set = %task_set_label,
                         state = "task_started",
                         "Heal scheduler task started"
                     );
@@ -286,8 +284,8 @@ impl HealManager {
                                 component = LOG_COMPONENT_HEAL,
                                 subsystem = LOG_SUBSYSTEM_MANAGER,
                                 task_id,
-                                heal_type = %task_type_label_for_spawn,
-                                set = %task_set_label_for_spawn,
+                                heal_type = %task_type_label,
+                                set = %task_set_label,
                                 state = "task_completed",
                                 "Heal scheduler task completed"
                             );
@@ -300,8 +298,8 @@ impl HealManager {
                                 subsystem = LOG_SUBSYSTEM_MANAGER,
                                 state = "verification_unavailable",
                                 task_id,
-                                heal_type = %task_type_label_for_spawn,
-                                set = %task_set_label_for_spawn,
+                                heal_type = %task_type_label,
+                                set = %task_set_label,
                                 detail = %e,
                                 "Heal attempt completed without independent verification"
                             );
@@ -314,8 +312,8 @@ impl HealManager {
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
                                     task_id,
-                                    heal_type = %task_type_label_for_spawn,
-                                    set = %task_set_label_for_spawn,
+                                    heal_type = %task_type_label,
+                                    set = %task_set_label,
                                     state = "task_retrying",
                                     retry_attempt = task.retry_attempts.saturating_add(1),
                                     error = %e,
@@ -328,8 +326,8 @@ impl HealManager {
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
                                     state = "task_failed",
                                     task_id,
-                                    heal_type = %task_type_label_for_spawn,
-                                    set = %task_set_label_for_spawn,
+                                    heal_type = %task_type_label,
+                                    set = %task_set_label,
                                     error = %e,
                                     "Heal scheduler task failed"
                                 });

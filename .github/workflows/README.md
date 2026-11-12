@@ -53,7 +53,7 @@ A hosted runner is also the only choice for a few things the pods cannot do: `mo
 These are the patterns that have cost real money here without validating anything more:
 
 - An `if: always()` summary or alert job on a self-hosted label inside a `workflow_run`-triggered workflow. The upstream workflow completes many times a day, the real jobs skip, and the summary still starts a pod each time. Gate it on the upstream job having run, and keep it on `ubuntu-latest`.
-- Per-push workflows on `main`. A merge triggers the applicable `ci.yml` matrix and cache warming; `build.yml` development builds are scheduled or manual; with tens of merges a day that is as much self-hosted time as all pull requests together. Anything that does not verify the merged tree itself belongs on a schedule or behind a `paths` filter.
+- Per-push workflows on `main`. A merge triggers cache warming and a `ci.yml` run, which validates the merged tree in full unless a merge-queue run already validated that tree; `build.yml` development builds are scheduled or manual; with tens of merges a day that is as much self-hosted time as all pull requests together. Anything that does not verify the merged tree itself belongs on a schedule or behind a `paths` filter.
 - `apt-get install` of tools the hosted image already ships. It is only needed on the minimal pod images.
 - A throttled `CARGO_BUILD_JOBS` on a 14-CPU pod. The limit exists for link-storm reasons documented in `ci.yml`; measure before raising it, and measure before lowering it further.
 - Tiny jobs on ARC pods. Each one pays roughly a minute of pod start-up before its first step; a compile-free job that takes ten seconds costs more to schedule than to run.

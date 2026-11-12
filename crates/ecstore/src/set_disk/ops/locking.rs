@@ -690,9 +690,10 @@ impl SetDisks {
             return Err(Error::other("DriveID: offline"));
         }
 
+        let set_drive_count = self.format.erasure.sets[0].len();
         for (i, set) in self.format.erasure.sets.iter().enumerate() {
-            for (j, _) in self.format.erasure.sets[0].iter().enumerate() {
-                if fm.erasure.this == set[j] {
+            for (j, drive) in set.iter().enumerate().take(set_drive_count) {
+                if fm.erasure.this == *drive {
                     return Ok((i, j));
                 }
             }

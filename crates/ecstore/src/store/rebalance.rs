@@ -1722,7 +1722,8 @@ mod tests {
             .await
             .expect("bucket should be created in both pools");
 
-        for (pool_index, pool) in store.pools[..2].iter().enumerate() {
+        assert!(store.pools.len() >= 2);
+        for (pool_index, pool) in store.pools.iter().enumerate().take(2) {
             let mut reader = PutObjReader::from_vec(format!("pool-{pool_index}-history").into_bytes());
             pool.put_object(
                 &bucket,
