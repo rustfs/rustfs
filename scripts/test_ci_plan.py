@@ -438,7 +438,7 @@ class PlannerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', str(script), 'select'], cwd=self.repo.root, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards', 'gateway_smoke', 'plan_contract'})
+        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'gateway_smoke', 'plan_contract'})
         self.assertEqual(values['gateway_smoke'], 'false')
         self.assertFalse(json.loads(values['plan'])['gateway_smoke']['run'])
         self.assertEqual(values['plan_contract'], gate.PLAN_CONTRACT)
@@ -462,7 +462,6 @@ class GateTests(unittest.TestCase):
         jobs = gate.expected_results(mode, event, 'refs/heads/main', connect)
         return {'schema_version': 1, 'event': event, 'ref': 'refs/heads/main', 'head': 'a' * 40, 'tree': 'b' * 40,
                 'base': 'c' * 40, 'action': '', 'mode': mode, 'connect': connect, 'full_validation': mode == 'full', 'packages': ['rustfs'] if mode != 'docs' else [],
-                'rehearse_shards': False,
                 'policy': {'revision': 'c' * 40, 'rollout': 'enforced'}, 'jobs': jobs, 'configurations': gate.configurations(jobs),
                 'reasons': ['fixture'], 'not_applicable': {job: 'fixture' for job, state in jobs.items() if state == 'skipped'}}
 
@@ -528,7 +527,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(expected['connect-feature-boundaries'], 'skipped')
         needs = {job: {'result': result} for job, result in expected.items()}
         needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': json.dumps(stale, separators=(',', ':')),
-                                                'connect': 'true', 'full_validation': 'true', 'rehearse_shards': 'false'}
+                                                'connect': 'true', 'full_validation': 'true'}
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
 
     def workflow(self):
@@ -545,8 +544,6 @@ class GateTests(unittest.TestCase):
                 expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
                 expression = "github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')"
-            elif job in gate.SHARD_JOBS:
-                expression = "needs.classify-changes.outputs.rehearse_shards == 'true'"
             elif job in gate.E2E_JOBS:
                 expression = "needs.classify-changes.outputs.mode != 'docs'"
             else:
@@ -583,6 +580,40 @@ class GateTests(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps(workflow))
             return gate.check_workflow(root)
+
+    def test_cache_warm_builds_each_reader_selection_and_skips_exact_hits(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        ci = gate.workflow_document((root / '.github/workflows/ci.yml').read_text())['jobs']
+        warm = gate.workflow_document((root / '.github/workflows/cache-warm.yml').read_text())['jobs']
+        self.assertEqual(gate.cache_warm_errors(ci, warm), [])
+        dev = warm['warm-ci-dev']['steps']
+        build = next(step for step in dev if 'cargo warm --configuration e2e' in step.get('run', ''))
+        lint = next(step for step in dev if gate.LINT_COMMANDS[1] in step.get('run', ''))
+        mutations = [
+            (lambda: build.update(run=build['run'].replace('cargo warm --configuration e2e', 'cargo warm --configuration workspace')),
+             'warm-ci-dev must build the e2e archive selection'),
+            (lambda: build.update(run=build['run'].replace('python3 scripts/ci_test_artifact.py cargo warm --configuration workspace', 'cargo build --workspace --all-targets')),
+             'warm-ci-dev must build the workspace archive selection'),
+            (lambda: lint.update(run=lint['run'].replace(gate.LINT_COMMANDS[1], 'cargo clippy --all-targets -- -D warnings')),
+             'warm-ci-dev must run the workspace lint command'),
+            (lambda: build.pop('if'), 'warm-ci-dev builds after an exact cache hit'),
+            (lambda: lint.update({'if': "always()"}), 'warm-ci-dev builds after an exact cache hit'),
+            (lambda: next(step for step in warm['warm-ci-uring']['steps'] if 'cargo build' in step.get('run', '')).pop('if'),
+             'warm-ci-uring builds after an exact cache hit'),
+            (lambda: next(step for step in warm['warm-ci-feat-rio']['steps'] if step.get('id') == 'setup').pop('id'),
+             'warm-ci-feat-rio builds after an exact cache hit'),
+            (lambda: ci['build-rustfs-debug-binary']['steps'].append({'run': 'python3 scripts/ci_test_artifact.py build --configuration other --archive x'}),
+             'warm-ci-dev must build the other archive selection'),
+        ]
+        for mutate, message in mutations:
+            original = json.dumps([ci, warm])
+            with self.subTest(message=message):
+                mutate()
+                self.assertIn(message, gate.cache_warm_errors(ci, warm))
+            ci, warm = json.loads(original)
+            dev = warm['warm-ci-dev']['steps']
+            build = next(step for step in dev if 'cargo warm --configuration e2e' in step.get('run', ''))
+            lint = next(step for step in dev if gate.LINT_COMMANDS[1] in step.get('run', ''))
 
     def test_ignored_ilm_archive_execution_preserves_failure_and_core_report(self):
         workflow = gate.workflow_document((Path(gate.__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text())
@@ -769,20 +800,6 @@ class GateTests(unittest.TestCase):
             for selected in ('true', 'false', ''):
                 self.assertTrue(runs(event, selected), (event, selected))
         self.assertEqual(workflow['jobs']['classify-changes']['outputs']['gateway_smoke'], "${{ steps.scope.outputs.gateway_smoke || 'true' }}")
-
-    def test_requested_shards_and_union_proof_are_required_and_cannot_be_skipped(self):
-        plan = self.plan('workflow_dispatch')
-        plan['rehearse_shards'] = True
-        plan['jobs'] = gate.expected_results('full', 'workflow_dispatch', plan['ref'], rehearse_shards=True)
-        plan['not_applicable'] = {job: 'not selected' for job, state in plan['jobs'].items() if state == 'skipped'}
-        self.assertEqual(gate.verify_results(self.needs(plan), plan['event'], plan['ref']), [])
-        for job in gate.SHARD_JOBS:
-            for state in ('failure', 'cancelled', 'skipped', None):
-                needs = self.needs(plan)
-                needs[job]['result'] = state
-                self.assertTrue(gate.verify_results(needs, plan['event'], plan['ref']))
-        with self.assertRaises(ValueError):
-            gate.expected_results('full', 'pull_request', plan['ref'], rehearse_shards=True)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()
