@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -33,12 +33,12 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "3"
+PLAN_CONTRACT = "4"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -47,6 +47,14 @@ E2E_SELECTION_FILES = {
         "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
     )
 }
+# Clippy and the test-binary archive share no compiler output, so the lint runs
+# beside the archive producer instead of in front of it. LINT_JOB is the only
+# job that may lint the workspace; nothing downstream of ARCHIVE_PRODUCER may
+# wait for it, or the lint is back on the path every workspace test waits on.
+LINT_JOB = "workspace-clippy"
+ARCHIVE_PRODUCER = "workspace-lint-and-build"
+ARCHIVE_CONSUMERS = ("workspace-tests", "workspace-shards", "workspace-shard-evidence")
+LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
@@ -333,8 +341,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "workspace-lint-and-build", "dev", []),
-        ("workspace-tests", "workspace-lint-and-build", "test", []),
+        ("workspace-lint", LINT_JOB, "dev", []),
+        ("workspace-tests", ARCHIVE_PRODUCER, "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -665,6 +673,49 @@ def condition(expression: str | bool, context: dict) -> bool:
     return bool(result)
 
 
+def job_needs(jobs: dict, job: str) -> list[str]:
+    dependencies = jobs.get(job, {}).get("needs", [])
+    return [dependencies] if isinstance(dependencies, str) else list(dependencies)
+
+
+def check_lint_lane(jobs: dict) -> list[str]:
+    """Keep workspace Clippy gating every code event without delaying the test archive."""
+    errors = []
+    lint_steps = {job: [step for step in block.get("steps", [])
+                        if any(command in step.get("run", "") for command in LINT_COMMANDS)]
+                  for job, block in jobs.items()}
+    clippy = lint_steps.get(LINT_JOB, [])
+    if len(clippy) != 1 or any("if" in step for step in clippy):
+        errors.append("workspace Clippy must run on every code event, pull requests included")
+    if any(steps for job, steps in lint_steps.items() if job != LINT_JOB):
+        errors.append(f"workspace Clippy belongs to {LINT_JOB} alone")
+    lint, producer = jobs.get(LINT_JOB, {}), jobs.get(ARCHIVE_PRODUCER, {})
+    # The lint replaces a step of the producer; it must keep that job's scope.
+    if not lint or lint.get("if") != producer.get("if"):
+        errors.append(f"{LINT_JOB} must run under the same condition as {ARCHIVE_PRODUCER}")
+    for job in (ARCHIVE_PRODUCER, *ARCHIVE_CONSUMERS):
+        reached, pending = set(), [job]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(job_needs(jobs, current))
+        if LINT_JOB in reached:
+            errors.append(f"{job} must not wait for {LINT_JOB}")
+    if ARCHIVE_PRODUCER not in job_needs(jobs, "workspace-tests"):
+        errors.append(f"workspace-tests must consume the archive of {ARCHIVE_PRODUCER}")
+    return errors
+
+
+def check_plan_contract_marker(jobs: dict) -> list[str]:
+    """The workflow's fallback must test for the marker this revision's planner emits."""
+    scopes = [step for step in jobs.get("classify-changes", {}).get("steps", []) if step.get("id") == "scope"]
+    markers = re.findall(r"grep -q '\^plan_contract=([^$']*)\$'", scopes[0].get("run", "")) if len(scopes) == 1 else []
+    if markers != [PLAN_CONTRACT]:
+        return [f"classify-changes must fall back to the full matrix unless the plan carries contract {PLAN_CONTRACT}"]
+    return []
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -733,15 +784,13 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("env", {}).get("CI_NEEDS") != "${{ toJSON(needs) }}"
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
-    lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
-              if any(command in step.get("run", "") for command in lint_commands)]
-    if not clippy or any("if" in step for step in clippy):
-        errors.append("workspace Clippy must run on every code event, pull requests included")
+    errors.extend(check_lint_lane(jobs))
+    errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "internode-transport": "--features rustfs/internode-transport"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):

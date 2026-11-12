@@ -16,6 +16,9 @@ use datafusion::{
 use std::assert_matches;
 use std::sync::Arc;
 
+#[path = "tests/dropped_table_history.rs"]
+mod dropped_table_history;
+
 #[path = "tests/superseded_commit_recovery.rs"]
 mod superseded_commit_recovery;
 

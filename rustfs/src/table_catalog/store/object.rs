@@ -362,6 +362,30 @@ pub(super) fn validate_table_maintenance_report_owner(
     Ok(())
 }
 
+pub(super) fn validate_table_maintenance_report_path(
+    paths: &TableCatalogObjectPaths,
+    bucket: &str,
+    key: &str,
+    suffix: &str,
+    report: &TableMetadataMaintenanceReport,
+) -> TableCatalogStoreResult<()> {
+    let job = &report.job;
+    let namespace = parse_namespace_for_store(&job.namespace)?;
+    let table = parse_table_for_store(&job.table)?;
+    validate_table_maintenance_report_owner(report, bucket, &namespace, &table, &job.table_id)?;
+    let expected = match suffix {
+        MAINTENANCE_CURRENT_JOB_FILE => paths.table_maintenance_current_job_path(bucket, &namespace, &table, &job.table_id),
+        MAINTENANCE_LATEST_JOB_FILE => paths.table_maintenance_latest_job_path(bucket, &namespace, &table, &job.table_id),
+        _ => paths.table_maintenance_job_path(bucket, &namespace, &table, &job.table_id, &job.job_id),
+    };
+    if job.table_id.is_empty() || key != expected {
+        return Err(TableCatalogStoreError::Invalid(
+            "maintenance report does not match its object path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_table_warehouse_index_entry_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
@@ -7834,6 +7858,13 @@ where
             )));
         };
         let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
+        // A rename source tombstone can still share its table ID with a live destination.
+        let history = if entry.state == TableCatalogEntryState::Active {
+            self.prepare_dropped_table_commit_cleanup(&entry).await?
+        } else {
+            Vec::new()
+        };
+        mutation_fence.ensure_held()?;
         self.tombstone_table_warehouse_index_for_drop(&entry, false).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
@@ -7884,6 +7915,11 @@ where
                 .ok_or_else(|| TableCatalogStoreError::Conflict("table maintenance config has no ETag".to_string()))?;
             self.backend
                 .delete_object_if_match_fenced(self.catalog_bucket(), &config_path, &etag, &mutation_fence)
+                .await?;
+        }
+        for (key, etag) in history {
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &key, &etag, &mutation_fence)
                 .await?;
         }
         Ok(())

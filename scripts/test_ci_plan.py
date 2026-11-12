@@ -554,7 +554,9 @@ class GateTests(unittest.TestCase):
             expression = f"({expression}) && (github.event_name != 'pull_request' || github.event.action != 'closed')"
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
         jobs['classify-changes']['outputs'] = {'mode': '${{ steps.scope.outputs.mode }}'}
-        jobs['workspace-lint-and-build']['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        jobs[gate.LINT_JOB]['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        jobs['workspace-tests']['needs'] = [gate.ARCHIVE_PRODUCER]
+        jobs['classify-changes']['steps'] = [{'id': 'scope', 'run': f"grep -q '^plan_contract={gate.PLAN_CONTRACT}$' \"$GITHUB_OUTPUT\""}]
         # The gateway integration branch reruns e2e-tests' suite as a report-only lane.
         for job, (mirror, steps, env, selection) in gate.REPORT_ONLY_JOBS.items():
             key, _, value = env.partition(': ')
@@ -567,7 +569,8 @@ class GateTests(unittest.TestCase):
             jobs['classify-changes']['outputs'][selection] = f"${{{{ steps.scope.outputs.{selection} || 'true' }}}}"
             jobs[job]['steps'].append({'name': 'Upload report', 'uses': 'actions/upload-artifact', 'with': {'name': job}})
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
-            {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'}]}}
+            {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'},
+            {'name': 'internode-transport', 'flags': '--features rustfs/internode-transport'}]}}
         jobs['required-checks'] = {'name': 'Test and Lint', 'if': "always() && (github.event_name != 'pull_request' || github.event.action != 'closed')",
                                    'needs': list(gate.ALWAYS_JOBS + gate.CODE_JOBS + gate.OPTIONAL_JOBS),
                                    'steps': [{'shell': 'bash', 'env': {'CI_NEEDS': '${{ toJSON(needs) }}'}, 'run': 'python3 scripts/ci_gate.py verify'}]}
@@ -649,6 +652,64 @@ class GateTests(unittest.TestCase):
         changed = copy.deepcopy(workflow)
         changed['jobs'][job]['steps'][-1]['with']['name'] = 'renamed-report'
         self.assertEqual(self.check(changed), [], "only the mirrored steps are bound")
+
+    def test_parallel_clippy_lane_still_gates_the_aggregate(self):
+        lint = gate.LINT_JOB
+        # The aggregate requires the lint wherever the archive producer runs.
+        for event, mode, required in (('pull_request', 'full', 'success'), ('pull_request', 'e2e', 'success'),
+                                      ('pull_request', 'docs', 'skipped'), ('merge_group', 'full', 'success'),
+                                      ('push', 'full', 'success'), ('schedule', 'full', 'success'),
+                                      ('workflow_dispatch', 'full', 'success')):
+            plan = self.plan(event, mode)
+            self.assertEqual(plan['jobs'][lint], required, (event, mode))
+            self.assertEqual(plan['jobs'][lint], plan['jobs'][gate.ARCHIVE_PRODUCER], (event, mode))
+            self.assertEqual(gate.verify_results(self.needs(plan), event, plan['ref']), [])
+            for bad in ({'failure', 'cancelled', 'skipped', 'success', None} - {required}):
+                needs = self.needs(plan)
+                needs[lint]['result'] = bad
+                errors = gate.verify_results(needs, event, plan['ref'])
+                self.assertTrue(any(error.startswith(f'{lint}: expected {required}') for error in errors), (event, mode, bad, errors))
+            needs = self.needs(plan)
+            del needs[lint]
+            self.assertTrue(any(lint in error and 'job set differs' in error for error in gate.verify_results(needs, event, plan['ref'])))
+        self.assertIn(lint, [item['job'] for item in gate.configurations(self.plan()['jobs']) if item['id'] == 'workspace-lint'])
+        # A base planner that predates the lint job cannot describe the job set.
+        stale = self.plan()
+        del stale['jobs'][lint]
+        needs = self.needs(stale)
+        self.assertTrue(gate.verify_results(needs, 'pull_request', stale['ref']))
+
+    def test_clippy_lane_is_wired_beside_the_archive_producer(self):
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        lint, producer = gate.LINT_JOB, gate.ARCHIVE_PRODUCER
+        step = {'run': 'python3 scripts/ci_test_artifact.py cargo lint --configuration workspace'}
+        for case, (mutate, message) in enumerate((
+            # The aggregate must keep depending on the lint, and the lint must keep running.
+            (lambda w: w['jobs']['required-checks']['needs'].remove(lint), 'required-checks must directly depend on every verification job exactly once'),
+            (lambda w: w['jobs'].pop(lint), 'CI verification jobs and the required gate contract differ'),
+            (lambda w: w['jobs'][lint].update({'steps': []}), 'workspace Clippy must run on every code event, pull requests included'),
+            (lambda w: w['jobs'][lint]['steps'][0].update({'if': "github.event_name != 'merge_group'"}), 'workspace Clippy must run on every code event, pull requests included'),
+            (lambda w: w['jobs'][lint]['steps'][0].update({'run': 'cargo clippy --all-targets'}), 'workspace Clippy must run on every code event, pull requests included'),
+            (lambda w: w['jobs'][lint].update({'continue-on-error': 'true'}), f'{lint} cannot convert a validation failure into success'),
+            (lambda w: w['jobs'][lint]['steps'][0].update({'continue-on-error': 'true'}), f'{lint} cannot convert a validation failure into success'),
+            # Its scope is the archive producer's scope on every event.
+            (lambda w: w['jobs'][lint].update({'if': "github.event_name == 'merge_group'"}), f'{lint} must run under the same condition as {producer}'),
+            (lambda w: w['jobs'][lint].update({'if': 'false'}), f'{lint} must run under the same condition as {producer}'),
+            # One lint, in one place, off the path the workspace tests wait on.
+            (lambda w: w['jobs'][producer]['steps'].append(dict(step)), f'workspace Clippy belongs to {lint} alone'),
+            (lambda w: w['jobs'][producer].update({'needs': [lint]}), f'{producer} must not wait for {lint}'),
+            (lambda w: w['jobs']['workspace-tests']['needs'].append(lint), f'workspace-tests must not wait for {lint}'),
+            (lambda w: w['jobs']['workspace-tests'].update({'needs': ['classify-changes']}), f'workspace-tests must consume the archive of {producer}'),
+            # The workflow fallback must name the contract this planner emits.
+            (lambda w: w['jobs']['classify-changes']['steps'][0].update({'run': "grep -q '^plan_contract=3$' \"$GITHUB_OUTPUT\""}), f'classify-changes must fall back to the full matrix unless the plan carries contract {gate.PLAN_CONTRACT}'),
+            (lambda w: w['jobs']['classify-changes'].update({'steps': []}), f'classify-changes must fall back to the full matrix unless the plan carries contract {gate.PLAN_CONTRACT}'),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertIn(message, self.check(changed), case)
+        # The checked-in workflow satisfies the same contract.
+        self.assertEqual(gate.check_workflow(Path(gate.__file__).resolve().parent.parent), [])
 
     def test_report_only_lane_runs_only_where_its_selection_says_and_always_outside_pull_requests(self):
         workflow = self.workflow()
@@ -738,7 +799,7 @@ class GateTests(unittest.TestCase):
             lambda w: w['jobs']['required-checks'].update({'if': "'always()' == 'always()'"}),
             lambda w: w['jobs']['required-checks']['steps'][0].update({'run': 'python3 scripts/ci_gate.py verify || true'}),
             lambda w: w['jobs']['typos'].update({'continue-on-error': 'true'}),
-            lambda w: w['jobs']['workspace-lint-and-build']['steps'][0].update({'if': 'false'}),
+            lambda w: w['jobs'][gate.LINT_JOB]['steps'][0].update({'if': 'false'}),
             lambda w: w['jobs']['test-and-lint-protocols']['strategy']['matrix']['features'].pop(),
             lambda w: w['jobs'].update({'unaccounted': {'name': 'New'}}),
             lambda w: w['on']['pull_request'].update({'paths': ['README.md']}),
