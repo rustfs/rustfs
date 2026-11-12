@@ -3975,8 +3975,8 @@ impl Metrics {
         m.partial_cycles = self.partial_scan_cycles.load(Ordering::Relaxed);
 
         // Lifetime operation counts
-        for i in 0..Metric::Last as usize {
-            let count = self.operations[i].load(Ordering::Relaxed);
+        for (i, operation) in self.operations.iter().enumerate().take(Metric::Last as usize) {
+            let count = operation.load(Ordering::Relaxed);
             if count > 0
                 && let Some(metric) = Metric::from_index(i)
             {
@@ -3985,8 +3985,8 @@ impl Metrics {
         }
 
         // Last-minute stats for realtime metrics — now plain sync calls
-        for i in 0..Metric::LastRealtime as usize {
-            let last_min = self.latency[i].total();
+        for (i, latency) in self.latency.iter().enumerate().take(Metric::LastRealtime as usize) {
+            let last_min = latency.total();
             if last_min.n > 0
                 && let Some(metric) = Metric::from_index(i)
             {
@@ -4002,8 +4002,8 @@ impl Metrics {
         }
 
         // Lifetime ILM counts
-        for i in 0..IlmAction::ActionCount as usize {
-            let count = self.actions[i].load(Ordering::Relaxed);
+        for (i, action_count) in self.actions.iter().enumerate().take(IlmAction::ActionCount as usize) {
+            let count = action_count.load(Ordering::Relaxed);
             if count > 0
                 && let Some(action) = IlmAction::from_index(i)
             {
@@ -4012,8 +4012,8 @@ impl Metrics {
         }
 
         // Last-minute ILM latency — plain sync calls
-        for i in 0..IlmAction::ActionCount as usize {
-            let last_min = self.actions_latency[i].total();
+        for (i, latency) in self.actions_latency.iter().enumerate().take(IlmAction::ActionCount as usize) {
+            let last_min = latency.total();
             if last_min.n > 0
                 && let Some(action) = IlmAction::from_index(i)
             {
