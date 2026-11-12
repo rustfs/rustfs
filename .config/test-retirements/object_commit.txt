@@ -1,0 +1,2 @@
+# Tests the object_commit slice retires (rustfs/backlog#2765); format and checks: scripts/check_test_retirements.py.
+# <crate> | <module path>::<test fn> | <kind: test, differential or e2e> | <replacement> | <reason>

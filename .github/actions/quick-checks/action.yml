@@ -105,6 +105,10 @@ runs:
       shell: bash
       run: python3 ./scripts/check_test_seams.py
 
+    - name: Check retired tests name existing replacements
+      shell: bash
+      run: python3 ./scripts/check_test_retirements.py
+
     - name: Check cryptographic capability wording
       shell: bash
       run: ./scripts/check_fips_wording.sh
