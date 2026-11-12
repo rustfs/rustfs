@@ -31,6 +31,14 @@ fn replication_extension_policy_action_uses_write_permission_for_active_check() 
         replication_extension_policy_action(ReplicationExtRoute::ResetStart),
         Action::S3Action(S3Action::ResetBucketReplicationStateAction)
     );
+    assert_eq!(
+        replication_extension_policy_action(ReplicationExtRoute::MetricsV2),
+        Action::S3Action(S3Action::GetReplicationConfigurationAction)
+    );
+    assert_eq!(
+        replication_extension_policy_action(ReplicationExtRoute::ResetStatus),
+        Action::S3Action(S3Action::ResetBucketReplicationStateAction)
+    );
 }
 
 #[test]

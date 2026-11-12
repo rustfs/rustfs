@@ -286,6 +286,21 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             assert_eq!(error_code(result, &format!("full {method} {uri}")), expected, "full {method} {uri}");
         }
 
+        // Changed by the move to the owned authorization entry point: a request that
+        // carries `x-amz-copy-source` is refused, because the owned decision requires a
+        // decoded copy source whenever that header is present. These routes read none.
+        for (method, template) in [
+            (Method::GET, "/{b}?replication-metrics"),
+            (Method::GET, "/{b}?events=s3:ObjectCreated:*"),
+        ] {
+            let uri = uri_for(template, &bucket);
+            let mut req = request(method.clone(), &uri, Some(&callers.full));
+            req.headers
+                .insert("x-amz-copy-source", http::HeaderValue::from_static("/other-bucket/key"));
+            let code = error_code(send(&router, req).await, &format!("copy-source {method} {uri}"));
+            assert_eq!(code, S3ErrorCode::AccessDenied, "copy-source {method} {uri}");
+        }
+
         for template in [
             "/?events=s3:ObjectCreated:*",
             "/{b}?events=s3:ObjectCreated:*",
