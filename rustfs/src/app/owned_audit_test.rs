@@ -49,6 +49,8 @@ const VERSION: &str = "0b5ae7d4-6c43-4c43-9b1e-8b4ad3e5c0f1";
 
 type Request = fn(&mut HeaderMap, &mut Extensions);
 type Steps = fn(OperationHelper) -> OperationHelper;
+/// A case name, the owned-side input change, and the owned values it must produce.
+type ViewRow = (&'static str, Request, Vec<(&'static str, Value)>);
 
 #[derive(Clone, Copy)]
 enum Answer {
@@ -533,7 +535,7 @@ fn with_cred(e: &mut Extensions, change: fn(&mut Credentials)) {
 fn an_input_of_the_audit_view_reaches_the_owned_entry() {
     let req_params =
         |agent: &str, principal: &str| json!({"host": "h2.example.test:9000", "user-agent": agent, "principalId": principal});
-    let rows: [(&str, Request, Vec<(&str, Value)>); 8] = [
+    let rows: [ViewRow; 8] = [
         (
             "success",
             |_, e| with_cred(e, |cred| cred.access_key = "other-user".to_owned()),
