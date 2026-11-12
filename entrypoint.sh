@@ -216,6 +216,17 @@ has_volume_range() {
   esac
 }
 
+has_local_pool_list() {
+  pool_count=0
+  for pool in $1; do
+    case "$pool" in
+      /*'{'*'...'*'}'*) pool_count=$((pool_count + 1)) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$pool_count" -gt 1 ]
+}
+
 # 2) Process data volumes (separate from log directory)
 DATA_VOLUMES=""
 process_data_volumes() {
@@ -226,6 +237,12 @@ process_data_volumes() {
     *) VOLUME_LIST_RAW="$VOLUME_RAW" ;;
   esac
   
+  # RustFS uses each local ellipsis argument as a pool boundary.
+  LOCAL_POOL_ARGS=""
+  if has_local_pool_list "$VOLUME_LIST_RAW"; then
+    LOCAL_POOL_ARGS="$VOLUME_LIST_RAW"
+  fi
+
   # Manually expand {N...M} ranges since sh doesn't support brace expansion on
   # variables. A single token can carry MORE than one range — the distributed
   # form "http://rustfs{1...4}:9000/data/rustfs{0...3}" has two — so expand the
@@ -247,7 +264,16 @@ process_data_volumes() {
                END=${RANGE##*..}
 
                # Check if START and END are numbers
-               if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
+               if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" ] 2>/dev/null; then
+                   # Match RustFS padding when it expands the original pool arguments.
+                   case "${LOCAL_POOL_ARGS:+$START}" in
+                     0?*)
+                       for i in $(seq -f "%0${#END}.0f" "$START" "$END"); do
+                         NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
+                       done
+                       continue
+                       ;;
+                   esac
                    i=$START
                    while [ "$i" -le "$END" ]; do
                      NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
@@ -289,6 +315,8 @@ process_data_volumes() {
       *)  : ;; # skip anything else we don't recognize
     esac
   done
+
+  DATA_VOLUMES=${LOCAL_POOL_ARGS:-$DATA_VOLUMES}
 
   echo "Initializing data directories:$CREATE_DIRS"
   for vol in $CREATE_DIRS; do

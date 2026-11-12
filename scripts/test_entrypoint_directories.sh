@@ -147,7 +147,7 @@ expect_start '' "$TMP_DIR/chown-failure" RUSTFS_UID=10001 RUSTFS_GID=10001 CHOWN
 expect_volumes() {
   local volumes="$1" expected_args="$2"
   expect_start '' "$volumes"
-  [ "$(cat "$TMP_DIR/args")" = "$expected_args" ]
+  diff -u <(printf '%s\n' "$expected_args") "$TMP_DIR/args"
 }
 
 # Keep delimiter and range parsing on one path, with unchanged child arguments.
@@ -167,6 +167,30 @@ for dots in '..' '...'; do
 $TMP_DIR/range${dots}1"
   [ -d "$TMP_DIR/range${dots}0" ] && [ -d "$TMP_DIR/range${dots}1" ]
 done
+
+# Each local pool is one server argument, with all of its drive directories ready.
+pool0="$TMP_DIR/rustfs0/{0...3}"
+pool1="$TMP_DIR/rustfs1/{0...3}"
+expect_volumes "$pool0   $pool1" "$pool0
+$pool1"
+for pool in rustfs0 rustfs1; do
+  for drive in 0 1 2 3; do
+    [ -d "$TMP_DIR/$pool/$drive" ]
+  done
+done
+
+# Directory setup must use the same padded drive names as the pool parser.
+padded_pool="$TMP_DIR/padded/{08...10}"
+expect_volumes "$pool0,$padded_pool" "$pool0
+$padded_pool"
+for drive in 08 09 10; do
+  [ -d "$TMP_DIR/padded/$drive" ]
+done
+
+# A range and a literal path can still supply individual drives to a legacy pool.
+expect_volumes "$TMP_DIR/mixed{0...1} $TMP_DIR/literal" "$TMP_DIR/mixed0
+$TMP_DIR/mixed1
+$TMP_DIR/literal"
 
 # Distributed endpoints create local paths without becoming positional arguments.
 expect_volumes "http://node{1...2}:9000$TMP_DIR/url{0...1}" ''
