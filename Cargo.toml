@@ -319,7 +319,7 @@ moka = { version = "0.12.16" }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.13.0"
-object = { version = "=0.40.0", default-features = false }
+object = { version = "=0.41.0", default-features = false }
 parking_lot = "0.13.0"
 same-file = "1.0.6"
 path-absolutize = "4.0.1"
@@ -380,7 +380,7 @@ windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
 zip = "9.5.1"
-zstd = "0.14.3"
+zstd = "0.14.4"
 
 # Observability and Metrics
 metrics = "0.24.6"
@@ -404,7 +404,7 @@ russh = { version = "0.65.1" }
 russh-sftp = "3.0.1"
 
 # WebDAV
-dav-server = "0.11.0"
+dav-server = "0.12.0"
 
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.4" }

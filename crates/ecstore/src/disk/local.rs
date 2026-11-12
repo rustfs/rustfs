@@ -3603,11 +3603,7 @@ pub(crate) fn has_delete_version_test_failpoints() -> bool {
     if os::prepared_publication_test_hooks::has_any_hooks() {
         return true;
     }
-    #[cfg(feature = "e2e-test-hooks")]
-    if std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some() {
-        return true;
-    }
-    false
+    cfg!(feature = "e2e-test-hooks") && std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
 }
 
 #[cfg(test)]

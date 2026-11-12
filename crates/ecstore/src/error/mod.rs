@@ -1996,7 +1996,7 @@ mod tests {
 
         for storage_error in storage_errors {
             let original_message = storage_error.to_string();
-            let io_error: std::io::Error = storage_error.clone().into();
+            let io_error: std::io::Error = storage_error.into();
 
             // The io::Error should contain the original error message or info
             assert!(io_error.to_string().contains(&original_message));
