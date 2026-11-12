@@ -1,0 +1,6 @@
+# Rulings for the gateway conformance lane (.github/workflows/gateway-acceptance.yml).
+#
+# One row per case that fails on one RustFS S3 stack for a reviewed reason. `ledger` is the entry
+# of rustfs/backlog#2684 that accepts the difference (R-0xx or K-n); `reason` says, in one line,
+# what the case observes. scripts/check_conformance_rulings.py fails the lane on a failed case
+# without a row, and on a row whose case no longer fails or no longer exists.
