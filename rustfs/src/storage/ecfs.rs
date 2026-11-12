@@ -18,7 +18,6 @@ use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
 use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
 use http::StatusCode;
-use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets as gateway_list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_utils::http::headers::{AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
@@ -285,15 +284,6 @@ pub(crate) fn validate_object_lock_configuration_input(input_cfg: &ObjectLockCon
 #[path = "legacy_edge/mod.rs"]
 mod legacy_edge;
 
-/// A ListBuckets value the s3s edge and the gateway's types disagree on. The seam converts every
-/// member both sides hold, so this is a defect in the conversion, never the caller's fault.
-fn list_buckets_seam_error(error: rustfs_gateway_types::compat::ConversionError) -> S3Error {
-    S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!("failed to convert ListBuckets through the gateway compatibility seam: {error}"),
-    )
-}
-
 #[async_trait::async_trait]
 impl S3 for FS {
     async fn abort_multipart_upload(
@@ -541,17 +531,7 @@ impl S3 for FS {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
         record_s3_op(S3Operation::ListBuckets);
         let usecase = s3_api::bucket_usecase_for(self);
-        // The use case speaks the envelope and the gateway's types; this edge only converts.
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        let input = gateway_list_buckets::input_from_s3s(req.input).map_err(list_buckets_seam_error)?;
-        let output = usecase.execute_list_buckets(envelope, input).await?;
-        let mut output = gateway_list_buckets::output_to_s3s(output).map_err(list_buckets_seam_error)?;
-        // The seam writes a listing without buckets as an absent member. This edge has always
-        // answered the element, empty or not, and clients index the answer by it.
-        if output.buckets.is_none() {
-            output.buckets = Some(Vec::new());
-        }
-        Ok(S3Response::new(output))
+        usecase.execute_list_buckets(req).await
     }
 
     async fn list_multipart_uploads(

@@ -148,20 +148,18 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
-        ListBucketsAuthzRequest, MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard,
-        PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
-        RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
-        StagedMultipartPartAuthorization, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
-        TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
-        apply_copy_source_bucket_generation_guard, authorize_copy_object_tags, authorize_request, authorize_request_core,
-        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
-        prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
-        retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+        MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
+        PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold,
+        RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
+        TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
+        delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
+        log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
+        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
-    #[cfg(feature = "gateway-stack")]
-    pub(crate) use super::super::access::{admit_operation, resolve_req_info};
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
 }
@@ -375,12 +373,16 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
+            pub(crate) mod bucket {
+                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
+            }
+
             pub(crate) mod list {
                 pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
             }

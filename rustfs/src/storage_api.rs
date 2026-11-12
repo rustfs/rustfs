@@ -232,13 +232,6 @@ pub(crate) mod server {
             pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
-        /// The access-phase functions the gateway stack's handlers run, shared with the legacy
-        /// access hooks.
-        #[cfg(feature = "gateway-stack")]
-        pub(crate) mod access {
-            pub(crate) use crate::storage::storage_api::access_consumer::{admit_operation, resolve_req_info};
-        }
-
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
             #[cfg(test)]

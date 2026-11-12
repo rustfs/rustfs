@@ -456,6 +456,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn headers(&self) -> &HeaderMap {
         self.headers()
     }
+    fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
+    }
     fn uri(&self) -> &http::Uri {
         self.uri()
     }
@@ -470,6 +473,9 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn req_info(&self) -> Option<&ReqInfo> {
         self.req_info()
+    }
+    fn req_info_mut(&mut self) -> Option<&mut ReqInfo> {
+        self.req_info_mut()
     }
     fn internal_object_authorization(&self) -> bool {
         false
