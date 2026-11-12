@@ -21,20 +21,20 @@
 //! NOT responsible for: any assertion about Keystone behaviour.
 //! Upstream: `rustfs_keystone`, `rustfs_gateway::ServiceBuilder`. Downstream: this crate's tests.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rustfs_credentials::Credentials;
 use rustfs_gateway::dto::{ListBuckets, ListBucketsOutput};
 use rustfs_gateway::sig::{AmzDate, PayloadMode, SigService, SigV4Signer, SigningCredentials, SigningRequest, SigningScope};
 use rustfs_gateway::{
-    AuthSchemeRef, Authorizer, AuthzRequest, BoxFuture, ClockSkewAck, Decision, FixedClock, Handler, HandlerResult, Identity,
-    IdentityOrigin, InputAuthzRequest, InputDecisions, RegionSet, Req, RequestContext, Resp, S3Service, SecurityFloor,
-    ServiceBuilder, SigV4Authenticator, WireResponse,
+    AuthSchemeRef, Authorizer, AuthzRequest, BoxFuture, ClockSkewAck, CredentialProvider, Decision, FixedClock, Handler,
+    HandlerResult, Identity, IdentityOrigin, InputAuthzRequest, InputDecisions, RegionSet, Req, RequestContext, Resp, S3Service,
+    SecurityFloor, ServiceBuilder, SigV4Authenticator, WireResponse,
 };
 use rustfs_iam::error::Error as IamError;
 use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneVersion, ValidatedKeystoneToken};
@@ -44,7 +44,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::{KeystoneVerifier, establish_keystone_identity, keystone_header_token_claim};
+use crate::IamAdapters;
 use crate::credentials::{IamCredentials, IamKeyLookup};
+use crate::policy::IamPrincipalLookup;
 use crate::root::{RootCell, RootCredentials};
 
 /// The instant the service's clock is fixed to: far enough ahead that `rustfs-keystone`, which
@@ -73,7 +75,20 @@ pub(crate) async fn validated(user_id: &str, expires_at: OffsetDateTime) -> (Cre
     }})
     .to_string();
     let server = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("one validation request");
+        // Bounded, so a client that never connects fails the case instead of hanging it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        listener.set_nonblocking(true).expect("a non-blocking listener");
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("no validation request reached the fake Keystone: {error}"),
+            }
+        };
+        socket.set_nonblocking(false).expect("a blocking socket");
+        socket.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
         let mut request = [0; 4096];
         assert!(socket.read(&mut request).expect("the request head") > 0);
         let response = format!(
@@ -127,6 +142,12 @@ impl IamKeyLookup for FakeIam {
             ..Default::default()
         };
         Box::pin(async move { Ok((Some(UserIdentity::new(user)), true)) })
+    }
+}
+
+impl IamPrincipalLookup for FakeIam {
+    fn group_memberships(&self, _user: &str) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -215,26 +236,41 @@ impl Fixture {
 }
 
 /// A service with the SigV4 authenticator over this crate's credential provider and, when
-/// `keystone`, the Keystone claim with its verifier. No policy source is installed: how a
-/// Keystone principal is authorised is not decided, and `IamPolicySource` refuses one.
+/// `keystone`, the Keystone claim with its verifier. No policy source is installed, so the `200`s
+/// it gives a token request are without one: `IamPolicySource` refuses a Keystone principal
+/// ([`assemble_with_iam_policy_source`]).
 ///
 /// With `anonymous_reaches_the_handler`, a request that presents no credential is served, so
 /// "served as nobody" differs from "refused".
 pub(crate) fn assemble(keystone: bool, anonymous_reaches_the_handler: bool) -> Fixture {
+    build(keystone, anonymous_reaches_the_handler, false)
+}
+
+/// The production assembly: `IamAdapters::install`, so `IamPolicySource` too, and the claim.
+pub(crate) fn assemble_with_iam_policy_source() -> Fixture {
+    build(true, false, true)
+}
+
+fn sigv4(provider: Arc<dyn CredentialProvider>) -> SigV4Authenticator {
+    SigV4Authenticator::new(provider, RegionSet::new(["us-east-1"]).expect("a region"))
+}
+
+fn build(keystone: bool, anonymous_reaches_the_handler: bool, iam_policy_source: bool) -> Fixture {
     let recorder = Arc::new(Recorder::default());
     let iam = Arc::new(FakeIam::default());
     let root = RootCredentials::new("rootadmin", "root-secret-key-0001", "sts-signing-key-0001").expect("valid root credentials");
-    let provider = IamCredentials::new(iam.clone(), Arc::new(RootCell::new(Some(root))));
+    let root = Arc::new(RootCell::new(Some(root)));
     let floor = if anonymous_reaches_the_handler {
         SecurityFloor::new().delegate_anonymous_to_authorizer_after_listing_in_the_posture_report()
     } else {
         SecurityFloor::new()
     };
-    let mut builder = ServiceBuilder::new()
-        .authenticator(SigV4Authenticator::new(
-            Arc::new(provider),
-            RegionSet::new(["us-east-1"]).expect("a region"),
-        ))
+    let builder = if iam_policy_source {
+        IamAdapters::new(iam.clone(), root).install(ServiceBuilder::new(), sigv4)
+    } else {
+        ServiceBuilder::new().authenticator(sigv4(Arc::new(IamCredentials::new(iam.clone(), root))))
+    };
+    let mut builder = builder
         .authorizer(Arc::clone(&recorder))
         .security_floor(floor)
         .clock_with_skew_ack(

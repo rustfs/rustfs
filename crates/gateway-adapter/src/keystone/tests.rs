@@ -24,8 +24,8 @@ use rustfs_gateway::{AuthSchemeRef, IdentityOrigin, WireResponse};
 use time::OffsetDateTime;
 
 use super::fixture::{
-    Fixture, NOW, TOKEN, USER_ID, USERNAME, assemble, established_as, plain, proof, signed, token_request, validated,
-    with_token_under,
+    Fixture, NOW, TOKEN, USER_ID, USERNAME, assemble, assemble_with_iam_policy_source, established_as, plain, proof, signed,
+    token_request, validated, with_token_under,
 };
 use super::*;
 
@@ -299,4 +299,18 @@ async fn n_a_signed_request_with_an_established_token_is_refused_without_a_looku
         !asked.is_empty() && asked.iter().all(|stage| stage.scheme == AuthSchemeRef::SigV4Header),
         "the control"
     );
+}
+
+/// Negative — the production assembly, with `IamPolicySource` installed, answers a token request
+/// `403` through `HOST_TOKEN_PRINCIPAL`: no stage or handler runs and no key is looked up. The same
+/// assembly serves a signed request.
+#[tokio::test]
+async fn n_the_production_assembly_refuses_a_token_request_until_authorisation_is_decided() {
+    let fixture = assemble_with_iam_policy_source();
+    let response = fixture
+        .exchange(established_as(proof(USER_ID, NOW + 60).await, token_request()))
+        .await;
+    assert_refused_before_anything_ran(&fixture, &response, "a token request");
+    assert_eq!(fixture.key_lookups(), 0, "IAM was asked about a Keystone principal's name");
+    assert_eq!(fixture.exchange(signed()).await.status(), http::StatusCode::OK, "the control");
 }

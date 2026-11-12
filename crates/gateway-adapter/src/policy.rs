@@ -581,6 +581,7 @@ mod tests {
         );
         let as_user = principal_of(&user_spelled_like_it, &access_key).await;
         assert!(payload(&as_user).kind() == PrincipalKind::User, "the control: an IAM user");
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 1, "the control: an access key is looked up");
     }
 
     /// Negative — a principal IAM no longer knows is refused as unknown, not as unavailable and
