@@ -64,20 +64,11 @@
 //! # What may not reach a record
 //!
 //! The record is built field by field from the event's `action`, `bucket`, `key`, `request_id`,
-//! `decision` and the verified identity's name and origin. Nothing is copied from `resources`,
+//! `decision` and the verified identity's access key id. Nothing is copied from `resources`,
 //! `subject`, `auth_scheme`, a version id or a copy-source identity, and nothing is formatted from a
-//! `Debug` implementation. The event carries no secret key, session token, Keystone token or
-//! signature.
-//!
-//! # Whose name it is
-//!
-//! `access_key` alone does not say who was refused: a Keystone principal's name can be spelled
-//! exactly like an access key. The gateway keeps the difference in the identity's origin and
-//! nowhere else, so the record carries that origin beside the name
-//! ([`GatewayDenialRecord::identity_origin`]). It is read from the identity itself, never inferred
-//! from the name's spelling or from the authentication scheme.
+//! `Debug` implementation. The event carries no secret key, session token or signature.
 
-use rustfs_gateway::{AuthzAuditEvent, AuthzAuditSink, AuthzStage, Decision, Identity, IdentityOrigin};
+use rustfs_gateway::{AuthzAuditEvent, AuthzAuditSink, AuthzStage, Decision};
 
 /// `tags.denialReason` of a `Deny` the gateway enforced. The event carries the decision, not one of
 /// the legacy reasons (`iam_explicit_deny`, `no_policy_allows_action`, ...).
@@ -116,14 +107,8 @@ pub struct GatewayDenialRecord {
     pub object: Option<String>,
     /// `requestID`: the identifier the caller received.
     pub request_id: String,
-    /// `accessKey`: the verified caller; `None` for an anonymous caller, as legacy omits it. For a
-    /// Keystone caller it is `keystone:<user_id>`, and [`Self::identity_origin`] says so.
+    /// `accessKey`: the verified caller; `None` for an anonymous caller, as legacy omits it.
     pub access_key: Option<String>,
-    /// How the name in [`Self::access_key`] was established; `None` exactly when that is `None`.
-    /// `IdentityOrigin::HostToken` is a principal the Keystone verifier reported, which is not the
-    /// access key of the same spelling. A sink that writes the name must write this with it, or it
-    /// records two principals as one.
-    pub identity_origin: Option<IdentityOrigin>,
     /// `tags.denialReason`: [`DENY_REASON`] or [`INDETERMINATE_REASON`].
     pub denial_reason: &'static str,
     /// `tags.suppressedDenials`, from [`DenialAdmission::Emit`].
@@ -191,7 +176,6 @@ impl<S: DenialAuditSink> AuthzAuditSink for RustfsAuthzAudit<S> {
             object: event.key.map(|key| key.as_str().to_owned()),
             request_id: event.request_id.as_str().to_owned(),
             access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
-            identity_origin: event.identity.map(Identity::origin),
             denial_reason,
             suppressed_denials: suppressed,
         });
@@ -401,7 +385,6 @@ mod tests {
             object: Some(KEY.to_owned()),
             request_id: RequestId::from_bits(0x5EED).as_str().to_owned(),
             access_key: access_key.map(str::to_owned),
-            identity_origin: access_key.map(|_| IdentityOrigin::AccessKey),
             denial_reason,
             suppressed_denials,
         }
@@ -501,45 +484,6 @@ mod tests {
             [expected(DENY_REASON, None, 0), expected(DENY_REASON, Some(ACCESS_KEY), 0)]
         );
         assert_eq!(audit.sink.limiter_asked(), [true, false]);
-    }
-
-    /// The one record a route-stage denial of `identity` under `scheme` leaves.
-    fn denial_of(f: &Fixture, identity: &Identity, scheme: AuthSchemeRef) -> GatewayDenialRecord {
-        let audit = RustfsAuthzAudit::new(Probe::open());
-        let asked = [target(f, Some(identity))];
-        audit.on_decision(&AuthzAuditEvent {
-            auth_scheme: scheme,
-            ..event(f, AuthzStage::Route, Decision::Deny, &asked, Some(identity))
-        });
-        audit.sink.records().pop().expect("the denial was recorded")
-    }
-
-    /// Positive and negative — a refused Keystone principal is recorded under its name and with
-    /// its origin, and the access key spelled exactly like it as an access key, so the sink does
-    /// not write two principals as one. The origin is the identity's own under every scheme the
-    /// event names: it is not inferred from the scheme or from the spelling.
-    #[tokio::test]
-    async fn p_a_keystone_refusal_is_recorded_with_its_origin() {
-        let keystone = crate::keystone::fixture::host_token_identity("user-0001").await;
-        let spelled_like_it = Identity::new(keystone.access_key_id()).expect("a legal access key");
-        let f = fixture();
-        for scheme in [
-            AuthSchemeRef::HeaderToken,
-            AuthSchemeRef::SigV4Header,
-            AuthSchemeRef::Anonymous,
-        ] {
-            for (identity, origin) in [
-                (&keystone, IdentityOrigin::HostToken),
-                (&spelled_like_it, IdentityOrigin::AccessKey),
-            ] {
-                let record = denial_of(&f, identity, scheme);
-                assert_eq!(
-                    (record.access_key.as_deref(), record.identity_origin),
-                    (Some("keystone:user-0001"), Some(origin)),
-                    "{scheme:?}"
-                );
-            }
-        }
     }
 
     /// Negative — values planted in the event's `resources`, version ids, subject, auth scheme,

@@ -36,8 +36,7 @@ pub use bucket_owner::{BucketLookup, OwnerLookupError, RustfsBucketOwners};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
 pub use host::rustfs_host_resolver;
 pub use keystone::{
-    KeystoneCaller, KeystoneCallerRefused, KeystoneEstablished, KeystoneNotEstablished, KeystoneVerifier,
-    establish_keystone_identity, keystone_header_token_claim,
+    KeystoneEstablished, KeystoneNotEstablished, KeystoneVerifier, establish_keystone_identity, keystone_header_token_claim,
 };
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
 pub use root::{MIN_SECRET_KEY_LEN, RootCredentials, RootCredentialsError, RootSource};

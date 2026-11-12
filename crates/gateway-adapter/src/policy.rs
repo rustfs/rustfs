@@ -23,17 +23,6 @@
 //! Upstream: the gateway's verified [`Identity`]. Downstream: the RustFS authorizer, which reads
 //! the payload back with `PolicySnapshot::get::<RustfsPrincipal>()`.
 //!
-//! # Keystone callers
-//!
-//! The gateway marks where a principal's name came from. A name the Keystone verifier reported
-//! (`IdentityOrigin::HostToken`) is not an access key, whatever it spells, so this source branches
-//! on the origin before anything else: such a name is never compared with the root access key and
-//! never looked up in IAM. Its snapshot holds no [`RustfsPrincipal`]. The gateway hands a policy
-//! source the identity alone, and a Keystone token's roles belong to the token, not to the user
-//! id: two tokens of one user can carry different roles, so facts looked up by the name would let
-//! one token answer for another. The facts are read from the request the decision is about
-//! ([`crate::KeystoneCaller::principal`]).
-//!
 //! # Failure classes
 //!
 //! Every refusal is a [`PolicyError`] with a constant label and nothing from IAM or the request:
@@ -42,7 +31,8 @@
 //! disabled one, or one whose secret fails the effective-length rule, is
 //! [`DISABLED_PRINCIPAL`]; an identity
 //! whose credential kind disagrees with IAM's record is [`SESSION_MISMATCH`]; a token whose claims
-//! cannot be read is [`PolicyError::malformed`]. None of them is ever an empty snapshot: an empty
+//! cannot be read is [`PolicyError::malformed`]; a principal a host verifier reported is
+//! [`HOST_TOKEN_PRINCIPAL`]. None of them is ever an empty snapshot: an empty
 //! snapshot is what an anonymous caller gets, and answering a fault with it would judge an
 //! authenticated caller as anonymous.
 //!
@@ -76,6 +66,10 @@ pub const DISABLED_PRINCIPAL: &str = "disabled-principal";
 /// [`PolicyError`] label: the identity's credential kind (session or long-term) disagrees with
 /// what IAM holds for its access key.
 pub const SESSION_MISMATCH: &str = "session-mismatch";
+/// [`PolicyError`] label: a principal a host verifier reported (`IdentityOrigin::HostToken`). It
+/// is not an access key, so it is never compared with root or looked up in IAM; how such a
+/// principal is authorised is not decided yet, so it is refused.
+pub const HOST_TOKEN_PRINCIPAL: &str = "host-token-principal";
 
 /// The narrow slice of IAM a policy reading needs, on top of [`IamKeyLookup`].
 ///
@@ -103,16 +97,7 @@ pub enum PrincipalKind {
     ServiceAccount,
     /// An STS temporary credential, acting for its parent user.
     Temporary,
-    /// The user of a validated Keystone token. No IAM record stands behind it:
-    /// [`crate::KeystoneCaller::principal`] builds its facts from the request, and
-    /// [`IamPolicySource`] never produces this kind.
-    Keystone,
 }
-
-/// The whole policy snapshot of a Keystone caller. Not a [`RustfsPrincipal`], so an authorizer
-/// that reads one from the snapshot finds none and cannot judge the caller without its roles; and
-/// not the empty snapshot, which is an anonymous caller's.
-struct KeystoneMarker;
 
 /// The caller's IAM facts: the payload of every [`PolicySnapshot`] [`IamPolicySource`] produces.
 ///
@@ -173,32 +158,10 @@ impl RustfsPrincipal {
     }
 
     /// Whether the caller owns the deployment (IAM `Args::is_owner`): root, or a credential of
-    /// root that no session policy or external OIDC identity narrows. For a Keystone caller, a
-    /// token that carries the `admin` or the `reseller_admin` role.
+    /// root that no session policy or external OIDC identity narrows.
     #[must_use]
     pub fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// The facts of a Keystone caller; see [`crate::KeystoneCaller::principal`], its only caller.
-    pub(crate) fn keystone(
-        account: &str,
-        username: &str,
-        roles: Option<Vec<String>>,
-        group_memberships: Vec<String>,
-        claims: HashMap<String, Value>,
-        is_owner: bool,
-    ) -> Self {
-        Self {
-            kind: PrincipalKind::Keystone,
-            account: account.to_owned(),
-            username: username.to_owned(),
-            parent_user: username.to_owned(),
-            credential_groups: roles,
-            group_memberships,
-            claims: Some(claims),
-            is_owner,
-        }
     }
 }
 
@@ -220,14 +183,9 @@ impl IamPolicySource {
         let Some(identity) = identity else {
             return Ok(PolicySnapshot::empty());
         };
-        // Before anything else: a host-reported name is not an access key, whatever it spells, so
-        // it must reach neither the root comparison nor the IAM lookup below.
         match identity.origin() {
-            IdentityOrigin::AccessKey => {
-                let principal = self.principal(identity).await?;
-                Ok(PolicySnapshot::of(Arc::new(principal)))
-            }
-            IdentityOrigin::HostToken => Ok(PolicySnapshot::of(Arc::new(KeystoneMarker))),
+            IdentityOrigin::AccessKey => Ok(PolicySnapshot::of(Arc::new(self.principal(identity).await?))),
+            IdentityOrigin::HostToken => Err(PolicyError::because(HOST_TOKEN_PRINCIPAL)),
         }
     }
 
@@ -284,10 +242,9 @@ impl IamPolicySource {
         }
 
         let claims = read_claims(kind, &cred, &root)?;
-        // Neither root nor a Keystone caller has an IAM record, so `kind` is neither here.
         let username = match kind {
             PrincipalKind::Temporary | PrincipalKind::ServiceAccount => cred.parent_user.clone(),
-            PrincipalKind::Root | PrincipalKind::User | PrincipalKind::Keystone => cred.access_key.clone(),
+            PrincipalKind::Root | PrincipalKind::User => cred.access_key.clone(),
         };
         let membership_subject = if username.is_empty() { access_key } else { username.as_str() };
         let group_memberships = self.iam.group_memberships(membership_subject);
@@ -324,7 +281,7 @@ fn read_claims(
         }
         PrincipalKind::Temporary => get_claims_from_token_with_secret(&cred.session_token, root.sts_signing_key())
             .map_err(|_| PolicyError::malformed())?,
-        PrincipalKind::Root | PrincipalKind::User | PrincipalKind::Keystone => return Ok(None),
+        PrincipalKind::Root | PrincipalKind::User => return Ok(None),
     };
     Ok(if claims.is_empty() { None } else { Some(claims) })
 }
@@ -358,7 +315,6 @@ impl PolicySource for IamPolicySource {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::keystone::fixture::host_token_identity;
     use crate::root::RootCell;
     use rustfs_credentials::{Credentials as IamCredential, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_gateway::SessionBinding;
@@ -601,6 +557,32 @@ mod tests {
         }
     }
 
+    /// Negative — a principal the host verifier reported is refused before root and IAM, although
+    /// the root access key and an IAM user are both spelled exactly like it; the access key of
+    /// that spelling is root to the one source and an IAM user to the other.
+    #[tokio::test]
+    async fn policy_host_token_principal_is_refused_without_lookup() {
+        let keystone = crate::keystone::fixture::host_token_identity("rootlike").await;
+        let spelling = keystone.access_key_id();
+        let iam = fake(true, || found(user()));
+        let root = RootCredentials::new(spelling, ROOT_SECRET, SIGNING_KEY).expect("valid root credentials");
+        let root_spelled_like_it = IamPolicySource::new(iam.clone(), Arc::new(RootCell::new(Some(root))));
+        let user_spelled_like_it = source(iam.clone());
+        for policy_source in [&root_spelled_like_it, &user_spelled_like_it] {
+            let error = refusal(policy_source.snapshot(Some(&keystone)).await);
+            assert_eq!(error, PolicyError::because(HOST_TOKEN_PRINCIPAL));
+        }
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 0, "IAM was asked about a host-reported name");
+
+        let access_key = long_term(spelling);
+        assert!(
+            payload(&principal_of(&root_spelled_like_it, &access_key).await).is_owner(),
+            "the control: root"
+        );
+        let as_user = principal_of(&user_spelled_like_it, &access_key).await;
+        assert!(payload(&as_user).kind() == PrincipalKind::User, "the control: an IAM user");
+    }
+
     /// Negative — a principal IAM no longer knows is refused as unknown, not as unavailable and
     /// not as an empty snapshot.
     #[tokio::test]
@@ -807,41 +789,6 @@ mod tests {
                 PolicyError::unavailable()
             );
         }
-    }
-
-    /// Negative — a principal the Keystone verifier reported is given no facts by this source,
-    /// whatever its name spells: its snapshot holds no `RustfsPrincipal` and is not the empty
-    /// snapshot an anonymous caller gets, IAM is not asked although it holds a user under every
-    /// name, and the name is not root although the root access key is spelled exactly like it. The
-    /// access key of that spelling is root to the one source and an IAM user to the other.
-    #[tokio::test]
-    async fn policy_keystone_principal_is_neither_looked_up_nor_root() {
-        const SPELLING: &str = "keystone:rootlike";
-        let keystone = host_token_identity("rootlike").await;
-        assert_eq!((keystone.access_key_id(), keystone.origin()), (SPELLING, IdentityOrigin::HostToken));
-        let root = RootCredentials::new(SPELLING, ROOT_SECRET, SIGNING_KEY).expect("valid root credentials");
-        let iam = fake(true, || found(user()));
-        let root_spelled_like_it = IamPolicySource::new(iam.clone(), Arc::new(RootCell::new(Some(root))));
-        let user_spelled_like_it = source(iam.clone());
-
-        for policy_source in [&root_spelled_like_it, &user_spelled_like_it] {
-            let snapshot = principal_of(policy_source, &keystone).await;
-            assert!(!snapshot.is_empty(), "a Keystone caller was given an anonymous caller's snapshot");
-            assert!(
-                snapshot.get::<RustfsPrincipal>().is_none(),
-                "a Keystone principal was read as an access key"
-            );
-        }
-        assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
-
-        let access_key = long_term(SPELLING);
-        assert!(
-            payload(&principal_of(&root_spelled_like_it, &access_key).await).is_owner(),
-            "the control: root"
-        );
-        let as_user = principal_of(&user_spelled_like_it, &access_key).await;
-        assert!(payload(&as_user).kind() == PrincipalKind::User, "the control: an IAM user");
-        assert_eq!(iam.calls.load(Ordering::SeqCst), 1);
     }
 
     /// Positive — `install` builds the authenticator exactly once, over a provider that reads the
