@@ -29,7 +29,7 @@ use crate::runtime::sources::{
 use crate::{
     disk::{
         DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET, error::DiskError,
-        format::FormatV3, new_disk,
+        format::FormatV3,
     },
     layout::endpoints::Endpoints,
 };
@@ -74,7 +74,7 @@ pub async fn init_disks(
                 let result = if endpoint.is_local {
                     prepare_local_disk(instance_ctx, endpoint, previous.clone(), opt).await
                 } else {
-                    new_disk(endpoint, opt).await
+                    crate::disk::new_disk_for_instance(instance_ctx, endpoint, opt).await
                 };
                 (index, endpoint, was_registered, previous, result)
             }
