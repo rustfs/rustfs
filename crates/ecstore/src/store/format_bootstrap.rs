@@ -19,13 +19,12 @@ use super::init_format::{
 use crate::disk::{DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError, format::FormatV3};
 use crate::error::{Error, Result};
 use crate::runtime::instance::InstanceContext;
-use bytes::Bytes;
 use futures::{StreamExt, future::join_all, stream};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::disk::FORMAT_BOOTSTRAP_DONE_FILE;
 pub(super) use crate::disk::FORMAT_BOOTSTRAP_FILE;
-const FORMAT_BOOTSTRAP_DONE_FILE: &str = "format.json.bootstrap.done";
 const FORMAT_BOOTSTRAP_READ_CONCURRENCY: usize = 16;
 
 /// Establishes restartable creator authority before any format is published.
@@ -38,10 +37,7 @@ pub(super) async fn write_format_bootstrap_intents(disks: &[Option<DiskStore>], 
     let writes = disks.iter().zip(formats).map(|(disk, format)| async move {
         let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
         let format = format.as_ref().ok_or(DiskError::CorruptedFormat)?;
-        let temporary = Uuid::new_v4().to_string();
-        disk.write_all(RUSTFS_META_BUCKET, &temporary, format.to_json()?.into_bytes().into())
-            .await?;
-        disk.rename_file_durable(RUSTFS_META_BUCKET, &temporary, RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE)
+        disk.write_format_control(FORMAT_BOOTSTRAP_FILE, format.to_json()?.into_bytes().into())
             .await
     });
     for result in join_all(writes).await {
@@ -71,8 +67,20 @@ pub(super) async fn resume_format_bootstrap(
     }
 
     let max_bytes = legacy_format_max_bytes(disks.len())?;
+    let Some(first) = disks.first().and_then(Option::as_ref) else {
+        return Ok(None);
+    };
+    let first_intent = async {
+        let reader = first.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await?;
+        let data = read_legacy_format_bytes(reader, max_bytes).await?;
+        FormatV3::try_from(data.as_slice()).map_err(DiskError::from)
+    }
+    .await;
+    let Ok(first_intent) = first_intent else {
+        return Ok(None);
+    };
     let intents = {
-        let reads = stream::iter(disks.iter().cloned().enumerate().map(|(index, disk)| async move {
+        let reads = stream::iter(disks.iter().cloned().enumerate().skip(1).map(|(index, disk)| async move {
             let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
             let reader = disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await?;
             let data = read_legacy_format_bytes(reader, max_bytes).await?;
@@ -82,6 +90,7 @@ pub(super) async fn resume_format_bootstrap(
         .buffer_unordered(FORMAT_BOOTSTRAP_READ_CONCURRENCY);
         tokio::pin!(reads);
         let mut intents = vec![None; disks.len()];
+        intents[0] = Some(first_intent);
         while let Some(result) = reads.next().await {
             let Ok((index, format)) = result else {
                 return Ok(None);
@@ -137,70 +146,22 @@ pub(super) async fn resume_format_bootstrap(
     Ok(Some(format))
 }
 
-// Publish through a random staging name so completion never follows an
-// existing leaf symlink. The strict write and durable rename synchronize the
-// same directory whose intent absence was just observed.
-async fn seal_format_bootstrap_absence(disk: &DiskStore) -> crate::disk::error::Result<()> {
-    let temporary = Uuid::new_v4().to_string();
-    disk.write_all(RUSTFS_META_BUCKET, &temporary, Bytes::new()).await?;
-    disk.rename_file_durable(RUSTFS_META_BUCKET, &temporary, RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_DONE_FILE)
-        .await
-}
-
-/// Retires creator authority after the initialized identity and committed
-/// metadata are durable. A completed rename or synchronized completion marker
-/// makes the incomplete intent set durable before any node is allowed to serve.
-pub(super) async fn clear_format_bootstrap_intents(disks: &[Option<DiskStore>]) -> Result<()> {
-    let retirements = disks.iter().map(|disk| async move {
-        let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+/// Consumes this pool's creator authority before initialized identity publication.
+/// Replay requires every intent, so one durably absent slot is sufficient. Each
+/// attempt finishes before another begins, including its directory-sync barrier.
+pub(super) async fn retire_format_bootstrap_authority(disks: &[Option<DiskStore>]) -> Result<()> {
+    let first = disks.first().and_then(Option::as_ref).into_iter();
+    let local = disks.iter().skip(1).flatten().filter(|disk| disk.is_local());
+    let remote = disks.iter().skip(1).flatten().filter(|disk| !disk.is_local());
+    let mut failure = DiskError::DiskNotFound;
+    for disk in first.chain(local).chain(remote) {
         match disk
             .rename_file_durable(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE, RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_DONE_FILE)
             .await
         {
-            Ok(()) => Ok(()),
-            Err(DiskError::FileNotFound) => seal_format_bootstrap_absence(disk).await,
-            Err(error) => Err(error),
-        }
-    });
-    let mut consumed = false;
-    let mut failure = None;
-    for result in join_all(retirements).await {
-        match result {
-            Ok(()) => consumed = true,
-            Err(error) => {
-                failure.get_or_insert(error);
-            }
+            Ok(()) => return Ok(()),
+            Err(error) => failure = error,
         }
     }
-    if !consumed {
-        return Err(failure.map_or(Error::CorruptedFormat, Into::into));
-    }
-    Ok(())
-}
-
-/// Synchronizing a completion marker after observing intent absence proves
-/// that this pool cannot replay a complete intent after a crash. An absence
-/// observed during an in-flight rename alone supplies no durability proof.
-pub(super) async fn ensure_format_bootstrap_consumed(disks: &[Option<DiskStore>]) -> Result<()> {
-    let reads = stream::iter(disks.iter().flatten().cloned().map(|disk| async move {
-        let absent = matches!(
-            disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await,
-            Err(DiskError::FileNotFound)
-        );
-        absent.then_some(disk)
-    }))
-    .buffer_unordered(FORMAT_BOOTSTRAP_READ_CONCURRENCY);
-    tokio::pin!(reads);
-    // Race only reads. Complete one sealing mutation before trying another
-    // candidate so successful startup never cancels sibling staged writes.
-    while let Some(candidate) = reads.next().await {
-        if let Some(disk) = candidate
-            && seal_format_bootstrap_absence(&disk).await.is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err(Error::other(
-        "pool metadata bootstrap pending: waiting for durable format bootstrap intent retirement",
-    ))
+    Err(failure.into())
 }

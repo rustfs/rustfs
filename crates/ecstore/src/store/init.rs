@@ -235,7 +235,22 @@ async fn persist_pool_meta_for_startup_if_safe<S>(
 where
     S: EcstoreObjectIO,
 {
-    persist_pool_meta_for_startup_guarded(meta, pools, replica_state, write_state, topology_update, elected_writer, None).await
+    let mut retirement = std::pin::pin!(std::future::ready(Ok(())));
+    if write_state.startup_identity_precedes_metadata_write() {
+        complete_pool_meta_for_startup(pools.clone(), write_state, elected_writer, None, retirement.as_mut()).await?;
+    }
+    let committed = persist_pool_meta_for_startup_guarded(
+        meta,
+        pools.clone(),
+        replica_state,
+        write_state,
+        topology_update,
+        elected_writer,
+        None,
+    )
+    .await?;
+    complete_pool_meta_for_startup(pools, write_state, elected_writer, None, retirement.as_mut()).await?;
+    Ok(committed)
 }
 
 async fn persist_pool_meta_for_startup_guarded<S>(
@@ -251,6 +266,11 @@ where
     S: EcstoreObjectIO,
 {
     if !elected_writer {
+        if topology_update {
+            return Err(Error::other(
+                "pool metadata bootstrap pending: waiting for the elected writer to commit the configured topology",
+            ));
+        }
         return Ok(meta.clone());
     }
     let should_write = topology_update || (replica_state.needs_repair && replica_state.repair_write_safe);
@@ -275,12 +295,30 @@ where
             None => save_validated_pool_meta_for_startup(meta, pools.clone(), write_state).await?,
         };
     }
-    if should_write || write_state.identity_requires_repair() {
-        persist_startup_identity_with_guard(pools, write_state, true, writer.as_ref())
+    Ok(committed)
+}
+
+async fn complete_pool_meta_for_startup<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    elected_writer: bool,
+    writer: Option<&Arc<rustfs_lock::NamespaceLockGuard>>,
+    before_identity_commit: impl Future<Output = Result<()>>,
+) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    if elected_writer && write_state.identity_requires_repair() {
+        write_state.ensure_write_safe("store init failed during prepare_pool_meta_identity")?;
+        // A committed predecessor or initial metadata commit makes retirement
+        // recoverable. Every node requires the committed configured topology
+        // and complete initialized identity before publication.
+        before_identity_commit.await?;
+        persist_startup_identity_with_guard(pools, write_state, true, writer)
             .await
             .map_err(|err| Error::other(format!("store init failed during commit_pool_meta_identity: {err}")))?;
     }
-    Ok(committed)
+    write_state.ensure_startup_identity_initialized()
 }
 
 async fn run_local_decommission_watchdog<F, Fut, W, Wait>(rx: CancellationToken, mut reconcile: F, mut wait_for_fleet_proof: W)
@@ -797,34 +835,52 @@ impl ECStore {
         // distributed startup can race on the same lock and replay the prior init bug.
         {
             let write_state = &mut *startup_write_state;
-            let persist = persist_pool_meta_for_startup_guarded(
-                &installed_pool_meta,
-                self.pools.clone(),
-                pool_meta_replica_state,
-                write_state,
-                update,
-                should_persist_pool_meta,
-                startup_pool_meta_guard.clone(),
-            );
+            let persist = async {
+                let mut retirement = std::pin::pin!(async {
+                    for pool in &self.pools {
+                        let mut disks = Vec::with_capacity(pool.set_count * pool.set_drive_count);
+                        for set in &pool.disk_set {
+                            disks.extend(set.disk_inventory().await);
+                        }
+                        super::format_bootstrap::retire_format_bootstrap_authority(&disks).await?;
+                    }
+                    Ok(())
+                });
+                if write_state.startup_identity_precedes_metadata_write() {
+                    complete_pool_meta_for_startup(
+                        self.pools.clone(),
+                        write_state,
+                        should_persist_pool_meta,
+                        startup_pool_meta_guard.as_ref(),
+                        retirement.as_mut(),
+                    )
+                    .await?;
+                }
+                let committed = persist_pool_meta_for_startup_guarded(
+                    &installed_pool_meta,
+                    self.pools.clone(),
+                    pool_meta_replica_state,
+                    write_state,
+                    update,
+                    should_persist_pool_meta,
+                    startup_pool_meta_guard.clone(),
+                )
+                .await?;
+                complete_pool_meta_for_startup(
+                    self.pools.clone(),
+                    write_state,
+                    should_persist_pool_meta,
+                    startup_pool_meta_guard.as_ref(),
+                    retirement.as_mut(),
+                )
+                .await?;
+                Ok::<_, Error>(committed)
+            };
             #[cfg(feature = "e2e-test-hooks")]
             let persist = crate::core::pools::startup_cas_test_scope(startup_attempt, "persist", &self.pools, persist);
             installed_pool_meta = persist.await?;
         }
 
-        // Retire durable creator authority under the metadata writer fence before
-        // any node can serve or launch background mutations. Followers wait until
-        // every pool's complete intent set has been broken by the elected writer.
-        for pool in &self.pools {
-            let mut disks = Vec::with_capacity(pool.set_count * pool.set_drive_count);
-            for set in &pool.disk_set {
-                disks.extend(set.disk_inventory().await);
-            }
-            if should_persist_pool_meta {
-                super::format_bootstrap::clear_format_bootstrap_intents(&disks).await?;
-            } else {
-                super::format_bootstrap::ensure_format_bootstrap_consumed(&disks).await?;
-            }
-        }
         if startup_pool_meta_guard
             .as_ref()
             .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
@@ -1002,11 +1058,12 @@ mod tests {
     include!("init/multipart_copy_heal_tests.rs");
     use super::{
         LOCAL_DECOMMISSION_RESUME_RETRY_DELAY, LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY, PoolMetaWriteState,
-        establish_pool_meta_bootstrap_identity_if_proven, load_pool_meta_for_startup, local_decommission_watchdog_retry_delay,
-        persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local, pool_meta_has_active_decommission,
-        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
-        run_local_decommission_watchdog, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_defer_rebalance_auto_start, should_retry_format_load, wait_for_local_decommission_resume_delay,
+        complete_pool_meta_for_startup, establish_pool_meta_bootstrap_identity_if_proven, load_pool_meta_for_startup,
+        local_decommission_watchdog_retry_delay, persist_pool_meta_for_startup_guarded, persist_pool_meta_for_startup_if_safe,
+        pool_first_endpoint_is_local, pool_meta_has_active_decommission, preflight_startup_rpc_secret_with,
+        resolve_startup_pool_defaults_with, resolve_store_init_stage_result, run_local_decommission_watchdog,
+        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init, should_defer_rebalance_auto_start,
+        should_retry_format_load, wait_for_local_decommission_resume_delay,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::core::pools::PoolMetaBootstrapAuthority;
@@ -1584,6 +1641,184 @@ mod tests {
             .await
             .expect_err("wiping pool metadata after the crash must require recovery");
         assert!(err.to_string().contains("initialized cluster identity exists"));
+        restarted
+            .ensure_write_safe("metadata erased after failed identity repair")
+            .expect_err("metadata loss cannot recreate creator authority");
+    }
+
+    #[tokio::test]
+    async fn test_startup_identity_publication_waits_for_bootstrap_retirement() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let pools = vec![storage.clone()];
+        let mut state = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut state, true)
+            .await
+            .expect("persist initial pending identity");
+        let (_, replicas) = load_pool_meta_for_startup(pools.clone(), &mut state)
+            .await
+            .expect("load fresh bootstrap state");
+        persist_pool_meta_for_startup_guarded(&init_test_pool_meta(None), pools.clone(), replicas, &mut state, true, true, None)
+            .await
+            .expect("commit initial pool metadata before consuming creator authority");
+        let identity_writes = storage.identity_write_attempts.load(Ordering::SeqCst);
+
+        complete_pool_meta_for_startup(pools.clone(), &mut state, true, None, async {
+            let objects = storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let metadata = objects
+                .get(POOL_META_NAME)
+                .expect("committed metadata must precede retirement");
+            assert_eq!(
+                pool_meta_v3_commit_state_for_test(metadata.0.clone()).expect("decode committed metadata"),
+                (1, true)
+            );
+            let identity = objects
+                .get(POOL_META_IDENTITY_NAME)
+                .expect("pending identity must remain available");
+            assert!(
+                !pool_meta_identity_initialized_for_test(&identity.0).expect("decode pending identity"),
+                "initialized publication must follow durable retirement"
+            );
+            Err(Error::Timeout)
+        })
+        .await
+        .expect_err("failed retirement must prevent initialized identity publication");
+        assert_eq!(storage.identity_write_attempts.load(Ordering::SeqCst), identity_writes);
+        state
+            .ensure_startup_identity_initialized()
+            .expect_err("a failed retirement must keep startup unpublished");
+
+        // Restarting after retirement failed reuses the committed metadata,
+        // without requiring the formatter's process-local bootstrap proof.
+        let mut restarted = PoolMetaWriteState::for_startup(deployment_id, false);
+        load_pool_meta_for_startup(pools.clone(), &mut restarted)
+            .await
+            .expect("committed metadata authorizes the retry");
+        complete_pool_meta_for_startup(pools, &mut restarted, true, None, std::future::ready(Ok(())))
+            .await
+            .expect("successful retirement permits initialized identity publication");
+        assert!(storage.identity_write_attempts.load(Ordering::SeqCst) > identity_writes);
+        restarted
+            .ensure_startup_identity_initialized()
+            .expect("completed initialization permits startup");
+    }
+
+    #[tokio::test]
+    async fn test_startup_followers_wait_for_initialized_identity_on_every_pool() {
+        let deployment_id = Uuid::new_v4();
+        let initialized = initialized_pool_meta_identity_for_test(deployment_id, 1).expect("encode initialized identity");
+        let pending = pending_pool_meta_identity_for_test(deployment_id, 1, Uuid::new_v4()).expect("encode pending identity");
+        for incomplete in [None, Some(pending), Some(vec![0, 1, 2])] {
+            let payload = startup_pool_meta_payload(&init_test_pool_meta(None));
+            let first = Arc::new(StartupPoolMetaStorage::new(payload.clone()));
+            let second = Arc::new(StartupPoolMetaStorage::new(payload));
+            first
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(POOL_META_IDENTITY_NAME.to_owned(), (initialized.clone(), "identity-0".to_owned()));
+            if let Some(identity) = incomplete {
+                second
+                    .objects
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(POOL_META_IDENTITY_NAME.to_owned(), (identity, "identity-1".to_owned()));
+            }
+            let pools = vec![first.clone(), second.clone()];
+            let mut state = PoolMetaWriteState::for_startup(deployment_id, false);
+            load_pool_meta_for_startup(pools.clone(), &mut state)
+                .await
+                .expect("a readable committed snapshot can await identity convergence");
+            complete_pool_meta_for_startup(pools.clone(), &mut state, false, None, async {
+                panic!("a follower must never execute intent retirement")
+            })
+            .await
+            .expect_err("an initialized replica cannot hide another pool's incomplete identity");
+            state
+                .ensure_write_safe("follower bootstrap retry")
+                .expect("waiting must remain retryable");
+
+            second
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(POOL_META_IDENTITY_NAME.to_owned(), (initialized.clone(), "identity-1-ready".to_owned()));
+            load_pool_meta_for_startup(pools.clone(), &mut state)
+                .await
+                .expect("observe initialized identity on every pool");
+            for elected_writer in [false, true] {
+                complete_pool_meta_for_startup(pools.clone(), &mut state, elected_writer, None, async {
+                    panic!("established startup must perform no intent retirement I/O")
+                })
+                .await
+                .expect("complete initialized identity permits read-only startup");
+            }
+            assert_eq!(first.identity_write_attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(second.identity_write_attempts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_startup_expansion_retires_before_identity_repair_and_waits_for_topology_commit() {
+        let deployment_id = Uuid::new_v4();
+        let first = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&init_test_pool_meta_with_pools(1))));
+        let second = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        inject_startup_object(
+            &first,
+            POOL_META_IDENTITY_NAME,
+            initialized_pool_meta_identity_for_test(deployment_id, 1).expect("encode predecessor identity"),
+        );
+        let pools = vec![first.clone(), second.clone()];
+        let mut state = PoolMetaWriteState::for_startup(deployment_id, false);
+        let (_, replicas) = load_pool_meta_for_startup(pools.clone(), &mut state)
+            .await
+            .expect("load committed predecessor with a new pool");
+        assert!(state.startup_identity_precedes_metadata_write());
+
+        complete_pool_meta_for_startup(pools.clone(), &mut state, true, None, async { Err(Error::Timeout) })
+            .await
+            .expect_err("failed retirement must stop identity repair before expansion");
+        for pool in &pools {
+            assert_eq!(pool.identity_write_attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(pool.pool_meta_write_attempts.load(Ordering::SeqCst), 0);
+        }
+        complete_pool_meta_for_startup(pools.clone(), &mut state, true, None, async {
+            assert!(startup_object(&second, POOL_META_IDENTITY_NAME).is_none());
+            assert!(startup_object(&first, POOL_META_NAME).is_some());
+            assert!(startup_object(&second, POOL_META_NAME).is_none());
+            Ok(())
+        })
+        .await
+        .expect("retirement authorizes repairing initialized identities from the predecessor");
+        state
+            .ensure_startup_identity_initialized()
+            .expect("every pool identity is repaired before native metadata publication");
+        let expanded = init_test_pool_meta_with_pools(2);
+        let identity_writes = pools
+            .iter()
+            .map(|pool| pool.identity_write_attempts.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        let error = persist_pool_meta_for_startup_guarded(&expanded, pools.clone(), replicas, &mut state, true, false, None)
+            .await
+            .expect_err("a follower cannot publish locally computed expanded topology");
+        assert!(error.to_string().contains("commit the configured topology"));
+        for (pool, identity_writes) in pools.iter().zip(identity_writes) {
+            assert_eq!(pool.identity_write_attempts.load(Ordering::SeqCst), identity_writes);
+            assert_eq!(pool.pool_meta_write_attempts.load(Ordering::SeqCst), 0);
+        }
+        state
+            .ensure_write_safe("waiting for topology commit")
+            .expect("a follower retry must stay writable");
+
+        let committed = persist_pool_meta_for_startup_guarded(&expanded, pools.clone(), replicas, &mut state, true, true, None)
+            .await
+            .expect("the elected writer can commit expansion after identity repair");
+        assert_eq!(committed.pools.len(), 2);
+        complete_pool_meta_for_startup(pools, &mut state, true, None, async {
+            panic!("the completed preflight retirement must not run twice")
+        })
+        .await
+        .expect("completed expansion remains initialized");
     }
 
     #[tokio::test]
@@ -3562,20 +3797,30 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(directory.path(), "interrupted-bootstrap", &[4, 4])).await;
         assert_eq!(store.id, deployment_id);
         for (pool, expected) in store.pools.iter().zip(&plans) {
+            let mut retired = 0;
             for set in &pool.disk_set {
                 let disks = set.disk_inventory().await;
                 let (formats, errors) = init_format::load_format_erasure_all(&disks, false).await;
                 assert!(errors.iter().all(Option::is_none), "recovered formats: {errors:?}");
                 assert_eq!(&formats, expected);
                 for disk in disks.iter().flatten() {
-                    assert!(matches!(
+                    if matches!(
                         disk.read_all(RUSTFS_META_BUCKET, "format.json.bootstrap").await,
                         Err(crate::disk::error::DiskError::FileNotFound)
-                    ));
-                    assert!(disk.read_all(RUSTFS_META_BUCKET, "format.json.bootstrap.done").await.is_ok());
+                    ) {
+                        retired += 1;
+                        assert!(disk.read_all(RUSTFS_META_BUCKET, "format.json.bootstrap.done").await.is_ok());
+                    }
                 }
             }
+            assert_eq!(retired, 1, "one durably absent intent consumes each pool's complete creator proof");
         }
+        store
+            .pool_meta_save_gate
+            .read()
+            .await
+            .ensure_startup_identity_initialized()
+            .expect("every pool identity is initialized before publication");
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         store
             .make_bucket("bootstrap-recovered", &MakeBucketOptions::default())

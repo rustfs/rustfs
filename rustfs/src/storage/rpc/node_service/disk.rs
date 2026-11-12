@@ -18,6 +18,7 @@ use crate::storage::storage_api::ecstore_disk::{
     MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
     PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
+    validate_format_control_path,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
@@ -75,6 +76,14 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: Bytes) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.write_local_format_control(disk_ref, path, data).await,
+            Self::Bootstrap(target) => target.write_local_format_control(disk_ref, path, data).await,
+            Self::Unbound => Err(DiskError::DiskNotFound),
+        }
+    }
+
     async fn recover_local_multipart_source(
         &self,
         disk_ref: &str,
@@ -2769,6 +2778,47 @@ impl NodeService {
                 success: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
+        }
+    }
+
+    pub(super) async fn handle_write_format_control(
+        &self,
+        request: Request<WriteFormatControlRequest>,
+    ) -> Result<Response<WriteAllResponse>, Status> {
+        let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("format control request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("format control requires a signed canonical body"))?;
+        validate_format_control_path(&request.get_ref().path)
+            .map_err(|_| Status::invalid_argument("unsupported format control filename"))?;
+        let request = request.into_inner();
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            request.data.len(),
+        );
+        let target = self.local_mutation_target();
+        let result = target
+            .write_local_format_control(&request.disk, &request.path, request.data)
+            .await;
+        match result {
+            Ok(()) => Ok(Response::new(WriteAllResponse {
+                success: true,
+                error: None,
+            })),
+            Err(error) => {
+                metrics
+                    .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+                Ok(Response::new(WriteAllResponse {
+                    success: false,
+                    error: Some(error.into()),
+                }))
+            }
         }
     }
 

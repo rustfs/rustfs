@@ -59,6 +59,20 @@ pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub(crate) const FORMAT_BOOTSTRAP_FILE: &str = "format.json.bootstrap";
+pub(crate) const FORMAT_BOOTSTRAP_DONE_FILE: &str = "format.json.bootstrap.done";
+
+/// Validate an internal format control filename for atomic publication.
+///
+/// # Errors
+/// Returns [`DiskError::MethodNotAllowed`] for every other path.
+pub fn validate_format_control_path(path: &str) -> Result<()> {
+    if matches!(path, FORMAT_CONFIG_FILE | FORMAT_BOOTSTRAP_FILE) {
+        Ok(())
+    } else {
+        Err(DiskError::MethodNotAllowed)
+    }
+}
+
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
@@ -1171,6 +1185,13 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.write_format_control(path, data).await,
+            Disk::Remote(remote_disk) => remote_disk.write_format_control(path, data).await,
+        }
+    }
+
     async fn compare_and_update_file(
         &self,
         volume: &str,
@@ -1906,6 +1927,17 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    /// Atomically publish a validated format control file in the system volume.
+    /// Success requires both the replacement inode and parent entry to be durable.
+    /// Cancellation can leave the replacement published and retries replace the
+    /// same complete payload. Unsupported peers fail before writing any file.
+    ///
+    /// # Errors
+    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations or
+    /// paths, and an I/O error when publication or its durability barrier fails.
+    async fn write_format_control(&self, _path: &str, _data: Bytes) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     /// Atomically replace or remove a small control file only when its current
     /// contents match `expected`. Implementations that cannot provide this
@@ -2861,6 +2893,26 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_control_paths_are_fixed_system_leaf_names() {
+        for path in [super::FORMAT_CONFIG_FILE, super::FORMAT_BOOTSTRAP_FILE] {
+            super::validate_format_control_path(path).expect("allowed format control leaf");
+        }
+        for path in [
+            "",
+            "../format.json",
+            "format.json/",
+            ".rustfs.sys/format.json",
+            "format.json.bootstrap.done",
+            "pool.bin",
+        ] {
+            assert!(matches!(
+                super::validate_format_control_path(path),
+                Err(super::DiskError::MethodNotAllowed)
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]

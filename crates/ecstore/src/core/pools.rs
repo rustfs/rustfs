@@ -6758,6 +6758,27 @@ impl PoolMetaWriteState {
         self.expected_cluster_id.is_some() && (self.identity_needs_repair || self.identity_initialized != Some(true))
     }
 
+    /// A committed predecessor authorizes repairing an established identity
+    /// before the next metadata write. A pending fresh identity must remain
+    /// pending until its initial metadata commit is recoverable.
+    pub(crate) fn startup_identity_precedes_metadata_write(&self) -> bool {
+        !self.pool_meta_absent && !self.identity_is_pending()
+    }
+
+    pub(crate) fn ensure_startup_identity_initialized(&self) -> Result<()> {
+        if self.expected_cluster_id.is_none()
+            || (self.identity_initialized == Some(true)
+                && !self.identity_needs_repair
+                && !self.identity_replicas_missing
+                && !self.identity_replicas_invalid)
+        {
+            return Ok(());
+        }
+        Err(Error::other(
+            "pool metadata bootstrap pending: waiting for the elected writer to initialize the identity on every pool",
+        ))
+    }
+
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
         let (Some(mut context), _) = self.write_block() else {
             return Ok(());
@@ -10145,6 +10166,8 @@ impl PoolMeta {
         self.save_for_startup_observing(pools, &mut write_state).await.map(|_| ())
     }
 
+    /// Commits a complete startup snapshot while leaving identity finalization
+    /// to the caller, after durable format-bootstrap authority is retired.
     pub(crate) async fn save_for_startup_observing<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10159,6 +10182,8 @@ impl PoolMeta {
         Ok(outcome.into_committed())
     }
 
+    /// Commits a complete startup snapshot under the writer fence. The caller
+    /// retires format-bootstrap authority before finalizing initialized identity.
     pub(crate) async fn save_for_startup_guarded<S>(
         &self,
         pools: Vec<Arc<S>>,
@@ -10361,7 +10386,10 @@ impl PoolMeta {
                     selection.revision.epoch, identity.epoch
                 )));
             }
-            if !selection.absent && write_state.identity_requires_repair() {
+            // Full-snapshot saves belong to startup. Their caller retires
+            // durable format authority before publishing initialized identity.
+            // Runtime scoped saves retain their existing identity repair.
+            if indices.is_some() && !selection.absent && write_state.identity_requires_repair() {
                 let initialized = write_state.identity_initialized != Some(false) || selection.revision.is_generation_protocol();
                 persist_pool_meta_identity(
                     pools.clone(),
@@ -10639,7 +10667,10 @@ impl PoolMeta {
             confirmed
         };
         if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
-            persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm).await?;
+            if indices.is_some() {
+                persist_pool_meta_identity(pools, write_state, true, PoolMetaIdentityWriteScope::All, fence, transaction_arm)
+                    .await?;
+            }
             #[cfg(feature = "e2e-test-hooks")]
             startup_cas_test_observe(serde_json::json!({
                 "kind": "confirmed", "object": POOL_META_NAME,

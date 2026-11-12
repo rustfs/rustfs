@@ -240,10 +240,10 @@ async fn bootstrap_intent_retirement_prevents_future_rebootstrap() {
         .await
         .expect("format fresh deployment");
     assert_eq!(first.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::Fresh);
-    clear_format_bootstrap_intents(&disks)
+    retire_format_bootstrap_authority(&disks)
         .await
         .expect("retire authority after committed pool metadata");
-    clear_format_bootstrap_intents(&disks)
+    retire_format_bootstrap_authority(&disks)
         .await
         .expect("authority retirement is idempotent");
     let before = format_snapshot(&disks).await;
@@ -364,39 +364,45 @@ async fn bootstrap_intent_conflicting_existing_format_cannot_be_overwritten() {
 }
 
 #[tokio::test]
-async fn bootstrap_intent_must_be_consumed_before_serving() {
-    let (_directory, disks) = local_disks(4).await;
+async fn bootstrap_intent_retirement_consumes_only_one_slot() {
+    let (_directory, mut disks) = local_disks(4).await;
     let plan = bootstrap_plan();
     write_format_bootstrap_intents(&disks, &plan)
         .await
         .expect("persist complete format intent");
+    write_format_file_all(&disks, &plan)
+        .await
+        .expect("publish every planned format");
+    retire_format_bootstrap_authority(&disks)
+        .await
+        .expect("retire creator authority");
+    retire_format_bootstrap_authority(&disks)
+        .await
+        .expect("repeat retirement after interrupted identity publication");
 
-    ensure_format_bootstrap_consumed(&disks)
+    let mut absent = 0;
+    for disk in disks.iter().flatten() {
+        match disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await {
+            Err(DiskError::FileNotFound) => absent += 1,
+            Ok(_) => {}
+            Err(error) => panic!("read intent after retirement: {error}"),
+        }
+    }
+    assert_eq!(absent, 1, "one consumed slot is sufficient and avoids writes to sibling disks");
+    let loaded = connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut disks, 1, 4, None)
         .await
-        .expect_err("complete fresh authority must block serving from committed pool metadata");
-
-    clear_format_bootstrap_intents(&disks[..1])
-        .await
-        .expect("durably retire one intent replica");
-    ensure_format_bootstrap_consumed(&disks)
-        .await
-        .expect("retiring one replica invalidates complete fresh authority");
-
-    clear_format_bootstrap_intents(&disks)
-        .await
-        .expect("complete retirement after an interruption");
-    clear_format_bootstrap_intents(&disks)
-        .await
-        .expect("completed retirement is idempotent");
-    ensure_format_bootstrap_consumed(&disks)
-        .await
-        .expect("fully retired authority permits serving from committed pool metadata");
+        .expect("load formats after creator authority consumption");
+    assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn bootstrap_intent_consumption_rejects_completion_symlink() {
+async fn bootstrap_intent_retirement_preserves_completion_symlink_target() {
     let (directory, disks) = local_disks(4).await;
+    let plan = bootstrap_plan();
+    write_format_bootstrap_intents(&disks, &plan)
+        .await
+        .expect("persist creator intent");
     let sentinel = directory.path().join("unrelated");
     tokio::fs::write(&sentinel, b"preserve").await.expect("write sentinel");
     let done = disks[0]
@@ -405,42 +411,47 @@ async fn bootstrap_intent_consumption_rejects_completion_symlink() {
         .path()
         .join(RUSTFS_META_BUCKET)
         .join("format.json.bootstrap.done");
-    std::os::unix::fs::symlink(&sentinel, &done).expect("install corrupt completion symlink");
-    ensure_format_bootstrap_consumed(&disks[..1])
+    std::os::unix::fs::symlink(&sentinel, &done).expect("install completion symlink");
+    retire_format_bootstrap_authority(&disks[..1])
         .await
-        .expect_err("a corrupt completion symlink must fail closed");
+        .expect("replace completion entry without following it");
     assert_eq!(tokio::fs::read(&sentinel).await.expect("read sentinel"), b"preserve");
-    assert!(
-        tokio::fs::symlink_metadata(done)
-            .await
-            .expect("completion symlink remains")
-            .file_type()
-            .is_symlink()
-    );
+    assert!(tokio::fs::symlink_metadata(done).await.expect("completion marker").is_file());
 }
 
 #[cfg(all(unix, feature = "test-util"))]
 #[tokio::test]
-async fn bootstrap_intent_absence_requires_successful_directory_sync() {
+async fn bootstrap_intent_retirement_requires_successful_directory_sync() {
     let (_directory, disks) = local_disks(4).await;
-    for disk in disks.iter().flatten() {
-        crate::disk::os::set_local_dir_fsync_failure(disk, RUSTFS_META_BUCKET, "", std::io::ErrorKind::Other)
-            .expect("inject consumption directory-sync failure");
-    }
-    ensure_format_bootstrap_consumed(&disks)
-        .await
-        .expect_err("visible absence cannot authorize serving when every sealing sync fails");
-    ensure_format_bootstrap_consumed(&disks)
-        .await
-        .expect("retry must establish durable absence");
-
     let disk = disks[0].as_ref().expect("fixture disk");
     crate::disk::os::set_local_dir_fsync_failure(disk, RUSTFS_META_BUCKET, "", std::io::ErrorKind::Other)
-        .expect("inject writer retirement retry sync failure");
-    clear_format_bootstrap_intents(&disks[..1])
+        .expect("inject absent-intent directory-sync failure");
+    retire_format_bootstrap_authority(&disks[..1])
         .await
-        .expect_err("writer retries must synchronize an already absent intent");
-    clear_format_bootstrap_intents(&disks[..1])
+        .expect_err("visible absence requires a successful sync");
+    retire_format_bootstrap_authority(&disks[..1])
         .await
-        .expect("writer retirement sync retries safely");
+        .expect("retirement sync retries safely");
+
+    let plan = bootstrap_plan();
+    write_format_bootstrap_intents(&disks, &plan)
+        .await
+        .expect("persist creator intent");
+    crate::disk::os::set_local_dir_fsync_failure(disk, RUSTFS_META_BUCKET, "", std::io::ErrorKind::Other)
+        .expect("inject post-rename directory-sync failure");
+    retire_format_bootstrap_authority(&disks[..1])
+        .await
+        .expect_err("rename visibility cannot replace durability");
+    assert!(matches!(
+        disk.read_file(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await,
+        Err(DiskError::FileNotFound)
+    ));
+    crate::disk::os::set_local_dir_fsync_failure(disk, RUSTFS_META_BUCKET, "", std::io::ErrorKind::Other)
+        .expect("inject retirement retry sync failure");
+    retire_format_bootstrap_authority(&disks[..1])
+        .await
+        .expect_err("retry must repeat the durability barrier");
+    retire_format_bootstrap_authority(&disks[..1])
+        .await
+        .expect("retry consumes authority durably");
 }

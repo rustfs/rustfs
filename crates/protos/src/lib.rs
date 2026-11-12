@@ -1432,6 +1432,20 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+/// Build the signed semantic body for atomic format-control publication.
+///
+/// # Errors
+/// Returns a length conversion error when a field exceeds the canonical wire limit.
+pub fn canonical_write_format_control_request_body(
+    request: &proto_gen::node_service::WriteFormatControlRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-format-control-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_compare_and_update_file_request_body(
     request: &proto_gen::node_service::CompareAndUpdateFileRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -3677,6 +3691,36 @@ mod tests {
 
         fields.sort();
         fields
+    }
+
+    #[test]
+    fn format_control_canonical_body_binds_every_field_and_operation() {
+        use proto_gen::node_service::{WriteAllRequest, WriteFormatControlRequest};
+        let request = WriteFormatControlRequest {
+            disk: "http://node-a:9000/data".into(),
+            path: "format.json.bootstrap".into(),
+            data: vec![1, 2, 3].into(),
+        };
+        let canonical = canonical_write_format_control_request_body(&request).expect("canonical format control");
+        for mutate in [
+            |r: &mut WriteFormatControlRequest| r.disk = "http://node-b:9000/data".into(),
+            |r: &mut WriteFormatControlRequest| r.path = "format.json".into(),
+            |r: &mut WriteFormatControlRequest| r.data = vec![1, 2, 4].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                canonical_write_format_control_request_body(&changed).expect("changed canonical body"),
+                canonical
+            );
+        }
+        let ordinary = WriteAllRequest {
+            disk: request.disk,
+            volume: ".rustfs.sys".into(),
+            path: request.path,
+            data: request.data,
+        };
+        assert_ne!(canonical_write_all_request_body(&ordinary).expect("ordinary canonical body"), canonical);
     }
 
     #[test]

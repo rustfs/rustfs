@@ -7716,7 +7716,7 @@ pub struct LocalDisk {
     /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
     io_format_path: PathBuf,
-    pub format_info: RwLock<FormatInfo>,
+    pub format_info: Arc<RwLock<FormatInfo>>,
     pub endpoint: Endpoint,
     pub disk_info_cache: Arc<Cache<DiskInfo>>,
     pub scanning: Arc<AtomicU32>,
@@ -8266,7 +8266,7 @@ impl LocalDisk {
             endpoint: ep.clone(),
             format_path,
             io_format_path,
-            format_info: RwLock::new(format_info),
+            format_info: Arc::new(RwLock::new(format_info)),
             disk_info_cache: Arc::new(cache),
             scanning: Arc::new(AtomicU32::new(0)),
             rotational: Default::default(),
@@ -11847,6 +11847,88 @@ impl LocalDisk {
         Ok(f)
     }
 
+    async fn retire_format_bootstrap(&self) -> Result<()> {
+        let base = self.io_root().to_path_buf();
+        let parent = base.join(RUSTFS_META_BUCKET);
+        let root = self.publication_root.clone();
+        let backend = Arc::clone(&self.io_backend);
+        self.blocking_queue
+            .run_fsync_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(IoError::new(ErrorKind::Interrupted, "format bootstrap retirement cancelled"));
+                }
+                let invalidate = || {
+                    backend.invalidate_cached_fds_under(RUSTFS_META_BUCKET, super::FORMAT_BOOTSTRAP_FILE);
+                    backend.invalidate_cached_fds_under(RUSTFS_META_BUCKET, super::FORMAT_BOOTSTRAP_DONE_FILE);
+                };
+                invalidate();
+                let retire = || -> std::io::Result<()> {
+                    os::record_native_publication(&parent.join(super::FORMAT_BOOTSTRAP_DONE_FILE));
+                    #[cfg(unix)]
+                    {
+                        use rustix::fs::{Mode, OFlags, openat, renameat};
+
+                        let mut parents = os::pin_multipart_source_directory(&parent, &base, &root)?;
+                        let directory = std::fs::File::from(parents.pop().ok_or(DiskError::InvalidPath)?);
+                        let source = openat(
+                            &directory,
+                            super::FORMAT_BOOTSTRAP_FILE,
+                            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        );
+                        match source {
+                            Ok(source) => {
+                                let source = std::fs::File::from(source);
+                                if !source.metadata()?.is_file() {
+                                    return Err(DiskError::FileCorrupt.into());
+                                }
+                                renameat(
+                                    &directory,
+                                    super::FORMAT_BOOTSTRAP_FILE,
+                                    &directory,
+                                    super::FORMAT_BOOTSTRAP_DONE_FILE,
+                                )?;
+                            }
+                            Err(rustix::io::Errno::NOENT) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        // Retry also synchronizes an already absent source. A visible
+                        // rename whose prior fsync failed grants no durable proof.
+                        os::fsync_directory_handle_std(&parent, Some(&directory))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let source = parent.join(super::FORMAT_BOOTSTRAP_FILE);
+                        let destination = parent.join(super::FORMAT_BOOTSTRAP_DONE_FILE);
+                        let _parents = os::pin_multipart_source_directory(&parent, &base, &root)?;
+                        match std::fs::symlink_metadata(&source) {
+                            Ok(metadata) if !metadata.is_file() => return Err(DiskError::FileCorrupt.into()),
+                            Ok(_) => {}
+                            Err(error) if error.kind() == ErrorKind::NotFound => return os::fsync_dir_std(&parent),
+                            Err(error) => return Err(error),
+                        }
+                        match os::rename_all_with_precondition_and_parent_sync_std(
+                            &source,
+                            &destination,
+                            &base,
+                            &root,
+                            None,
+                            true,
+                        ) {
+                            Err(error) if error.kind() == ErrorKind::NotFound => os::fsync_dir_std(&parent),
+                            result => result,
+                        }
+                    }
+                };
+                let result = retire();
+                invalidate();
+                result
+            })
+            .await
+            .map_err(to_file_error)
+            .map_err(DiskError::from)
+    }
+
     async fn open_format_bootstrap_reader(&self, offset: usize, length: usize) -> Result<FileReader> {
         use tokio::io::AsyncReadExt;
 
@@ -14348,6 +14430,42 @@ impl DiskAPI for LocalDisk {
         self.write_all_public(volume, path, data).await
     }
 
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        super::validate_format_control_path(path)?;
+        let file_path = self.io_get_object_open_path(RUSTFS_META_BUCKET, path)?;
+        let base = self.io_root().to_path_buf();
+        let root = self.publication_root.clone();
+        let backend = Arc::clone(&self.io_backend);
+        let format_info = (path == super::FORMAT_CONFIG_FILE).then(|| Arc::clone(&self.format_info));
+        let path = path.to_owned();
+        self.blocking_queue
+            .run_fsync_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(IoError::new(ErrorKind::Interrupted, "format control publication cancelled"));
+                }
+                let invalidate = || {
+                    backend.invalidate_cached_fds_under(RUSTFS_META_BUCKET, &path);
+                    if let Some(format_info) = &format_info {
+                        let mut format_info = format_info.blocking_write();
+                        format_info.data = Bytes::new();
+                        format_info.id = None;
+                        format_info.file_info = None;
+                        format_info.last_check = None;
+                    }
+                };
+                // The native owner outlives a cancelled RPC. Both invalidations
+                // run there, with cache guards released throughout filesystem I/O.
+                invalidate();
+                let result = os::replace_multipart_source_metadata(&file_path, &data, &base, &root);
+                invalidate();
+                crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+                result
+            })
+            .await
+            .map_err(to_file_error)
+            .map_err(DiskError::from)
+    }
+
     async fn compare_and_update_file(
         &self,
         volume: &str,
@@ -15627,6 +15745,13 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        if src_volume == RUSTFS_META_BUCKET
+            && dst_volume == RUSTFS_META_BUCKET
+            && src_path == super::FORMAT_BOOTSTRAP_FILE
+            && dst_path == super::FORMAT_BOOTSTRAP_DONE_FILE
+        {
+            return self.retire_format_bootstrap().await;
+        }
         let source = self.io_get_object_path(src_volume, src_path)?;
         let destination = self.io_get_object_path(dst_volume, dst_path)?;
         check_path_length(source.to_string_lossy().as_ref())?;
@@ -19314,6 +19439,257 @@ mod test {
             }
         }
         assert_eq!(fs::read(&target).await.expect("unchanged symlink target"), b"foreign-bootstrap-plan");
+    }
+
+    #[tokio::test]
+    async fn format_control_publication_preserves_previous_bytes_before_commit() {
+        use os::multipart_source_syscall_failures::{Stage, fail_once};
+
+        let directory = tempfile::tempdir().expect("atomic format fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("atomic format endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("atomic format disk");
+        for path in [super::super::FORMAT_CONFIG_FILE, super::super::FORMAT_BOOTSTRAP_FILE] {
+            let previous = Bytes::from_static(b"previous-control");
+            disk.write_format_control(path, previous.clone())
+                .await
+                .expect("initial atomic control");
+            let native = disk
+                .io_get_object_open_path(RUSTFS_META_BUCKET, path)
+                .expect("control I/O path");
+            for stage in [Stage::Create, Stage::Write, Stage::FileSync, Stage::Rename] {
+                let fault = fail_once(stage, &native, ErrorKind::Other);
+                disk.write_format_control(path, Bytes::from_static(b"successor-control"))
+                    .await
+                    .expect_err("failed preparation preserves existing control");
+                assert!(fault.was_triggered(), "{stage:?} must exercise the real native publication");
+                assert_eq!(
+                    fs::read(directory.path().join(RUSTFS_META_BUCKET).join(path))
+                        .await
+                        .expect("physical control"),
+                    previous
+                );
+                assert_eq!(disk.read_all(RUSTFS_META_BUCKET, path).await.expect("current control cache"), previous);
+            }
+        }
+        assert!(matches!(
+            disk.write_format_control("pool.bin", Bytes::new()).await,
+            Err(DiskError::MethodNotAllowed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_control_publication_failure_after_rename_invalidates_format_cache() {
+        let directory = tempfile::tempdir().expect("atomic format cache fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("atomic format endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("atomic format disk");
+        disk.write_all(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE, Bytes::from_static(b"previous"))
+            .await
+            .expect("seed previous cached format");
+        os::fsync_dir_recorder::set_failure(&directory.path().join(RUSTFS_META_BUCKET), ErrorKind::Other);
+        disk.write_format_control(super::super::FORMAT_CONFIG_FILE, Bytes::from_static(b"complete-successor"))
+            .await
+            .expect_err("a failed directory barrier cannot acknowledge publication");
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE)
+                .await
+                .expect("reload visible successor after ambiguous publication"),
+            Bytes::from_static(b"complete-successor")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_control_cancelled_caller_cannot_retain_old_format_caches() {
+        use os::prepared_publication_test_hooks::{Stage, install_at};
+
+        let directory = tempfile::tempdir().expect("cancelled format publication fixture");
+        let mut endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("format cancellation endpoint");
+        endpoint.set_idx = 0;
+        endpoint.disk_idx = 0;
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("format cancellation disk"));
+        let mut previous = FormatV3::new(1, 1);
+        previous.erasure.this = previous.erasure.sets[0][0];
+        let previous_bytes = Bytes::from(previous.to_json().expect("previous format JSON"));
+        disk.write_format_control(super::super::FORMAT_CONFIG_FILE, previous_bytes.clone())
+            .await
+            .expect("publish previous format");
+        assert_eq!(disk.get_disk_id().await.expect("cache previous disk id"), Some(previous.erasure.this));
+
+        let mut successor = previous.clone();
+        successor.erasure.this = Uuid::new_v4();
+        successor.erasure.sets[0][0] = successor.erasure.this;
+        let successor_bytes = Bytes::from(successor.to_json().expect("successor format JSON"));
+        let native = disk
+            .io_get_object_open_path(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE)
+            .expect("native format path");
+        let parent = native.parent().expect("native format parent");
+        let (before_rename_tx, before_rename_rx) = tokio::sync::oneshot::channel();
+        let (rename_release_tx, rename_release_rx) = std::sync::mpsc::channel();
+        let _rename = install_at(Stage::PreparedRename, &native, move || {
+            let _ = before_rename_tx.send(());
+            let _ = rename_release_rx.recv();
+        });
+        let (before_sync_tx, before_sync_rx) = tokio::sync::oneshot::channel();
+        let (sync_release_tx, sync_release_rx) = std::sync::mpsc::channel();
+        let _sync = install_at(Stage::DirFsync, parent, move || {
+            let _ = before_sync_tx.send(());
+            let _ = sync_release_rx.recv();
+        });
+        let caller = tokio::spawn({
+            let disk = Arc::clone(&disk);
+            let bytes = successor_bytes.clone();
+            async move { disk.write_format_control(super::super::FORMAT_CONFIG_FILE, bytes).await }
+        });
+        timeout(Duration::from_secs(5), before_rename_rx)
+            .await
+            .expect("native publication reaches rename")
+            .expect("rename barrier reports arrival");
+        // A real reader can repopulate old caches while publication is staged.
+        assert_eq!(
+            disk.get_disk_id().await.expect("read previous disk while staging"),
+            Some(previous.erasure.this)
+        );
+        assert_eq!(
+            disk.read_file_mmap_copy(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE, 0, previous_bytes.len())
+                .await
+                .expect("cache previous file descriptor"),
+            previous_bytes
+        );
+        rename_release_tx.send(()).expect("release physical rename");
+        timeout(Duration::from_secs(5), before_sync_rx)
+            .await
+            .expect("native publication reaches post-rename sync")
+            .expect("sync barrier reports arrival");
+        caller.abort();
+        assert!(caller.await.expect_err("caller is cancelled at the barrier").is_cancelled());
+        sync_release_tx
+            .send(())
+            .expect("allow detached native publication to complete");
+        timeout(Duration::from_secs(5), async {
+            while !disk.format_info.read().await.data.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native owner invalidates caches after cancelled caller");
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE)
+                .await
+                .expect("read current published format"),
+            successor_bytes
+        );
+        assert_eq!(disk.get_disk_id().await.expect("reload committed disk id"), Some(successor.erasure.this));
+        assert_eq!(
+            disk.read_file_mmap_copy(RUSTFS_META_BUCKET, super::super::FORMAT_CONFIG_FILE, 0, successor_bytes.len())
+                .await
+                .expect("read successor through descriptor path"),
+            successor_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn format_control_retirement_retries_directory_sync_after_source_disappears() {
+        let directory = tempfile::tempdir().expect("format retirement fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("format retirement endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("format retirement disk");
+        disk.write_format_control(super::super::FORMAT_BOOTSTRAP_FILE, Bytes::from_static(b"durable-intent"))
+            .await
+            .expect("durable bootstrap intent");
+        let parent = directory.path().join(RUSTFS_META_BUCKET);
+        for _ in 0..2 {
+            os::fsync_dir_recorder::set_failure(&parent, ErrorKind::Other);
+            disk.rename_file_durable(
+                RUSTFS_META_BUCKET,
+                super::super::FORMAT_BOOTSTRAP_FILE,
+                RUSTFS_META_BUCKET,
+                super::super::FORMAT_BOOTSTRAP_DONE_FILE,
+            )
+            .await
+            .expect_err("retirement and already-absent retry must both synchronize the parent");
+            assert!(!parent.join(super::super::FORMAT_BOOTSTRAP_FILE).exists());
+        }
+        disk.rename_file_durable(
+            RUSTFS_META_BUCKET,
+            super::super::FORMAT_BOOTSTRAP_FILE,
+            RUSTFS_META_BUCKET,
+            super::super::FORMAT_BOOTSTRAP_DONE_FILE,
+        )
+        .await
+        .expect("a later successful barrier completes retirement");
+        assert_eq!(
+            fs::read(parent.join(super::super::FORMAT_BOOTSTRAP_DONE_FILE))
+                .await
+                .expect("retired intent"),
+            b"durable-intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_control_publication_keeps_metadata_reads_on_foreground_lane() {
+        let directory = tempfile::tempdir().expect("format lane fixture");
+        let endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("fixture path is UTF-8")).expect("format lane endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("format lane disk");
+        let metadata = directory.path().join("existing-metadata");
+        fs::write(&metadata, b"readable").await.expect("foreground metadata");
+        let mut releases = Vec::new();
+        let mut blockers = Vec::new();
+        for _ in 0..os::MAX_FSYNC_WORKERS_PER_DISK {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let queue = Arc::clone(&disk.blocking_queue);
+            blockers.push(tokio::spawn(async move {
+                queue
+                    .run_fsync_cancellable(move |_| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            }));
+            started_rx.await.expect("fsync worker reached barrier");
+            releases.push(release_tx);
+        }
+        let mut publication =
+            std::pin::pin!(disk.write_format_control(super::super::FORMAT_BOOTSTRAP_FILE, Bytes::from_static(b"durable-plan"),));
+        let queued = futures::FutureExt::now_or_never(&mut publication).is_none();
+        let read = timeout(
+            Duration::from_secs(5),
+            disk.run_metadata_read(None, metadata, |opened| {
+                let mut file = opened?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok::<_, std::io::Error>(bytes)
+            }),
+        )
+        .await;
+        let published_while_blocked = directory
+            .path()
+            .join(RUSTFS_META_BUCKET)
+            .join(super::super::FORMAT_BOOTSTRAP_FILE)
+            .exists();
+        for release in releases {
+            release.send(()).expect("release fsync worker");
+        }
+        for blocker in blockers {
+            blocker.await.expect("join fsync blocker").expect("fsync blocker result");
+        }
+        publication
+            .await
+            .expect("atomic publication completes after fsync lane release");
+        assert!(queued && !published_while_blocked, "format publication must use the fsync lane");
+        assert_eq!(
+            read.expect("foreground read progresses while fsync workers wait")
+                .expect("metadata executor")
+                .expect("metadata bytes"),
+            b"readable"
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #[cfg(test)]
-use super::format_bootstrap::{FORMAT_BOOTSTRAP_FILE, clear_format_bootstrap_intents, ensure_format_bootstrap_consumed};
+use super::format_bootstrap::{FORMAT_BOOTSTRAP_FILE, retire_format_bootstrap_authority};
 use super::format_bootstrap::{resume_format_bootstrap, write_format_bootstrap_intents};
 use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
@@ -1011,7 +1011,13 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
         return Err(DiskError::other("format is none"));
     };
 
-    write_format_file(disk, format).await?;
+    // Replacement healing retains the interoperable write/rename contract
+    // while configured peers are upgraded independently.
+    let temporary = Uuid::new_v4().to_string();
+    disk.write_all(RUSTFS_META_BUCKET, &temporary, format.to_json()?.into_bytes().into())
+        .await?;
+    disk.rename_file_durable(RUSTFS_META_BUCKET, &temporary, RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+        .await?;
     disk.set_disk_id(Some(format.erasure.this)).await?;
 
     Ok(())
@@ -1020,15 +1026,8 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
 pub(super) async fn write_format_file(disk: &DiskStore, format: &FormatV3) -> disk::error::Result<()> {
     let json_data = format.to_json()?;
 
-    let tmpfile = Uuid::new_v4().to_string();
-
-    disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
-        .await?;
-
-    disk.rename_file_durable(RUSTFS_META_BUCKET, tmpfile.as_str(), RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
-        .await?;
-
-    Ok(())
+    disk.write_format_control(FORMAT_CONFIG_FILE, json_data.into_bytes().into())
+        .await
 }
 
 pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
@@ -2013,7 +2012,7 @@ mod tests {
                 .expect("format publication path");
             let (arrived, arrival) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::channel();
-            hooks.push(install_at(Stage::Rename, &destination, move || {
+            hooks.push(install_at(Stage::PreparedRename, &destination, move || {
                 let _ = arrived.send(());
                 let _ = released.recv();
             }));
@@ -2208,6 +2207,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn replacement_format_publication_keeps_interoperable_rename_contract() {
+        use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_directory, disks) = local_disks(1).await;
+        let disk = disks[0].as_ref().expect("replacement fixture disk");
+        let destination = disk.path().join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE);
+        let renamed = Arc::new(AtomicUsize::new(0));
+        let observed = renamed.clone();
+        let _hook = install_at(Stage::Rename, &destination, move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(format.clone()))
+            .await
+            .expect("publish replacement through established RPCs");
+        assert_eq!(
+            renamed.load(Ordering::SeqCst),
+            1,
+            "replacement publication uses the interoperable durable rename"
+        );
+        assert_eq!(load_format_erasure(disk, false).await.expect("load replacement format"), format);
+        assert_eq!(disk.get_disk_id().await.expect("load replacement identity"), Some(format.erasure.this));
     }
 
     #[tokio::test]

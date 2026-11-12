@@ -554,7 +554,7 @@ pub(crate) mod ecstore_disk {
         RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo,
         RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
         is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
-        with_remote_background_io,
+        validate_format_control_path, with_remote_background_io,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{
