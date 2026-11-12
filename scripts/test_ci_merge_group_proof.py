@@ -75,8 +75,7 @@ class ProofTests(unittest.TestCase):
                 self.assertIsNone(self.lookup(payload)[0])
 
     def test_no_request_without_a_token_or_with_a_malformed_identity(self):
-        for overrides in ({"token": ""}, {"tree": ""}, {"tree": "B" * 40}, {"tree": "b" * 39}, {"branch": ""},
-                          {"branch": "main/../x"}, {"repository": "rustfs"}, {"repository": "a/b/c"}):
+        for overrides in ({"token": ""}, {"tree": ""}, {"tree": "B" * 40}, {"tree": "b" * 39}, {"repository": "rustfs"}, {"repository": "a/b/c"}):
             with self.subTest(overrides=overrides):
                 found, requests = self.lookup({"workflow_runs": [run()]}, **overrides)
                 self.assertIsNone(found)

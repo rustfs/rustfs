@@ -107,10 +107,9 @@ jobs:
           # the validation jobs; the lookup answers null on any doubt.
           PROOF_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            CI_MERGE_GROUP_PROOF="$(GITHUB_TOKEN="$PROOF_TOKEN" python3 -I scripts/ci_merge_group_proof.py)" || CI_MERGE_GROUP_PROOF=null
-            export CI_MERGE_GROUP_PROOF
-          fi
+          # Without a token (every event but push) the lookup answers null at once.
+          CI_MERGE_GROUP_PROOF="$(GITHUB_TOKEN="$PROOF_TOKEN" python3 -I scripts/ci_merge_group_proof.py)" || CI_MERGE_GROUP_PROOF=null
+          export CI_MERGE_GROUP_PROOF
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             python3 -I scripts/ci_gate.py select
           elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
@@ -119,7 +118,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=6$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=7$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
