@@ -183,7 +183,7 @@ fn event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMa
 
 /// What an operation answered, as its audit entry and notification event record it.
 #[derive(Clone, Copy)]
-pub(crate) enum OperationOutcome<'a> {
+enum OperationOutcome<'a> {
     /// `headers` are the response headers the operation adds beyond its output.
     Success {
         status: StatusCode,
@@ -196,11 +196,12 @@ pub(crate) enum OperationOutcome<'a> {
 }
 
 impl<'a> OperationOutcome<'a> {
-    /// The outcome of an owned operation that answers success with `status` and `headers`.
-    pub(crate) fn of<T>(result: &'a rustfs_s3_types::S3Result<T>, status: StatusCode, headers: &'a HeaderMap) -> Self {
+    /// An owned error without a message is recorded under its code name, so every
+    /// failure entry carries `error` (the legacy s3s error stores a default message).
+    fn owned<T>(result: &'a rustfs_s3_types::S3Result<T>, status: StatusCode, headers: &'a HeaderMap) -> Self {
         match result {
             Ok(_) => Self::Success { status, headers },
-            Err(err) => Self::failure(err.status_code(), err.message()),
+            Err(err) => Self::failure(err.status_code(), Some(err.message().unwrap_or_else(|| err.code().as_str()))),
         }
     }
 
@@ -601,8 +602,18 @@ impl OperationHelper {
         self.complete_with(OperationOutcome::legacy(result))
     }
 
-    /// [`Self::complete`] for an owned operation's outcome.
-    pub(crate) fn complete_with(mut self, outcome: OperationOutcome<'_>) -> Self {
+    /// [`Self::complete`] for an owned operation, which answers success with
+    /// `status` and adds `headers` beyond its output.
+    pub(crate) fn complete_owned<T>(
+        self,
+        result: &rustfs_s3_types::S3Result<T>,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> Self {
+        self.complete_with(OperationOutcome::owned(result, status, headers))
+    }
+
+    fn complete_with(mut self, outcome: OperationOutcome<'_>) -> Self {
         let Self::Enabled(state) = &mut self else {
             return self;
         };

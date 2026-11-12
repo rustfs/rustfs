@@ -14,11 +14,15 @@
 
 //! Owned-versus-legacy audit parity: one logical request through the s3s
 //! constructors of `OperationHelper` and through `RequestEnvelope::audit_view`
-//! must produce the same audit entry and notification event, field by field.
-//! Each negative row perturbs one input on the owned side only and names the
-//! fields that must then differ, so the comparison itself is shown to see them.
+//! must produce the same audit entry (every serialized field) and the same
+//! notification event (the fields `event_json` lists). Each negative row
+//! changes one input the audit view derives, on the owned side only, and pins
+//! the owned value it must then carry.
+//!
+//! The completion probe is a process-global map keyed by bucket, so every test
+//! here runs under one `serial` key.
 
-use crate::app::storage_api::context::{OperationHelper, OperationOutcome};
+use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::object_usecase::helper::MutationCompletionProbe;
 use crate::app::storage_api::owned_parity::{ReqInfo, RequestContext};
 use crate::app::storage_api::s3::{Credentials as S3sCredentials, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
@@ -34,6 +38,7 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::EventName;
 use rustfs_trusted_proxies::ClientInfo;
 use serde_json::{Value, json};
+use serial_test::serial;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -49,8 +54,10 @@ type Steps = fn(OperationHelper) -> OperationHelper;
 enum Answer {
     Ok(StatusCode, &'static [(&'static str, &'static str)]),
     NoSuchKey(&'static str),
-    /// A code without a status of its own.
+    /// A code without a status of its own, with a message.
     Custom,
+    /// The same code without a message.
+    BareCustom,
     /// An internal error carrying a non-S3 cause and a message.
     Internal,
     /// A code with neither message nor cause.
@@ -67,15 +74,6 @@ struct Case {
     request: Request,
     steps: Steps,
     answer: Answer,
-}
-
-/// One input changed on the owned side only.
-#[derive(Clone, Copy)]
-enum Perturb {
-    Request(Request),
-    Steps(Steps),
-    Answer(Answer),
-    Event(EventName),
 }
 
 fn req_info(bucket: &str, object: &str, access_key: &str) -> ReqInfo {
@@ -302,7 +300,8 @@ fn legacy_result(answer: Answer) -> S3Result<S3Response<()>> {
             Ok(response)
         }
         Answer::NoSuchKey(message) => Err(S3Error::with_message(S3ErrorCode::NoSuchKey, message)),
-        Answer::Custom => Err(S3Error::new(S3ErrorCode::Custom("H2Custom".into()))),
+        Answer::Custom => Err(S3Error::with_message(S3ErrorCode::Custom("H2Custom".into()), "h2 custom refusal")),
+        Answer::BareCustom => Err(S3Error::new(S3ErrorCode::Custom("H2Custom".into()))),
         Answer::Internal => {
             let mut err = S3Error::internal_error(std::io::Error::other("disk fault"));
             err.set_message("h2 storage fault");
@@ -317,7 +316,8 @@ fn owned_result(answer: Answer) -> rustfs_s3_types::S3Result<()> {
     match answer {
         Answer::Ok(..) => Ok(()),
         Answer::NoSuchKey(message) => Err(S3Error::with_message(S3ErrorCode::NoSuchKey, message)),
-        Answer::Custom => Err(S3Error::new(S3ErrorCode::Custom("H2Custom".into()))),
+        Answer::Custom => Err(S3Error::with_message(S3ErrorCode::Custom("H2Custom".into()), "h2 custom refusal")),
+        Answer::BareCustom => Err(S3Error::new(S3ErrorCode::Custom("H2Custom".into()))),
         Answer::Internal => {
             let mut err = S3Error::internal_error(std::io::Error::other("disk fault"));
             err.set_message("h2 storage fault");
@@ -429,12 +429,8 @@ fn run_legacy(case: &Case) -> Captured {
     capture(&probe)
 }
 
-fn run_owned(case: &Case, perturb: Option<Perturb>) -> Captured {
+fn run_owned(case: &Case, extra: Option<Request>) -> Captured {
     let probe = MutationCompletionProbe::install(bucket(case));
-    let extra = match perturb {
-        Some(Perturb::Request(extra)) => Some(extra),
-        _ => None,
-    };
     let (uri, headers, extensions) = parts(case, extra);
     let head = RequestHead {
         method: Method::PUT,
@@ -447,24 +443,12 @@ fn run_owned(case: &Case, perturb: Option<Perturb>) -> Captured {
         service: None,
     };
     let envelope = RequestEnvelope::from_parts(head, extensions);
-    let event = match perturb {
-        Some(Perturb::Event(event)) => event,
-        _ => case.event,
-    };
-    let mut helper = (case.steps)(OperationHelper::from_view(&envelope.audit_view(), event, case.op));
-    if let Some(Perturb::Steps(steps)) = perturb {
-        helper = steps(helper);
-    }
-    let answer = match perturb {
-        Some(Perturb::Answer(answer)) => answer,
-        _ => case.answer,
-    };
-    let (status, headers) = match answer {
+    let helper = (case.steps)(OperationHelper::from_view(&envelope.audit_view(), case.event, case.op));
+    let (status, headers) = match case.answer {
         Answer::Ok(status, headers) => (status, response_headers(headers)),
         _ => (StatusCode::OK, HeaderMap::new()),
     };
-    let result = owned_result(answer);
-    drop(helper.complete_with(OperationOutcome::of(&result, status, &headers)));
+    drop(helper.complete_owned(&owned_result(case.answer), status, &headers));
     capture(&probe)
 }
 
@@ -477,6 +461,7 @@ fn differing(legacy: &Captured, owned: &Captured) -> Vec<String> {
 }
 
 #[test]
+#[serial(owned_audit_probe)]
 fn owned_and_legacy_helpers_record_the_same_entry_and_event() {
     for case in CASES {
         let legacy = run_legacy(case);
@@ -496,6 +481,7 @@ fn owned_and_legacy_helpers_record_the_same_entry_and_event() {
 /// The rows a reader would check first are pinned to their legacy values, so
 /// "both paths agree" cannot mean "both paths lost the field".
 #[test]
+#[serial(owned_audit_probe)]
 fn parity_rows_carry_the_fields_they_exercise() {
     let field = |name: &str, key: &str| run_owned(&case(name), None).fields.get(key).cloned();
     assert_eq!(field("success", "audit.accessKey"), Some(json!("h2-user")));
@@ -506,7 +492,9 @@ fn parity_rows_carry_the_fields_they_exercise() {
     );
     assert_eq!(field("s3 error", "audit.error"), Some(json!("no such key in h2")));
     assert_eq!(field("s3 error", "audit.api.status_code"), Some(json!(404)));
+    assert_eq!(field("success", "event.object.size"), Some(json!(42)));
     assert_eq!(field("custom code without status", "audit.api.status_code"), Some(json!(400)));
+    assert_eq!(field("custom code without status", "audit.error"), Some(json!("h2 custom refusal")));
     assert_eq!(field("non-s3 cause", "audit.api.status_code"), Some(json!(500)));
     assert_eq!(field("non-s3 cause", "audit.error"), Some(json!("h2 storage fault")));
     assert_eq!(field("versioned object", "event.version_id"), Some(json!(VERSION)));
@@ -515,6 +503,7 @@ fn parity_rows_carry_the_fields_they_exercise() {
         field("delete marker", "event.event_name"),
         Some(json!("s3:ObjectRemoved:DeleteMarkerCreated"))
     );
+    assert_eq!(field("delete marker", "audit.event"), Some(json!("s3:ObjectRemoved:DeleteMarkerCreated")));
     assert_eq!(
         field("multipart completion", "audit.responseHeader"),
         Some(json!({"x-amz-checksum-xxhash64": "h2-checksum"}))
@@ -530,133 +519,117 @@ fn parity_rows_carry_the_fields_they_exercise() {
     );
 }
 
+fn with_cred(e: &mut Extensions, change: fn(&mut Credentials)) {
+    if let Some(cred) = e.get_mut::<ReqInfo>().and_then(|info| info.cred.as_mut()) {
+        change(cred);
+    }
+}
+
+/// Each row changes one input that `audit_view` hands to the helper, on the
+/// owned side only. The owned entry must carry the changed value (so a view that
+/// dropped the input goes red) and differ from legacy in exactly those fields.
 #[test]
-fn a_field_perturbed_on_the_owned_side_is_reported_as_different() {
-    let rows: &[(&str, Perturb, &[&str])] = &[
+#[serial(owned_audit_probe)]
+fn an_input_of_the_audit_view_reaches_the_owned_entry() {
+    let req_params =
+        |agent: &str, principal: &str| json!({"host": "h2.example.test:9000", "user-agent": agent, "principalId": principal});
+    let rows: [(&str, Request, Vec<(&str, Value)>); 8] = [
         (
             "success",
-            Perturb::Request(|_, e| {
-                if let Some(cred) = e.get_mut::<ReqInfo>().and_then(|info| info.cred.as_mut()) {
-                    cred.access_key = "other-user".to_owned();
-                }
-            }),
-            &["audit.accessKey", "event.req_params"],
+            |_, e| with_cred(e, |cred| cred.access_key = "other-user".to_owned()),
+            vec![
+                ("audit.accessKey", json!("other-user")),
+                ("event.req_params", req_params("h2-parity", "other-user")),
+            ],
         ),
         (
             "success",
-            Perturb::Request(|_, e| {
-                if let Some(cred) = e.get_mut::<ReqInfo>().and_then(|info| info.cred.as_mut()) {
-                    cred.parent_user = "other-parent".to_owned();
-                }
-            }),
-            &["audit.parentUser"],
+            |_, e| with_cred(e, |cred| cred.parent_user = "other-parent".to_owned()),
+            vec![("audit.parentUser", json!("other-parent"))],
+        ),
+        (
+            "success",
+            |_, e| {
+                with_cred(e, |cred| {
+                    cred.claims = Some(std::collections::HashMap::from([
+                        ("sub".to_owned(), json!("h2-subject")),
+                        ("iss".to_owned(), json!("rustfs-oidc")),
+                        ("oidc_provider".to_owned(), json!("h2-provider")),
+                        ("email".to_owned(), json!("private@example.test")),
+                    ]))
+                })
+            },
+            vec![(
+                "audit.requestClaims",
+                json!({"sub": "h2-subject", "iss": "rustfs-oidc", "oidc_provider": "h2-provider"}),
+            )],
         ),
         (
             "forwarded client and peer",
-            Perturb::Request(|_, e| {
+            |_, e| {
                 e.insert(ClientInfo::direct(SocketAddr::from(([198, 51, 100, 9], 0))));
-            }),
-            &["audit.remotehost"],
+            },
+            vec![("audit.remotehost", json!("198.51.100.9"))],
         ),
         (
             "peer only",
-            Perturb::Request(|_, e| {
+            |_, e| {
                 e.insert(Some(RemoteAddr(SocketAddr::from(([10, 0, 0, 4], 6666)))));
-            }),
-            &["audit.remotehost"],
+            },
+            vec![("audit.remotehost", json!("10.0.0.4"))],
         ),
         (
             "success",
-            Perturb::Request(|_, e| {
+            |_, e| {
                 if let Some(info) = e.get_mut::<ReqInfo>() {
                     info.object = Some("other-key".to_owned());
                 }
-            }),
-            &["audit.api.object"],
+            },
+            vec![("audit.api.object", json!("other-key"))],
         ),
         (
             "success",
-            Perturb::Request(|h, _| {
+            |h, _| {
                 h.insert("user-agent", HeaderValue::from_static("other-agent"));
-            }),
-            &[
-                "audit.requestQuery",
-                "audit.userAgent",
-                "event.req_params",
-                "event.user_agent",
+            },
+            vec![
+                ("audit.requestQuery", json!({"host": "h2.example.test:9000", "user-agent": "other-agent"})),
+                ("audit.userAgent", json!("other-agent")),
+                ("event.req_params", req_params("other-agent", "h2-user")),
+                ("event.user_agent", json!("other-agent")),
             ],
         ),
         (
             "success",
-            Perturb::Request(|_, e| {
+            |_, e| {
                 e.insert(context("h2-other-request"));
-            }),
-            &["audit.requestID", "audit.tags", "event.resp_elements"],
-        ),
-        (
-            "delete marker",
-            Perturb::Answer(Answer::Ok(StatusCode::OK, &[])),
-            &["audit.api.status_code"],
-        ),
-        ("s3 error", Perturb::Answer(Answer::NoSuchKey("other message")), &["audit.error"]),
-        ("non-s3 cause", Perturb::Answer(Answer::Custom), &["audit.api.status_code", "audit.error"]),
-        (
-            "bulk delete objects",
-            Perturb::Answer(Answer::NoSuchKey("refused")),
-            &[
-                "audit.api.status",
-                "audit.api.status_code",
-                "audit.error",
-                "audit.responseHeader",
+            },
+            vec![
+                ("audit.requestID", json!("h2-other-request")),
+                (
+                    "audit.tags",
+                    json!({"traceId": "trace-h2-other-request", "spanId": "span-h2-other-request"}),
+                ),
+                ("event.resp_elements", json!({"x-amz-request-id": "h2-other-request"})),
             ],
-        ),
-        (
-            "multipart completion",
-            Perturb::Answer(Answer::Ok(StatusCode::OK, &[])),
-            &["audit.responseHeader", "event.resp_elements"],
-        ),
-        (
-            "success",
-            Perturb::Steps(|helper| {
-                helper.object(StorageObjectInfo {
-                    size: 7,
-                    ..object_info("h2-success", false)
-                })
-            }),
-            &["event.object.size"],
-        ),
-        (
-            "versioned object",
-            Perturb::Steps(|helper| helper.version_id("other-version")),
-            &["event.version_id"],
-        ),
-        (
-            "delete marker",
-            Perturb::Steps(|helper| helper.event_name(EventName::ObjectRemovedDelete)),
-            &["audit.event", "event.event_name"],
-        ),
-        (
-            "bulk delete objects",
-            Perturb::Steps(|helper| helper.audit_objects(vec![ObjectVersion::new("extra".to_owned(), None)])),
-            &["audit.api.objects"],
-        ),
-        (
-            "peer only",
-            Perturb::Event(EventName::ObjectCreatedPost),
-            &["audit.event", "event.event_name"],
         ),
     ];
-    for (name, perturb, expected) in rows {
+    for (name, extra, expected) in rows {
         let case = case(name);
         let legacy = run_legacy(&case);
-        let owned = run_owned(&case, Some(*perturb));
-        assert_eq!(differing(&legacy, &owned), expected.to_vec(), "{name}");
+        let owned = run_owned(&case, Some(extra));
+        let keys: Vec<String> = expected.iter().map(|(key, _)| (*key).to_owned()).collect();
+        assert_eq!(differing(&legacy, &owned), keys, "{name}");
+        for (key, value) in expected {
+            assert_eq!(owned.fields.get(key), Some(&value), "{name}: {key}");
+        }
     }
 }
 
 /// The owned wrapper records what the legacy `audit_only_operation` records,
 /// hands the handler's result back unchanged, and builds no notification event.
 #[tokio::test]
+#[serial(owned_audit_probe)]
 async fn owned_audit_only_operation_matches_the_legacy_wrapper() {
     let bucket = "h2-audit-only";
     let request = |h: &mut HeaderMap, e: &mut Extensions| common(h, e, bucket, "");
@@ -715,22 +688,25 @@ async fn owned_audit_only_operation_matches_the_legacy_wrapper() {
     }
 }
 
-/// The one field the two edges do not share: s3s stores its code's default
-/// message on a bare error and the legacy entry records it, while the owned
-/// error type keeps no default message, so the owned entry has no `error`.
-/// Owned callers that want the field give their error a message.
+/// The one field the two edges record differently: for an error without a
+/// message the owned entry carries the code name, while the legacy entry carries
+/// whatever default message s3s stored for the code (its prose for a known code,
+/// nothing for a custom one).
 #[test]
-fn a_bare_error_code_records_a_message_only_through_the_legacy_error_type() {
-    let case = Case {
-        answer: Answer::Bare,
-        ..case("non-s3 cause")
-    };
-    let (legacy, owned) = (run_legacy(&case), run_owned(&case, None));
-    assert_eq!(differing(&legacy, &owned), vec!["audit.error".to_owned()]);
-    assert!(
-        legacy.fields["audit.error"]
-            .as_str()
-            .is_some_and(|message| !message.is_empty())
-    );
-    assert!(!owned.fields.contains_key("audit.error"));
+#[serial(owned_audit_probe)]
+fn an_error_without_a_message_is_audited_under_its_code_name() {
+    for (answer, owned_error) in [(Answer::Bare, "InternalError"), (Answer::BareCustom, "H2Custom")] {
+        let case = Case {
+            answer,
+            ..case("non-s3 cause")
+        };
+        let (legacy, owned) = (run_legacy(&case), run_owned(&case, None));
+        assert_eq!(differing(&legacy, &owned), vec!["audit.error".to_owned()], "{owned_error}");
+        assert_eq!(owned.fields.get("audit.error"), Some(&json!(owned_error)));
+        let legacy_error = legacy.fields.get("audit.error").and_then(Value::as_str);
+        match answer {
+            Answer::Bare => assert!(legacy_error.is_some_and(|message| !message.is_empty() && message != owned_error)),
+            _ => assert_eq!(legacy_error, None),
+        }
+    }
 }

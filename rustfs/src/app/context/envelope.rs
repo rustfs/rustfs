@@ -28,6 +28,7 @@
 use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
+use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
     AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
 };
@@ -38,7 +39,6 @@ use crate::app::storage_api::context::{
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
     TableDataPlaneListAccess, TableDataPlanePublicationGuards,
 };
-use crate::app::storage_api::context::{OperationHelper, OperationOutcome};
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
@@ -615,7 +615,8 @@ impl RequestEnvelope {
     /// The entry is started before the request is handed over; a success is
     /// recorded with `success_status` and no added response headers. An operation
     /// that adds response headers builds its helper with
-    /// [`OperationHelper::audit_only_from_view`] and completes it itself.
+    /// [`OperationHelper::audit_only_from_view`] and calls
+    /// [`OperationHelper::complete_owned`] itself.
     pub(crate) async fn audit_only_operation<O, F, Fut>(
         req: Self,
         op: S3Operation,
@@ -628,7 +629,7 @@ impl RequestEnvelope {
     {
         let helper = OperationHelper::audit_only_from_view(&req.audit_view(), op);
         let result = handler(req).await;
-        let _helper = helper.complete_with(OperationOutcome::of(&result, success_status, &HeaderMap::new()));
+        let _helper = helper.complete_owned(&result, success_status, &HeaderMap::new());
         result
     }
 }
