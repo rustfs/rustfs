@@ -60,6 +60,7 @@ required-features = ["swift"]
 # feature can select.
 [[test]]
 name = "embedded_gateway_stack_test"
+path = "tests/embedded_gateway_stack_test/main.rs"
 required-features = ["gateway-stack"]
 
 [features]
@@ -87,7 +88,7 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 # The rustfs-gateway S3 stack, selected at startup with RUSTFS_S3_STACK=gateway
 # (rustfs/backlog#2734). Under construction: off by default and never enabled in a
 # release build; the stack refuses to compile without debug assertions, and
-# `scripts/check_gateway_stack_release_boundary.sh` keeps it out of release inputs.
+# `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
 gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
