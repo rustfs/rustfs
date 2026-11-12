@@ -584,6 +584,18 @@ pub trait KmsBackend: Send + Sync {
         BackendCapabilities::minimal()
     }
 
+    /// Whether objects on disk may carry this backend's data-key ciphertext
+    /// without a [`crate::encryption::DataKeyEnvelope`] around it.
+    ///
+    /// Every backend wraps the data keys it generates in an envelope, which is
+    /// what lets a reader recognize a KMS-wrapped key from its bytes alone. A
+    /// backend returns `true` only when an earlier release persisted its
+    /// provider-native ciphertext bare, so those bytes still have to be routed
+    /// to [`Self::decrypt`] even though nothing in them identifies the backend.
+    fn reads_bare_data_key_ciphertext(&self) -> bool {
+        false
+    }
+
     /// Remove a key whose scheduled deletion deadline has passed.
     ///
     /// Used by the background deletion worker. Implementations must re-check
