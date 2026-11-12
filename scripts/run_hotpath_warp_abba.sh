@@ -44,6 +44,7 @@ OUT_DIR="${PROJECT_ROOT}/target/hotpath-abba/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/nu
 DRY_RUN=false
 ALLOW_UNMANAGED_EXTERNAL=false
 AFTER_PROBE=false
+NODE_DOCKER_CONTAINERS=()
 NODE_SSH_TARGETS=()
 NODE_SSH_IDENTITY_FILE=""
 NODE_SSH_TIMEOUT_SECS=30
@@ -105,13 +106,15 @@ Production / cluster mode:
   --allow-unmanaged-external Preserve legacy external mode without a deploy
                               hook. Its output is not formal ABBA evidence.
   --after-probe              Enable per-round PUT HEAD/GET/hash verification.
+  --node-docker-container <node=container>
+                              Capture Docker CPU/memory/network/block I/O snapshots.
   --node-ssh-target <node=host>
                               Capture node CPU/RSS/IOPS/await/PSI/scheduler telemetry.
   --node-ssh-identity-file <path>
                               SSH identity file for node telemetry.
   --node-ssh-timeout-secs <n>
                               Bound each remote telemetry command (default 30).
-  --require-node-telemetry    Fail a round if node telemetry is incomplete.
+  --require-node-telemetry    Fail a round if SSH node telemetry is incomplete.
   --service-prometheus-query-url <url>
                               Prometheus query endpoint for PUT stage snapshots.
   --service-prometheus-query <query>
@@ -193,6 +196,16 @@ validate_drive_sync_spec() {
   [[ "$value" == "true" || "$value" == "false" ]] || die "--drive-sync value must be true or false"
 }
 
+validate_docker_targets() {
+  local entry node seen_nodes=""
+  for entry in "${NODE_DOCKER_CONTAINERS[@]}"; do
+    [[ "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*=.+$ && "$entry" != *$'\n'* && "$entry" != *,* ]] || die "--node-docker-container must be node=container without commas or newlines"
+    node="${entry%%=*}"
+    [[ " $seen_nodes " != *" $node "* ]] || die "--node-docker-container repeats node: $node"
+    seen_nodes="${seen_nodes} ${node}"
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --baseline-bin) BASELINE_BIN="$2"; shift 2 ;;
@@ -222,6 +235,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --allow-unmanaged-external) ALLOW_UNMANAGED_EXTERNAL=true; shift ;;
     --after-probe) AFTER_PROBE=true; shift ;;
+    --node-docker-container) NODE_DOCKER_CONTAINERS+=("$2"); shift 2 ;;
     --node-ssh-target) NODE_SSH_TARGETS+=("$2"); shift 2 ;;
     --node-ssh-identity-file) NODE_SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --node-ssh-timeout-secs) NODE_SSH_TIMEOUT_SECS="$2"; shift 2 ;;
@@ -235,6 +249,10 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown argument: $1" ;;
   esac
 done
+
+if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+  validate_docker_targets
+fi
 
 if ((${#WORKLOAD_OVERRIDES[@]} > 0)); then
   for workload in "${WORKLOAD_OVERRIDES[@]}"; do
@@ -432,6 +450,11 @@ measure() {
   if [[ "$AFTER_PROBE" == "true" && "$mode" == "put" ]]; then
     args+=(--after-probe)
   fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    for node_target in "${NODE_DOCKER_CONTAINERS[@]}"; do
+      args+=(--node-docker-container "$node_target")
+    done
+  fi
   if ((${#NODE_SSH_TARGETS[@]} > 0)); then
     for node_target in "${NODE_SSH_TARGETS[@]}"; do
       args+=(--node-ssh-target "$node_target")
@@ -548,6 +571,7 @@ evidence_mode=$(evidence_mode)
 formal_evidence=$(formal_evidence)
 performance_conclusion=$(performance_conclusion)
 after_probe=$AFTER_PROBE
+node_docker_container_count=${#NODE_DOCKER_CONTAINERS[@]}
 node_ssh_target_count=${#NODE_SSH_TARGETS[@]}
 node_ssh_identity_file=${NODE_SSH_IDENTITY_FILE:-N/A}
 node_ssh_timeout_secs=$NODE_SSH_TIMEOUT_SECS

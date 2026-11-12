@@ -44,6 +44,10 @@ Sizes are passed to the driver as `--sizes` (one per cell); any size in the driv
 
 In external mode (`--endpoint <host:port>`) the rig never starts or restarts RustFS. Before each phase or leg it runs `--deploy-hook <cmd>` with the context below in the environment, then waits for `http://<endpoint><health-path>` (default `/health`). A non-zero hook exit aborts the run.
 
+For container-based experiments, pass a repeatable `--node-docker-container node=container` mapping. The runner forwards every mapping to the load driver for before/after Docker CPU, memory, network and block I/O snapshots in each leg's `node_resources/` directory and `node_resource_captures.csv`. Use container names that the deploy hook recreates consistently across legs; the driver records the resolved container and image identities per leg. Node names must be unique.
+
+Docker snapshots expose instantaneous CPU percentages and resource samples. Computing CPU/object requires cumulative process or cgroup CPU counters aligned with the Warp measurement window and its completed object count. The current `--require-node-telemetry` failure gate applies to SSH snapshots; inspect Docker capture statuses explicitly because Docker snapshot failures are reported as warnings. A container lab's shared host and storage topology must be recorded with the results.
+
 | Variable | Quick A/B | ABBA | Value |
 | --- | --- | --- | --- |
 | `HOTPATH_AB_PHASE` / `HOTPATH_ABBA_PHASE` | yes | yes | `baseline` or `candidate` |

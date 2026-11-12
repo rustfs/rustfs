@@ -87,6 +87,53 @@ awk -F',' 'NR == 1 {next} {seen[$3]++; if ($1 != "sync-on" || $3 !~ /^put-(128|5
 rg -Fxq 'workloads=put-128kib|put|128KiB;put-512kib|put|512KiB' "$FOCUSED_OUT_DIR/manifest.env"
 rg -Fxq 'drive_sync_matrix=sync-on|true' "$FOCUSED_OUT_DIR/manifest.env"
 
+DOCKER_OUT_DIR="${TMP_DIR}/docker-telemetry"
+DOCKER_TRACE="${TMP_DIR}/docker-telemetry-trace.log"
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --workload 'put-100kib|put|100KiB' \
+  --drive-sync 'sync-on|true' \
+  --node-docker-container 'node-1=rustfs-one' \
+  --node-docker-container 'node-2=rustfs-two' \
+  --out-dir "$DOCKER_OUT_DIR" \
+  --dry-run >"$DOCKER_TRACE" 2>&1
+rg -qx 'node_docker_container_count=2' "$DOCKER_OUT_DIR/manifest.env"
+[[ "$(rg -c -F -- '--node-docker-container node-1=rustfs-one --node-docker-container node-2=rustfs-two' "$DOCKER_TRACE")" == "4" ]]
+
+for invalid_target in 'missing-equals' '=container' 'node=' 'node,1=container' $'node=container\nother'; do
+  if "$RUNNER" \
+    --baseline-bin /usr/bin/true \
+    --candidate-bin /usr/bin/true \
+    --warp-bin /usr/bin/true \
+    --node-docker-container "$invalid_target" \
+    --out-dir "${TMP_DIR}/invalid-docker-target" \
+    --dry-run >"${TMP_DIR}/invalid-docker-target.log" 2>&1; then
+    echo "expected malformed Docker node mapping to fail" >&2
+    exit 1
+  fi
+  rg -qF -- '--node-docker-container must be node=container' "${TMP_DIR}/invalid-docker-target.log"
+  [[ ! -e "${TMP_DIR}/invalid-docker-target" ]]
+done
+
+if "$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --warp-bin /usr/bin/true \
+  --node-docker-container 'node-1=rustfs-one' \
+  --node-docker-container 'node-1=rustfs-two' \
+  --out-dir "${TMP_DIR}/duplicate-docker-target" \
+  --dry-run >"${TMP_DIR}/duplicate-docker-target.log" 2>&1; then
+  echo "expected duplicate Docker node mapping to fail" >&2
+  exit 1
+fi
+rg -qF -- '--node-docker-container repeats node: node-1' "${TMP_DIR}/duplicate-docker-target.log"
+[[ ! -e "${TMP_DIR}/duplicate-docker-target" ]]
+
 if "$RUNNER" --baseline-bin /usr/bin/true --candidate-bin /usr/bin/true --baseline-revision baseline-test --candidate-revision candidate-test --warp-bin /usr/bin/true --rounds 3 --workload 'bad|delete|1KiB' --out-dir "${TMP_DIR}/bad-workload" --dry-run >/dev/null 2>&1; then
   echo "expected invalid --workload mode to fail" >&2
   exit 1
