@@ -40,10 +40,6 @@
 name: Gateway Acceptance
 
 on:
-  # TEMPORARY: removed before merge; it exists only to run this lane on its own pull request.
-  pull_request:
-    paths:
-      - ".github/workflows/gateway-acceptance.yml"
   schedule:
     - cron: "29 3 * * *"
   workflow_dispatch:
@@ -222,17 +218,18 @@ jobs:
             --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
             > lane/rustfs.log 2>&1 &
           pid=$!
+          # Liveness first: a ready answer counts only while this process is still running.
           for _ in $(seq 120); do
-            if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
-              echo ready > lane/startup.txt
-              exit 0
-            fi
             if ! kill -0 "$pid" 2>/dev/null; then
-              wait "$pid"
-              status=$?
+              status=0
+              wait "$pid" || status=$?
               echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' lane/rustfs.log | tail -n 1)" > lane/startup.txt
               cat lane/startup.txt
               exit 1
+            fi
+            if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
+              echo ready > lane/startup.txt
+              exit 0
             fi
             sleep 1
           done

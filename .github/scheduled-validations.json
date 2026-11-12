@@ -955,12 +955,10 @@
       "workflow": ".github/workflows/gateway-acceptance.yml",
       "name": "Gateway Acceptance",
       "roles": [
-        "pr",
         "periodic",
         "manual"
       ],
       "events": [
-        "pull_request",
         "schedule",
         "workflow_dispatch"
       ],
