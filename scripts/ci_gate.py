@@ -789,7 +789,8 @@ def check_workflow(root: Path) -> list[str]:
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "internode-transport": "--features rustfs/internode-transport"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):

@@ -58,6 +58,7 @@ pub(crate) mod s3 {
     pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
@@ -73,6 +74,8 @@ pub(crate) mod s3 {
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    #[cfg(test)]
+    pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
@@ -1851,6 +1854,8 @@ pub(crate) mod context {
         TableDataPlanePublicationGuards,
     };
     pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use crate::storage::storage_api::rpc_consumer::InstalledControlService;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};

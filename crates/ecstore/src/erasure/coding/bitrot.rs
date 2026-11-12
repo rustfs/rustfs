@@ -600,6 +600,27 @@ where
     }
 }
 
+impl BitrotWriter<CustomWriter> {
+    pub(crate) async fn write_shard_bytes(
+        &mut self,
+        buf: bytes::Bytes,
+        integrity_spec: Option<(rustfs_filemeta::shard_integrity::PartIntegrity, u32, usize)>,
+    ) -> std::io::Result<(usize, Option<[u8; 32]>)> {
+        if !buf.is_empty()
+            && !self.finished
+            && buf.len() <= self.shard_size
+            && let Some(local) = self.inner.as_lazy_local_file_writer_mut()
+        {
+            if buf.len() < self.shard_size {
+                self.finished = true;
+            }
+            let hash_algo = self.hash_algo.clone();
+            return local.write_bitrot_shard(buf, hash_algo, integrity_spec).await;
+        }
+        self.write(&buf).await.map(|n| (n, None))
+    }
+}
+
 /// Read into `buf` until it is full or the reader hits EOF, returning the number
 /// of bytes actually read. A raw tokio File typically satisfies this in one
 /// `read` (one spawn_blocking round-trip); the loop only re-enters on a genuine
@@ -759,7 +780,7 @@ pub enum CustomWriter {
     /// Inline buffer writer - stores data in memory
     InlineBuffer(InlineBuffer),
     /// Disk-based writer using tokio file
-    Other(Box<dyn AsyncWrite + Unpin + Send + Sync>),
+    Other(crate::disk::FileWriter),
 }
 
 /// Inline payload storage retains its background allocation through export.
@@ -833,6 +854,17 @@ impl CustomWriter {
         W: AsyncWrite + Unpin + Send + Sync + 'static,
     {
         Self::Other(Box::new(writer))
+    }
+
+    pub fn from_file_writer(writer: crate::disk::FileWriter) -> Self {
+        Self::Other(writer)
+    }
+
+    pub(crate) fn as_lazy_local_file_writer_mut(&mut self) -> Option<&mut crate::disk::local::LazyLocalFileWriter> {
+        match self {
+            Self::InlineBuffer(_) => None,
+            Self::Other(writer) => crate::disk::as_lazy_local_file_writer_mut(&mut **writer),
+        }
     }
 
     /// Get the inline buffer data if this is an inline buffer writer
@@ -957,6 +989,17 @@ impl BitrotWriterWrapper {
             integrity.verify(buf).await?;
         }
         self.bitrot_writer.write(buf).await
+    }
+
+    pub(crate) async fn write_shard_bytes(
+        &mut self,
+        buf: bytes::Bytes,
+        integrity_spec: Option<(rustfs_filemeta::shard_integrity::PartIntegrity, u32, usize)>,
+    ) -> std::io::Result<(usize, Option<[u8; 32]>)> {
+        if let Some(integrity) = &mut self.integrity {
+            integrity.verify(&buf).await?;
+        }
+        self.bitrot_writer.write_shard_bytes(buf, integrity_spec).await
     }
 
     pub(crate) fn set_integrity(&mut self, verifier: crate::io_support::shard_integrity::ShardVerifier) {
