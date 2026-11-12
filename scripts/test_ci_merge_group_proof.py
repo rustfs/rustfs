@@ -61,6 +61,7 @@ class ProofTests(unittest.TestCase):
                         {"conclusion": "failure"}, {"conclusion": "cancelled"}, {"conclusion": None},
                         {"status": "in_progress"}, {"event": "push"}, {"event": "pull_request"},
                         {"head_branch": "main"}, {"head_branch": "gh-readonly-queue/release/pr-1-x"},
+                        {"head_branch": "gh-readonly-queue/mainline/pr-1-x"},
                         {"head_branch": None}, {"id": "7"}, {"id": 0}, {"id": True},
                         {"html_url": "https://example.invalid/runs/7"}, {"html_url": None}):
             with self.subTest(changes=changes):
