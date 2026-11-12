@@ -802,7 +802,6 @@ impl ECStore {
             let set = set.clone();
             let rx = rx.clone();
             let bucket = bucket.clone();
-            let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
                 let list_rx = rx.clone();

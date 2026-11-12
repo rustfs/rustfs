@@ -977,7 +977,7 @@ async fn enumerate_target_conflicts(target: &Path, manifest: &BackupManifest) ->
             (stem.to_string(), format!("target already has key file {entry:?}"))
         } else if entry == LOCAL_KMS_MASTER_KEY_SALT_FILE {
             (
-                entry.clone(),
+                entry,
                 "target holds an orphan master-key KDF salt; it would poison every key created after the restore".to_string(),
             )
         } else {

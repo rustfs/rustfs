@@ -1764,12 +1764,7 @@ impl DataUsageCache {
         let mut found = HashSet::new();
         found.insert(top);
         mark(self, &top_e, &mut found);
-        self.cache.retain(|k, _| {
-            if !found.contains(k) {
-                return false;
-            }
-            true
-        });
+        self.cache.retain(|k, _| found.contains(k));
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
