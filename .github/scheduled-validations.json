@@ -765,6 +765,32 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/dual-stack-nightly.yml",
+      "name": "dual-stack-nightly",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule",
+        "pull_request"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "13 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "dual-stack-nightly.yml",
+      "disposition": "both-stack JUnit diff of every e2e profile; the gateway legs are report-only until T2.10",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/e2e-distributed.yml",
       "name": "e2e-distributed",
       "roles": [
@@ -1076,17 +1102,18 @@
       ],
       "events": [
         "workflow_dispatch",
-        "schedule"
+        "schedule",
+        "pull_request"
       ],
-      "cadence": "weekly",
+      "cadence": "nightly",
       "timezone": "UTC",
       "schedule": [
-        "41 6 * * 0"
+        "41 6 * * *"
       ],
       "owner": "@overtrue",
       "policy": "active",
       "monitor": "workflow",
-      "max_age_hours": 192,
+      "max_age_hours": 36,
       "result_owner": "mint.yml",
       "disposition": "retained independent entry",
       "failure_owner": "workflow",
