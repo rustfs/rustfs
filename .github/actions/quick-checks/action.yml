@@ -95,7 +95,17 @@ runs:
 
     - name: Check s3s footprint ratchet
       shell: bash
-      run: ./scripts/check_s3s_footprint.sh
+      env:
+        # Pull requests and merge groups compare with their base revision; a
+        # push or scheduled run holds the tree to the baseline file exactly.
+        FOOTPRINT_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+      run: |
+        if [[ -z "$FOOTPRINT_BASE" ]]; then
+          ./scripts/check_s3s_footprint.sh
+          exit
+        fi
+        git cat-file -e "$FOOTPRINT_BASE^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$FOOTPRINT_BASE"
+        ./scripts/check_s3s_footprint.sh --base "$FOOTPRINT_BASE"
 
     - name: Check per-crate test-count ratchet
       shell: bash

@@ -4,7 +4,7 @@
 # made a ratchet by rustfs/backlog#2734 task T0.4, rustfs/backlog#2739; allowlist
 # mode added by task T0.6, rustfs/backlog#2741).
 #
-# Usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run]
+# Usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]
 #        scripts/check_s3s_footprint.sh --self-test
 #
 # The two modes are independent: each reads its own input file and runs its own
@@ -73,20 +73,25 @@
 # serving-side s3s references out of the storage engine (ARCHITECTURE.md
 # invariant 4); the S3-consuming client already moved to crates/s3-client.
 #
-# The baseline is a CEILING and is LOWER-ONLY (rustfs/backlog#2765 ruling for
-# the parallel operation slices):
+# Two comparisons, both LOWER-ONLY (rustfs/backlog#2765 ruling for the
+# parallel operation slices):
 #
+#   --base <rev> (pull requests and merge groups; Quick Checks passes the base
+#   SHA): this script measures the tree at <rev> the same way and fails when
+#   any counter is higher than there ("grew against the base revision"). The
+#   baseline stays an absolute ceiling. A slice that shrinks the footprint
+#   passes without editing the baseline, and no slice can spend the slack
+#   another one created, because the bar is the base, not the baseline.
+#
+#   without --base (push and scheduled runs, local runs) the baseline is exact:
 #   measured > baseline  fails with "s3s footprint grew: <measured> > <baseline>".
 #                        Route the new code through the gateway abstractions
 #                        instead of importing s3s. Raising a baseline value is
 #                        never the fix: rustfs/rustfs#5964 raised the s3_error!
 #                        ceiling to go green.
-#   measured < baseline  passes and prints the line to put in the baseline
-#                        ("lower the baseline to: <key>=<measured>"). Slices
-#                        that shrink the footprint merge in any order without
-#                        touching the baseline; the migration coordinator
-#                        lowers it after merges, so the slack never outlives
-#                        the next lowering.
+#   measured < baseline  fails and prints the line to put in the baseline
+#                        ("lower the baseline to: <key>=<measured>"); whoever
+#                        merges the drop lowers it.
 #   measured = baseline  passes.
 #
 # End state: when all three values reach 0 the baseline file is retired and
@@ -154,15 +159,30 @@ SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$0")/.."
 
 usage() {
-    echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run]" >&2
+    echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]" >&2
     echo "       scripts/check_s3s_footprint.sh --self-test" >&2
 }
 
 MODE=''
 DRY_RUN=0
 SELF_TEST=0
+BASE_REV=''
+PRINT_COUNTS=0
 while (($# > 0)); do
     case "$1" in
+        --base)
+            if (($# < 2)) || [[ -z "$2" || -n "$BASE_REV" ]]; then
+                echo "error: '--base' needs one revision and is given at most once" >&2
+                usage
+                exit 2
+            fi
+            BASE_REV="$2"
+            shift 2
+            ;;
+        --print-counts) # internal: measures the base tree for --base
+            PRINT_COUNTS=1
+            shift
+            ;;
         --self-test)
             SELF_TEST=1
             shift
@@ -205,6 +225,11 @@ if ((SELF_TEST)) && { [[ -n "$MODE" ]] || ((DRY_RUN)); }; then
     exit 2
 fi
 MODE="${MODE:-baseline}"
+if { [[ -n "$BASE_REV" ]] || ((PRINT_COUNTS)); } && { [[ "$MODE" != baseline ]] || ((SELF_TEST)); }; then
+    echo "error: '--base' is only valid in the baseline mode" >&2
+    usage
+    exit 2
+fi
 if ((DRY_RUN)) && [[ "$MODE" != allowlist ]]; then
     echo "error: '--dry-run' is only valid with '--mode allowlist'" >&2
     usage
@@ -394,6 +419,20 @@ self_test_expect_failure() {
     fi
 }
 
+# Like self_test_expect_failure, for fixture tree $1 run with arguments $4...
+self_test_expect_failure_args() {
+    local name="$1" needle="$2" what="$3" out status=0
+    shift 3
+    out="$(bash "$SELF_TEST_DIR/$name/scripts/check_s3s_footprint.sh" "$@" <"$SELF_TEST_STDIN" 2>&1)" || status=$?
+    if ((status != 0)) && [[ "$out" == *"$needle"* ]]; then
+        echo "self-test ok: $name: $what (exit $status)"
+    else
+        echo "self-test FAILED: $name: $what: expected a failure printing '$needle', got exit $status:" >&2
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
+    fi
+}
+
 # Positive cases: s3s's macro in a recognised form is counted. Negative cases:
 # a line that must not count, a form that must not clear its file (fail
 # closed), and a broken input that must fail the guard. Every expected count
@@ -459,19 +498,43 @@ self_test() {
         SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
     fi
 
-    # The baseline is a ceiling: a tree below it passes and names the lowered
-    # line for every counter that dropped, and only for those.
-    self_test_tree p7-below-ceiling
-    out="$(self_test_run p7-below-ceiling 3 1 2)" && status=0 || status=$?
-    if ((status == 0)) && [[ "$out" == *"s3s footprint baseline check passed"* ]] \
-        && [[ "$out" == *"lower the baseline to: files=1"* ]] && [[ "$out" == *"lower the baseline to: ecstore_files=0"* ]] \
-        && [[ "$out" != *"lower the baseline to: s3_error_lines"* ]]; then
-        echo "self-test ok: p7-below-ceiling: a tree below the baseline passes and prints the lowered lines (exit 0)"
+    # Without --base (push and scheduled runs) a tree below the baseline fails
+    # and names the lowered line for every counter that dropped, and only those.
+    self_test_tree n0-below-baseline
+    out="$(self_test_run n0-below-baseline 3 1 2)" && status=0 || status=$?
+    if ((status != 0)) && [[ "$out" == *"lower the baseline to: files=1"* ]] \
+        && [[ "$out" == *"lower the baseline to: ecstore_files=0"* ]] && [[ "$out" != *"lower the baseline to: s3_error_lines"* ]]; then
+        echo "self-test ok: n0-below-baseline: a tree below the baseline fails and prints the lowered lines (exit $status)"
     else
-        echo "self-test FAILED: p7-below-ceiling: a tree below the baseline should pass and print the lowered lines, got exit $status:" >&2
+        echo "self-test FAILED: n0-below-baseline: expected a failure printing the lowered lines, got exit $status:" >&2
         printf '%s\n' "$out" | sed 's/^/    /' >&2
         SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
     fi
+
+    # With --base (pull requests): the base revision is the bar. A drop below
+    # the baseline passes; a rise against the base fails even under the ceiling.
+    self_test_tree b1-base
+    self_test_file b1-base crates/a/src/lib.rs 'fn f(_: s3s::dto::ETag) {}'
+    self_test_file b1-base crates/ecstore/src/lib.rs 'fn e() {}' # git keeps no empty directory
+    printf 'files=5\ns3_error_lines=5\necstore_files=5\n' >"$SELF_TEST_DIR/b1-base/.config/s3s-footprint-baseline.txt"
+    git -C "$SELF_TEST_DIR/b1-base" init -q
+    git -C "$SELF_TEST_DIR/b1-base" add -A
+    git -C "$SELF_TEST_DIR/b1-base" -c user.name=t -c user.email=t@t commit -q -m base
+    rm "$SELF_TEST_DIR/b1-base/crates/a/src/lib.rs"
+    out="$(bash "$SELF_TEST_DIR/b1-base/scripts/check_s3s_footprint.sh" --base HEAD <"$SELF_TEST_STDIN" 2>&1)" && status=0 || status=$?
+    if ((status == 0)) && [[ "$out" == *"files importing s3s is 1 (base revision 2"* ]]; then
+        echo "self-test ok: b1-base: a drop against the base passes below the baseline (exit 0)"
+    else
+        echo "self-test FAILED: b1-base: a drop against the base should pass, got exit $status:" >&2
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
+    fi
+    self_test_file b1-base crates/a/src/lib.rs 'fn f(_: s3s::dto::ETag) {}'
+    self_test_file b1-base crates/b/src/lib.rs 'fn g(_: s3s::dto::ETag) {}'
+    self_test_expect_failure_args b1-base "s3s footprint grew against the base revision: 3 > 2 (files importing s3s" \
+        "a rise against the base fails under the ceiling" --base HEAD
+    self_test_expect_failure_args b1-base "could not measure the base revision 'missing'" \
+        "an unknown base revision fails" --base missing
 
     # --- negative: lines that must not count -------------------------------
     self_test_tree n1-rustfs-import
@@ -741,16 +804,42 @@ if ((s3s_import_files < s3s_ecstore_files)); then
     exit 1
 fi
 
+if ((PRINT_COUNTS)); then
+    printf 'files=%s\ns3_error_lines=%s\necstore_files=%s\n' "$s3s_import_files" "$s3_error_lines" "$s3s_ecstore_files"
+    exit 0
+fi
+
+# --base: the same measurement, by this very script, of the tree at <rev>.
+base_counts=''
+if [[ -n "$BASE_REV" ]]; then
+    mkdir "$TMP_DIR/base"
+    if ! git archive "$BASE_REV" | tar -x -C "$TMP_DIR/base" \
+        || ! cp "$SCRIPT_PATH" "$TMP_DIR/base/scripts/check_s3s_footprint.sh" \
+        || ! base_counts="$(bash "$TMP_DIR/base/scripts/check_s3s_footprint.sh" --print-counts </dev/null)"; then
+        echo "error: could not measure the base revision '$BASE_REV' (is the commit fetched?)" >&2
+        exit 1
+    fi
+fi
+
 status=0
 
-# Ceiling comparison of one counter against its baseline line. Reports every
-# counter before failing so one run shows all three deltas. The allowlist mode
-# lives in run_allowlist_mode above, dispatched before any baseline input is
-# read, not inside this function.
-check_ceiling() {
-    local key="$1" label="$2" count="$3" baseline="$4" inspect_cmd="$5"
+# One counter against its baseline line and, with --base, against the base
+# revision. Reports every counter before failing so one run shows all three
+# deltas. The allowlist mode lives in run_allowlist_mode above, dispatched
+# before any baseline input is read, not inside this function.
+check_counter() {
+    local key="$1" label="$2" count="$3" baseline="$4" inspect_cmd="$5" base
+    base="$(printf '%s\n' "$base_counts" | sed -n "s/^$1=//p")"
 
-    if ((count > baseline)); then
+    if [[ -n "$BASE_REV" ]] && ! [[ "$base" =~ ^[0-9]+$ ]]; then
+        echo "error: no '$key' measurement for the base revision '$BASE_REV'" >&2
+        status=1
+    elif [[ -n "$BASE_REV" ]] && ((count > base)); then
+        echo "❌ s3s footprint grew against the base revision: $count > $base ($label, key '$key')" >&2
+        echo "   Use the gateway abstractions instead of importing s3s directly. To find the" >&2
+        echo "   offenders, compare '$inspect_cmd' against $BASE_REV." >&2
+        status=1
+    elif ((count > baseline)); then
         echo "❌ s3s footprint grew: $count > $baseline ($label, baseline key '$key')" >&2
         echo "   New code must not widen the s3s surface being removed by the gateway" >&2
         echo "   migration (rustfs/backlog#1677 F1, rustfs/backlog#2734). Use the gateway" >&2
@@ -758,18 +847,22 @@ check_ceiling() {
         echo "   $BASELINE_FILE. To find the offenders, compare" >&2
         echo "   '$inspect_cmd' against the PR base branch." >&2
         status=1
+    elif [[ -n "$BASE_REV" ]]; then
+        echo "s3s footprint OK: $label is $count (base revision $base, ceiling $key=$baseline)"
     elif ((count < baseline)); then
-        echo "s3s footprint OK: $label is $count, below the baseline $key=$baseline; lower the baseline to: $key=$count"
+        echo "❌ s3s footprint is below its baseline: $count < $baseline ($label)" >&2
+        echo "   lower the baseline to: $key=$count (in $BASELINE_FILE)" >&2
+        status=1
     else
         echo "s3s footprint OK: $label is $count (baseline $key=$baseline)"
     fi
 }
 
-check_ceiling files "files importing s3s" "$s3s_import_files" "$files_baseline" \
+check_counter files "files importing s3s" "$s3s_import_files" "$files_baseline" \
     "rg -l '$S3S_PATH_PATTERN' --type rust $E2E_TEST_GLOB ."
-check_ceiling s3_error_lines "$S3_ERROR_LABEL" "$s3_error_lines" "$s3_error_lines_baseline" \
+check_counter s3_error_lines "$S3_ERROR_LABEL" "$s3_error_lines" "$s3_error_lines_baseline" \
     "rg -n 's3_error!' --type rust $E2E_TEST_GLOB . (minus the lines the header's s3_error_lines rule clears)"
-check_ceiling ecstore_files "ecstore files referencing s3s" "$s3s_ecstore_files" "$ecstore_files_baseline" \
+check_counter ecstore_files "ecstore files referencing s3s" "$s3s_ecstore_files" "$ecstore_files_baseline" \
     "rg -l '$S3S_PATH_PATTERN' --type rust crates/ecstore/src"
 
 if ((status != 0)); then
