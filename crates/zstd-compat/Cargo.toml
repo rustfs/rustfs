@@ -30,7 +30,7 @@ zstdmt = ["zstd_fixed/zstdmt"]
 
 [dev-dependencies]
 zstd-safe = { version = "8.2.0", features = ["seekable"] }
-toml = "1.2.0"
+toml = "1.2.1"
 semver = "1.0.28"
 apache-avro.workspace = true
 arrow-array = "60.1.0"
