@@ -488,6 +488,7 @@ impl ECStore {
 
         preflight_startup_rpc_secret(&endpoint_pools)?;
         instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
+        runtime_sources::ensure_local_disk_maps(&instance_ctx, endpoint_pools.clone()).await?;
 
         let mut deployment_id = None;
         let mut pool_meta_bootstrap_authorities = Vec::new();
@@ -496,8 +497,6 @@ impl ECStore {
 
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());
-
-        let mut local_disks = Vec::new();
 
         debug!(
             event = EVENT_ECSTORE_INIT_STATUS,
@@ -649,21 +648,10 @@ impl ECStore {
                 deployment_id = Some(Uuid::new_v4());
             }
 
-            for disk in disks.iter() {
-                if disk.is_some() && disk.as_ref().expect("operation should succeed").is_local() {
-                    local_disks.push(disk.as_ref().expect("operation should succeed").clone());
-                }
-            }
-
             let sets = Sets::new_with_instance_ctx(disks.clone(), pool_eps, &fm, i, parity_drives, instance_ctx.clone()).await?;
             pools.push(sets);
 
             disk_map.insert(i, disks);
-        }
-
-        // Replace the local disk
-        if !instance_ctx.is_dist_erasure().await {
-            runtime_sources::record_local_disks(&instance_ctx, local_disks).await;
         }
 
         let deployment_id = deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?;
@@ -3576,8 +3564,10 @@ mod tests {
         assert!(completed.is_multipart());
         let disks = set.disks.read().await.clone();
         let registered = ctx.local_disk_map().read().await.clone();
+        let layout = ctx.local_disk_set_drives().read().await.clone();
         assert_eq!(disks.len(), 4, "direct construction keeps the configured set width");
         assert_eq!(registered.len(), disks.len(), "direct construction publishes every local drive");
+        assert_eq!((layout.len(), layout[0].len(), layout[0][0].len()), (1, 1, 4));
         for (slot, disk) in disks.iter().enumerate() {
             let disk = disk.as_ref().expect("direct constructor populates the runtime slot");
             assert_eq!(
@@ -3589,6 +3579,12 @@ mod tests {
                 .and_then(Option::as_ref)
                 .expect("runtime slot has a local RPC route");
             assert!(Arc::ptr_eq(disk, route), "runtime slot and RPC registry share their admitted handle");
+            assert!(Arc::ptr_eq(
+                disk,
+                layout[0][0][slot]
+                    .as_ref()
+                    .expect("direct construction publishes the original topology slot"),
+            ));
         }
         let mut reader = set
             .get_object_reader(bucket, object, None, http::HeaderMap::new(), &opts)

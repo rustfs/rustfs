@@ -23,8 +23,8 @@ use crate::error::{Error, Result};
 use crate::layout::format::{legacy_format_max_bytes, validate_format_erasure_layout};
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources::{
-    LOCAL_DISK_OPEN_CONCURRENCY, PreparedLocalDisk, prepare_local_disk, prepare_local_disks, publish_local_disks,
-    quarantine_local_disks, quarantine_local_disks_preserving_bootstrap_routes, reconcile_local_disk_ids,
+    PreparedLocalDisk, prepare_disks, publish_local_disks, quarantine_local_disks,
+    quarantine_local_disks_preserving_bootstrap_routes, reconcile_local_disk_ids,
 };
 use crate::{
     disk::{
@@ -50,60 +50,32 @@ pub async fn init_disks(
     opt: &DiskOption,
 ) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
     let _registration = instance_ctx.local_disk_registration_lock().lock().await;
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let has_layout = !set_drives.read().await.is_empty();
-    let map = instance_ctx.local_disk_map();
-    let registered = {
-        let disks = map.read().await;
-        eps.as_ref()
-            .iter()
-            .map(|endpoint| {
-                if endpoint.is_local {
-                    let entry = disks.get(&endpoint.to_string());
-                    (entry.is_some(), entry.cloned().flatten())
-                } else {
-                    (false, None)
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut results = stream::iter(eps.as_ref().iter().enumerate())
-        .map(|(index, endpoint)| {
-            let (was_registered, previous) = registered[index].clone();
-            async move {
-                let result = if endpoint.is_local {
-                    prepare_local_disk(instance_ctx, endpoint, previous.clone(), opt).await
-                } else {
-                    crate::disk::new_disk_for_instance(instance_ctx, endpoint, opt).await
-                };
-                (index, endpoint, was_registered, previous, result)
-            }
-        })
-        .buffer_unordered(LOCAL_DISK_OPEN_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    results.sort_unstable_by_key(|(index, _, _, _, _)| *index);
+    let results = prepare_disks(instance_ctx, eps.as_ref(), opt).await;
     let mut disks = vec![None; results.len()];
     let mut errors = vec![None; results.len()];
     let mut prepared = Vec::new();
     let mut publication_indices = Vec::new();
-    for (index, endpoint, was_registered, previous, result) in results {
-        let has_geometry = endpoint.pool_idx >= 0 && endpoint.set_idx >= 0 && endpoint.disk_idx >= 0;
-        let needs_publication = endpoint.is_local && (has_layout || (was_registered && has_geometry));
-        let disk = match result {
+    for (index, opened) in results.into_iter().enumerate() {
+        let disk = match opened.result {
             Ok(disk) => Some(disk),
             Err(error) => {
                 errors[index] = Some(error);
                 None
             }
         };
-        if !needs_publication {
-            // A standalone raw opener without a registered member returns its
-            // handle directly. Its constructor owns later erasure admission.
-            disks[index] = disk;
-            continue;
-        }
-        match PreparedLocalDisk::new(endpoint, previous, disk) {
+        let registration = match opened.registration {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                // A raw opener owns no runtime membership to publish.
+                disks[index] = disk;
+                continue;
+            }
+            Err(error) => {
+                errors[index].get_or_insert(error);
+                continue;
+            }
+        };
+        match PreparedLocalDisk::new(registration, disk) {
             Ok(registration) => {
                 prepared.push(registration);
                 publication_indices.push(index);
@@ -149,7 +121,7 @@ pub(crate) async fn refresh_missing_local_disks(
         .map(|(index, endpoint)| (index, endpoint.clone()))
         .collect::<Vec<_>>();
     let endpoints = pending.iter().map(|(_, endpoint)| endpoint.clone()).collect::<Vec<_>>();
-    let prepared = prepare_local_disks(
+    let opened = prepare_disks(
         instance_ctx,
         &endpoints,
         &DiskOption {
@@ -157,7 +129,11 @@ pub(crate) async fn refresh_missing_local_disks(
             health_check: true,
         },
     )
-    .await?;
+    .await;
+    let mut prepared = Vec::with_capacity(opened.len());
+    for opened in opened {
+        prepared.push(opened.into_local_registration()?);
+    }
     let published = publish_local_disks(instance_ctx, prepared).await?;
     for ((index, _), disk) in pending.into_iter().zip(published) {
         if let Some(disk) = disk {
@@ -1459,6 +1435,43 @@ mod tests {
         assert!(errors.iter().all(Option::is_none), "disk initialization failed: {errors:?}");
         assert!(disks[0].is_some());
         assert!(!staging.exists(), "a fresh disk open must still clear stale staging");
+    }
+
+    #[tokio::test]
+    async fn init_disks_preserves_registered_raw_endpoint_without_geometry() {
+        let directory = tempfile::tempdir().expect("raw local endpoint fixture");
+        let endpoint = Endpoint::try_from(directory.path().to_str().expect("UTF-8 raw endpoint")).expect("raw endpoint");
+        assert_eq!((endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx), (-1, -1, -1));
+        let original = crate::disk::new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("open raw endpoint");
+        let context = Arc::new(InstanceContext::new());
+        record_local_disks(&context, vec![original.clone()]).await;
+        let staging = directory.path().join(RUSTFS_META_BUCKET).join("tmp/raw-live-staging");
+        tokio::fs::write(&staging, b"live raw staging")
+            .await
+            .expect("seed raw live staging");
+
+        let (opened, errors) = init_disks(
+            &context,
+            &Endpoints::from(vec![endpoint.clone()]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "raw endpoint errors: {errors:?}");
+        assert!(Arc::ptr_eq(opened[0].as_ref().expect("raw handle remains available"), &original));
+        assert!(Arc::ptr_eq(
+            context.local_disk_map().read().await[&endpoint.to_string()]
+                .as_ref()
+                .expect("raw registration remains available"),
+            &original,
+        ));
+        assert!(context.local_disk_set_drives().read().await.is_empty());
+        assert_eq!(tokio::fs::read(staging).await.expect("preserved raw staging"), b"live raw staging");
     }
 
     #[tokio::test]
