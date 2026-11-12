@@ -146,6 +146,33 @@ rg -qF -- '--labeled-compare-csv sync-on/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/A2-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/A2-vs-A1' "$TRACE_FILE"
+[[ "$(rg -c -- '--baseline-drift' "$TRACE_FILE")" == "1" ]]
+rg 'DRY-RUN:.*candidate_gate.md' "$TRACE_FILE" >"${TMP_DIR}/candidate-gate-command.log"
+rg 'DRY-RUN:.*baseline_drift_gate.md' "$TRACE_FILE" >"${TMP_DIR}/drift-gate-command.log"
+if rg -q -- '--baseline-drift' "${TMP_DIR}/candidate-gate-command.log"; then
+  echo "expected candidate gate to retain directional regression checks" >&2
+  exit 1
+fi
+rg -q -- '--baseline-drift.*--require-tail-error' "${TMP_DIR}/drift-gate-command.log"
+
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --workload 'put-100kib|put|100KiB' \
+  --drive-sync 'sync-on|true' \
+  --allow-regression --exemption-reason 'candidate correctness tradeoff' \
+  --out-dir "${TMP_DIR}/candidate-exemption" \
+  --dry-run >"${TMP_DIR}/candidate-exemption-trace.log" 2>&1
+rg 'DRY-RUN:.*candidate_gate.md' "${TMP_DIR}/candidate-exemption-trace.log" | rg -q -- '--allow-regression'
+rg 'DRY-RUN:.*baseline_drift_gate.md' "${TMP_DIR}/candidate-exemption-trace.log" >"${TMP_DIR}/exempted-run-drift-command.log"
+rg -q -- '--baseline-drift' "${TMP_DIR}/exempted-run-drift-command.log"
+if rg -q -- '--allow-regression|--exemption-reason' "${TMP_DIR}/exempted-run-drift-command.log"; then
+  echo "expected candidate exemption to leave baseline stability checks strict" >&2
+  exit 1
+fi
 
 if "$RUNNER" \
   --baseline-bin /usr/bin/true \

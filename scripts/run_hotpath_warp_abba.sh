@@ -636,7 +636,7 @@ for i in "${!CANDIDATE_COMPARE_CSVS[@]}"; do
 done
 [[ "$ALLOW_REGRESSION" == "true" ]] && gate_args+=(--allow-regression --exemption-reason "$EXEMPTION_REASON")
 
-drift_gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
+drift_gate_args=(--baseline-drift --fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
 for i in "${!DRIFT_COMPARE_CSVS[@]}"; do
   drift_gate_args+=(--labeled-compare-csv "${DRIFT_COMPARE_LABELS[$i]}" "${DRIFT_COMPARE_CSVS[$i]}")
 done
@@ -675,8 +675,8 @@ cat >"$OUT_DIR/summary.md" <<EOF
 
 Interpretation:
 
-- Treat candidate gate failures as actionable only when the A2-vs-A1 drift gate is PASS or the affected workload's A2 drift is materially smaller than the B1/B2 candidate delta.
-- If both candidate and baseline drift fail on the same workload, rerun with longer duration, more rounds, or a quieter runner before assigning causality.
+- Attribute candidate changes only after the affected workload's A2-vs-A1 baseline drift gate passes.
+- Baseline drift is measured in both directions. Rerun an unstable workload with longer duration, more rounds, or a quieter runner before assigning causality.
 EOF
 
 log "summary written to $OUT_DIR/summary.md"
