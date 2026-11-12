@@ -50,18 +50,32 @@ impl IntegrityBuilder {
         })
     }
 
+    pub(crate) fn part(&self) -> &PartIntegrity {
+        &self.part
+    }
+
     pub(crate) async fn push<'a>(&mut self, shards: impl ExactSizeIterator<Item = &'a [u8]>) -> io::Result<()> {
+        self.push_with_precomputed(shards, &[]).await
+    }
+
+    pub(crate) async fn push_with_precomputed<'a>(
+        &mut self,
+        shards: impl ExactSizeIterator<Item = &'a [u8]>,
+        precomputed: &[Option<[u8; 32]>],
+    ) -> io::Result<()> {
         if shards.len() != self.part.layout.shards() {
             return Err(corrupt());
         }
         let mut row = Vec::with_capacity(shards.len() * 32);
         for (index, payload) in shards.enumerate() {
-            row.extend_from_slice(
-                &self
+            let digest = match precomputed.get(index).copied().flatten() {
+                Some(digest) => digest,
+                None => self
                     .part
                     .shard_digest(self.part.stripes, index, payload)
                     .map_err(|_| corrupt())?,
-            );
+            };
+            row.extend_from_slice(&digest);
         }
         self.append(&row).await?;
         self.part.stripes = self.part.stripes.checked_add(1).ok_or_else(corrupt)?;
@@ -248,11 +262,45 @@ impl PreparedIntegrity {
         directory: &str,
     ) -> io::Result<PartIntegrity> {
         let length = self.part.index_size().map_err(|_| corrupt())?;
+        let length_i64 = i64::try_from(length).map_err(|_| corrupt())?;
         let path = format!("{directory}/{}", self.part.file_name());
+        let mut file = match self.index {
+            Spool::Memory(bytes) => {
+                let payload = Bytes::from(bytes);
+                futures::future::join_all(disks.iter_mut().map(|disk_opt| {
+                    let path = &path;
+                    let payload = payload.clone();
+                    async move {
+                        let Some(disk) = disk_opt.as_ref() else {
+                            return;
+                        };
+                        let res = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                            let mut writer = disk
+                                .create_file(original_volume, volume, path, length_i64)
+                                .await
+                                .map_err(io::Error::other)?;
+                            if let Some(local) = crate::disk::as_lazy_local_file_writer_mut(&mut *writer) {
+                                local.write_all_bytes(payload).await?;
+                            } else {
+                                writer.write_all(&payload).await?;
+                            }
+                            writer.shutdown().await
+                        })
+                        .await;
+                        if !matches!(res, Ok(Ok(()))) {
+                            *disk_opt = None;
+                        }
+                    }
+                }))
+                .await;
+                return Ok(self.part);
+            }
+            Spool::File(file) => file,
+        };
         let mut writers = futures::future::join_all(disks.iter().map(|disk| async {
             match disk {
                 Some(disk) => disk
-                    .create_file(original_volume, volume, &path, i64::try_from(length).map_err(|_| corrupt())?)
+                    .create_file(original_volume, volume, &path, length_i64)
                     .await
                     .map(Some)
                     .map_err(io::Error::other),
@@ -264,19 +312,14 @@ impl PreparedIntegrity {
         .map(Result::ok)
         .map(Option::flatten)
         .collect::<Vec<_>>();
-        let mut source: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match self.index {
-            Spool::Memory(bytes) => Box::new(std::io::Cursor::new(bytes)),
-            Spool::File(mut file) => {
-                // The file has a single owner; duplicated descriptors share offsets.
-                file = tokio::task::spawn_blocking(move || {
-                    file.seek(SeekFrom::Start(0))?;
-                    io::Result::Ok(file)
-                })
-                .await
-                .map_err(io::Error::other)??;
-                Box::new(tokio::fs::File::from_std(file))
-            }
-        };
+        // The file has a single owner; duplicated descriptors share offsets.
+        file = tokio::task::spawn_blocking(move || {
+            file.seek(SeekFrom::Start(0))?;
+            io::Result::Ok(file)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        let mut source = tokio::fs::File::from_std(file);
         let mut buffer = vec![0; COPY_CHUNK_SIZE.min(length)];
         loop {
             let n = source.read(&mut buffer).await?;

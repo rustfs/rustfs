@@ -509,7 +509,9 @@ pass/fail table in the job summary.
   incomplete parameterized cases.
 - `api_coverage.py` — quantifies S3 API surface coverage by comparing the
   s3s `S3` trait (at the revision pinned in Cargo.toml) against the methods
-  RustFS overrides in `impl S3 for FS`:
+  RustFS overrides in `impl S3 for FS`, found exactly once across
+  `rustfs/src/storage/ecfs.rs` and `rustfs/src/storage/legacy_edge/`
+  (contract tests: `test_api_coverage.py`, run by `make script-tests`):
 
   ```bash
   python3 scripts/s3-tests/api_coverage.py            # summary + missing ops

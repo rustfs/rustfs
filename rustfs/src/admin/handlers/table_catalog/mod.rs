@@ -1088,20 +1088,6 @@ fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> 
     Ok(AdminResponse::with_headers(status, body, headers))
 }
 
-// These handlers still use the legacy router while their request bodies migrate.
-// TODO(T1.12-codemod): move them to the owned operation boundary.
-type LegacyRequest = s3s::S3Request<s3s::Body>;
-type LegacyResponse = s3s::S3Response<(StatusCode, s3s::Body)>;
-
-fn legacy_request_view(req: &LegacyRequest) -> AdminRequest {
-    AdminRequest::new(RequestEnvelope::from_s3s(req), Body::empty())
-}
-
-fn legacy_response(response: AdminResponse) -> LegacyResponse {
-    let (status, headers, body) = response.into_parts();
-    LegacyResponse::with_headers((status, body.into()), headers)
-}
-
 fn duration_millis_u64(duration: StdDuration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1297,16 +1283,19 @@ struct TableCatalogRequestPrincipal {
     iam_store: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
 }
 
-fn install_table_catalog_s3_request_info(req: &mut LegacyRequest, principal: &TableCatalogRequestPrincipal) -> S3Result<()> {
-    if req.extensions.get::<ReqInfo>().is_none() {
-        req.extensions.insert(ReqInfo {
-            region: req.region.clone(),
+fn install_table_catalog_s3_request_info(req: &mut AdminRequest, principal: &TableCatalogRequestPrincipal) -> S3Result<()> {
+    if req.req_info().is_none() {
+        let _ = req.install_req_info(ReqInfo {
+            region: req
+                .region()
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| table_catalog_internal_error("invalid table catalog request region"))?,
             ..Default::default()
         });
     }
     let req_info = req
-        .extensions
-        .get_mut::<ReqInfo>()
+        .req_info_mut()
         .ok_or_else(|| s3_error!(InternalError, "failed to install table catalog authorization context"))?;
     req_info.cred = Some(principal.credentials.clone());
     req_info.is_owner = principal.owner;
@@ -1451,10 +1440,10 @@ where
         }
     }
 
-    fn for_request(backend: B, req: LegacyRequest) -> Self {
+    fn for_request(backend: B, req: AdminRequest) -> Self {
         Self::new(
             backend,
-            TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(legacy_request_view(&req)))),
+            TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
             rustfs_utils::get_env_bool(crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED, false),
         )
     }

@@ -3170,7 +3170,11 @@ fn process_connection(
         let http_service = SwiftService::new(true, None, http_service);
         let http_service =
             EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
+        #[cfg(not(feature = "internode-transport"))]
         let http_service = InternodeRpcService::new(http_service);
+        #[cfg(feature = "internode-transport")]
+        let http_service =
+            InternodeRpcService::with_external_control(http_service, if is_console { None } else { server_ctx.peer_control() });
 
         let external_service = hybrid(http_service.clone(), rpc_service.clone());
         let internode_service = hybrid(http_service, rpc_service);
