@@ -234,6 +234,8 @@ pub struct InstanceContext {
     /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
     list_read_budget: OnceLock<ListReadBudget>,
+    #[cfg(feature = "internode-transport")]
+    internode_data_transport: OnceLock<Arc<dyn crate::api::rpc::InternodeDataTransport>>,
     /// This instance's namespace lock manager (Phase 5 Slice 3, backlog#939).
     ///
     /// Owned per-instance so two instances no longer share a lock namespace
@@ -391,6 +393,49 @@ impl InstanceContext {
         Self::with_lock_manager(Arc::new(GlobalLockManager::new()))
     }
 
+    /// Select this instance's transport before creating or reconnecting remote disks.
+    /// Returns an error for a repeated installation or an unsupported configured name.
+    #[cfg(feature = "internode-transport")]
+    pub fn install_internode_data_transport(
+        &self,
+        provider: Arc<dyn crate::api::rpc::InternodeDataTransport>,
+    ) -> std::io::Result<()> {
+        let configured = std::env::var(rustfs_config::ENV_RUSTFS_INTERNODE_DATA_TRANSPORT).ok();
+        self.select_internode_data_transport(provider, configured.as_deref())
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn select_internode_data_transport(
+        &self,
+        provider: Arc<dyn crate::api::rpc::InternodeDataTransport>,
+        configured: Option<&str>,
+    ) -> std::io::Result<()> {
+        let name = provider.name();
+        if name.is_empty()
+            || name.len() > 64
+            || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            || rustfs_config::KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS.contains(&name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid external internode transport name",
+            ));
+        }
+        let selected = match configured.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) if value.eq_ignore_ascii_case(name) => provider,
+            value => crate::cluster::rpc::internode_data_transport::build_internode_data_transport(value)
+                .map_err(std::io::Error::other)?,
+        };
+        self.internode_data_transport
+            .set(selected)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "internode transport already installed"))
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn internode_data_transport(&self) -> Option<&Arc<dyn crate::api::rpc::InternodeDataTransport>> {
+        self.internode_data_transport.get()
+    }
+
     /// Bound native listing fanout independently of GET body permits. A walk
     /// keeps its shared grant until all of its disk producers have terminated.
     /// Acquire before creating the merge channels or taking object locks.
@@ -418,6 +463,8 @@ impl InstanceContext {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
             list_read_budget: OnceLock::new(),
+            #[cfg(feature = "internode-transport")]
+            internode_data_transport: OnceLock::new(),
             lock_manager,
             region: OnceLock::new(),
             additional_regions: OnceLock::new(),

@@ -55,6 +55,10 @@ use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, measure_client_rpc,
+};
+use rustfs_io_metrics::internode_metrics::{
     INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE,
     INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE,
     INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
@@ -997,6 +1001,8 @@ pub struct RemoteDisk {
     #[cfg(test)]
     recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     data_transport: Arc<dyn InternodeDataTransport>,
+    #[cfg(feature = "internode-transport")]
+    external_streams: bool,
     /// Bound the per-operation failure warnings of this peer. An unreachable
     /// peer fails every in-flight shard operation; the counters keep the exact
     /// numbers per operation. Per handle, so one peer cannot hide another's.
@@ -1438,6 +1444,8 @@ impl RemoteDisk {
             #[cfg(test)]
             recovery_monitor_teardown_hook: Arc::new(tokio::sync::Mutex::new(None)),
             data_transport,
+            #[cfg(feature = "internode-transport")]
+            external_streams: false,
             timeout_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
             network_error_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
         };
@@ -1450,6 +1458,14 @@ impl RemoteDisk {
         }
 
         Ok(disk)
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn with_instance_transport(mut self) -> Self {
+        // Built-in names are reserved by the instance registration API. A host provider
+        // owns its open, data verification and cancellation as one operation.
+        self.external_streams = !rustfs_config::KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS.contains(&self.data_transport.name());
+        self
     }
 
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
@@ -1475,6 +1491,10 @@ impl RemoteDisk {
     }
 
     async fn open_write_with_retry(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+        #[cfg(feature = "internode-transport")]
+        if self.external_streams {
+            return self.data_transport.open_write(request).await;
+        }
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
@@ -3721,13 +3741,17 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RpcStatus,
+                        );
                         return Err(err.into());
                     }
                 };
 
                 if !response.success {
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                        crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::RemoteResponse,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -3746,7 +3770,9 @@ impl DiskAPI for RemoteDisk {
                     }
                     Err(err) => {
                         record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, decode_started);
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error(
+                            crate::cluster::rpc::runtime_sources::ReadVersionErrorStage::ResponseDecode,
+                        );
                         return Err(err);
                     }
                 };
@@ -3808,12 +3834,8 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response_result = client.batch_read_version(request).await;
-                    if let Some(rpc_started) = rpc_started {
-                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
-                            rpc_started.elapsed(),
-                        );
-                    }
+                    let response_result =
+                        measure_client_rpc(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, client.batch_read_version(request)).await;
                     let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
@@ -4206,6 +4228,10 @@ impl DiskAPI for RemoteDisk {
             length,
             stall_timeout: timeouts.body_stall,
         };
+        #[cfg(feature = "internode-transport")]
+        if self.external_streams {
+            return self.data_transport.open_read(request).await;
+        }
         let reader = self.open_read_with_retry(request.clone()).await?;
         Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
             reader,
@@ -4237,6 +4263,10 @@ impl DiskAPI for RemoteDisk {
             length,
             stall_timeout: timeouts.body_stall,
         };
+        #[cfg(feature = "internode-transport")]
+        if self.external_streams {
+            return self.data_transport.open_read_chunks(request).await;
+        }
         let reader = self.open_read_chunks_with_retry(request.clone()).await?;
         Ok(reader.map(|reader| {
             Box::new(RetryingRemoteChunkReader::new_with_timeouts(
@@ -4831,9 +4861,7 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let rpc_started = Instant::now();
-                let response = client.read_multiple(request).await;
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = measure_client_rpc(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, client.read_multiple(request)).await;
                 let response = response?.into_inner();
 
                 if !response.success {
@@ -4885,8 +4913,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
-                let rpc_started = Instant::now();
-                let response = match client.write_all(request).await {
+                let response = match measure_client_rpc(INTERNODE_OPERATION_GRPC_WRITE_ALL, client.write_all(request)).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
@@ -4894,7 +4921,6 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -4992,16 +5018,13 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
-                let rpc_started = Instant::now();
-                let response = match client.read_all(request).await {
+                let response = match measure_client_rpc(INTERNODE_OPERATION_GRPC_READ_ALL, client.read_all(request)).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                         return Err(err.into());
                     }
                 };
-
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
@@ -10392,6 +10415,81 @@ mod tests {
             }
             other => panic!("expected append write transport call, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_open_returns_the_original_error_after_one_attempt() {
+        let failure = || {
+            OpenWriteTestStep::Error(DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+                rustfs_rio::InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            )))
+        };
+        let writer = RetryingOpenWriteInternodeDataTransport::with_steps(vec![failure(), OpenWriteTestStep::Success]);
+        let disk = new_remote_disk_with_transport(Arc::new(writer.clone()))
+            .await
+            .with_instance_transport();
+        let error = disk
+            .create_file("", "bucket", "shard", 3)
+            .await
+            .err()
+            .expect("provider write failure");
+        assert_eq!(
+            error.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE))
+        );
+        assert_eq!(writer.calls().len(), 1);
+        let reader = RetryingOpenReadInternodeDataTransport::with_steps(vec![failure(), OpenWriteTestStep::Success]);
+        let disk = new_remote_disk_with_transport(Arc::new(reader.clone()))
+            .await
+            .with_instance_transport();
+        let error = disk
+            .read_file_stream("bucket", "shard", 0, 3)
+            .await
+            .err()
+            .expect("provider read failure");
+        assert_eq!(
+            error.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE))
+        );
+        assert_eq!(reader.calls().len(), 1);
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_body_failures_never_open_a_fresh_stream() {
+        let provider = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::PartialThenReset(b"x".to_vec())]));
+        let disk = new_remote_disk_with_transport(provider.clone())
+            .await
+            .with_instance_transport();
+        let mut reader = disk.read_file_stream("bucket", "shard", 0, 3).await.expect("reader");
+        let mut bytes = Vec::new();
+        let error = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
+            .await
+            .expect_err("stream reset");
+        assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
+        assert_eq!(bytes, b"x");
+        assert_eq!(provider.read_requests.lock().expect("recorded transport calls").len(), 1);
+        assert!(provider.fresh_read_requests.lock().expect("recorded fresh calls").is_empty());
+        let provider = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::PartialThenReset(b"x".to_vec())]));
+        let disk = new_remote_disk_with_transport(provider.clone())
+            .await
+            .with_instance_transport();
+        let mut reader = disk
+            .read_file_stream_chunks("bucket", "shard", 0, 3)
+            .await
+            .expect("chunked stream")
+            .expect("supported");
+        let chunk = std::future::poll_fn(|cx| Pin::new(reader.as_mut()).poll_read_chunk(cx, 16))
+            .await
+            .expect("first chunk");
+        assert_eq!(chunk, Some(Bytes::from_static(b"x")));
+        let error = std::future::poll_fn(|cx| Pin::new(reader.as_mut()).poll_read_chunk(cx, 16))
+            .await
+            .expect_err("chunk stream reset");
+        assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
+        assert_eq!(provider.chunk_requests.lock().expect("recorded transport calls").len(), 1);
+        assert!(provider.fresh_chunk_requests.lock().expect("recorded fresh calls").is_empty());
     }
 
     #[tokio::test]

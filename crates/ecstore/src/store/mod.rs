@@ -456,6 +456,8 @@ mod rebalance;
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
+#[cfg(feature = "internode-transport")]
+pub use peer::external_rpc_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,

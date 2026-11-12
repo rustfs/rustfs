@@ -185,57 +185,122 @@ def _matching(text: str, mask: bytearray, open_pos: int) -> int:
     raise InputError(f"unbalanced brace at offset {open_pos}")
 
 
-def module_declaration(root: Path, path: str) -> tuple[list[str], str] | None:
-    """(candidate parent files, module name) for a file below src/, or None for a crate root."""
-    parts = Path(path)
-    if parts.name in ("lib.rs", "main.rs") and parts.parent.name == "src":
-        return None
-    if parts.name == "mod.rs":
-        name, directory = parts.parent.name, parts.parent.parent
-    else:
-        name, directory = parts.stem, parts.parent
-    if directory.name == "bin" and parts.name != "mod.rs":
-        return None
-    candidates = [directory.with_suffix(".rs"), directory / "mod.rs"]
-    if directory.name == "src":
-        candidates = [directory / "lib.rs", directory / "main.rs"]
-    return [str(parent) for parent in candidates if (root / parent).is_file()], name
+def module_attributes(code: str, offset: int) -> list[tuple[int, int]]:
+    """Attribute spans immediately preceding a declaration, using masked code."""
+    attributes = []
+    end = offset
+    while True:
+        end = len(code[:end].rstrip())
+        if end == 0 or code[end - 1] != "]":
+            return attributes
+        depth, start = 1, end - 2
+        while start >= 0 and depth:
+            depth += code[start] == "]"
+            depth -= code[start] == "["
+            start -= 1
+        if depth:
+            raise InputError("unbalanced module attribute")
+        start = len(code[:start + 1].rstrip()) - 1
+        if start < 0 or code[start] != "#":
+            return attributes
+        attributes.append((start, end))
+        end = start
 
 
-def is_test_only_file(root: Path, path: str, cache: dict[str, bool]) -> bool:
+class ModuleDeclarations:
+    """Resolve file-level external modules; inline and macro scopes are not inferred."""
+
+    def __init__(self, root: Path, files: list[str]):
+        self.root = root.resolve()
+        self.sources: dict[str, tuple[str, bytearray]] = {}
+        self.parents: dict[str, list[tuple[str, int]]] = {}
+        pending: list[tuple[str, int, str, list[str]]] = []
+        declaration = re.compile(r"\b(?:pub(?:\([^()\n]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*;")
+        for parent in files:
+            text = (root / parent).read_text()
+            mask = code_mask(text)
+            self.sources[parent] = (text, mask)
+            code = "".join(ch if mask[i] or ch == "\n" else " " for i, ch in enumerate(text))
+            depth, previous = 0, 0
+            for match in declaration.finditer(code):
+                for ch in code[previous:match.start()]:
+                    depth += ch in "([{"
+                    depth -= ch in ")]}"
+                previous = match.start()
+                if depth != 0:
+                    continue
+                paths = []
+                for start, end in module_attributes(code, match.start()):
+                    attribute = code[start:end]
+                    if re.match(r"#\s*\[\s*path\b", attribute):
+                        literal = re.fullmatch(r'#\s*\[\s*path\s*=\s*"([^"\\]*)"\s*\]', text[start:end])
+                        if literal is None:
+                            raise InputError(f"{parent}: unsupported module path attribute")
+                        paths.append(literal.group(1))
+                    elif re.search(r"\bpath\s*=", attribute):
+                        raise InputError(f"{parent}: conditional module path attributes are unsupported")
+                if len(paths) > 1:
+                    raise InputError(f"{parent}: duplicate module path attributes")
+                pending.append((parent, match.start(), match.group(1), paths))
+        # rustc treats every #[path]-included file like mod.rs for its children,
+        # regardless of the source filename or the declared module name.
+        attributed_files = {(root / Path(parent).parent / paths[0]).resolve()
+                            for parent, _, _, paths in pending if paths}
+        for parent, offset, name, paths in pending:
+            file = Path(parent)
+            if paths:
+                targets = [file.parent / paths[0]]
+            else:
+                crate_root = file.parent.name == "src" and file.name in ("lib.rs", "main.rs") or file.parent.name == "bin"
+                mod_rs = file.name == "mod.rs" or crate_root or (root / file).resolve() in attributed_files
+                directory = file.parent if mod_rs else file.with_suffix("")
+                targets = [directory / f"{name}.rs", directory / name / "mod.rs"]
+            if not paths and sum((root / target).is_file() for target in targets) > 1:
+                raise InputError(f"{parent}: ambiguous module files for {name}")
+            for target in targets:
+                resolved = (root / target).resolve()
+                if not resolved.is_relative_to(self.root):
+                    raise InputError(f"{parent}: module path escapes the repository: {target}")
+                if not resolved.is_file():
+                    if paths:
+                        raise InputError(f"{parent}: module path is missing: {target}")
+                    continue
+                relative = str(resolved.relative_to(self.root))
+                self.parents.setdefault(relative, []).append((parent, offset))
+
+
+def is_test_only_file(root: Path, path: str, cache: dict[str, bool], modules: ModuleDeclarations, visiting: set[str]) -> bool:
     if path in cache:
         return cache[path]
-    parts = Path(path).parts
-    if len(parts) > 1 and parts[1] in ("tests", "benches"):
-        cache[path] = True
-        return True
-    text = (root / path).read_text()
-    mask = code_mask(text)
-    if any(text[m.start() + 1] == "!" for m in CFG_TEST.finditer(text) if mask[m.start()]):
-        cache[path] = True
-        return True
-    declaration = module_declaration(root, path)
-    if declaration is None:
-        if Path(path).name in ("lib.rs", "main.rs") or Path(path).parent.name == "bin":
+    if path in visiting:
+        raise InputError(f"{path}: cycle in module declarations")
+    visiting.add(path)
+    try:
+        parts = Path(path).parts
+        if len(parts) > 1 and parts[1] in ("tests", "benches"):
+            cache[path] = True
+            return True
+        text, mask = modules.sources[path]
+        if any(text[m.start() + 1] == "!" for m in CFG_TEST.finditer(text) if mask[m.start()]):
+            cache[path] = True
+            return True
+        file = Path(path)
+        if file.name in ("lib.rs", "main.rs") and file.parent.name == "src" or file.parent.name == "bin":
             cache[path] = False
             return False
-        raise InputError(f"{path}: cannot find the file that declares this module")
-    parents, name = declaration
-    declarations = []
-    for parent in parents:
-        parent_text = (root / parent).read_text()
-        parent_mask = code_mask(parent_text)
-        pattern = rf"(?m)^[ \t]*(?:pub(?:\([^)\n]*\))?[ \t]+)?mod[ \t]+{re.escape(name)}[ \t]*;"
-        for m in re.finditer(pattern, parent_text):
-            if parent_mask[m.start() + len(m.group()) - len(m.group().lstrip())]:
-                declarations.append((parent, parent_text, parent_mask, m.start()))
-    if len(declarations) != 1:
-        raise InputError(f"{path}: expected one `mod {name};` in {' or '.join(parents) or 'a parent file'}, found {len(declarations)}")
-    parent, parent_text, parent_mask, offset = declarations[0]
-    cfg_test = any(start <= offset < end for start, end in test_regions(parent_text, parent_mask))
-    result = cfg_test or is_test_only_file(root, parent, cache)
-    cache[path] = result
-    return result
+        declarations = modules.parents.get(path, [])
+        if len(declarations) != 1:
+            name = file.parent.name if file.name == "mod.rs" else file.stem
+            raise InputError(f"{path}: expected one `mod {name};` declaration resolving to this file, found {len(declarations)}")
+        parent, offset = declarations[0]
+        parent_text, parent_mask = modules.sources[parent]
+        cfg_test = any(start <= offset < end for start, end in test_regions(parent_text, parent_mask))
+        # Validate the parent chain even when this declaration is test-only.
+        parent_test = is_test_only_file(root, parent, cache, modules, visiting)
+        cache[path] = cfg_test or parent_test
+        return cache[path]
+    finally:
+        visiting.remove(path)
 
 
 def rust_files(root: Path) -> list[str]:
@@ -271,13 +336,14 @@ def check(root: Path, files: list[str] | None = None) -> list[str]:
                 errors.append(f"{owner}: owner file of {method} is missing; update SEAMS in {Path(__file__).name}")
     files = rust_files(root) if files is None else files
     cache: dict[str, bool] = {}
+    modules = ModuleDeclarations(root, files)
     for path in files:
         text = (root / path).read_text()
         mask = code_mask(text)
         calls = [m for m in CALL.finditer(text) if mask[m.start()]]
         if not calls:
             continue
-        whole_file = is_test_only_file(root, path, cache)
+        whole_file = is_test_only_file(root, path, cache, modules, set())
         regions = test_regions(text, mask)
         for match in calls:
             method = match.group(1)
@@ -432,6 +498,150 @@ class SelfTest(unittest.TestCase):
     def test_owner_test_and_production_calls_pass(self):
         self.write("rustfs/src/app/object/put.rs", "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { u.execute_put_object(&fs, r); }\n}\n")
         self.assertEqual(self.run_check(), [])
+
+    def path_module(self, attributes: str = "", body: str = "fn prod() { u.execute_get_object(r); }\n"):
+        self.write("rustfs/src/app/storage.rs", attributes + '#[path = "moved/mod.rs"]\nmod relocated;\n')
+        self.write("rustfs/src/app/moved/mod.rs", body)
+
+    def test_path_module_from_non_mod_file_passes(self):
+        self.path_module()
+        self.assertEqual(self.run_check(), [])
+
+    def test_path_module_from_mod_file_passes(self):
+        self.write("rustfs/src/app/mod.rs", self.files["rustfs/src/app/mod.rs"] + '#[path = "elsewhere.rs"]\nmod renamed;\n')
+        self.write("rustfs/src/app/elsewhere.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.assertEqual(self.run_check(), [])
+
+    def test_path_module_child_uses_its_file_directory(self):
+        self.path_module(body="mod child;\n")
+        self.write("rustfs/src/app/moved/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.assertEqual(self.run_check(), [])
+
+    def test_non_mod_file_default_child_uses_module_directory(self):
+        self.write("rustfs/src/app/storage.rs", "mod child;\n")
+        self.write("rustfs/src/app/storage/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.assertEqual(self.run_check(), [])
+
+    def test_attributed_non_mod_file_child_is_a_sibling(self):
+        self.write("rustfs/src/app/storage.rs", '#[path = "other.rs"]\nmod renamed;\n')
+        self.write("rustfs/src/app/other.rs", "mod child;\n")
+        self.write("rustfs/src/app/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.assertEqual(self.run_check(), [])
+
+    def test_attributed_non_mod_file_child_does_not_use_stem_directory(self):
+        self.write("rustfs/src/app/storage.rs", '#[path = "other.rs"]\nmod renamed;\n')
+        self.write("rustfs/src/app/other.rs", "mod child;\n")
+        self.write("rustfs/src/app/other/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        with self.assertRaisesRegex(InputError, "expected one `mod child;`.*found 0"):
+            self.run_check()
+
+    def test_attributed_non_mod_file_test_ancestor_is_preserved(self):
+        self.write("rustfs/src/app/storage.rs", '#[cfg(test)]\n#[path = "other.rs"]\nmod renamed;\n')
+        self.write("rustfs/src/app/other.rs", "mod child;\n")
+        self.write("rustfs/src/app/child.rs", "fn t() { u.execute_get_object(r); }\n")
+        self.assertRegex(self.run_check()[0], r"app/child.rs:1: test calls execute_get_object directly")
+
+    def test_two_conventional_module_files_are_ambiguous(self):
+        self.write("rustfs/src/app/storage.rs", "mod child;\n")
+        self.write("rustfs/src/app/storage/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.write("rustfs/src/app/storage/child/mod.rs", "fn prod() {}\n")
+        with self.assertRaisesRegex(InputError, "ambiguous module files for child"):
+            self.run_check()
+
+    def test_path_module_cfg_test_still_rejects_direct_call(self):
+        self.path_module("#[cfg(test)]\n")
+        self.assertRegex(self.run_check()[0], r"moved/mod.rs:1: test calls execute_get_object directly")
+
+    def test_path_module_test_ancestor_still_rejects_direct_call(self):
+        self.path_module(body="mod child;\n")
+        self.write("rustfs/src/app/mod.rs", self.files["rustfs/src/app/mod.rs"].replace("mod storage;", "#[cfg(test)]\nmod storage;"))
+        self.write("rustfs/src/app/moved/child.rs", "fn t() { u.execute_get_object(r); }\n")
+        self.assertRegex(self.run_check()[0], r"moved/child.rs:1: test calls execute_get_object directly")
+
+    def test_path_module_test_using_seam_passes(self):
+        self.path_module("#[cfg(test)]\n", "fn t() { crate::app::test_seams::get_object(&u, r); }\n")
+        self.assertEqual(self.run_check(), [])
+
+    def test_path_module_missing_target_fails(self):
+        self.path_module()
+        (self.root / "rustfs/src/app/moved/mod.rs").unlink()
+        del self.files["rustfs/src/app/moved/mod.rs"]
+        with self.assertRaisesRegex(InputError, "module path is missing"):
+            self.run_check()
+
+    def test_path_module_duplicate_declarations_fail(self):
+        self.path_module()
+        self.write("rustfs/src/app/storage.rs", self.files["rustfs/src/app/storage.rs"] + '#[path = "moved/mod.rs"]\nmod second;\n')
+        with self.assertRaisesRegex(InputError, "found 2"):
+            self.run_check()
+
+    def test_conventional_and_explicit_owners_are_ambiguous(self):
+        self.write("rustfs/src/app/storage.rs", "mod child;\n")
+        self.write("rustfs/src/app/storage/child.rs", "fn prod() { u.execute_get_object(r); }\n")
+        self.write("rustfs/src/app/mod.rs", self.files["rustfs/src/app/mod.rs"] + '#[path = "storage/child.rs"]\nmod alias;\n')
+        with self.assertRaisesRegex(InputError, "expected one `mod child;`.*found 2"):
+            self.run_check()
+
+    def test_path_module_normalized_target_and_same_line_attributes(self):
+        self.path_module()
+        self.write("rustfs/src/app/storage.rs", '#[cfg(test)] #[path = "./moved/../moved/mod.rs"] pub(crate) mod renamed;\n')
+        self.assertRegex(self.run_check()[0], r"moved/mod.rs:1: test calls execute_get_object directly")
+
+    def test_path_module_does_not_declare_conventional_target(self):
+        self.write("rustfs/src/app/storage.rs", '#[cfg(test)]\n#[path = "actual.rs"]\nmod nominal;\n')
+        self.write("rustfs/src/app/actual.rs", "fn actual() {}\n")
+        self.write("rustfs/src/app/storage/nominal.rs", "fn t() { u.execute_get_object(r); }\n")
+        with self.assertRaisesRegex(InputError, "expected one `mod nominal;`.*found 0"):
+            self.run_check()
+
+    def test_path_module_wrong_existing_target_leaves_file_undeclared(self):
+        self.path_module()
+        self.write("rustfs/src/app/elsewhere.rs", "fn elsewhere() {}\n")
+        self.write("rustfs/src/app/storage.rs", '#[path = "elsewhere.rs"]\nmod relocated;\n')
+        with self.assertRaisesRegex(InputError, "expected one `mod moved;`.*found 0"):
+            self.run_check()
+
+    def test_path_module_fake_declarations_are_ignored(self):
+        self.path_module()
+        self.write("rustfs/src/app/storage.rs", self.files["rustfs/src/app/storage.rs"] +
+                   '// #[path = "moved/mod.rs"] mod fake;\n'
+                   '/* #[path = "moved/mod.rs"] mod fake; */\n'
+                   'const S: &str = r#"#[path = "moved/mod.rs"] mod fake;"#;\n')
+        self.assertEqual(self.run_check(), [])
+
+    def test_path_module_inline_and_macro_scopes_are_not_inferred(self):
+        for wrapper in ("mod inline {\n%s}\n", "some_macro! {\n%s}\n"):
+            with self.subTest(wrapper=wrapper):
+                self.path_module()
+                self.write("rustfs/src/app/storage.rs", wrapper % self.files["rustfs/src/app/storage.rs"])
+                with self.assertRaisesRegex(InputError, "found 0"):
+                    self.run_check()
+
+    def test_path_module_escape_is_rejected(self):
+        self.write("rustfs/src/app/storage.rs", '#[path = "../../../../outside.rs"]\nmod escaped;\n')
+        with self.assertRaisesRegex(InputError, "escapes the repository"):
+            self.run_check()
+
+    def test_path_module_unsupported_literal_is_rejected(self):
+        self.write("rustfs/src/app/storage.rs", '#[path = "moved\\x2fmod.rs"]\nmod escaped;\n')
+        with self.assertRaisesRegex(InputError, "unsupported module path"):
+            self.run_check()
+
+    def test_path_module_conditional_path_is_rejected(self):
+        self.write("rustfs/src/app/storage.rs", '#[cfg_attr(test, path = "moved.rs")]\nmod conditional;\n')
+        with self.assertRaisesRegex(InputError, "conditional module path"):
+            self.run_check()
+
+    def test_path_module_duplicate_attributes_are_rejected(self):
+        self.path_module('#[path = "moved/mod.rs"]\n')
+        with self.assertRaisesRegex(InputError, "duplicate module path attributes"):
+            self.run_check()
+
+    def test_path_module_parent_cycle_is_rejected(self):
+        self.write("rustfs/src/app/a.rs", '#[path = "b.rs"]\nmod b;\nfn prod() { u.execute_get_object(r); }\n')
+        self.write("rustfs/src/app/b.rs", '#[path = "a.rs"]\nmod a;\n')
+        with self.assertRaisesRegex(InputError, "cycle in module declarations"):
+            self.run_check()
 
     def test_calls_in_comments_and_strings_are_ignored(self):
         self.write("rustfs/src/app/storage.rs", '#[cfg(test)]\nmod tests {\n    // u.execute_get_object(r)\n    const S: &str = "u.execute_get_object(r)";\n}\n')

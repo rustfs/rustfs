@@ -60,7 +60,9 @@ use rustfs_utils::{
         AMZ_CHECKSUM_SHA256,
     },
     net::get_endpoint_url,
-    retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer},
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
@@ -117,6 +119,33 @@ fn transition_transport_error(err: hyper_util::client::legacy::Error) -> std::io
         return remote_tier_timeout_error("remote tier connection timed out");
     }
     std::io::Error::other(err)
+}
+
+fn is_retryable_transport_error(error: &std::io::Error) -> bool {
+    // Hyper wraps connection and body errors; the outer io::Error is often Other.
+    let mut current: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        }) || error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|error| error.is_incomplete_message() || error.is_closed())
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 async fn next_response_body_data<B>(
@@ -727,6 +756,18 @@ impl TransitionClient {
         Ok(resp)
     }
 
+    /// Executes a remote request, retrying transient failures up to `max_retries` total attempts.
+    ///
+    /// Only GET, HEAD, and PUT of a fixed multipart upload part with a buffered body
+    /// are replayed. Object readers and other mutations get one attempt: replaying
+    /// ordinary PUT or DELETE can create additional versions or delete markers.
+    /// Request construction failures and errors reading a successful response body
+    /// are not retried. Dropping this future stops further attempts and any pending
+    /// backoff; a failed or canceled request may still have reached the remote server.
+    ///
+    /// # Errors
+    /// Returns a request construction error, a permanent remote error, or the last
+    /// transient error when the attempt budget is exhausted.
     pub async fn execute_method(
         &self,
         method: http::Method,
@@ -738,24 +779,27 @@ impl TransitionClient {
             return Err(std::io::Error::other(s));
         }
 
-        let retryable: bool;
-        //let mut body_seeker: BufferReader;
-        let mut req_retry = self.max_retries;
-        let mut resp: Response<Incoming>;
-
-        //if metadata.content_body != nil {
-        //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
-        retryable = true;
-        if !retryable {
-            req_retry = 1;
-        }
-        //}
+        let retryable = matches!(&metadata.content_body, ReaderImpl::Body(_))
+            && (method == http::Method::GET
+                || method == http::Method::HEAD
+                || (method == http::Method::PUT
+                    && metadata.query_values.get("uploadId").is_some_and(|value| !value.is_empty())
+                    && metadata.query_values.get("partNumber").is_some_and(|value| !value.is_empty())));
+        let req_retry = if retryable { self.max_retries.max(1) } else { 1 };
+        let mut last_error = None;
 
         let mut retry_timer = RetryTimer::new(req_retry, DEFAULT_RETRY_UNIT, DEFAULT_RETRY_CAP, MAX_JITTER, self.random);
         while retry_timer.next().await.is_some() {
             let req = self.new_request(&method, metadata).await?;
 
-            resp = self.doit(req).await?;
+            let resp = match self.doit(req).await {
+                Ok(resp) => resp,
+                Err(error) if retryable && is_retryable_transport_error(&error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             for http_status in SUCCESS_STATUS {
                 if http_status == resp.status() {
@@ -766,11 +810,17 @@ impl TransitionClient {
             let resp_status = resp.status();
             let h = resp.headers().clone();
 
-            let body_vec = self
-                .collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE)
-                .await?;
+            let body_vec = match self.collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE).await {
+                Ok(body) => body,
+                Err(error) if retryable && is_retryable_transport_error(&error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let parsed_error =
                 http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
+            let retryable_response = is_http_status_retryable(&resp_status) || is_s3code_retryable(parsed_error.code.as_str());
             let routing_region = parsed_error.region;
             let code = match parsed_error.code {
                 code if code.is_custom() => RemoteErrorCode::RESPONSE_INTERRUPTED,
@@ -784,6 +834,11 @@ impl TransitionClient {
                 key: metadata.object_name.clone(),
                 ..Default::default()
             };
+
+            if retryable && retryable_response {
+                last_error = Some(std::io::Error::other(err_response));
+                continue;
+            }
 
             if self.region == "" {
                 return match err_response.code {
@@ -819,7 +874,7 @@ impl TransitionClient {
             return Err(std::io::Error::other(err_response));
         }
 
-        Err(std::io::Error::other("remote tier request did not produce a response"))
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("remote tier request did not produce a response")))
     }
 
     pub async fn collect_response_body<B>(&self, body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>

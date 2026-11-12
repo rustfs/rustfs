@@ -58,6 +58,13 @@ impl EncodedBlock {
         self.data.chunks_exact(self.shard_size)
     }
 
+    pub(crate) fn shards_bytes(&self) -> impl ExactSizeIterator<Item = Bytes> + '_ {
+        debug_assert!(self.shard_size > 0, "only non-empty encoded blocks reach shard writers");
+        debug_assert_eq!(self.data.len() % self.shard_size, 0);
+        let count = self.data.len() / self.shard_size;
+        (0..count).map(move |i| self.data.slice(i * self.shard_size..(i + 1) * self.shard_size))
+    }
+
     fn into_shards(mut self, shard_count: usize) -> Vec<Bytes> {
         if self.shard_size == 0 {
             return vec![Bytes::new(); shard_count];

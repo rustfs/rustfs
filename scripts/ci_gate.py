@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -33,12 +33,12 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "3"
+PLAN_CONTRACT = "5"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -47,6 +47,14 @@ E2E_SELECTION_FILES = {
         "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
     )
 }
+# Clippy and the test-binary archive share no compiler output, so the lint runs
+# beside the archive producer instead of in front of it. LINT_JOB is the only
+# job that may lint the workspace; nothing downstream of ARCHIVE_PRODUCER may
+# wait for it, or the lint is back on the path every workspace test waits on.
+LINT_JOB = "workspace-clippy"
+ARCHIVE_PRODUCER = "workspace-lint-and-build"
+ARCHIVE_CONSUMERS = ("workspace-tests", "workspace-shards", "workspace-shard-evidence")
+LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
@@ -303,7 +311,8 @@ def closure(seeds: set[str], graph: dict[str, set[str]], reverse: bool = False) 
 def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "", rehearse_shards: bool = False) -> dict[str, str]:
     if event not in EVENTS:
         raise ValueError(f"unsupported CI event: {event!r}")
-    if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
+    # `proven`: a push whose tree a successful merge-group run already validated.
+    if mode not in ("docs", "e2e", "full", "proven") or (mode != "full" and event != ("push" if mode == "proven" else "pull_request")):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
     if type(rehearse_shards) is not bool or (rehearse_shards and event != "workflow_dispatch"):
         raise ValueError("shard rehearsal requires an explicit manual event")
@@ -333,8 +342,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "workspace-lint-and-build", "dev", []),
-        ("workspace-tests", "workspace-lint-and-build", "test", []),
+        ("workspace-lint", LINT_JOB, "dev", []),
+        ("workspace-tests", ARCHIVE_PRODUCER, "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -368,7 +377,8 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
              "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
 
 
-def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False) -> dict:
+def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False,
+                *, proof: dict | None = None) -> dict:
     if event not in EVENTS or not SHA.fullmatch(head):
         raise ValueError("unsupported event or missing candidate SHA")
     tree = git(root, "rev-parse", f"{head}^{{tree}}").strip()
@@ -465,6 +475,10 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
     effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
     effective_connect = mode == "full" if shadow else connect
     effective_full = mode == "full" if shadow else full
+    proven = event == "push" and mode == "full" and isinstance(proof, dict) and proof.get("tree") == tree
+    if proven:
+        mode = "proven"
+        reasons.append(f"merge_group run {proof['url']} already validated tree {tree}")
     jobs = expected_results(mode, event, ref, effective_connect, action, rehearse_shards)
     plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
@@ -473,7 +487,9 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
-            "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
+            "not_applicable": {job: f"proven by {proof['url']}" if proven else f"not required for {mode}/{event}"
+                               for job, result in jobs.items() if result == "skipped"},
+            "proven_by": proof if proven else None}
     return plan
 
 
@@ -505,6 +521,12 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
         raise ValueError("invalid plan packages")
     if plan.get("mode") != "docs" and not packages:
         raise ValueError("code validation plan must not be empty")
+    proof = plan.get("proven_by")
+    if (proof is not None or plan.get("mode") == "proven") and not (
+            isinstance(proof, dict) and plan.get("mode") == "proven" and proof.get("tree") == plan["tree"]
+            and type(proof.get("run_id")) is int and proof["run_id"] > 0
+            and re.fullmatch(rf"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/{proof['run_id']}", str(proof.get("url")))):
+        raise ValueError("a proven push requires the merge-group run that validated its tree")
     expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""), plan["rehearse_shards"])
     if plan.get("jobs") != expected:
         raise ValueError("plan job contract differs from selected responsibilities")
@@ -665,6 +687,49 @@ def condition(expression: str | bool, context: dict) -> bool:
     return bool(result)
 
 
+def job_needs(jobs: dict, job: str) -> list[str]:
+    dependencies = jobs.get(job, {}).get("needs", [])
+    return [dependencies] if isinstance(dependencies, str) else list(dependencies)
+
+
+def check_lint_lane(jobs: dict) -> list[str]:
+    """Keep workspace Clippy gating every code event without delaying the test archive."""
+    errors = []
+    lint_steps = {job: [step for step in block.get("steps", [])
+                        if any(command in step.get("run", "") for command in LINT_COMMANDS)]
+                  for job, block in jobs.items()}
+    clippy = lint_steps.get(LINT_JOB, [])
+    if len(clippy) != 1 or any("if" in step for step in clippy):
+        errors.append("workspace Clippy must run on every code event, pull requests included")
+    if any(steps for job, steps in lint_steps.items() if job != LINT_JOB):
+        errors.append(f"workspace Clippy belongs to {LINT_JOB} alone")
+    lint, producer = jobs.get(LINT_JOB, {}), jobs.get(ARCHIVE_PRODUCER, {})
+    # The lint replaces a step of the producer; it must keep that job's scope.
+    if not lint or lint.get("if") != producer.get("if"):
+        errors.append(f"{LINT_JOB} must run under the same condition as {ARCHIVE_PRODUCER}")
+    for job in (ARCHIVE_PRODUCER, *ARCHIVE_CONSUMERS):
+        reached, pending = set(), [job]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(job_needs(jobs, current))
+        if LINT_JOB in reached:
+            errors.append(f"{job} must not wait for {LINT_JOB}")
+    if ARCHIVE_PRODUCER not in job_needs(jobs, "workspace-tests"):
+        errors.append(f"workspace-tests must consume the archive of {ARCHIVE_PRODUCER}")
+    return errors
+
+
+def check_plan_contract_marker(jobs: dict) -> list[str]:
+    """The workflow's fallback must test for the marker this revision's planner emits."""
+    scopes = [step for step in jobs.get("classify-changes", {}).get("steps", []) if step.get("id") == "scope"]
+    markers = re.findall(r"grep -q '\^plan_contract=([^$']*)\$'", scopes[0].get("run", "")) if len(scopes) == 1 else []
+    if markers != [PLAN_CONTRACT]:
+        return [f"classify-changes must fall back to the full matrix unless the plan carries contract {PLAN_CONTRACT}"]
+    return []
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -733,15 +798,13 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("env", {}).get("CI_NEEDS") != "${{ toJSON(needs) }}"
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
-    lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
-              if any(command in step.get("run", "") for command in lint_commands)]
-    if not clippy or any("if" in step for step in clippy):
-        errors.append("workspace Clippy must run on every code event, pull requests included")
+    errors.extend(check_lint_lane(jobs))
+    errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "internode-transport": "--features rustfs/internode-transport"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):
@@ -751,7 +814,7 @@ def check_workflow(root: Path) -> list[str]:
     # Truth tables protect behavior while allowing equivalent expression and YAML formatting.
     for event, rehearse_shards in [(event, rehearsal) for event in EVENTS
                                    for rehearsal in ((False, True) if event == "workflow_dispatch" else (False,))]:
-        for mode in (("docs", "e2e", "full") if event == "pull_request" else ("full",)):
+        for mode in {"pull_request": ("docs", "e2e", "full"), "push": ("full", "proven")}.get(event, ("full",)):
             for ref in ("refs/heads/main", "refs/heads/release"):
                 for connect in (True, False) if event == "pull_request" and mode == "full" else (mode == "full",):
                     for action in ("opened", "closed") if event == "pull_request" else ("",):
@@ -828,9 +891,14 @@ def main() -> int:
         return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
     if sys.argv[1:] == ["select"]:
         try:
+            # scripts/ci_merge_group_proof.py output; select_plan accepts it only for a push of the same tree.
+            try:
+                proof = json.loads(os.environ.get("CI_MERGE_GROUP_PROOF") or "null")
+            except ValueError:
+                proof = None
             plan = select_plan(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""),
-                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""),
-                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true")
+                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""), Path.cwd(),
+                               os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true", proof=proof)
             with open(os.environ["GITHUB_OUTPUT"], "a") as output:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
@@ -858,7 +926,16 @@ def main() -> int:
                 base = (payload["pull_request"]["base"]["sha"] if event == "pull_request" else
                         payload["merge_group"]["base_sha"] if event == "merge_group" else payload.get("before", ""))
                 action = payload.get("action", "")
-            errors = verify_results(json.loads(os.environ["CI_NEEDS"]), event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            needs = json.loads(os.environ["CI_NEEDS"])
+            errors = verify_results(needs, event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            plan = json.loads(needs["classify-changes"]["outputs"].get("plan") or "null")
+            if not errors and isinstance(plan, dict) and plan["mode"] == "proven":
+                # The check list shows these jobs as skipped like any other; say why.
+                note = f"Validation jobs were skipped as proven: merge_group run {plan['proven_by']['url']} passed tree {plan['tree']}."
+                print(note)
+                if os.environ.get("GITHUB_STEP_SUMMARY"):
+                    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                        summary.write(note + "\n")
         except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
             errors = [str(error)]
     elif sys.argv[1:] == ["--check-workflow"]:
