@@ -7866,7 +7866,21 @@ mod tests {
         let mut client = NodeServiceClient::connect(format!("http://{address}"))
             .await
             .expect("connect real format-control client");
-        let payload = Bytes::from_static(b"complete durable bootstrap plan");
+        let drive_id = Uuid::new_v4();
+        let payload = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1",
+                "format": "xl-single",
+                "id": Uuid::new_v4(),
+                "xl": {
+                    "version": "3",
+                    "this": drive_id,
+                    "sets": [[drive_id]],
+                    "distributionAlgo": "SIPMOD+PARITY",
+                },
+            }))
+            .expect("encode a valid single-drive format plan"),
+        );
         let message = WriteFormatControlRequest {
             disk: endpoint.to_string(),
             path: "format.json.bootstrap".into(),
@@ -7880,6 +7894,8 @@ mod tests {
             mark_v2_authenticated(&mut request);
             request
         };
+        let metrics = rustfs_io_metrics::internode_metrics::global_internode_metrics();
+        let before = metrics.snapshot();
         let response = super::timeout(Duration::from_secs(10), client.write_format_control(sign(message.clone())))
             .await
             .expect("bounded atomic control RPC")
@@ -7887,6 +7903,13 @@ mod tests {
             .into_inner();
         assert!(response.success, "{:?}", response.error);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one atomic publication uses one unary RPC");
+        let successful = metrics.snapshot();
+        assert_eq!(successful.incoming_requests_total - before.incoming_requests_total, 1);
+        assert_eq!(
+            successful.recv_bytes_total - before.recv_bytes_total,
+            u64::try_from(payload.len()).expect("payload length")
+        );
+        assert_eq!(successful.errors_total, before.errors_total);
         assert_eq!(
             tokio::fs::read(root.path().join(".rustfs.sys/format.json.bootstrap"))
                 .await
@@ -7919,6 +7942,13 @@ mod tests {
             .await
             .expect_err("unsigned control mutation rejected");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let completed = metrics.snapshot();
+        assert_eq!(completed.incoming_requests_total - before.incoming_requests_total, 2);
+        assert_eq!(
+            completed.recv_bytes_total - before.recv_bytes_total,
+            2 * u64::try_from(payload.len()).expect("payload length")
+        );
+        assert_eq!(completed.errors_total - before.errors_total, 1);
         shutdown.send(()).expect("stop format-control server");
         super::timeout(Duration::from_secs(10), server)
             .await

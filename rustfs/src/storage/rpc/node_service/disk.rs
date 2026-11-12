@@ -2761,6 +2761,7 @@ impl NodeService {
         &self,
         request: Request<WriteFormatControlRequest>,
     ) -> Result<Response<WriteAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_WRITE_ALL);
         let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
             .map_err(|_| Status::invalid_argument("format control request length cannot be represented"))?;
         verify_tonic_canonical_body_digest(&request, &canonical)
@@ -3076,6 +3077,82 @@ mod tests {
                 other => panic!("duration metric must be a histogram, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn format_control_handler_metrics_count_admitted_payload_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::WriteFormatControlRequest;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let enabled = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler metrics runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let message = WriteFormatControlRequest {
+                    disk: "missing-format-target".into(),
+                    path: "format.json.bootstrap".into(),
+                    data: bytes::Bytes::from_static(b"format-plan"),
+                };
+                let mut request = Request::new(message.clone());
+                let canonical =
+                    rustfs_protos::canonical_write_format_control_request_body(request.get_ref()).expect("canonical control");
+                crate::storage::storage_api::set_tonic_canonical_body_digest(&mut request, &canonical).expect("control digest");
+                request
+                    .metadata_mut()
+                    .insert("x-rustfs-rpc-auth-version", "2".parse().expect("v2 header"));
+                let response = server
+                    .handle_write_format_control(request)
+                    .await
+                    .expect("typed target failure")
+                    .into_inner();
+                assert!(!response.success);
+                let error = server
+                    .handle_write_format_control(Request::new(message))
+                    .await
+                    .expect_err("unsigned control rejection");
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            });
+        });
+        rustfs_io_metrics::set_metrics_enabled(enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let value = |name: &str| {
+            &entries
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "grpc_write_all")
+                })
+                .expect("format-control handler metric")
+                .3
+        };
+        for (name, expected) in [
+            ("rustfs_system_network_internode_operation_requests_incoming_total", 1),
+            ("rustfs_system_network_internode_operation_recv_bytes_total", 11),
+            ("rustfs_system_network_internode_operation_errors_total", 1),
+        ] {
+            assert!(matches!(value(name), DebugValue::Counter(count) if *count == expected), "{name}");
+        }
+        assert!(
+            matches!(value("rustfs_system_network_internode_operation_server_duration_ms"), DebugValue::Histogram(samples) if samples.len() == 2)
+        );
+        assert!(
+            matches!(value("rustfs_system_network_internode_rpc_active"), DebugValue::Gauge(active) if active.into_inner() == 0.0)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(key, _, _, _)| key.key().name() != "rustfs_system_network_internode_operation_duration_ms")
+        );
     }
 
     #[test]

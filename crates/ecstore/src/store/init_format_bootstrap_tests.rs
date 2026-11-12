@@ -154,6 +154,185 @@ async fn bootstrap_intent_reuses_plan_when_no_formats_were_published() {
 }
 
 #[tokio::test]
+async fn bootstrap_intent_anchor_is_durable_before_fanout() {
+    use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};
+
+    let (_directory, disks) = local_disks(4).await;
+    let plan = bootstrap_plan();
+    let anchor = disks[0]
+        .as_ref()
+        .expect("anchor disk")
+        .path()
+        .join(RUSTFS_META_BUCKET)
+        .join(FORMAT_BOOTSTRAP_FILE);
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let _hook = install_at(Stage::PreparedRename, &anchor, move || {
+        let _ = arrived.send(());
+        let _ = released.recv();
+    });
+    let publication = tokio::spawn({
+        let disks = disks.clone();
+        let plan = plan.clone();
+        async move { write_format_bootstrap_intents(&disks, &plan).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), arrival)
+        .await
+        .expect("anchor reaches native publication")
+        .expect("anchor publication hook");
+    for disk in disks.iter().skip(1).flatten() {
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE).await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+    release.send(()).expect("release anchor publication");
+    publication
+        .await
+        .expect("join anchor-first publication")
+        .expect("publish the selected plan");
+    assert!(format_snapshot(&disks).await.iter().all(Option::is_none));
+}
+
+#[tokio::test]
+async fn bootstrap_intent_anchor_only_restart_preserves_selected_plan() {
+    let (_directory, disks) = local_disks(4).await;
+    let plan = bootstrap_plan();
+    disks[0]
+        .as_ref()
+        .expect("anchor disk")
+        .write_format_control(
+            FORMAT_BOOTSTRAP_FILE,
+            plan[0]
+                .as_ref()
+                .expect("anchor format")
+                .to_json()
+                .expect("encode selected plan")
+                .into_bytes()
+                .into(),
+        )
+        .await
+        .expect("persist only the anchor before interruption");
+
+    let mut reopened = reopen_disks(&disks).await;
+    let loaded = connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut reopened, 1, 4, None)
+        .await
+        .expect("complete fanout from the accepted anchor after restart");
+    assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::Fresh);
+    assert_plan_published(&reopened, &plan).await;
+}
+
+#[tokio::test]
+async fn bootstrap_intent_missing_anchor_cannot_replace_partial_plan() {
+    let (_directory, disks) = local_disks(4).await;
+    let plan = bootstrap_plan();
+    let existing = plan[1]
+        .as_ref()
+        .expect("second slot format")
+        .to_json()
+        .expect("encode partial plan");
+    disks[1]
+        .as_ref()
+        .expect("second disk")
+        .write_all(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE, existing.clone().into_bytes().into())
+        .await
+        .expect("persist a partial plan with no anchor");
+    let mut reopened = reopen_disks(&disks).await;
+    connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut reopened, 1, 4, None)
+        .await
+        .err()
+        .expect("partial plan cannot authorize selecting another anchor");
+    assert!(format_snapshot(&disks).await.iter().all(Option::is_none));
+    assert!(matches!(
+        disks[0]
+            .as_ref()
+            .expect("anchor disk")
+            .read_all(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE)
+            .await,
+        Err(DiskError::FileNotFound)
+    ));
+    assert_eq!(
+        disks[1]
+            .as_ref()
+            .expect("second disk")
+            .read_all(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE)
+            .await
+            .expect("read preserved partial plan")
+            .as_ref(),
+        existing.as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_intent_conflicting_fanout_cannot_change_anchor_or_formats() {
+    let (_directory, disks) = local_disks(4).await;
+    let selected = bootstrap_plan();
+    let foreign = bootstrap_plan();
+    for (index, plan) in [(0, &selected), (1, &foreign)] {
+        disks[index]
+            .as_ref()
+            .expect("fixture disk")
+            .write_all(
+                RUSTFS_META_BUCKET,
+                FORMAT_BOOTSTRAP_FILE,
+                plan[index]
+                    .as_ref()
+                    .expect("planned slot")
+                    .to_json()
+                    .expect("encode planned slot")
+                    .into_bytes()
+                    .into(),
+            )
+            .await
+            .expect("persist conflicting observed plans");
+    }
+    let mut reopened = reopen_disks(&disks).await;
+    connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut reopened, 1, 4, None)
+        .await
+        .err()
+        .expect("a conflicting intent cannot be replaced by the selected anchor");
+    assert!(format_snapshot(&disks).await.iter().all(Option::is_none));
+    let anchor = disks[0]
+        .as_ref()
+        .expect("anchor disk")
+        .read_all(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE)
+        .await
+        .expect("read preserved anchor");
+    assert_eq!(
+        FormatV3::try_from(anchor.as_ref()).expect("decode preserved anchor"),
+        *selected[0].as_ref().expect("selected anchor")
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_intent_partial_proof_cannot_fill_a_partially_formatted_pool() {
+    let (_directory, disks) = local_disks(4).await;
+    let plan = bootstrap_plan();
+    write_format_bootstrap_intents(&disks, &plan)
+        .await
+        .expect("persist the selected plan");
+    write_format_file_all(&disks[..3], &plan[..3])
+        .await
+        .expect("publish only three formats");
+    let missing = disks[3]
+        .as_ref()
+        .expect("fourth disk")
+        .path()
+        .join(RUSTFS_META_BUCKET)
+        .join(FORMAT_BOOTSTRAP_FILE);
+    tokio::fs::remove_file(&missing).await.expect("remove one proof replica");
+    let before = format_snapshot(&disks).await;
+    let mut reopened = reopen_disks(&disks).await;
+    if let Ok(loaded) =
+        connect_load_init_formats_with_instance_ctx(&Arc::new(InstanceContext::new()), true, &mut reopened, 1, 4, None).await
+    {
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
+    }
+    assert_eq!(format_snapshot(&disks).await, before);
+    assert!(!missing.exists(), "partial format state cannot recreate missing proof");
+}
+
+#[tokio::test]
 async fn bootstrap_intent_absence_does_not_reinitialize_existing_formats() {
     let (_directory, mut disks) = local_disks(4).await;
     let plan = bootstrap_plan();
@@ -344,9 +523,22 @@ async fn bootstrap_intent_conflicting_existing_format_cannot_be_overwritten() {
         .await
         .expect("publish first three formats");
     let foreign = bootstrap_plan();
-    write_format_file_all(&disks[3..], &foreign[3..])
+    disks[3]
+        .as_ref()
+        .expect("fourth disk")
+        .write_all(
+            RUSTFS_META_BUCKET,
+            FORMAT_CONFIG_FILE,
+            foreign[3]
+                .as_ref()
+                .expect("foreign fourth format")
+                .to_json()
+                .expect("encode foreign physical format")
+                .into_bytes()
+                .into(),
+        )
         .await
-        .expect("publish another deployment's format on the fourth disk");
+        .expect("inject another deployment's physical format on the fourth disk");
     let physical_disks = disks.clone();
     let before = format_snapshot(&physical_disks).await;
 

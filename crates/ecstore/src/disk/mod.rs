@@ -1927,14 +1927,18 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
-    /// Atomically publish a validated format control file in the system volume.
-    /// Success requires both the replacement inode and parent entry to be durable.
-    /// Cancellation can leave the replacement published and retries replace the
-    /// same complete payload. Unsupported peers fail before writing any file.
+    /// Atomically publish a valid per-drive `FormatV3` control file in the system volume.
+    /// Deployment, topology and member UUID must agree with existing control records.
+    /// Pending intents admit equivalent plans, and retired intents reject bootstrap
+    /// republication. Success requires a durable replacement inode and parent entry.
+    /// Cancellation can leave the complete plan published. Retries revalidate the
+    /// plan under the per-disk owner before publishing it durably.
     ///
     /// # Errors
-    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations or
-    /// paths, and an I/O error when publication or its durability barrier fails.
+    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations,
+    /// paths or retired bootstrap intents, [`DiskError::CorruptedFormat`] for
+    /// invalid or conflicting plans, and an I/O error when publication or its
+    /// durability barrier fails.
     async fn write_format_control(&self, _path: &str, _data: Bytes) -> Result<()> {
         Err(DiskError::MethodNotAllowed)
     }

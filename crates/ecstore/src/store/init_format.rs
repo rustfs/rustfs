@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 use super::format_bootstrap::{FORMAT_BOOTSTRAP_FILE, retire_format_bootstrap_authority};
-use super::format_bootstrap::{resume_format_bootstrap, write_format_bootstrap_intents};
+use super::format_bootstrap::{project_format_slots, resume_format_bootstrap, write_format_bootstrap_intents};
 use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
 use crate::core::pools::PoolMetaBootstrapAuthority;
@@ -417,20 +417,11 @@ async fn init_format_erasure(
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3> {
-    let fm = FormatV3::new(set_count, set_drive_count);
-    let mut fms = vec![None; disks.len()];
-    for i in 0..set_count {
-        for j in 0..set_drive_count {
-            let idx = i * set_drive_count + j;
-            let mut newfm = fm.clone();
-            newfm.erasure.this = fm.erasure.sets[i][j];
-            if let Some(id) = deployment_id {
-                newfm.id = id;
-            }
-
-            fms[idx] = Some(newfm);
-        }
+    let mut fm = FormatV3::new(set_count, set_drive_count);
+    if let Some(id) = deployment_id {
+        fm.id = id;
     }
+    let fms = project_format_slots(&fm);
 
     write_format_bootstrap_intents(disks, &fms).await?;
     write_format_file_all(disks, &fms).await?;
