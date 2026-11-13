@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Scheduled development artifacts and reusable immutable-candidate builds.
-# The daily cron builds Linux. Sunday 16:00 UTC builds macOS and Windows.
+# The daily cron builds Linux. Sunday 16:17 UTC builds macOS and Windows.
 # Public release writes live exclusively in release-publish.yml. Candidate callers
 # select Linux or desktop and pin release inputs before any matrix starts.
 
@@ -32,7 +32,7 @@ on:
         type: string
   schedule:
     - cron: "13 1 * * *" # Daily Linux, 01:13 UTC
-    - cron: "0 16 * * 0" # Weekly macOS and Windows, Sunday 16:00 UTC (Monday 00:00 Asia/Shanghai)
+    - cron: "17 16 * * 0" # Weekly macOS and Windows, Sunday 16:17 UTC
   workflow_dispatch:
     inputs:
       publish:
@@ -236,7 +236,7 @@ jobs:
           if [[ "${EVENT_NAME}" == "schedule" && "${HAS_PLATFORM_INPUT}" != "true" ]]; then
             if [[ "${EVENT_SCHEDULE}" == "13 1 * * *" ]]; then
               selected="linux"
-            elif [[ "${EVENT_SCHEDULE}" == "0 16 * * 0" ]]; then
+            elif [[ "${EVENT_SCHEDULE}" == "17 16 * * 0" ]]; then
               selected="desktop"
             else
               echo "Unrecognized schedule cron: ${EVENT_SCHEDULE}" >&2

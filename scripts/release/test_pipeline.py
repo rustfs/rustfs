@@ -395,7 +395,7 @@ class PromotionTests(unittest.TestCase):
 class WorkflowContractTests(unittest.TestCase):
     def test_schedule_cron_selects_linux_or_desktop_without_dropping_manual_platforms(self):
         value = workflow("build.yml")
-        self.assertEqual([item["cron"] for item in value["on"]["schedule"]], ["13 1 * * *", "0 16 * * 0"])
+        self.assertEqual([item["cron"] for item in value["on"]["schedule"]], ["13 1 * * *", "17 16 * * 0"])
         self.assertNotIn("push", value["on"])
         self.assertNotIn("pull_request", value["on"])
         self.assertEqual(value["on"]["workflow_dispatch"]["inputs"]["platforms"]["default"], "all")
@@ -433,7 +433,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(daily.returncode, 0, daily.stderr)
         self.assertEqual(rows(daily_out), linux)
         self.assertEqual(daily_out["selected"], ",".join(item[0] for item in linux))
-        weekly, weekly_out = select("schedule", "linux", "0 16 * * 0")
+        weekly, weekly_out = select("schedule", "linux", "17 16 * * 0")
         self.assertEqual(weekly.returncode, 0, weekly.stderr)
         self.assertEqual(rows(weekly_out), desktop)
         self.assertEqual(weekly_out["selected"], ",".join(item[0] for item in desktop))
@@ -441,7 +441,7 @@ class WorkflowContractTests(unittest.TestCase):
             rejected, _ = select("schedule", "all", schedule)
             self.assertNotEqual(rejected.returncode, 0, schedule)
             self.assertIn("Unrecognized schedule cron", rejected.stderr)
-        caller, caller_out = select("schedule", "linux", "0 16 * * 0", has_input="true")
+        caller, caller_out = select("schedule", "linux", "17 16 * * 0", has_input="true")
         self.assertEqual(caller.returncode, 0, caller.stderr)
         self.assertEqual(rows(caller_out), linux)
         dispatched, dispatched_out = select("workflow_dispatch", "all", has_input="true")
