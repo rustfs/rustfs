@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
 
+pub mod management;
 mod partial_write;
 pub use partial_write::{MrfLegacyResponsibility, MrfOperatorAcceptance};
 use partial_write::{PartialWrites, ResponsibilityCheckpoint};
@@ -64,6 +65,8 @@ static GLOBAL_MRF_LIFECYCLE_SENDER: std::sync::OnceLock<mpsc::Sender<MrfLifecycl
 pub enum MrfLifecycleControlError {
     #[error("MRF lifecycle controller is unavailable")]
     Unavailable,
+    #[error("MRF read query budget is exhausted; retry later")]
+    Busy,
     #[error("the MRF checkpoint is unreadable; retain its files and restore a compatible reader")]
     CheckpointUnreadable,
     #[error("the requested responsibility changed or does not exist")]
@@ -94,7 +97,7 @@ pub struct MrfLegacyRiskAcceptanceRequest {
     pub request_id: Uuid,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MrfLegacyResponsibilitySnapshot {
     pub contract_version: u32,
@@ -119,14 +122,19 @@ pub async fn list_legacy_responsibilities(
             "cursor must be non-nil and limit must be between 1 and 256".to_string(),
         ));
     }
+    let permit = management::read_permit()?;
     let sender = GLOBAL_MRF_LIFECYCLE_SENDER
         .get()
         .ok_or(MrfLifecycleControlError::Unavailable)?;
     let (response, receiver) = tokio::sync::oneshot::channel();
     sender
-        .send(MrfLifecycleCommand::List { after, limit, response })
-        .await
-        .map_err(|_| MrfLifecycleControlError::Unavailable)?;
+        .try_send(MrfLifecycleCommand::List {
+            after,
+            limit,
+            response,
+            _permit: permit,
+        })
+        .map_err(management::queue_error)?;
     receiver.await.map_err(|_| MrfLifecycleControlError::Unavailable)?
 }
 
@@ -181,7 +189,13 @@ pub async fn accept_unverified_legacy_risk(request: MrfLegacyRiskAcceptanceReque
 }
 
 enum MrfLifecycleCommand {
+    Get {
+        id: Uuid,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        response: tokio::sync::oneshot::Sender<Result<management::MrfResponsibilityObservation, MrfLifecycleControlError>>,
+    },
     List {
+        _permit: tokio::sync::OwnedSemaphorePermit,
         after: Option<Uuid>,
         limit: usize,
         response: tokio::sync::oneshot::Sender<Result<MrfLegacyResponsibilitySnapshot, MrfLifecycleControlError>>,
@@ -1325,8 +1339,31 @@ impl MrfRuntime {
 
     async fn handle_lifecycle_command(&mut self, manager: &HealManager, command: MrfLifecycleCommand) {
         match command {
-            MrfLifecycleCommand::List { after, limit, response } => {
-                let _ = response.send(self.list_unverified_legacy(after, limit));
+            MrfLifecycleCommand::List {
+                after,
+                limit,
+                response,
+                _permit,
+            } => {
+                if !response.is_closed() {
+                    let _ = response.send(self.list_unverified_legacy(after, limit));
+                }
+                return;
+            }
+            MrfLifecycleCommand::Get { id, response, _permit } => {
+                if !response.is_closed() {
+                    let result = if self.replay_readable {
+                        Ok(management::MrfResponsibilityObservation {
+                            contract_version: 1,
+                            observed_at_ms: management::now_ms(),
+                            responsibility: self.partial_writes.responsibility(id),
+                        })
+                    } else {
+                        Err(MrfLifecycleControlError::CheckpointUnreadable)
+                    };
+                    let _ = response.send(result);
+                }
+                return;
             }
             MrfLifecycleCommand::Recheck {
                 responsibility_id,
@@ -1826,6 +1863,7 @@ impl MrfRuntime {
         gauge!("rustfs_heal_mrf_legacy_generation_unknown").set(metric_f64(lifecycle.legacy_generation_unknown_count));
         gauge!("rustfs_heal_mrf_bucket_incarnation_changed").set(metric_f64(lifecycle.bucket_incarnation_changed_count));
         gauge!("rustfs_heal_mrf_operator_accepted_unverified").set(metric_f64(lifecycle.operator_accepted_count));
+        management::publish_summary(self, &lifecycle);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -2499,6 +2537,9 @@ async fn finalize_mrf_consumer(
     lifecycle_receiver.close();
     while let Some(command) = lifecycle_receiver.recv().await {
         match command {
+            MrfLifecycleCommand::Get { response, .. } => {
+                let _ = response.send(Err(MrfLifecycleControlError::Unavailable));
+            }
             MrfLifecycleCommand::List { response, .. } => {
                 let _ = response.send(Err(MrfLifecycleControlError::Unavailable));
             }

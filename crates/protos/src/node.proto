@@ -1090,6 +1090,21 @@ message BackgroundHealStatusRequest {
   uint32 protocol_version = 1;
 }
 
+// The signed body binds the authenticated admin actor, target node and topology.
+message MrfLifecycleRequest {
+  uint32 protocol_version = 1;
+  string topology_fingerprint = 2;
+  string node_id = 3;
+  bytes command = 4;
+  bytes challenge = 5;
+}
+
+message MrfLifecycleResponse {
+  uint32 protocol_version = 1;
+  bytes result = 2;
+  bytes response_proof = 3;
+}
+
 message BackgroundHealStatusResponse {
   bool success = 1;
   bytes bg_heal_state = 2;
@@ -1415,6 +1430,7 @@ service NodeService {
   rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
+  rpc MrfLifecycle(MrfLifecycleRequest) returns (MrfLifecycleResponse) {}; // auth-policy: body-bound
   rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
   rpc PeerDriveAdmission(PeerDriveAdmissionRequest) returns (PeerDriveAdmissionResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
