@@ -5845,7 +5845,9 @@ impl SetDisks {
         let part = ObjectPartInfo::unmarshal(&meta)?;
         let integrity = part.integrity.map(Arc::new);
 
+        let recover_started = rustfs_io_metrics::put_stage_timer();
         self.recover_part_transaction(dst_object, write_quorum).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("rename_part_recover_before", recover_started);
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5896,7 +5898,9 @@ impl SetDisks {
                 Some(Ok(()))
             }
         });
+        let prepare_started = rustfs_io_metrics::put_stage_timer();
         let prepare_results = join_all(prepare_tasks).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("rename_part_prepare", prepare_started);
         let prepare_errs = prepare_results
             .into_iter()
             .map(|result| match result {
@@ -5930,7 +5934,9 @@ impl SetDisks {
             })
         });
 
+        let rename_started = rustfs_io_metrics::put_stage_timer();
         let results = join_all(futures).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("rename_part_rename", rename_started);
         for result in results {
             match result? {
                 Ok(_) => {
@@ -5991,6 +5997,7 @@ impl SetDisks {
             .iter()
             .zip(prepared_disks.iter())
             .all(|(err, disk)| err.is_none() && disk.as_ref().is_some_and(|d| d.is_local()));
+        let settle_started = rustfs_io_metrics::put_stage_timer();
         let committed = if all_prepared_succeeded {
             let settles = prepared_disks.iter().map(|disk| {
                 let disk = disk.clone();
@@ -6017,6 +6024,14 @@ impl SetDisks {
         } else {
             self.recover_part_transaction(&dst_object, write_quorum).await?
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            if all_prepared_succeeded {
+                "rename_part_settle"
+            } else {
+                "rename_part_recover_after"
+            },
+            settle_started,
+        );
         if !committed {
             let err = DiskError::ErasureWriteQuorum;
             if let Some(context) = quorum_context {

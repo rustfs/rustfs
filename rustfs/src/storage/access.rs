@@ -33,6 +33,7 @@ use crate::storage::helper::DenialScope;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use chacha20poly1305::{
@@ -2566,10 +2567,18 @@ async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
     };
-    if table_data_plane_publication_fence_required(req, action) {
+    // A lockless cache bucket skips the publication fence that holds off a
+    // concurrent table-bucket enablement; it still fences once the cached marker
+    // shows a table bucket.
+    let lockless_cache = is_lockless_cache_bucket(bucket);
+    if table_data_plane_publication_fence_required(req, action) && !lockless_cache {
         retain_table_bucket_publication_guard(req, bucket).await?;
     }
-    let table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    let mut table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    if lockless_cache && table_bucket_enabled && table_data_plane_publication_fence_required(req, action) {
+        retain_table_bucket_publication_guard(req, bucket).await?;
+        table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    }
     let Some(resource) = table_data_plane_resource_for_authorization(req, bucket, object, table_bucket_enabled).await? else {
         return Ok(());
     };
@@ -2621,10 +2630,18 @@ async fn deny_anonymous_table_data_plane_if_needed<R: AuthorizationRequest + ?Si
     if table_data_plane_admin_action(action).is_none() {
         return Ok(());
     }
-    if table_data_plane_publication_fence_required(req, action) {
+    // A lockless cache bucket skips the publication fence that holds off a
+    // concurrent table-bucket enablement; it still fences once the cached marker
+    // shows a table bucket.
+    let lockless_cache = is_lockless_cache_bucket(bucket);
+    if table_data_plane_publication_fence_required(req, action) && !lockless_cache {
         retain_table_bucket_publication_guard(req, bucket).await?;
     }
-    let table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    let mut table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    if lockless_cache && table_bucket_enabled && table_data_plane_publication_fence_required(req, action) {
+        retain_table_bucket_publication_guard(req, bucket).await?;
+        table_bucket_enabled = table_bucket_enabled_for_data_plane(req, bucket).await?;
+    }
     if table_data_plane_resource_for_authorization(req, bucket, object, table_bucket_enabled)
         .await?
         .is_some()

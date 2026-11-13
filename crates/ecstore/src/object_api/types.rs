@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::erasure::codec::shard_emit::ShardEmitter;
 use crate::storage_api_contracts::{
     list::VersionMarker,
     object::{
@@ -1040,10 +1041,192 @@ impl DeleteRecoveryWorkBudget {
     }
 }
 
+/// The byte-stream half of a sink writer.
+pub type GetObjectSinkStream = Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>;
+
+/// The writer a [`GetObjectSink`] hands to the read pipeline: the byte stream
+/// the decoder writes into, plus an optional [`ShardEmitter`] that takes whole
+/// data shards out of registered arena memory instead (zero-copy emit). Both
+/// halves must share one byte position: bytes written through the stream and
+/// shards taken by the emitter arrive in request order.
+pub struct GetObjectSinkWriter {
+    stream: GetObjectSinkStream,
+    emitter: Option<Box<dyn ShardEmitter>>,
+}
+
+impl GetObjectSinkWriter {
+    pub fn new(stream: GetObjectSinkStream) -> Self {
+        Self { stream, emitter: None }
+    }
+
+    pub fn with_emitter(stream: GetObjectSinkStream, emitter: Box<dyn ShardEmitter>) -> Self {
+        Self {
+            stream,
+            emitter: Some(emitter),
+        }
+    }
+
+    /// Splits the writer into its stream and its emitter.
+    pub fn into_parts(self) -> (GetObjectSinkStream, Option<Box<dyn ShardEmitter>>) {
+        (self.stream, self.emitter)
+    }
+}
+
+impl std::fmt::Debug for GetObjectSinkWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectSinkWriter")
+            .field("emitter", &self.emitter.is_some())
+            .finish()
+    }
+}
+
+impl tokio::io::AsyncWrite for GetObjectSinkWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// Builds the writer for one segment of a fanned-out GET: `(offset, len)` are
+/// relative to the start of the requested range, in bytes.
+pub type GetObjectSinkSegmentFactory = Arc<dyn Fn(u64, u64) -> GetObjectSinkWriter + Send + Sync + 'static>;
+
+/// A sink that can take the body as several concurrently produced segments
+/// (each written at its own offset) instead of one sequential stream.
+#[derive(Clone)]
+pub struct GetObjectSinkSegments {
+    pub factory: GetObjectSinkSegmentFactory,
+    /// Upper bound on concurrent segments; below 2 the sink is sequential.
+    pub max_segments: usize,
+    /// Smallest segment worth its own producer (rounded up to whole erasure
+    /// blocks); shorter requests stay sequential.
+    pub min_segment_bytes: u64,
+}
+
+impl std::fmt::Debug for GetObjectSinkSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectSinkSegments")
+            .field("max_segments", &self.max_segments)
+            .field("min_segment_bytes", &self.min_segment_bytes)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct GetObjectSinkInner {
+    writer: Option<GetObjectSinkWriter>,
+    segments: Option<GetObjectSinkSegments>,
+    taken: bool,
+}
+
+/// A one-shot destination handed to the GET read pipeline through
+/// [`ObjectOptions::get_object_sink`]; the pipeline takes it exactly once,
+/// either as the sequential writer or (when offered and worthwhile) as a set
+/// of segment writers.
+#[derive(Clone, Default)]
+pub struct GetObjectSink {
+    inner: Arc<std::sync::Mutex<GetObjectSinkInner>>,
+}
+
+impl GetObjectSink {
+    pub fn new(writer: GetObjectSinkWriter) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(GetObjectSinkInner {
+                writer: Some(writer),
+                segments: None,
+                taken: false,
+            })),
+        }
+    }
+
+    /// A sink that also offers segmented delivery.
+    pub fn with_segments(writer: GetObjectSinkWriter, segments: GetObjectSinkSegments) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(GetObjectSinkInner {
+                writer: Some(writer),
+                segments: Some(segments),
+                taken: false,
+            })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GetObjectSinkInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes the sequential writer; `None` once the sink has been taken in
+    /// either form (or was never set).
+    pub fn take(&self) -> Option<GetObjectSinkWriter> {
+        let mut inner = self.lock();
+        if inner.taken {
+            return None;
+        }
+        let writer = inner.writer.take()?;
+        inner.taken = true;
+        inner.segments = None;
+        Some(writer)
+    }
+
+    /// The segment offer, without taking the sink.
+    pub fn segments(&self) -> Option<GetObjectSinkSegments> {
+        let inner = self.lock();
+        if inner.taken { None } else { inner.segments.clone() }
+    }
+
+    /// Takes the sink in segmented form; `None` if no segments were offered
+    /// or the sink was already taken.
+    pub fn take_segments(&self) -> Option<GetObjectSinkSegments> {
+        let mut inner = self.lock();
+        if inner.taken {
+            return None;
+        }
+        let segments = inner.segments.take()?;
+        inner.taken = true;
+        inner.writer = None;
+        Some(segments)
+    }
+
+    /// Whether the pipeline took the sink (in either form).
+    pub fn is_taken(&self) -> bool {
+        self.lock().taken
+    }
+}
+
+impl std::fmt::Debug for GetObjectSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.lock();
+        f.debug_struct("GetObjectSink")
+            .field("taken", &inner.taken)
+            .field("segments", &inner.segments)
+            .finish()
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
+    /// Caller-provided destination for a GET body: when set, the legacy
+    /// duplex read pipeline writes the decoded bytes straight into this sink
+    /// instead of a pipe the caller drains, and the returned reader only
+    /// carries the producer's completion. Paths that do not stream through the
+    /// pipeline (inline bodies, cache hits, the codec streaming reader) leave
+    /// the sink untaken, and the caller must then consume the reader as usual.
+    pub get_object_sink: Option<GetObjectSink>,
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,

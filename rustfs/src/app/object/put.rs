@@ -872,6 +872,103 @@ pub(super) fn apply_put_request_object_lock_opts(
     Ok(())
 }
 
+/// Whether PUT bodies that fit the object data cache are inserted as they
+/// stream in (`RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT`), read once.
+fn object_data_cache_fill_on_put_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_ON_PUT,
+            rustfs_config::DEFAULT_OBJECT_DATA_CACHE_FILL_ON_PUT,
+        )
+    })
+}
+
+/// Frames of a streaming PUT body kept for a cache fill after the commit.
+type PutBodyCacheCollector = Arc<Mutex<Vec<Bytes>>>;
+
+/// Decides whether this PUT keeps a copy of its plaintext body for the cache:
+/// fill-on-put must be on, the cache must accept fills, and the body must be
+/// plain (no compression, no ciphertext, no SSE request) and fit the entry
+/// limit. Bucket-default encryption is caught after the commit by the plan.
+fn put_body_cache_collector(
+    adapter: &ObjectDataCacheAdapter,
+    size: i64,
+    should_compress: bool,
+    ciphertext_passthrough: bool,
+    headers: &HeaderMap,
+) -> Option<PutBodyCacheCollector> {
+    if should_compress
+        || ciphertext_passthrough
+        || has_put_sse_request_headers(headers)
+        || !put_body_may_fill_cache(adapter, size)
+    {
+        return None;
+    }
+    Some(Arc::new(Mutex::new(Vec::new())))
+}
+
+/// Whether fill-on-put could keep this PUT's body (see
+/// [`put_body_cache_collector`]); when it cannot, the body is consumed and
+/// dropped with the request.
+fn put_body_may_fill_cache(adapter: &ObjectDataCacheAdapter, size: i64) -> bool {
+    object_data_cache_fill_on_put_enabled()
+        && !adapter.is_disabled()
+        && adapter.fill_enabled()
+        && u64::try_from(size).is_ok_and(|size| size > 0 && size <= adapter.fill_size_ceiling_bytes())
+}
+
+/// Joins the collected frames into one body when they add up to `size` bytes.
+fn collected_put_body(collector: &PutBodyCacheCollector, size: i64) -> Option<Bytes> {
+    let frames = std::mem::take(&mut *collector.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let total: usize = frames.iter().map(Bytes::len).sum();
+    if usize::try_from(size).ok() != Some(total) {
+        return None;
+    }
+    if frames.len() == 1 {
+        return frames.into_iter().next();
+    }
+    let mut body = BytesMut::with_capacity(total);
+    for frame in &frames {
+        body.extend_from_slice(frame);
+    }
+    Some(body.freeze())
+}
+
+/// Inserts the PUT body under the key the GET path would plan for the committed
+/// version, after the usual post-put invalidation.
+async fn fill_object_data_cache_after_put(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+    info: &ObjectInfo,
+    collector: &PutBodyCacheCollector,
+) {
+    let Some(body) = collected_put_body(collector, info.size) else {
+        debug!(
+            bucket,
+            key,
+            size = info.size,
+            "fill-on-put skipped: collected body does not match the committed size"
+        );
+        return;
+    };
+    let plan = build_get_object_body_cache_plan_for_revalidation(
+        adapter,
+        GetObjectBodyCacheRequest {
+            bucket,
+            key,
+            info,
+            response_content_length: info.size,
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        },
+    );
+    let result = fill_get_object_body_cache_from_buffered_body(adapter, &plan, &body).await;
+    debug!(bucket, key, size = info.size, ?result, "fill-on-put");
+}
+
 pub(super) fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
     input
         .server_side_encryption
@@ -1466,6 +1563,12 @@ impl DefaultObjectUsecase {
             preserve_etag,
             mut origin,
         } = write;
+        // Objects without Content-MD5 take the bucket's ETag algorithm.
+        let etag_algorithm = if bucket_uses_xxh3_etag(&bucket) {
+            EtagAlgorithm::Xxh3
+        } else {
+            EtagAlgorithm::Md5
+        };
         let PutObjectSseInput {
             server_side_encryption,
             ssekms_key_id,
@@ -1716,6 +1819,17 @@ impl DefaultObjectUsecase {
             object_lock.retain_until_date,
             &mut opts,
         )?;
+        // A lockless cache bucket commits without distributed locks. Every feature
+        // those locks protect sends the PUT down the locked path instead.
+        if matches!(origin, PutObjectOrigin::S3 { .. })
+            && matches!(object_lock_config_state, metadata_sys::ObjectLockConfigState::ConfirmedAbsent)
+            && !quota_enabled
+            && !opts.versioned
+            && !opts.version_suspended
+            && version_id.is_none()
+        {
+            opts.use_lockless_cache_write(&bucket);
+        }
         let eager_put_commit_cancellation =
             (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path).then(tokio_util::sync::CancellationToken::new);
         opts.put_object_cancellation = eager_put_commit_cancellation.clone();
@@ -1807,6 +1921,9 @@ impl DefaultObjectUsecase {
         // Additional-checksum (XXHash3/64/128, SHA-512) values to echo on the PutObject
         // response (#1256); captured at want_checksum set points before opts is moved.
         let mut put_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
+        let cache_adapter = self.object_data_cache();
+        let fill_on_put_collector =
+            put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers);
         let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut reader = if should_compress {
             let compressed_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
@@ -1819,7 +1936,8 @@ impl DefaultObjectUsecase {
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
-                HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
+                HashReader::from_stream_with_etag(body, size, size, md5hex.take(), sha256hex.take(), false, etag_algorithm)
+                    .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum(headers, trailer_source(trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
@@ -1846,7 +1964,8 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::record_zero_copy_write(body_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let reader =
-                    HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                    HashReader::from_stream_with_etag(eager_body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                        .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_hash_reader_setup_zero_copy",
                     hash_reader_stage_start,
@@ -1868,8 +1987,16 @@ impl DefaultObjectUsecase {
                         eager_read_stage_start,
                     );
                     let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
-                    let reader = HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?;
+                    let reader = HashReader::from_stream_with_etag(
+                        eager_body,
+                        size,
+                        actual_size,
+                        md5hex,
+                        sha256hex,
+                        false,
+                        etag_algorithm,
+                    )
+                    .map_err(ApiError::from)?;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_hash_reader_setup_small_direct",
                         hash_reader_stage_start,
@@ -1890,8 +2017,16 @@ impl DefaultObjectUsecase {
                     );
                     let hash_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
                     let eager_reader = PooledBufferReader::new(eager_body, body_size as usize);
-                    let reader = HashReader::from_stream(eager_reader, size, actual_size, md5hex, sha256hex, false)
-                        .map_err(ApiError::from)?;
+                    let reader = HashReader::from_stream_with_etag(
+                        eager_reader,
+                        size,
+                        actual_size,
+                        md5hex,
+                        sha256hex,
+                        false,
+                        etag_algorithm,
+                    )
+                    .map_err(ApiError::from)?;
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         "app_hash_reader_setup_small_pooled",
                         hash_reader_stage_start,
@@ -1900,12 +2035,22 @@ impl DefaultObjectUsecase {
                 }
             } else {
                 let streaming_reader_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let collector = fill_on_put_collector.clone();
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
-                    StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
+                    StreamReader::new(body.map(move |f| {
+                        let f = f.map_err(s3s_body_error_to_io);
+                        if let (Some(collector), Ok(frame)) = (&collector, &f) {
+                            collector
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(frame.clone());
+                        }
+                        f
+                    })),
                 );
-                let reader =
-                    HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+                let reader = HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                    .map_err(ApiError::from)?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_reader_prepare_streaming",
                     streaming_reader_stage_start,
@@ -2064,6 +2209,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
+            opts.drop_lockless_cache_write();
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
@@ -2073,7 +2219,6 @@ impl DefaultObjectUsecase {
             );
         }
 
-        let cache_adapter = self.object_data_cache();
         let cache_invalidate_before_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
         rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -2218,6 +2363,9 @@ impl DefaultObjectUsecase {
 
                 let cache_invalidate_stage_start = put_stage_metrics_enabled.then(Instant::now);
                 let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+                if let Some(collector) = fill_on_put_collector.as_ref() {
+                    fill_object_data_cache_after_put(&cache_adapter, &bucket, &key, &obj_info, collector).await;
+                }
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     "app_post_store_data_cache_invalidate",
                     cache_invalidate_stage_start,
@@ -2384,6 +2532,18 @@ fn passthrough_compressed_actual_size(user_defined: &HashMap<String, String>) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collected_put_body_joins_frames_only_when_they_match_the_size() {
+        let collector: super::PutBodyCacheCollector =
+            Arc::new(Mutex::new(vec![Bytes::from_static(b"he"), Bytes::from_static(b"llo")]));
+        assert_eq!(super::collected_put_body(&collector, 5).as_deref(), Some(&b"hello"[..]));
+        let collector: super::PutBodyCacheCollector = Arc::new(Mutex::new(vec![Bytes::from_static(b"hello")]));
+        assert!(super::collected_put_body(&collector, 4).is_none(), "a size mismatch must not fill");
+        let collector: super::PutBodyCacheCollector = Arc::new(Mutex::new(vec![Bytes::from_static(b"hello")]));
+        assert_eq!(super::collected_put_body(&collector, 5).as_deref(), Some(&b"hello"[..]));
+        assert!(collector.lock().unwrap().is_empty(), "frames are released after the join");
+    }
+
     use super::*;
     use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
     use futures::StreamExt;

@@ -411,7 +411,12 @@ async fn enqueue_transition_after_write(
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
                 enqueue_transition_immediate(&oi, src.clone()).await;
-                if let Ok(api) = metadata_sys::object_store_in(&store.ctx).await {
+                // Immediate expiry needs the bucket incarnation under the
+                // metadata-transaction lock; a lockless cache PUT leaves expiry
+                // to the scanner.
+                if !opts.is_lockless_cache_write()
+                    && let Ok(api) = metadata_sys::object_store_in(&store.ctx).await
+                {
                     enqueue_immediate_expiry(api, &oi, src, opts).await;
                 }
             }

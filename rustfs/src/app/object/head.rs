@@ -417,9 +417,14 @@ impl DefaultObjectUsecase {
             return result;
         }
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        if is_lockless_cache_bucket(&bucket) {
+            // See the GetObject path: cache objects never change once written.
+            opts.no_lock = true;
+            opts.metadata_cache_safe = true;
+        }
         let opts = internal_object_info_lookup_opts(opts);
 
         prepare_odm_read_generation(&store, &mut req, &bucket).await;

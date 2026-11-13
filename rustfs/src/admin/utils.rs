@@ -21,6 +21,7 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 use tokio::sync::Semaphore;
+use url::form_urlencoded;
 
 // Each compatible request can run two 64 MiB derivations. Keep both CPU and
 // memory bounded without occupying runtime workers or queueing unbounded jobs.
@@ -131,6 +132,32 @@ pub(crate) fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
         }
     }
     params
+}
+
+/// Every query pair of `uri`, decoded and in request order; repeated keys are kept.
+pub(crate) fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    uri.query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first value of `key`, decoded; `Some("")` for a key written without a value.
+pub(crate) fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+}
+
+/// Every value of `key`, decoded and in request order.
+pub(crate) fn query_values_exact(uri: &Uri, key: &str) -> Vec<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .filter_map(|(k, v)| if k == key { Some(v) } else { None })
+        .collect()
 }
 
 #[cfg(test)]

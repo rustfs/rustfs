@@ -3876,6 +3876,33 @@ struct FileCacheReclaimReader {
     reclaim_len: usize,
     reclaim_on_drop: bool,
     reclaimed: bool,
+    /// Current read position, advanced by every successful poll.
+    pos: u64,
+    /// End of the ranged read (`reclaim_offset + reclaim_len`).
+    end: u64,
+    /// Page-cache read-ahead has been requested up to here.
+    advised_until: u64,
+    /// Read-ahead window in bytes; `0` disables.
+    read_ahead: u64,
+}
+
+/// Largest single read a ranged stream hands the blocking pool; one RDMA chunk.
+const STREAM_READ_MAX_BUF_SIZE: usize = 4 * 1024 * 1024;
+
+/// The next range to request page-cache read-ahead for, if less than half of
+/// the window is still queued in front of `pos`.
+#[cfg(any(target_os = "linux", test))]
+fn next_read_ahead_range(pos: u64, advised_until: u64, end: u64, window: u64) -> Option<(u64, u64)> {
+    if window == 0 || advised_until >= end {
+        return None;
+    }
+    let queued = advised_until.saturating_sub(pos);
+    if queued > window / 2 {
+        return None;
+    }
+    let start = advised_until.max(pos);
+    let stop = start.saturating_add(window).min(end);
+    (stop > start).then_some((start, stop))
 }
 
 struct StallTimeoutReader<R> {
@@ -4176,21 +4203,58 @@ async fn read_dir_entry_batch_with_walk_stall(
 }
 
 impl FileCacheReclaimReader {
-    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
         inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
         }
 
-        Self {
+        let mut reader = Self {
             inner,
             reclaim_offset,
             reclaim_len,
             reclaim_on_drop,
             reclaimed: false,
-        }
+            pos: reclaim_offset,
+            end: reclaim_offset.saturating_add(reclaim_len as u64),
+            advised_until: reclaim_offset,
+            read_ahead: read_ahead as u64,
+        };
+        reader.advise_read_ahead();
+        reader
     }
+
+    /// Queues page-cache read-ahead in front of the read position (Linux).
+    ///
+    /// `WILLNEED` allocates the pages and submits the reads before it
+    /// returns (a few milliseconds per 16 MiB), so it runs on the blocking
+    /// pool over a duplicate descriptor; the bookkeeping is optimistic.
+    #[cfg(target_os = "linux")]
+    fn advise_read_ahead(&mut self) {
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
+        use std::os::fd::AsFd;
+
+        let Some((start, stop)) = next_read_ahead_range(self.pos, self.advised_until, self.end, self.read_ahead) else {
+            return;
+        };
+        let Some(len) = NonZeroU64::new(stop - start) else {
+            return;
+        };
+        let Ok(fd) = self.inner.as_fd().try_clone_to_owned() else {
+            self.read_ahead = 0;
+            return;
+        };
+        self.advised_until = stop;
+        tokio::task::spawn_blocking(move || {
+            // Best effort: a refused range only costs the read-ahead.
+            let _ = fadvise(&fd, start, Some(len), Advice::WillNeed);
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn advise_read_ahead(&mut self) {}
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
@@ -4249,7 +4313,13 @@ impl AsyncRead for FileCacheReclaimReader {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            self.pos = self.pos.saturating_add((buf.filled().len() - before) as u64);
+            self.advise_read_ahead();
+        }
+        polled
     }
 }
 
@@ -5082,6 +5152,13 @@ cached_read_env! {
     fn file_cache_reclaim_threshold() -> usize = rustfs_utils::get_env_usize(
         rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
         rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
+}
+
+cached_read_env! {
+    fn stream_read_ahead_bytes() -> usize = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_STREAM_READ_AHEAD_BYTES,
+        rustfs_config::DEFAULT_OBJECT_STREAM_READ_AHEAD_BYTES,
     );
 }
 
@@ -5955,9 +6032,10 @@ impl LocalIoBackend for StdBackend {
         if offset > 0 {
             f.seek(SeekFrom::Start(offset as u64)).await?;
         }
+        f.set_max_buf_size(STREAM_READ_MAX_BUF_SIZE);
 
         let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
-        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop);
+        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop, stream_read_ahead_bytes());
         Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
     }
 
@@ -32938,7 +33016,7 @@ mod test {
         writer.shutdown().await.expect("writer should reclaim on shutdown");
 
         let file = File::open(&path).await.expect("reader file should open");
-        let mut reader = FileCacheReclaimReader::new(file, 0, 6, true);
+        let mut reader = FileCacheReclaimReader::new(file, 0, 6, true, 0);
         let mut body = Vec::new();
         reader.read_to_end(&mut body).await.expect("reader should forward reads");
         assert!(body.ends_with(b"abcdef"));
@@ -32970,7 +33048,7 @@ mod test {
             writer.inner.sync_all().await.expect("sync the completed test file");
 
             let file = File::open(&path).await.expect("reopen completed file");
-            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true);
+            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true, 0);
             let mut actual = vec![0; wire_len];
             let read = reader
                 .read(&mut actual)
@@ -39533,5 +39611,30 @@ mod test {
             take_prepared_part_txn_receipt(&txn2_open).is_none(),
             "Drop for LocalDisk must purge cached part transaction receipts"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::next_read_ahead_range;
+
+    #[test]
+    fn read_ahead_queues_a_window_then_tops_up_past_the_half_mark() {
+        // A fresh stream queues one full window from the start offset.
+        assert_eq!(next_read_ahead_range(100, 100, 1_000, 200), Some((100, 300)));
+        // More than half the window still queued: nothing to do.
+        assert_eq!(next_read_ahead_range(150, 300, 1_000, 200), None);
+        // At the half mark the next window is queued from where advice stopped.
+        assert_eq!(next_read_ahead_range(200, 300, 1_000, 200), Some((300, 500)));
+        // The last window is clipped to the end of the range and then stops.
+        assert_eq!(next_read_ahead_range(850, 900, 1_000, 200), Some((900, 1_000)));
+        assert_eq!(next_read_ahead_range(950, 1_000, 1_000, 200), None);
+    }
+
+    #[test]
+    fn read_ahead_is_disabled_by_a_zero_window_and_never_lags_the_position() {
+        assert_eq!(next_read_ahead_range(0, 0, 1_000, 0), None);
+        // Advice that fell behind the read position restarts at the position.
+        assert_eq!(next_read_ahead_range(400, 100, 1_000, 200), Some((400, 600)));
     }
 }

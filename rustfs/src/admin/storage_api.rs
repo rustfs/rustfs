@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
+        bandwidth, bucket_target_sys, durability, etag, lifecycle, metadata, metadata_sys, object_lock, quota, remote_s3_client,
         replication, target, utils, versioning, versioning_sys,
     };
 }
@@ -304,6 +304,7 @@ pub(crate) mod metadata {
     pub(crate) const BUCKET_TARGETS_FILE: &str = super::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
     pub(crate) const BUCKET_VERSIONING_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
     pub(crate) const BUCKET_DURABILITY_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_DURABILITY_CONFIG;
+    pub(crate) const BUCKET_ETAG_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_ETAG_CONFIG;
     pub(crate) const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
     pub(crate) const OBJECT_LOCK_CONFIG: &str = super::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
 
@@ -316,6 +317,10 @@ pub(crate) mod metadata {
 
 pub(crate) mod durability {
     pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
+}
+
+pub(crate) mod etag {
+    pub(crate) type BucketEtagConfig = super::ecstore_bucket::etag::BucketEtagConfig;
 }
 
 pub(crate) mod remote_s3_client {
@@ -510,6 +515,10 @@ pub(crate) mod metadata_sys {
         bucket: &str,
     ) -> Result<(Option<super::durability::BucketDurabilityConfig>, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
+    }
+
+    pub(crate) async fn get_etag_config(bucket: &str) -> Result<(Option<super::etag::BucketEtagConfig>, OffsetDateTime)> {
+        super::ecstore_bucket::metadata_sys::get_etag_config(bucket).await
     }
 
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -955,7 +964,7 @@ pub(crate) mod data_usage {
 
 pub(crate) mod access {
     pub(crate) use crate::app::{authorize_owned_internal_object_request, authorize_owned_request};
-    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+    pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 
@@ -963,6 +972,7 @@ pub(crate) mod bucket {
     pub(crate) use super::bandwidth;
     pub(crate) use super::bucket_target_sys as target_sys;
     pub(crate) use super::durability;
+    pub(crate) use super::etag;
     #[cfg(test)]
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;
