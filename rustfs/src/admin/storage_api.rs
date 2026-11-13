@@ -955,7 +955,7 @@ pub(crate) mod data_usage {
 
 pub(crate) mod access {
     pub(crate) use crate::app::{authorize_owned_internal_object_request, authorize_owned_request};
-    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+    pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 

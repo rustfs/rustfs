@@ -64,6 +64,7 @@ pub mod quota;
 pub mod realtime;
 pub mod rebalance;
 pub mod replication;
+pub(crate) mod s3_extension;
 pub mod scanner;
 pub mod service_account;
 pub mod site_replication;

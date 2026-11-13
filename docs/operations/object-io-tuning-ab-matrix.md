@@ -77,11 +77,11 @@ iostat -xz 5 > telemetry/iostat.txt &
 
 #### Fsync worker idle policy experiment
 
-The disk fsync queue exposes two independent experimental controls for measuring idle CPU cost. Both are cached at first queue creation and require restarting every participating server when changed. Their defaults retain the current worker policy.
+The disk fsync queue exposes two independent experimental controls for measuring idle CPU cost. Both are cached at first queue creation and require restarting every participating server when changed. The default spin budget is 256 iterations per empty-queue episode, with multiple idle workers allowed.
 
 | Variable | Default | Values and effect |
 | --- | --- | --- |
-| `RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS` | `1024` | Spin budget per empty-queue episode, clamped to `0..=1024`. `0` immediately rechecks retirement under the queue mutex. Invalid values use the default. |
+| `RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS` | `256` | Spin budget per empty-queue episode, clamped to `0..=1024`. `0` immediately rechecks retirement under the queue mutex. Invalid values use the default. Set `1024` to restore the longer spin budget. |
 | `RUSTFS_EXPERIMENTAL_FSYNC_WORKER_KEEP_MULTIPLE_IDLE` | `true` | `false` retires an empty fsync worker when another idle/reserved worker already exists. Invalid values use the default. |
 
 These controls affect the foreground fsync lane's idle policy. Its maximum execution concurrency remains eight workers per disk, and the namespace and isolated cleanup lanes retain their own policy. The queue's internal idle count includes worker reservations awaiting execution, so measure actual worker and spin activity through the diagnostics below.
@@ -90,10 +90,10 @@ Use one fixed binary and the four cells below to distinguish the two factors and
 
 | Cell | Spin iterations | Keep multiple idle workers |
 | --- | --- | --- |
-| Current default | 1024 | true |
-| Shorter spin | 256 | true |
-| Single idle reservation | 1024 | false |
-| Combined candidate | 256 | false |
+| Current default | 256 | true |
+| Longer spin | 1024 | true |
+| Single idle reservation | 256 | false |
+| Longer spin, single idle reservation | 1024 | false |
 
 Before A1, record the acceptable baseline drift, minimum gain above measurement noise, and p99, RSS and error limits. Verify A/A stability, then compare each candidate with the default through A1/B1/B2/A2. Include sustained fresh 100 KiB PUT and short burst/idle/burst traffic. Track the dev-to-1.0.5 change and the beta.10 gap as separate outcomes.
 

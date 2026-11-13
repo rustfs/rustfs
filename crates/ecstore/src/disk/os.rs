@@ -2452,7 +2452,8 @@ pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
-const FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
+const DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 256;
+const MAX_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
 
 const ENV_FSYNC_WORKER_IDLE_SPIN_ITERS: &str = "RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS";
@@ -2467,8 +2468,8 @@ struct FsyncWorkerIdlePolicy {
 impl FsyncWorkerIdlePolicy {
     fn from_env() -> Self {
         Self {
-            spin_iters: rustfs_utils::get_env_usize(ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, FSYNC_WORKER_IDLE_SPIN_ITERS)
-                .min(FSYNC_WORKER_IDLE_SPIN_ITERS),
+            spin_iters: rustfs_utils::get_env_usize(ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS)
+                .min(MAX_FSYNC_WORKER_IDLE_SPIN_ITERS),
             keep_multiple_idle: rustfs_utils::get_env_bool(ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE, true),
         }
     }
@@ -4595,7 +4596,7 @@ pub(crate) mod multipart_source_syscall_failures {
         );
         FailureGuard { key, failure }
     }
-    pub(super) fn check(stage: Stage, path: &Path) -> io::Result<()> {
+    pub(crate) fn check(stage: Stage, path: &Path) -> io::Result<()> {
         if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
             failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
             return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
@@ -5890,7 +5891,7 @@ impl PublicationRoot {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
+    pub(crate) fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
         self.open_relative(
             path,
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
@@ -13156,14 +13157,14 @@ mod tests {
     #[test]
     fn disk_blocking_queue_fsync_idle_policy_parses_and_bounds_configuration() {
         for (spin_value, multiple_value, expected_spins, expected_multiple) in [
-            (None, None, 1024, true),
+            (None, None, 256, true),
             (Some("256"), Some("false"), 256, false),
             (Some("1024"), Some("true"), 1024, true),
             (Some("0"), Some("false"), 0, false),
             (Some("1025"), Some("true"), 1024, true),
-            (Some("invalid"), Some("invalid"), 1024, true),
-            (Some("-1"), None, 1024, true),
-            (Some("184467440737095516160"), None, 1024, true),
+            (Some("invalid"), Some("invalid"), 256, true),
+            (Some("-1"), None, 256, true),
+            (Some("184467440737095516160"), None, 256, true),
         ] {
             temp_env::with_vars(
                 [

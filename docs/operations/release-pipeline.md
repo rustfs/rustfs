@@ -10,7 +10,7 @@ RustFS builds the final product version before publication. A candidate is ident
 | `release-complete.yml` | Successful candidate run, accepted Linux manifest SHA-256, backlog acceptance report | Desktop archives, DEB/RPM, OCI images, Helm chart, full certification and sealed manifest | None |
 | `release-publish.yml` | Successful completion run and approved final manifest SHA-256 | Annotated tag, GitHub Release, R2 files, registry images, stable pointers and Helm index | Explicit publication |
 
-The builder workflows (`build.yml`, `package.yml`, `docker.yml`, `helm-package.yml`) are reusable stages. Only `release-publish.yml` has release write credentials. Development builds retain their artifact names and download channel. Daily development builds now select Linux only; macOS/Windows development artifacts are refreshed by an explicit manual build, and both remain mandatory for a completed release candidate. Tag pushes no longer start a second compilation.
+The builder workflows (`build.yml`, `package.yml`, `docker.yml`, `helm-package.yml`) are reusable stages. Only `release-publish.yml` has release write credentials. Development builds retain their artifact names and download channel. The daily schedule selects Linux only; the Sunday 16:17 UTC schedule selects macOS and Windows. Manual dispatch can still select any platform list, and both desktop targets remain mandatory for a completed release candidate. Tag pushes no longer start a second compilation.
 
 ## Freeze and build
 

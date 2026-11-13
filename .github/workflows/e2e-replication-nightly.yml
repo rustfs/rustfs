@@ -54,12 +54,15 @@ concurrency:
 jobs:
   repl-nightly:
     if: github.repository == 'rustfs/rustfs'
-    name: Replication e2e (nightly)
+    name: Replication e2e (nightly, ${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
     # dual-node tests spawn two full rustfs servers each; the extra headroom
     # over the per-PR sm-standard-2 e2e job keeps the parallel process fan-out
     # from starving the runner. Mirrors the ILM serial lane's runner class.
     runs-on: sm-standard-4
     timeout-minutes: 45
+    # The gateway leg is report-only until T2.10.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -95,6 +98,11 @@ jobs:
         run: |
           python3 scripts/e2e_binary.py build --bins
 
+      # A gateway binary that refuses to start skips the suite; the summary says why.
+      - name: Gateway preflight
+        if: matrix.stack == 'gateway'
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/leg/stack.json"
+
       - name: Verify replication e2e membership
         env:
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-repl-nightly-list.json
@@ -105,13 +113,22 @@ jobs:
       - name: Run replication e2e nightly suite
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-repl-nightly-logs
+          RUSTFS_S3_STACK: ${{ matrix.stack }}
         run: python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-repl-nightly -p e2e_test
+
+      - name: Prove the stack and upload the leg
+        if: always()
+        uses: ./.github/actions/dual-stack-leg
+        with:
+          profile: e2e-repl-nightly
+          stack: ${{ matrix.stack }}
+          logs: ${{ runner.temp }}/rustfs-e2e-repl-nightly-logs
 
       - name: Upload nextest junit report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-replication-nightly-junit-${{ github.run_number }}
+          name: e2e-replication-nightly-junit-${{ github.run_number }}-${{ matrix.stack }}
           path: |
             target/nextest/e2e-repl-nightly/junit.xml
             ${{ runner.temp }}/rustfs-e2e-repl-nightly-list.json
@@ -121,9 +138,12 @@ jobs:
 
   cluster-nightly:
     if: github.repository == 'rustfs/rustfs'
-    name: Cluster fault e2e (nightly)
+    name: Cluster fault e2e (nightly, ${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
     runs-on: sm-standard-4
     timeout-minutes: 90
+    # The gateway leg is report-only until T2.10.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -144,6 +164,11 @@ jobs:
         run: |
           python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 
+      # A gateway binary that refuses to start skips the suite; the summary says why.
+      - name: Gateway preflight
+        if: matrix.stack == 'gateway'
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/leg/stack.json"
+
       - name: Verify cluster fault e2e membership
         env:
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-nightly-list.json
@@ -155,13 +180,22 @@ jobs:
         env:
           CARGO_BIN_EXE_rustfs: ${{ github.workspace }}/target/debug/rustfs
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-nightly-logs
+          RUSTFS_S3_STACK: ${{ matrix.stack }}
         run: python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-nightly -p e2e_test
+
+      - name: Prove the stack and upload the leg
+        if: always()
+        uses: ./.github/actions/dual-stack-leg
+        with:
+          profile: e2e-nightly
+          stack: ${{ matrix.stack }}
+          logs: ${{ runner.temp }}/rustfs-e2e-nightly-logs
 
       - name: Upload cluster fault diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-cluster-nightly-${{ github.run_number }}
+          name: e2e-cluster-nightly-${{ github.run_number }}-${{ matrix.stack }}
           path: |
             target/nextest/e2e-nightly/junit.xml
             ${{ runner.temp }}/rustfs-e2e-nightly-list.json
@@ -171,9 +205,12 @@ jobs:
 
   protocols-nightly:
     if: github.repository == 'rustfs/rustfs'
-    name: Protocol e2e (nightly)
+    name: Protocol e2e (nightly, ${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
     runs-on: sm-standard-4
     timeout-minutes: 90
+    # The gateway leg is report-only until T2.10.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFS_BUILD_FEATURES: ftps,webdav,sftp
@@ -200,6 +237,11 @@ jobs:
       - name: Build protocol server
         run: python3 scripts/e2e_binary.py build --features "$RUSTFS_BUILD_FEATURES"
 
+      # A gateway binary that refuses to start skips the suite; the summary says why.
+      - name: Gateway preflight
+        if: matrix.stack == 'gateway'
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/leg/stack.json"
+
       # The suite owns fixed protocol ports and serializes its internal cases.
       - name: Verify protocol e2e membership
         env:
@@ -211,20 +253,48 @@ jobs:
       - name: Run protocol e2e nightly suite
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-protocol-e2e-logs
-        run: >-
-          python3 scripts/e2e_binary.py run --features "$RUSTFS_BUILD_FEATURES" -- cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
+          RUSTFS_S3_STACK: ${{ matrix.stack }}
+          # These servers set no log level of their own; the stack proof reads their start-up line.
+          RUST_LOG: rustfs=info
+        # The servers inherit nextest's stdout (--no-capture): keep it where the stack proof reads it.
+        run: |
+          set -o pipefail
+          mkdir -p "$RUSTFS_E2E_LOG_DIR"
+          python3 scripts/e2e_binary.py run --features "$RUSTFS_BUILD_FEATURES" -- cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture 2>&1 | tee "$RUSTFS_E2E_LOG_DIR/nextest.log"
+
+      - name: Prove the stack and upload the leg
+        if: always()
+        uses: ./.github/actions/dual-stack-leg
+        with:
+          profile: e2e-protocols
+          stack: ${{ matrix.stack }}
+          logs: ${{ runner.temp }}/rustfs-protocol-e2e-logs
 
       - name: Upload protocol diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-protocol-nightly-${{ github.run_number }}
+          name: e2e-protocol-nightly-${{ github.run_number }}-${{ matrix.stack }}
           path: |
             target/nextest/e2e-protocols/junit.xml
             ${{ runner.temp }}/rustfs-e2e-protocols-list.json
             ${{ runner.temp }}/rustfs-protocol-e2e-logs/
           retention-days: 7
           if-no-files-found: warn
+
+  dual-stack-summary:
+    name: Both-stack diff summary
+    needs: [repl-nightly, cluster-nightly, protocols-nightly]
+    if: github.repository == 'rustfs/rustfs' && always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dual-stack-summary
+        with:
+          profiles: e2e-repl-nightly,e2e-nightly,e2e-protocols
 
   alert-on-failure:
     name: Alert on scheduled failure

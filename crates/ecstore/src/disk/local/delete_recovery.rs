@@ -1211,13 +1211,7 @@ fn read_child_regular_bytes(
         use rustix::fs::{Mode, OFlags, openat};
         let fd = openat(dir, child_name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(std::io::Error::from)?;
         let mut file = std::fs::File::from(fd);
-        let cap = file
-            .metadata()
-            .ok()
-            .and_then(|m| usize::try_from(m.len()).ok())
-            .unwrap_or(0)
-            .min(64 * 1024);
-        let mut buf = Vec::with_capacity(cap);
+        let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut buf)?;
         return Ok(buf);
     }
@@ -1415,11 +1409,61 @@ pub(super) fn clear_delete_receipts_under(io_root: &Path, root: &Path) {
 }
 
 #[cfg(unix)]
+fn open_child_dir_fd(parent_fd: Option<&std::fs::File>, child_name: &str, fallback_path: &Path) -> Option<std::fs::File> {
+    if let Some(p_fd) = parent_fd {
+        use rustix::fs::{Mode, OFlags, openat};
+        return openat(
+            p_fd,
+            child_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()
+        .map(std::fs::File::from);
+    }
+    open_dir_fd(fallback_path).ok()
+}
+
+#[cfg(not(unix))]
+fn open_child_dir_fd(_parent_fd: Option<&std::fs::File>, _child_name: &str, _fallback_path: &Path) -> Option<std::fs::File> {
+    None
+}
+
+#[cfg(unix)]
+fn rename_in_same_dir_fd(
+    dir_fd: Option<&std::fs::File>,
+    src_name: &str,
+    src_fallback: &Path,
+    dst_name: &str,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    if let Some(d_fd) = dir_fd {
+        return rustix::fs::renameat(d_fd, src_name, d_fd, dst_name).map_err(std::io::Error::from);
+    }
+    std::fs::rename(src_fallback, dst_fallback)
+}
+
+#[cfg(not(unix))]
+fn rename_in_same_dir_fd(
+    _dir_fd: Option<&std::fs::File>,
+    _src_name: &str,
+    src_fallback: &Path,
+    _dst_name: &str,
+    dst_fallback: &Path,
+) -> std::io::Result<()> {
+    std::fs::rename(src_fallback, dst_fallback)
+}
+
+#[cfg(unix)]
 fn open_dir_fd(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags, open};
-    open(path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(std::io::Error::from)
+    open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)
 }
 
 fn format_commit_receipt_bytes(journal_raw: &[u8], finished: bool) -> Vec<u8> {
@@ -2986,8 +3030,8 @@ impl LocalDisk {
                     return Err(err);
                 }
                 let old_data_path = old_dir
-                    .map(|uuid| file_path.join(uuid.to_string()))
-                    .filter(|p| old_data_dir_state.unwrap_or_else(|| p.is_dir()));
+                    .map(|uuid| (uuid.to_string(), file_path.join(uuid.to_string())))
+                    .filter(|(_, p)| old_data_dir_state.unwrap_or_else(|| p.is_dir()));
                 if sync && let Err(err) = os::fsync_directory_handle_std(&file_path, file_path_dir.as_deref()) {
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
@@ -2995,14 +3039,12 @@ impl LocalDisk {
                 #[cfg(all(test, unix))]
                 fused_prepare_checkpoint::run(&file_path);
                 let mut reserved_data_path = None;
-                if let Some(old_path) = old_data_path {
-                    let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
-                    #[cfg(unix)]
-                    let old_dir_file = sync.then(|| open_dir_fd(&old_path).ok()).flatten();
-                    #[cfg(not(unix))]
-                    let old_dir_file: Option<std::fs::File> = None;
+                if let Some((old_dir_name, old_path)) = old_data_path {
+                    let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+                    let reserved_marker = old_path.join(&reserved_name);
+                    let old_dir_file = open_child_dir_fd(file_path_dir.as_deref(), &old_dir_name, &old_path);
                     let reserve_res = (|| -> std::io::Result<()> {
-                        let marker = std::fs::File::create(&reserved_marker)?;
+                        let marker = create_and_write_child_file(old_dir_file.as_ref(), &reserved_name, &reserved_marker, &[])?;
                         if sync {
                             marker.sync_all()?;
                             os::fsync_directory_handle_std(&old_path, old_dir_file.as_ref())?;
@@ -3010,11 +3052,11 @@ impl LocalDisk {
                         Ok(())
                     })();
                     if let Err(err) = reserve_res {
-                        let _ = std::fs::remove_file(&reserved_marker);
+                        let _ = unlink_child_file(old_dir_file.as_ref(), &reserved_name, &reserved_marker);
                         let _ = std::fs::remove_dir_all(&destination);
                         return Err(err);
                     }
-                    reserved_data_path = Some((old_path, reserved_marker, old_dir_file));
+                    reserved_data_path = Some((old_path, reserved_name, reserved_marker, old_dir_file));
                 }
                 if let Some(ref target_bytes) = target {
                     // A provisional head must stay outside the published recovery transaction.
@@ -3046,8 +3088,8 @@ impl LocalDisk {
                         })()
                     };
                     if let Err(err) = write_res {
-                        if let Some((_, reserved_marker, _)) = &reserved_data_path {
-                            let _ = std::fs::remove_file(reserved_marker);
+                        if let Some((_, reserved_name, reserved_marker, old_dir_file)) = &reserved_data_path {
+                            let _ = unlink_child_file(old_dir_file.as_ref(), reserved_name, reserved_marker);
                         }
                         let _ = std::fs::remove_dir_all(&destination);
                         return Err(err);
@@ -3055,8 +3097,8 @@ impl LocalDisk {
                 } else if let Err(err) = unlink_child_file(file_path_dir.as_deref(), STORAGE_FORMAT_FILE, &xl_path)
                     && err.kind() != ErrorKind::NotFound
                 {
-                    if let Some((_, reserved_marker, _)) = &reserved_data_path {
-                        let _ = std::fs::remove_file(reserved_marker);
+                    if let Some((_, reserved_name, reserved_marker, old_dir_file)) = &reserved_data_path {
+                        let _ = unlink_child_file(old_dir_file.as_ref(), reserved_name, reserved_marker);
                     }
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
@@ -3065,9 +3107,16 @@ impl LocalDisk {
                     os::fsync_directory_handle_std(&file_path, file_path_dir.as_deref())?;
                 }
                 let had_old_data_dir = reserved_data_path.is_some();
-                if let Some((old_path, reserved_marker, old_dir_file)) = reserved_data_path {
-                    let recovery_marker = old_path.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
-                    match std::fs::rename(&reserved_marker, &recovery_marker) {
+                if let Some((old_path, reserved_name, reserved_marker, old_dir_file)) = reserved_data_path {
+                    let recovery_name = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+                    let recovery_marker = old_path.join(&recovery_name);
+                    match rename_in_same_dir_fd(
+                        old_dir_file.as_ref(),
+                        &reserved_name,
+                        &reserved_marker,
+                        &recovery_name,
+                        &recovery_marker,
+                    ) {
                         Ok(()) if sync => os::fsync_directory_handle_std(&old_path, old_dir_file.as_ref())?,
                         Ok(()) => {}
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -3486,11 +3535,15 @@ impl LocalDisk {
             if cached_had_old_data_dir != Some(false) {
                 let bases: &[&Path] = if fast_cleanup { &[&root] } else { &[&root, &rollback] };
                 for data_dir in &data_dirs {
+                    let data_dir_str = data_dir.to_string();
                     for base in bases {
-                        let dir_path = base.join(data_dir.to_string());
+                        let dir_path = base.join(&data_dir_str);
                         match std::fs::read_dir(&dir_path) {
                             Ok(entries) => {
                                 had_physical_data_dirs = true;
+                                let data_dir_fd = (*base == root)
+                                    .then(|| open_child_dir_fd(file_path_dir.as_deref(), &data_dir_str, &dir_path))
+                                    .flatten();
                                 let mut removable = Vec::new();
                                 let mut preserve_dir = false;
                                 for entry in recovery_entries(entries, work_budget.as_deref()) {
@@ -3507,25 +3560,33 @@ impl LocalDisk {
                                             || name == reserved
                                             || is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
                                     {
-                                        removable.push(entry.path());
+                                        removable.push((name.to_owned(), entry.path()));
                                     } else {
                                         preserve_dir = true;
                                     }
                                 }
-                                for path in removable {
-                                    ignore_not_found(std::fs::remove_file(path))?;
+                                for (name, path) in removable {
+                                    ignore_not_found(unlink_child_file(data_dir_fd.as_ref(), &name, &path))?;
                                 }
                                 let mut dir_removed = false;
                                 if !preserve_dir {
-                                    match std::fs::remove_dir(&dir_path) {
+                                    drop(data_dir_fd);
+                                    let rmdir_res = if *base == root {
+                                        rmdir_child_dir(file_path_dir.as_deref(), &data_dir_str, &dir_path)
+                                    } else {
+                                        std::fs::remove_dir(&dir_path)
+                                    };
+                                    match rmdir_res {
                                         Ok(()) => dir_removed = true,
                                         Err(err) if err.kind() == ErrorKind::NotFound => dir_removed = true,
                                         Err(err) if is_dir_not_empty_error(&err) => {}
                                         Err(err) => return Err(err),
                                     }
-                                }
-                                if !dir_removed && sync {
-                                    os::fsync_dir_std(&dir_path)?;
+                                    if !dir_removed && sync {
+                                        os::fsync_dir_std(&dir_path)?;
+                                    }
+                                } else if sync {
+                                    os::fsync_directory_handle_std(&dir_path, data_dir_fd.as_ref())?;
                                 }
                             }
                             Err(err) if err.kind() == ErrorKind::NotFound => {}

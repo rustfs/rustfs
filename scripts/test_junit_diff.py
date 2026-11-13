@@ -90,6 +90,21 @@ class JunitDiffTests(unittest.TestCase):
         code, _, _ = run("base.xml", "does_not_exist.xml")
         self.assertEqual(code, 2)
 
+    def test_absent_side_is_named_by_its_label(self):
+        labels = ("--label-a", "legacy", "--label-b", "gateway")
+        absent = ("does_not_exist.xml", "empty.xml", "no_cases.xml")
+        for name in absent:
+            for a, b, stack in (("base.xml", name, "gateway"), (name, "base.xml", "legacy")):
+                code, out, err = run(a, b, *labels)
+                self.assertEqual(code, 2, (a, b, out, err))
+                self.assertIn(f"no result for {stack}", err)
+                self.assertNotIn("No differences", out)
+
+    def test_unusable_report_is_not_reported_as_absent(self):
+        code, _, err = run("base.xml", "malformed.xml", "--label-a", "legacy", "--label-b", "gateway")
+        self.assertEqual(code, 2)
+        self.assertNotIn("no result", err)
+
     def test_stale_allow_entry_fails_run(self):
         code, out, _ = run("base.xml", "pass_fail.xml", "--allow", str(FIXTURES / "allow_stale.txt"))
         self.assertEqual(code, 1)

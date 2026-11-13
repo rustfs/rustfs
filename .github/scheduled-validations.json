@@ -360,14 +360,15 @@
       "cadence": "nightly",
       "timezone": "UTC",
       "schedule": [
-        "13 1 * * *"
+        "13 1 * * *",
+        "17 16 * * 0"
       ],
       "owner": "@overtrue",
       "policy": "active",
       "monitor": "workflow",
       "max_age_hours": 36,
       "result_owner": "build.yml",
-      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
+      "disposition": "Daily cron builds Linux; Sunday 16:17 UTC builds macOS and Windows. Public release writes belong to release-publish.yml.",
       "failure_owner": "workflow",
       "origin": "baseline",
       "alert_contract": "scheduled-validation"
@@ -765,6 +766,31 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/dual-stack-nightly.yml",
+      "name": "dual-stack-nightly",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "13 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "dual-stack-nightly.yml",
+      "disposition": "both-stack JUnit diff of the two profiles only ci.yml runs; the gateway legs are report-only until T2.10",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/e2e-distributed.yml",
       "name": "e2e-distributed",
       "roles": [
@@ -1023,7 +1049,7 @@
     },
     {
       "workflow": ".github/workflows/manual-main-packages.yml",
-      "name": "Manual main packages",
+      "name": "Manual Linux packages",
       "roles": [
         "manual"
       ],
@@ -1037,7 +1063,7 @@
       "policy": "active",
       "monitor": "none",
       "result_owner": "manual-main-packages.yml",
-      "disposition": "Packages the origin/main tip as workflow artifacts only. No GitHub Release or download-channel writes.",
+      "disposition": "Packages a git tag, or the origin/main tip when the ref input is empty, as workflow artifacts only. No GitHub Release or download-channel writes.",
       "monitor_reason": "Operator-requested packaging has no periodic freshness obligation.",
       "origin": "manual-main-packages"
     },
