@@ -72,6 +72,7 @@ use uuid::Uuid;
 #[cfg(feature = "e2e-test-hooks")]
 mod e2e_rpc_delay;
 pub(crate) mod heal;
+pub(crate) mod mrf;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
@@ -2860,6 +2861,59 @@ impl Node for NodeService {
         Ok(Response::new(response))
     }
 
+    async fn mrf_lifecycle(&self, request: Request<MrfLifecycleRequest>) -> Result<Response<MrfLifecycleResponse>, Status> {
+        if request.get_ref().command.len() > rustfs_protos::MRF_LIFECYCLE_MAX_COMMAND_BYTES
+            || request.get_ref().topology_fingerprint.len() != 64
+            || request.get_ref().node_id.len() != 64
+            || request.get_ref().challenge.len() != 16
+        {
+            return Err(Status::invalid_argument("invalid MRF request bounds"));
+        }
+        let canonical = request
+            .get_ref()
+            .canonical_body()
+            .map_err(|_| Status::invalid_argument("invalid MRF request size"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("MRF body authentication failed"))?;
+        let request = request.into_inner();
+        if request.protocol_version != rustfs_protos::MRF_LIFECYCLE_PROTOCOL_VERSION {
+            return Err(Status::unimplemented("unsupported MRF protocol version"));
+        }
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage not initialized"))?;
+        let endpoints = store
+            .instance_endpoints()
+            .ok_or_else(|| Status::unavailable("topology unavailable"))?;
+        let fingerprint = heal::heal_topology_fingerprint(&endpoints).map_err(|_| Status::unavailable("topology unavailable"))?;
+        if fingerprint != request.topology_fingerprint
+            || !endpoints
+                .get_nodes()
+                .iter()
+                .any(|node| node.is_local && mrf::node_id(&node.grid_host) == request.node_id)
+        {
+            return Err(Status::failed_precondition("MRF target topology changed"));
+        }
+        let operation: mrf::MrfOperation =
+            serde_json::from_slice(&request.command).map_err(|_| Status::invalid_argument("invalid MRF command"))?;
+        let result = mrf::execute(operation).await;
+        let bytes = serde_json::to_vec(&result).map_err(|_| Status::internal("MRF result encoding failed"))?;
+        if bytes.len() > rustfs_protos::MRF_LIFECYCLE_MAX_MESSAGE_BYTES / 2 {
+            return Err(Status::resource_exhausted("MRF response exceeds budget"));
+        }
+        let mut response = MrfLifecycleResponse {
+            protocol_version: rustfs_protos::MRF_LIFECYCLE_PROTOCOL_VERSION,
+            result: bytes.into(),
+            response_proof: Bytes::new(),
+        };
+        let canonical = rustfs_protos::canonical_mrf_lifecycle_response_body(&request, &response)
+            .map_err(|_| Status::internal("MRF result authentication failed"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&canonical)
+            .map_err(|_| Status::unavailable("MRF result authentication unavailable"))?
+            .into();
+        Ok(Response::new(response))
+    }
+
     async fn background_heal_status(
         &self,
         request: Request<BackgroundHealStatusRequest>,
@@ -3271,15 +3325,16 @@ mod tests {
         HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
         LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
         LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
-        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest, PreparePartTransactionRequest,
-        ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
-        RecoverMultipartSourceRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
-        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        MakeVolumeRequest, MakeVolumesRequest, MrfLifecycleRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest,
+        PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
+        RecoverDeleteTransactionRequest, RecoverMultipartSourceRequest, ReloadPoolMetaRequest,
+        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
+        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
+        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -4459,6 +4514,239 @@ mod tests {
         let service = make_server();
         // LocalPeerS3Client is a struct, not an Option, so we just check it exists
         assert!(format!("{:?}", service.local_peer).contains("LocalPeerS3Client"));
+    }
+
+    mod mrf_lifecycle_rpc_tests {
+        use super::{make_server_for_context, mark_v2_authenticated, target_rpc_fixture};
+        use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
+        use crate::storage::rpc::node_service::mrf;
+        use crate::storage::storage_api::set_tonic_canonical_body_digest;
+        use bytes::Bytes;
+        use rustfs_protos::CanonicalMutationBody as _;
+        use rustfs_protos::proto_gen::node_service::MrfLifecycleRequest;
+        use rustfs_protos::proto_gen::node_service::node_service_server::NodeService as _;
+        use rustfs_protos::{
+            MRF_LIFECYCLE_MAX_COMMAND_BYTES, MRF_LIFECYCLE_PROTOCOL_VERSION, canonical_mrf_lifecycle_response_body,
+        };
+        use tonic::Request;
+
+        fn request_body() -> MrfLifecycleRequest {
+            MrfLifecycleRequest {
+                protocol_version: MRF_LIFECYCLE_PROTOCOL_VERSION,
+                topology_fingerprint: "a".repeat(64),
+                node_id: "b".repeat(64),
+                command: Bytes::from_static(br#"{"operation":"summary"}"#),
+                challenge: Bytes::from_static(&[7; 16]),
+            }
+        }
+
+        fn signed_request(body: MrfLifecycleRequest) -> Request<MrfLifecycleRequest> {
+            let canonical = body.canonical_body().expect("MRF canonical request");
+            let mut request = Request::new(body);
+            set_tonic_canonical_body_digest(&mut request, &canonical).expect("MRF body digest");
+            // Direct-handler precondition; wire authentication is owned by the interceptor.
+            mark_v2_authenticated(&mut request);
+            request
+        }
+
+        #[tokio::test]
+        async fn mrf_lifecycle_requires_body_bound_auth_before_storage_lookup() {
+            let service = make_server_for_context(None);
+            let body = request_body();
+            let mut digest_only = Request::new(body.clone());
+            set_tonic_canonical_body_digest(&mut digest_only, &body.canonical_body().expect("canonical body"))
+                .expect("MRF body digest");
+            let mut marker_only = Request::new(body.clone());
+            mark_v2_authenticated(&mut marker_only);
+            for request in [Request::new(body.clone()), digest_only, marker_only] {
+                assert_eq!(
+                    service
+                        .mrf_lifecycle(request)
+                        .await
+                        .expect_err("MRF reads require authenticated body binding")
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+            }
+            for change in [
+                |r: &mut MrfLifecycleRequest| r.protocol_version += 1,
+                |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "c".repeat(64),
+                |r: &mut MrfLifecycleRequest| r.node_id = "d".repeat(64),
+                |r: &mut MrfLifecycleRequest| r.command = Bytes::from_static(br#"{"operation":"list","limit":1}"#),
+                |r: &mut MrfLifecycleRequest| r.challenge = Bytes::from_static(&[8; 16]),
+            ] {
+                let mut request = signed_request(body.clone());
+                change(request.get_mut());
+                assert_eq!(
+                    service
+                        .mrf_lifecycle(request)
+                        .await
+                        .expect_err("tampering with any signed request field must fail")
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+            }
+            assert_eq!(
+                service
+                    .mrf_lifecycle(signed_request(body))
+                    .await
+                    .expect_err("authenticated request still needs storage")
+                    .code(),
+                tonic::Code::Unavailable
+            );
+        }
+
+        #[tokio::test]
+        async fn mrf_lifecycle_rejects_unsupported_protocol_and_invalid_bounds() {
+            let service = make_server_for_context(None);
+            let baseline = request_body();
+            let mut unsupported = baseline.clone();
+            unsupported.protocol_version += 1;
+            assert_eq!(
+                service
+                    .mrf_lifecycle(signed_request(unsupported))
+                    .await
+                    .expect_err("unknown MRF protocol must fail before storage lookup")
+                    .code(),
+                tonic::Code::Unimplemented
+            );
+            for change in [
+                |r: &mut MrfLifecycleRequest| r.topology_fingerprint.truncate(63),
+                |r: &mut MrfLifecycleRequest| r.topology_fingerprint.push('a'),
+                |r: &mut MrfLifecycleRequest| r.node_id.truncate(63),
+                |r: &mut MrfLifecycleRequest| r.node_id.push('b'),
+                |r: &mut MrfLifecycleRequest| r.challenge = Bytes::from_static(&[7; 15]),
+                |r: &mut MrfLifecycleRequest| r.challenge = Bytes::from_static(&[7; 17]),
+                |r: &mut MrfLifecycleRequest| r.command = vec![b' '; MRF_LIFECYCLE_MAX_COMMAND_BYTES + 1].into(),
+            ] {
+                let mut body = baseline.clone();
+                change(&mut body);
+                assert_eq!(
+                    service
+                        .mrf_lifecycle(Request::new(body))
+                        .await
+                        .expect_err("invalid bounds must be rejected before canonical copying")
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+            }
+            let mut at_limit = baseline;
+            let mut command = at_limit.command.to_vec();
+            command.resize(MRF_LIFECYCLE_MAX_COMMAND_BYTES, b' ');
+            at_limit.command = command.into();
+            assert_eq!(
+                service
+                    .mrf_lifecycle(signed_request(at_limit))
+                    .await
+                    .expect_err("maximum-sized request passes bounds but needs storage")
+                    .code(),
+                tonic::Code::Unavailable
+            );
+        }
+
+        #[tokio::test]
+        async fn mrf_lifecycle_checks_target_and_signs_observation_for_exact_request() {
+            let _ = rustfs_credentials::set_global_rpc_secret("mrf-node-observation-test-secret".into());
+            let fixture = target_rpc_fixture().await;
+            fixture.instance.set_endpoints(fixture.env.endpoint_pools.clone());
+            let endpoints = fixture.env.ecstore.instance_endpoints().expect("fixture topology");
+            let local_id = endpoints
+                .get_nodes()
+                .iter()
+                .find(|node| node.is_local)
+                .map(|node| mrf::node_id(&node.grid_host))
+                .expect("fixture local node");
+            let body = MrfLifecycleRequest {
+                topology_fingerprint: heal_topology_fingerprint(&endpoints).expect("fixture topology fingerprint"),
+                node_id: local_id,
+                ..request_body()
+            };
+            let service = make_server_for_context(Some(fixture.context.clone()));
+            for change in [
+                |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "0".repeat(64),
+                |r: &mut MrfLifecycleRequest| r.node_id = mrf::node_id("not-a-cluster-node"),
+            ] {
+                let mut changed = body.clone();
+                change(&mut changed);
+                assert_eq!(
+                    service
+                        .mrf_lifecycle(signed_request(changed))
+                        .await
+                        .expect_err("signed requests cannot target another topology or node")
+                        .code(),
+                    tonic::Code::FailedPrecondition
+                );
+            }
+            for command in [
+                br#"{"operation":"summary","force":true}"#.as_slice(),
+                br#"{"operation":"unknown"}"#,
+                b"not-json",
+            ] {
+                let mut malformed = body.clone();
+                malformed.command = Bytes::copy_from_slice(command);
+                assert_eq!(
+                    service
+                        .mrf_lifecycle(signed_request(malformed))
+                        .await
+                        .expect_err("unsupported MRF commands must not execute")
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+            }
+            let response = service
+                .mrf_lifecycle(signed_request(body.clone()))
+                .await
+                .expect("valid authenticated target returns a signed observation")
+                .into_inner();
+            assert_eq!(response.protocol_version, MRF_LIFECYCLE_PROTOCOL_VERSION);
+            assert!(
+                matches!(
+                    serde_json::from_slice::<mrf::MrfReply>(&response.result).expect("MRF observation result"),
+                    mrf::MrfReply::Error { code } if code == "unavailable"
+                ),
+                "an uninitialized controller must not become an empty healthy summary"
+            );
+            let canonical = canonical_mrf_lifecycle_response_body(&body, &response).expect("MRF response body");
+            crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+                .expect("response proof must authenticate the observation");
+            for change in [
+                |r: &mut MrfLifecycleRequest| r.protocol_version += 1,
+                |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "1".repeat(64),
+                |r: &mut MrfLifecycleRequest| r.node_id = "2".repeat(64),
+                |r: &mut MrfLifecycleRequest| r.command = Bytes::from_static(br#"{"operation":"list","limit":1}"#),
+                |r: &mut MrfLifecycleRequest| r.challenge = Bytes::from_static(&[8; 16]),
+            ] {
+                let mut changed = body.clone();
+                change(&mut changed);
+                let changed_canonical =
+                    canonical_mrf_lifecycle_response_body(&changed, &response).expect("changed request context");
+                assert!(
+                    crate::storage::storage_api::verify_tonic_rpc_response_proof(&changed_canonical, &response.response_proof)
+                        .is_err(),
+                    "response proof must not replay for another request"
+                );
+            }
+            for changed in [
+                rustfs_protos::proto_gen::node_service::MrfLifecycleResponse {
+                    protocol_version: response.protocol_version + 1,
+                    ..response.clone()
+                },
+                rustfs_protos::proto_gen::node_service::MrfLifecycleResponse {
+                    result: Bytes::from_static(br#"{"result":"error","code":"checkpoint_unreadable"}"#),
+                    ..response.clone()
+                },
+            ] {
+                let changed_canonical = canonical_mrf_lifecycle_response_body(&body, &changed).expect("changed response");
+                assert!(
+                    crate::storage::storage_api::verify_tonic_rpc_response_proof(&changed_canonical, &response.response_proof)
+                        .is_err(),
+                    "altered response fields must invalidate the proof"
+                );
+            }
+            let mut changed_proof = response.response_proof.to_vec();
+            changed_proof[0] ^= 1;
+            assert!(crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &changed_proof).is_err());
+        }
     }
 
     fn heal_control_request(command: &[u8]) -> Request<HealControlRequest> {
@@ -11302,6 +11590,16 @@ mod tests {
         assert_tampered!(load_group, LoadGroupRequest::default());
         assert_tampered!(reload_site_replication_config, ReloadSiteReplicationConfigRequest::default());
         assert_tampered!(signal_service, SignalServiceRequest::default());
+        assert_tampered!(
+            mrf_lifecycle,
+            MrfLifecycleRequest {
+                protocol_version: rustfs_protos::MRF_LIFECYCLE_PROTOCOL_VERSION,
+                topology_fingerprint: "a".repeat(64),
+                node_id: "b".repeat(64),
+                command: Bytes::new(),
+                challenge: vec![7; 16].into(),
+            }
+        );
         assert_tampered!(
             scanner_activity,
             ScannerActivityRequest {
