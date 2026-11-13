@@ -309,6 +309,9 @@ pub struct InstanceContext {
     /// reads share one registry. Replaces the three `GLOBAL_LOCAL_DISK_*`
     /// statics: the path→disk map, the disk-id→endpoint map, and the
     /// pool/set/drive layout.
+    // Registration writers serialize preparation and publication independently
+    // of the short-lived inventory locks used by RPC readers.
+    local_disk_registration: Mutex<()>,
     local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
@@ -478,6 +481,7 @@ impl InstanceContext {
             bucket_monitor: OnceLock::new(),
             replication_stats: OnceCell::new(),
             replication_pool: OnceCell::new(),
+            local_disk_registration: Mutex::new(()),
             local_disk_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
@@ -957,11 +961,12 @@ impl InstanceContext {
         Ok(stored.1.clone())
     }
 
+    pub(crate) fn bound_multipart_proof_verification_context(&self) -> Option<ProofVerificationContext> {
+        self.multipart_proof_topology.get().map(|(_, authority)| authority.clone())
+    }
+
     pub(crate) fn multipart_proof_verification_context(&self) -> ProofVerificationContext {
-        self.multipart_proof_topology
-            .get()
-            .map(|(_, authority)| authority.clone())
-            .unwrap_or_default()
+        self.bound_multipart_proof_verification_context().unwrap_or_default()
     }
 
     /// This instance's tier configuration manager, materializing it on first
@@ -1028,6 +1033,10 @@ impl InstanceContext {
     }
 
     /// Handle to this instance's local path→disk map.
+    pub(crate) fn local_disk_registration_lock(&self) -> &Mutex<()> {
+        &self.local_disk_registration
+    }
+
     pub(crate) fn local_disk_map(&self) -> Arc<RwLock<HashMap<String, Option<DiskStore>>>> {
         self.local_disk_map.clone()
     }
