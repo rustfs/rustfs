@@ -8500,8 +8500,8 @@ mod tests {
                         assert_eq!(setup.available_shards(), expected);
                         if expected == 2 {
                             assert_eq!(setup.deferred_shards(), 2);
-                            for index in 2..4 {
-                                assert!(!setup.attempted[index]);
+                            for (index, attempted) in setup.attempted.iter().enumerate().take(4).skip(2) {
+                                assert!(!attempted);
                                 assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
                             }
                         }
