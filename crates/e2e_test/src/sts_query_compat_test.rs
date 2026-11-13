@@ -745,6 +745,13 @@ async fn test_list_buckets_opa_contract() -> TestResult {
     Ok(())
 }
 
+// Construct storage futures in a separate frame before boxing so the caller's
+// poll frame does not retain their large construction temporaries.
+#[inline(never)]
+fn boxed_fixture_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 /// Stop and reap the directory's owning server before opening the fixture store.
 async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, bucket: &str) -> TestResult {
     use crate::storage_api::bucket_tag_fixture::{
@@ -759,15 +766,17 @@ async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, buck
     server.wait()?;
     env.process = None;
     let layout = DisksLayout::from_volumes(std::slice::from_ref(&env.temp_dir))?;
-    let (pools, _) = EndpointServerPools::create_server_endpoints(&env.address, &layout).await?;
+    let (pools, _) = boxed_fixture_future(|| EndpointServerPools::create_server_endpoints(&env.address, &layout)).await?;
     let context = std::sync::Arc::new(InstanceContext::new());
-    init_local_disks_with_instance_ctx(&context, pools.clone()).await?;
-    let store = ECStore::new_with_instance_ctx(env.address.parse()?, pools, Default::default(), context.clone()).await?;
+    boxed_fixture_future(|| init_local_disks_with_instance_ctx(&context, pools.clone())).await?;
+    let address = env.address.parse()?;
+    let store =
+        boxed_fixture_future(|| ECStore::new_with_instance_ctx(address, pools, Default::default(), context.clone())).await?;
     let _cancel = context
         .background_cancel_token()
         .expect("store binds its shutdown token")
         .drop_guard();
-    let mut metadata = load_bucket_metadata(store.clone(), bucket).await?;
+    let mut metadata = boxed_fixture_future(|| load_bucket_metadata(store.clone(), bucket)).await?;
     let incarnation = metadata.bucket_incarnation_id;
     let policy = metadata.policy_config_json.clone();
     assert!(!incarnation.is_nil());
@@ -775,8 +784,8 @@ async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, buck
     // Encode the duplicate tag set with the same bucket record and erasure writer used by the store.
     let xml = b"<Tagging><TagSet><Tag><Key>department</Key><Value>finance</Value></Tag><Tag><Key>department</Key><Value>engineering</Value></Tag></TagSet></Tagging>";
     metadata.tagging_config_xml = xml.to_vec();
-    metadata.save_with_store(store.clone()).await?;
-    let persisted = load_bucket_metadata(store, bucket).await?;
+    boxed_fixture_future(|| metadata.save_with_store(store.clone())).await?;
+    let persisted = boxed_fixture_future(|| load_bucket_metadata(store, bucket)).await?;
     assert_eq!(persisted.bucket_incarnation_id, incarnation);
     assert_eq!(persisted.policy_config_json, policy);
     assert_eq!(persisted.tagging_config_xml.as_slice(), xml);
