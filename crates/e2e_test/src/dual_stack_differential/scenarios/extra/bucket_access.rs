@@ -14,7 +14,26 @@
 
 //! Differential cases of the `bucket_access` batch (see `super`).
 
-use super::super::Recorder;
+use super::super::{Recorder, none};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 
-pub(super) async fn cases(_s: &mut Recorder, _c: &Client) {}
+const BUCKET: &str = "a2-bucket-access";
+
+pub(super) async fn cases(s: &mut Recorder, c: &Client) {
+    s.step("CreateBucket", "a2-setup", c.create_bucket().bucket(BUCKET).send(), none).await;
+    versioning(s, c).await;
+}
+
+async fn versioning(s: &mut Recorder, c: &Client) {
+    let status = |o: &aws_sdk_s3::operation::get_bucket_versioning::GetBucketVersioningOutput| {
+        vec![("status", format!("{:?}", o.status())), ("mfa_delete", format!("{:?}", o.mfa_delete()))]
+    };
+    s.step("GetBucketVersioning", "unconfigured", c.get_bucket_versioning().bucket(BUCKET).send(), status)
+        .await;
+    let suspended = VersioningConfiguration::builder().status(BucketVersioningStatus::Suspended).build();
+    let put = c.put_bucket_versioning().bucket(BUCKET).versioning_configuration(suspended);
+    s.step("PutBucketVersioning", "a2-suspended", put.send(), none).await;
+    s.step("GetBucketVersioning", "suspended", c.get_bucket_versioning().bucket(BUCKET).send(), status)
+        .await;
+}

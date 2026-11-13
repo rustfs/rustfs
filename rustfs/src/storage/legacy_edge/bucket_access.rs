@@ -25,6 +25,7 @@ use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api::{self, acl};
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_bucket_versioning;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -140,11 +141,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
         record_s3_op(S3Operation::GetBucketVersioning);
         let usecase = s3_api::bucket_usecase_for(self);
-        let config = usecase.execute_get_bucket_versioning(req).await?;
-        Ok(S3Response::new(GetBucketVersioningOutput {
-            status: config.status.map(BucketVersioningStatus::from),
-            ..Default::default()
-        }))
+        through_gateway_seam(
+            req,
+            get_bucket_versioning::input_from_s3s,
+            get_bucket_versioning::output_to_s3s,
+            |_, input| usecase.execute_get_bucket_versioning(input),
+        )
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_acl_edge(

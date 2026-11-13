@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::bucket::{ObjectLockConfigExt as _, VersioningConfigExt as _};
-use crate::app::storage_api::s3::dto::{GetBucketVersioningInput, PutBucketVersioningInput, PutBucketVersioningOutput};
+use crate::app::storage_api::s3::dto::{PutBucketVersioningInput, PutBucketVersioningOutput};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
@@ -72,24 +72,26 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersi
 }
 
 impl DefaultBucketUsecase {
-    #[instrument(level = "debug", skip(self, req))]
+    /// The bucket's versioning status. A bucket that never configured versioning answers no status.
+    #[instrument(level = "debug", skip(self, input))]
     pub async fn execute_get_bucket_versioning(
         &self,
-        req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<PersistedVersioningConfiguration> {
-        let GetBucketVersioningInput { bucket, .. } = req.input;
+        input: gateway_dto::GetBucketVersioningInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketVersioningOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        BucketVersioningSys::get(&bucket)
-            .await
-            .map_err(|err| ApiError::from(err).into())
+        let config = BucketVersioningSys::get(input.bucket.as_str()).await.map_err(ApiError::from)?;
+        Ok(gateway_dto::GetBucketVersioningOutput {
+            status: config.status.map(gateway_dto::Status::custom),
+            ..Default::default()
+        })
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -132,8 +134,6 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
-    use http::Method;
 
     #[tokio::test]
     async fn validate_bucket_versioning_update_rejects_invalid_status_before_metadata_lookup() {
@@ -181,15 +181,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_versioning_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketVersioningInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
+        let input = gateway_dto::GetBucketVersioningInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_versioning(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_versioning(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 }

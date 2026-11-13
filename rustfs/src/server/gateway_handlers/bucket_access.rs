@@ -15,4 +15,31 @@
 //! The gateway operations of migration batch A2 (rustfs/backlog#2765): bucket policy, policy status, versioning, notification and ACL.
 //! None is served yet; the batch appends its rows here.
 
-pub(super) const ROWS: &[super::OpRow] = &[];
+use super::{OpRow, Served, row};
+use crate::app::RequestEnvelope;
+use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::runtime_sources::AppContext;
+use crate::storage_api::server::http::access::authorize_bucket_request;
+use rustfs_gateway::{Req, Resp, dto};
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::S3Result;
+use std::sync::Arc;
+
+pub(super) const ROWS: &[OpRow] = &[row::<dto::GetBucketVersioning>()];
+
+impl Served for dto::GetBucketVersioning {
+    const METRIC: S3Operation = S3Operation::GetBucketVersioning;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketVersioningAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_versioning(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
