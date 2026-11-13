@@ -292,7 +292,14 @@ async fn fetch_chunk(pool: Arc<dyn NixlRecvPool>, request: ReadStreamRequest, ti
     build_auth_headers(&url, &Method::GET, &mut headers)?;
     let (status, response_headers, _) = rustfs_rio::internode_http_request(&url, Method::GET, headers, Some(timeout)).await?;
     if !status.is_success() {
-        return Err(io::Error::other(format!("nixl internode read returned {status}")));
+        debug!(
+            component = LOG_COMPONENT_INTERNODE,
+            subsystem = LOG_SUBSYSTEM_NIXL,
+            result = "failed",
+            status = status.as_u16(),
+            "nixl internode read refused by peer"
+        );
+        return Err(io::Error::other("nixl internode read refused by peer"));
     }
     let landed = response_headers
         .get(NIXL_BYTES_HEADER)
@@ -472,17 +479,30 @@ async fn send_segment(
     let (status, response_headers, body) = rustfs_rio::internode_http_request(&url, Method::PUT, headers, Some(timeout)).await?;
     rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_segment_request", request_started);
     if !status.is_success() {
-        return Err(io::Error::other(format!(
-            "nixl internode write returned {status}: {}",
-            String::from_utf8_lossy(&body)
-        )));
+        debug!(
+            component = LOG_COMPONENT_INTERNODE,
+            subsystem = LOG_SUBSYSTEM_NIXL,
+            result = "failed",
+            status = status.as_u16(),
+            body_len = body.len(),
+            "nixl internode write refused by peer"
+        );
+        return Err(io::Error::other("nixl internode write refused by peer"));
     }
     let written = response_headers
         .get(NIXL_BYTES_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
     if written != Some(total) {
-        return Err(io::Error::other(format!("nixl internode write stored {written:?} of {total} bytes")));
+        debug!(
+            component = LOG_COMPONENT_INTERNODE,
+            subsystem = LOG_SUBSYSTEM_NIXL,
+            result = "failed",
+            written = ?written,
+            total,
+            "nixl internode write stored a different byte count"
+        );
+        return Err(io::Error::other("nixl internode write stored a different byte count"));
     }
     for (buffer, _) in buffers {
         buffer.release();
