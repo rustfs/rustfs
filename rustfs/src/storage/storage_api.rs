@@ -152,7 +152,7 @@ pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
         AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
-        resolve_req_info,
+        authorize_object_request, resolve_req_info,
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
@@ -822,6 +822,7 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
+pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;

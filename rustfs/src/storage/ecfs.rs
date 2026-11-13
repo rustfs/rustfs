@@ -23,12 +23,9 @@ use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use rustfs_utils::http::headers::{AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -179,30 +176,6 @@ pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Op
 
 const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
 const MAXIMUM_RETENTION_YEARS: i32 = 100;
-
-pub(crate) fn object_lock_retention_from_metadata(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRetention> {
-    let mode = metadata
-        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-        .map(|value| ObjectLockRetentionMode::from(value.as_str().to_string()));
-    let retain_until_date = metadata
-        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        // The S3 timestamp serializer emits a literal Z, so its wall clock
-        // must be UTC before it is serialized.
-        .map(|date| {
-            date.checked_to_offset(time::UtcOffset::UTC)
-                .filter(|date| (0..=9999).contains(&date.year()))
-                .map(Timestamp::from)
-                .ok_or_else(|| {
-                    S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        "Stored retention date is outside the supported UTC range".to_string(),
-                    )
-                })
-        })
-        .transpose()?;
-    Ok(ObjectLockRetention { mode, retain_until_date })
-}
 
 fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::MalformedXML, message.into())

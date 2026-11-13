@@ -1799,6 +1799,17 @@ pub(crate) mod object_usecase {
     };
 }
 
+pub(crate) mod object_meta_usecase {
+    pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::{BucketOperations, BucketOptions, ObjectOperations};
+    }
+
+    pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::decode_tags as decode_stored_tags;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
+    pub(crate) use crate::storage::storage_api::parse_object_version_id;
+}
+
 pub(crate) mod multipart_usecase {
     pub(crate) mod contract {
         #[cfg(test)]

@@ -3269,14 +3269,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_meta::authorize_object_tagging_request(
             req,
-            versioned_tagging_action(S3Action::DeleteObjectTaggingAction, req.input.version_id.as_deref()),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            S3Action::DeleteObjectTaggingAction,
         )
         .await
     }
@@ -3584,14 +3583,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_meta::authorize_object_tagging_request(
             req,
-            versioned_tagging_action(S3Action::GetObjectTaggingAction, req.input.version_id.as_deref()),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            S3Action::GetObjectTaggingAction,
         )
         .await
     }

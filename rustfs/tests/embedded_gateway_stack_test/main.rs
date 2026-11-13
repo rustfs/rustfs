@@ -15,7 +15,7 @@
 // The gateway S3 stack inside an embedded RustFS server (rustfs/backlog#2734). Requests are signed
 // by the AWS SDK and travel through the whole middleware stack, so what is asserted here is what a
 // client sees. Every served operation has a row in the refusal matrix, kept per migration family in
-// the module named after it, and the matrix runs on both stacks.
+// the module named after it, or an entry in `ANSWERS_EVERY_CALLER_ALIKE`; both run on both stacks.
 
 #![recursion_limit = "256"]
 
@@ -88,6 +88,26 @@ const MATRIX: &[&[MatrixRow]] = &[
 fn matrix() -> impl Iterator<Item = &'static MatrixRow> {
     MATRIX.iter().flat_map(|family| family.iter())
 }
+
+/// A served operation whose answer does not depend on the caller, so it has no refusal rows. It
+/// must refuse every caller it serves alike, never serve data: an operation here cannot dodge the
+/// matrix while answering `2xx`.
+struct AnswersEveryCallerAlike {
+    operation: &'static str,
+    reason: &'static str,
+    metric: S3Operation,
+    /// The code and status every admitted caller gets.
+    answer: (&'static str, u16),
+    call: for<'a> fn(&'a Client, &'a str) -> BoxFuture<'a, Outcome>,
+}
+
+const ANSWERS_EVERY_CALLER_ALIKE: &[AnswersEveryCallerAlike] = &[AnswersEveryCallerAlike {
+    operation: "GetObjectTorrent",
+    reason: "always NoSuchKey: the legacy hook checks nothing and no torrent is ever served",
+    metric: S3Operation::GetObjectTorrent,
+    answer: ("NoSuchKey", 404),
+    call: object_meta::get_object_torrent,
+}];
 
 /// What one call observed: served, or refused.
 pub(crate) type Outcome = Result<(), Refusal>;
@@ -266,14 +286,72 @@ fn every_served_operation_has_one_matrix_row_and_every_row_a_served_operation() 
     let rows: Vec<&str> = matrix().map(|row| row.operation).collect();
     let distinct: BTreeSet<&str> = rows.iter().copied().collect();
 
+    let alike: BTreeSet<&str> = ANSWERS_EVERY_CALLER_ALIKE.iter().map(|entry| entry.operation).collect();
+
     assert_eq!(rows.len(), distinct.len(), "an operation has two rows: {rows:?}");
-    assert_eq!(distinct, gateway_operations().into_iter().collect());
+    assert_eq!(alike.len(), ANSWERS_EVERY_CALLER_ALIKE.len(), "an operation is listed twice: {alike:?}");
+    assert!(distinct.is_disjoint(&alike), "{:?}", distinct.intersection(&alike));
+    assert_eq!(&distinct | &alike, gateway_operations().into_iter().collect());
+}
+
+/// Every operation that answers every caller alike gives root, the user without a policy and the
+/// anonymous caller its one non-`2xx` answer, counted once under its label, while authentication
+/// still refuses a wrong secret and an unknown key before any operation is known.
+async fn every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike(server: RustFSServer) {
+    create_bucket_in_the_store(MATRIX_BUCKET).await;
+    create_user_without_a_policy(NO_POLICY_USER).await;
+    let endpoint = server.endpoint();
+    let admitted = [
+        ("root", s3_client(&endpoint, server.access_key(), server.secret_key())),
+        ("no policy", s3_client(&endpoint, NO_POLICY_USER, USER_SECRET_KEY)),
+        ("anonymous", anonymous_client(&endpoint).await),
+    ];
+    let unauthenticated = [
+        ("wrong secret", s3_client(&endpoint, ROOT_ACCESS_KEY, "not-the-root-secret")),
+        ("unknown key", s3_client(&endpoint, "gatewaystackunknown", USER_SECRET_KEY)),
+    ];
+
+    for entry in ANSWERS_EVERY_CALLER_ALIKE {
+        let (code, status) = entry.answer;
+        assert!(!(200..300).contains(&status), "{} ({}) serves", entry.operation, entry.reason);
+        for (caller, client) in &admitted {
+            let before = s3_request_counts();
+            let context = format!("{} as the {caller} caller", entry.operation);
+            let refusal = (entry.call)(client, MATRIX_BUCKET).await.expect_err(&context);
+            assert_eq!((refusal.code.as_deref(), refusal.status), (Some(code), Some(status)), "{context}");
+            let counted = counted_since(&before);
+            let series = [(entry.metric.as_str(), "4xx")];
+            assert!(counted.values().all(|total| *total == 1), "{context} {counted:?}");
+            assert!(
+                counted.keys().map(|(_, label, outcome)| (*label, *outcome)).eq(series),
+                "{context} {counted:?}"
+            );
+        }
+        for (caller, client) in &unauthenticated {
+            let context = format!("{} as the {caller} caller", entry.operation);
+            let refusal = (entry.call)(client, MATRIX_BUCKET).await.expect_err(&context);
+            assert_eq!(refusal.status, Some(403), "{context}");
+        }
+    }
+
+    server.shutdown().await;
+}
+
+#[test]
+fn operations_that_answer_every_caller_alike_do_so_on_the_gateway_stack() {
+    with_stack(GATEWAY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
+}
+
+#[test]
+fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
+    with_stack(LEGACY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
 }
 
 /// Every served operation serves the root caller, counted once under its label, and refuses
 /// each caller it cannot admit with the code the legacy stack answers, counted once.
 async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer) {
     create_bucket_in_the_store(MATRIX_BUCKET).await;
+    create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
     create_user_without_a_policy(NO_POLICY_USER).await;
     let endpoint = server.endpoint();
     let root = s3_client(&endpoint, server.access_key(), server.secret_key());

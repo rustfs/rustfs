@@ -14506,10 +14506,11 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    assert_object_metadata_reserved_prefix_guard_calls(&crate::guard_sources::SourceSet::production(
-        "src/storage/ecfs.rs",
-        "src/storage/legacy_edge",
-    ));
+    // DeleteObjectTagging's call moved into the use case of batch B1; PutObjectTagging's is still on
+    // the legacy edge.
+    let sources = crate::guard_sources::SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge")
+        .and(crate::guard_sources::SourceSet::production("src/app/mod.rs", "src/app/object_meta"));
+    assert_object_metadata_reserved_prefix_guard_calls(&sources);
 }
 
 /// `count` production calls of `guard`, one per method, for count-guard fixtures.
