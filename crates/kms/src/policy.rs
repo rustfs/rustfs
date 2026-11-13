@@ -564,8 +564,23 @@ impl OwnWrites {
     }
 
     /// Record an acknowledged write of `record` as `version`.
+    ///
+    /// The remembered version never moves backwards: two writes of one record
+    /// by this client can have their acknowledgements processed out of order,
+    /// and the lower one must not replace the higher. A write that follows
+    /// this client's own delete starts a new record, whose versions count from
+    /// the beginning again, so it replaces the delete marker as is.
     pub(crate) async fn wrote(&self, record: &str, version: u32) {
-        self.recent.insert(record.to_string(), OwnWrite::Version(version)).await;
+        self.recent
+            .entry_by_ref(record)
+            .and_upsert_with(|current| {
+                let newest = match current.map(|entry| entry.into_value()) {
+                    Some(OwnWrite::Version(remembered)) => remembered.max(version),
+                    Some(OwnWrite::Deleted) | None => version,
+                };
+                std::future::ready(OwnWrite::Version(newest))
+            })
+            .await;
     }
 
     /// Record an acknowledged delete of `record`.
@@ -1141,6 +1156,28 @@ mod tests {
         own.wrote("record", 2).await;
         own.deleted("record").await;
         assert_eq!(read_scripted(&own, &[Some(2), None]).await, (None, 2));
+    }
+
+    /// Acknowledgements of two writes can be processed in the reverse of the
+    /// order the writes landed in; the earlier version must not become the
+    /// floor again.
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_keeps_the_highest_version_when_acknowledgements_arrive_out_of_order() {
+        let own = OwnWrites::new();
+        own.wrote("record", 3).await;
+        own.wrote("record", 2).await;
+        assert_eq!(read_scripted(&own, &[Some(2), Some(3)]).await, (Some(3), 2));
+    }
+
+    /// A record this client deleted and then created again counts its versions
+    /// from the beginning, so the first version of the new record is current.
+    #[tokio::test(start_paused = true)]
+    async fn own_writes_restarts_the_version_floor_after_its_own_delete() {
+        let own = OwnWrites::new();
+        own.wrote("record", 7).await;
+        own.deleted("record").await;
+        own.wrote("record", 1).await;
+        assert_eq!(read_scripted(&own, &[Some(1)]).await, (Some(1), 1));
     }
 
     /// A record another client replaced is still returned, after a bounded
