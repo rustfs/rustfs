@@ -970,14 +970,14 @@ pub(super) enum PutObjectOrigin<'a> {
 impl PutObjectOrigin<'_> {
     fn replication_request_authorized(&self) -> bool {
         match self {
-            Self::S3 { req, .. } => replication_request_authorized(req),
+            Self::S3 { req, .. } => replication_request_authorized(*req),
             Self::Internal { .. } => false,
         }
     }
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(req, bucket, opts),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1010,14 +1010,14 @@ impl PutObjectOrigin<'_> {
 
     fn table_data_plane_publication_guards(&self) -> Option<TableDataPlanePublicationGuards> {
         match self {
-            Self::S3 { req, .. } => retained_table_data_plane_publication_guards(req),
+            Self::S3 { req, .. } => retained_table_data_plane_publication_guards(*req),
             Self::Internal { .. } => None,
         }
     }
 
     fn sse_principal(&self) -> Option<SseKmsPrincipal> {
         match self {
-            Self::S3 { req, .. } => SseKmsPrincipal::from_request(req),
+            Self::S3 { req, .. } => SseKmsPrincipal::from_request(*req),
             Self::Internal { .. } => None,
         }
     }

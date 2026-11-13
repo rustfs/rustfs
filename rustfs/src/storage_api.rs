@@ -235,6 +235,8 @@ pub(crate) mod server {
         /// The access-phase functions the gateway stack shares with the legacy access hooks.
         #[cfg(feature = "gateway-stack")]
         pub(crate) mod access {
+            /// The per-batch authorization shapes, one module per migration batch.
+            pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
                 AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
             };

@@ -28,9 +28,10 @@
 //! member without a counterpart, `ReplicationRuleFilter::cached_tags`, is a
 //! parse cache with no wire form.
 //!
-//! Upstream: `storage::ecfs` (`put_bucket_replication`,
-//! `get_bucket_replication`). Downstream: `app::bucket_usecase`, which takes and
-//! answers the persistence shape. The gateway HTTP stack retires this edge
+//! Upstream: `storage::ecfs` (`put_bucket_replication`). Downstream:
+//! `app::bucket_usecase`, which takes the persistence shape. Answers cross the
+//! gateway seam instead; the reverse direction is compiled only as the oracle
+//! of this module's tests and goes with the forward one. The gateway HTTP stack retires this edge
 //! (T1.8, rustfs/backlog#2749).
 
 use rustfs_gateway_types::persistence::{
@@ -49,7 +50,8 @@ pub(crate) fn replication_configuration_from_s3s(value: dto::ReplicationConfigur
     }
 }
 
-/// A stored configuration in the shape the legacy `GetBucketReplication` encoder takes.
+/// A stored configuration in the shape the s3s encoder takes.
+#[cfg(test)]
 pub(crate) fn replication_configuration_to_s3s(value: PersistedReplicationConfiguration) -> dto::ReplicationConfiguration {
     dto::ReplicationConfiguration {
         role: value.role,
@@ -145,6 +147,7 @@ fn tag_from_s3s(value: dto::Tag) -> PersistedReplicationTag {
     }
 }
 
+#[cfg(test)]
 fn rule_to_s3s(value: PersistedReplicationRule) -> dto::ReplicationRule {
     dto::ReplicationRule {
         delete_marker_replication: value.delete_marker_replication.map(|wrapper| dto::DeleteMarkerReplication {
@@ -175,6 +178,7 @@ fn rule_to_s3s(value: PersistedReplicationRule) -> dto::ReplicationRule {
     }
 }
 
+#[cfg(test)]
 fn destination_to_s3s(value: PersistedReplicationDestination) -> dto::Destination {
     dto::Destination {
         access_control_translation: value
@@ -201,10 +205,12 @@ fn destination_to_s3s(value: PersistedReplicationDestination) -> dto::Destinatio
     }
 }
 
+#[cfg(test)]
 fn time_value_to_s3s(value: PersistedReplicationTimeValue) -> dto::ReplicationTimeValue {
     dto::ReplicationTimeValue { minutes: value.minutes }
 }
 
+#[cfg(test)]
 fn filter_to_s3s(value: PersistedReplicationFilter) -> dto::ReplicationRuleFilter {
     dto::ReplicationRuleFilter {
         and: value.and.map(|and| dto::ReplicationRuleAndOperator {
@@ -217,6 +223,7 @@ fn filter_to_s3s(value: PersistedReplicationFilter) -> dto::ReplicationRuleFilte
     }
 }
 
+#[cfg(test)]
 fn tag_to_s3s(value: PersistedReplicationTag) -> dto::Tag {
     dto::Tag {
         key: value.key,
@@ -478,5 +485,40 @@ mod tests {
         assert!(s3s_reads(input));
         let stored = parse_replication(input).expect("the gateway reader skips the unknown root element");
         assert_eq!(stored.rules.len(), 1);
+    }
+
+    /// Every member the legacy answer carries, the MinIO one included.
+    const STORED: &[u8] = b"<ReplicationConfiguration><Role>arn:minio:replication::id:target</Role><Rule>\
+<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><DeleteReplication><Status>Enabled</Status>\
+</DeleteReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket><StorageClass>STANDARD</StorageClass></Destination>\
+<ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication><Filter><And><Prefix>a/</Prefix><Tag><Key>k\
+</Key><Value>v</Value></Tag></And></Filter><ID>r1</ID><Priority>1</Priority><SourceSelectionCriteria><ReplicaModifications>\
+<Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria><Status>Enabled</Status></Rule>\
+</ReplicationConfiguration>";
+
+    /// The legacy stack answers a stored configuration through the gateway seam with the bytes it
+    /// answered through this module's reverse direction.
+    #[test]
+    fn the_legacy_answer_through_the_seam_is_the_answer_of_the_reverse_direction() {
+        use crate::app::dto_values::stored_config;
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_bucket_replication::output_to_s3s;
+        use rustfs_gateway_types::persistence::parse_replication_dto;
+
+        let stored = parse_replication(STORED).expect("the fixture is a stored document");
+        let before = s3s_bytes(&replication_configuration_to_s3s(stored.clone()));
+        let answer = rustfs_gateway_types::dto::GetBucketReplicationOutput {
+            replication_configuration: Some(stored_config(&stored, parse_replication_dto).expect("gateway answer")),
+        };
+
+        let after = output_to_s3s(answer)
+            .expect("seam")
+            .replication_configuration
+            .expect("a configuration");
+        let after = s3s_bytes(&after);
+
+        assert_eq!(String::from_utf8_lossy(&after), String::from_utf8_lossy(&before));
+        for member in ["<DeleteReplication>", "<ExistingObjectReplication>", "<ReplicaModifications>"] {
+            assert!(String::from_utf8_lossy(&after).contains(member), "{member} is missing");
+        }
     }
 }

@@ -712,3 +712,43 @@ fn an_error_without_a_message_is_audited_under_its_code_name() {
         }
     }
 }
+
+fn s3_op_total(op: S3Operation) -> u64 {
+    rustfs_io_metrics::s3_op_metrics_snapshot()
+        .into_iter()
+        .find(|snapshot| snapshot.op == op.as_str())
+        .map_or(0, |snapshot| snapshot.total)
+}
+
+/// An operation is counted once per request, by its edge: the legacy constructor counts, as it
+/// did, for operations whose edge does not; the owned constructor never does, because the owned
+/// edge already counted before the use case built it.
+#[test]
+#[serial(owned_audit_probe)]
+fn only_the_legacy_helper_counts_the_operation() {
+    let op = S3Operation::GetObjectRetention;
+    let event = EventName::ObjectAccessedGetRetention;
+    let req = S3Request {
+        input: (),
+        method: Method::GET,
+        uri: Uri::from_static("/count-bucket/count-object?retention"),
+        headers: HeaderMap::new(),
+        extensions: Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    };
+    let envelope = RequestEnvelope::from_s3s(&req);
+
+    let before = s3_op_total(op);
+    drop(OperationHelper::from_view(&envelope.audit_view(), event, op).complete_owned(
+        &Ok(()),
+        StatusCode::OK,
+        &HeaderMap::new(),
+    ));
+    assert_eq!(s3_op_total(op), before, "the owned helper counts nothing");
+
+    drop(OperationHelper::new(&req, event, op).complete(&Ok(S3Response::new(()))));
+    assert_eq!(s3_op_total(op), before + 1, "the legacy helper counts once");
+}

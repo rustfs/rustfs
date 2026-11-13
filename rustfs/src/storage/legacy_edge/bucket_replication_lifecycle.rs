@@ -26,9 +26,10 @@ use crate::storage::StorageVersioningConfigExt as _;
 use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
+use crate::storage::persisted_from_s3s;
 use crate::storage::s3_api;
-use crate::storage::s3_compat::lifecycle::{lifecycle_configuration_from_s3s, lifecycle_configuration_to_s3s};
-use crate::storage::s3_compat::replication::{replication_configuration_from_s3s, replication_configuration_to_s3s};
+use crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s;
+use crate::storage::s3_compat::replication::replication_configuration_from_s3s;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecstore_bucket::utils::serialize as serialize_bucket_config;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
@@ -36,8 +37,10 @@ use crate::storage::{
     BUCKET_VERSIONING_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, get_bucket_object_lock_config,
     update_bucket_metadata_config_if_incarnation,
 };
-use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use http::StatusCode;
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
+    get_bucket_lifecycle_configuration, get_bucket_replication, get_object_lock_configuration,
+};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_s3_ops::S3Operation;
@@ -278,13 +281,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
         record_s3_op(S3Operation::GetBucketLifecycleConfiguration);
         let usecase = s3_api::bucket_usecase_for(self);
-        let config = usecase.execute_get_bucket_lifecycle_configuration(req).await?;
-        let config = lifecycle_configuration_to_s3s(config)
-            .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, error.to_string()))?;
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules: Some(config.rules),
-            ..Default::default()
-        }))
+        through_gateway_seam(
+            req,
+            get_bucket_lifecycle_configuration::input_from_s3s,
+            get_bucket_lifecycle_configuration::output_to_s3s,
+            |_, input| usecase.execute_get_bucket_lifecycle_configuration(input),
+        )
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_replication_edge(
@@ -293,10 +296,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
         record_s3_op(S3Operation::GetBucketReplication);
         let usecase = s3_api::bucket_usecase_for(self);
-        let replication_configuration = usecase.execute_get_bucket_replication(req).await?;
-        Ok(S3Response::new(GetBucketReplicationOutput {
-            replication_configuration: Some(replication_configuration_to_s3s(replication_configuration)),
-        }))
+        through_gateway_seam(
+            req,
+            get_bucket_replication::input_from_s3s,
+            get_bucket_replication::output_to_s3s,
+            |_, input| usecase.execute_get_bucket_replication(input),
+        )
+        .await
     }
 
     #[instrument(name = "get_object_lock_configuration", level = "debug", skip(self, req))]
@@ -305,44 +311,14 @@ impl FS {
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
         record_s3_op(S3Operation::GetObjectLockConfiguration);
-        let GetObjectLockConfigurationInput { bucket, .. } = req.input;
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let object_lock_configuration = match get_bucket_object_lock_config(&bucket).await {
-            Ok((cfg, _created)) => Some(persisted_to_s3s::<_, ObjectLockConfiguration>(&cfg)?),
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ObjectLockConfigurationNotFoundError,
-                        "Object Lock configuration does not exist for this bucket".to_string(),
-                    ));
-                }
-                warn!(
-                    component = LOG_COMPONENT_STORAGE,
-                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                    event = "object_lock_config_load_failed",
-                    bucket = %bucket,
-                    error = ?err,
-                    "Failed to load bucket object lock configuration"
-                );
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
-        };
-
-        Ok(S3Response::new(GetObjectLockConfigurationOutput {
-            object_lock_configuration,
-        }))
+        let usecase = s3_api::bucket_usecase_for(self);
+        through_gateway_seam(
+            req,
+            get_object_lock_configuration::input_from_s3s,
+            get_object_lock_configuration::output_to_s3s,
+            |_, input| usecase.execute_get_object_lock_configuration(input),
+        )
+        .await
     }
 
     #[instrument(name = "put_bucket_lifecycle_configuration", level = "debug", skip(self, req))]

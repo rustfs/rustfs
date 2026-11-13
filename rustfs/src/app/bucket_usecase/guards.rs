@@ -33,7 +33,7 @@ fn bucket_create_and_delete_use_admitted_fresh_tasks() {
         (
             "execute_create_bucket",
             "bucket creation",
-            "execute_create_bucket_inner(req, mutation_permit).await",
+            "execute_create_bucket_inner(envelope, input, mutation_permit).await",
         ),
         ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
     ] {

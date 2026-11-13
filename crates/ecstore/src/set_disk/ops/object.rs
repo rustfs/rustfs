@@ -3859,7 +3859,10 @@ async fn run_legacy_producer_segment(
     // Disk read timeouts must be enforced at the actual disk I/O operations.
     // A sink that can take shards out of arena memory (zero-copy emit) is
     // offered to the decode loop for the whole read.
-    let read = crate::set_disk::with_get_object_read_policy(
+    // The read future is boxed so the producer future stays pointer-sized:
+    // `get_object_reader` builds one producer per arm (and per segment), and
+    // embedding the whole read pipeline inline there overflows a 2 MiB stack.
+    let read = Box::pin(crate::set_disk::with_get_object_read_policy(
         context.read_policy,
         SetDisks::get_object_with_fileinfo(
             &context.bucket,
@@ -3881,7 +3884,7 @@ async fn run_legacy_producer_segment(
             context.object_class,
             context.size_bucket,
         ),
-    );
+    ));
     let read = async move {
         match emitter {
             Some(emitter) => crate::erasure::codec::shard_emit::with_shard_emitter(emitter, read).await,
@@ -4055,6 +4058,43 @@ mod sink_segment_plan_tests {
         let ranges = plan_sink_segments(0, (10 * BLOCK) as i64, BLOCK, 4, 0);
         let lens: Vec<usize> = ranges.iter().map(|(_, len)| *len as usize / BLOCK).collect();
         assert_eq!(lens, vec![2, 3, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod legacy_producer_stack_tests {
+    use super::*;
+
+    /// `get_object_reader` builds a producer future per arm and per segment;
+    /// each one inlined the whole read pipeline and the GET path overflowed a
+    /// 2 MiB debug stack. The producer must keep that pipeline on the heap.
+    #[test]
+    fn legacy_producer_future_keeps_the_read_pipeline_off_the_stack() {
+        let context = Arc::new(LegacyProducerContext {
+            bucket: "bucket".to_owned(),
+            object: "object".to_owned(),
+            erasure_cache: Arc::new(super::super::super::ErasureCache::new()),
+            fi: FileInfo::default(),
+            files: Vec::new(),
+            disks: Vec::new(),
+            set_index: 0,
+            pool_index: 0,
+            skip_verify: false,
+            suppress_read_repair: false,
+            read_policy: Default::default(),
+            object_class: "plain",
+            size_bucket: "small",
+            cancellation: None,
+        });
+        let writer = GetObjectSinkWriter::new(Box::new(tokio::io::sink()));
+
+        let future = run_legacy_producer_segment(context, 0, 0, writer);
+        let future_size = std::mem::size_of_val(&future);
+
+        assert!(
+            future_size <= 1024,
+            "legacy GET producer future must stay stack-bounded, got {future_size} bytes"
+        );
     }
 }
 
