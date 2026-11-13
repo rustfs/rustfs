@@ -24,7 +24,7 @@
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
 use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
-use rustfs_gateway_types::{BucketName, NamePolicy, NameValidator, Stricter, Timestamp};
+use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, Stricter, Timestamp};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::sync::{Arc, LazyLock};
 use time::OffsetDateTime;
@@ -91,6 +91,23 @@ pub(crate) fn owner() -> Owner {
         display_name: Some(RUSTFS_OWNER_DISPLAY_NAME.to_owned()),
         id: Some(RUSTFS_OWNER_ID.to_owned()),
     }
+}
+
+/// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
+/// converts it here, and none drops, rewrites or refuses one.
+///
+/// A tag the gateway's reader accepts is read as it reads it (a surrounding quote pair or a `W/`
+/// prefix is the store's spelling of it); any other, empty or carrying a control character, is
+/// carried byte for byte.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the object reads of batch C and the listings of B2 are its first callers"
+    )
+)]
+pub(crate) fn stored_etag(stored: &str) -> ETag {
+    ETag::new(stored.to_owned()).unwrap_or_else(|_| ETag::from_stored(stored.to_owned()))
 }
 
 #[cfg(test)]
@@ -173,5 +190,25 @@ mod tests {
         let converted = timestamp(at);
 
         assert_eq!((converted.secs(), converted.subsec_nanos()), (1_700_000_000, 123_000_000));
+    }
+
+    #[test]
+    fn a_stored_tag_is_carried_as_stored_in_every_spelling_the_store_writes() {
+        for stored in ["0123abcd", "\"0123abcd\"", "0123abcd-2", "W/\"0123abcd\""] {
+            let etag = stored_etag(stored);
+
+            assert_eq!(etag.opaque_tag(), stored.trim_start_matches("W/").trim_matches('"'), "{stored}");
+            assert_eq!(etag.is_weak(), stored.starts_with("W/"), "{stored}");
+        }
+    }
+
+    #[test]
+    fn a_stored_tag_the_reader_refuses_is_carried_byte_for_byte() {
+        for stored in ["", "\"\"", "abc\u{1}def", "abc\ndef"] {
+            let etag = stored_etag(stored);
+
+            assert_eq!(etag.opaque_tag(), stored, "{stored:?}");
+            assert!(!etag.is_weak(), "{stored:?}");
+        }
     }
 }
