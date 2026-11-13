@@ -56,7 +56,7 @@ jobs:
     runs-on: sm-standard-4
     timeout-minutes: 60
     outputs:
-      stacks: ${{ steps.plan.outputs.stacks }}
+      stacks: ${{ steps.preflight.outputs.stacks }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -86,20 +86,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # Its verdict decides whether the gateway legs run; it is not a leg's result.
+      # Without a proven gateway start there is no gateway leg to run.
       - name: Gateway preflight
         id: preflight
-        continue-on-error: true
-        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/preflight/stack.json"
-
-      # Without a proven gateway start there is no gateway leg to run.
-      - name: Choose the stacks to run
-        id: plan
-        env:
-          PREFLIGHT: ${{ steps.preflight.outcome }}
         run: |
-          if [ "$PREFLIGHT" = success ]; then stacks='["legacy","gateway"]'; else stacks='["legacy"]'; fi
-          echo "stacks=${stacks}" >> "$GITHUB_OUTPUT"
+          if python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/preflight/stack.json"; then
+            echo 'stacks=["legacy","gateway"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'stacks=["legacy"]' >> "$GITHUB_OUTPUT"
+          fi
 
       # The evidence stands in for a gateway leg that is skipped; a leg that runs overwrites it.
       - name: Upload the preflight evidence for e2e-smoke
