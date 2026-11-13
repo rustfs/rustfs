@@ -2487,7 +2487,12 @@ impl DefaultObjectUsecase {
                 opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
             );
             // auth_req inherits the outer request's date; a PAX override replaces it.
-            set_requested_object_lock_retain_until(&mut auth_req, effective_object_lock_retain_until_date.as_ref());
+            set_requested_object_lock_retain_until(
+                &mut auth_req,
+                effective_object_lock_retain_until_date
+                    .clone()
+                    .map(time::OffsetDateTime::from),
+            );
             extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await);
             if iam_requirements.tagging {
                 extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await);

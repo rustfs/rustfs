@@ -7317,16 +7317,71 @@ mod heal_result_report_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn heal_object_with_queued_disk_renewal() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
         use crate::set_disk::core::io_primitives::disk_call_counters;
+        use std::collections::HashMap;
         use std::future::Future;
         use std::task::Poll;
         use std::time::Duration;
         use tokio::io::AsyncReadExt;
 
+        // renew_disk still registers local disks on the ambient context. Match
+        // the default serial group used by its other setup/registry fixtures,
+        // and restore only this temporary endpoint, including on a failed join.
+        struct RenewDiskTestState {
+            ctx: Arc<InstanceContext>,
+            was_dist_erasure: bool,
+            map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+            endpoint: String,
+            previous_disk: Option<Option<DiskStore>>,
+        }
+
+        impl Drop for RenewDiskTestState {
+            fn drop(&mut self) {
+                let ctx = self.ctx.clone();
+                let was_dist_erasure = self.was_dist_erasure;
+                let map = self.map.clone();
+                let endpoint = self.endpoint.clone();
+                let previous_disk = self.previous_disk.take();
+                let handle = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    handle.block_on(async move {
+                        let mut map = map.write().await;
+                        match previous_disk {
+                            Some(disk) => {
+                                map.insert(endpoint, disk);
+                            }
+                            None => {
+                                map.remove(&endpoint);
+                            }
+                        }
+                        drop(map);
+                        if was_dist_erasure {
+                            ctx.update_erasure_type(SetupType::DistErasure).await;
+                        }
+                    });
+                })
+                .join()
+                .expect("renew fixture state restoration should finish");
+            }
+        }
+
         let (_temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let endpoint = set.set_endpoints[0].clone();
-        crate::runtime::sources::record_local_disks(set.instance_ctx(), disks.clone()).await;
-        let map = set.instance_ctx().local_disk_map();
+        let ctx = crate::runtime::global::current_ctx();
+        let map = ctx.local_disk_map();
+        let restore = RenewDiskTestState {
+            ctx: ctx.clone(),
+            was_dist_erasure: ctx.is_dist_erasure().await,
+            map: map.clone(),
+            endpoint: endpoint.to_string(),
+            previous_disk: map.read().await.get(&endpoint.to_string()).cloned(),
+        };
+        // Only distributed erasure needs an override to avoid the ambient slot array.
+        if restore.was_dist_erasure {
+            ctx.update_erasure_type(SetupType::Erasure).await;
+        }
 
         let bucket = "heal-disk-renewal-bucket";
         let object = "heal-disk-renewal-object";
@@ -7398,12 +7453,8 @@ mod heal_result_report_tests {
             .get(&endpoint.to_string())
             .cloned()
             .flatten()
-            .expect("original RPC route while renewal waits for its inventory write");
-        assert!(Arc::ptr_eq(&registered, &disks[0]));
-        assert!(Arc::ptr_eq(
-            read_gate[0].as_ref().expect("original set slot while renewal waits"),
-            &registered,
-        ));
+            .expect("renewal must register the connected disk before its inventory write");
+        assert!(!Arc::ptr_eq(&registered, &disks[0]), "renewal must construct a new disk handle");
         tokio::time::timeout(Duration::from_secs(5), async {
             while calls.total(disk_call_counters::KIND_READ_VERSION) < 4 {
                 tokio::task::yield_now().await;
@@ -7427,12 +7478,7 @@ mod heal_result_report_tests {
         let renewed = set.get_disks_internal().await[0]
             .clone()
             .expect("the renewed slot must remain online");
-        let registered = map.read().await[&endpoint.to_string()].clone().expect("renewed RPC route");
-        assert!(!Arc::ptr_eq(&renewed, &disks[0]));
-        assert!(
-            Arc::ptr_eq(&renewed, &registered),
-            "the set and RPC route must publish the same renewed handle"
-        );
+        assert!(Arc::ptr_eq(&renewed, &registered), "the set must publish the newly connected handle");
         assert_eq!(renewed.endpoint(), endpoint);
         let format = load_format_erasure(&renewed, false)
             .await

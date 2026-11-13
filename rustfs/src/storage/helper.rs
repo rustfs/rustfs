@@ -147,11 +147,13 @@ where
 
 /// Own a parsed mutation through its storage and event/audit completion.
 /// Dropping the HTTP waiter does not cancel the operation. Streaming bodies
-/// must use their bounded upload owner instead of this entry point.
-pub(crate) async fn run_owned_mutation<T, F>(operation: F) -> S3Result<S3Response<T>>
+/// must use their bounded upload owner instead of this entry point. Generic
+/// over the result, so a legacy and an owned use case share it.
+pub(crate) async fn run_owned_mutation<R, E, F>(operation: F) -> Result<R, E>
 where
-    T: Send + 'static,
-    F: Future<Output = S3Result<S3Response<T>>> + Send + 'static,
+    R: Send + 'static,
+    E: From<rustfs_s3_types::S3Error> + Send + 'static,
+    F: Future<Output = Result<R, E>> + Send + 'static,
 {
     let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
     let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
@@ -167,7 +169,7 @@ where
     );
     super::request_context::spawn_traced_join(operation)
         .await
-        .map_err(|_| s3s::s3_error!(InternalError, "object mutation owner task failed"))?
+        .map_err(|_| E::from(rustfs_s3_types::s3_error!(InternalError, "object mutation owner task failed")))?
 }
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
@@ -370,11 +372,13 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        record_s3_op(op);
         Self::from_view(&AuditRequestView::legacy(req), event, op)
     }
 
     /// [`Self::new`] for a request whose audit facts an owned edge decoded
-    /// (`RequestEnvelope::audit_view`).
+    /// (`RequestEnvelope::audit_view`). It does not count the operation: the owned edge already
+    /// did, once, before calling the use case.
     pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
@@ -440,10 +444,6 @@ impl OperationHelper {
             .and_then(|info| info.bucket.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
-
-        if !audit_only {
-            record_s3_op(op);
-        }
 
         // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {

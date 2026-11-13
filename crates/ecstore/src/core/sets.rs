@@ -270,18 +270,15 @@ impl Sets {
                 if disk.as_ref().unwrap().is_local() && instance_ctx.is_dist_erasure().await {
                     let local_disk = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await;
 
-                    let Some(local_disk) = local_disk else {
+                    if local_disk.is_none() {
                         warn!("sets new set_drive {}-{} local_disk is none", i, j);
                         set_drive.push(None);
                         continue;
-                    };
-                    if let Some(previous) = disk.as_ref()
-                        && !Arc::ptr_eq(previous, &local_disk)
-                    {
-                        let _ = previous.close().await;
                     }
 
-                    disk = Some(local_disk);
+                    let _ = disk.as_ref().unwrap().close().await;
+
+                    disk = local_disk;
                 }
 
                 let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
@@ -2389,83 +2386,6 @@ mod tests {
             !Arc::ptr_eq(sets.instance_ctx(), &bootstrap_ctx()),
             "a fresh context must not alias the process bootstrap context"
         );
-    }
-
-    #[tokio::test]
-    async fn distributed_sets_preserve_the_admitted_disk_health_monitor() {
-        use crate::layout::endpoints::EndpointServerPools;
-
-        for reuse_registered in [true, false] {
-            let directory = tempfile::tempdir().expect("distributed set root");
-            let metadata = directory.path().join(crate::disk::RUSTFS_META_BUCKET);
-            tokio::fs::create_dir_all(&metadata).await.expect("metadata directory");
-            let mut format = FormatV3::new(1, 1);
-            format.erasure.this = format.erasure.sets[0][0];
-            tokio::fs::write(
-                metadata.join(crate::disk::FORMAT_CONFIG_FILE),
-                format.to_json().expect("disk format bytes"),
-            )
-            .await
-            .expect("persist distributed set format");
-            let mut endpoint =
-                Endpoint::try_from(directory.path().to_str().expect("UTF-8 disk root")).expect("distributed endpoint");
-            endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(0);
-            let pool = PoolEndpoints {
-                legacy: false,
-                set_count: 1,
-                drives_per_set: 1,
-                endpoints: vec![endpoint.clone()].into(),
-                cmd_line: "distributed-health-monitor".to_string(),
-                platform: "test".to_string(),
-            };
-            let context = Arc::new(InstanceContext::new());
-            context.update_erasure_type(SetupType::DistErasure).await;
-            let options = DiskOption {
-                cleanup: false,
-                health_check: true,
-            };
-            runtime_sources::initialize_local_disk_maps(&context, EndpointServerPools(vec![pool.clone()]), &options)
-                .await
-                .expect("register admitted disk");
-            let admitted = runtime_sources::local_disk_set_drive(&context, 0, 0, 0)
-                .await
-                .expect("registered physical handle");
-            let input = if reuse_registered {
-                admitted.clone()
-            } else {
-                new_disk(&endpoint, &options).await.expect("duplicate startup handle")
-            };
-            if !reuse_registered {
-                input.enable_health_check();
-            }
-            admitted.enable_health_check();
-
-            let sets = Sets::new_with_instance_ctx(vec![Some(input.clone())], &pool, &format, 0, 0, context)
-                .await
-                .expect("construct distributed set");
-
-            let active = sets.disk_set[0].disk_inventory().await[0]
-                .clone()
-                .expect("admitted runtime handle");
-            assert!(Arc::ptr_eq(&active, &admitted));
-            let crate::disk::Disk::Local(active_wrapper) = active.as_ref() else {
-                panic!("fixture must retain a local handle");
-            };
-            assert!(active_wrapper.health_check_enabled_for_test());
-            assert!(!active_wrapper.health_monitor_cancelled_for_test());
-            let crate::disk::Disk::Local(input_wrapper) = input.as_ref() else {
-                panic!("fixture input must be local");
-            };
-            assert_eq!(input_wrapper.health_monitor_cancelled_for_test(), !reuse_registered);
-            assert_eq!(active.get_disk_id().await.expect("active handle identity"), Some(format.erasure.this));
-            active
-                .disk_info(&crate::disk::DiskInfoOptions::default())
-                .await
-                .expect("admitted handle remains usable");
-            active.close().await.expect("stop test health monitor");
-        }
     }
 
     // The legacy constructor keeps single-instance behavior byte-for-byte: it

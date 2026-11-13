@@ -16,10 +16,11 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus, GetBucketLifecycleConfigurationInput,
-    LifecycleRule, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus, LifecycleRule,
+    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
 };
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_gateway_types::persistence::parse_lifecycle_dto;
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
@@ -156,32 +157,41 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    /// The stored lifecycle configuration as the gateway's answer holds it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized or the stored document cannot be
+    /// represented; the lookup's storage error, `NoSuchBucket` among them;
+    /// `NoSuchLifecycleConfiguration` when none is stored.
+    #[instrument(level = "debug", skip(self, input))]
     pub async fn execute_get_bucket_lifecycle_configuration(
         &self,
-        req: S3Request<GetBucketLifecycleConfigurationInput>,
-    ) -> S3Result<PersistedLifecycleConfiguration> {
-        let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
-
+        input: gateway_dto::GetBucketLifecycleConfigurationInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketLifecycleConfigurationOutput> {
+        let bucket = input.bucket.as_str();
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let config = match metadata_sys::get_lifecycle_config(&bucket).await {
+        let config = match metadata_sys::get_lifecycle_config(bucket).await {
             Ok((cfg, _)) => cfg,
             Err(StorageError::ConfigNotFound) => {
-                return Err(s3_error!(NoSuchLifecycleConfiguration));
+                return Err(rustfs_s3_types::s3_error!(NoSuchLifecycleConfiguration));
             }
             // An unreadable stored configuration is not an absent one.
             Err(err) => return Err(ApiError::from(err).into()),
         };
 
-        Ok(config)
+        Ok(gateway_dto::GetBucketLifecycleConfigurationOutput {
+            rules: dto_values::stored_config(&config, parse_lifecycle_dto)?.rules,
+            ..Default::default()
+        })
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -346,6 +356,18 @@ mod tests {
         BucketLifecycleConfiguration, LifecycleExpiration, NoncurrentVersionTransition, Transition, TransitionStorageClass,
     };
     use http::Method;
+
+    #[tokio::test]
+    async fn execute_get_bucket_lifecycle_configuration_returns_internal_error_when_store_uninitialized() {
+        let input = gateway_dto::GetBucketLifecycleConfigurationInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase.execute_get_bucket_lifecycle_configuration(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
 
     #[test]
     fn normalize_lifecycle_rules_generate_rule_ids_for_missing_values() {

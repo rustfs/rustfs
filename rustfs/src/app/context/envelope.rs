@@ -272,6 +272,55 @@ impl RequestEnvelope {
         }
     }
 
+    /// A copy for one more authorization of the same request, such as one member of an archive
+    /// upload, which is authorized as its own object. It carries every fact the original carries,
+    /// the access phase's output included: the same captured generations and the same body-read
+    /// budget. The table publication guards are one shared set, so a lock the copy's
+    /// authorization retains stays held for the original's write too. Anything else installed on
+    /// the copy does not show on the original.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the PutObject archive member loop of batch D is its first caller")
+    )]
+    pub(crate) fn fork_for_authorization(&self) -> Self {
+        Self {
+            method: self.method.clone(),
+            uri: self.uri.clone(),
+            headers: self.headers.clone(),
+            credentials: self.credentials.clone(),
+            region: self.region.clone(),
+            service: self.service.clone(),
+            remote_addr: self.remote_addr,
+            client_info: self.client_info.clone(),
+            native_tls_transport: self.native_tls_transport,
+            request_context: self.request_context.clone(),
+            server_context: self.server_context.clone(),
+            body_read_control: self.body_read_control.clone(),
+            verified_sigv4: self.verified_sigv4,
+            verified_presigned: self.verified_presigned,
+            website_read: self.website_read.clone(),
+            post_object: self.post_object.clone(),
+            post_object_policy_headers: self.post_object_policy_headers.clone(),
+            req_info: self.req_info.clone(),
+            bucket_generation: self.bucket_generation.clone(),
+            pending_delete_bucket_generation: self.pending_delete_bucket_generation.clone(),
+            copy_source_bucket_generation: self.copy_source_bucket_generation.clone(),
+            odm_read_generation: self.odm_read_generation.clone(),
+            bucket_config_mutation: self.bucket_config_mutation.clone(),
+            table_publication_guards: self.table_publication_guards.clone(),
+            table_list_access: self.table_list_access.clone(),
+            object_tag_conditions: self.object_tag_conditions.clone(),
+            multipart_staging_operation: self.multipart_staging_operation,
+            staged_multipart_part_authorization: self.staged_multipart_part_authorization.clone(),
+            requested_object_lock_retention: self.requested_object_lock_retention.clone(),
+            requested_object_lock_retain_until: self.requested_object_lock_retain_until.clone(),
+            requested_object_legal_hold: self.requested_object_legal_hold.clone(),
+            requested_object_tags: self.requested_object_tags.clone(),
+            requested_copy_source: self.requested_copy_source.clone(),
+            residual_extensions: self.residual_extensions.clone(),
+        }
+    }
+
     pub fn method(&self) -> &Method {
         &self.method
     }
@@ -507,6 +556,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot> {
         self.bucket_config_mutation.as_ref()
     }
+    fn install_bucket_config_mutation(&mut self, snapshot: BucketConfigMutationSnapshot) {
+        self.bucket_config_mutation = Some(snapshot);
+    }
     #[cfg(test)]
     fn test_extensions(&self) -> &Extensions {
         &self.residual_extensions
@@ -532,8 +584,26 @@ impl AuthorizationRequest for RequestEnvelope {
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
         self.requested_object_tags()
     }
+    fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention) {
+        self.requested_object_lock_retention = Some(retention);
+    }
+    fn install_requested_retain_until(&mut self, retain_until: Option<RequestedObjectLockRetainUntil>) {
+        self.requested_object_lock_retain_until = retain_until;
+    }
+    fn install_requested_legal_hold(&mut self, legal_hold: RequestedObjectLegalHold) {
+        self.requested_object_legal_hold = Some(legal_hold);
+    }
+    fn install_requested_object_tags(&mut self, tags: RequestedObjectTags) {
+        self.requested_object_tags = Some(tags);
+    }
     fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
         self.requested_copy_source()
+    }
+    fn install_requested_copy_source(&mut self, source: RequestedCopySource) {
+        self.requested_copy_source = Some(source);
+    }
+    fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard) {
+        self.copy_source_bucket_generation = Some(guard);
     }
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
@@ -549,6 +619,9 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.install_table_publication_guards(guards);
+    }
+    fn install_table_list_access(&mut self, access: TableDataPlaneListAccess) {
+        self.table_list_access = Some(access);
     }
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
         auditor.audit_owned(&self.audit_view(), action, reason, DenialScope::Request);
@@ -680,9 +753,10 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert(MultipartStagingOperation);
         extensions.insert(StagedMultipartPartAuthorization);
-        let mut retention = RequestedObjectLockRetention(Default::default());
-        retention.0.mode = Some("COMPLIANCE".to_owned().into());
-        extensions.insert(retention);
+        extensions.insert(RequestedObjectLockRetention {
+            mode: Some("COMPLIANCE".to_owned()),
+            retain_until: None,
+        });
         let retain_until = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("valid timestamp");
         extensions.insert(RequestedObjectLockRetainUntil(retain_until));
         let head = || RequestHead {
@@ -703,7 +777,7 @@ mod tests {
                 envelope.staged_multipart_part_authorization().is_some(),
                 envelope
                     .requested_object_lock_retention()
-                    .and_then(|value| value.0.mode.as_ref().map(|mode| mode.as_str())),
+                    .and_then(|value| value.mode.as_deref()),
                 envelope.requested_object_lock_retain_until().map(|value| value.0),
                 envelope.residual_extensions().is_empty(),
                 empty.multipart_staging_operation().is_none(),
@@ -719,11 +793,8 @@ mod tests {
     fn request_body_policy_payloads_move_from_extensions_into_named_fields() {
         let mut form_headers = HeaderMap::new();
         form_headers.insert("x-amz-tagging", http::HeaderValue::from_static("from=form"));
-        let mut legal_hold = RequestedObjectLegalHold(Default::default());
-        legal_hold.0.status = Some("ON".to_owned().into());
-        let mut tags = RequestedObjectTags(Default::default());
-        tags.0.tag_set.push(Default::default());
-        tags.0.tag_set[0].key = Some("body".to_owned());
+        let legal_hold = RequestedObjectLegalHold(Some("ON".to_owned()));
+        let tags = RequestedObjectTags(vec![("body".to_owned(), "xml".to_owned())]);
         let mut extensions = Extensions::new();
         extensions.insert(PostObjectPolicyHeaders(form_headers));
         extensions.insert(legal_hold);
@@ -747,13 +818,11 @@ mod tests {
                     .post_object_policy_headers()
                     .and_then(|headers| headers.0.get("x-amz-tagging"))
                     .and_then(|value| value.to_str().ok()),
-                envelope
-                    .requested_object_legal_hold()
-                    .and_then(|hold| hold.0.status.as_ref().map(|status| status.as_str())),
+                envelope.requested_object_legal_hold().and_then(|hold| hold.0.as_deref()),
                 envelope
                     .requested_object_tags()
-                    .and_then(|tags| tags.0.tag_set.first())
-                    .and_then(|tag| tag.key.as_deref()),
+                    .and_then(|tags| tags.0.first())
+                    .map(|(key, _)| key.as_str()),
                 envelope.requested_copy_source().map(|source| source.0.as_str()),
                 envelope.residual_extensions().is_empty(),
                 empty.post_object_policy_headers().is_none(),

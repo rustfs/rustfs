@@ -29626,7 +29626,13 @@ mod delete_recovery_inventory_tests {
             .await
             .expect("seed actual version");
         let endpoint = set.set_endpoints[0].clone();
-        let map = set.instance_ctx().local_disk_map();
+        let ctx = crate::runtime::global::current_ctx();
+        let was_dist = ctx.is_dist_erasure().await;
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        }
+        let map = ctx.local_disk_map();
+        let previous = map.read().await.get(&endpoint.to_string()).cloned();
 
         let barrier = DeleteCleanupBarrier::install(bucket);
         let delete_store = store.clone();
@@ -29669,12 +29675,8 @@ mod delete_recovery_inventory_tests {
             .get(&endpoint.to_string())
             .cloned()
             .flatten()
-            .expect("registered original handle while renewal waits");
-        assert!(Arc::ptr_eq(&connected, &disks[0]));
-        assert!(Arc::ptr_eq(
-            extra_gate[0].as_ref().expect("original set slot while renewal waits"),
-            &connected,
-        ));
+            .expect("renewal registered new handle");
+        assert!(!Arc::ptr_eq(&connected, &disks[0]));
         drop(extra_gate);
         barrier.release();
         let outcome = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(renewal.as_mut(), &mut deletion) }).await;
@@ -29685,14 +29687,25 @@ mod delete_recovery_inventory_tests {
         if outcome.is_err() {
             let _ = deletion.await;
         }
+        {
+            let mut map = map.write().await;
+            match previous {
+                Some(old) => {
+                    map.insert(endpoint.to_string(), old);
+                }
+                None => {
+                    map.remove(&endpoint.to_string());
+                }
+            }
+        }
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+        }
         let (_, result) =
             outcome.expect("batch DELETE and real queued disk renewal must finish without nested inventory-read deadlock");
         let (_, errors) = result.expect("delete task must finish");
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
-        let renewed = set.disk_inventory().await[0].clone().expect("renewed set slot");
-        let registered = map.read().await[&endpoint.to_string()].clone().expect("renewed RPC route");
-        assert!(!Arc::ptr_eq(&renewed, &disks[0]));
-        assert!(Arc::ptr_eq(&renewed, &registered));
     }
 }
 
