@@ -166,16 +166,49 @@ struct InternalObjectAuthorization;
 #[derive(Clone, Debug)]
 pub(crate) struct RequestedObjectLockRetainUntil(pub(crate) OffsetDateTime);
 
-#[derive(Clone, Debug)]
-pub(crate) struct RequestedObjectLockRetention(pub(crate) ObjectLockRetention);
+/// Retention a standalone PutObjectRetention applies from its XML body. Owned, so both request
+/// forms carry it; each edge converts its decoded body once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestedObjectLockRetention {
+    pub(crate) mode: Option<String>,
+    pub(crate) retain_until: Option<OffsetDateTime>,
+}
+
+impl From<&ObjectLockRetention> for RequestedObjectLockRetention {
+    fn from(retention: &ObjectLockRetention) -> Self {
+        Self {
+            mode: retention.mode.as_ref().map(|mode| mode.as_str().to_owned()),
+            retain_until: retention.retain_until_date.clone().map(OffsetDateTime::from),
+        }
+    }
+}
 
 /// Legal hold status a standalone PutObjectLegalHold applies from its XML body.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestedObjectLegalHold(pub(crate) ObjectLockLegalHold);
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestedObjectLegalHold(pub(crate) Option<String>);
 
-/// Tag set a standalone PutObjectTagging applies from its XML body.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestedObjectTags(pub(crate) Tagging);
+impl From<&ObjectLockLegalHold> for RequestedObjectLegalHold {
+    fn from(legal_hold: &ObjectLockLegalHold) -> Self {
+        Self(legal_hold.status.as_ref().map(|status| status.as_str().to_owned()))
+    }
+}
+
+/// Tag set a standalone PutObjectTagging applies from its XML body, as the key/value pairs a
+/// policy condition can name: a tag without a key or a value names none.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestedObjectTags(pub(crate) Vec<(String, String)>);
+
+impl From<&Tagging> for RequestedObjectTags {
+    fn from(tagging: &Tagging) -> Self {
+        Self(
+            tagging
+                .tag_set
+                .iter()
+                .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone()?)))
+                .collect(),
+        )
+    }
+}
 
 /// Request headers with the object policy inputs a POST upload applies from its
 /// form fields, so header-derived condition keys describe what is stored.
@@ -1053,6 +1086,10 @@ pub(crate) trait AuthorizationRequest {
     fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil>;
     fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags>;
+    fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention);
+    fn install_requested_retain_until(&mut self, retain_until: Option<RequestedObjectLockRetainUntil>);
+    fn install_requested_legal_hold(&mut self, legal_hold: RequestedObjectLegalHold);
+    fn install_requested_object_tags(&mut self, tags: RequestedObjectTags);
     fn requested_copy_source(&self) -> Option<&RequestedCopySource>;
     fn install_requested_copy_source(&mut self, source: RequestedCopySource);
     fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard);
@@ -1149,6 +1186,25 @@ impl<T> AuthorizationRequest for S3Request<T> {
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
         self.extensions.get::<RequestedObjectTags>()
     }
+    fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention) {
+        self.extensions.insert(retention);
+    }
+    fn install_requested_retain_until(&mut self, retain_until: Option<RequestedObjectLockRetainUntil>) {
+        match retain_until {
+            Some(retain_until) => {
+                self.extensions.insert(retain_until);
+            }
+            None => {
+                self.extensions.remove::<RequestedObjectLockRetainUntil>();
+            }
+        }
+    }
+    fn install_requested_legal_hold(&mut self, legal_hold: RequestedObjectLegalHold) {
+        self.extensions.insert(legal_hold);
+    }
+    fn install_requested_object_tags(&mut self, tags: RequestedObjectTags) {
+        self.extensions.insert(tags);
+    }
     fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
         self.extensions.get::<RequestedCopySource>()
     }
@@ -1244,40 +1300,38 @@ fn authorization_conditions_with_internal<R: AuthorizationRequest + ?Sized>(
     if let Some(RequestedCopySource(source)) = req.requested_copy_source() {
         conditions.insert("x-amz-copy-source".to_string(), vec![source.clone()]);
     }
-    if let Some(RequestedObjectLegalHold(legal_hold)) = req.requested_legal_hold() {
+    if let Some(RequestedObjectLegalHold(status)) = req.requested_legal_hold() {
         // Standalone legal hold writes apply the XML body, so headers must not
         // supply a different value to the policy decision.
         conditions.remove("object-lock-legal-hold");
-        if let Some(status) = &legal_hold.status {
-            conditions.insert("object-lock-legal-hold".to_string(), vec![status.as_str().to_string()]);
+        if let Some(status) = status {
+            conditions.insert("object-lock-legal-hold".to_string(), vec![status.clone()]);
         }
     }
-    if let Some(RequestedObjectTags(tagging)) = req.requested_object_tags() {
+    if let Some(RequestedObjectTags(tags)) = req.requested_object_tags() {
         // Standalone tag writes apply the XML body; the x-amz-tagging header is
         // not stored and must not describe the request to the policy engine.
         conditions.retain(|key, _| key != "RequestObjectTagKeys" && !key.starts_with("RequestObjectTag/"));
         let mut keys = Vec::new();
-        for tag in &tagging.tag_set {
-            if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
-                keys.push(key.clone());
-                conditions
-                    .entry(format!("RequestObjectTag/{key}"))
-                    .or_default()
-                    .push(value.clone());
-            }
+        for (key, value) in tags {
+            keys.push(key.clone());
+            conditions
+                .entry(format!("RequestObjectTag/{key}"))
+                .or_default()
+                .push(value.clone());
         }
         conditions.insert("RequestObjectTagKeys".to_string(), keys);
     }
-    if let Some(RequestedObjectLockRetention(retention)) = req.requested_retention() {
+    if let Some(retention) = req.requested_retention() {
         // Standalone retention writes apply the XML body, so headers must not
         // supply a different value to the policy decision.
         conditions.remove("object-lock-mode");
         conditions.remove("object-lock-retain-until-date");
         if let Some(mode) = &retention.mode {
-            conditions.insert("object-lock-mode".to_string(), vec![mode.as_str().to_string()]);
+            conditions.insert("object-lock-mode".to_string(), vec![mode.clone()]);
         }
-        if let Some(date) = &retention.retain_until_date {
-            let date = OffsetDateTime::from(date.clone())
+        if let Some(date) = retention.retain_until {
+            let date = date
                 .format(&time::format_description::well_known::Rfc3339)
                 .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
             conditions.insert("object-lock-retain-until-date".to_string(), vec![date]);
@@ -1294,16 +1348,11 @@ fn authorization_conditions_with_internal<R: AuthorizationRequest + ?Sized>(
 /// Records the retain-until date a request asks to set, or clears it when the
 /// request sets none. Call it before `authorize_request` with the parsed date from
 /// headers, form fields, the PutObjectRetention XML body, or an archive member.
-pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, retain_until: Option<&Timestamp>) {
-    match retain_until {
-        Some(retain_until) => {
-            req.extensions
-                .insert(RequestedObjectLockRetainUntil(OffsetDateTime::from(retain_until.clone())));
-        }
-        None => {
-            req.extensions.remove::<RequestedObjectLockRetainUntil>();
-        }
-    }
+pub(crate) fn set_requested_object_lock_retain_until<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    retain_until: Option<OffsetDateTime>,
+) {
+    req.install_requested_retain_until(retain_until.map(RequestedObjectLockRetainUntil));
 }
 
 /// Keep the XML value literal for IAM; endpoint aliases are resolved later.
@@ -1318,9 +1367,14 @@ fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<Str
 }
 
 fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
-    let retention = req.input.retention.clone().unwrap_or_default();
-    set_requested_object_lock_retain_until(req, retention.retain_until_date.as_ref());
-    req.extensions.insert(RequestedObjectLockRetention(retention));
+    let retention = req
+        .input
+        .retention
+        .as_ref()
+        .map(RequestedObjectLockRetention::from)
+        .unwrap_or_default();
+    set_requested_object_lock_retain_until(req, retention.retain_until);
+    req.install_requested_retention(retention);
 }
 
 /// A POST upload stores the object policy inputs from its form fields, while
@@ -2081,7 +2135,7 @@ pub(crate) async fn authorize_copy_object_tags(
         }
         result?;
     }
-    req.extensions.insert(RequestedObjectTags(Tagging { tag_set }));
+    req.install_requested_object_tags(RequestedObjectTags::from(&Tagging { tag_set }));
     authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
 }
 
@@ -2968,7 +3022,7 @@ impl S3Access for FS {
         req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
 
         let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+        set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
         let replacement = crate::storage::s3_api::tagging::resolve_copy_object_tags(
             req.input.tagging.as_deref(),
             req.input.tagging_directive.as_ref(),
@@ -3017,7 +3071,7 @@ impl S3Access for FS {
             )
             .await?;
         }
-        req.extensions.insert(RequestedObjectTags(Tagging::default()));
+        req.install_requested_object_tags(RequestedObjectTags::default());
         authorize_copy_object_tags(req, &source_tags, replacement.as_deref().unwrap_or(&source_tags)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -3044,7 +3098,7 @@ impl S3Access for FS {
         req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
 
         let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+        set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -3918,7 +3972,7 @@ impl S3Access for FS {
                 bucket_generation
             };
             let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-            set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+            set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
             set_post_object_policy_headers(req)?;
             authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
             let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
@@ -3954,8 +4008,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
-        req.extensions
-            .insert(RequestedObjectLegalHold(req.input.legal_hold.clone().unwrap_or_default()));
+        req.install_requested_legal_hold(
+            req.input
+                .legal_hold
+                .as_ref()
+                .map(RequestedObjectLegalHold::from)
+                .unwrap_or_default(),
+        );
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -4007,7 +4066,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
-        req.extensions.insert(RequestedObjectTags(req.input.tagging.clone()));
+        req.install_requested_object_tags(RequestedObjectTags::from(&req.input.tagging));
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -5643,13 +5702,17 @@ mod tests {
         // Without the hook's extension the header leaks into the decision.
         let conditions = remaining_retention_days_conditions(&req, action);
         assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
-        req.extensions
-            .insert(RequestedObjectLegalHold(req.input.legal_hold.clone().unwrap_or_default()));
+        req.extensions.insert(
+            req.input
+                .legal_hold
+                .as_ref()
+                .map(RequestedObjectLegalHold::from)
+                .unwrap_or_default(),
+        );
         let conditions = remaining_retention_days_conditions(&req, action);
         assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["OFF".to_string()]));
         // A body without a status stores no hold change; the header must not fill it in.
-        req.extensions
-            .insert(RequestedObjectLegalHold(ObjectLockLegalHold::default()));
+        req.extensions.insert(RequestedObjectLegalHold::default());
         let conditions = remaining_retention_days_conditions(&req, action);
         assert!(!conditions.contains_key("object-lock-legal-hold"));
     }
@@ -5673,11 +5736,11 @@ mod tests {
         req.headers
             .insert("x-amz-tagging", HeaderValue::from_static("classification=public"));
         let action = Action::S3Action(S3Action::PutObjectTaggingAction);
-        req.extensions.insert(RequestedObjectTags(req.input.tagging.clone()));
+        req.extensions.insert(RequestedObjectTags::from(&req.input.tagging));
         let conditions = remaining_retention_days_conditions(&req, action);
         assert_eq!(conditions.get("RequestObjectTag/classification"), Some(&vec!["confidential".to_string()]));
         assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&vec!["classification".to_string()]));
-        req.extensions.insert(RequestedObjectTags(Tagging::default()));
+        req.extensions.insert(RequestedObjectTags::default());
         let conditions = remaining_retention_days_conditions(&req, action);
         assert!(!conditions.contains_key("RequestObjectTag/classification"));
         assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&Vec::new()));
@@ -6041,7 +6104,7 @@ mod tests {
     fn request_retaining_for(retain_for: time::Duration) -> S3Request<()> {
         let mut req = build_request((), Method::PUT);
         let retain_until = OffsetDateTime::now_utc() + retain_for;
-        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        set_requested_object_lock_retain_until(&mut req, Some(retain_until));
         req
     }
 
@@ -6120,7 +6183,7 @@ mod tests {
         );
 
         let retain_until = OffsetDateTime::now_utc() + time::Duration::days(400);
-        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        set_requested_object_lock_retain_until(&mut req, Some(retain_until));
         assert_eq!(
             remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
             Some(&vec!["400".to_string()])
