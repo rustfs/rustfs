@@ -455,13 +455,12 @@ pub(crate) fn bucket_config_mutation_incarnation<R: AuthorizationRequest + ?Size
     Ok(Some(snapshot.incarnation_id))
 }
 
-async fn load_bucket_config_mutation_snapshot<T>(
-    fs: &FS,
-    req: &S3Request<T>,
+async fn load_bucket_config_mutation_snapshot<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &R,
     bucket: &str,
 ) -> S3Result<BucketConfigMutationSnapshot> {
-    let store = fs
-        .server_ctx()
+    let store = server_ctx
         .object_store()
         .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
     let lock = store
@@ -489,14 +488,28 @@ async fn load_bucket_config_mutation_snapshot<T>(
     })
 }
 
-async fn authorize_bucket_config_mutation<T>(fs: &FS, req: &mut S3Request<T>, action: Action) -> S3Result<()> {
-    let bucket = req_info_ref(req)?
-        .bucket
-        .clone()
-        .ok_or_else(|| s3_error!(InternalError, "bucket config mutation request has no bucket"))?;
-    let snapshot = load_bucket_config_mutation_snapshot(fs, req, &bucket).await;
+/// Authorizes a bucket-configuration mutation for either edge: `action` on `bucket`, with the
+/// bucket incarnation snapshotted under the lifecycle namespace read lock BEFORE the decision, so
+/// a bucket recreated during authorization is refused by the use case's conditional write. A
+/// snapshot failure surfaces only after an Allow, which keeps AccessDenied first. On Allow the
+/// snapshot is installed for [`bucket_config_mutation_incarnation`].
+///
+/// The legacy hooks pass `FS::server_ctx`; the gateway edge passes the envelope's server context.
+///
+/// # Errors
+///
+/// `InternalError` when the access phase installed no `ReqInfo`; what [`authorize_request`]
+/// refuses; then the snapshot's lock or store error.
+pub(crate) async fn authorize_bucket_config_mutation<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    action: Action,
+) -> S3Result<()> {
+    req_info_mut(req)?.bucket = Some(bucket.to_owned());
+    let snapshot = load_bucket_config_mutation_snapshot(server_ctx, req, bucket).await;
     authorize_request(req, action).await?;
-    req.extensions.insert(snapshot?);
+    req.install_bucket_config_mutation(snapshot?);
     Ok(())
 }
 
@@ -1021,6 +1034,7 @@ pub(crate) trait AuthorizationRequest {
     fn odm_read_generation(&self) -> Option<&OdmReadGenerationGuard>;
     fn install_odm_read_generation(&mut self, guard: OdmReadGenerationGuard);
     fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot>;
+    fn install_bucket_config_mutation(&mut self, snapshot: BucketConfigMutationSnapshot);
     /// The extensions no typed accessor covers, for test-only payloads.
     #[cfg(test)]
     fn test_extensions(&self) -> &http::Extensions;
@@ -1095,6 +1109,9 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot> {
         self.extensions.get::<BucketConfigMutationSnapshot>()
+    }
+    fn install_bucket_config_mutation(&mut self, snapshot: BucketConfigMutationSnapshot) {
+        self.extensions.insert(snapshot);
     }
     #[cfg(test)]
     fn test_extensions(&self) -> &http::Extensions {
@@ -3224,20 +3241,18 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_cors(&self, req: &mut S3Request<DeleteBucketCorsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketCorsAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::DeleteBucketCorsAction))
+            .await
     }
 
     /// Checks whether the DeleteBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_encryption(&self, req: &mut S3Request<DeleteBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketEncryptionAction))
+            .await
     }
 
     /// Checks whether the DeleteBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -3264,10 +3279,9 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_lifecycle(&self, req: &mut S3Request<DeleteBucketLifecycleInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketLifecycleAction))
+            .await
     }
 
     /// Checks whether the DeleteBucketMetricsConfiguration request has accesses to the resources.
@@ -3291,32 +3305,34 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_policy(&self, req: &mut S3Request<DeleteBucketPolicyInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::DeleteBucketPolicyAction))
+            .await
     }
 
     /// Checks whether the DeleteBucketReplication request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_replication(&self, req: &mut S3Request<DeleteBucketReplicationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(
+            self.server_ctx(),
+            req,
+            &bucket,
+            Action::S3Action(S3Action::PutReplicationConfigurationAction),
+        )
+        .await
     }
 
     /// Checks whether the DeleteBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_tagging(&self, req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
+        let bucket = req.input.bucket.clone();
         rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
-            self,
+            self.server_ctx(),
             req,
+            &bucket,
             Action::S3Action(S3Action::PutBucketTaggingAction),
         ))
         .await
@@ -3326,10 +3342,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_website(&self, req: &mut S3Request<DeleteBucketWebsiteInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, bucket_website_config_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the DeleteObject request has accesses to the resources.
@@ -3379,10 +3393,14 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_public_access_block(&self, req: &mut S3Request<DeletePublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(
+            self.server_ctx(),
+            req,
+            &bucket,
+            Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction),
+        )
+        .await
     }
 
     /// Checks whether the GetBucketAccelerateConfiguration request has accesses to the resources.
@@ -3872,10 +3890,8 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketAcl request has accesses to the resources.
@@ -3902,20 +3918,17 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_cors(&self, req: &mut S3Request<PutBucketCorsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketCorsAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketCorsAction)).await
     }
 
     /// Checks whether the PutBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_encryption(&self, req: &mut S3Request<PutBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketEncryptionAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketEncryptionAction))
+            .await
     }
 
     /// Checks whether the PutBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -3945,17 +3958,15 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLifecycleAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketLifecycleAction))
+            .await
     }
 
     async fn put_bucket_logging(&self, req: &mut S3Request<PutBucketLoggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketLoggingAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketLoggingAction))
+            .await
     }
 
     /// Checks whether the PutBucketMetricsConfiguration request has accesses to the resources.
@@ -3972,10 +3983,9 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketNotificationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketNotificationAction))
+            .await
     }
 
     /// Checks whether the PutBucketOwnershipControls request has accesses to the resources.
@@ -3989,60 +3999,56 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_policy(&self, req: &mut S3Request<PutBucketPolicyInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, put_bucket_policy_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, put_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the PutBucketReplication request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_replication(&self, req: &mut S3Request<PutBucketReplicationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutReplicationConfigurationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(
+            self.server_ctx(),
+            req,
+            &bucket,
+            Action::S3Action(S3Action::PutReplicationConfigurationAction),
+        )
+        .await
     }
 
     /// Checks whether the PutBucketRequestPayment request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_request_payment(&self, req: &mut S3Request<PutBucketRequestPaymentInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketPolicyAction)).await
     }
 
     /// Checks whether the PutBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_tagging(&self, req: &mut S3Request<PutBucketTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketTaggingAction))
+            .await
     }
 
     /// Checks whether the PutBucketVersioning request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_versioning(&self, req: &mut S3Request<PutBucketVersioningInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketVersioningAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, Action::S3Action(S3Action::PutBucketVersioningAction))
+            .await
     }
 
     /// Checks whether the PutBucketWebsite request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_website(&self, req: &mut S3Request<PutBucketWebsiteInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, bucket_website_config_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(self.server_ctx(), req, &bucket, bucket_website_config_authorize_action()).await
     }
 
     /// Checks whether the PutObject request has accesses to the resources.
@@ -4128,10 +4134,14 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_lock_configuration(&self, req: &mut S3Request<PutObjectLockConfigurationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(
+            self.server_ctx(),
+            req,
+            &bucket,
+            Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction),
+        )
+        .await
     }
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
@@ -4176,10 +4186,14 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_public_access_block(&self, req: &mut S3Request<PutPublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketPublicAccessBlockAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_config_mutation(
+            self.server_ctx(),
+            req,
+            &bucket,
+            Action::S3Action(S3Action::PutBucketPublicAccessBlockAction),
+        )
+        .await
     }
 
     /// Checks whether the RestoreObject request has accesses to the resources.
