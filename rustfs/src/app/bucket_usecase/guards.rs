@@ -86,11 +86,13 @@ fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
             body.contains(operation),
             "{method} should identify the bucket metadata operation in reload logs"
         );
-        let expected_reload = format!(
-            "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
-        );
+        let expected_reload = |bucket| {
+            format!(
+                "notify_bucket_metadata_reload({bucket}, \"{operation}\", request_context, {scanner_maintenance_change}).await;"
+            )
+        };
         assert!(
-            body.contains(&expected_reload),
+            body.contains(&expected_reload("bucket.clone()")) || body.contains(&expected_reload("bucket.to_owned()")),
             "{method} should propagate scanner_maintenance_change={scanner_maintenance_change}"
         );
     }
