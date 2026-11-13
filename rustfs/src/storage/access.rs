@@ -3322,10 +3322,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_acl(&self, req: &mut S3Request<GetBucketAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketAclAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketAclAction)).await
     }
 
     /// Checks whether the GetBucketAnalyticsConfiguration request has accesses to the resources.
@@ -3440,20 +3438,16 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, get_bucket_policy_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, get_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy_status(&self, req: &mut S3Request<GetBucketPolicyStatusInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
     }
 
     /// Checks whether the GetBucketReplication request has accesses to the resources.

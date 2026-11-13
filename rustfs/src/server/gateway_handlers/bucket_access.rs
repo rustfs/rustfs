@@ -26,7 +26,12 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::GetBucketVersioning>()];
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::GetBucketVersioning>(),
+    row::<dto::GetBucketPolicy>(),
+    row::<dto::GetBucketPolicyStatus>(),
+    row::<dto::GetBucketAcl>(),
+];
 
 impl Served for dto::GetBucketVersioning {
     const METRIC: S3Operation = S3Operation::GetBucketVersioning;
@@ -39,6 +44,54 @@ impl Served for dto::GetBucketVersioning {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_get_bucket_versioning(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketPolicy {
+    const METRIC: S3Operation = S3Operation::GetBucketPolicy;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPolicyAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_policy(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketPolicyStatus {
+    const METRIC: S3Operation = S3Operation::GetBucketPolicyStatus;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPolicyStatusAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_policy_status(envelope, request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketAcl {
+    const METRIC: S3Operation = S3Operation::GetBucketAcl;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketAclAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_acl(request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

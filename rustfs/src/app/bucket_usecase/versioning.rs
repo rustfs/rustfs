@@ -87,7 +87,9 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let config = BucketVersioningSys::get(input.bucket.as_str()).await.map_err(ApiError::from)?;
+        let config = BucketVersioningSys::get(input.bucket.as_str())
+            .await
+            .map_err(ApiError::from)?;
         Ok(gateway_dto::GetBucketVersioningOutput {
             status: config.status.map(gateway_dto::Status::custom),
             ..Default::default()

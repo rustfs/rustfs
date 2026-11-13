@@ -22,10 +22,12 @@
 use crate::error::ApiError;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
-use crate::storage::s3_api::{self, acl};
+use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
-use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_bucket_versioning;
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
+    get_bucket_acl, get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
+};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -74,18 +76,11 @@ impl FS {
         req: S3Request<GetBucketAclInput>,
     ) -> S3Result<S3Response<GetBucketAclOutput>> {
         record_s3_op(S3Operation::GetBucketAcl);
-        let GetBucketAclInput { bucket, .. } = req.input;
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(acl::build_get_bucket_acl_output()))
+        let usecase = s3_api::bucket_usecase_for(self);
+        through_gateway_seam(req, get_bucket_acl::input_from_s3s, get_bucket_acl::output_to_s3s, |_, input| {
+            usecase.execute_get_bucket_acl(input)
+        })
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_notification_configuration_edge(
@@ -122,7 +117,10 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
         record_s3_op(S3Operation::GetBucketPolicy);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_policy(req).await
+        through_gateway_seam(req, get_bucket_policy::input_from_s3s, get_bucket_policy::output_to_s3s, |_, input| {
+            usecase.execute_get_bucket_policy(input)
+        })
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_policy_status_edge(
@@ -131,7 +129,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
         record_s3_op(S3Operation::GetBucketPolicyStatus);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_policy_status(req).await
+        through_gateway_seam(
+            req,
+            get_bucket_policy_status::input_from_s3s,
+            get_bucket_policy_status::output_to_s3s,
+            |envelope, input| usecase.execute_get_bucket_policy_status(envelope, input),
+        )
+        .await
     }
 
     #[instrument(name = "get_bucket_versioning", level = "debug", skip(self, req))]
