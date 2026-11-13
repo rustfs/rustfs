@@ -1,0 +1,54 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Both-stack leg
+description: Prove which S3 stack one e2e leg's servers selected and upload the leg for the summary (call with if always)
+
+inputs:
+  profile:
+    description: The nextest profile the leg ran
+    required: true
+  stack:
+    description: The stack the leg requested, legacy or gateway
+    required: true
+  logs:
+    description: Directory or file holding the servers' output
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Prove which stack the servers selected
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        STACK: ${{ inputs.stack }}
+        LOGS: ${{ inputs.logs }}
+      run: |
+        # Outside the workspace: e2e_binary.py refuses a run whose source tree changed.
+        mkdir -p "$RUNNER_TEMP/leg"
+        junit="target/nextest/${PROFILE}/junit.xml"
+        if [ -s "$junit" ]; then cp "$junit" "$RUNNER_TEMP/leg/junit.xml"; fi
+        # A gateway leg stopped by its preflight has no output; the preflight's stack.json stays.
+        if [ -e "$LOGS" ]; then python3 scripts/dual_stack.py stack --expect "$STACK" --out "$RUNNER_TEMP/leg/stack.json" "$LOGS"; fi
+
+    - name: Upload the leg
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: dual-stack-leg-${{ inputs.profile }}-${{ inputs.stack }}
+        overwrite: true
+        path: ${{ runner.temp }}/leg
+        if-no-files-found: warn
+        retention-days: 7
