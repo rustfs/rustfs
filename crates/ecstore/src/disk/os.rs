@@ -10009,7 +10009,7 @@ mod tests {
         let configured_dst = configured_base.join("object");
         std::fs::create_dir(&configured_base).expect("create bucket through configured root");
         std::fs::write(&configured_src, b"configured").expect("write staged object through configured root");
-        super::rename_all(&configured_src, &configured_dst, &configured_base, &publication_root)
+        super::rename_all_with_owner(&configured_src, &configured_dst, &configured_base, &publication_root, None)
             .await
             .expect("publish a configured path relative to the pinned root");
         assert_eq!(
@@ -10022,7 +10022,7 @@ mod tests {
         let resolved_dst = resolved_base.join("object");
         std::fs::create_dir(&resolved_base).expect("create bucket through resolved root");
         std::fs::write(&resolved_src, b"resolved").expect("write staged object through resolved root");
-        super::rename_all(&resolved_src, &resolved_dst, &resolved_base, &publication_root)
+        super::rename_all_with_owner(&resolved_src, &resolved_dst, &resolved_base, &publication_root, None)
             .await
             .expect("publish a resolved path relative to the pinned root");
 
@@ -10442,7 +10442,7 @@ mod tests {
         std::fs::write(&dst, b"uncommitted-metadata").expect("write metadata to replace");
         let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root above the object tree");
 
-        super::rename_all(&src, &dst, &object_dir, &publication_root)
+        super::rename_all_with_owner(&src, &dst, &object_dir, &publication_root, None)
             .await
             .expect("a rollback source below its destination parent must not conflict with its own guards");
 
