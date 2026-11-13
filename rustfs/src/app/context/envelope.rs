@@ -714,13 +714,6 @@ impl RequestEnvelope {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the operation batches of rustfs/backlog#2749 are its first callers (task H2)"
-    )
-)]
 impl RequestEnvelope {
     /// Runs `handler` on this request and records its outcome as an audit-only
     /// entry for `op`, the owned form of the legacy edge's `audit_only_operation`.

@@ -23,6 +23,7 @@ use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
 use crate::storage::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{delete_bucket_cors, put_bucket_cors};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -33,8 +34,15 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        record_s3_op(S3Operation::DeleteBucketCors);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketCors, |req| usecase.execute_delete_bucket_cors(req)).await
+        through_gateway_seam(
+            req,
+            delete_bucket_cors::input_from_s3s,
+            delete_bucket_cors::output_to_s3s,
+            |envelope, input| usecase.execute_delete_bucket_cors(envelope, input),
+        )
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn delete_bucket_encryption_edge(
@@ -131,9 +139,12 @@ impl FS {
         &self,
         req: S3Request<PutBucketCorsInput>,
     ) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        let prepared = persisted_from_s3s(&req.input.cors_configuration);
+        record_s3_op(S3Operation::PutBucketCors);
         let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req, prepared)).await
+        through_gateway_seam(req, put_bucket_cors::input_from_s3s, put_bucket_cors::output_to_s3s, |envelope, input| {
+            usecase.execute_put_bucket_cors(envelope, input)
+        })
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_encryption_edge(

@@ -150,7 +150,8 @@ pub(crate) mod access_consumer {
     pub(crate) use super::super::access::access_owned;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
-        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
+        resolve_req_info,
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
