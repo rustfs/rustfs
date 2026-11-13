@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::access_owned::listing_multipart::{
+    authorize_bucket_listing, authorize_list_objects_v2, prepare_table_data_plane_list_access,
+};
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
 use super::ecfs::FS;
@@ -232,7 +235,6 @@ impl TableDataPlanePublicationGuards {
 
 pub(crate) const TABLE_DATA_PLANE_LIST_CURSOR_PREFIX: &str = "rustfs-table-list:v1:";
 const TABLE_DATA_PLANE_LIST_CURSOR_VERSION: u8 = 1;
-const TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT: &[u8] = b"rustfs-table-list-cursor-key:v1";
 const TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN: usize = 16 * 1024;
 
 fn table_data_plane_list_internal_error(message: impl Into<String>) -> S3Error {
@@ -1061,6 +1063,7 @@ pub(crate) trait AuthorizationRequest {
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions);
     fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards>;
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards);
+    fn install_table_list_access(&mut self, access: TableDataPlaneListAccess);
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str);
 }
 
@@ -1171,6 +1174,9 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.extensions.insert(guards);
+    }
+    fn install_table_list_access(&mut self, access: TableDataPlaneListAccess) {
+        self.extensions.insert(access);
     }
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
         auditor.audit(self, action, reason, DenialScope::Request);
@@ -2652,157 +2658,12 @@ async fn table_bucket_enabled_for_data_plane<R: AuthorizationRequest + ?Sized>(r
     }
 }
 
-fn update_table_list_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value);
-}
-
-fn table_list_principal_fingerprint(cred: Option<&rustfs_credentials::Credentials>, is_owner: bool) -> String {
-    let mut hasher = Sha256::new();
-    update_table_list_fingerprint_field(
-        &mut hasher,
-        cred.map_or(b"anonymous".as_slice(), |credential| credential.access_key.as_bytes()),
-    );
-    hasher.update([u8::from(is_owner)]);
-    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
-}
-
-fn table_list_snapshot_fingerprint(resources: &[TableDataPlaneListResource]) -> String {
-    let mut hasher = Sha256::new();
-    for entry in resources {
-        for value in [
-            entry.resource.table_bucket.as_bytes(),
-            entry.resource.namespace.as_bytes(),
-            entry.resource.table.as_bytes(),
-            entry.resource.table_id.as_bytes(),
-            entry.resource.warehouse_object_prefix.as_bytes(),
-        ] {
-            update_table_list_fingerprint_field(&mut hasher, value);
-        }
-        hasher.update([u8::from(entry.allowed)]);
-    }
-    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
-}
-
-fn table_list_cursor_key<T>(req: &S3Request<T>) -> S3Result<[u8; 32]> {
-    let credentials = match req.extensions.get::<Arc<ServerContextSlot>>() {
-        Some(server_ctx) => server_ctx
-            .installed_app_context()
-            .and_then(|context| context.action_credentials().get()),
-        None => runtime_sources::current_action_credentials(),
-    }
-    .ok_or_else(|| table_data_plane_list_internal_error("action credentials are not initialized"))?;
-    let mut hasher = Sha256::new();
-    update_table_list_fingerprint_field(&mut hasher, TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT);
-    update_table_list_fingerprint_field(&mut hasher, credentials.access_key.as_bytes());
-    update_table_list_fingerprint_field(&mut hasher, credentials.secret_key.as_bytes());
-    Ok(hasher.finalize().into())
-}
-
 fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
     if err.is_unavailable() {
         S3Error::from(ApiError::from(err))
     } else {
         S3Error::from(ApiError::access_denied())
     }
-}
-
-pub(crate) async fn authorize_bucket_listing<T>(req: &mut S3Request<T>, bucket: &str, action: S3Action) -> S3Result<()> {
-    authorize_request(req, Action::S3Action(action)).await?;
-    if action == S3Action::ListBucketAction
-        && get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED).as_deref() == Some("true")
-    {
-        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
-    }
-    prepare_table_data_plane_list_access(req, bucket, action).await
-}
-
-async fn prepare_table_data_plane_list_access<T>(req: &mut S3Request<T>, bucket: &str, action: S3Action) -> S3Result<()> {
-    if !table_bucket_enabled_for_data_plane(req, bucket).await? {
-        return Ok(());
-    }
-    retain_table_bucket_publication_guard(req, bucket).await?;
-    if !table_bucket_enabled_for_data_plane(req, bucket).await? {
-        return Err(S3Error::from(ApiError::access_denied()));
-    }
-
-    let (cred, is_owner) = {
-        let req_info = req_info_ref(req)?;
-        (req_info.cred.clone(), req_info.is_owner)
-    };
-    let default_cred = rustfs_credentials::Credentials::default();
-    let condition_cred = cred.as_ref().unwrap_or(&default_cred);
-    let root_access_key = root_access_key();
-    let principal = AuthzPrincipal::new(condition_cred, &root_access_key);
-    let facts = request_authz_facts(
-        req,
-        AuthzTarget {
-            action: Action::S3Action(action),
-            bucket,
-            object: "",
-            version_id: None,
-            location_constraint: None,
-        },
-    );
-    let conditions = authorization_conditions(req, &principal, &facts)?;
-    let iam_store = cred.as_ref().map(|_| request_iam_store(req)).transpose()?;
-    let store = table_catalog_store_for_data_plane(req)?;
-    let tables = crate::table_catalog::TableCatalogStore::list_all_tables(&store, bucket)
-        .await
-        .map_err(table_list_catalog_error)?;
-    let default_claims = HashMap::new();
-    let claims = cred
-        .as_ref()
-        .and_then(|credential| credential.claims.as_ref())
-        .unwrap_or(&default_claims);
-    let mut resources = Vec::with_capacity(tables.len());
-    for table in tables {
-        let warehouse_object_prefix =
-            crate::table_catalog::table_warehouse_object_prefix(&table).map_err(table_list_catalog_error)?;
-        let resource = crate::table_catalog::table_data_plane_resource_from_entry(table.clone(), warehouse_object_prefix);
-        let allowed = match (cred.as_ref(), iam_store.as_ref()) {
-            (Some(credential), Some(iam_store)) => {
-                let resource_object = resource.catalog_resource_object();
-                iam_store
-                    .is_allowed(&Args {
-                        account: &credential.access_key,
-                        groups: &credential.groups,
-                        action: Action::AdminAction(AdminAction::GetTableMetadataAction),
-                        bucket,
-                        conditions: &conditions,
-                        is_owner,
-                        object: &resource_object,
-                        claims,
-                        deny_only: false,
-                    })
-                    .await
-            }
-            _ => false,
-        };
-        resources.push(TableDataPlaneListResource { resource, allowed });
-    }
-    resources.sort_by(|left, right| {
-        left.resource
-            .warehouse_object_prefix
-            .cmp(&right.resource.warehouse_object_prefix)
-    });
-    if resources.windows(2).any(|window| {
-        crate::table_catalog::warehouse_object_prefixes_overlap(
-            &window[0].resource.warehouse_object_prefix,
-            &window[1].resource.warehouse_object_prefix,
-        )
-    }) {
-        return Err(S3Error::from(ApiError::access_denied()));
-    }
-    let access = TableDataPlaneListAccess {
-        bucket: bucket.to_string(),
-        principal_fingerprint: table_list_principal_fingerprint(cred.as_ref(), is_owner),
-        snapshot_fingerprint: table_list_snapshot_fingerprint(&resources),
-        cursor_key: table_list_cursor_key(req)?,
-        resources,
-    };
-    req.extensions.insert(access);
-    Ok(())
 }
 
 async fn table_data_plane_resource_for_request<R: AuthorizationRequest + ?Sized>(
@@ -3819,9 +3680,7 @@ impl S3Access for FS {
     /// authorization-related issue occurs.
     async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        authorize_bucket_listing(req, &bucket, S3Action::ListBucketVersionsAction).await
+        Ok(authorize_bucket_listing(req, &bucket, S3Action::ListBucketVersionsAction).await?)
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.
@@ -3829,10 +3688,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await
+        Ok(authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await?)
     }
 
     /// Checks whether the ListObjectsV2 request has accesses to the resources.
@@ -3840,13 +3696,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await?;
-        req.install_odm_read_generation(source_generation);
-        Ok(())
+        Ok(authorize_list_objects_v2(self.server_ctx(), req, &bucket).await?)
     }
 
     /// Checks whether the ListParts request has accesses to the resources.
@@ -4812,6 +4662,25 @@ mod tests {
                 allowed,
             }],
         }
+    }
+
+    /// The listing authorization hands its table snapshot to the use case through the request it
+    /// was given, on either edge.
+    #[test]
+    fn table_list_access_reaches_the_use_case_from_either_edge() {
+        use super::AuthorizationRequest;
+        let access = TableDataPlaneListAccess::test_listing_fixture("bucket");
+
+        let mut req = build_request((), Method::GET);
+        let mut envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        assert!(req.extensions.get::<TableDataPlaneListAccess>().is_none());
+        assert!(envelope.table_list_access().is_none());
+
+        AuthorizationRequest::install_table_list_access(&mut req, access.clone());
+        AuthorizationRequest::install_table_list_access(&mut envelope, access);
+
+        assert!(req.extensions.get::<TableDataPlaneListAccess>().is_some());
+        assert!(envelope.table_list_access().is_some());
     }
 
     #[test]
@@ -7605,11 +7474,18 @@ mod tests {
                         ..Default::default()
                     });
                     req.headers.insert(header, HeaderValue::from_static(value));
+                    let mut envelope = crate::app::RequestEnvelope::from_s3s(&req);
+                    let owned = super::authorize_bucket_listing(&mut envelope, &bucket, S3Action::ListBucketAction).await;
                     let result = super::authorize_bucket_listing(&mut req, &bucket, S3Action::ListBucketAction).await;
+                    assert_eq!(
+                        owned.as_ref().err().map(|err| err.code().as_str().to_owned()),
+                        result.as_ref().err().map(|err| err.code().as_str().to_owned()),
+                        "both edges decide alike: {header}={value}, authenticated={authenticated}"
+                    );
                     if value == "true" && (deny_versions || (authenticated && !grant_versions)) {
                         assert_eq!(
                             result.expect_err("version visibility requires permission").code(),
-                            &S3ErrorCode::AccessDenied
+                            &rustfs_s3_types::S3ErrorCode::AccessDenied
                         );
                     } else {
                         result.expect("authorized listings remain available");

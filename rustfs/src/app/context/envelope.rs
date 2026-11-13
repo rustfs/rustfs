@@ -559,6 +559,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
         self.install_table_publication_guards(guards);
     }
+    fn install_table_list_access(&mut self, access: TableDataPlaneListAccess) {
+        self.table_list_access = Some(access);
+    }
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
         auditor.audit_owned(&self.audit_view(), action, reason, DenialScope::Request);
     }

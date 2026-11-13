@@ -18,7 +18,8 @@ use super::bucket_usecase::DefaultBucketUsecase;
 use super::object_usecase::DefaultObjectUsecase;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::storage::access::{ReqInfo, authorize_bucket_listing, req_info_mut};
+use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
+use crate::storage::access::{ReqInfo, req_info_mut};
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
@@ -682,7 +683,7 @@ async fn check_metadata_access(req: &mut S3Request<Body>, target: BucketTarget) 
         MetadataOperation::ListObjectVersions => S3Action::ListBucketVersionsAction,
         MetadataOperation::ListObjectsV2 => S3Action::ListBucketAction,
     };
-    authorize_bucket_listing(req, &target.bucket, action).await
+    Ok(authorize_bucket_listing(req, &target.bucket, action).await?)
 }
 
 async fn call_list_object_versions(req: S3Request<Body>, bucket: String) -> S3Result<S3Response<Body>> {
