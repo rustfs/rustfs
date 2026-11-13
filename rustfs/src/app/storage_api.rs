@@ -1840,7 +1840,8 @@ pub(crate) mod owned_parity {
         DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
         ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
         RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
-        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_object_request, authorize_request,
+        parity_test_support,
     };
 }
 

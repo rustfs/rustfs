@@ -175,7 +175,7 @@ pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::{
         ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
-        TableDataPlanePublicationGuards, authorize_request, parity_test_support,
+        TableDataPlanePublicationGuards, authorize_object_request, authorize_request, parity_test_support,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;

@@ -75,7 +75,7 @@ use super::storage_api::ecstore_object::{
     ReadEncryptionMode, ReadEncryptionRequest,
 };
 use crate::runtime_sources::current_kms_runtime_service_manager;
-use crate::storage::access::{ReqInfo, request_context_from_req, resource_free_condition_values};
+use crate::storage::access::{AuthorizationRequest, request_context_from_req, resource_free_condition_values};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -100,7 +100,6 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use s3s::S3ErrorCode;
-use s3s::S3Request;
 use s3s::dto::ServerSideEncryption;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -898,8 +897,8 @@ impl SseKmsPrincipal {
     /// Anonymous requests use an empty account, matching the bucket-policy authorization
     /// path. This keeps every request that crossed the S3 boundary distinct from trusted
     /// internal callers, which are represented by `None`.
-    pub(crate) fn from_request<T>(req: &S3Request<T>) -> Option<Self> {
-        let req_info = req.extensions.get::<ReqInfo>()?;
+    pub(crate) fn from_request<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<Self> {
+        let req_info = req.req_info()?;
         let cred = req_info.cred.as_ref();
 
         Some(Self {
@@ -910,7 +909,7 @@ impl SseKmsPrincipal {
             conditions: cred.map(|cred| resource_free_condition_values(req, cred)).unwrap_or_default(),
             request_audit: request_context_from_req(req).and_then(|context| kms_request_audit(&context.request_id)),
             #[cfg(test)]
-            test_hooks: req.extensions.get::<TestAuthorizationHooks>().cloned(),
+            test_hooks: req.test_extensions().get::<TestAuthorizationHooks>().cloned(),
         })
     }
 
