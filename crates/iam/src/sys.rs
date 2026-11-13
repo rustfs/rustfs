@@ -1591,14 +1591,16 @@ impl<T: Store> IamSys<T> {
             claims: caller.claims_or_empty(),
             deny_only: false,
         };
-        if !self.is_allowed(&args).await {
+        // Both built-in decisions must use the same identity and policy revision.
+        let prepared = self.prepare_auth(&args).await;
+        if !self.eval_prepared(&prepared, &args).await {
             return Err(IamError::IAMActionNotAllowed);
         }
         args.action = Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction);
-        if !self.is_allowed(&args).await {
+        if !self.eval_prepared(&prepared, &args).await {
             return Err(IamError::IAMActionNotAllowed);
         }
-        if self.get_user(target).await.is_none() {
+        if self.check_key(target).await?.0.is_none() {
             return Err(IamError::NoSuchUser(target.to_owned()));
         }
 
@@ -3149,6 +3151,7 @@ mod tests {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
         bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
+        policy_load_barrier: Option<Arc<tokio::sync::Barrier>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
@@ -3171,6 +3174,7 @@ mod tests {
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
+                policy_load_barrier: None,
                 bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
@@ -3363,7 +3367,14 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+        async fn load_policy_doc(&self, name: &str, docs: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            if let Some(barrier) = &self.policy_load_barrier {
+                // merge_policies has already captured the cached policy documents.
+                barrier.wait().await;
+                barrier.wait().await;
+                docs.insert(name.to_owned(), PolicyDoc::new(Policy::default()));
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -5193,6 +5204,82 @@ mod tests {
             iam_sys.eval_prepared(&prepared, &args).await,
             "STS temp credentials should resolve custom canned policy names carried in JWT policy claims"
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_requires_both_actions_in_one_policy_revision() {
+        use rustfs_policy::policy::SVC_TARGET_USER;
+
+        ensure_test_global_credentials();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut store = StsTestMockStore::new(true);
+        store.policy_load_barrier = Some(barrier.clone());
+        let cache = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], IamCache::new(store.clone()))
+            .await
+            .expect("initialize IAM");
+        let iam = IamSys::new(cache);
+        let operator = "backup-operator";
+        let target = "backup-user";
+        for name in [operator, target] {
+            iam.create_user(
+                name,
+                &AddOrUpdateUserReq {
+                    secret_key: "testSecret123".into(),
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                    policy: None,
+                },
+            )
+            .await
+            .expect("create local user");
+        }
+        let caller = iam.get_user(operator).await.expect("operator exists").credentials;
+        let set_grant = |action: &str| {
+            let policy = serde_json::json!({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": action}]});
+            let policy = Policy::parse_config(policy.to_string().as_bytes()).expect("parse administrator policy");
+            iam.store
+                .cache
+                .add_or_update_policy_doc("operator-grant", &PolicyDoc::new(policy), OffsetDateTime::now_utc());
+        };
+        set_grant("admin:CreateServiceAccount");
+        iam.store.cache.add_or_update_user_policy(
+            operator,
+            &MappedPolicy::new("operator-grant,uncached-policy"),
+            OffsetDateTime::now_utc(),
+        );
+        let conditions = HashMap::from([(SVC_TARGET_USER.to_owned(), vec![target.to_owned()])]);
+        let create = iam.new_service_account_for_user(target, NewServiceAccountOpts::default(), &caller, &conditions, false);
+        let replace = async {
+            barrier.wait().await;
+            set_grant("admin:CreateServiceAccountForUser");
+            barrier.wait().await;
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(create, replace) })
+            .await
+            .expect("finish lookup and concurrent policy replacement");
+        assert!(matches!(result, Err(Error::IAMActionNotAllowed)));
+        assert_eq!(store.saved_service_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_distinguishes_missing_target_from_storage_failure() {
+        use rustfs_policy::policy::SVC_TARGET_USER;
+
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam = IamSys::new(IamCache::new(store.clone()).await.expect("initialize IAM"));
+        let caller = crate::root_credentials::credentials().expect("root credentials");
+        for target in ["missing-target", "load-failure-user"] {
+            let conditions = HashMap::from([(SVC_TARGET_USER.to_owned(), vec![target.to_owned()])]);
+            let error = iam
+                .new_service_account_for_user(target, NewServiceAccountOpts::default(), &caller, &conditions, true)
+                .await
+                .expect_err("cannot publish without a target");
+            match target {
+                "missing-target" => assert!(matches!(error, Error::NoSuchUser(name) if name == target)),
+                _ => assert!(matches!(error, Error::Io(_))),
+            }
+        }
+        assert_eq!(store.saved_service_account_count(), 0);
     }
 
     #[tokio::test]
