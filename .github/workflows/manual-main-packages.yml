@@ -1,11 +1,13 @@
 # Copyright 2026 RustFS Team
 # SPDX-License-Identifier: Apache-2.0
 
-# Manual packaging of the current origin/main tip. Workflow artifacts only.
-# Dispatch uses this file from the selected branch. The build fetches
-# refs/heads/main and checks out that commit, not the dispatch ref or a tag.
+# Manual Linux zip/deb/rpm packaging. Workflow artifacts only.
+# Dispatch uses this file from the selected branch. An empty ref packages
+# the tip of refs/heads/main. A non-empty ref must already exist; the
+# resolver fetches that tag, branch, or commit so checkout is not limited
+# to the default branch. Nothing is published.
 
-name: Manual main packages
+name: Manual Linux packages
 
 on:
   workflow_dispatch:
@@ -19,10 +21,16 @@ on:
           - arm
           - all
         default: all
-      version:
-        description: "Binary and package version: MAJOR.MINOR.PATCH, or MAJOR.MINOR.PATCH-(alpha|beta|rc).N. No leading v."
-        required: true
+      ref:
+        description: "Git tag to package. Leave empty to package the tip of origin/main. A branch name or full commit SHA is also accepted."
+        required: false
         type: string
+        default: ""
+      version:
+        description: "Package version: MAJOR.MINOR.PATCH, or MAJOR.MINOR.PATCH-(alpha|beta|rc).N. No leading v. Required for origin/main. For a tag, leave empty to derive it from the tag; an explicit value is used as entered."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -34,48 +42,43 @@ env:
 
 jobs:
   prepare:
-    name: Resolve main tip and version
+    name: Resolve source and version
     if: github.repository == 'rustfs/rustfs'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      source_sha: ${{ steps.pin.outputs.source_sha }}
-      version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_kind: ${{ steps.source.outputs.source_kind }}
+      source_name: ${{ steps.source.outputs.source_name }}
+      version: ${{ steps.source.outputs.version }}
+      packaging: ${{ steps.source.outputs.packaging }}
+      tool_sha: ${{ steps.source.outputs.tool_sha }}
+      confirm_from: ${{ steps.source.outputs.confirm_from }}
       toolchain: ${{ steps.inputs.outputs.toolchain }}
       console: ${{ steps.inputs.outputs.console }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Checkout main
+      # Tooling checkout. An empty ref then detaches this tree to the tip of
+      # origin/main. A tag or other ref is fetched and pinned without
+      # replacing this tree, because console resolution needs candidate.py.
+      - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Pin the tip of origin/main
-        id: pin
-        shell: bash
-        run: |
-          set -euo pipefail
-          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main
-          sha=$(git rev-parse FETCH_HEAD)
-          git checkout --detach "$sha"
-          test "$(git rev-parse HEAD)" = "$sha"
-          printf 'source_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
-          printf 'Pinned origin/main %s\n' "$sha"
-
-      - name: Validate package version
-        id: version
+      - name: Resolve source and version
+        id: source
         shell: bash
         env:
+          SOURCE_REF: ${{ inputs.ref }}
           PACKAGE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          bash scripts/release/package_manual_artifacts.sh validate \
-            --version "$PACKAGE_VERSION" \
-            --arch x86_64 \
-            --libc gnu | tee "$RUNNER_TEMP/package-version.txt"
-          printf 'version=%s\n' "$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          bash scripts/release/package_manual_artifacts.sh resolve-source \
+            --source "$SOURCE_REF" \
+            --version "$PACKAGE_VERSION" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -134,22 +137,45 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
-      - name: Checkout the pinned origin/main commit
+      - name: Checkout the pinned source commit
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Confirm the checkout is that main commit
+      # Tags cut before the manual packaging script still compile from their
+      # own tree. The official zip/deb/rpm recipe, and confirm-source when the
+      # tagged script does not implement it, come from the prepare checkout.
+      - name: Checkout packaging recipe
+        if: ${{ needs.prepare.outputs.packaging == 'tool' || needs.prepare.outputs.confirm_from == 'tool' }}
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ needs.prepare.outputs.tool_sha }}
+          path: packaging-tools
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm the pinned source
         shell: bash
         env:
+          SOURCE_KIND: ${{ needs.prepare.outputs.source_kind }}
+          SOURCE_NAME: ${{ needs.prepare.outputs.source_name }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main
-          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+          helper=scripts/release/package_manual_artifacts.sh
+          if [[ ! -f "$helper" ]] || ! grep -q 'confirm-source)' "$helper"; then
+            helper=packaging-tools/scripts/release/package_manual_artifacts.sh
+          fi
+          if [[ ! -f "$helper" ]] || ! grep -q 'confirm-source)' "$helper"; then
+            printf 'no packaging script implements confirm-source\n' >&2
+            exit 1
+          fi
+          bash "$helper" confirm-source \
+            --kind "$SOURCE_KIND" \
+            --name "$SOURCE_NAME" \
+            --sha "$SOURCE_SHA"
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -247,7 +273,15 @@ jobs:
             exit 1
           fi
           if [[ -n "$BUILD_GLIBC" ]]; then
-            python3 scripts/release/check_glibc.py "$BUILD_GLIBC" "$bin"
+            glibc_check=scripts/release/check_glibc.py
+            if [[ ! -f "$glibc_check" ]]; then
+              glibc_check=packaging-tools/scripts/release/check_glibc.py
+            fi
+            if [[ ! -f "$glibc_check" ]]; then
+              printf 'glibc check script not found\n' >&2
+              exit 1
+            fi
+            python3 "$glibc_check" "$BUILD_GLIBC" "$bin"
           fi
 
       - name: Generate the CPU symbol catalog
@@ -285,9 +319,23 @@ jobs:
           LIBC: ${{ matrix.libc }}
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_FEATURES: ${{ matrix.features }}
+          SOURCE_KIND: ${{ needs.prepare.outputs.source_kind }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          PACKAGING: ${{ needs.prepare.outputs.packaging }}
         run: |
           set -euo pipefail
+          case "$PACKAGING" in
+            source) script=scripts/release/package_manual_artifacts.sh ;;
+            tool) script=packaging-tools/scripts/release/package_manual_artifacts.sh ;;
+            *)
+              printf 'unexpected packaging recipe: %q\n' "$PACKAGING" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! -f "$script" ]]; then
+            printf 'packaging script not found: %s\n' "$script" >&2
+            exit 1
+          fi
           binary="target/${BUILD_TARGET}/release/rustfs"
           extra=()
           if [[ "$BUILD_TARGET" == *-linux-gnu && "$BUILD_FEATURES" == pyroscope ]]; then
@@ -296,14 +344,14 @@ jobs:
               --zip-extra "target/${BUILD_TARGET}/release/rustfs.cpu-symbol-catalog.sha256"
             )
           fi
-          bash scripts/release/package_manual_artifacts.sh package \
+          bash "$script" package \
             --version "$PACKAGE_VERSION" \
             --arch "$ARCH" \
             --libc "$LIBC" \
             --binary "$binary" \
             --output dist \
             "${extra[@]}"
-          printf 'Packaged %s from origin/main %s\n' "$PACKAGE_VERSION" "$SOURCE_SHA"
+          printf 'Packaged %s from %s %s\n' "$PACKAGE_VERSION" "$SOURCE_KIND" "$SOURCE_SHA"
 
       - name: Verify the packaged binary
         shell: bash
