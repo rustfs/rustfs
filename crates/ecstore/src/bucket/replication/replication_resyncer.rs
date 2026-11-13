@@ -6442,8 +6442,8 @@ mod tests {
         };
         apply_replication_resync_timestamp(&mut rinfo, "reset-1");
         let resync_decision = |user_defined: &HashMap<String, String>, reset_id: &str| {
-            crate::bucket::replication::replication_object_decision_boundary::resync_target_for_object(
-                &crate::bucket::replication::replication_object_decision_boundary::ReplicationResyncTargetObject {
+            super::super::replication_object_decision_boundary::resync_target_for_object(
+                &super::super::replication_object_decision_boundary::ReplicationResyncTargetObject {
                     mod_time: Some(reset_before - time::Duration::hours(1)),
                     user_defined,
                 },
