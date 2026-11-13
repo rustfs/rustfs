@@ -44,6 +44,7 @@ OUT_DIR="${PROJECT_ROOT}/target/hotpath-abba/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/nu
 DRY_RUN=false
 ALLOW_UNMANAGED_EXTERNAL=false
 AFTER_PROBE=false
+NODE_DOCKER_CONTAINERS=()
 NODE_SSH_TARGETS=()
 NODE_SSH_IDENTITY_FILE=""
 NODE_SSH_TIMEOUT_SECS=30
@@ -105,13 +106,15 @@ Production / cluster mode:
   --allow-unmanaged-external Preserve legacy external mode without a deploy
                               hook. Its output is not formal ABBA evidence.
   --after-probe              Enable per-round PUT HEAD/GET/hash verification.
+  --node-docker-container <node=container>
+                              Capture Docker CPU/memory/network/block I/O snapshots.
   --node-ssh-target <node=host>
                               Capture node CPU/RSS/IOPS/await/PSI/scheduler telemetry.
   --node-ssh-identity-file <path>
                               SSH identity file for node telemetry.
   --node-ssh-timeout-secs <n>
                               Bound each remote telemetry command (default 30).
-  --require-node-telemetry    Fail a round if node telemetry is incomplete.
+  --require-node-telemetry    Fail a round if SSH node telemetry is incomplete.
   --service-prometheus-query-url <url>
                               Prometheus query endpoint for PUT stage snapshots.
   --service-prometheus-query <query>
@@ -193,6 +196,16 @@ validate_drive_sync_spec() {
   [[ "$value" == "true" || "$value" == "false" ]] || die "--drive-sync value must be true or false"
 }
 
+validate_docker_targets() {
+  local entry node seen_nodes=""
+  for entry in "${NODE_DOCKER_CONTAINERS[@]}"; do
+    [[ "$entry" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*=.+$ && "$entry" != *$'\n'* && "$entry" != *,* ]] || die "--node-docker-container must be node=container without commas or newlines"
+    node="${entry%%=*}"
+    [[ " $seen_nodes " != *" $node "* ]] || die "--node-docker-container repeats node: $node"
+    seen_nodes="${seen_nodes} ${node}"
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --baseline-bin) BASELINE_BIN="$2"; shift 2 ;;
@@ -222,6 +235,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --allow-unmanaged-external) ALLOW_UNMANAGED_EXTERNAL=true; shift ;;
     --after-probe) AFTER_PROBE=true; shift ;;
+    --node-docker-container) NODE_DOCKER_CONTAINERS+=("$2"); shift 2 ;;
     --node-ssh-target) NODE_SSH_TARGETS+=("$2"); shift 2 ;;
     --node-ssh-identity-file) NODE_SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --node-ssh-timeout-secs) NODE_SSH_TIMEOUT_SECS="$2"; shift 2 ;;
@@ -235,6 +249,10 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown argument: $1" ;;
   esac
 done
+
+if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+  validate_docker_targets
+fi
 
 if ((${#WORKLOAD_OVERRIDES[@]} > 0)); then
   for workload in "${WORKLOAD_OVERRIDES[@]}"; do
@@ -432,6 +450,11 @@ measure() {
   if [[ "$AFTER_PROBE" == "true" && "$mode" == "put" ]]; then
     args+=(--after-probe)
   fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    for node_target in "${NODE_DOCKER_CONTAINERS[@]}"; do
+      args+=(--node-docker-container "$node_target")
+    done
+  fi
   if ((${#NODE_SSH_TARGETS[@]} > 0)); then
     for node_target in "${NODE_SSH_TARGETS[@]}"; do
       args+=(--node-ssh-target "$node_target")
@@ -455,7 +478,8 @@ measure() {
     args+=(--extra-args "--objects $((CONCURRENCY * DATASET_OBJECTS_PER_WORKER)) --noclear")
   fi
   [[ -n "$baseline_csv" ]] && args+=(--baseline-csv "$baseline_csv")
-  run "$ENHANCED_BENCH" "${args[@]}" >&2
+  # Command substitution may clear errexit; emit a cell path only after success.
+  run "$ENHANCED_BENCH" "${args[@]}" >&2 || return $?
   echo "$cell"
 }
 
@@ -548,6 +572,7 @@ evidence_mode=$(evidence_mode)
 formal_evidence=$(formal_evidence)
 performance_conclusion=$(performance_conclusion)
 after_probe=$AFTER_PROBE
+node_docker_container_count=${#NODE_DOCKER_CONTAINERS[@]}
 node_ssh_target_count=${#NODE_SSH_TARGETS[@]}
 node_ssh_identity_file=${NODE_SSH_IDENTITY_FILE:-N/A}
 node_ssh_timeout_secs=$NODE_SSH_TIMEOUT_SECS
@@ -590,7 +615,7 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
         baseline_csv="$OUT_DIR/$workload/$sync_label/A1/median_summary.csv"
       fi
 
-      cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")"
+      cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")" || exit $?
       case "$leg" in
         B1|B2)
           CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv")
@@ -612,7 +637,7 @@ for i in "${!CANDIDATE_COMPARE_CSVS[@]}"; do
 done
 [[ "$ALLOW_REGRESSION" == "true" ]] && gate_args+=(--allow-regression --exemption-reason "$EXEMPTION_REASON")
 
-drift_gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
+drift_gate_args=(--baseline-drift --fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
 for i in "${!DRIFT_COMPARE_CSVS[@]}"; do
   drift_gate_args+=(--labeled-compare-csv "${DRIFT_COMPARE_LABELS[$i]}" "${DRIFT_COMPARE_CSVS[$i]}")
 done
@@ -651,8 +676,8 @@ cat >"$OUT_DIR/summary.md" <<EOF
 
 Interpretation:
 
-- Treat candidate gate failures as actionable only when the A2-vs-A1 drift gate is PASS or the affected workload's A2 drift is materially smaller than the B1/B2 candidate delta.
-- If both candidate and baseline drift fail on the same workload, rerun with longer duration, more rounds, or a quieter runner before assigning causality.
+- Attribute candidate changes only after the affected workload's A2-vs-A1 baseline drift gate passes.
+- Baseline drift is measured in both directions. Rerun an unstable workload with longer duration, more rounds, or a quieter runner before assigning causality.
 EOF
 
 log "summary written to $OUT_DIR/summary.md"

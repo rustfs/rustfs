@@ -102,6 +102,11 @@ impl DavMetaData for WebDavMetaData {
         self.is_dir
     }
 
+    fn is_symlink(&self) -> bool {
+        // S3 represents these entries as regular objects or directory prefixes.
+        false
+    }
+
     fn created(&self) -> FsResult<SystemTime> {
         Ok(self.created)
     }
@@ -949,7 +954,7 @@ where
                             modified,
                             created: modified,
                             is_dir: false,
-                            etag: Some(etag_to_string(&obj.e_tag)),
+                            etag: obj.e_tag.as_ref().map(etag_to_string),
                             content_type: None,
                         },
                     });
@@ -1231,6 +1236,10 @@ where
             }
         }
         .boxed()
+    }
+
+    fn symlink_metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
+        self.metadata(path)
     }
 
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
@@ -1711,6 +1720,35 @@ mod tests {
         assert_eq!(copy_content_length(None, None), -1);
         assert_eq!(copy_content_length(None, Some(12)), 12);
         assert_eq!(copy_content_length(Some(8), Some(12)), 8);
+    }
+
+    #[tokio::test]
+    async fn symlink_metadata_reports_object_and_directory_types() {
+        let backend = DummyBackend::new();
+        backend.queue_head_object_ok(42, None);
+        let driver = WebDavDriver::new(backend, Arc::new(test_session(Protocol::WebDav)));
+        let path = DavPath::new("/bucket/file.txt").expect("object path");
+        let metadata = with_test_auth_override(|_, _, _| true, driver.symlink_metadata(&path))
+            .await
+            .expect("object metadata");
+        assert_eq!(metadata.len(), 42);
+        assert!(!metadata.is_dir());
+        assert!(!metadata.is_symlink());
+
+        let root = DavPath::new("/").expect("root path");
+        let metadata = driver.symlink_metadata(&root).await.expect("root directory metadata");
+        assert!(metadata.is_dir());
+        assert!(!metadata.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn symlink_metadata_enforces_backend_authorization() {
+        let backend = DummyBackend::new().deny_authorization();
+        let driver = WebDavDriver::new(backend.clone(), Arc::new(test_session(Protocol::WebDav)));
+        let path = DavPath::new("/bucket/secret.txt").expect("object path");
+        let result = with_test_auth_override(|_, _, _| true, driver.symlink_metadata(&path)).await;
+        assert!(matches!(result, Err(FsError::Forbidden)));
+        assert!(backend.head_object_calls().is_empty(), "denied metadata lookup must stop before storage");
     }
 
     #[tokio::test]

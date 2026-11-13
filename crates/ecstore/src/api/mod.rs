@@ -638,7 +638,14 @@ pub mod rio {
 }
 
 pub mod rpc {
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::http_auth::ExternalStreamAuth;
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::internode_data_transport::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
+    };
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
@@ -699,6 +706,8 @@ pub mod store_list {
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::store::external_rpc_disk;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
         all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,

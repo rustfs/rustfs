@@ -1022,6 +1022,26 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/manual-main-packages.yml",
+      "name": "Manual main packages",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "manual-main-packages.yml",
+      "disposition": "Packages the origin/main tip as workflow artifacts only. No GitHub Release or download-channel writes.",
+      "monitor_reason": "Operator-requested packaging has no periodic freshness obligation.",
+      "origin": "manual-main-packages"
+    },
+    {
       "workflow": ".github/workflows/minio-interop.yml",
       "name": "minio-interop",
       "roles": [

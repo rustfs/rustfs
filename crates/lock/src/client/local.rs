@@ -30,19 +30,92 @@ use crate::{
 const DEFAULT_GUARD_SHARD_COUNT: usize = 64;
 const EVENT_NAMESPACE_LOCK_ACQUIRE: &str = "namespace_lock_acquire";
 const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
+const EVENT_LOCK_GUARD_RECLAIMED: &str = "lock_guard_reclaimed";
 const LOG_COMPONENT_LOCK: &str = "lock";
 const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
 
-type GuardMap = HashMap<LockId, LocalGuardEntry>;
 type GuardShard = Arc<GuardRegistry>;
 type GuardStorage = Arc<Vec<GuardShard>>;
+
+#[derive(Debug, Default)]
+struct GuardRegistryState {
+    entries: HashMap<LockId, LocalGuardEntry>,
+    // A lower bound on every registered lease deadline. Removal and refresh
+    // may leave it early, so a due sweep recomputes it from the surviving leases.
+    next_expiry: Option<Instant>,
+    #[cfg(test)]
+    expiry_scans: usize,
+}
+
+impl GuardRegistryState {
+    fn insert(&mut self, lock_id: LockId, entry: LocalGuardEntry) -> Option<LocalGuardEntry> {
+        self.next_expiry = Some(
+            self.next_expiry
+                .map_or(entry.deadline, |deadline| deadline.min(entry.deadline)),
+        );
+        self.entries.insert(lock_id, entry)
+    }
+
+    fn remove(&mut self, lock_id: &LockId) -> Option<LocalGuardEntry> {
+        let entry = self.entries.remove(lock_id);
+        if self.entries.is_empty() {
+            self.next_expiry = None;
+        }
+        entry
+    }
+
+    fn refresh(&mut self, lock_id: &LockId) -> bool {
+        let Some(entry) = self.entries.get_mut(lock_id) else {
+            return false;
+        };
+        if entry.is_expired() {
+            return false;
+        }
+        entry.refresh();
+        self.next_expiry = Some(
+            self.next_expiry
+                .map_or(entry.deadline, |deadline| deadline.min(entry.deadline)),
+        );
+        true
+    }
+
+    fn sweep_due(&self) -> bool {
+        self.next_expiry.is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    fn extract_expired(&mut self) -> Vec<LocalGuardEntry> {
+        if !self.sweep_due() {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        {
+            self.expiry_scans += 1;
+        }
+        let now = Instant::now();
+        let mut next_expiry: Option<Instant> = None;
+        let expired = self
+            .entries
+            .extract_if(|_, entry| {
+                if entry.deadline <= now {
+                    true
+                } else {
+                    next_expiry = Some(next_expiry.map_or(entry.deadline, |deadline| deadline.min(entry.deadline)));
+                    false
+                }
+            })
+            .map(|(_, entry)| entry)
+            .collect();
+        self.next_expiry = next_expiry;
+        expired
+    }
+}
 
 /// Registry access never reserves the table for a task that has not resumed.
 /// Only short synchronous map operations hold the native lock; contention
 /// waits on a notification without blocking an executor thread.
 #[derive(Debug, Default)]
 struct GuardRegistry {
-    entries: RwLock<GuardMap>,
+    entries: RwLock<GuardRegistryState>,
     changed: Notify,
 }
 
@@ -83,7 +156,7 @@ impl GuardRegistry {
         }
     }
 
-    async fn read(&self) -> GuardRegistryAccess<'_, RwLockReadGuard<'_, GuardMap>> {
+    async fn read(&self) -> GuardRegistryAccess<'_, RwLockReadGuard<'_, GuardRegistryState>> {
         tokio::task::consume_budget().await;
         if let Some(guard) = self.entries.try_read() {
             return self.access(guard);
@@ -100,7 +173,7 @@ impl GuardRegistry {
         }
     }
 
-    async fn write(&self) -> GuardRegistryAccess<'_, RwLockWriteGuard<'_, GuardMap>> {
+    async fn write(&self) -> GuardRegistryAccess<'_, RwLockWriteGuard<'_, GuardRegistryState>> {
         tokio::task::consume_budget().await;
         if let Some(guard) = self.entries.try_write() {
             return self.access(guard);
@@ -143,6 +216,49 @@ struct LocalGuardEntry {
     ttl: Duration,
 }
 
+/// The shared acquisition algorithm reports facts before either API formats them.
+enum LocalAcquireFailure {
+    Timeout,
+    Conflict {
+        current_owner: Arc<str>,
+        current_mode: crate::LockMode,
+    },
+    InvalidResource,
+}
+
+impl LocalAcquireFailure {
+    fn into_response(self, request: &LockRequest) -> LockResponse {
+        match self {
+            Self::Timeout => LockResponse::failure("Lock acquisition timeout", request.acquire_timeout),
+            Self::Conflict {
+                current_owner,
+                current_mode,
+            } => LockResponse::failure(
+                format!("Lock conflict: resource held by {current_owner} in {current_mode:?} mode"),
+                Duration::ZERO,
+            ),
+            Self::InvalidResource => {
+                LockResponse::failure("Lock id resource does not match the requested resource", Duration::ZERO)
+            }
+        }
+    }
+
+    fn into_batch_outcome(self, request: &LockRequest) -> super::BatchAcquireOutcome {
+        use super::BatchAcquireOutcome;
+        match self {
+            Self::Timeout => BatchAcquireOutcome::RetryableNoGrant {
+                error: crate::LockError::timeout(request.resource.to_string(), request.acquire_timeout),
+            },
+            Self::Conflict { current_owner, .. } => BatchAcquireOutcome::RetryableNoGrant {
+                error: crate::LockError::already_locked(request.resource.to_string(), current_owner.to_string()),
+            },
+            Self::InvalidResource => BatchAcquireOutcome::TerminalNoGrant {
+                error: crate::LockError::invalid_handle(request.lock_id.to_string()),
+            },
+        }
+    }
+}
+
 impl LocalGuardEntry {
     fn new(guard: FastLockGuard, ttl: Duration) -> Self {
         let acquired_at = SystemTime::now();
@@ -171,6 +287,158 @@ impl LocalGuardEntry {
 }
 
 impl LocalClient {
+    async fn acquire_lock_until(
+        &self,
+        request: &LockRequest,
+        acquire_deadline: Instant,
+    ) -> std::result::Result<LockInfo, LocalAcquireFailure> {
+        let started = Instant::now();
+        self.ensure_reaper();
+        if request.lock_id.resource != request.resource {
+            return Err(LocalAcquireFailure::InvalidResource);
+        }
+        let lock_manager = self.get_lock_manager();
+        let initial_remaining = acquire_deadline.saturating_duration_since(Instant::now());
+        let reclaimed_before_acquire = if initial_remaining.is_zero() {
+            0
+        } else {
+            timeout(initial_remaining, self.reclaim_expired_guards_for_resource(&request.resource))
+                .await
+                .unwrap_or(0)
+        };
+        let reclaim_elapsed = started.elapsed();
+
+        let build_lock_request = |acquire_timeout| match request.lock_type {
+            LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
+                .with_acquire_timeout(acquire_timeout),
+            LockType::Shared => crate::ObjectLockRequest::new_read(request.resource.clone(), request.owner.clone())
+                .with_acquire_timeout(acquire_timeout),
+        };
+
+        let mut retried_after_reclaim = reclaimed_before_acquire > 0;
+        loop {
+            let remaining = acquire_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LocalAcquireFailure::Timeout);
+            }
+            let manager_started = Instant::now();
+            // The backend uses its own relative wait; enforce the caller's
+            // absolute budget across that entire future as well. Dropping an
+            // uncompleted manager acquisition releases its publication ticket.
+            let acquired = match timeout_at(acquire_deadline, lock_manager.acquire_lock(build_lock_request(remaining))).await {
+                Ok(acquired) => acquired,
+                Err(_) => return Err(LocalAcquireFailure::Timeout),
+            };
+            match acquired {
+                Ok(guard) => {
+                    let manager_elapsed = manager_started.elapsed();
+                    let registration_started = Instant::now();
+                    let physical_guard_id = guard.guard_id();
+                    let lock_id = request.lock_id.clone();
+                    let entry = LocalGuardEntry::new(guard, request.ttl);
+                    let acquired_at = entry.acquired_at;
+                    let expires_at = entry.expires_at;
+
+                    let (replaced_entry, registration_wait, registration_mutation, registry_entries, registry_capacity) = {
+                        let shard = self.get_shard(&lock_id);
+                        let Ok(mut guards) = timeout_at(acquire_deadline, shard.write()).await else {
+                            return Err(LocalAcquireFailure::Timeout);
+                        };
+                        // A ready table cannot publish a grant after the peer
+                        // budget expired while its acquisition task was idle.
+                        if Instant::now() >= acquire_deadline {
+                            drop(guards);
+                            return Err(LocalAcquireFailure::Timeout);
+                        }
+                        let registration_wait = registration_started.elapsed();
+                        let mutation_started = Instant::now();
+                        let replaced_entry = guards.insert(lock_id.clone(), entry);
+                        (
+                            replaced_entry,
+                            registration_wait,
+                            mutation_started.elapsed(),
+                            guards.entries.len(),
+                            guards.entries.capacity(),
+                        )
+                    };
+                    // Repeated shared requests can replace an entry. Releasing
+                    // its physical guard must not reenter locks under the table.
+                    drop(replaced_entry);
+
+                    let registration_elapsed = registration_started.elapsed();
+                    if started.elapsed() >= Duration::from_millis(100) {
+                        tracing::trace!(
+                            target: "rustfs_lock::namespace_owner",
+                            event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "local_completed",
+                            resource = %request.resource,
+                            lock_id = %lock_id,
+                            mode = ?request.lock_type,
+                            physical_guard_id,
+                            reclaim_ms = reclaim_elapsed.as_millis(),
+                            manager_ms = manager_elapsed.as_millis(),
+                            registration_ms = registration_elapsed.as_millis(),
+                            registration_wait_ms = registration_wait.as_millis(),
+                            registration_mutation_ms = registration_mutation.as_millis(),
+                            registry_entries,
+                            registry_capacity,
+                            acquire_ms = started.elapsed().as_millis(),
+                            "Namespace local lock acquisition completed slowly"
+                        );
+                    }
+
+                    let lock_info = LockInfo {
+                        id: lock_id,
+                        resource: request.resource.clone(),
+                        lock_type: request.lock_type,
+                        status: crate::types::LockStatus::Acquired,
+                        owner: request.owner.clone(),
+                        acquired_at,
+                        expires_at,
+                        last_refreshed: acquired_at,
+                        metadata: request.metadata.clone(),
+                        priority: request.priority,
+                        wait_start_time: None,
+                    };
+                    return Ok(lock_info);
+                }
+                Err(crate::fast_lock::LockResult::Timeout) => {
+                    if !retried_after_reclaim {
+                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
+                        }
+                        retried_after_reclaim = true;
+                        continue;
+                    }
+                    return Err(LocalAcquireFailure::Timeout);
+                }
+                Err(crate::fast_lock::LockResult::Conflict {
+                    current_owner,
+                    current_mode,
+                }) => {
+                    if !retried_after_reclaim {
+                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
+                        }
+                        retried_after_reclaim = true;
+                        continue;
+                    }
+                    return Err(LocalAcquireFailure::Conflict {
+                        current_owner,
+                        current_mode,
+                    });
+                }
+                Err(crate::fast_lock::LockResult::Acquired) => {
+                    unreachable!("Acquired should not be an error")
+                }
+            }
+        }
+    }
+
     /// Create new local client with default shard count
     pub fn new() -> Self {
         Self::with_shard_count(DEFAULT_GUARD_SHARD_COUNT)
@@ -220,8 +488,8 @@ impl LocalClient {
         self.manager.clone().unwrap_or_else(crate::get_global_lock_manager)
     }
 
-    /// Guard entries for one resource share a shard so expiration checks do not
-    /// need to take every shard's write lock on the acquisition hot path.
+    /// Guard entries for one resource share a shard so acquisition only checks
+    /// that shard's expiration deadline.
     fn get_resource_shard_index(&self, resource: &crate::ObjectKey) -> usize {
         resource.shard_index(self.shard_mask)
     }
@@ -234,46 +502,32 @@ impl LocalClient {
 
     async fn reclaim_expired_guards_for_resource(&self, resource: &crate::ObjectKey) -> usize {
         let shard = &self.guard_storage[self.get_resource_shard_index(resource)];
-        let has_expired = {
-            let guards = shard.read().await;
-            guards
-                .iter()
-                .any(|(lock_id, entry)| &lock_id.resource == resource && entry.is_expired())
-        };
-        if !has_expired {
+        if !shard.read().await.sweep_due() {
             return 0;
         }
 
         let expired_entries = {
             let mut guards = shard.write().await;
-            guards
-                .extract_if(|lock_id, entry| &lock_id.resource == resource && entry.is_expired())
-                .map(|(_, entry)| entry)
-                .collect::<Vec<_>>()
+            guards.extract_expired()
         };
-        Self::release_reclaimed_guards(expired_entries, Some(resource))
+        let reclaimed_for_resource = expired_entries.iter().filter(|entry| entry.guard.key() == resource).count();
+        Self::release_reclaimed_guards(expired_entries);
+        reclaimed_for_resource
     }
 
     async fn extract_expired_guards(storage: &GuardStorage) -> Vec<LocalGuardEntry> {
         let mut expired_entries = Vec::new();
         for shard in storage.iter() {
-            let has_expired = {
-                let guards = shard.read().await;
-                guards.values().any(LocalGuardEntry::is_expired)
-            };
-            if !has_expired {
+            if !shard.read().await.sweep_due() {
                 continue;
             }
             let mut guards = shard.write().await;
-            expired_entries.extend(guards.extract_if(|_, entry| entry.is_expired()).map(|(_, entry)| entry));
+            expired_entries.extend(guards.extract_expired());
         }
         expired_entries
     }
 
-    fn release_reclaimed_guards(
-        entries: impl IntoIterator<Item = LocalGuardEntry>,
-        resource: Option<&crate::ObjectKey>,
-    ) -> usize {
+    fn release_reclaimed_guards(entries: impl IntoIterator<Item = LocalGuardEntry>) -> usize {
         let mut reclaimed = 0;
         for mut entry in entries {
             let _ = entry.guard.release();
@@ -281,11 +535,14 @@ impl LocalClient {
             reclaimed += 1;
         }
         if reclaimed > 0 {
-            if let Some(resource) = resource {
-                tracing::debug!(event = "lock_guard_reclaimed", resource = %resource, count = reclaimed, "expired lock guards reclaimed");
-            } else {
-                tracing::debug!(event = "lock_guard_reaper_sweep", count = reclaimed, "expired lock guards reclaimed");
-            }
+            tracing::debug!(
+                event = EVENT_LOCK_GUARD_RECLAIMED,
+                component = LOG_COMPONENT_LOCK,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                state = "reclaimed",
+                count = reclaimed,
+                "Expired lock guards reclaimed"
+            );
         }
         reclaimed
     }
@@ -304,7 +561,7 @@ impl LocalClient {
                     break;
                 };
                 let expired_entries = Self::extract_expired_guards(&storage).await;
-                Self::release_reclaimed_guards(expired_entries, None);
+                Self::release_reclaimed_guards(expired_entries);
             }
         });
     }
@@ -320,149 +577,29 @@ impl Default for LocalClient {
 impl LockClient for LocalClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         let started = Instant::now();
-        self.ensure_reaper();
-        if request.lock_id.resource != request.resource {
-            return Ok(LockResponse::failure(
-                "Lock id resource does not match the requested resource",
-                Duration::ZERO,
-            ));
-        }
-        let acquire_deadline = Instant::now()
-            .checked_add(request.acquire_timeout)
-            .unwrap_or_else(Instant::now);
-        let lock_manager = self.get_lock_manager();
-        let initial_remaining = acquire_deadline.saturating_duration_since(Instant::now());
-        let reclaimed_before_acquire = if initial_remaining.is_zero() {
-            0
-        } else {
-            timeout(initial_remaining, self.reclaim_expired_guards_for_resource(&request.resource))
-                .await
-                .unwrap_or(0)
-        };
-        let reclaim_elapsed = started.elapsed();
+        let deadline = started.checked_add(request.acquire_timeout).unwrap_or(started);
+        Ok(match self.acquire_lock_until(request, deadline).await {
+            Ok(info) => LockResponse::success(info, Duration::ZERO),
+            Err(failure) => failure.into_response(request),
+        })
+    }
 
-        let build_lock_request = |acquire_timeout| match request.lock_type {
-            LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
-                .with_acquire_timeout(acquire_timeout),
-            LockType::Shared => crate::ObjectLockRequest::new_read(request.resource.clone(), request.owner.clone())
-                .with_acquire_timeout(acquire_timeout),
-        };
-
-        let mut retried_after_reclaim = reclaimed_before_acquire > 0;
-        loop {
-            let remaining = acquire_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
-            }
-            let manager_started = Instant::now();
-            match lock_manager.acquire_lock(build_lock_request(remaining)).await {
-                Ok(guard) => {
-                    let manager_elapsed = manager_started.elapsed();
-                    let registration_started = Instant::now();
-                    let physical_guard_id = guard.guard_id();
-                    let lock_id = request.lock_id.clone();
-                    let entry = LocalGuardEntry::new(guard, request.ttl);
-                    let acquired_at = entry.acquired_at;
-                    let expires_at = entry.expires_at;
-
-                    let (replaced_entry, registration_wait, registration_mutation, registry_entries, registry_capacity) = {
-                        let shard = self.get_shard(&lock_id);
-                        let Ok(mut guards) = timeout_at(acquire_deadline, shard.write()).await else {
-                            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
-                        };
-                        // A ready table cannot publish a grant after the peer
-                        // budget expired while its acquisition task was idle.
-                        if Instant::now() >= acquire_deadline {
-                            drop(guards);
-                            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
-                        }
-                        let registration_wait = registration_started.elapsed();
-                        let mutation_started = Instant::now();
-                        let replaced_entry = guards.insert(lock_id.clone(), entry);
-                        (
-                            replaced_entry,
-                            registration_wait,
-                            mutation_started.elapsed(),
-                            guards.len(),
-                            guards.capacity(),
-                        )
-                    };
-                    // Repeated shared requests can replace an entry. Releasing
-                    // its physical guard must not reenter locks under the table.
-                    drop(replaced_entry);
-
-                    let registration_elapsed = registration_started.elapsed();
-                    if started.elapsed() >= Duration::from_millis(100) {
-                        tracing::trace!(
-                            target: "rustfs_lock::namespace_owner",
-                            event = EVENT_NAMESPACE_LOCK_ACQUIRE,
-                            component = LOG_COMPONENT_LOCK,
-                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
-                            state = "local_completed",
-                            resource = %request.resource,
-                            lock_id = %lock_id,
-                            mode = ?request.lock_type,
-                            physical_guard_id,
-                            reclaim_ms = reclaim_elapsed.as_millis(),
-                            manager_ms = manager_elapsed.as_millis(),
-                            registration_ms = registration_elapsed.as_millis(),
-                            registration_wait_ms = registration_wait.as_millis(),
-                            registration_mutation_ms = registration_mutation.as_millis(),
-                            registry_entries,
-                            registry_capacity,
-                            acquire_ms = started.elapsed().as_millis(),
-                            "Namespace local lock acquisition completed slowly"
-                        );
-                    }
-
-                    let lock_info = LockInfo {
-                        id: lock_id,
-                        resource: request.resource.clone(),
-                        lock_type: request.lock_type,
-                        status: crate::types::LockStatus::Acquired,
-                        owner: request.owner.clone(),
-                        acquired_at,
-                        expires_at,
-                        last_refreshed: acquired_at,
-                        metadata: request.metadata.clone(),
-                        priority: request.priority,
-                        wait_start_time: None,
-                    };
-                    return Ok(LockResponse::success(lock_info, Duration::ZERO));
-                }
-                Err(crate::fast_lock::LockResult::Timeout) => {
-                    if !retried_after_reclaim {
-                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
-                        if !remaining.is_zero() {
-                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
-                        }
-                        retried_after_reclaim = true;
-                        continue;
-                    }
-                    return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
-                }
-                Err(crate::fast_lock::LockResult::Conflict {
-                    current_owner,
-                    current_mode,
-                }) => {
-                    if !retried_after_reclaim {
-                        let remaining = acquire_deadline.saturating_duration_since(Instant::now());
-                        if !remaining.is_zero() {
-                            let _ = timeout(remaining, self.reclaim_expired_guards_for_resource(&request.resource)).await;
-                        }
-                        retried_after_reclaim = true;
-                        continue;
-                    }
-                    return Ok(LockResponse::failure(
-                        format!("Lock conflict: resource held by {current_owner} in {current_mode:?} mode"),
-                        Duration::ZERO,
-                    ));
-                }
-                Err(crate::fast_lock::LockResult::Acquired) => {
-                    unreachable!("Acquired should not be an error")
+    async fn acquire_locks_batch_until(&self, requests: &[LockRequest], deadline: Instant) -> Vec<super::BatchAcquireOutcome> {
+        // Every item shares the entry time, including items first polled later.
+        let started = Instant::now();
+        futures::future::join_all(requests.iter().map(|request| {
+            let item_deadline = deadline.min(started.checked_add(request.acquire_timeout).unwrap_or(started));
+            async move {
+                match self.acquire_lock_until(request, item_deadline).await {
+                    Ok(info) => super::BatchAcquireOutcome::Granted {
+                        lock_info: Some(Box::new(info)),
+                        wait_time: Duration::ZERO,
+                    },
+                    Err(failure) => failure.into_batch_outcome(request),
                 }
             }
-        }
+        }))
+        .await
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
@@ -510,19 +647,17 @@ impl LockClient for LocalClient {
         let shard = self.get_shard(lock_id);
         let expired_entry = {
             let mut guards = shard.write().await;
-            let Some(entry) = guards.get_mut(lock_id) else {
-                return Ok(false);
-            };
-            if entry.is_expired() {
-                guards.remove(lock_id)
-            } else {
-                entry.refresh();
+            if guards.refresh(lock_id) {
                 None
+            } else if let Some(entry) = guards.remove(lock_id) {
+                Some(entry)
+            } else {
+                return Ok(false);
             }
         };
 
         if let Some(entry) = expired_entry {
-            Self::release_reclaimed_guards([entry], Some(&lock_id.resource));
+            Self::release_reclaimed_guards([entry]);
             Ok(false)
         } else {
             Ok(true)
@@ -536,7 +671,7 @@ impl LockClient for LocalClient {
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>> {
         let shard = self.get_shard(lock_id);
         let guards = shard.read().await;
-        if let Some(entry) = guards.get(lock_id) {
+        if let Some(entry) = guards.entries.get(lock_id) {
             // We have an active guard for this lock
             let lock_type = match entry.guard.mode() {
                 crate::LockMode::Shared => LockType::Shared,
@@ -569,8 +704,8 @@ impl LockClient for LocalClient {
         let mut leases = Vec::new();
         for shard in self.guard_storage.iter() {
             let guards = shard.read().await;
-            leases.reserve(guards.len());
-            leases.extend(guards.iter().map(|(lock_id, entry)| crate::LockLeaseInfo {
+            leases.reserve(guards.entries.len());
+            leases.extend(guards.entries.iter().map(|(lock_id, entry)| crate::LockLeaseInfo {
                 resource: lock_id.resource.clone(),
                 lock_type: match entry.guard.mode() {
                     crate::LockMode::Shared => LockType::Shared,
@@ -609,10 +744,304 @@ mod tests {
     use futures::FutureExt;
     use std::task::Poll;
 
+    #[tokio::test(start_paused = true)]
+    async fn typed_batch_preserves_free_key_grants_beside_a_contended_key() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let hot = crate::ObjectKey::new("bucket", "hot");
+        let holder = request(hot.clone(), "holder", Duration::from_secs(30));
+        assert!(client.acquire_lock(&holder).await.expect("hold contended key").success);
+        let requests = [
+            request(crate::ObjectKey::new("bucket", "free"), "batch", Duration::from_secs(30)),
+            request(hot, "batch", Duration::from_secs(30)),
+        ];
+        let outcomes = client
+            .acquire_locks_batch_until(&requests, Instant::now() + Duration::from_secs(1))
+            .await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(outcomes[0], super::super::BatchAcquireOutcome::Granted { .. }));
+        assert!(matches!(outcomes[1], super::super::BatchAcquireOutcome::RetryableNoGrant { .. }));
+        assert!(
+            client
+                .check_status(&requests[0].lock_id)
+                .await
+                .expect("check free grant")
+                .is_some()
+        );
+        assert!(
+            client
+                .check_status(&requests[1].lock_id)
+                .await
+                .expect("check rejected attempt")
+                .is_none()
+        );
+        assert!(client.release(&holder.lock_id).await.expect("release holder"));
+        assert!(client.release(&requests[0].lock_id).await.expect("release free key"));
+        assert!(client.list_lock_leases().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_batch_manager_wait_obeys_absolute_deadline_without_releasing_holder() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        let resource = crate::ObjectKey::new("bucket", "manager-deadline");
+        let holder = manager
+            .acquire_lock(crate::ObjectLockRequest::new_write(resource.clone(), "holder"))
+            .await
+            .expect("hold the physical lock independently of a backend lease");
+        let requests = [request(resource.clone(), "batch", Duration::from_secs(30)).with_acquire_timeout(Duration::from_secs(5))];
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let outcomes = timeout_at(deadline + Duration::from_millis(1), client.acquire_locks_batch_until(&requests, deadline))
+            .await
+            .expect("the manager wait must finish at the absolute caller deadline");
+        assert!(started.elapsed() <= Duration::from_millis(100));
+        assert!(matches!(
+            outcomes.as_slice(),
+            [super::super::BatchAcquireOutcome::RetryableNoGrant { .. }]
+        ));
+        assert!(client.list_lock_leases().await.is_empty(), "no failed attempt is registered");
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled manager")
+                .get_shard(&resource)
+                .active_guard_count(),
+            1,
+            "the original holder is never released by a timed-out attempt"
+        );
+        drop(holder);
+        let successor = manager
+            .acquire_lock(crate::ObjectLockRequest::new_write(resource.clone(), "successor"))
+            .await
+            .expect("no cancelled manager waiter may take the released lock later");
+        drop(successor);
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled manager")
+                .get_shard(&resource)
+                .active_guard_count(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_batch_rejects_late_poll_without_resetting_the_caller_deadline() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let requests = [
+            request(crate::ObjectKey::new("bucket", "late"), "batch", Duration::from_secs(30))
+                .with_acquire_timeout(Duration::from_secs(5)),
+        ];
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let acquire = client.acquire_locks_batch_until(&requests, deadline);
+        tokio::time::advance(Duration::from_millis(21)).await;
+        assert!(matches!(
+            acquire.await.as_slice(),
+            [super::super::BatchAcquireOutcome::RetryableNoGrant {
+                error: crate::LockError::Timeout { .. }
+            }]
+        ));
+        assert!(client.list_lock_leases().await.is_empty(), "an expired item must never register a grant");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_batch_registration_timeout_drops_the_unpublished_physical_guard() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "typed-registration-timeout");
+        let blocker = manager
+            .acquire_lock(crate::ObjectLockRequest::new_write(resource.clone(), "holder"))
+            .await
+            .expect("hold physical lock until preflight completes");
+        let requests = [request(resource.clone(), "batch", Duration::from_secs(30)).with_acquire_timeout(Duration::from_secs(5))];
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut acquire = Box::pin(tokio::task::unconstrained(client.acquire_locks_batch_until(&requests, deadline)));
+        assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+        let (release_table, table_owner) = hold_guard_shard(client.get_shard(&requests[0].lock_id).clone());
+        drop(blocker);
+        assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled manager")
+                .get_shard(&resource)
+                .active_guard_count(),
+            1
+        );
+        tokio::time::advance(Duration::from_millis(21)).await;
+        let result = acquire.await;
+        assert!(matches!(result.as_slice(), [super::super::BatchAcquireOutcome::RetryableNoGrant { .. }]));
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled manager")
+                .get_shard(&resource)
+                .active_guard_count(),
+            0,
+            "NoGrant must only be returned after the unpublished physical guard is dropped"
+        );
+        release_table.send(()).expect("release table");
+        table_owner.join().expect("table owner finishes");
+        assert!(client.list_lock_leases().await.is_empty());
+    }
+
+    #[test]
+    fn legacy_acquisition_messages_remain_compatible() {
+        let request = request(crate::ObjectKey::new("bucket", "legacy"), "owner", Duration::from_secs(30));
+        assert_eq!(
+            LocalAcquireFailure::Timeout.into_response(&request).error.as_deref(),
+            Some("Lock acquisition timeout")
+        );
+        assert_eq!(
+            LocalAcquireFailure::Conflict {
+                current_owner: Arc::from("holder"),
+                current_mode: crate::LockMode::Exclusive
+            }
+            .into_response(&request)
+            .error
+            .as_deref(),
+            Some("Lock conflict: resource held by holder in Exclusive mode")
+        );
+    }
+
     fn request(resource: crate::ObjectKey, owner: &str, ttl: Duration) -> LockRequest {
         LockRequest::new(resource, LockType::Exclusive, owner)
             .with_ttl(ttl)
             .with_acquire_timeout(Duration::from_millis(80))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unexpired_shared_acquisitions_and_reaper_do_not_scan_guard_entries() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "unexpired-shared-registry");
+        let mut requests = Vec::with_capacity(512);
+        for _ in 0..512 {
+            let request = LockRequest::new(resource.clone(), LockType::Shared, "reader");
+            assert!(client.acquire_lock(&request).await.expect("register shared lease").success);
+            requests.push(request);
+        }
+        assert!(LocalClient::extract_expired_guards(&client.guard_storage).await.is_empty());
+        {
+            let registry = client.get_shard(&requests[0].lock_id).read().await;
+            assert_eq!(registry.entries.len(), 512);
+            assert_eq!(registry.expiry_scans, 0, "live lease acquisition and reaping must use the deadline hint");
+            assert!(registry.next_expiry.is_some());
+        }
+        for request in &requests {
+            assert!(client.release(&request.lock_id).await.expect("release shared lease"));
+        }
+        let registry = client.get_shard(&requests[0].lock_id).read().await;
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.next_expiry, None, "the final release must clear the deadline hint");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_shard_expiration_sweep_only_counts_the_requested_resource() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "live-sweep-trigger");
+        let shard_index = client.get_resource_shard_index(&resource);
+        let other_resource = (0..4096)
+            .map(|index| crate::ObjectKey::new("bucket", format!("expired-same-shard-{index}")))
+            .find(|candidate| client.get_resource_shard_index(candidate) == shard_index)
+            .expect("find an independent resource in the same guard shard");
+        let live = request(resource.clone(), "live", Duration::from_secs(30));
+        let expired = request(other_resource.clone(), "expired", Duration::from_secs(5));
+        assert!(client.acquire_lock(&live).await.expect("register live lease").success);
+        assert!(client.acquire_lock(&expired).await.expect("register earlier lease").success);
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert!(
+            client
+                .check_status(&expired.lock_id)
+                .await
+                .expect("expired lease status")
+                .is_none()
+        );
+        assert!(client.check_status(&live.lock_id).await.expect("live lease status").is_some());
+        let replacement = manager
+            .acquire_lock(crate::ObjectLockRequest::new_write(other_resource, "replacement"))
+            .await
+            .expect("the sweep must release the other resource's expired physical guard");
+        drop(replacement);
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert_eq!(client.get_shard(&live.lock_id).read().await.expiry_scans, 1);
+        assert!(client.release(&live.lock_id).await.expect("release live lease"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refreshed_and_removed_earliest_leases_only_trigger_one_sweep_per_deadline() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "refresh-expiry-hint");
+        let short = LockRequest::new(resource.clone(), LockType::Shared, "short").with_ttl(Duration::from_secs(10));
+        let long = LockRequest::new(resource.clone(), LockType::Shared, "long").with_ttl(Duration::from_secs(30));
+        assert!(client.acquire_lock(&short).await.expect("short lease").success);
+        assert!(client.acquire_lock(&long).await.expect("long lease").success);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(client.refresh(&short.lock_id).await.expect("extend the earliest deadline"));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert_eq!(client.get_shard(&short.lock_id).read().await.expiry_scans, 1);
+
+        assert!(
+            client
+                .release(&short.lock_id)
+                .await
+                .expect("remove the earliest surviving lease")
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 0);
+        assert_eq!(client.get_shard(&long.lock_id).read().await.expiry_scans, 2);
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(client.reclaim_expired_guards_for_resource(&resource).await, 1);
+        let registry = client.get_shard(&long.lock_id).read().await;
+        assert_eq!(registry.expiry_scans, 3);
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.next_expiry, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_shared_id_replacement_preserves_earlier_expiration_and_reaper_cleanup() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "replace-expiry-hint");
+        let original = LockRequest::new(resource.clone(), LockType::Shared, "owner").with_ttl(Duration::from_secs(30));
+        assert!(client.acquire_lock(&original).await.expect("register original lease").success);
+        let replacement = original.clone().with_ttl(Duration::from_secs(5));
+        assert!(
+            client
+                .acquire_lock(&replacement)
+                .await
+                .expect("replace the same grant identity")
+                .success
+        );
+        assert_eq!(client.get_shard(&original.lock_id).read().await.entries.len(), 1);
+        let backend = manager.as_fast_lock_manager().expect("enabled physical lock backend");
+        assert_eq!(backend.get_shard(&resource).active_guard_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let expired = LocalClient::extract_expired_guards(&client.guard_storage).await;
+        assert_eq!(LocalClient::release_reclaimed_guards(expired), 1);
+        assert_eq!(backend.get_shard(&resource).active_guard_count(), 0);
+        assert!(
+            client
+                .check_status(&original.lock_id)
+                .await
+                .expect("replaced lease status")
+                .is_none()
+        );
+        let registry = client.get_shard(&original.lock_id).read().await;
+        assert_eq!(registry.expiry_scans, 1);
+        assert_eq!(registry.next_expiry, None);
     }
 
     fn hold_guard_shard(shard: GuardShard) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
@@ -801,7 +1230,7 @@ mod tests {
         let access = timeout(Duration::from_millis(100), survivor)
             .await
             .expect("a cancelled waiter must not consume another waiter's unlock notification");
-        assert!(access.is_empty());
+        assert!(access.entries.is_empty());
     }
 
     #[tokio::test]

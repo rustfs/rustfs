@@ -34,6 +34,7 @@ use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_iam::error::Error as IamError;
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_iam::mfa::service as mfa_service;
 use rustfs_madmin::account::{ERR_MFA_REQUIRED, IdentityType};
@@ -110,6 +111,13 @@ fn assume_role_site_replication_item(cred: &rustfs_credentials::Credentials, upd
         updated_at: Some(updated_at),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
+    }
+}
+
+fn sts_session_publication_error(error: IamError) -> S3Error {
+    match error {
+        IamError::IAMActionNotAllowed => s3_error!(AccessDenied, "Access Denied"),
+        other => super::iam_error::iam_error_to_s3_error(other),
     }
 }
 
@@ -222,7 +230,7 @@ async fn handle_assume_role(
 
     // The signature was verified before the request body was consumed. A fresh
     // IAM lookup must not silently replace the secret that authenticated it.
-    if !crate::auth::constant_time_eq(&cred.secret_key, user.secret_key()) {
+    if !user.secret_key_matches(&cred.secret_key) {
         return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
     }
 
@@ -320,7 +328,7 @@ async fn handle_assume_role(
     let updated_at = iam_store
         .set_temp_user_from_parent(&new_cred, &cred)
         .await
-        .map_err(super::iam_error::iam_error_to_s3_error)?;
+        .map_err(sts_session_publication_error)?;
 
     let root_access_key = current_action_credentials().map(|cred| cred.access_key);
     if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
@@ -694,6 +702,17 @@ mod tests {
         assert_eq!(sts.session_token, cred.session_token);
         assert_eq!(sts.parent_user, cred.parent_user);
         assert_eq!(sts.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
+    }
+
+    #[test]
+    fn sts_session_publication_errors_distinguish_parent_denial_from_server_failure() {
+        let denied = sts_session_publication_error(IamError::IAMActionNotAllowed);
+        assert_eq!(denied.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(denied.status_code(), Some(StatusCode::FORBIDDEN));
+
+        let failed = sts_session_publication_error(IamError::IamSysNotInitialized);
+        assert_eq!(failed.code(), &S3ErrorCode::InternalError);
+        assert_eq!(failed.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     #[test]

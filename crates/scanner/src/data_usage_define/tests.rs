@@ -3995,7 +3995,7 @@ fn test_lifecycle_cache_legacy_msgpack_oracle() {
             [
                 rmp_serde::to_vec(&frozen_tuple_read).expect("encode the fixed legacy tuple after production read"),
                 rmp_serde::to_vec(&frozen_map_read).expect("encode the fixed legacy map after production read"),
-                current_map.clone(),
+                current_map,
                 rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&current.lifecycle))
                     .expect("encode the independent domain lifecycle payload"),
             ],

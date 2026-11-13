@@ -63,6 +63,11 @@ inputs:
     required: false
     default: "true"
 
+outputs:
+  cache-hit:
+    description: "'true' when the Rust cache was restored from an exact key match"
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
+
 runs:
   using: "composite"
   steps:
@@ -143,6 +148,7 @@ runs:
         tool: cargo-nextest@0.9.138
 
     - name: Setup Rust cache
+      id: rust-cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         # false is rust-cache's own default. With true, cleanup.ts returns

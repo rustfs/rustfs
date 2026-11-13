@@ -50,10 +50,8 @@ const _: () = assert!(DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS <= MAX_ADMIN_PEER_PR
 
 // ── Client-side internode gRPC channel tuning (P0) ──
 // These mirror the server-side HTTP/2 transport tuning in `rustfs/src/server/http.rs`
-// on the *client* `tonic` `Endpoint` used for internode control-plane RPCs. Prior to
-// this, the client channel only set timeouts/keepalive, leaving Nagle enabled and the
-// default 64KiB HTTP/2 window in place — hurting small lock-RPC latency and large
-// metadata-response throughput respectively.
+// on the *client* `tonic` `Endpoint` used for internode RPCs. Explicit values make
+// the operator's receive-credit policy independent of changes to library defaults.
 
 /// Disable Nagle's algorithm on internode gRPC client sockets.
 ///
@@ -69,8 +67,8 @@ const _: () = assert!(DEFAULT_INTERNODE_RPC_TCP_NODELAY);
 
 /// HTTP/2 initial stream window size (bytes) for internode gRPC client channels.
 ///
-/// The library default (64KiB) throttles larger unary responses (e.g. `ReadMultiple`,
-/// `BatchReadVersion`) by the bandwidth-delay product. Set to 0 to fall back to the
+/// Size this for the bandwidth-delay product and concurrent response budget of
+/// unary responses such as `ReadMultiple` and `BatchReadVersion`. Set to 0 to use the
 /// `tonic`/`hyper` default. Defaults to 1MiB.
 pub const ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE";
 pub const DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: u32 = 1024 * 1024;
@@ -283,6 +281,18 @@ const _: () = assert!(!DEFAULT_INTERNODE_CHANNEL_ISOLATION);
 /// dedicated connection (still separate from control).
 pub const ENV_INTERNODE_BULK_CHANNELS: &str = "RUSTFS_INTERNODE_BULK_CHANNELS";
 pub const DEFAULT_INTERNODE_BULK_CHANNELS: usize = 2;
+
+/// Optional receive-window overrides for isolated bulk channels. When unset, inherit the
+/// corresponding `RUSTFS_INTERNODE_RPC_HTTP2_*` setting. Zero selects the library default.
+pub const ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE";
+pub const ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE";
+
+/// Transport admission and pending-buffer limits for isolated bulk channels. These limits
+/// apply to the tonic service; complete unary bodies are observed separately by RPC metrics.
+pub const ENV_INTERNODE_BULK_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT";
+pub const DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT: usize = 64;
+pub const ENV_INTERNODE_BULK_BUFFER_SIZE: &str = "RUSTFS_INTERNODE_BULK_BUFFER_SIZE";
+pub const DEFAULT_INTERNODE_BULK_BUFFER_SIZE: usize = 1024;
 
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";

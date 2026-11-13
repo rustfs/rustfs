@@ -343,7 +343,7 @@ impl Operation for AddServiceAccount {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), req_cred.access_key()).await?;
 
-        if !constant_time_eq(&cred.secret_key, req_cred.secret_key()) {
+        if !req_cred.secret_key_matches(&cred.secret_key) {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "access denied"));
         }
 

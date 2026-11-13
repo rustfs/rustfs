@@ -2786,38 +2786,122 @@ impl NotificationSys {
         self.load_bucket_metadata_with_scanner_maintenance(bucket, false).await
     }
 
+    /// Reload bucket metadata and report every configured remote member's acknowledgement.
+    ///
+    /// Peer failures remain in `NotificationPeerErr::err`; an empty successful report means
+    /// there are no remote members. Hosts are configuration topology identities, without
+    /// URL schemes or drive paths. Acknowledgements do not certify a quota revision.
+    /// This uses the existing parallel RPC attempts and their retry/deadline policy.
+    /// Cancellation can leave outcomes unknown and does not undo completed reloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the complete peer inventory cannot be identified. Available
+    /// clients are still notified before this error is returned.
+    pub async fn load_bucket_metadata_report(&self, bucket: &str) -> Result<Vec<NotificationPeerErr>> {
+        self.load_bucket_metadata_report_with(bucket, PeerRestClient::load_bucket_metadata)
+            .await
+    }
+
     pub async fn load_bucket_metadata_for_scanner_maintenance(&self, bucket: &str) -> Result<()> {
         self.load_bucket_metadata_with_scanner_maintenance(bucket, true).await
     }
 
     async fn load_bucket_metadata_with_scanner_maintenance(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
+        let results = self
+            .collect_bucket_metadata_reload_results(bucket, scanner_maintenance_change, PeerRestClient::load_bucket_metadata)
+            .await;
         let operation = format!("load_bucket_metadata({bucket})");
         let mut failures = Vec::new();
-        let mut futures = Vec::with_capacity(self.peer_clients.len());
         for (idx, client) in self.peer_clients.iter().enumerate() {
-            if let Some(client) = client {
-                let host = client.host.to_string();
-                let b = bucket.to_string();
-                futures.push(async move {
-                    client
-                        .load_bucket_metadata(&b, scanner_maintenance_change)
-                        .await
-                        .map_err(|err| (host, err))
-                });
-            } else {
+            if client.is_none() {
                 failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
             }
         }
-
-        for result in join_all(futures).await {
-            if let Err((host, err)) = result {
-                let failure = format!("peer {host} {operation} failed: {err}");
-                error!("notification {operation} err {failure}");
-                failures.push(failure);
+        for (client, result) in self.peer_clients.iter().zip(results) {
+            if let Some(client) = client
+                && let Err(err) = result
+            {
+                failures.push(format!("peer {} {operation} failed: {err}", client.host));
             }
         }
 
         aggregate_notification_failures(&operation, failures)
+    }
+
+    async fn load_bucket_metadata_report_with<'a, F, Fut>(
+        &'a self,
+        bucket: &'a str,
+        reload: F,
+    ) -> Result<Vec<NotificationPeerErr>>
+    where
+        F: FnMut(&'a PeerRestClient, &'a str, bool) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        // A reporting failure must not suppress the best-effort reload itself.
+        let results = self.collect_bucket_metadata_reload_results(bucket, false, reload).await;
+        let mut members = BTreeSet::new();
+        if self.peer_clients.len() != self.peer_topology_hosts.len()
+            || self.peer_clients.iter().zip(&self.peer_topology_hosts).any(|(client, host)| {
+                host.is_empty()
+                    || !members.insert(host.as_str())
+                    || client.as_ref().is_some_and(|client| client.topology_member() != host)
+            })
+        {
+            return Err(Error::other("bucket metadata reload peer topology is incomplete or inconsistent"));
+        }
+
+        Ok(self
+            .peer_topology_hosts
+            .iter()
+            .zip(results)
+            .map(|(host, result)| NotificationPeerErr {
+                host: host.clone(),
+                err: result.err(),
+            })
+            .collect())
+    }
+
+    async fn collect_bucket_metadata_reload_results<'a, F, Fut>(
+        &'a self,
+        bucket: &'a str,
+        scanner_maintenance_change: bool,
+        mut reload: F,
+    ) -> Vec<Result<()>>
+    where
+        F: FnMut(&'a PeerRestClient, &'a str, bool) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let futures = self.peer_clients.iter().map(|client| {
+            let attempt = client
+                .as_ref()
+                .map(|client| reload(client, bucket, scanner_maintenance_change));
+            async move {
+                match attempt {
+                    Some(attempt) => attempt.await,
+                    None => Err(Error::other("peer is not reachable")),
+                }
+            }
+        });
+        let results = join_all(futures).await;
+        for (client, result) in self.peer_clients.iter().zip(&results) {
+            if let Some(client) = client
+                && let Err(err) = result
+            {
+                error!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    result = "failed",
+                    action = "load_bucket_metadata",
+                    peer = %client.topology_member(),
+                    bucket,
+                    error_code = ?err.code(),
+                    "notification peer propagation"
+                );
+            }
+        }
+        results
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
@@ -3084,7 +3168,7 @@ impl NotificationSys {
                     return Err(Error::other("scanner scoped dirty usage capability requires scoped acknowledgements"));
                 }
             };
-            if by_host.insert(host.clone(), acknowledgement).is_some() {
+            if by_host.insert(host, acknowledgement).is_some() {
                 return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
@@ -3134,7 +3218,7 @@ impl NotificationSys {
                 ScannerDirtyUsageAcknowledgement::Generation { host, .. }
                 | ScannerDirtyUsageAcknowledgement::Scoped { host, .. } => host.clone(),
             };
-            if by_host.insert(host.clone(), acknowledgement).is_some() {
+            if by_host.insert(host, acknowledgement).is_some() {
                 return Err(Error::other("duplicate scanner dirty usage acknowledgement target"));
             }
         }
@@ -5900,6 +5984,158 @@ mod tests {
         assert!(msg.contains("load_bucket_metadata(bucket-a)"));
         assert!(msg.contains("1 failure(s)"));
         assert!(msg.contains("peer[0]"));
+    }
+
+    fn bucket_metadata_reload_test_sys(hosts: &[&str]) -> NotificationSys {
+        let peer_clients = hosts
+            .iter()
+            .map(|host| {
+                let (name, port) = host.rsplit_once(':').expect("test peers have explicit ports");
+                Some(PeerRestClient::new(
+                    XHost {
+                        name: name.trim_matches(['[', ']']).to_string(),
+                        port: port.parse().expect("valid configured test port"),
+                        is_port_set: true,
+                    },
+                    format!("https://{host}"),
+                ))
+            })
+            .collect();
+        NotificationSys {
+            peer_clients,
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_report_preserves_each_peer_outcome() {
+        for failure_mask in [0_u8, 2, 3] {
+            let sys = bucket_metadata_reload_test_sys(&["node-a:9100", "node-b:9200"]);
+            let barrier = tokio::sync::Barrier::new(2);
+            let barrier = &barrier;
+            let report = timeout(
+                Duration::from_secs(1),
+                sys.load_bucket_metadata_report_with("bucket-a", |client, bucket, scanner_maintenance_change| async move {
+                    assert_eq!(bucket, "bucket-a");
+                    assert!(!scanner_maintenance_change, "ordinary reloads must not announce scanner maintenance");
+                    let peer_bit = if client.topology_member() == "node-a:9100" { 1 } else { 2 };
+                    barrier.wait().await;
+                    if failure_mask & peer_bit == 0 {
+                        Ok(())
+                    } else {
+                        Err(Error::VolumeNotFound)
+                    }
+                }),
+            )
+            .await
+            .expect("peer reloads must run concurrently")
+            .expect("peer failures must retain a complete report");
+
+            assert_eq!(
+                report.iter().map(|peer| peer.host.as_str()).collect::<Vec<_>>(),
+                ["node-a:9100", "node-b:9200"]
+            );
+            for (peer, peer_bit) in report.iter().zip([1, 2]) {
+                if failure_mask & peer_bit == 0 {
+                    assert!(peer.err.is_none(), "successful peer must retain its acknowledgement");
+                } else {
+                    assert!(matches!(peer.err, Some(Error::VolumeNotFound)), "peer failure type must be preserved");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_report_keeps_identities_when_clients_are_unavailable() {
+        let hosts = ["[::1]:9100", "node-b:9200"];
+        let mut sys = bucket_metadata_reload_test_sys(&hosts);
+        let online = sys
+            .load_bucket_metadata_report_with("bucket-a", |_, _, _| async { Ok(()) })
+            .await
+            .expect("configured online peers must be identifiable");
+        sys.peer_clients.iter_mut().for_each(|client| *client = None);
+        let unavailable = sys
+            .load_bucket_metadata_report("bucket-a")
+            .await
+            .expect("missing clients must not hide known topology identities");
+
+        assert_eq!(online.iter().map(|peer| peer.host.as_str()).collect::<Vec<_>>(), hosts);
+        assert_eq!(unavailable.iter().map(|peer| peer.host.as_str()).collect::<Vec<_>>(), hosts);
+        assert!(online.iter().all(|peer| peer.err.is_none()));
+        assert!(unavailable.iter().all(|peer| peer.err.is_some()));
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_report_accepts_zero_remote_members() {
+        let sys = bucket_metadata_reload_test_sys(&[]);
+        let report = sys
+            .load_bucket_metadata_report("bucket-a")
+            .await
+            .expect("a single node needs no remote acknowledgements");
+        assert!(report.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_report_rejects_invalid_inventory_after_fanout() {
+        for topology in [
+            vec![],
+            vec!["node-a:9100"],
+            vec!["node-a:9100", "node-b:9200", "node-c:9300"],
+            vec!["", "node-b:9200"],
+            vec!["node-a:9100", "node-a:9100"],
+            vec!["other-node:9100", "node-b:9200"],
+        ] {
+            let mut sys = bucket_metadata_reload_test_sys(&["node-a:9100", "node-b:9200"]);
+            sys.peer_topology_hosts = topology.iter().map(|host| (*host).to_string()).collect();
+            let calls = AtomicUsize::new(0);
+            let calls = &calls;
+            let report = sys
+                .load_bucket_metadata_report_with("bucket-a", |_, _, _| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(report.is_err(), "invalid topology must not produce a partial report: {topology:?}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "reporting failure must not suppress available peer reloads"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_legacy_wrappers_keep_their_inventory_semantics() {
+        let mut sys = bucket_metadata_reload_test_sys(&[]);
+        sys.peer_topology_hosts.push("node-a:9100".to_string());
+        assert!(sys.load_bucket_metadata_report("bucket-a").await.is_err());
+        sys.load_bucket_metadata("bucket-a")
+            .await
+            .expect("the legacy reload must not gain a new topology validation failure");
+        sys.load_bucket_metadata_for_scanner_maintenance("bucket-a")
+            .await
+            .expect("the scanner reload must not gain a new topology validation failure");
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_reload_collection_preserves_scanner_maintenance_flag() {
+        let sys = bucket_metadata_reload_test_sys(&["node-a:9100"]);
+        for expected_flag in [false, true] {
+            let results = sys
+                .collect_bucket_metadata_reload_results("bucket-a", expected_flag, |_, bucket, actual_flag| async move {
+                    assert_eq!(bucket, "bucket-a");
+                    assert_eq!(actual_flag, expected_flag);
+                    Ok(())
+                })
+                .await;
+
+            assert_eq!(results.len(), 1);
+            assert!(results[0].is_ok(), "the peer acknowledgement must survive collection");
+        }
     }
 
     #[test]

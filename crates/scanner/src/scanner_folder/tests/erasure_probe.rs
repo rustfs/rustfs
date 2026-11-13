@@ -17,9 +17,18 @@ static ORDERED_DIRECTORIES: LazyLock<Mutex<HashMap<String, DirectoryOrder>>> = L
 
 pub(in crate::scanner_folder) struct OrderedDirectory(String);
 
+/// The failed-object key the scanner records for `relative` under `root`.
+/// Production builds it with `path_join_buf`, which uses `/` separators on
+/// every platform, so a native `root.join(..)` never matches on Windows.
+fn failed_object_key(root: &std::path::Path, relative: &str) -> String {
+    rustfs_utils::path::path_join_buf(&[&root.join(relative).to_string_lossy()])
+}
+
 impl OrderedDirectory {
     fn new(path: &std::path::Path) -> Self {
-        let path = path.to_string_lossy().into_owned();
+        // Key the probe by the cleaned form the scanner opens; on Windows a joined
+        // `C:\root\bucket/object` would otherwise never match `C:/root/bucket/object`.
+        let path = rustfs_utils::path::path_join_buf(&[&path.to_string_lossy()]);
         ORDERED_DIRECTORIES
             .lock()
             .expect("ordered directory registry")
@@ -136,7 +145,7 @@ async fn erasure_candidate_finds_late_part_without_scanning_data_children() {
             .new_cache
             .info
             .failed_objects
-            .contains_key(root.join("bucket/object/xl.meta").to_string_lossy().as_ref())
+            .contains_key(&failed_object_key(&root, "bucket/object/xl.meta"))
     );
     assert_eq!(budget.reason(), None, "payload directories must not consume namespace directory quota");
     assert!(scanner.new_cache.info.pending_heals.iter().any(|pending| {
@@ -602,7 +611,7 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
             .new_cache
             .info
             .failed_objects
-            .contains_key(root.join("bucket/xl.meta").to_string_lossy().as_ref())
+            .contains_key(&failed_object_key(&root, "bucket/xl.meta"))
     );
     assert_eq!(
         charged_ops(&root),
@@ -661,7 +670,7 @@ async fn erasure_late_data_sibling_prevents_parent_coverage_certification() {
             .new_cache
             .info
             .failed_objects
-            .contains_key(root.join("bucket/object/xl.meta").to_string_lossy().as_ref())
+            .contains_key(&failed_object_key(&root, "bucket/object/xl.meta"))
     );
 }
 

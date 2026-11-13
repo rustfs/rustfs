@@ -392,14 +392,11 @@ pub(crate) mod prepared_publication_test_hooks {
     }
 
     pub(crate) fn has_any_hooks() -> bool {
-        if !BEFORE_PUBLICATION.lock().is_empty() {
-            return true;
-        }
         #[cfg(test)]
         if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
             return true;
         }
-        false
+        !BEFORE_PUBLICATION.lock().is_empty()
     }
 
     #[cfg(test)]
@@ -609,6 +606,11 @@ pub(crate) mod prepare_rename_test_hooks {
             .entry(path.to_path_buf())
             .or_default()
             .push_back(Box::new(hook));
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_hooks() -> bool {
+        AFTER_COMPONENT_OPENED.lock().values().any(|q| !q.is_empty())
     }
 
     pub(crate) fn run_after_component_opened(path: &Path) {
@@ -2453,6 +2455,28 @@ const WORKER_IDLE_SPIN_ITERS: usize = 256;
 const FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
 
+const ENV_FSYNC_WORKER_IDLE_SPIN_ITERS: &str = "RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS";
+const ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE: &str = "RUSTFS_EXPERIMENTAL_FSYNC_WORKER_KEEP_MULTIPLE_IDLE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsyncWorkerIdlePolicy {
+    spin_iters: usize,
+    keep_multiple_idle: bool,
+}
+
+impl FsyncWorkerIdlePolicy {
+    fn from_env() -> Self {
+        Self {
+            spin_iters: rustfs_utils::get_env_usize(ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, FSYNC_WORKER_IDLE_SPIN_ITERS)
+                .min(FSYNC_WORKER_IDLE_SPIN_ITERS),
+            keep_multiple_idle: rustfs_utils::get_env_bool(ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE, true),
+        }
+    }
+}
+
+// Resolve once so each queue uses one policy throughout worker retirement and respawn.
+static FSYNC_WORKER_IDLE_POLICY: LazyLock<FsyncWorkerIdlePolicy> = LazyLock::new(FsyncWorkerIdlePolicy::from_env);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiskBlockingLane {
     Foreground,
@@ -2489,6 +2513,9 @@ struct DiskBlockingQueueLane {
 
 pub(crate) struct DiskBlockingQueue {
     lanes: [DiskBlockingQueueLane; 3],
+    fsync_idle_policy: FsyncWorkerIdlePolicy,
+    #[cfg(test)]
+    before_idle_spin: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2555,8 +2582,15 @@ impl Drop for DiskBlockingWorkerGuard {
 
 impl DiskBlockingQueue {
     fn new() -> Arc<Self> {
+        Self::with_fsync_idle_policy(*FSYNC_WORKER_IDLE_POLICY)
+    }
+
+    fn with_fsync_idle_policy(fsync_idle_policy: FsyncWorkerIdlePolicy) -> Arc<Self> {
         Arc::new(Self {
             lanes: std::array::from_fn(|_| DiskBlockingQueueLane::default()),
+            fsync_idle_policy,
+            #[cfg(test)]
+            before_idle_spin: Mutex::new(None),
         })
     }
 
@@ -2631,6 +2665,9 @@ impl DiskBlockingQueue {
             state: DiskBlockingWorkerState::Submitted,
         };
         let worker = move || {
+            let worker_metrics = (lane == DiskBlockingLane::Fsync)
+                .then(rustfs_io_metrics::start_disk_fsync_worker_metrics)
+                .flatten();
             let mut guard = guard;
             #[cfg(any(test, feature = "test-util"))]
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
@@ -2659,7 +2696,9 @@ impl DiskBlockingQueue {
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
                     if job.is_none() {
-                        if lane != DiskBlockingLane::Fsync && state.idle_workers > 0 {
+                        if (lane != DiskBlockingLane::Fsync || !queue.fsync_idle_policy.keep_multiple_idle)
+                            && state.idle_workers > 0
+                        {
                             state.active_workers = state.active_workers.saturating_sub(1);
                             guard.state = DiskBlockingWorkerState::Retired;
                             return;
@@ -2677,16 +2716,32 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
+                    #[cfg(test)]
+                    {
+                        let hook = queue.before_idle_spin.lock().clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     let spin_iters = if lane == DiskBlockingLane::Fsync {
-                        FSYNC_WORKER_IDLE_SPIN_ITERS
+                        queue.fsync_idle_policy.spin_iters
                     } else {
                         WORKER_IDLE_SPIN_ITERS
                     };
+                    let spin_metrics = worker_metrics
+                        .as_ref()
+                        .filter(|_| spin_iters > 0)
+                        .map(|metrics| metrics.start_idle_spin());
+                    let mut spun = 0;
                     for _ in 0..spin_iters {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
                         std::hint::spin_loop();
+                        spun += 1;
+                    }
+                    if let Some(metrics) = spin_metrics {
+                        metrics.finish(spun);
                     }
                     // Recheck and retire under the same mutex used by enqueue.
                     idle_polled = true;
@@ -4060,7 +4115,8 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
     if let Some(check) = precondition {
         check()?;
     }
-    let preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
@@ -4080,10 +4136,10 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
         {
             let pinned = preparation
                 .parent_guard
-                .as_ref()
-                .and_then(|guard| guard.last())
+                .as_mut()
+                .and_then(Vec::pop)
                 .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
-            let opened = std::fs::File::from(pinned.try_clone()?);
+            let opened = std::fs::File::from(pinned);
             fsync_directory_handle_std(parent, Some(&opened))?;
         }
         #[cfg(not(unix))]
@@ -4359,21 +4415,27 @@ fn open_existing_directory_below_base_std(
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{ResolveFlags, openat2};
-        use std::os::fd::AsFd;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let owned_base;
-        let base_fd = if base == publication_root.io_path.as_path() || base == publication_root.path.as_path() {
-            publication_root.directory.as_fd()
-        } else {
-            owned_base = std::os::fd::OwnedFd::from(publication_root.open_directory(base)?);
-            owned_base.as_fd()
-        };
-        let target = if relative.as_os_str().is_empty() {
+        let base_relative = publication_root.relative_path(base)?;
+        if linux_relative_path_has_invalid_component(base_relative) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = publication_root.relative_path(directory)?;
+        if linux_relative_path_has_invalid_component(target) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = if target.as_os_str().is_empty() {
             Path::new(".")
         } else {
-            relative
+            target
         };
-        match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match openat2(
+            &*publication_root.directory,
+            target,
+            flags,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
             Ok(leaf) => return Ok(vec![leaf]),
             Err(rustix::io::Errno::NOSYS) => {}
             Err(err) => return Err(err.into()),
@@ -5244,7 +5306,23 @@ fn prepare_rename_with_retry(
 ) -> io::Result<RenamePreparation> {
     let parent_guard = dst_file_path
         .parent()
-        .map(|parent| prepare_destination_parent_with_retry(parent, base_dir, publication_root))
+        .map(|parent| {
+            #[cfg(target_os = "linux")]
+            {
+                #[cfg(test)]
+                let has_hooks = prepare_rename_test_hooks::has_hooks();
+                #[cfg(not(test))]
+                let has_hooks = false;
+                if !has_hooks
+                    && existing_base_directory_suffix(parent, base_dir)
+                        .is_ok_and(|rel| rel.as_os_str().as_encoded_bytes().contains(&b'/'))
+                    && let Ok(guard) = open_existing_directory_below_base_std(parent, base_dir, publication_root)
+                {
+                    return Ok(guard);
+                }
+            }
+            prepare_destination_parent_with_retry(parent, base_dir, publication_root)
+        })
         .transpose()?;
     Ok(RenamePreparation {
         parent_guard,
@@ -7315,7 +7393,7 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || reparse_tag == IO_REPARSE_TAG_DEDUP
 }
 
-fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
+pub(crate) fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
     #[cfg(target_os = "linux")]
     {
         let relative = rustfs_utils::path::unix_normalized_path_strip_prefix(dir_path, base_dir).ok_or_else(|| {
@@ -7478,16 +7556,45 @@ pub(crate) fn pin_multipart_source_directory(
 
 fn same_parent_commit_guard(
     parent: &Path,
+    create_base: Option<&Path>,
     base: &Path,
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
 ) -> io::Result<RenameCommitGuard> {
     #[cfg(target_os = "linux")]
-    if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+    let same_dir = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
         let dir = &directory_guard.directories.source;
+        Some((
+            directory_guard.directories.root.clone(),
+            LinuxCommitDirectory {
+                file: Arc::clone(&dir.file),
+                device: dir.device,
+                inode: dir.inode,
+            },
+        ))
+    } else if let Some(fd) = leaf_fd {
+        existing_base_directory_suffix(parent, base)?;
+        Some((publication_root.clone(), LinuxCommitDirectory::new(std::fs::File::from(fd))?))
+    } else if let Some(staging_base) = create_base {
+        existing_base_directory_suffix(parent, base)?;
+        let file = match publication_root.open_directory(parent) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut parents = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+                std::fs::File::from(parents.pop().ok_or_else(|| io::Error::other("missing directory guard"))?)
+            }
+            Err(err) => return Err(err),
+        };
+        Some((publication_root.clone(), LinuxCommitDirectory::new(file)?))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if let Some((root, dir)) = same_dir {
         return Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
-                root: directory_guard.directories.root.clone(),
+                root,
                 source_path: parent.to_path_buf(),
                 destination_path: parent.to_path_buf(),
                 source: LinuxCommitDirectory {
@@ -7495,18 +7602,21 @@ fn same_parent_commit_guard(
                     device: dir.device,
                     inode: dir.inode,
                 },
-                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                }),
+                destination: std::sync::OnceLock::from(dir),
                 destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: base.to_path_buf(),
             }),
         });
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = leaf_fd;
     #[cfg(not(target_os = "linux"))]
-    let _ = directory_guard;
+    {
+        if let Some(staging_base) = create_base {
+            let _ = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+        }
+        let _ = directory_guard;
+    }
     prepare_rename_commit_guard(parent, parent, base, publication_root)
 }
 
@@ -7518,7 +7628,54 @@ pub(crate) fn replace_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    replace_multipart_source_metadata_with_guard(path, bytes, base, publication_root, None)
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_creating_parent(
+    path: &Path,
+    bytes: &[u8],
+    create_base: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        Some(create_base),
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_with_leaf_fd(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        leaf_fd,
+    )
 }
 
 pub(crate) fn replace_multipart_source_metadata_with_guard(
@@ -7528,10 +7685,43 @@ pub(crate) fn replace_multipart_source_metadata_with_guard(
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
 ) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+fn replace_multipart_source_metadata_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_base: Option<&Path>,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
     #[cfg(not(target_os = "linux"))]
-    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let _pinned = if create_base.is_none() {
+        Some(pin_multipart_source_directory(parent, base, publication_root)?)
+    } else {
+        None
+    };
+    let guard = same_parent_commit_guard(
+        parent,
+        create_base,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        leaf_fd,
+    )?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
     let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
     prepared.write_all(bytes, true)?;
@@ -7708,7 +7898,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root, None)
 }
 
 pub(crate) fn sync_multipart_owned_record_parents_options(
@@ -7718,6 +7908,7 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
     sync_source_root: bool,
     base: &Path,
     publication_root: &PublicationRoot,
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))] mut pinned_parents: Option<ExistingBaseDirectoryGuard>,
 ) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
@@ -7729,6 +7920,9 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid native record parent depth"));
+    }
+    if depth == 0 && !include_leaf {
+        return Ok(());
     }
     let mut directory = if include_leaf {
         record_parent
@@ -7744,16 +7938,20 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
         if directory == source && !sync_source_root {
             return Ok(());
         }
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
-        {
+        if let Some(fd) = pinned_parents.as_mut().and_then(Vec::pop) {
+            let opened = std::fs::File::from(fd);
+            fsync_directory_handle_std(directory, Some(&opened))?;
+        } else {
+            let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
             let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty native directory guard"))?);
             fsync_directory_handle_std(directory, Some(&opened))?;
         }
         #[cfg(not(unix))]
-        fsync_dir_std(directory)?;
-        drop(pinned);
+        {
+            let _pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+            fsync_dir_std(directory)?;
+        }
         if directory == source {
             return Ok(());
         }
@@ -7782,7 +7980,15 @@ pub(crate) fn install_multipart_prepared_head(
     }
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let guard = same_parent_commit_guard(
+        parent,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;
@@ -12938,55 +13144,97 @@ mod tests {
         assert_eq!(completed, 257, "yielding must not discard hot-disk jobs");
     }
 
+    fn fsync_idle_test_policies() -> impl Iterator<Item = FsyncWorkerIdlePolicy> {
+        [0, 256, 1024].into_iter().flat_map(|spin_iters| {
+            [false, true].map(|keep_multiple_idle| FsyncWorkerIdlePolicy {
+                spin_iters,
+                keep_multiple_idle,
+            })
+        })
+    }
+
+    #[test]
+    fn disk_blocking_queue_fsync_idle_policy_parses_and_bounds_configuration() {
+        for (spin_value, multiple_value, expected_spins, expected_multiple) in [
+            (None, None, 1024, true),
+            (Some("256"), Some("false"), 256, false),
+            (Some("1024"), Some("true"), 1024, true),
+            (Some("0"), Some("false"), 0, false),
+            (Some("1025"), Some("true"), 1024, true),
+            (Some("invalid"), Some("invalid"), 1024, true),
+            (Some("-1"), None, 1024, true),
+            (Some("184467440737095516160"), None, 1024, true),
+        ] {
+            temp_env::with_vars(
+                [
+                    (ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, spin_value),
+                    (ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE, multiple_value),
+                ],
+                || {
+                    assert_eq!(
+                        FsyncWorkerIdlePolicy::from_env(),
+                        FsyncWorkerIdlePolicy {
+                            spin_iters: expected_spins,
+                            keep_multiple_idle: expected_multiple,
+                        },
+                        "unexpected policy for spin={spin_value:?}, multiple={multiple_value:?}",
+                    );
+                },
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn disk_blocking_queue_drains_bursts_across_worker_retirement() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
-            let queue = DiskBlockingQueue::new();
-            let completed = Arc::new(AtomicUsize::new(0));
-            for _ in 0..8 {
-                let mut producers = tokio::task::JoinSet::new();
+        for policy in fsync_idle_test_policies() {
+            for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
+                let queue = DiskBlockingQueue::with_fsync_idle_policy(policy);
+                let completed = Arc::new(AtomicUsize::new(0));
                 for _ in 0..8 {
-                    let queue = Arc::clone(&queue);
-                    let completed = Arc::clone(&completed);
-                    producers.spawn(async move {
-                        for _ in 0..64 {
-                            let completed = Arc::clone(&completed);
-                            queue
-                                .run_on_lane(
-                                    lane,
-                                    "burst dispatch failed",
-                                    DiskBlockingQueue::test_stages_for_lane(lane),
-                                    move |_| {
-                                        completed.fetch_add(1, Ordering::Relaxed);
-                                        Ok(())
-                                    },
-                                )
-                                .await?;
-                        }
-                        Ok::<_, io::Error>(())
-                    });
-                }
-                while let Some(result) = producers.join_next().await {
-                    result.expect("producer joined").expect("all jobs drained");
-                }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        {
-                            let state = queue.lane(lane).state.lock();
-                            if state.active_workers == 0 {
-                                assert!(state.jobs.is_empty());
-                                assert!(!queue.lane(lane).ready.load(Ordering::Relaxed));
-                                break;
+                    let mut producers = tokio::task::JoinSet::new();
+                    for _ in 0..8 {
+                        let queue = Arc::clone(&queue);
+                        let completed = Arc::clone(&completed);
+                        producers.spawn(async move {
+                            for _ in 0..64 {
+                                let completed = Arc::clone(&completed);
+                                queue
+                                    .run_on_lane(
+                                        lane,
+                                        "burst dispatch failed",
+                                        DiskBlockingQueue::test_stages_for_lane(lane),
+                                        move |_| {
+                                            completed.fetch_add(1, Ordering::Relaxed);
+                                            Ok(())
+                                        },
+                                    )
+                                    .await?;
                             }
-                        }
-                        tokio::task::yield_now().await;
+                            Ok::<_, io::Error>(())
+                        });
                     }
-                })
-                .await
-                .expect("idle worker retires without stranded jobs");
+                    while let Some(result) = producers.join_next().await {
+                        result.expect("producer joined").expect("all jobs drained");
+                    }
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            {
+                                let state = queue.lane(lane).state.lock();
+                                if state.active_workers == 0 {
+                                    assert!(state.jobs.is_empty());
+                                    assert!(!queue.lane(lane).ready.load(Ordering::Relaxed));
+                                    break;
+                                }
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("idle worker retires without stranded jobs");
+                }
+                assert_eq!(completed.load(Ordering::Relaxed), 8 * 8 * 64);
             }
-            assert_eq!(completed.load(Ordering::Relaxed), 8 * 8 * 64);
         }
     }
 
@@ -13061,78 +13309,204 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_fsync_idle_policy_retains_selected_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for keep_multiple_idle in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let queue = DiskBlockingQueue::with_fsync_idle_policy(FsyncWorkerIdlePolicy {
+                    spin_iters: 256,
+                    keep_multiple_idle,
+                });
+                let idle_entries = Arc::new(AtomicUsize::new(0));
+                let (idle_entered_tx, mut idle_entered_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut idle_release_txs = Vec::new();
+                let mut idle_release_rxs = VecDeque::new();
+                for _ in 0..2 {
+                    let (tx, rx) = oneshot::channel();
+                    idle_release_txs.push(tx);
+                    idle_release_rxs.push_back(rx);
+                }
+                let idle_release_rxs = Mutex::new(idle_release_rxs);
+                *queue.before_idle_spin.lock() = Some(Arc::new({
+                    let idle_entries = Arc::clone(&idle_entries);
+                    move || {
+                        let release = idle_release_rxs
+                            .lock()
+                            .expect("lock idle releases")
+                            .pop_front()
+                            .expect("only the two controlled workers enter idle");
+                        idle_entries.fetch_add(1, Ordering::SeqCst);
+                        let _ = idle_entered_tx.send(());
+                        // Dropping the test future releases this worker on assertion or timeout.
+                        let _ = release.blocking_recv();
+                    }
+                }));
+
+                let mut job_releases = VecDeque::new();
+                let mut jobs = VecDeque::new();
+                for _ in 0..2 {
+                    let (started_tx, started_rx) = oneshot::channel();
+                    let (release_tx, release_rx) = oneshot::channel();
+                    let worker_queue = Arc::clone(&queue);
+                    jobs.push_back(tokio::spawn(async move {
+                        worker_queue
+                            .run_on_lane(
+                                DiskBlockingLane::Fsync,
+                                "controlled fsync job failed",
+                                DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                                move |_| {
+                                    let _ = started_tx.send(());
+                                    let _ = release_rx.blocking_recv();
+                                    Ok(())
+                                },
+                            )
+                            .await
+                    }));
+                    job_releases.push_back(release_tx);
+                    started_rx.await.expect("controlled worker started");
+                }
+
+                job_releases
+                    .pop_front()
+                    .expect("first job release")
+                    .send(())
+                    .expect("release first job");
+                idle_entered_rx.recv().await.expect("first worker entered idle");
+                job_releases
+                    .pop_front()
+                    .expect("second job release")
+                    .send(())
+                    .expect("release second job");
+                for job in jobs {
+                    job.await
+                        .expect("controlled worker joined")
+                        .expect("controlled job completed");
+                }
+
+                let expected_idle = if keep_multiple_idle { 2 } else { 1 };
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == expected_idle
+                            && state.idle_workers == expected_idle
+                            && idle_entries.load(Ordering::SeqCst) == expected_idle
+                        {
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+
+                *queue.before_idle_spin.lock() = None;
+                for release in idle_release_txs {
+                    let _ = release.send(());
+                }
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == 0 {
+                            assert_eq!(state.idle_workers, 0);
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    queue
+                        .run_on_lane(
+                            DiskBlockingLane::Fsync,
+                            "post-idle fsync job failed",
+                            DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                            |_| Ok(17),
+                        )
+                        .await
+                        .expect("queue restarts after all workers retire"),
+                    17,
+                );
+            })
+            .await
+            .expect("controlled idle policy and restart must complete");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn disk_blocking_queue_fsync_lane_scales_workers_and_retires_idle() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let queue = DiskBlockingQueue::new();
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_seen = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(AtomicUsize::new(0));
-        let (all_entered_tx, all_entered_rx) = oneshot::channel();
-        let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
-        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        for policy in fsync_idle_test_policies() {
+            let queue = DiskBlockingQueue::with_fsync_idle_policy(policy);
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(AtomicUsize::new(0));
+            let (all_entered_tx, all_entered_rx) = oneshot::channel();
+            let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
+            let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-        let mut handles = Vec::new();
-        for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
-            let q = Arc::clone(&queue);
-            let active = Arc::clone(&active);
-            let max_seen = Arc::clone(&max_seen);
-            let entered = Arc::clone(&entered);
-            let all_entered_tx = Arc::clone(&all_entered_tx);
-            let mut release_rx = release_tx.subscribe();
-            handles.push(tokio::spawn(async move {
-                use_current_runtime_for_fsync();
-                q.run_on_lane(
-                    DiskBlockingLane::Fsync,
-                    "fsync scale test failed",
-                    DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
-                    move |_| {
-                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        max_seen.fetch_max(cur, Ordering::SeqCst);
-                        let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
-                        if ord == MAX_FSYNC_WORKERS_PER_DISK
-                            && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
-                        {
-                            let _ = tx.send(());
-                        }
-                        if ord <= MAX_FSYNC_WORKERS_PER_DISK {
-                            let _ = release_rx.blocking_recv();
-                        }
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        Ok(i)
-                    },
-                )
-                .await
-            }));
-        }
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
-            .await
-            .expect("all fsync workers should enter within timeout")
-            .expect("all_entered channel");
-        let _ = release_tx.send(());
-        for (i, handle) in handles.into_iter().enumerate() {
-            assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
-        }
-        assert_eq!(
-            max_seen.load(Ordering::SeqCst),
-            MAX_FSYNC_WORKERS_PER_DISK,
-            "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                {
-                    let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
-                    if state.active_workers == 0 && state.idle_workers == 0 {
-                        assert!(state.jobs.is_empty());
-                        break;
-                    }
-                }
-                tokio::task::yield_now().await;
+            let mut handles = Vec::new();
+            for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
+                let q = Arc::clone(&queue);
+                let active = Arc::clone(&active);
+                let max_seen = Arc::clone(&max_seen);
+                let entered = Arc::clone(&entered);
+                let all_entered_tx = Arc::clone(&all_entered_tx);
+                let mut release_rx = release_tx.subscribe();
+                handles.push(tokio::spawn(async move {
+                    use_current_runtime_for_fsync();
+                    q.run_on_lane(
+                        DiskBlockingLane::Fsync,
+                        "fsync scale test failed",
+                        DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                        move |_| {
+                            let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(cur, Ordering::SeqCst);
+                            let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                            if ord == MAX_FSYNC_WORKERS_PER_DISK
+                                && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            if ord <= MAX_FSYNC_WORKERS_PER_DISK {
+                                let _ = release_rx.blocking_recv();
+                            }
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(i)
+                        },
+                    )
+                    .await
+                }));
             }
-        })
-        .await
-        .expect("all fsync workers must retire with zero idle count");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
+                .await
+                .expect("all fsync workers should enter within timeout")
+                .expect("all_entered channel");
+            let _ = release_tx.send(());
+            for (i, handle) in handles.into_iter().enumerate() {
+                assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
+            }
+            assert_eq!(
+                max_seen.load(Ordering::SeqCst),
+                MAX_FSYNC_WORKERS_PER_DISK,
+                "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == 0 && state.idle_workers == 0 {
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all fsync workers must retire with zero idle count");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
