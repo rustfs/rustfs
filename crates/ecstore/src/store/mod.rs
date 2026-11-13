@@ -848,6 +848,12 @@ impl ECStore {
         self.ctx.region()
     }
 
+    /// Get the further regions this store instance accepts as a bucket
+    /// `LocationConstraint` besides [`Self::region`].
+    pub fn additional_regions(&self) -> Vec<rustfs_s3_types::Region> {
+        self.ctx.additional_regions()
+    }
+
     /// Get the tier config manager
     pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::services::tier::tier::TierConfigMgr>> {
         self.ctx.tier_config_mgr()

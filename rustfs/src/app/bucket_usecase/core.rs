@@ -22,6 +22,13 @@ use crate::app::storage_api::s3::dto::{
 use crate::app::storage_api::s3::region::Region;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
+/// Whether `CreateBucket` may record `location`: the server's own region, or
+/// one of the further regions listed after it in `RUSTFS_REGION`. `location`
+/// has already had the `EU` alias resolved.
+fn location_constraint_is_served(location: &str, server_region: &str, additional_regions: &[Region]) -> bool {
+    location == server_region || additional_regions.iter().any(|region| region.as_str() == location)
+}
+
 /// Answer a `CreateBucket` for a bucket that already exists.
 ///
 /// A deployment owns one bucket namespace, so every requester that passed
@@ -66,7 +73,11 @@ impl DefaultBucketUsecase {
         {
             let location = if location == "EU" { "eu-west-1" } else { location };
             let region = self.global_region();
-            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+            if !location_constraint_is_served(
+                location,
+                region.as_ref().map_or(RUSTFS_REGION, Region::as_str),
+                &self.additional_regions(),
+            ) {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidLocationConstraint,
                     "The specified location constraint does not match this server's region.",
@@ -315,6 +326,23 @@ mod tests {
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, s3_op_total};
     use crate::app::storage_api::s3::dto;
     use http::Method;
+
+    #[test]
+    fn location_constraint_is_served_accepts_server_and_additional_regions() {
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &[]));
+        assert!(!location_constraint_is_served("us-west-2", "us-east-1", &[]));
+
+        let additional: Vec<Region> = ["ap-southeast-2", "us-west-2"]
+            .into_iter()
+            .map(|region| region.parse().expect("region"))
+            .collect();
+        assert!(location_constraint_is_served("ap-southeast-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-west-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &additional));
+        assert!(!location_constraint_is_served("eu-west-1", "us-east-1", &additional));
+        // whole region names only, never a prefix
+        assert!(!location_constraint_is_served("us-west", "us-east-1", &additional));
+    }
 
     #[test]
     fn create_bucket_exists_response_returns_ok_in_default_region() {
