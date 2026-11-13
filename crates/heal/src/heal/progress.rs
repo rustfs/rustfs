@@ -509,6 +509,12 @@ pub struct HealStatistics {
     /// Completed attempts without independent verification; not the current durable MRF backlog.
     #[serde(default)]
     pub unverified_tasks: u64,
+    /// Physical repair attempts for unverified legacy objects, not verified outcomes or unique objects.
+    #[serde(default)]
+    pub total_unverified_objects_repaired: u64,
+    /// Logical object bytes in those repair attempts, not physical disk or network bytes.
+    #[serde(default)]
+    pub total_unverified_bytes_repaired: u64,
     /// Running tasks
     pub running_tasks: u64,
     /// Total healed objects
@@ -532,6 +538,8 @@ impl HealStatistics {
             successful_tasks: 0,
             failed_tasks: 0,
             unverified_tasks: 0,
+            total_unverified_objects_repaired: 0,
+            total_unverified_bytes_repaired: 0,
             running_tasks: 0,
             total_objects_healed: 0,
             total_bytes_healed: 0,
@@ -556,6 +564,11 @@ impl HealStatistics {
     pub(crate) fn update_unverified_task_completion(&mut self) {
         self.unverified_tasks = self.unverified_tasks.saturating_add(1);
         self.last_update_time = SystemTime::now();
+    }
+
+    pub(crate) fn add_unverified_repair(&mut self, bytes: u64) {
+        self.total_unverified_objects_repaired = self.total_unverified_objects_repaired.saturating_add(1);
+        self.total_unverified_bytes_repaired = self.total_unverified_bytes_repaired.saturating_add(bytes);
     }
 
     pub fn add_healed_objects(&mut self, count: u64, bytes: u64) {
@@ -928,15 +941,26 @@ mod tests {
     fn unverified_statistics_preserve_old_snapshot_compatibility() {
         let mut stats = HealStatistics::new();
         stats.update_unverified_task_completion();
+        stats.add_unverified_repair(8192);
         assert_eq!(stats.unverified_tasks, 1);
         assert_eq!(stats.successful_tasks, 0);
         assert_eq!(stats.failed_tasks, 0);
         let mut wire = serde_json::to_value(&stats).expect("serialize task statistics");
         let current: HealStatistics = serde_json::from_value(wire.clone()).expect("read new statistics");
         assert_eq!(current.unverified_tasks, 1);
-        wire.as_object_mut().expect("statistics object").remove("unverified_tasks");
+        assert_eq!(current.total_unverified_objects_repaired, 1);
+        assert_eq!(current.total_unverified_bytes_repaired, 8192);
+        for field in [
+            "unverified_tasks",
+            "total_unverified_objects_repaired",
+            "total_unverified_bytes_repaired",
+        ] {
+            wire.as_object_mut().expect("statistics object").remove(field);
+        }
         let old: HealStatistics = serde_json::from_value(wire).expect("read statistics without new field");
         assert_eq!(old.unverified_tasks, 0);
+        assert_eq!(old.total_unverified_objects_repaired, 0);
+        assert_eq!(old.total_unverified_bytes_repaired, 0);
     }
 
     #[test]

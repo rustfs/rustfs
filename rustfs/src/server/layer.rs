@@ -194,9 +194,6 @@ fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_ena
 
     let path = req.uri().path();
     let method = req.method();
-    let is_admin_health_request =
-        (method == Method::GET || method == Method::HEAD) && matches!(path, HEALTH_PREFIX | HEALTH_READY_PATH);
-    let is_profile_request = method == Method::GET && matches!(path, PROFILE_CPU_PATH | PROFILE_MEMORY_PATH);
     let is_public_health_alias_request = (method == Method::GET || method == Method::HEAD)
         && matches!(
             path,
@@ -208,11 +205,7 @@ fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_ena
         )
         && is_public_health_endpoint_request(method, path);
 
-    !(is_admin_path(path)
-        || is_console_path(path)
-        || is_admin_health_request
-        || is_profile_request
-        || is_public_health_alias_request)
+    !(is_control_plane_route(method, req.uri(), req.headers()) || is_public_health_alias_request)
 }
 
 /// Creates a server-owned context and response ID for S3 requests while
@@ -867,6 +860,18 @@ where
         let mut inner = self.inner.clone();
         Box::pin(async move { inner.call(req).await.map_err(Into::into) })
     }
+}
+
+/// The routes the admin router answers that are not S3 operations: the admin and table-catalog
+/// APIs, the console, STS, the public health probes and profiling. The one predicate every place
+/// that tells them from S3 requests reads.
+pub(crate) fn is_control_plane_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    let path = uri.path();
+    is_admin_path(path)
+        || is_console_path(path)
+        || ((method == Method::GET || method == Method::HEAD) && matches!(path, HEALTH_PREFIX | HEALTH_READY_PATH))
+        || (method == Method::GET && matches!(path, PROFILE_CPU_PATH | PROFILE_MEMORY_PATH))
+        || is_sts_query_request(method, uri, headers)
 }
 
 pub(crate) fn is_sts_query_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {

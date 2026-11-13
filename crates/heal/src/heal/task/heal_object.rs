@@ -514,17 +514,36 @@ impl HealTask {
         let receipt_missing = storage_result.receipt.is_none();
         if !self.record_verified_storage_receipt(&expected, storage_result.receipt).await {
             let ok_drive_state = DriveState::Ok.to_string();
-            let healthy_legacy_without_repair = receipt_missing
+            let selected_version_matches = storage_result.item.resolved_version_id.is_some_and(|resolved| {
+                let requested = version_id.filter(|version| !version.is_empty());
+                match requested {
+                    Some(requested) => Uuid::parse_str(requested).is_ok_and(|version| version.as_bytes() == &resolved),
+                    None => resolved == [0; 16],
+                }
+            });
+            // A completed legacy repair can restore redundancy without proving
+            // original content. Keep the same durable responsibility as an
+            // already-healthy Deep result, including when this attempt repaired
+            // a shard. Storage errors and invalid receipts never qualify.
+            let healthy_legacy = receipt_missing
                 && storage_result.item.legacy_identity_unverified
-                && storage_result.item.drives_healed() == Some(0)
-                && !storage_result.item.after.drives.is_empty()
+                && selected_version_matches
+                && storage_result.item.drives_healed().is_some()
+                && storage_result.item.after.drives.len() == storage_result.item.disk_count
+                && storage_result
+                    .item
+                    .before
+                    .drives
+                    .iter()
+                    .zip(&storage_result.item.after.drives)
+                    .all(|(before, after)| before.endpoint == after.endpoint)
                 && storage_result
                     .item
                     .after
                     .drives
                     .iter()
                     .all(|drive| drive.state == ok_drive_state);
-            if healthy_legacy_without_repair {
+            if healthy_legacy {
                 self.outcome.write().await.record(HealObjectOutcome {
                     deep_check_observed: false,
                     quorum_selected_data_dir: None,
@@ -534,7 +553,7 @@ impl HealTask {
                 });
             }
             self.record_result_item(storage_result.item).await;
-            return Err(if healthy_legacy_without_repair {
+            return Err(if healthy_legacy {
                 Error::LegacyMrfUnverified {
                     target: format!("{bucket}/{object}"),
                 }

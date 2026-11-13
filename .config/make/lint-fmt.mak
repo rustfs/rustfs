@@ -70,6 +70,11 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	@echo "📦 Checking s3s footprint ratchet..."
 	./scripts/check_s3s_footprint.sh
 
+.PHONY: release-feature-boundary-check
+release-feature-boundary-check: ## Check no release-reachable feature enables a debug-only one
+	@echo "🚧 Checking release feature boundaries..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --features-only
+
 .PHONY: test-count-ratchet-check
 test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
 	@echo "🧪 Checking per-crate test-count ratchet..."

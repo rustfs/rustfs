@@ -107,6 +107,10 @@ runs:
         git cat-file -e "$FOOTPRINT_BASE^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$FOOTPRINT_BASE"
         ./scripts/check_s3s_footprint.sh --base "$FOOTPRINT_BASE"
 
+    - name: Check release feature boundaries
+      shell: bash
+      run: python3 scripts/check_connect_release_boundary.py --features-only
+
     - name: Check per-crate test-count ratchet
       shell: bash
       run: ./scripts/check_test_count_ratchet.sh

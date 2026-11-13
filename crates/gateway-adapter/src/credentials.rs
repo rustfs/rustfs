@@ -70,15 +70,18 @@ impl<T: Store> IamKeyLookup for IamSys<T> {
 
 /// A [`CredentialProvider`] over RustFS IAM and the live root credentials.
 ///
-/// Built only by [`crate::IamAdapters::new`], so it always reads the same [`RootSource`] as the
-/// policy source it was assembled with.
+/// A deployment that also installs the policy source builds both through
+/// [`crate::IamAdapters::new`], so the two read the same [`RootSource`]; one that installs no
+/// policy source builds this half alone with [`IamCredentials::new`].
 pub struct IamCredentials {
     iam: Arc<dyn IamKeyLookup>,
     root: Arc<dyn RootSource>,
 }
 
 impl IamCredentials {
-    pub(crate) fn new(iam: Arc<dyn IamKeyLookup>, root: Arc<dyn RootSource>) -> Self {
+    /// The provider over `iam`, with `root` read on every lookup.
+    #[must_use]
+    pub fn new(iam: Arc<dyn IamKeyLookup>, root: Arc<dyn RootSource>) -> Self {
         Self { iam, root }
     }
 
