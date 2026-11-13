@@ -66,10 +66,6 @@ pub(crate) fn current_object_data_cache() -> Option<Arc<ObjectDataCacheAdapter>>
     current_object_data_cache_handle_for_context(context.as_deref())
 }
 
-pub(crate) fn app_context_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<AppContext>> {
-    app_context_from_extensions(&req.extensions)
-}
-
 pub(crate) fn app_context_from_envelope(envelope: &RequestEnvelope) -> Option<Arc<AppContext>> {
     match envelope.server_context() {
         Some(slot) => slot.installed_app_context(),
@@ -85,27 +81,6 @@ pub(crate) fn object_store_from_envelope(envelope: &RequestEnvelope) -> Option<A
     match envelope.server_context() {
         Some(slot) => slot.installed_object_store(),
         None => current_object_store_handle(),
-    }
-}
-
-/// Resolve an application context from request extensions.
-///
-/// An injected slot identifies the server that owns the request. If that
-/// server has not finished startup yet, returning its ambient global context
-/// could select a different server, so this fails closed. Only requests with
-/// no slot retain the legacy ambient fallback.
-/// [`object_store_from_envelope`] for handlers still on the s3s request.
-pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<ECStore>> {
-    match req.extensions.get::<Arc<ServerContextSlot>>() {
-        Some(slot) => slot.installed_object_store(),
-        None => current_object_store_handle(),
-    }
-}
-
-pub(crate) fn app_context_from_extensions(extensions: &http::Extensions) -> Option<Arc<AppContext>> {
-    match extensions.get::<Arc<ServerContextSlot>>() {
-        Some(slot) => slot.installed_app_context(),
-        None => current_app_context(),
     }
 }
 
@@ -167,8 +142,8 @@ pub(crate) fn publish_storage_class_config(config: StorageClassConfig) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, app_context_from_extensions,
-        app_context_from_req, current_app_context, object_store_from_envelope, publish_test_app_context,
+        AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, current_app_context,
+        object_store_from_envelope, publish_test_app_context,
     };
     use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
     use crate::admin::router::S3Router;
@@ -248,9 +223,8 @@ mod tests {
         let mut extensions = http::Extensions::new();
         extensions.insert(slot);
 
-        assert!(app_context_from_extensions(&extensions).is_none());
-        assert!(object_store_from_envelope(&envelope(extensions.clone())).is_none());
-        assert!(app_context_from_req(&request(extensions)).is_none());
+        assert!(app_context_from_envelope(&envelope(extensions.clone())).is_none());
+        assert!(object_store_from_envelope(&envelope(extensions)).is_none());
         assert!(Arc::ptr_eq(
             &current_app_context().expect("ambient context must remain available"),
             &ambient
@@ -267,7 +241,7 @@ mod tests {
         let mut extensions = http::Extensions::new();
         extensions.insert(slot);
 
-        let resolved = app_context_from_extensions(&extensions).expect("installed slot must resolve");
+        let resolved = app_context_from_envelope(&envelope(extensions)).expect("installed slot must resolve");
         assert!(Arc::ptr_eq(&resolved, &installed));
         assert!(!Arc::ptr_eq(&resolved, &ambient));
     }
@@ -278,7 +252,7 @@ mod tests {
         let ambient = ambient_context().await;
         let extensions = http::Extensions::new();
 
-        let resolved = app_context_from_extensions(&extensions).expect("legacy request must use ambient context");
+        let resolved = app_context_from_envelope(&envelope(extensions.clone())).expect("legacy request must use ambient context");
         assert!(Arc::ptr_eq(&resolved, &ambient));
         assert!(object_store_from_envelope(&envelope(extensions)).is_some());
     }

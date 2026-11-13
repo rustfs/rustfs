@@ -766,6 +766,31 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/dual-stack-nightly.yml",
+      "name": "dual-stack-nightly",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch",
+        "schedule"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "13 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "dual-stack-nightly.yml",
+      "disposition": "both-stack JUnit diff of the two profiles only ci.yml runs; the gateway legs are report-only until T2.10",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/e2e-distributed.yml",
       "name": "e2e-distributed",
       "roles": [

@@ -100,6 +100,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_junit_diff.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_dual_stack.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_mint_stack_diff.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_api_coverage.py
