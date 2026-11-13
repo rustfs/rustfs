@@ -139,6 +139,8 @@ const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_METADATA_BYTES: u64 = 1024 * 1024;
 const REPLAY_CACHE_TABLE_OVERHEAD_BYTES: u64 = 512;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
+const NS_SCANNER_COMPLETE_OBSERVATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-complete-observation-v1";
+const NS_SCANNER_DURABLE_PROGRESS_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-durable-progress-v1";
 const NS_SCANNER_CHECKPOINT_COVERAGE_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-checkpoint-coverage-v1";
 const NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-generation-v1";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
@@ -795,6 +797,8 @@ fn update_ns_scanner_capability_mac(
     server_epoch: Uuid,
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) {
     mac.update(NS_SCANNER_CAPABILITY_AUTH_DOMAIN);
     mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
@@ -809,14 +813,22 @@ fn update_ns_scanner_capability_mac(
     if supports_checkpoint_coverage {
         mac.update(NS_SCANNER_CHECKPOINT_COVERAGE_AUTH_DOMAIN);
     }
+    if supports_durable_progress {
+        mac.update(NS_SCANNER_DURABLE_PROGRESS_AUTH_DOMAIN);
+    }
+    if supports_complete_observation {
+        mac.update(NS_SCANNER_COMPLETE_OBSERVATION_AUTH_DOMAIN);
+    }
 }
 
-fn generate_ns_scanner_capability_proof(
+fn generate_ns_scanner_capability_proof_with_observation(
     secret: &str,
     challenge: Uuid,
     server_epoch: Uuid,
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) -> std::io::Result<Vec<u8>> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
@@ -829,17 +841,22 @@ fn generate_ns_scanner_capability_proof(
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+        supports_complete_observation,
     );
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn verify_ns_scanner_capability_proof(
+#[allow(clippy::too_many_arguments)]
+fn verify_ns_scanner_capability_proof_with_observation(
     secret: &str,
     challenge: Uuid,
     server_epoch: Uuid,
     proof: &[u8],
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) -> std::io::Result<()> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
@@ -852,9 +869,33 @@ fn verify_ns_scanner_capability_proof(
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+        supports_complete_observation,
     );
     mac.verify_slice(proof)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid namespace scanner capability proof"))
+}
+
+fn generate_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof_with_observation(secret, challenge, server_epoch, tier, checkpoint, progress, false)
+}
+fn verify_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof_with_observation(secret, challenge, server_epoch, proof, tier, checkpoint, progress, false)
 }
 
 pub fn sign_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
@@ -879,12 +920,29 @@ pub fn sign_ns_scanner_capability_with_checkpoint_coverage(
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
 ) -> std::io::Result<Vec<u8>> {
+    sign_ns_scanner_capability_with_durable_progress(
+        challenge,
+        server_epoch,
+        supports_tier_registry_generation,
+        supports_checkpoint_coverage,
+        false,
+    )
+}
+
+pub fn sign_ns_scanner_capability_with_durable_progress(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+) -> std::io::Result<Vec<u8>> {
     generate_ns_scanner_capability_proof(
         &get_shared_secret()?,
         challenge,
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
     )
 }
 
@@ -910,6 +968,24 @@ pub fn verify_ns_scanner_capability_with_checkpoint_coverage(
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
 ) -> std::io::Result<()> {
+    verify_ns_scanner_capability_with_durable_progress(
+        challenge,
+        server_epoch,
+        proof,
+        supports_tier_registry_generation,
+        supports_checkpoint_coverage,
+        false,
+    )
+}
+
+pub fn verify_ns_scanner_capability_with_durable_progress(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+) -> std::io::Result<()> {
     verify_ns_scanner_capability_proof(
         &get_shared_secret()?,
         challenge,
@@ -917,6 +993,74 @@ pub fn verify_ns_scanner_capability_with_checkpoint_coverage(
         proof,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+    )
+}
+
+pub fn sign_ns_scanner_capability_with_usage_capabilities(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+    observation: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof_with_observation(
+        &get_shared_secret()?,
+        challenge,
+        server_epoch,
+        tier,
+        checkpoint,
+        progress,
+        observation,
+    )
+}
+fn ns_scanner_usage_watch_capability_mac(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<HmacSha256> {
+    if challenge.is_nil() || server_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid namespace scanner usage watch capability scope"));
+    }
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(b"rustfs-ns-scanner-usage-watch-capability-v1\0");
+    mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
+    mac.update(challenge.as_bytes());
+    mac.update(server_epoch.as_bytes());
+    Ok(mac)
+}
+
+/// Sign the independent worker capability to validate bucket watches before
+/// reusing or durably publishing a complete scanner cache.
+pub fn sign_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+    Ok(ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
+        .finalize()
+        .into_bytes()
+        .to_vec())
+}
+
+pub fn verify_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+    ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::other("Invalid namespace scanner usage watch capability proof"))
+}
+
+pub fn verify_ns_scanner_capability_with_usage_capabilities(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    tier: bool,
+    checkpoint: bool,
+    progress: bool,
+    observation: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof_with_observation(
+        &get_shared_secret()?,
+        challenge,
+        server_epoch,
+        proof,
+        tier,
+        checkpoint,
+        progress,
+        observation,
     )
 }
 
@@ -2202,13 +2346,119 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false, false)
             .expect("capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false, false).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false, false).is_err());
-        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false, false, false).is_err());
+        assert!(
+            verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn namespace_scanner_watch_capability_is_independent_and_rejects_replay() {
+        let _ = rustfs_credentials::set_global_rpc_secret("usage-watch-capability-test-secret".into());
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let proof = sign_ns_scanner_usage_watch_capability(challenge, epoch).expect("watch capability");
+        verify_ns_scanner_usage_watch_capability(challenge, epoch, &proof).expect("exact watch capability scope");
+        assert!(verify_ns_scanner_usage_watch_capability(Uuid::new_v4(), epoch, &proof).is_err());
+        assert!(verify_ns_scanner_usage_watch_capability(challenge, Uuid::new_v4(), &proof).is_err());
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let other =
+                    sign_ns_scanner_capability_with_usage_capabilities(challenge, epoch, true, true, progress, observation)
+                        .expect("independent older capabilities");
+                assert!(verify_ns_scanner_usage_watch_capability(challenge, epoch, &other).is_err());
+                assert!(
+                    verify_ns_scanner_capability_with_usage_capabilities(
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        observation
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_scanner_observation_and_progress_scopes_are_independent() {
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let secret = "independent-usage-capabilities";
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let proof = generate_ns_scanner_capability_proof_with_observation(
+                    secret,
+                    challenge,
+                    epoch,
+                    true,
+                    true,
+                    progress,
+                    observation,
+                )
+                .expect("proof");
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        observation
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        !progress,
+                        observation
+                    )
+                    .is_err()
+                );
+                assert!(
+                    verify_ns_scanner_capability_proof_with_observation(
+                        secret,
+                        challenge,
+                        epoch,
+                        &proof,
+                        true,
+                        true,
+                        progress,
+                        !observation
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_scanner_capability_proof_binds_durable_progress_independently() {
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let secret = "durable-progress-test";
+        for supported in [false, true] {
+            let proof = generate_ns_scanner_capability_proof(secret, challenge, epoch, true, true, supported).expect("proof");
+            assert!(verify_ns_scanner_capability_proof(secret, challenge, epoch, &proof, true, true, supported).is_ok());
+            assert!(verify_ns_scanner_capability_proof(secret, challenge, epoch, &proof, true, true, !supported).is_err());
+            assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), epoch, &proof, true, true, supported).is_err());
+        }
     }
 
     #[test]
@@ -2216,16 +2466,16 @@ mod tests {
         let secret = "checkpoint-capability-test-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, true)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, true, false)
             .expect("checkpoint capability proof");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, true).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, true).is_err());
-        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false)
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, true, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, true, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false, false)
             .expect("legacy generation capability proof");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, true).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &[], true, true).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, true, true).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &[], true, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, true, true, false).is_err());
     }
 
     #[test]
@@ -2233,14 +2483,14 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false)
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true, false, false)
             .expect("generation capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false).is_err());
-        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false)
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true, false, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false, false, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false, false, false)
             .expect("legacy capability proof should be generated");
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true, false, false).is_err());
     }
 
     /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,

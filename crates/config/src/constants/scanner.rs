@@ -44,6 +44,21 @@ pub const SCANNER_CYCLE_MAX_OBJECTS: &str = "cycle_max_objects";
 /// Scanner config key capping directories entered by one cycle.
 pub const SCANNER_CYCLE_MAX_DIRECTORIES: &str = "cycle_max_directories";
 
+/// Per-bucket admission limit in seconds; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_DURATION: &str = "bucket_quantum_duration";
+
+/// Per-bucket admission limit in objects; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_OBJECTS: &str = "bucket_quantum_objects";
+
+/// Per-bucket admission limit in directories; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_DIRECTORIES: &str = "bucket_quantum_directories";
+
+/// Per-bucket admission limit in raw entries; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_ENTRIES: &str = "bucket_quantum_entries";
+
+/// Per-bucket admission limit in raw entry-name bytes; zero disables this dimension.
+pub const SCANNER_BUCKET_QUANTUM_NAME_BYTES: &str = "bucket_quantum_name_bytes";
+
 /// Scanner config key setting the periodic bitrot scan cycle in seconds.
 pub const SCANNER_BITROT_CYCLE: &str = "bitrot_cycle";
 
@@ -93,6 +108,11 @@ pub const SCANNER_KEYS: &[&str] = &[
     SCANNER_CYCLE_MAX_DURATION,
     SCANNER_CYCLE_MAX_OBJECTS,
     SCANNER_CYCLE_MAX_DIRECTORIES,
+    SCANNER_BUCKET_QUANTUM_DURATION,
+    SCANNER_BUCKET_QUANTUM_OBJECTS,
+    SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+    SCANNER_BUCKET_QUANTUM_ENTRIES,
+    SCANNER_BUCKET_QUANTUM_NAME_BYTES,
     SCANNER_BITROT_CYCLE,
     SCANNER_IDLE_MODE,
     SCANNER_CACHE_SAVE_TIMEOUT,
@@ -140,6 +160,36 @@ pub const ENV_SCANNER_CYCLE_MAX_OBJECTS: &str = "RUSTFS_SCANNER_CYCLE_MAX_OBJECT
 /// A value of `0` disables the per-cycle directory budget.
 /// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES=100000`
 pub const ENV_SCANNER_CYCLE_MAX_DIRECTORIES: &str = "RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES";
+
+/// Per-bucket admission limit in seconds; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS: u64 = 0;
+
+/// Per-bucket admission limit in objects; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_OBJECTS: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS: u64 = 0;
+
+/// Per-bucket admission limit in directories; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES: u64 = 0;
+
+/// Per-bucket admission limit in raw entries; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_ENTRIES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES: u64 = 0;
+
+/// Per-bucket admission limit in raw entry-name bytes; zero disables this dimension.
+pub const ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES: &str = "RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES";
+
+/// Disabled until controlled-fleet acceptance selects production limits.
+pub const DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES: u64 = 0;
 
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.

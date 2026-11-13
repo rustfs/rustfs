@@ -50,6 +50,7 @@ async fn run_cohort_cycle(
     cycle: u64,
     budget: Arc<ScannerCycleBudget>,
 ) -> (ScannerCycleResult, Option<DataUsageInfo>) {
+    let ctx = CancellationToken::new();
     let root_before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
         .expect("root before candidate");
@@ -61,6 +62,7 @@ async fn run_cohort_cycle(
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget,
                 updates,
@@ -73,6 +75,7 @@ async fn run_cohort_cycle(
                 requires_full_scan: false,
                 service_cohort: Some(cohort),
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
@@ -413,6 +416,105 @@ fn quantum_budget(quantum: crate::scanner_budget::ScannerBucketQuantum) -> Arc<S
             ..Default::default()
         },
     )
+}
+
+#[tokio::test]
+#[serial]
+async fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots() {
+    let mut evidence = None;
+    temp_env::async_with_vars([(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("1"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let (directory, store) = setup_two_pool_scanner_store().await;
+        clear_dirty_usage_buckets_for_tests();
+        create_cohort_bucket(&store, "a-completes-first").await;
+        create_cohort_bucket_objects(&store, "z-needs-several-turns", 6).await;
+        let sources = store.all_set_disks().len();
+        assert!(sources > scanner_max_concurrent_set_scans(sources));
+        let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+            max_objects: Some(2),
+            ..Default::default()
+        });
+        let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+        let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget.clone()).await;
+        let admissions = budget.source_turn_admissions();
+        assert!(
+            admissions.len() > sources,
+            "the physical sources must need more than one turn: {admissions:?}"
+        );
+        assert_eq!(
+            admissions[..sources].iter().copied().collect::<HashSet<_>>().len(),
+            sources,
+            "every waiting source must run before a source repeats: {admissions:?}"
+        );
+        assert_eq!(
+            result.status,
+            ScannerCycleStatus::Complete,
+            "completed roots must survive later source turns"
+        );
+        let total = usage.expect("complete all-source usage").objects_total_count;
+        assert_eq!(total, 14);
+        assert!(!budget.budget_elapsed(), "source turns do not exhaust the unbounded parent");
+        for set in store.all_set_disks() {
+            let mut cache = DataUsageCache::default();
+            cache.load(set, DATA_USAGE_CACHE_NAME).await.expect("final source cache");
+            assert!(cache.info.snapshot_complete);
+            assert_eq!(cache.find("a-completes-first").expect("earlier turn root").objects, 1);
+        }
+        clear_dirty_usage_buckets_for_tests();
+        evidence = Some(serde_json::json!({
+            "physical_sources": sources,
+            "concurrent_source_limit": scanner_max_concurrent_set_scans(sources),
+            "source_turn_admissions": admissions,
+            "complete_object_count": total,
+        }));
+        drop(store);
+        let fixture_path = directory.path().to_path_buf();
+        directory.close().expect("remove source-turn physical disk fixture");
+        assert!(!fixture_path.exists());
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-07", "assertion_id": "USAGE-07-A02", "status": "PASS",
+            "evidence": evidence.expect("a completed physical-source fixture"),
+        })
+    );
+    println!(
+        "usage_cleanup: {}",
+        serde_json::json!({"case_id": "USAGE-07", "status": "PASS", "fixture_removed": true, "runtime_config_restored": true})
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn source_turn_zero_new_frontier_stops_requeueing_without_starving_other_sources() {
+    temp_env::async_with_vars([(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("1"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let (_dir, store) = setup_two_pool_scanner_store().await;
+        clear_dirty_usage_buckets_for_tests();
+        create_cohort_bucket_objects(&store, "blocked-frontier", 3).await;
+        let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+            max_objects: Some(1),
+            ..Default::default()
+        });
+        let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+        let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget.clone()).await;
+        let admissions = budget.source_turn_admissions();
+        let sources = store.all_set_disks().len();
+        assert_eq!(admissions.iter().copied().collect::<HashSet<_>>().len(), sources);
+        assert!(
+            admissions.len() <= sources * 3,
+            "no durable frontier must stop a same-cycle retry: {admissions:?}"
+        );
+        assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+        assert!(usage.is_none(), "partial sources cannot publish complete usage");
+        assert!(!budget.budget_elapsed());
+        clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[tokio::test]

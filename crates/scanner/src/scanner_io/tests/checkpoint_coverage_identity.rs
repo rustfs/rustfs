@@ -41,6 +41,7 @@ async fn run_full_cycle(
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget: Arc::clone(&budget),
                 updates,
@@ -53,6 +54,7 @@ async fn run_full_cycle(
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },

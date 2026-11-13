@@ -30,6 +30,7 @@ pub mod local;
 pub mod multipart_index;
 pub mod multipart_source;
 pub mod os;
+mod usage_watch;
 
 pub(crate) use io_admission::memory as background_memory;
 pub(crate) use io_admission::remote as remote_io_admission;
@@ -1406,6 +1407,16 @@ impl Disk {
 }
 
 impl Disk {
+    /// The progress flag is derived from a verified capability scope.
+    pub async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_progress_capability().await,
+        }
+    }
+
     pub async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(_) => Ok(None),
@@ -1582,14 +1593,18 @@ pub(crate) async fn new_disk_for_instance(
     ep: &Endpoint,
     opt: &DiskOption,
 ) -> Result<DiskStore> {
-    new_disk_with_health_tracker(
+    let disk = new_disk_with_health_tracker(
         ep,
         opt,
         None,
         #[cfg(feature = "internode-transport")]
         Some(_instance),
     )
-    .await
+    .await?;
+    if let Disk::Local(wrapper) = disk.as_ref() {
+        wrapper.get_disk().usage_watch_binding.bind(&_instance.usage_watches);
+    }
+    Ok(disk)
 }
 
 pub(crate) async fn new_disk_with_health_tracker(

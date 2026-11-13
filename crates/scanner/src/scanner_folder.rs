@@ -3530,6 +3530,14 @@ pub(crate) async fn scan_data_folder_scoped(
                 .scan_progress
                 .is_some_and(|progress| progress.started_plan != progress.requested_plan);
             new_cache.info.snapshot_complete = !unresolved_objects && !mixed_coverage;
+            if mixed_coverage && !unresolved_objects {
+                new_cache.record_completed_bucket_observation();
+                // A companion is not an old-reader LKG or a reusable main value.
+                new_cache.info.lkg_snapshot_complete = false;
+                new_cache.info.scan_bucket_value_origins.clear();
+            } else if new_cache.info.snapshot_complete {
+                new_cache.info.scan_bucket_observations.remove(&bucket_name);
+            }
             if let Some(progress) = &mut new_cache.info.scan_progress {
                 if new_cache.info.snapshot_complete {
                     new_cache.info.scan_plan_digest = Some(progress.requested_plan);

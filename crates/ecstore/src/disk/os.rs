@@ -3817,20 +3817,6 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
     Ok(volumes)
 }
 
-#[tracing::instrument(level = "debug", skip_all)]
-pub async fn rename_all(
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    publication_root: &PublicationRoot,
-) -> Result<()> {
-    reliable_rename(src_file_path, dst_file_path.as_ref(), base_dir, publication_root)
-        .await
-        .map_err(to_file_error)?;
-
-    Ok(())
-}
-
 /// Retain mutation ownership through both metadata publication and its directory
 /// barriers, even when the async caller stops waiting after the rename starts.
 pub(crate) async fn rename_metadata_and_sync_with_lease(
@@ -3873,6 +3859,19 @@ pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Ar
         let _ = namespace_owner;
         fsync_dir_std(path)
     }
+}
+
+/// Preserve file, symlink, and empty-directory removal semantics while the
+/// actual filesystem executor retains namespace ownership after cancellation.
+pub(crate) async fn remove_with_owner(path: impl AsRef<Path>, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        super::fs::remove_std(path)
+    })
+    .await
 }
 
 /// Retain namespace ownership in the actual filesystem executor after timeout.
@@ -4960,15 +4959,6 @@ pub(crate) fn rename_source_is_missing(src_file_path: &Path, publication_root: &
 #[cfg(not(windows))]
 pub(crate) fn rename_source_is_missing(src_file_path: &Path, _publication_root: &PublicationRoot) -> bool {
     matches!(std::fs::symlink_metadata(src_file_path), Err(err) if err.kind() == io::ErrorKind::NotFound)
-}
-
-async fn reliable_rename(
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    publication_root: &PublicationRoot,
-) -> io::Result<()> {
-    reliable_rename_inner(src_file_path, dst_file_path, base_dir, publication_root, true).await
 }
 
 async fn reliable_rename_inner(
@@ -9165,7 +9155,7 @@ mod tests {
         let dst_file_path = dst_file_path.as_ref();
         let base_dir = base_dir.as_ref();
         let publication_root = test_publication_root(&[src_file_path, dst_file_path, base_dir]);
-        super::rename_all(src_file_path, dst_file_path, base_dir, &publication_root).await
+        super::rename_all_with_owner(src_file_path, dst_file_path, base_dir, &publication_root, None).await
     }
 
     async fn rename_all_ignore_missing_source(

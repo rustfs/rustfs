@@ -4251,7 +4251,7 @@ impl SetDisks {
                     explicit_delete: true,
                     transaction_guard: transaction_guard.cloned(),
                     namespace_owner: Some(Arc::new((
-                        self.ctx.begin_namespace_commit(),
+                        self.ctx.begin_namespace_commit_for_bucket(bucket),
                         lock_guard.cloned(),
                         opts.object_lock_config_snapshot.clone(),
                         opts.scanner_publication_commit_scope.clone(),
@@ -6010,7 +6010,8 @@ impl SetDisks {
                     .with_publication_scope(commit_scanner_publication_scope.clone())
                     .with_rollback_receipt(commit_rollback_receipt.clone())
                     .with_namespace_commit_guard(
-                        (!is_meta_bucketname(&commit_bucket)).then(|| commit_set.ctx.begin_namespace_commit()),
+                        (!is_meta_bucketname(&commit_bucket))
+                            .then(|| commit_set.ctx.begin_namespace_commit_for_bucket(&commit_bucket)),
                     ),
                 )
                 .await;
@@ -9412,7 +9413,7 @@ impl SetDisks {
         let disks = self.disk_inventory().await;
         let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
             Arc::new((
-                self.ctx.begin_namespace_commit(),
+                self.ctx.begin_namespace_commit_for_bucket(bucket),
                 commit_context.guard.clone(),
                 commit_context.transaction_guard.clone(),
                 commit_context
@@ -10833,7 +10834,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let rollback_dir = Uuid::new_v4();
         let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
             Arc::new((
-                self.ctx.begin_namespace_commit(),
+                self.ctx.begin_namespace_commit_for_bucket(bucket),
                 Arc::clone(&transaction_guards),
                 opts.delete_mutation_owner.clone(),
                 opts.object_lock_config_snapshot.clone(),
@@ -11381,7 +11382,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         work_budget: opts.delete_recovery_work_budget.clone(),
                         explicit_delete,
                         namespace_owner: Some(Arc::new((
-                            self.ctx.begin_namespace_commit(),
+                            self.ctx.begin_namespace_commit_for_bucket(bucket),
                             opts.delete_mutation_owner.clone(),
                             opts.object_lock_config_snapshot.clone(),
                         ))),
@@ -11737,7 +11738,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         work_budget: opts.delete_recovery_work_budget.clone(),
                         transaction_guard: transaction_guard.clone(),
                         namespace_owner: Some(Arc::new((
-                            self.ctx.begin_namespace_commit(),
+                            self.ctx.begin_namespace_commit_for_bucket(bucket),
                             _lock_guard.clone(),
                             opts.object_lock_config_snapshot.clone(),
                             opts.scanner_publication_commit_scope.clone(),

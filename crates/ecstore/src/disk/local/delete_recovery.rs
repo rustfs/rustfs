@@ -2138,6 +2138,7 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
+        let owner = self.usage_watch_binding.owner(volume, owner);
         self.reject_multipart_delete_recovery_mutation(volume, object)?;
         if let Ok(root) = self.io_get_object_path(volume, object) {
             let tx_dir = root.join(transaction.to_string());
@@ -3175,6 +3176,7 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if transaction.is_nil() {
             return Err(DiskError::InvalidPath);
         }
@@ -3397,6 +3399,7 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<bool> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         fn ignore_not_found(res: std::io::Result<()>) -> std::io::Result<()> {
             match res {
                 Ok(()) => Ok(()),

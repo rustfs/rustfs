@@ -1034,6 +1034,43 @@ message ScannerScopedDirtyUsageAckResponse {
   bytes response_proof = 8;
 }
 
+// Independent from dirty-list/ACK capability: each requested bucket yields
+// either a same-session watch proof or an explicit Unknown entry.
+message ScannerUsageWatchEntry {
+  string bucket = 1;
+  bytes bucket_incarnation = 2;
+  bytes watch_id = 3;
+  bool release = 4;
+  bytes session_id = 5;
+}
+
+message ScannerUsageWatchRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+  string owner_id = 3;
+  repeated ScannerUsageWatchEntry entries = 4;
+}
+
+message ScannerUsageWatchResult {
+  string bucket = 1;
+  bool known = 2;
+  bytes bucket_incarnation = 3;
+  bytes watch_id = 4;
+  uint64 revision = 5;
+  uint64 inflight = 6;
+  uint32 coverage_version = 7;
+  uint64 coverage_epoch = 8;
+  uint64 lease_remaining_ms = 9;
+}
+
+message ScannerUsageWatchResponse {
+  uint32 protocol_version = 1;
+  string owner_id = 2;
+  bytes session_id = 3;
+  repeated ScannerUsageWatchResult entries = 4;
+  bytes response_proof = 5;
+}
+
 // A short-lived storage-owned read admission used only around a final
 // scanner metadata publication.  It is intentionally separate from the
 // ScannerActivity observation wire so v6/v7 rolling compatibility remains
@@ -1425,6 +1462,7 @@ service NodeService {
 
 service ScannerControlService {
   rpc ScannerScopedDirtyUsageAck(ScannerScopedDirtyUsageAckRequest) returns (ScannerScopedDirtyUsageAckResponse) {}; // auth-policy: body-bound
+  rpc ScannerUsageWatch(ScannerUsageWatchRequest) returns (ScannerUsageWatchResponse) {}; // auth-policy: body-bound
 }
 
 service HealControlService {

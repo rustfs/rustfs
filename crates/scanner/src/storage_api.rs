@@ -21,6 +21,18 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+#[cfg(test)]
+pub(crate) mod remote_transport_fixture {
+    pub(crate) use rustfs_ecstore::api::disk::error::{Error, Result};
+    pub(crate) use rustfs_ecstore::api::disk::{FileReader, FileWriter};
+    pub(crate) use rustfs_ecstore::api::rpc::test_util::remote_disk_with_transport;
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    pub(crate) use rustfs_storage_api::{NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse};
+}
+
 pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
 pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
@@ -54,6 +66,8 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     lifecycle_version_delete_target as ecstore_lifecycle_version_delete_target,
 };
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_from_object_info as ecstore_object_opts_from_object_info;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
@@ -148,6 +162,8 @@ pub(crate) use rustfs_ecstore::api::rpc::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::ScannerUsageWatchRequest as EcstoreUsageWatchRequest;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
 pub(crate) use rustfs_ecstore::api::runtime::{
@@ -448,6 +464,13 @@ pub(crate) trait ScannerStorage:
     fn scanner_data_movement_generation(&self) -> u64;
     fn scanner_data_movement_changed(&self) -> Arc<Notify>;
     fn scanner_notification_system(&self) -> Option<Arc<ScannerNotificationSys>>;
+    async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<EcstoreStore>> {
+        None
+    }
+    /// Backends without producer watches cannot authorize nonempty proofs.
+    async fn scanner_verify_usage_watches(&self, proofs: &[crate::scanner_io::ScannerUsageWatchProof]) -> bool {
+        proofs.is_empty()
+    }
     async fn setup_is_erasure(&self) -> bool;
     async fn setup_is_dist_erasure(&self) -> bool;
     async fn setup_is_erasure_sd(&self) -> bool;
@@ -468,6 +491,19 @@ pub(crate) trait ScannerStorage:
 
 #[async_trait::async_trait]
 impl ScannerStorage for EcstoreStore {
+    async fn scanner_usage_watch_store_handle(&self) -> Option<Arc<EcstoreStore>> {
+        EcstoreStore::scanner_usage_watch_store_handle(self).await
+    }
+    async fn scanner_verify_usage_watches(&self, proofs: &[crate::scanner_io::ScannerUsageWatchProof]) -> bool {
+        for batch in proofs.chunks(4) {
+            let checks = batch.iter().map(|proof| proof.verify_with_store(self)).collect::<Vec<_>>();
+            if futures::future::join_all(checks).await.into_iter().any(|valid| !valid) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn scanner_topology_digest(&self) -> [u8; 32] {
         crate::scanner::scanner_topology_digest(self)
     }

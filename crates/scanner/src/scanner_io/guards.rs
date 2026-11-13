@@ -63,6 +63,7 @@ struct ScannerCohortWait {
 /// cursor shared with its last member. Candidate selection borrows at most
 /// 4096 inventory entries; the existing full inventory is not bounded here.
 pub(crate) struct ScannerServiceCohort {
+    pub(super) usage_watches: Arc<StdMutex<ScannerUsageWatchCohort>>,
     members: HashMap<DataUsageCacheSource, HashMap<Arc<str>, ScannerCohortWait>>,
     cursor: Option<(DataUsageCacheSource, Arc<str>)>,
     next_order: u64,
@@ -79,6 +80,7 @@ pub(crate) struct ScannerServiceCohort {
 impl Default for ScannerServiceCohort {
     fn default() -> Self {
         Self {
+            usage_watches: Arc::default(),
             members: HashMap::new(),
             cursor: None,
             next_order: 0,
@@ -95,6 +97,10 @@ impl Default for ScannerServiceCohort {
 }
 
 impl ScannerServiceCohort {
+    pub(crate) fn usage_watch_cohort(&self) -> Arc<StdMutex<ScannerUsageWatchCohort>> {
+        self.usage_watches.clone()
+    }
+
     pub(crate) fn refresh(&mut self, inventory: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>) {
         let count = inventory
             .values()
