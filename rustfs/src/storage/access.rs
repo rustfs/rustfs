@@ -6811,23 +6811,46 @@ mod tests {
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
-    /// The table-policy, anonymous table and force-delete exits live deep in the authorization
-    /// flow and need a table catalog to reach. This source-level guard fails if one stops
-    /// auditing; it does not execute them.
+    fn production_sources_audit_reason(sources: &[&str], reason: &str) -> bool {
+        sources.iter().any(|source| {
+            let production = source.split("\nmod tests {").next().expect("source has a production section");
+            production
+                .match_indices("audit_request_denial(")
+                .any(|(at, _)| production[at..].chars().take(260).collect::<String>().contains(reason))
+        })
+    }
+
+    /// Request-level denial exits span the legacy and owned authorization modules.
+    /// Check their production audit wiring alongside the audit behavior tests.
     #[test]
     fn denial_exits_without_a_context_call_the_audit_function() {
-        // Only the production code counts; the tests' own calls must not satisfy the guard.
-        let source = include_str!("access.rs").split("\nmod tests {").next().unwrap();
+        let sources = [include_str!("access.rs"), include_str!("access_owned/object_misc.rs")];
         for reason in [
             "\"table_resource_policy_denied\"",
             "\"anonymous_table_data_plane_access\"",
             "\"recursive_force_delete_requires_authenticated_caller\"",
         ] {
-            let call = source
-                .match_indices("audit_request_denial(")
-                .any(|(at, _)| source[at..].chars().take(260).collect::<String>().contains(reason));
-            assert!(call, "{reason} exit does not call audit_request_denial");
+            assert!(
+                production_sources_audit_reason(&sources, reason),
+                "{reason} exit does not call audit_request_denial"
+            );
         }
+    }
+
+    #[test]
+    fn denial_source_guard_tracks_moved_calls_and_rejects_removed_calls() {
+        let reason = "\"recursive_force_delete_requires_authenticated_caller\"";
+        let original = "fn original_exit() {}";
+        let moved = format!("fn moved_exit() {{ audit_request_denial(req, auditor, {reason}, action); }}");
+
+        assert!(!production_sources_audit_reason(&[original], reason));
+        assert!(production_sources_audit_reason(&[original, &moved], reason));
+
+        let removed = moved.replace("audit_request_denial(", "unrecorded_denial(");
+        assert!(!production_sources_audit_reason(&[original, &removed], reason));
+
+        let test_only = format!("{original}\nmod tests {{\n{moved}\n}}");
+        assert!(!production_sources_audit_reason(&[original, &test_only], reason));
     }
 
     /// DeleteObjects audits its refused keys as one entry per denied action, carrying the count and
