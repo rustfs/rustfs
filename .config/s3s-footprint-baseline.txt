@@ -2,12 +2,12 @@
 # scripts/check_s3s_footprint.sh (rustfs/backlog#1677; rustfs/backlog#2734 T0.4;
 # comparison rules on rustfs/backlog#2765).
 #
-# A counter above its line here fails everywhere: new code widened the s3s
-# surface; route it through the gateway abstractions instead and never raise a
-# value here. On a pull request the bar is the base revision's measurement, so a
-# slice that shrinks the surface need not edit this file; on a push to main a
-# measurement below its line fails and the check prints the lowered line, which
-# whoever merged the drop puts here.
+# Each line is a ceiling everywhere: a counter above it fails, because new code
+# widened the s3s surface; route it through the gateway abstractions instead and
+# never raise a value here. Pull requests and merge groups are additionally held
+# to their base revision's measurement, so a slice that shrinks the surface need
+# not edit this file. A counter below its line passes and the check prints the
+# lowered line; the migration coordinator lowers the lines in batches.
 #
 # files           Rust files referencing s3s paths, repo-wide minus crates/e2e_test
 # s3_error_lines  lines holding s3_error!, same scope, minus those the script
