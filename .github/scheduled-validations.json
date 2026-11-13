@@ -319,7 +319,7 @@
       "monitor": "workflow",
       "max_age_hours": 192,
       "result_owner": "rdma-feature-check.yml",
-      "disposition": "compiles the nixl feature on Linux; the feature is off in every other build",
+      "disposition": "compiles the nixl feature and runs rustfs-nixl unit tests on Linux; the feature is off in every other build",
       "failure_owner": "workflow",
       "origin": "added",
       "alert_contract": "scheduled-validation"

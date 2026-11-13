@@ -93,7 +93,7 @@ gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter", "dep:rustfs
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
-nixl = ["dep:rustfs-nixl"]
+nixl = ["dep:rustfs-nixl", "rustfs-nixl/sys"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]

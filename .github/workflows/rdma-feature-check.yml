@@ -2,7 +2,8 @@ name: S3-over-RDMA feature check
 
 # The `nixl` and `cuobject` features are off in every other build, so the code
 # behind them is compiled nowhere else. This job compiles the `nixl` half on
-# Linux; nixl-sys builds through its stub fallback, so no NIXL SDK is needed.
+# Linux and runs rustfs-nixl's unit tests; nixl-sys builds through its stub
+# fallback, so no NIXL SDK is needed.
 # The cuObject half needs the NVIDIA cuObject SDK and is not compiled here.
 # Not a required check and not part of the `Test and Lint` aggregate.
 
@@ -32,7 +33,7 @@ concurrency:
 
 jobs:
   nixl-check:
-    name: cargo check (nixl)
+    name: cargo check and unit tests (nixl)
     runs-on: sm-standard-4
     timeout-minutes: 60
     env:
@@ -63,6 +64,11 @@ jobs:
 
       - name: Check the nixl feature build
         run: cargo check --locked -p rustfs --features nixl
+
+      # These unit tests use a fake sysfs and plain host memory; none needs an
+      # RDMA device or the NIXL libraries.
+      - name: Run the rustfs-nixl unit tests
+        run: cargo test --locked -p rustfs-nixl --features sys
 
   alert-on-failure:
     name: Alert on scheduled failure
