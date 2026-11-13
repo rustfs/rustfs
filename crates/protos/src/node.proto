@@ -116,6 +116,12 @@ message WriteAllRequest {
   bytes data = 4;
 }
 
+message WriteFormatControlRequest {
+  string disk = 1;
+  string path = 2;
+  bytes data = 3;
+}
+
 message WriteAllResponse {
   bool success = 1;
   optional Error error = 2;
@@ -1323,6 +1329,7 @@ service NodeService {
 
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
+  rpc WriteFormatControl(WriteFormatControlRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
   rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound

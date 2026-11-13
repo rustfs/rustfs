@@ -1586,6 +1586,13 @@ impl Node for NodeService {
         self.handle_write_all(request).await
     }
 
+    async fn write_format_control(
+        &self,
+        request: Request<WriteFormatControlRequest>,
+    ) -> Result<Response<WriteAllResponse>, Status> {
+        self.handle_write_format_control(request).await
+    }
+
     async fn compare_and_update_file(
         &self,
         request: Request<CompareAndUpdateFileRequest>,
@@ -3334,7 +3341,7 @@ mod tests {
         SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
         StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
         TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest, WriteRequest,
+        WriteFormatControlRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3352,7 +3359,7 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 34] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 35] = [
         "renamedata",
         "renamemultipartdata",
         "recovermultipartsource",
@@ -3371,6 +3378,7 @@ mod tests {
         "writemetadata",
         "updatemetadata",
         "writeall",
+        "writeformatcontrol",
         "compareandupdatefile",
         "delete",
         "deletepaths",
@@ -5434,6 +5442,15 @@ mod tests {
                 data: vec![0x01, 0x02].into(),
             },
             rustfs_protos::canonical_write_all_request_body
+        );
+        assert_gated!(
+            write_format_control,
+            WriteFormatControlRequest {
+                disk: disk.clone(),
+                path: "format.json.bootstrap".into(),
+                data: vec![0x01, 0x02].into(),
+            },
+            rustfs_protos::canonical_write_format_control_request_body
         );
         assert_gated!(
             compare_and_update_file,
@@ -8085,6 +8102,146 @@ mod tests {
             CompareAndUpdateFileOutcome::CompareAndUpdateFileMissing
         );
         assert!(matches!(disk.read_all(volume, &path).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn format_control_rpc_publishes_unformatted_listener_target_in_one_call() {
+        use crate::storage::storage_api::{init_local_disks_with_instance_ctx, new_instance_ctx};
+        use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower_http::trace::TraceLayer;
+
+        let root = tempfile::tempdir().expect("format-control RPC disk");
+        let mut endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 disk path")).expect("local endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let instance = new_instance_ctx();
+        let pool = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint.clone()]),
+            cmd_line: "format-control-rpc".into(),
+            platform: "test".into(),
+        };
+        init_local_disks_with_instance_ctx(&instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register unformatted listener target");
+        assert!(!root.path().join(".rustfs.sys/format.json").exists());
+        let slot = super::ServerContextSlot::with_instance_context(instance);
+        let service = super::make_server_for_slot(slot);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("format-control listener");
+        let address = listener.local_addr().expect("listener address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let trace = TraceLayer::new_for_grpc().on_request(move |request: &http::Request<_>, _: &tracing::Span| {
+            if request.uri().path() == "/node_service.NodeService/WriteFormatControl" {
+                recorded.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(trace)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve format-control target");
+        });
+        let mut client = NodeServiceClient::connect(format!("http://{address}"))
+            .await
+            .expect("connect real format-control client");
+        let drive_id = Uuid::new_v4();
+        let payload = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1",
+                "format": "xl-single",
+                "id": Uuid::new_v4(),
+                "xl": {
+                    "version": "3",
+                    "this": drive_id,
+                    "sets": [[drive_id]],
+                    "distributionAlgo": "SIPMOD+PARITY",
+                },
+            }))
+            .expect("encode a valid single-drive format plan"),
+        );
+        let message = WriteFormatControlRequest {
+            disk: endpoint.to_string(),
+            path: "format.json.bootstrap".into(),
+            data: payload.clone(),
+        };
+        let sign = |message: WriteFormatControlRequest| {
+            let mut request = Request::new(message);
+            let canonical =
+                rustfs_protos::canonical_write_format_control_request_body(request.get_ref()).expect("canonical control request");
+            set_tonic_canonical_body_digest(&mut request, &canonical).expect("body digest");
+            mark_v2_authenticated(&mut request);
+            request
+        };
+        let metrics = rustfs_io_metrics::internode_metrics::global_internode_metrics();
+        let before = metrics.snapshot();
+        let response = super::timeout(Duration::from_secs(10), client.write_format_control(sign(message.clone())))
+            .await
+            .expect("bounded atomic control RPC")
+            .expect("atomic control response")
+            .into_inner();
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one atomic publication uses one unary RPC");
+        let successful = metrics.snapshot();
+        assert_eq!(successful.incoming_requests_total - before.incoming_requests_total, 1);
+        assert_eq!(
+            successful.recv_bytes_total - before.recv_bytes_total,
+            u64::try_from(payload.len()).expect("payload length")
+        );
+        assert_eq!(successful.errors_total, before.errors_total);
+        assert_eq!(
+            tokio::fs::read(root.path().join(".rustfs.sys/format.json.bootstrap"))
+                .await
+                .expect("published control"),
+            payload
+        );
+        assert!(
+            !root.path().join(".rustfs.sys/format.json").exists(),
+            "an endpoint route needs no disk UUID"
+        );
+
+        let mut invalid = message.clone();
+        invalid.path = "../outside".into();
+        let error = client
+            .write_format_control(sign(invalid))
+            .await
+            .expect_err("invalid control path rejected before disk work");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let mut missing = message.clone();
+        missing.disk = "unregistered-format-target".into();
+        let response = client
+            .write_format_control(sign(missing))
+            .await
+            .expect("typed missing-target response")
+            .into_inner();
+        assert!(!response.success);
+        assert_eq!(response.error.expect("typed target failure").code, DiskError::DiskNotFound.to_u32());
+        let error = client
+            .write_format_control(Request::new(message))
+            .await
+            .expect_err("unsigned control mutation rejected");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let completed = metrics.snapshot();
+        assert_eq!(completed.incoming_requests_total - before.incoming_requests_total, 2);
+        assert_eq!(
+            completed.recv_bytes_total - before.recv_bytes_total,
+            2 * u64::try_from(payload.len()).expect("payload length")
+        );
+        assert_eq!(completed.errors_total - before.errors_total, 1);
+        shutdown.send(()).expect("stop format-control server");
+        super::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("bounded server shutdown")
+            .expect("server task");
     }
 
     #[cfg(not(windows))]
