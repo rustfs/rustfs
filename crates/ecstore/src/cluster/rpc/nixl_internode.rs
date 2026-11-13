@@ -563,12 +563,22 @@ impl WriterState {
         if let Err(error) = futures::ready!(self.poll_sending(cx)) {
             return Poll::Ready(Err(error));
         }
-        if self.current.is_none() {
+        while self.current.is_none() {
             let pool = Arc::clone(&self.pool);
             let reserving = self.reserving.get_or_insert_with(|| pool.reserve());
-            let buffer = futures::ready!(reserving.as_mut().poll(cx));
-            self.reserving = None;
-            self.current = Some((LentBuffer { buffer: Some(buffer?) }, 0));
+            match reserving.as_mut().poll(cx) {
+                Poll::Ready(buffer) => {
+                    self.reserving = None;
+                    self.current = Some((LentBuffer { buffer: Some(buffer?) }, 0));
+                }
+                Poll::Pending if !self.filled.is_empty() => {
+                    // Send held buffers before waiting for capacity that their acknowledgement releases.
+                    self.reserving = None;
+                    self.start_segment(false);
+                    futures::ready!(self.poll_sending(cx))?;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
         let (lent, filled) = self.current.as_mut().expect("buffer reserved above");
         let spare = lent.buffer.as_mut().expect("lent buffer present").spare_mut();
@@ -758,6 +768,133 @@ mod tests {
         assert_eq!(staged, data);
         assert_eq!(state.filled.len(), 2);
         assert_eq!(state.current.as_ref().map(|(_, len)| *len), Some(4));
+    }
+
+    struct LimitedBuffer {
+        bytes: VecBuffer,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    impl NixlRecvBuffer for LimitedBuffer {
+        fn descriptor(&self) -> String {
+            self.bytes.descriptor()
+        }
+
+        fn descriptor_for(&self, len: usize) -> String {
+            self.bytes.descriptor_for(len)
+        }
+
+        fn spare_mut(&mut self) -> &mut [u8] {
+            self.bytes.spare_mut()
+        }
+
+        fn into_bytes(self: Box<Self>, len: usize) -> io::Result<Bytes> {
+            Ok(Bytes::copy_from_slice(&self.bytes.0[..len]))
+        }
+    }
+
+    struct LimitedPool(Arc<tokio::sync::Semaphore>);
+
+    impl NixlRecvPool for LimitedPool {
+        fn agent_name(&self) -> &str {
+            "test-agent"
+        }
+
+        fn metadata_base64(&self) -> &str {
+            ""
+        }
+
+        fn metadata_sha256_hex(&self) -> &str {
+            ""
+        }
+
+        fn chunk_bytes(&self) -> usize {
+            8
+        }
+
+        fn reserve(&self) -> ReserveFuture {
+            let permits = Arc::clone(&self.0);
+            Box::pin(async move {
+                let permit = permits.acquire_owned().await.map_err(io::Error::other)?;
+                Ok(Box::new(LimitedBuffer {
+                    bytes: VecBuffer(vec![0; 8]),
+                    _permit: permit,
+                }) as Box<dyn NixlRecvBuffer>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_writer_sends_staged_bytes_when_the_pool_is_full() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        for chunks in 1..=3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("segment listener");
+            let address = listener.local_addr().expect("segment address");
+            let server = tokio::spawn(async move {
+                let mut received = 0;
+                while received < 40 {
+                    let (mut socket, _) = listener.accept().await.expect("segment connection");
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let mut bytes = [0; 1024];
+                        let n = socket.read(&mut bytes).await.expect("segment request");
+                        assert!(n > 0 && request.len() < 16384, "bounded request headers");
+                        request.extend_from_slice(&bytes[..n]);
+                    }
+                    let request = std::str::from_utf8(&request).expect("request text");
+                    let target = request.split_whitespace().nth(1).expect("request target");
+                    let url = url::Url::parse(&format!("http://{address}{target}")).expect("segment URL");
+                    let descriptors = url
+                        .query_pairs()
+                        .find(|(name, _)| name == NIXL_BUFFERS_QUERY)
+                        .expect("buffers")
+                        .1;
+                    let bytes: usize = descriptors
+                        .split(',')
+                        .map(|descriptor| {
+                            descriptor
+                                .rsplit(':')
+                                .next()
+                                .expect("buffer length")
+                                .parse::<usize>()
+                                .expect("numeric length")
+                        })
+                        .sum();
+                    assert!(bytes > 0 && bytes <= chunks * 8);
+                    received += bytes;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\nx-rustfs-nixl-bytes: {bytes}\r\n\r\n"
+                    );
+                    socket.write_all(response.as_bytes()).await.expect("segment acknowledgement");
+                }
+                received
+            });
+            let pool = Arc::new(LimitedPool(Arc::new(tokio::sync::Semaphore::new(chunks))));
+            let request = WriteStreamRequest {
+                endpoint: format!("http://{address}"),
+                disk: "disk".to_owned(),
+                volume: "volume".to_owned(),
+                path: "path".to_owned(),
+                append: false,
+                size: 40,
+            };
+            let mut writer = NixlFileWriter::new(pool.clone(), request);
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                writer.write_all(&[7; 40]).await?;
+                writer.shutdown().await
+            })
+            .await;
+            if result.is_err() {
+                server.abort();
+            }
+            result
+                .expect("a writer must dispatch before exhausting its pool")
+                .expect("shard write");
+            assert_eq!(server.await.expect("segment server"), 40);
+            assert_eq!(pool.0.available_permits(), chunks, "acknowledged buffers return to the pool");
+        }
     }
 
     #[tokio::test(start_paused = true)]

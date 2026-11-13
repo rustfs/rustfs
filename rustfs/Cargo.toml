@@ -89,7 +89,7 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 # (rustfs/backlog#2734). Under construction: off by default and never enabled in a
 # release build; the stack refuses to compile without debug assertions, and
 # `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
-gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter"]
+gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter", "dep:rustfs-gateway-stream"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
@@ -278,6 +278,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-gateway = { workspace = true, optional = true }
 rustfs-gateway-adapter = { workspace = true, optional = true }
+rustfs-gateway-stream = { workspace = true, optional = true }
 rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
