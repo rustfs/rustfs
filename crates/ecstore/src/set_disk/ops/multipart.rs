@@ -4688,7 +4688,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .with_multipart_commit_owner(multipart_commit_owner)
                     .with_namespace_commit_guard(
                         (!crate::bucket::utils::is_meta_bucketname(&commit_bucket))
-                            .then(|| commit_set.ctx.begin_namespace_commit()),
+                            .then(|| commit_set.ctx.begin_namespace_commit_for_bucket(&commit_bucket)),
                     ),
             )
             .await;

@@ -9809,6 +9809,7 @@ dependencies = [
  "rmp-serde",
  "rustfs-filemeta",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -299,6 +299,7 @@ fn test_usage(bucket: &str, objects: usize) -> DataUsageEntryInfo {
         entry,
         bucket_incarnation: Some(Uuid::from_u128(7)),
         tier_registry_generation: Some(0),
+        value_origin: None,
     }
 }
 
@@ -314,6 +315,9 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
         leader_epoch: 9,
         scan_plan_digest: TEST_PLAN_DIGEST,
         checkpoint_plan_digest: None,
+        supports_durable_progress: false,
+        supports_complete_observation: false,
+        usage_watch: None,
         skip_healing: true,
         scan_mode: HealScanMode::Deep,
         budget: RemoteScannerBudget {
@@ -382,6 +386,247 @@ fn request_round_trip_preserves_scan_inputs_without_cache_data() {
     assert_eq!(decoded.0.budget.max_objects, Some(10));
     assert_eq!(decoded.0.budget.max_directories, Some(20));
     assert!(body.len() < 512);
+}
+
+#[test]
+fn remote_request_binds_a_complete_watch_and_rejects_malformed_proofs() {
+    use crate::storage_api::scanner_io::ScannerUsageWatchKnown;
+    let owner = Uuid::from_u128(1);
+    let incarnation = Uuid::from_u128(7);
+    let proof = crate::scanner_io::ScannerUsageWatchProof {
+        version: 1,
+        bucket: "bucket".into(),
+        bucket_incarnation: incarnation,
+        structure: DataUsageScanPlanDigest([1; 32]),
+        peers: std::collections::BTreeMap::from([(
+            owner,
+            ScannerUsageWatchKnown {
+                owner_id: owner,
+                session_id: Uuid::from_u128(2),
+                watch_id: Uuid::from_u128(3),
+                bucket_incarnation: incarnation,
+                revision: 1,
+                inflight: 0,
+                coverage_version: 1,
+                coverage_epoch: 1,
+                lease_remaining_ms: 60_000,
+            },
+        )]),
+    };
+    let mut request = test_request(Uuid::new_v4());
+    assert!(
+        !serde_json::to_value(&request)
+            .expect("legacy body")
+            .as_object()
+            .expect("map")
+            .contains_key("usage_watch")
+    );
+    request.usage_watch = Some(Box::new(proof.clone()));
+    let encoded = rmp_serde::to_vec_named(&request).expect("watch-bearing request");
+    let decoded = decode_remote_scanner_request(&encoded).expect("valid complete proof");
+    assert_eq!(decoded.0.usage_watch.as_deref(), Some(&proof));
+    for case in 0..5 {
+        let mut malformed = proof.clone();
+        match case {
+            0 => malformed.bucket = "other-bucket".into(),
+            1 => malformed.peers.clear(),
+            2 => malformed.version += 1,
+            3 => malformed.peers.get_mut(&owner).expect("proof owner").revision = 0,
+            _ => malformed.peers.get_mut(&owner).expect("proof owner").inflight = 1,
+        }
+        request.usage_watch = Some(Box::new(malformed));
+        assert!(decode_remote_scanner_request(&rmp_serde::to_vec_named(&request).expect("malformed proof body")).is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage() {
+    use crate::scanner_io::tests::{setup_local_scanner_store, wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
+    let (_directory, store) = setup_local_scanner_store(1, 4).await;
+    let bucket = "remote-watch-eof";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    store
+        .put_object(
+            bucket,
+            "before",
+            &mut crate::ScannerPutObjReader::from_vec(b"payload".to_vec()),
+            &crate::ScannerObjectOptions::default(),
+        )
+        .await
+        .expect("initial object");
+    for index in 0..2 {
+        store
+            .put_object(
+                bucket,
+                &format!("prefix-{index}/object"),
+                &mut crate::ScannerPutObjReader::from_vec(b"payload".to_vec()),
+                &crate::ScannerObjectOptions::default(),
+            )
+            .await
+            .expect("additional object for durable resume");
+    }
+    wait_for_namespace_commit_tails(&store).await;
+    let proof = crate::scanner_io::ScannerUsageWatchProof::install_for_test(&store, bucket)
+        .await
+        .expect("complete real producer proof");
+    assert!(proof.verify_with_store(&store).await);
+    let set = store.pools[0].disk_set[0].clone();
+    let disks = scanner_set_disk_inventory(&set).await;
+    let disk = disks[0].clone();
+    let source = cache_source_for_disk(&disk).expect("real cache source");
+    let publication_epoch = scanner_publication_epoch(set.clone()).await.expect("publication epoch");
+    let tier_generation = crate::runtime_tier_registry_for_cycle(1, 1).await.generation;
+    let identity = crate::scanner_io::scanner_bucket_checkpoint_identity(
+        &set,
+        bucket,
+        publication_epoch,
+        tier_generation,
+        HealScanMode::Normal,
+    )
+    .await
+    .expect("storage checkpoint identity")
+    .expect("real incarnation");
+    let plan = proof.digest();
+    let mut cache = DataUsageCache::default();
+    current_cache_root_or_prepare_with_generation(
+        &mut cache,
+        bucket,
+        source,
+        1,
+        1,
+        plan,
+        DataUsageCacheReuseOptions {
+            require_source: true,
+            tier_registry_generation: Some(tier_generation),
+            checkpoint_identity: Some(identity),
+            checkpoint_plan_digest: Some(plan),
+        },
+    );
+    crate::scanner_io::bind_usage_watch_to_checkpoint(&mut cache, Some(&proof), plan);
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+    );
+    let first = ScannerIODisk::nsscanner_disk(
+        disk.clone(),
+        budget.token(),
+        budget.clone(),
+        disks.clone(),
+        cache,
+        None,
+        ScannerDiskScanOptions {
+            scan_mode: HealScanMode::Normal,
+            prefix_scan_scope: None,
+            checkpoint_tx: None,
+        },
+    )
+    .await
+    .expect("first bounded walk");
+    assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
+    assert_eq!(budget.progress().0, 1, "the real object budget must stop the first walk");
+    assert!(!ctx.is_cancelled(), "a work-budget stop must preserve the owner");
+    let ScannerDiskScanOutcome::Partial(partial) = first else {
+        panic!("bounded walk must require resume")
+    };
+    assert!(partial.has_scan_position());
+    let persisted = rmp_serde::to_vec_named(&partial).expect("durable checkpoint format");
+    let cache: DataUsageCache = rmp_serde::from_slice(&persisted).expect("reload real checkpoint");
+    let resumed_sweep = cache.has_scan_position();
+    assert!(resumed_sweep);
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let outcome = ScannerIODisk::nsscanner_disk(
+        disk,
+        budget.token(),
+        budget,
+        disks,
+        cache,
+        None,
+        ScannerDiskScanOptions {
+            scan_mode: HealScanMode::Normal,
+            prefix_scan_scope: None,
+            checkpoint_tx: None,
+        },
+    )
+    .await
+    .expect("real bucket scan");
+    assert!(!ctx.is_cancelled(), "the resumed walk retains its owner");
+    assert!(matches!(outcome, ScannerDiskScanOutcome::Complete(_)), "fixture must reach healthy EOF");
+    let (complete, terminal) =
+        classify_remote_usage_watch_outcome(&store, outcome, Some(&proof), plan, Some(plan), resumed_sweep).await;
+    assert!(terminal.is_none());
+    assert!(complete.info.snapshot_complete);
+
+    store
+        .put_object(
+            bucket,
+            "after",
+            &mut crate::ScannerPutObjReader::from_vec(b"later".to_vec()),
+            &crate::ScannerObjectOptions::default(),
+        )
+        .await
+        .expect("mutation after walk");
+    wait_for_namespace_commit_tails(&store).await;
+    assert!(!proof.verify_with_store(&store).await);
+    let complete_bytes = rmp_serde::to_vec_named(&complete).expect("complete result format");
+    let compatible_complete: DataUsageCache = rmp_serde::from_slice(&complete_bytes).expect("complete candidate copy");
+    let (single_pass, single_terminal) = classify_remote_usage_watch_outcome(
+        &store,
+        ScannerDiskScanOutcome::Complete(compatible_complete),
+        Some(&proof),
+        plan,
+        Some(plan),
+        false,
+    )
+    .await;
+    assert!(
+        single_terminal.is_none(),
+        "ordinary single-pass CompletePending remains the coordinator's decision"
+    );
+    assert!(single_pass.info.snapshot_complete);
+    let (observed, terminal) = classify_remote_usage_watch_outcome(
+        &store,
+        ScannerDiskScanOutcome::Complete(complete),
+        Some(&proof),
+        plan,
+        Some(plan),
+        resumed_sweep,
+    )
+    .await;
+    assert!(matches!(terminal, Some(RemoteScannerFrameResult::Partial)));
+    assert!(!observed.info.snapshot_complete);
+    assert!(!observed.info.lkg_snapshot_complete);
+    assert_eq!(
+        observed
+            .completed_bucket_observation()
+            .expect("complete EOF observation")
+            .entry
+            .objects,
+        3
+    );
+    assert!(observed.info.scan_checkpoint.is_none());
+    assert!(observed.info.scan_progress.is_some());
+    let bytes = rmp_serde::to_vec_named(&observed).expect("durable worker candidate");
+    let reloaded: DataUsageCache = rmp_serde::from_slice(&bytes).expect("reload worker candidate");
+    assert!(!reloaded.info.snapshot_complete);
+    assert!(!reloaded.info.lkg_snapshot_complete);
+    assert_eq!(
+        reloaded
+            .completed_bucket_observation()
+            .expect("retained observation")
+            .entry
+            .objects,
+        3
+    );
 }
 
 #[tokio::test]
@@ -487,6 +732,10 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
             parent,
             budget,
             RemoteScannerScanSpec {
+                supports_durable_progress: false,
+                supports_complete_observation: false,
+                usage_watch: None,
+                checkpoint_identity: None,
                 bucket: "bucket",
                 next_cycle: 7,
                 leader_epoch: 9,
@@ -825,6 +1074,11 @@ async fn terminal_frame_without_eof_still_obeys_rpc_deadline() {
         parent,
         budget,
         RemoteScannerResponseExpectation {
+            supports_durable_progress: false,
+            supports_complete_observation: false,
+            checkpoint_identity: None,
+            checkpoint_plan_digest: TEST_PLAN_DIGEST,
+            leader_epoch: 0,
             bucket: "bucket",
             source: TEST_SOURCE,
             next_cycle: TEST_NEXT_CYCLE,
@@ -1431,6 +1685,11 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
         parent,
         budget.clone(),
         RemoteScannerResponseExpectation {
+            supports_durable_progress: false,
+            supports_complete_observation: false,
+            checkpoint_identity: None,
+            checkpoint_plan_digest: TEST_PLAN_DIGEST,
+            leader_epoch: 0,
             bucket: "bucket",
             source: TEST_SOURCE,
             next_cycle: TEST_NEXT_CYCLE,
@@ -2410,6 +2669,11 @@ async fn namespace_decode_denial_keeps_previously_reported_progress() {
         budget.token(),
         budget.clone(),
         RemoteScannerResponseExpectation {
+            supports_durable_progress: false,
+            supports_complete_observation: false,
+            checkpoint_identity: None,
+            checkpoint_plan_digest: TEST_PLAN_DIGEST,
+            leader_epoch: 0,
             bucket: "bucket",
             source: TEST_SOURCE,
             next_cycle: 7,
@@ -2561,4 +2825,25 @@ async fn background_envelope_accepts_the_full_wire_limit_and_matches_none() {
     );
     assert_eq!((foreground_sequence, background_sequence), (1, 1));
     assert_eq!(owner.snapshot().used, 0);
+}
+
+#[path = "durable_progress.rs"]
+mod durable_progress;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn remote_usage_watch_worker_rejects_another_storage_instance_with_identical_coordinates() {
+    let (_first_directory, first) = crate::scanner_io::tests::setup_local_scanner_store(1, 4).await;
+    let (_second_directory, second) = crate::scanner_io::tests::setup_local_scanner_store(1, 4).await;
+    let first_set = first.pools[0].disk_set[0].clone();
+    let second_set = second.pools[0].disk_set[0].clone();
+    let first_disks = scanner_set_disk_inventory(&first_set).await;
+    let second_disks = scanner_set_disk_inventory(&second_set).await;
+    let first_source = cache_source_for_disk(&first_disks[0]).expect("first source");
+    let second_source = cache_source_for_disk(&second_disks[0]).expect("second source");
+    assert_eq!(first_source.pool_index, second_source.pool_index);
+    assert_eq!(first_source.set_index, second_source.set_index);
+    assert!(remote_disk_belongs_to_set(&first_disks[0], &first_set).await);
+    assert!(!remote_disk_belongs_to_set(&first_disks[0], &second_set).await);
+    assert!(remote_disk_belongs_to_set(&second_disks[0], &second_set).await);
 }

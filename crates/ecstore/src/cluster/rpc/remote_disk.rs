@@ -1221,6 +1221,15 @@ impl RemoteDisk {
     }
 
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        Ok(self
+            .ns_scanner_progress_capability()
+            .await?
+            .map(|capability| capability.server_epoch))
+    }
+
+    pub(crate) async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
@@ -1228,6 +1237,9 @@ impl RemoteDisk {
             endpoint: self.endpoint.grid_host(),
             supports_tier_registry_generation: true,
             supports_checkpoint_coverage: true,
+            supports_durable_progress: true,
+            supports_complete_observation: true,
+            supports_usage_watch: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
@@ -1238,7 +1250,12 @@ impl RemoteDisk {
                 if response.supports_tier_registry_generation == Some(true)
                     && response.supports_checkpoint_coverage == Some(true) =>
             {
-                Ok(Some(response.server_epoch))
+                Ok(Some(crate::storage_api_contracts::internode::NsScannerCapabilities {
+                    server_epoch: response.server_epoch,
+                    supports_durable_progress: response.supports_durable_progress == Some(true),
+                    supports_complete_observation: response.supports_complete_observation == Some(true),
+                    supports_usage_watch: response.usage_watch_proof.is_some(),
+                }))
             }
             Ok(_) => Ok(None),
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
@@ -7065,6 +7082,9 @@ mod tests {
                 proof: Vec::new(),
                 supports_tier_registry_generation,
                 supports_checkpoint_coverage: *self.ns_scanner_checkpoint_support.lock().expect("checkpoint capability lock"),
+                supports_durable_progress: None,
+                supports_complete_observation: None,
+                usage_watch_proof: None,
             })
         }
 

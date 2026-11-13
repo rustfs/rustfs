@@ -3081,6 +3081,42 @@ impl NotificationSys {
         Ok(true)
     }
 
+    /// Query exactly the requested peers and buckets. Missing peers and old
+    /// protocol endpoints fail the query instead of fabricating clean entries.
+    pub async fn scanner_usage_watches(
+        &self,
+        requests: Vec<(String, uuid::Uuid, Vec<crate::runtime::usage_watch::ScannerUsageWatchRequest>)>,
+    ) -> Result<Vec<(String, Vec<crate::runtime::usage_watch::ScannerUsageWatchObservation>)>> {
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut seen = std::collections::HashSet::new();
+        let mut futures = Vec::with_capacity(requests.len());
+        for (host, owner, entries) in requests {
+            if !seen.insert(host.clone()) {
+                return Err(Error::other("duplicate usage watch peer"));
+            }
+            let client = clients
+                .get(&host)
+                .cloned()
+                .ok_or_else(|| Error::other("usage watch peer is not reachable"))?;
+            futures.push(async move {
+                let observations = timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_usage_watch(owner, entries))
+                    .await
+                    .map_err(|_| Error::other("usage watch peer timed out"))??;
+                Ok::<_, Error>((host, observations))
+            });
+        }
+        let mut results = Vec::with_capacity(futures.len());
+        for result in join_all(futures).await {
+            results.push(result?);
+        }
+        Ok(results)
+    }
+
     pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<ScannerDirtyUsageAcknowledgement>) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
         for acknowledgement in acknowledgements {

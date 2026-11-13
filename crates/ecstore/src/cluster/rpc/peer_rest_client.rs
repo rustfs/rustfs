@@ -97,6 +97,7 @@ const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
 const SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+const SCANNER_USAGE_WATCH_PEER_CONCURRENCY: usize = 4;
 /// Reserve time for the acquire response's network/clock uncertainty.  The
 /// server owns the real expiry; this local deadline is intentionally earlier
 /// so a coordinator never starts a bounded persistence operation at the edge
@@ -296,6 +297,22 @@ fn scanner_scoped_dirty_usage_ack_payload(
     };
     canonical_scoped_dirty_usage_request(&payload).map_err(|err| Error::other(err.to_string()))?;
     Ok(payload)
+}
+
+/// Authentication binds a response to the complete current request before any
+/// returned watch can be consumed. Semantic validation still rejects a signed
+/// response for the wrong producer session, bucket, or token.
+fn validate_scanner_usage_watch_response(
+    request: &rustfs_protos::proto_gen::node_service::ScannerUsageWatchRequest,
+    response: &rustfs_protos::proto_gen::node_service::ScannerUsageWatchResponse,
+) -> Result<()> {
+    use rustfs_protos::usage_watch::{
+        canonical_usage_watch_request, canonical_usage_watch_response, validate_usage_watch_response,
+    };
+    let canonical = canonical_usage_watch_request(request).map_err(|error| Error::other(error.to_string()))?;
+    let body = canonical_usage_watch_response(&canonical, response).map_err(|error| Error::other(error.to_string()))?;
+    verify_tonic_rpc_response_proof(&body, response.response_proof.as_ref())?;
+    validate_usage_watch_response(request, response).map_err(|error| Error::other(error.to_string()))
 }
 
 fn scanner_scoped_dirty_usage_ack_response_matches(
@@ -741,6 +758,9 @@ pub struct PeerRestClient {
     topology_member: String,
     offline: Arc<AtomicBool>,
     recovery_running: Arc<AtomicBool>,
+    /// All clones used by admission, keepalive and root verification share
+    /// this peer's bounded sender capacity.
+    scanner_usage_watch_admission: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -900,7 +920,18 @@ impl PeerRestClient {
             topology_member,
             offline: Arc::new(AtomicBool::new(false)),
             recovery_running: Arc::new(AtomicBool::new(false)),
+            scanner_usage_watch_admission: Arc::new(tokio::sync::Semaphore::new(SCANNER_USAGE_WATCH_PEER_CONCURRENCY)),
         }
+    }
+
+    async fn acquire_usage_watch_send_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        timeout(
+            SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT,
+            self.scanner_usage_watch_admission.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::other("usage watch sender admission timed out"))?
+        .map_err(|_| Error::other("usage watch sender admission is closed"))
     }
 
     fn parse_topology_host(peer_host_port: &str, grid_host: &str) -> Result<XHost> {
@@ -2429,6 +2460,129 @@ impl PeerRestClient {
         .await
     }
 
+    /// Independently negotiated bucket watches; an old peer returns an error
+    /// and callers retain the global-generation fallback for that bucket.
+    pub async fn scanner_usage_watch(
+        &self,
+        owner_id: Uuid,
+        mut entries: Vec<crate::runtime::usage_watch::ScannerUsageWatchRequest>,
+    ) -> Result<Vec<crate::runtime::usage_watch::ScannerUsageWatchObservation>> {
+        use crate::runtime::usage_watch::{
+            SCANNER_USAGE_WATCH_COVERAGE_VERSION, SCANNER_USAGE_WATCH_LEASE_MS, ScannerUsageWatchKnown,
+            ScannerUsageWatchObservation,
+        };
+        use rustfs_protos::proto_gen::node_service::{ScannerUsageWatchEntry, ScannerUsageWatchRequest};
+        use rustfs_protos::usage_watch::*;
+        entries.sort_by(|left, right| left.bucket.cmp(&right.bucket));
+        if owner_id.is_nil() || entries.windows(2).any(|pair| pair[0].bucket == pair[1].bucket) {
+            return Err(Error::other("usage watch request contains duplicate buckets or an invalid owner"));
+        }
+        // Local queue pressure is not a network failure. Keep admission errors
+        // outside finalize_result so they cannot mark a healthy peer offline.
+        let _send_permit = self.acquire_usage_watch_send_permit().await?;
+        self.finalize_result(
+            async {
+                let mut client = super::client::scanner_control_time_out_client(
+                    &self.grid_host,
+                    TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                )
+                .await?;
+                let mut observations = Vec::with_capacity(entries.len());
+                for batch in entries.chunks(USAGE_WATCH_MAX_ENTRIES) {
+                    let payload = ScannerUsageWatchRequest {
+                        challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+                        protocol_version: USAGE_WATCH_PROTOCOL_VERSION,
+                        owner_id: owner_id.to_string(),
+                        entries: batch
+                            .iter()
+                            .map(|entry| ScannerUsageWatchEntry {
+                                bucket: entry.bucket.clone(),
+                                bucket_incarnation: entry.bucket_incarnation.as_bytes().to_vec().into(),
+                                watch_id: entry.watch_id.map_or_else(Bytes::new, |id| id.as_bytes().to_vec().into()),
+                                release: entry.release,
+                                session_id: entry.session_id.map_or_else(Bytes::new, |id| id.as_bytes().to_vec().into()),
+                            })
+                            .collect(),
+                    };
+                    let canonical = canonical_usage_watch_request(&payload).map_err(|error| Error::other(error.to_string()))?;
+                    let mut request = Request::new(payload.clone());
+                    set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                    let started = std::time::Instant::now();
+                    let response = timeout(SCANNER_SCOPED_DIRTY_USAGE_STAGE_TIMEOUT, client.scanner_usage_watch(request))
+                        .await
+                        .map_err(|_| Error::other("usage watch request timed out"))??
+                        .into_inner();
+                    let budget_used = u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(250);
+                    validate_scanner_usage_watch_response(&payload, &response)?;
+                    let session = Uuid::from_slice(response.session_id.as_ref())
+                        .map_err(|_| Error::other("invalid usage watch session"))?;
+                    if response.protocol_version != USAGE_WATCH_PROTOCOL_VERSION
+                        || response.owner_id != payload.owner_id
+                        || session.is_nil()
+                        || response.entries.len() != payload.entries.len()
+                    {
+                        return Err(Error::other("usage watch response does not match request"));
+                    }
+                    for (requested, entry) in batch.iter().zip(response.entries) {
+                        if entry.bucket != requested.bucket {
+                            return Err(Error::other("usage watch response bucket order differs"));
+                        }
+                        let known = if entry.known {
+                            let token = Uuid::from_slice(entry.watch_id.as_ref())
+                                .map_err(|_| Error::other("invalid usage watch token"))?;
+                            if token.is_nil()
+                                || entry.bucket_incarnation.as_ref() != requested.bucket_incarnation.as_bytes()
+                                || requested.watch_id.is_some_and(|expected| expected != token)
+                                || entry.revision == 0
+                                || entry.revision == u64::MAX
+                                || entry.inflight == u64::MAX
+                                || entry.coverage_version != SCANNER_USAGE_WATCH_COVERAGE_VERSION
+                                || entry.coverage_epoch == 0
+                                || entry.lease_remaining_ms == 0
+                                || entry.lease_remaining_ms > SCANNER_USAGE_WATCH_LEASE_MS
+                            {
+                                return Err(Error::other("usage watch response contains an invalid proof"));
+                            }
+                            let lease_remaining_ms = entry.lease_remaining_ms.saturating_sub(budget_used);
+                            (lease_remaining_ms != 0).then_some(ScannerUsageWatchKnown {
+                                owner_id,
+                                session_id: session,
+                                watch_id: token,
+                                bucket_incarnation: requested.bucket_incarnation,
+                                revision: entry.revision,
+                                inflight: entry.inflight,
+                                coverage_version: entry.coverage_version,
+                                coverage_epoch: entry.coverage_epoch,
+                                lease_remaining_ms,
+                            })
+                        } else {
+                            if !entry.watch_id.is_empty()
+                                || !entry.bucket_incarnation.is_empty()
+                                || entry.revision != 0
+                                || entry.inflight != 0
+                                || entry.coverage_version != 0
+                                || entry.coverage_epoch != 0
+                                || entry.lease_remaining_ms != 0
+                            {
+                                return Err(Error::other("Unknown usage watch entry contains proof fields"));
+                            }
+                            None
+                        };
+                        observations.push(ScannerUsageWatchObservation {
+                            bucket: entry.bucket,
+                            known,
+                        });
+                    }
+                }
+                Ok(observations)
+            }
+            .await,
+        )
+        .await
+    }
+
     pub async fn acknowledge_scanner_scoped_dirty_usage(
         &self,
         owner_id: String,
@@ -3261,6 +3415,74 @@ mod tests {
             },
             "http://127.0.0.1:9000".to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn usage_watch_client_clones_share_receiver_sized_send_admission() {
+        let receiver = Arc::new(tokio::sync::Semaphore::new(4));
+        let occupied = (0..4)
+            .map(|_| receiver.clone().try_acquire_owned().expect("four receiver slots"))
+            .collect::<Vec<_>>();
+        assert!(receiver.try_acquire().is_err(), "an uncoordinated fifth request is rejected");
+        drop(occupied);
+
+        let client = test_peer_client();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks = (0..12).map(|_| {
+            // Simulate the shared client's independent admission, keeper and
+            // publication callers. Each uses the actual production gate.
+            let client = client.clone();
+            let receiver = receiver.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                let _send = client
+                    .acquire_usage_watch_send_permit()
+                    .await
+                    .expect("bounded sender admission");
+                let _receive = receiver
+                    .try_acquire_owned()
+                    .expect("coexisting client clones must never send more than the receiver's four slots");
+                let count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(count, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                active.fetch_sub(1, Ordering::AcqRel);
+            })
+        });
+        for result in futures::future::join_all(tasks).await {
+            result.expect("all queued callers finish");
+        }
+        assert_eq!(peak.load(Ordering::Acquire), 4);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(client.scanner_usage_watch_admission.available_permits(), 4);
+        assert_eq!(receiver.available_permits(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_watch_sender_queue_timeout_does_not_mark_the_peer_offline() {
+        let client = test_peer_client();
+        let _occupied = client
+            .scanner_usage_watch_admission
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let result = client
+            .scanner_usage_watch(
+                Uuid::from_u128(1),
+                vec![crate::runtime::usage_watch::ScannerUsageWatchRequest {
+                    bucket: "bucket".into(),
+                    bucket_incarnation: Uuid::from_u128(2),
+                    watch_id: None,
+                    session_id: None,
+                    release: false,
+                }],
+            )
+            .await;
+        assert!(result.unwrap_err().to_string().contains("sender admission timed out"));
+        assert!(!client.offline.load(Ordering::Acquire));
+        assert!(!client.recovery_running.load(Ordering::Acquire));
     }
 
     fn decode_test_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerPeerActivity> {
@@ -4336,6 +4558,112 @@ mod tests {
 
         assert!(err.to_string().contains("exceeds size limit"));
         assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn usage_watch_consumer_authenticates_the_current_request_and_rejects_replay() {
+        use rustfs_protos::proto_gen::node_service::{
+            ScannerUsageWatchEntry, ScannerUsageWatchRequest, ScannerUsageWatchResponse, ScannerUsageWatchResult,
+        };
+        use rustfs_protos::usage_watch::{canonical_usage_watch_request, canonical_usage_watch_response};
+
+        runtime_sources::ensure_test_rpc_secret();
+        let request = ScannerUsageWatchRequest {
+            challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+            protocol_version: 1,
+            owner_id: Uuid::new_v4().to_string(),
+            entries: vec![ScannerUsageWatchEntry {
+                bucket: "usage-watch".into(),
+                bucket_incarnation: Uuid::new_v4().as_bytes().to_vec().into(),
+                watch_id: Uuid::new_v4().as_bytes().to_vec().into(),
+                session_id: Uuid::new_v4().as_bytes().to_vec().into(),
+                release: false,
+            }],
+        };
+        let sign = |request: &ScannerUsageWatchRequest, response: &mut ScannerUsageWatchResponse| {
+            let canonical = canonical_usage_watch_request(request).expect("valid request to sign");
+            let body = canonical_usage_watch_response(&canonical, response).expect("bounded canonical watch response");
+            response.response_proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(&body)
+                .expect("real response HMAC")
+                .into();
+        };
+        let mut response = ScannerUsageWatchResponse {
+            protocol_version: 1,
+            owner_id: request.owner_id.clone(),
+            session_id: request.entries[0].session_id.clone(),
+            entries: vec![ScannerUsageWatchResult {
+                bucket: request.entries[0].bucket.clone(),
+                known: true,
+                bucket_incarnation: request.entries[0].bucket_incarnation.clone(),
+                watch_id: request.entries[0].watch_id.clone(),
+                revision: 7,
+                inflight: 0,
+                coverage_version: 1,
+                coverage_epoch: 3,
+                lease_remaining_ms: 60_000,
+            }],
+            response_proof: Bytes::new(),
+        };
+        sign(&request, &mut response);
+        validate_scanner_usage_watch_response(&request, &response).expect("current request accepts its signed response");
+
+        let mut rejected_replays = 0;
+        for field in 0..8 {
+            let mut current = request.clone();
+            match field {
+                0 => current.challenge = Uuid::new_v4().as_bytes().to_vec().into(),
+                1 => current.owner_id = Uuid::new_v4().to_string(),
+                2 => current.entries[0].bucket.push('x'),
+                3 => current.entries[0].bucket_incarnation = Uuid::new_v4().as_bytes().to_vec().into(),
+                4 => current.entries[0].watch_id = Uuid::new_v4().as_bytes().to_vec().into(),
+                5 => current.entries[0].session_id = Uuid::new_v4().as_bytes().to_vec().into(),
+                6 => current.entries[0].release = true,
+                _ => current.protocol_version += 1,
+            }
+            assert!(
+                validate_scanner_usage_watch_response(&current, &response).is_err(),
+                "a previously signed response must not authorize request mutation {field}"
+            );
+            rejected_replays += 1;
+        }
+        let mut tampered = response.clone();
+        tampered.entries[0].revision += 1;
+        assert!(validate_scanner_usage_watch_response(&request, &tampered).is_err());
+        let mut unsigned = response.clone();
+        unsigned.response_proof = Bytes::new();
+        assert!(validate_scanner_usage_watch_response(&request, &unsigned).is_err());
+
+        let mut rejected_signed_mismatches = 0;
+        for field in 0..5 {
+            let mut mismatched = response.clone();
+            match field {
+                0 => mismatched.owner_id = Uuid::new_v4().to_string(),
+                1 => mismatched.session_id = Uuid::new_v4().as_bytes().to_vec().into(),
+                2 => mismatched.entries[0].bucket_incarnation = Uuid::new_v4().as_bytes().to_vec().into(),
+                3 => mismatched.entries[0].watch_id = Uuid::new_v4().as_bytes().to_vec().into(),
+                _ => mismatched.entries[0].known = false,
+            }
+            sign(&request, &mut mismatched);
+            assert!(
+                validate_scanner_usage_watch_response(&request, &mismatched).is_err(),
+                "an authentic HMAC cannot replace requested watch identity or authorize malformed Unknown: {field}"
+            );
+            rejected_signed_mismatches += 1;
+        }
+        println!(
+            "usage_assertion: {}",
+            serde_json::json!({
+                "case_id": "USAGE-12", "assertion_id": "USAGE-12-A07", "status": "PASS",
+                "evidence": {"current_response_authenticated": true, "replayed_requests_rejected": rejected_replays,
+                    "signed_identity_mismatches_rejected": rejected_signed_mismatches,
+                    "tampered_response_rejected": true, "missing_hmac_rejected": true}
+            })
+        );
+        drop((request, response, tampered, unsigned));
+        println!(
+            "usage_cleanup: {}",
+            serde_json::json!({"case_id": "USAGE-12", "status": "PASS", "scope": "process-local"})
+        );
     }
 
     #[test]

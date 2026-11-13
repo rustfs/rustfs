@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::resolve_scanner_server_config;
-use crate::scanner_budget::ScannerCycleBudgetConfig;
+use crate::scanner_budget::{ScannerBucketQuantum, ScannerCycleBudgetConfig};
 use crate::sleeper::{SCANNER_SLEEPER, ScannerDiskIoBudgetConfig, ScannerIoBudgetLimit, scanner_default_speed};
 use rustfs_config::{
     DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
@@ -36,6 +36,14 @@ use rustfs_config::{
     SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
     SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
     server_config::{Config as ServerConfig, KVS},
+};
+use rustfs_config::{
+    DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES, DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS,
+    DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES, DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES, DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS,
+    ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES, ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS, ENV_SCANNER_BUCKET_QUANTUM_ENTRIES,
+    ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES, ENV_SCANNER_BUCKET_QUANTUM_OBJECTS, SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+    SCANNER_BUCKET_QUANTUM_DURATION, SCANNER_BUCKET_QUANTUM_ENTRIES, SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+    SCANNER_BUCKET_QUANTUM_OBJECTS,
 };
 use serde::Serialize;
 use std::fmt;
@@ -105,6 +113,11 @@ pub(crate) struct ScannerRuntimeConfig {
     pub(crate) cycle_max_duration_source: ScannerRuntimeConfigSource,
     pub(crate) cycle_max_objects_source: ScannerRuntimeConfigSource,
     pub(crate) cycle_max_directories_source: ScannerRuntimeConfigSource,
+    pub(crate) bucket_quantum_duration_source: ScannerRuntimeConfigSource,
+    pub(crate) bucket_quantum_objects_source: ScannerRuntimeConfigSource,
+    pub(crate) bucket_quantum_directories_source: ScannerRuntimeConfigSource,
+    pub(crate) bucket_quantum_entries_source: ScannerRuntimeConfigSource,
+    pub(crate) bucket_quantum_name_bytes_source: ScannerRuntimeConfigSource,
     pub(crate) cache_save_timeout: Duration,
     pub(crate) cache_save_timeout_source: ScannerRuntimeConfigSource,
     pub(crate) recovery_backoff_cap: Duration,
@@ -155,6 +168,11 @@ impl Default for ScannerRuntimeConfig {
             cycle_max_duration_source: ScannerRuntimeConfigSource::Default,
             cycle_max_objects_source: ScannerRuntimeConfigSource::Default,
             cycle_max_directories_source: ScannerRuntimeConfigSource::Default,
+            bucket_quantum_duration_source: ScannerRuntimeConfigSource::Default,
+            bucket_quantum_objects_source: ScannerRuntimeConfigSource::Default,
+            bucket_quantum_directories_source: ScannerRuntimeConfigSource::Default,
+            bucket_quantum_entries_source: ScannerRuntimeConfigSource::Default,
+            bucket_quantum_name_bytes_source: ScannerRuntimeConfigSource::Default,
             cache_save_timeout: Duration::from_secs(DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS),
             cache_save_timeout_source: ScannerRuntimeConfigSource::Default,
             recovery_backoff_cap: Duration::from_secs(DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS),
@@ -209,6 +227,11 @@ pub struct ScannerRuntimeConfigStatus {
     pub cycle_max_duration_seconds: ScannerRuntimeConfigValue<Option<u64>>,
     pub cycle_max_objects: ScannerRuntimeConfigValue<Option<u64>>,
     pub cycle_max_directories: ScannerRuntimeConfigValue<Option<u64>>,
+    pub bucket_quantum_duration_seconds: ScannerRuntimeConfigValue<Option<u64>>,
+    pub bucket_quantum_objects: ScannerRuntimeConfigValue<Option<u64>>,
+    pub bucket_quantum_directories: ScannerRuntimeConfigValue<Option<u64>>,
+    pub bucket_quantum_entries: ScannerRuntimeConfigValue<Option<u64>>,
+    pub bucket_quantum_name_bytes: ScannerRuntimeConfigValue<Option<u64>>,
     pub cache_save_timeout_seconds: ScannerRuntimeConfigValue<u64>,
     pub recovery_backoff_cap_seconds: ScannerRuntimeConfigValue<u64>,
     pub max_concurrent_set_scans: ScannerRuntimeConfigValue<usize>,
@@ -437,6 +460,23 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
     }
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
+    validate_persisted_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_DURATION,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS,
+    )?;
+    validate_persisted_bucket_quantum_limit(scanner_kvs, SCANNER_BUCKET_QUANTUM_OBJECTS, DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS)?;
+    validate_persisted_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+    )?;
+    validate_persisted_bucket_quantum_limit(scanner_kvs, SCANNER_BUCKET_QUANTUM_ENTRIES, DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES)?;
+    validate_persisted_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+    )?;
     if let Some(value) = config_value(heal_kvs, HEAL_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
         parse_config_bitrot_cycle(HEAL_BITROT_CYCLE, value)?;
     }
@@ -636,6 +676,48 @@ fn lookup_start_delay(kvs: Option<&KVS>) -> Result<(Option<Duration>, ScannerRun
     Ok((None, ScannerRuntimeConfigSource::Default))
 }
 
+fn validate_persisted_bucket_quantum_limit(
+    kvs: Option<&KVS>,
+    key: &'static str,
+    default: u64,
+) -> Result<Option<u64>, ScannerRuntimeConfigError> {
+    let count = config_value(kvs, key, default)
+        .map(|value| parse_config_u64(key, value))
+        .transpose()?;
+    if key == SCANNER_BUCKET_QUANTUM_DURATION {
+        cycle_duration_from_secs(key, count.unwrap_or(default))?;
+    }
+    Ok(count)
+}
+
+fn lookup_bucket_quantum_limit(
+    kvs: Option<&KVS>,
+    key: &'static str,
+    env_key: &'static str,
+    default: u64,
+) -> Result<(Option<u64>, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
+    // An environment override must not hide an invalid durable control.
+    let persisted = validate_persisted_bucket_quantum_limit(kvs, key, default)?;
+    let (count, source) = match rustfs_utils::get_env_parse_outcome::<u64>(env_key) {
+        rustfs_utils::EnvParseOutcome::Parsed(count) => (count, ScannerRuntimeConfigSource::Env),
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            return Err(invalid_value(env_key, "<invalid>", "expected an unsigned integer limit"));
+        }
+        rustfs_utils::EnvParseOutcome::Absent => persisted.map_or((default, ScannerRuntimeConfigSource::Default), |count| {
+            (count, ScannerRuntimeConfigSource::Config)
+        }),
+    };
+    if key == SCANNER_BUCKET_QUANTUM_DURATION {
+        let source_key = if source == ScannerRuntimeConfigSource::Env {
+            env_key
+        } else {
+            key
+        };
+        cycle_duration_from_secs(source_key, count)?;
+    }
+    Ok(((count != 0).then_some(count), source))
+}
+
 fn lookup_count_budget(
     kvs: Option<&KVS>,
     key: &'static str,
@@ -739,10 +821,48 @@ pub(crate) fn lookup_scanner_runtime_config(
         ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
         DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES,
     )?;
+    let (bucket_quantum_duration, bucket_quantum_duration_source) = lookup_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_DURATION,
+        ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS,
+    )?;
+    let (bucket_quantum_objects, bucket_quantum_objects_source) = lookup_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_OBJECTS,
+        ENV_SCANNER_BUCKET_QUANTUM_OBJECTS,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS,
+    )?;
+    let (bucket_quantum_directories, bucket_quantum_directories_source) = lookup_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+        ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+    )?;
+    let (bucket_quantum_entries, bucket_quantum_entries_source) = lookup_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_ENTRIES,
+        ENV_SCANNER_BUCKET_QUANTUM_ENTRIES,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES,
+    )?;
+    let (bucket_quantum_name_bytes, bucket_quantum_name_bytes_source) = lookup_bucket_quantum_limit(
+        scanner_kvs,
+        SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+        ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+        DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+    )?;
+    let bucket_quantum = ScannerBucketQuantum {
+        max_duration: bucket_quantum_duration.map(Duration::from_secs),
+        max_objects: bucket_quantum_objects,
+        max_directories: bucket_quantum_directories,
+        max_entries: bucket_quantum_entries,
+        max_entry_name_bytes: bucket_quantum_name_bytes,
+    };
     let cycle_budget = ScannerCycleBudgetConfig {
         max_duration: cycle_max_duration.filter(|duration| !duration.is_zero()),
         max_objects: cycle_max_objects,
         max_directories: cycle_max_directories,
+        bucket_quantum: (bucket_quantum != ScannerBucketQuantum::default()).then_some(bucket_quantum),
         ..Default::default()
     };
 
@@ -833,6 +953,11 @@ pub(crate) fn lookup_scanner_runtime_config(
         cycle_max_duration_source,
         cycle_max_objects_source,
         cycle_max_directories_source,
+        bucket_quantum_duration_source,
+        bucket_quantum_objects_source,
+        bucket_quantum_directories_source,
+        bucket_quantum_entries_source,
+        bucket_quantum_name_bytes_source,
         cache_save_timeout: Duration::from_secs(cache_save_timeout.max(1)),
         cache_save_timeout_source,
         recovery_backoff_cap,
@@ -1004,6 +1129,33 @@ pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
             value: config.cycle_budget.max_directories,
             source: config.cycle_max_directories_source,
         },
+        bucket_quantum_duration_seconds: ScannerRuntimeConfigValue {
+            value: config
+                .cycle_budget
+                .bucket_quantum
+                .and_then(|quantum| quantum.max_duration)
+                .map(|duration| duration.as_secs()),
+            source: config.bucket_quantum_duration_source,
+        },
+        bucket_quantum_objects: ScannerRuntimeConfigValue {
+            value: config.cycle_budget.bucket_quantum.and_then(|quantum| quantum.max_objects),
+            source: config.bucket_quantum_objects_source,
+        },
+        bucket_quantum_directories: ScannerRuntimeConfigValue {
+            value: config.cycle_budget.bucket_quantum.and_then(|quantum| quantum.max_directories),
+            source: config.bucket_quantum_directories_source,
+        },
+        bucket_quantum_entries: ScannerRuntimeConfigValue {
+            value: config.cycle_budget.bucket_quantum.and_then(|quantum| quantum.max_entries),
+            source: config.bucket_quantum_entries_source,
+        },
+        bucket_quantum_name_bytes: ScannerRuntimeConfigValue {
+            value: config
+                .cycle_budget
+                .bucket_quantum
+                .and_then(|quantum| quantum.max_entry_name_bytes),
+            source: config.bucket_quantum_name_bytes_source,
+        },
         cache_save_timeout_seconds: ScannerRuntimeConfigValue {
             value: config.cache_save_timeout.as_secs(),
             source: config.cache_save_timeout_source,
@@ -1097,6 +1249,12 @@ pub(crate) fn scanner_alert_excess_folders() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES, ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS, ENV_SCANNER_BUCKET_QUANTUM_ENTRIES,
+        ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES, ENV_SCANNER_BUCKET_QUANTUM_OBJECTS, SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+        SCANNER_BUCKET_QUANTUM_DURATION, SCANNER_BUCKET_QUANTUM_ENTRIES, SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+        SCANNER_BUCKET_QUANTUM_OBJECTS,
+    };
     use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
     use crate::init_ecstore_config_for_scanner_tests;
     use crate::sleeper::ScannerIoBudgetLimit;
@@ -1327,6 +1485,154 @@ mod tests {
             let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
             assert_eq!(resolved.cycle_budget.max_duration, None);
             assert_eq!(resolved.cycle_max_duration_source, ScannerRuntimeConfigSource::Config);
+        });
+    }
+
+    const QUANTUM_KEYS: [(&str, &str); 5] = [
+        (SCANNER_BUCKET_QUANTUM_DURATION, ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS),
+        (SCANNER_BUCKET_QUANTUM_OBJECTS, ENV_SCANNER_BUCKET_QUANTUM_OBJECTS),
+        (SCANNER_BUCKET_QUANTUM_DIRECTORIES, ENV_SCANNER_BUCKET_QUANTUM_DIRECTORIES),
+        (SCANNER_BUCKET_QUANTUM_ENTRIES, ENV_SCANNER_BUCKET_QUANTUM_ENTRIES),
+        (SCANNER_BUCKET_QUANTUM_NAME_BYTES, ENV_SCANNER_BUCKET_QUANTUM_NAME_BYTES),
+    ];
+
+    #[test]
+    #[serial]
+    fn bucket_quantum_defaults_remain_disabled_and_all_dimensions_are_configurable() {
+        temp_env::with_vars(QUANTUM_KEYS.map(|(_, env)| (env, None::<&str>)), || {
+            let defaults = lookup_scanner_runtime_config(None).expect("default quantum config");
+            assert_eq!(defaults.cycle_budget.bucket_quantum, None);
+            assert_eq!(super::ScannerRuntimeConfig::default().cycle_budget.bucket_quantum, None);
+
+            let config = server_config_with_scanner(&[
+                (SCANNER_BUCKET_QUANTUM_DURATION, "2"),
+                (SCANNER_BUCKET_QUANTUM_OBJECTS, "17"),
+                (SCANNER_BUCKET_QUANTUM_DIRECTORIES, "3"),
+                (SCANNER_BUCKET_QUANTUM_ENTRIES, "128"),
+                (SCANNER_BUCKET_QUANTUM_NAME_BYTES, "4096"),
+            ]);
+            validate_scanner_runtime_config(&config).expect("registered quantum controls");
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("persisted quantum config");
+            assert_eq!(
+                resolved.cycle_budget.bucket_quantum,
+                Some(super::ScannerBucketQuantum {
+                    max_duration: Some(Duration::from_secs(2)),
+                    max_objects: Some(17),
+                    max_directories: Some(3),
+                    max_entries: Some(128),
+                    max_entry_name_bytes: Some(4096),
+                })
+            );
+            for source in [
+                resolved.bucket_quantum_duration_source,
+                resolved.bucket_quantum_objects_source,
+                resolved.bucket_quantum_directories_source,
+                resolved.bucket_quantum_entries_source,
+                resolved.bucket_quantum_name_bytes_source,
+            ] {
+                assert_eq!(source, ScannerRuntimeConfigSource::Config);
+            }
+            for (key, _) in QUANTUM_KEYS {
+                let config = server_config_with_scanner(&[(key, "1")]);
+                let quantum = lookup_scanner_runtime_config(Some(&config))
+                    .expect("single dimension quantum")
+                    .cycle_budget
+                    .bucket_quantum
+                    .expect("one nonzero dimension enables quantum");
+                assert_eq!(
+                    [
+                        quantum.max_duration.is_some(),
+                        quantum.max_objects.is_some(),
+                        quantum.max_directories.is_some(),
+                        quantum.max_entries.is_some(),
+                        quantum.max_entry_name_bytes.is_some()
+                    ]
+                    .into_iter()
+                    .filter(|value| *value)
+                    .count(),
+                    1
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn bucket_quantum_environment_overrides_and_reports_each_source() {
+        let config = server_config_with_scanner(&QUANTUM_KEYS.map(|(key, _)| (key, "8")));
+        temp_env::with_vars(QUANTUM_KEYS.map(|(_, env)| (env, Some("1"))), || {
+            super::apply_scanner_runtime_config(&config).expect("valid quantum env overrides");
+            let status = super::scanner_runtime_config_status();
+            for field in [
+                status.bucket_quantum_duration_seconds,
+                status.bucket_quantum_objects,
+                status.bucket_quantum_directories,
+                status.bucket_quantum_entries,
+                status.bucket_quantum_name_bytes,
+            ] {
+                assert_eq!(field.value, Some(1));
+                assert_eq!(field.source, ScannerRuntimeConfigSource::Env);
+            }
+            with_var(ENV_SCANNER_BUCKET_QUANTUM_OBJECTS, Some("0"), || {
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("disable one quantum dimension");
+                let quantum = resolved
+                    .cycle_budget
+                    .bucket_quantum
+                    .expect("remaining dimensions stay active");
+                assert_eq!(quantum.max_objects, None);
+                assert_eq!(quantum.max_directories, Some(1));
+                assert_eq!(resolved.bucket_quantum_objects_source, ScannerRuntimeConfigSource::Env);
+            });
+        });
+        temp_env::with_vars(QUANTUM_KEYS.map(|(_, env)| (env, Some("0"))), || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("disable every quantum dimension");
+            assert_eq!(resolved.cycle_budget.bucket_quantum, None);
+        });
+        super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn bucket_quantum_invalid_environment_never_silently_falls_back() {
+        for (key, env) in QUANTUM_KEYS {
+            let config = server_config_with_scanner(&[(key, "7")]);
+            for value in ["-1", "1.5", "secret-invalid-value", "18446744073709551616"] {
+                with_var(env, Some(value), || {
+                    let error = lookup_scanner_runtime_config(Some(&config)).expect_err("invalid quantum env must fail");
+                    assert!(matches!(error, super::ScannerRuntimeConfigError::InvalidValue { key, .. } if key == env));
+                    assert!(!error.to_string().contains("secret-invalid-value"));
+                });
+            }
+        }
+        with_var(ENV_SCANNER_BUCKET_QUANTUM_DURATION_SECS, Some("18446744073709551615"), || {
+            assert!(lookup_scanner_runtime_config(None).is_err(), "timer overflow must fail");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn bucket_quantum_invalid_persisted_control_preserves_applied_configuration() {
+        temp_env::with_vars(QUANTUM_KEYS.map(|(_, env)| (env, Some("1"))), || {
+            let before = super::current_scanner_runtime_config();
+            let generation = super::scanner_runtime_config_generation();
+            for (key, _) in QUANTUM_KEYS {
+                for value in ["-1", "1.5", "invalid", "18446744073709551616"] {
+                    let config = server_config_with_scanner(&[(key, value)]);
+                    assert!(validate_scanner_runtime_config(&config).is_err(), "persisted {key}={value}");
+                    assert!(
+                        lookup_scanner_runtime_config(Some(&config)).is_err(),
+                        "override must not hide {key}={value}"
+                    );
+                    assert!(super::apply_scanner_runtime_config(&config).is_err());
+                    assert_eq!(super::current_scanner_runtime_config(), before);
+                    assert_eq!(super::scanner_runtime_config_generation(), generation);
+                }
+            }
+            let config = server_config_with_scanner(&[(SCANNER_BUCKET_QUANTUM_DURATION, "18446744073709551615")]);
+            assert!(
+                lookup_scanner_runtime_config(Some(&config)).is_err(),
+                "override must not hide a persisted timer overflow"
+            );
         });
     }
 

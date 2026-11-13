@@ -56,6 +56,8 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+const ADMIN_USAGE_INCARNATION_CONCURRENCY: usize = 4;
+const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
 // A scanner save invalidates only the saving process's snapshot cache; every
 // other node sees it only after reloading. A fail-closed usage lookup for a
 // bucket the cached snapshot does not mention at all may reload a copy this
@@ -505,6 +507,7 @@ fn stale_data_usage_persist_reason_for_source(
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+    reject_admin_usage_projection(&data_usage_info)?;
     if data_usage_info.usage_snapshot_converged == Some(false) {
         return Err(Error::other(
             "nonconverged data usage observations cannot replace the quota-authoritative snapshot",
@@ -534,6 +537,7 @@ async fn save_data_usage_in_backend(
     store: Arc<ECStore>,
     expected_publication_epoch: u64,
 ) -> Result<(), Error> {
+    reject_admin_usage_projection(&data_usage_info)?;
     let data =
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
@@ -663,8 +667,9 @@ fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &s
 
     let removed_usage = data_usage_info.buckets_usage.remove(bucket).is_some();
     let removed_size = data_usage_info.bucket_sizes.remove(bucket).is_some();
+    let removed_observation = data_usage_info.usage_snapshot_bucket_observations.remove(bucket).is_some();
 
-    if !removed_usage && !removed_size {
+    if !removed_usage && !removed_size && !removed_observation {
         return false;
     }
 
@@ -816,7 +821,9 @@ fn map_data_usage_metadata_read_error(err: Error, object: &str) -> Error {
 }
 
 fn data_usage_contains_bucket(data_usage_info: &DataUsageInfo, bucket: &str) -> bool {
-    data_usage_info.buckets_usage.contains_key(bucket) || data_usage_info.bucket_sizes.contains_key(bucket)
+    data_usage_info.buckets_usage.contains_key(bucket)
+        || data_usage_info.bucket_sizes.contains_key(bucket)
+        || data_usage_info.usage_snapshot_bucket_observations.contains_key(bucket)
 }
 
 fn advance_data_usage_last_update(data_usage_info: &mut DataUsageInfo) {
@@ -1137,14 +1144,26 @@ fn record_usage_snapshot_decode_failure(operation: &'static str, object: &str, e
 }
 
 fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
-    serde_json::from_slice(buf).map_err(|e| {
+    let mut info: DataUsageInfo = serde_json::from_slice(buf).map_err(|e| {
         Error::other(format!(
             "Failed to deserialize data usage info: {:?} at line {} column {}",
             e.classify(),
             e.line(),
             e.column()
         ))
-    })
+    })?;
+    reject_admin_usage_projection(&info)?;
+    for usage in info.buckets_usage.values_mut() {
+        usage.normalize_usage_provenance();
+    }
+    Ok(info)
+}
+
+fn reject_admin_usage_projection(info: &DataUsageInfo) -> Result<(), Error> {
+    if info.usage_snapshot_admin_projection {
+        return Err(Error::other("admin usage projections cannot be persisted or used as a storage baseline"));
+    }
+    Ok(())
 }
 
 /// Decide which usage snapshot to serve: a primary usage object or its
@@ -1327,6 +1346,9 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
 /// Fill quota-baseline gaps from an observed (nonconverged) snapshot without
 /// overriding any bucket the authoritative baseline already covers.
 fn backfill_degraded_baseline_from_observed(degraded_baseline: &mut HashMap<String, u64>, observed: &DataUsageInfo) {
+    if observed.usage_snapshot_admin_projection {
+        return;
+    }
     for (bucket, usage) in &observed.buckets_usage {
         degraded_baseline.entry(bucket.clone()).or_insert(usage.size);
     }
@@ -1419,6 +1441,7 @@ fn merge_partial_observation_for_admin(mut authoritative: DataUsageInfo, observe
     authoritative.usage_snapshot_converged = Some(false);
     authoritative.usage_snapshot_authoritative_baseline = observed.usage_snapshot_authoritative_baseline;
     authoritative.usage_snapshot_set_states = observed.usage_snapshot_set_states;
+    authoritative.usage_snapshot_bucket_observations = observed.usage_snapshot_bucket_observations;
     authoritative.usage_snapshot_bootstrap_pending = false;
     authoritative.buckets_count = authoritative.buckets_usage.len() as u64;
     authoritative.bucket_sizes = authoritative
@@ -1437,10 +1460,48 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
     let (authoritative, source) = load_data_usage_snapshot(store.clone()).await?;
     // For the one-shot admin view a failed observed read degrades to "no
     // observation", same as before the read was fallible.
-    let observed = load_observed_data_usage_snapshot(store).await.ok().flatten();
+    let observed = load_observed_data_usage_snapshot(store.clone()).await.ok().flatten();
     let (selected, selected_is_current_format) =
         select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
-    Ok(normalize_loaded_data_usage(selected, selected_is_current_format).await.0)
+    let mut response = normalize_loaded_data_usage(selected, selected_is_current_format).await.0;
+    use futures::StreamExt as _;
+    let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
+    let mut incarnations = HashMap::new();
+    {
+        // Display-only identity reads must not serialize every bucket behind a
+        // slow metadata lock while holding the shared admin refresh permit.
+        // The common deadline bounds their total added latency; dropping this
+        // stream cancels all unfinished reads without spawning detached work.
+        // Own the names and store across awaits so this future remains Send
+        // when composed into spawned metrics collectors.
+        let buckets = response
+            .usage_snapshot_bucket_observations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut identities = futures::stream::iter(buckets)
+            .map(move |bucket| {
+                let store = store.clone();
+                async move {
+                    let identity = store.bucket_incarnation_id_from_disk(&bucket).await;
+                    (bucket, identity)
+                }
+            })
+            .buffer_unordered(ADMIN_USAGE_INCARNATION_CONCURRENCY);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some((bucket, identity))) = tokio::time::timeout_at(deadline, identities.next()).await else {
+                break;
+            };
+            // Unavailable, timed-out or recreated buckets retain canonical values.
+            if let Ok(incarnation) = identity
+                && !incarnation.is_nil()
+            {
+                incarnations.insert(bucket, incarnation.to_string());
+            }
+        }
+    }
+    response.project_bucket_observations_for_admin(&incarnations);
+    Ok(response)
 }
 
 fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
@@ -2082,7 +2143,9 @@ where
 fn apply_live_bucket_usage_to_response(data_usage_info: &mut DataUsageInfo, bucket: &str, usage: &BucketUsageInfo) {
     let inserted_bucket = !data_usage_info.buckets_usage.contains_key(bucket);
     data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
-    data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
+    let mut observed = usage.clone();
+    observed.mark_observed();
+    data_usage_info.buckets_usage.insert(bucket.to_string(), observed);
     if inserted_bucket {
         data_usage_info.usage_snapshot_complete = false;
     }
@@ -2774,7 +2837,9 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
         }
 
         added_bucket |= !data_usage_info.buckets_usage.contains_key(bucket);
-        data_usage_info.buckets_usage.insert(bucket.clone(), cached.usage.clone());
+        let mut observed = cached.usage.clone();
+        observed.mark_observed();
+        data_usage_info.buckets_usage.insert(bucket.clone(), observed);
         data_usage_info.bucket_sizes.insert(bucket.clone(), cached.usage.size);
         changed = true;
     }
@@ -3024,6 +3089,7 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 
 #[cfg(test)]
 mod tests {
+    mod companion_projection;
     mod snapshot_projection;
 
     use super::*;

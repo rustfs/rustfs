@@ -85,6 +85,14 @@ impl RemoteScannerBudget {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn remote_scanner_budget_wire_round_trip_for_test(config: ScannerCycleBudgetConfig) -> ScannerCycleBudgetConfig {
+    let bytes = rmp_serde::to_vec_named(&RemoteScannerBudget::from_config(config)).expect("remote budget request wire");
+    rmp_serde::from_slice::<RemoteScannerBudget>(&bytes)
+        .expect("decode actual remote budget wire")
+        .into_config()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RemoteScannerRequestWire {
@@ -99,9 +107,19 @@ pub(super) struct RemoteScannerRequestWire {
     scan_plan_digest: DataUsageScanPlanDigest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
+    #[serde(default, skip_serializing_if = "capability_disabled")]
+    supports_durable_progress: bool,
+    #[serde(default, skip_serializing_if = "capability_disabled")]
+    supports_complete_observation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) usage_watch: Option<Box<crate::scanner_io::ScannerUsageWatchProof>>,
     skip_healing: bool,
     scan_mode: HealScanMode,
     budget: RemoteScannerBudget,
+}
+
+fn capability_disabled(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug)]
@@ -132,6 +150,23 @@ struct RemoteScannerComplete {
     pending_maintenance_work: bool,
 }
 
+/// Only a successful durable cache CAS can produce this terminal receipt.
+/// Progress accounting is separate from bucket usage and never certifies a root.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteScannerDurableProgress {
+    source: DataUsageCacheSource,
+    identity: crate::DataUsageScanIdentity,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    checkpoint_plan_digest: DataUsageScanPlanDigest,
+    leader_epoch: u64,
+    next_cycle: u64,
+    advanced: bool,
+    resource_deferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<Box<crate::DataUsageBucketObservation>>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RemoteScannerErrorScope {
@@ -151,6 +186,7 @@ struct RemoteScannerErrorFrame {
 enum RemoteScannerFrameResult {
     Progress,
     Complete(Box<RemoteScannerComplete>),
+    DurableProgress(Box<RemoteScannerDurableProgress>),
     Partial,
     NamespaceNotFound,
     CycleAhead { required_cycle: u64 },
@@ -200,6 +236,11 @@ struct RemoteScannerFrameEnvelope {
 
 #[derive(Debug)]
 pub(crate) enum RemoteScannerOutcome {
+    DurableProgress {
+        advanced: bool,
+        resource_deferred: bool,
+        observation: Option<Box<crate::DataUsageBucketObservation>>,
+    },
     Complete {
         usage: Box<DataUsageEntryInfo>,
         pending_maintenance_work: bool,
@@ -218,6 +259,10 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
     pub(crate) plans: ScannerBucketPlanDigests,
+    pub(crate) supports_durable_progress: bool,
+    pub(crate) supports_complete_observation: bool,
+    pub(crate) usage_watch: Option<&'a crate::scanner_io::ScannerUsageWatchProof>,
+    pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
     pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
@@ -225,6 +270,11 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
 
 #[derive(Clone, Copy)]
 struct RemoteScannerResponseExpectation<'a> {
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
+    checkpoint_identity: Option<crate::DataUsageScanIdentity>,
+    checkpoint_plan_digest: DataUsageScanPlanDigest,
+    leader_epoch: u64,
     bucket: &'a str,
     source: DataUsageCacheSource,
     next_cycle: u64,
@@ -493,6 +543,90 @@ struct FrameAuthenticator {
     secret: String,
 }
 
+/// Feed the real remote consumer a completed physical fixture root after its
+/// count budget stops. Only the transport and terminal timing are controlled.
+#[cfg(test)]
+pub(crate) async fn write_budget_drain_fixture_frames<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    request_body: &[u8],
+    source: DataUsageCacheSource,
+    mut cache: DataUsageCache,
+    store: Arc<crate::SetDisks>,
+    release_complete: CancellationToken,
+) {
+    let request = decode_remote_scanner_request(request_body)
+        .expect("valid real scanner request")
+        .0;
+    assert!(request.supports_durable_progress || request.supports_complete_observation);
+    assert_eq!(cache.info.name, request.bucket, "the terminal must come from the actual fixture bucket");
+    assert_eq!(cache.info.source, Some(source));
+    assert!(cache.info.snapshot_complete);
+    let identity = cache
+        .info
+        .scan_identity
+        .expect("the physical root carries a durable identity");
+    assert_eq!(
+        store
+            .bucket_incarnation_id_from_disk(&request.bucket)
+            .await
+            .expect("physical bucket incarnation"),
+        identity.bucket_incarnation
+    );
+    // The fixture namespace is quiescent after its real scan. Rebind that exact
+    // root to this request and perform the producer-side cache CAS before a
+    // response may claim completion; no in-memory root stands in for storage.
+    let cache_name = path_join_buf(&[&request.bucket, DATA_USAGE_CACHE_NAME]);
+    let revisions = DataUsageCache::read_revisions(store.clone(), &cache_name)
+        .await
+        .expect("physical root revisions");
+    cache.info.next_cycle = request.next_cycle;
+    cache.info.leader_epoch = request.leader_epoch;
+    cache.info.scan_plan_digest = Some(request.scan_plan_digest);
+    cache.info.last_update = Some(std::time::SystemTime::now());
+    cache
+        .save_with_revisions_for_epoch(store.clone(), &cache_name, &revisions, identity.publication_epoch)
+        .await
+        .expect("durable current-request root CAS");
+    let mut persisted = DataUsageCache::default();
+    persisted
+        .load(store, &cache_name)
+        .await
+        .expect("read back the durable current-request root");
+    assert_eq!(persisted.info.next_cycle, request.next_cycle);
+    assert_eq!(persisted.info.scan_plan_digest, Some(request.scan_plan_digest));
+    let usage = cache_root_entry_info(&persisted).expect("flatten the read-back physical root");
+    assert!(usage.entry.children.is_empty());
+    assert_eq!(usage.bucket_incarnation, Some(identity.bucket_incarnation));
+    let authenticator = FrameAuthenticator::from_rpc_secret(request.request_id).expect("fixture frame authentication");
+    let progress = RemoteScannerProgress {
+        objects_scanned: 1,
+        directories_started: 0,
+        entries_visited: 0,
+    };
+    let mut sequence = 0;
+    write_frame(&mut writer, &authenticator, &mut sequence, &RemoteScannerFrame::progress(progress))
+        .await
+        .expect("write authenticated budget-stopping progress");
+    release_complete.cancelled().await;
+    write_frame(
+        &mut writer,
+        &authenticator,
+        &mut sequence,
+        &RemoteScannerFrame::terminal(
+            progress,
+            RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
+                source,
+                scan_plan_digest: request.scan_plan_digest,
+                usage,
+                pending_maintenance_work: false,
+            })),
+        ),
+    )
+    .await
+    .expect("write authenticated complete after the parent count stop");
+    writer.shutdown().await.expect("remote complete must have a clean EOF");
+}
+
 impl FrameAuthenticator {
     fn from_rpc_secret(request_id: Uuid) -> Result<Self, ScannerError> {
         let secret = try_get_rpc_token()
@@ -675,6 +809,52 @@ where
     }
 }
 
+/// This is the final worker-side classification before the durable cache CAS.
+/// A failed producer witness retains an EOF observation and fresh-sweep debt.
+async fn classify_remote_usage_watch_outcome(
+    store: &crate::ECStore,
+    outcome: ScannerDiskScanOutcome,
+    usage_watch: Option<&crate::scanner_io::ScannerUsageWatchProof>,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
+    resumed_sweep: bool,
+) -> (DataUsageCache, Option<RemoteScannerFrameResult>) {
+    match outcome {
+        ScannerDiskScanOutcome::Complete(mut cache) => {
+            if resumed_sweep
+                && usage_watch.is_some()
+                && match cache.info.scan_usage_watch.as_ref() {
+                    Some(proof) => !proof.verify_with_store(store).await,
+                    None => true,
+                }
+            {
+                crate::scanner_io::invalidate_completed_usage_watch_cache(
+                    &mut cache,
+                    checkpoint_plan_digest.unwrap_or(scan_plan_digest),
+                );
+                (cache, Some(RemoteScannerFrameResult::Partial))
+            } else {
+                // The folder completes under its coverage plan; finished cache
+                // reuse and the response remain bound to the requested reuse plan.
+                cache.info.scan_plan_digest = Some(scan_plan_digest);
+                (cache, None)
+            }
+        }
+        ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
+        ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
+    }
+}
+
+async fn remote_disk_belongs_to_set(disk: &Disk, set: &crate::SetDisks) -> bool {
+    match disk {
+        Disk::Local(requested) => set.disks.read().await.iter().flatten().any(|candidate| {
+            matches!(candidate.as_ref(), Disk::Local(local)
+                if Arc::ptr_eq(&requested.get_disk(), &local.get_disk()))
+        }),
+        Disk::Remote(_) => false,
+    }
+}
+
 async fn scan_and_persist_local_bucket(
     disk: Arc<Disk>,
     ctx: CancellationToken,
@@ -689,6 +869,9 @@ async fn scan_and_persist_local_bucket(
         leader_epoch,
         scan_plan_digest,
         checkpoint_plan_digest,
+        supports_durable_progress,
+        supports_complete_observation,
+        usage_watch,
         skip_healing,
         scan_mode,
         ..
@@ -700,6 +883,13 @@ async fn scan_and_persist_local_bucket(
     let _tier_cycle_guard = crate::begin_tier_registry_cycle(next_cycle, leader_epoch);
     let store = resolve_scanner_object_store_handle()
         .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
+    if let Some(proof) = usage_watch.as_deref()
+        && !proof.verify_with_store(&store).await
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote namespace scanner usage watch is unavailable at admission",
+        ));
+    }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
         .map_err(|err| {
@@ -718,6 +908,14 @@ async fn scan_and_persist_local_bucket(
                 source.pool_index, source.set_index
             ))
         })?;
+    // A process-global store can belong to another in-process instance. Disk
+    // coordinates alone do not identify the physical producer whose watch is
+    // being verified: require the exact LocalDisk allocation in this set.
+    if !remote_disk_belongs_to_set(disk.as_ref(), &set).await {
+        return Err(RemoteScannerServerError::worker(
+            "remote namespace scanner disk does not belong to its storage instance",
+        ));
+    }
     let expected_publication_epoch = scanner_publication_epoch(set.clone()).await.ok_or_else(|| {
         RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
     })?;
@@ -735,6 +933,17 @@ async fn scan_and_persist_local_bucket(
     let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
+    if let Some(proof) = usage_watch.as_deref()
+        && cache.info.snapshot_complete
+        && cache
+            .info
+            .scan_usage_watch
+            .as_ref()
+            .is_none_or(|stored| stored.digest() != proof.digest())
+    {
+        cache.info.snapshot_complete = false;
+        cache.info.lkg_snapshot_complete = false;
+    }
     // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
     // Requiring its generation here prevents a cache snapshot classified by an
     // older registry from being reused before the folder scan gets a chance to
@@ -783,6 +992,13 @@ async fn scan_and_persist_local_bucket(
                     "remote namespace scanner cache publication epoch changed before reusing the current snapshot",
                 ));
             }
+            if let Some(proof) = usage_watch.as_deref()
+                && !proof.verify_with_store(&store).await
+            {
+                return Err(RemoteScannerServerError::retry_bucket(
+                    "remote namespace scanner usage watch changed before cache reuse",
+                ));
+            }
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
                 source,
                 scan_plan_digest,
@@ -805,6 +1021,13 @@ async fn scan_and_persist_local_bucket(
         },
     }
     cache.info.skip_healing = skip_healing;
+    crate::scanner_io::bind_usage_watch_to_checkpoint(
+        &mut cache,
+        usage_watch.as_deref(),
+        checkpoint_plan_digest.unwrap_or(scan_plan_digest),
+    );
+    let scan_position_before = cache.durable_scan_progress();
+    let resumed_sweep = cache.has_scan_position();
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
@@ -955,16 +1178,15 @@ async fn scan_and_persist_local_bucket(
             }
         }
     };
-    let (cache, partial_result) = match outcome {
-        ScannerDiskScanOutcome::Complete(mut cache) => {
-            // The folder completes under its coverage plan; finished cache
-            // reuse and the response remain bound to the requested reuse plan.
-            cache.info.scan_plan_digest = Some(scan_plan_digest);
-            (cache, None)
-        }
-        ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
-        ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
-    };
+    let (cache, partial_result) = classify_remote_usage_watch_outcome(
+        &store,
+        outcome,
+        usage_watch.as_deref(),
+        scan_plan_digest,
+        checkpoint_plan_digest,
+        resumed_sweep,
+    )
+    .await;
     if let Some(expected) = cache.info.scan_identity
         && crate::scanner_io::scanner_bucket_checkpoint_identity(
             &set,
@@ -1028,6 +1250,23 @@ async fn scan_and_persist_local_bucket(
     if let Some(partial_result) = partial_result {
         if matches!(partial_result, RemoteScannerFrameResult::Partial) {
             log_saved_partial_bucket_cache(&cache, &cache_name);
+            if (supports_durable_progress || supports_complete_observation)
+                && let (Some(identity), Some(checkpoint_plan_digest)) = (cache.info.scan_identity, checkpoint_plan_digest)
+            {
+                return Ok(RemoteScannerFrameResult::DurableProgress(Box::new(RemoteScannerDurableProgress {
+                    source,
+                    identity,
+                    scan_plan_digest,
+                    checkpoint_plan_digest,
+                    leader_epoch,
+                    next_cycle,
+                    advanced: supports_durable_progress && cache.durable_scan_progress().advanced_from(&scan_position_before),
+                    resource_deferred: cache.info.scan_resource_deferred,
+                    observation: supports_complete_observation
+                        .then(|| cache.completed_bucket_observation().cloned().map(Box::new))
+                        .flatten(),
+                })));
+            }
         }
         return Ok(partial_result);
     }
@@ -1064,6 +1303,10 @@ pub(crate) async fn scan_remote_bucket(
         session_id,
         session_sequence,
         plans,
+        supports_durable_progress,
+        supports_complete_observation,
+        usage_watch,
+        checkpoint_identity,
         tier_registry_generation,
         skip_healing,
         scan_mode,
@@ -1085,6 +1328,9 @@ pub(crate) async fn scan_remote_bucket(
         leader_epoch,
         scan_plan_digest,
         checkpoint_plan_digest: Some(checkpoint_plan_digest),
+        supports_durable_progress,
+        supports_complete_observation,
+        usage_watch: usage_watch.cloned().map(Box::new),
         skip_healing,
         scan_mode,
         budget: RemoteScannerBudget::from_config(budget.remaining_config()),
@@ -1175,6 +1421,11 @@ pub(crate) async fn scan_remote_bucket(
             ctx,
             budget.clone(),
             RemoteScannerResponseExpectation {
+                supports_durable_progress,
+                supports_complete_observation,
+                checkpoint_identity,
+                checkpoint_plan_digest,
+                leader_epoch,
                 bucket,
                 source: expected_source,
                 next_cycle,
@@ -1293,6 +1544,11 @@ where
         ctx,
         budget,
         RemoteScannerResponseExpectation {
+            supports_durable_progress: false,
+            supports_complete_observation: false,
+            checkpoint_identity: None,
+            checkpoint_plan_digest: expected_scan_plan_digest,
+            leader_epoch: 0,
             bucket: expected_bucket,
             source: expected_source,
             next_cycle: TEST_NEXT_CYCLE,
@@ -1325,41 +1581,18 @@ where
     let mut semantic_progress_deadline =
         bounded_remote_scanner_deadline(Instant::now(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT, rpc_deadline);
 
+    let negotiated = expected.supports_durable_progress || expected.supports_complete_observation;
     loop {
-        if ctx.is_cancelled() && budget.reason().is_none() {
-            return Err(RemoteScannerStreamError::for_phase(
-                StorageError::other("remote namespace scanner cancelled"),
-                last_phase,
-            ));
-        }
-        let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
-        let read_deadline = rpc_deadline.min(semantic_progress_deadline);
-        let frame = tokio::select! {
-            biased;
-            _ = ctx.cancelled(), if budget.reason().is_none() => {
-                return Err(RemoteScannerStreamError::for_phase(
-                    StorageError::other("remote namespace scanner cancelled"),
-                    last_phase,
-                ));
-            }
-            result = tokio::time::timeout_at(
-                read_deadline,
-                read_frame(&mut reader, &authenticator, &mut expected_sequence, memory.as_ref()),
-            ) => match result {
-                Ok(Ok(frame)) => frame,
-                Ok(Err(err)) => {
-                    return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase));
-                }
-                Err(_) => {
-                    let message = if lifetime_limited {
-                        "remote namespace scanner RPC lifetime exceeded"
-                    } else {
-                        "remote namespace scanner made no semantic progress"
-                    };
-                    return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
-                }
-            }
-        };
+        let frame = await_remote_scanner_read(
+            read_frame(&mut reader, &authenticator, &mut expected_sequence, memory.as_ref()),
+            &ctx,
+            &budget,
+            negotiated,
+            last_phase,
+            semantic_progress_deadline,
+            rpc_deadline,
+        )
+        .await?;
 
         let advanced = apply_remote_progress(&budget, &mut last_progress, frame.progress)
             .map_err(|err| RemoteScannerStreamError::for_phase(err, last_phase))?;
@@ -1380,7 +1613,10 @@ where
 
         let terminal = match frame.result {
             RemoteScannerFrameResult::Progress => {
-                if budget.budget_elapsed() && frame.phase == RemoteScannerPhase::Scanning {
+                if budget.budget_elapsed()
+                    && frame.phase == RemoteScannerPhase::Scanning
+                    && !(expected.supports_durable_progress || expected.supports_complete_observation)
+                {
                     return Ok(RemoteScannerOutcome::Partial);
                 }
                 None
@@ -1411,7 +1647,7 @@ where
                         "remote namespace scanner returned non-flattened bucket usage",
                     )));
                 }
-                if budget.budget_elapsed() {
+                if budget.budget_elapsed() && !(expected.supports_durable_progress || expected.supports_complete_observation) {
                     Some(Ok(RemoteScannerOutcome::Partial))
                 } else {
                     Some(Ok(RemoteScannerOutcome::Complete {
@@ -1419,6 +1655,35 @@ where
                         pending_maintenance_work: complete.pending_maintenance_work,
                     }))
                 }
+            }
+            RemoteScannerFrameResult::DurableProgress(receipt) => {
+                if !(expected.supports_durable_progress || expected.supports_complete_observation)
+                    || (!expected.supports_durable_progress && receipt.advanced)
+                    || (!expected.supports_complete_observation && receipt.observation.is_some())
+                    || frame.phase != RemoteScannerPhase::Persisting
+                    || receipt.source != expected.source
+                    || Some(receipt.identity) != expected.checkpoint_identity
+                    || receipt.scan_plan_digest != expected.scan_plan_digest
+                    || receipt.checkpoint_plan_digest != expected.checkpoint_plan_digest
+                    || receipt.leader_epoch != expected.leader_epoch
+                    || receipt.next_cycle != expected.next_cycle
+                    || receipt.identity.tier_registry_generation != expected.tier_registry_generation
+                    || !receipt.identity.is_valid()
+                    || receipt.observation.as_ref().is_some_and(|observation| {
+                        !observation.matches(expected.source, receipt.identity)
+                            || (observation.completed_epoch, observation.completed_cycle)
+                                > (expected.leader_epoch, expected.next_cycle)
+                    })
+                {
+                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned an unnegotiated or mismatched durable progress receipt",
+                    )));
+                }
+                Some(Ok(RemoteScannerOutcome::DurableProgress {
+                    advanced: receipt.advanced,
+                    resource_deferred: receipt.resource_deferred,
+                    observation: receipt.observation,
+                }))
             }
             RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
             RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
@@ -1449,28 +1714,16 @@ where
 
         if let Some(result) = terminal {
             let mut trailing = [0_u8; 1];
-            let read_deadline = rpc_deadline.min(semantic_progress_deadline);
-            let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
-            let eof = tokio::select! {
-                biased;
-                _ = ctx.cancelled(), if budget.reason().is_none() => {
-                    return Err(RemoteScannerStreamError::for_phase(
-                        StorageError::other("remote namespace scanner cancelled"), last_phase,
-                    ));
-                }
-                read = tokio::time::timeout_at(read_deadline, reader.read(&mut trailing)) => match read {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(err)) => return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase)),
-                    Err(_) => {
-                        let message = if lifetime_limited {
-                            "remote namespace scanner RPC lifetime exceeded"
-                        } else {
-                            "remote namespace scanner made no semantic progress"
-                        };
-                        return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
-                    }
-                }
-            };
+            let eof = await_remote_scanner_read(
+                reader.read(&mut trailing),
+                &ctx,
+                &budget,
+                negotiated,
+                last_phase,
+                semantic_progress_deadline,
+                rpc_deadline,
+            )
+            .await?;
             if eof != 0 {
                 return Err(RemoteScannerStreamError::for_phase(
                     StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
@@ -1489,6 +1742,49 @@ where
                 );
             }
             return result;
+        }
+    }
+}
+
+/// Keep the in-flight decoder alive when a budget stop shortens its deadline.
+/// Restarting `read_frame` after a partially consumed frame would corrupt framing.
+async fn await_remote_scanner_read<T, F>(
+    read: F,
+    owner: &CancellationToken,
+    budget: &ScannerCycleBudget,
+    negotiated: bool,
+    phase: RemoteScannerPhase,
+    semantic_deadline: Instant,
+    rpc_deadline: Instant,
+) -> RemoteScannerStreamResult<T>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    tokio::pin!(read);
+    loop {
+        let drain = (negotiated && budget.budget_elapsed()).then(|| budget.shutdown_deadline());
+        let base = semantic_deadline.min(rpc_deadline);
+        let deadline = drain.map_or(base, |drain| drain.min(base));
+        tokio::select! {
+            biased;
+            _ = owner.cancelled(), if negotiated || budget.reason().is_none() => {
+                return Err(RemoteScannerStreamError::for_phase(StorageError::other("remote namespace scanner cancelled"), phase));
+            }
+            _ = budget.wait_for_stop(), if negotiated && drain.is_none() => continue,
+            result = tokio::time::timeout_at(deadline, read.as_mut()) => return match result {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(RemoteScannerStreamError::for_phase(StorageError::other(error), phase)),
+                Err(_) => {
+                    let message = if drain.is_some_and(|drain| drain <= base) {
+                        "remote namespace scanner budget drain deadline exceeded"
+                    } else if rpc_deadline <= semantic_deadline {
+                        "remote namespace scanner RPC lifetime exceeded"
+                    } else {
+                        "remote namespace scanner made no semantic progress"
+                    };
+                    Err(RemoteScannerStreamError::for_phase(StorageError::other(message), phase))
+                }
+            }
         }
     }
 }

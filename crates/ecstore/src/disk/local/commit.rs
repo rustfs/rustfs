@@ -500,6 +500,10 @@ impl LocalDisk {
         dst_path: &str,
         state: &mut RenameDataState,
     ) -> Result<RenameDataResp> {
+        state.namespace_owner = self.usage_watch_binding.owner(dst_volume, state.namespace_owner.take());
+        if src_volume != dst_volume {
+            state.namespace_owner = self.usage_watch_binding.owner(src_volume, state.namespace_owner.take());
+        }
         super::multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), src_volume, src_path).inspect_err(
             |_| {
                 state.preflight_rejection = Some(LocalRenamePreflightRejection(()));

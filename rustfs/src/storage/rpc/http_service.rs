@@ -19,9 +19,9 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
     PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
-    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
-    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
-    with_rpc_background_request,
+    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
+    sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+    with_remote_background_io, with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -375,6 +375,9 @@ struct NsScannerCapabilityQuery {
     #[serde(rename = "ns_scanner_tier_registry_generation")]
     ns_scanner_tier_registry_generation: Option<bool>,
     ns_scanner_checkpoint_coverage: Option<bool>,
+    ns_scanner_durable_progress: Option<bool>,
+    ns_scanner_complete_observation: Option<bool>,
+    ns_scanner_usage_watch: Option<bool>,
 }
 
 fn verify_ns_scanner_body_digest(query: &NsScannerQuery, body: &[u8]) -> bool {
@@ -528,6 +531,9 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
                         challenge,
                         query.ns_scanner_tier_registry_generation == Some(true),
                         query.ns_scanner_checkpoint_coverage == Some(true),
+                        query.ns_scanner_durable_progress == Some(true),
+                        query.ns_scanner_complete_observation == Some(true),
+                        query.ns_scanner_usage_watch == Some(true),
                     ),
                     Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
                 },
@@ -609,13 +615,18 @@ fn ns_scanner_capability_response(
     challenge: uuid::Uuid,
     include_tier_registry_generation: bool,
     include_checkpoint_coverage: bool,
+    include_durable_progress: bool,
+    include_complete_observation: bool,
+    include_usage_watch: bool,
 ) -> Response<Body> {
     let server_epoch = *NS_SCANNER_SERVER_EPOCH;
-    let proof = match sign_ns_scanner_capability_with_checkpoint_coverage(
+    let proof = match sign_ns_scanner_capability_with_usage_capabilities(
         challenge,
         server_epoch,
         include_tier_registry_generation,
         include_checkpoint_coverage,
+        include_durable_progress,
+        include_complete_observation,
     ) {
         Ok(proof) => proof,
         Err(err) => {
@@ -635,12 +646,27 @@ fn ns_scanner_capability_response(
             return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
         }
     };
+    let usage_watch_proof = match include_usage_watch
+        .then(|| sign_ns_scanner_usage_watch_capability(challenge, server_epoch))
+        .transpose()
+    {
+        Ok(proof) => proof,
+        Err(_) => {
+            return response_with_status(
+                StatusCode::UPGRADE_REQUIRED,
+                "namespace scanner usage watch authentication is unavailable",
+            );
+        }
+    };
     let body = match rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
         version: NS_SCANNER_PROTOCOL_VERSION,
         server_epoch,
         proof,
         supports_tier_registry_generation: include_tier_registry_generation.then_some(true),
         supports_checkpoint_coverage: include_checkpoint_coverage.then_some(true),
+        supports_durable_progress: include_durable_progress.then_some(true),
+        supports_complete_observation: include_complete_observation.then_some(true),
+        usage_watch_proof,
     }) {
         Ok(body) => body,
         Err(err) => {
@@ -2654,7 +2680,7 @@ mod tests {
         let _ = rustfs_credentials::set_global_rpc_secret("checkpoint-capability-server-test-secret".to_string());
         for (tier, coverage) in [(false, false), (true, false), (true, true)] {
             let challenge = uuid::Uuid::new_v4();
-            let response = super::ns_scanner_capability_response(challenge, tier, coverage);
+            let response = super::ns_scanner_capability_response(challenge, tier, coverage, false, false, false);
             assert_eq!(response.status(), StatusCode::OK);
             let body = http_body_util::BodyExt::collect(response.into_body())
                 .await
@@ -2682,6 +2708,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn namespace_scanner_usage_capabilities_are_emitted_only_when_requested() {
+        let _ = rustfs_credentials::set_global_rpc_secret("usage-capability-server-test-secret".to_string());
+        for progress in [false, true] {
+            for observation in [false, true] {
+                let challenge = uuid::Uuid::new_v4();
+                let response = super::ns_scanner_capability_response(challenge, true, true, progress, observation, false);
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let capability: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("response");
+                crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_usage_capabilities(
+                    challenge,
+                    capability.server_epoch,
+                    &capability.proof,
+                    true,
+                    true,
+                    progress,
+                    observation,
+                )
+                .expect("exact authenticated scope");
+                assert_eq!(capability.supports_durable_progress, progress.then_some(true));
+                assert_eq!(capability.supports_complete_observation, observation.then_some(true));
+            }
+        }
+    }
+
     #[test]
     fn namespace_scanner_capability_response_support_is_optional_for_old_peers() {
         #[derive(serde::Deserialize)]
@@ -2698,6 +2753,9 @@ mod tests {
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: None,
             supports_checkpoint_coverage: None,
+            supports_durable_progress: None,
+            supports_complete_observation: None,
+            usage_watch_proof: None,
         })
         .expect("old response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&old).expect("old response should decode");
@@ -2715,6 +2773,9 @@ mod tests {
             proof: vec![1, 2, 3],
             supports_tier_registry_generation: Some(true),
             supports_checkpoint_coverage: None,
+            supports_durable_progress: None,
+            supports_complete_observation: None,
+            usage_watch_proof: None,
         })
         .expect("new response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&current).expect("new response should decode");

@@ -2107,6 +2107,7 @@ mod tests {
         for path in [
             "/node_service.HealControlService/HealControl",
             "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/node_service.ScannerControlService/ScannerUsageWatch",
             "/node_service.TierMutationControlService/PrepareTierMutation",
         ] {
             let response = service
@@ -2123,7 +2124,7 @@ mod tests {
                 .expect("control routing");
             assert_eq!(response.status(), StatusCode::OK, "gRPC bootstrap must reach the authenticated router");
         }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         for (version, content_type, path) in [
             (
                 http::Version::HTTP_11,
@@ -2134,6 +2135,11 @@ mod tests {
                 http::Version::HTTP_2,
                 Some("application/json"),
                 "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerUsageWatch",
             ),
             (http::Version::HTTP_2, None, "/bucket/object"),
         ] {
@@ -2151,7 +2157,7 @@ mod tests {
         }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
+            4,
             "REST requests must remain outside their handlers"
         );
     }

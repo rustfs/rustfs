@@ -525,6 +525,9 @@ pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disk
     let map = instance_ctx.local_disk_map();
     let mut global_local_disk_map = map.write().await;
     for disk in disks {
+        if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
+            wrapper.get_disk().usage_watch_binding.bind(&instance_ctx.usage_watches);
+        }
         let path = disk.endpoint().to_string();
         global_local_disk_map.insert(path, Some(disk.clone()));
     }
@@ -611,6 +614,7 @@ pub(crate) async fn initialize_local_disk_maps(
                 Err(err) => return Err(err.into()),
             };
             if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
+                wrapper.get_disk().usage_watch_binding.bind(&instance_ctx.usage_watches);
                 wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
             }
             let path = disk.endpoint().to_string();

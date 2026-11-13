@@ -515,7 +515,7 @@ impl SetDisks {
         let owner = context
             .namespace_owner
             .take()
-            .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+            .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
         context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         let can_commit = context.can_commit;
         let can_try_local_fast_path = disks.len() == self.set_drive_count
@@ -791,7 +791,7 @@ impl SetDisks {
             let namespace_owner = context
                 .namespace_owner
                 .clone()
-                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+                .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
             context.namespace_owner = Some(Arc::new((namespace_owner, guard.clone())));
         }
         let can_commit = context.can_commit;
@@ -821,7 +821,7 @@ impl SetDisks {
             let owner = context
                 .namespace_owner
                 .take()
-                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+                .unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket));
             context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         }
         let DeleteRecoveryContext {
@@ -1025,7 +1025,7 @@ impl SetDisks {
         let namespace_owner = if dry_run {
             None
         } else {
-            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit()))
+            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit_for_bucket(bucket)))
         };
         if !dry_run && metadata_may_change {
             self.invalidate_get_object_metadata_cache(bucket, object).await;

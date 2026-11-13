@@ -88,7 +88,7 @@ impl ECStore {
     /// Resolve a quota lease against this request's captured storage instance.
     pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false, None).await?;
         Ok(disk)
     }
 
@@ -106,7 +106,7 @@ impl ECStore {
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
             let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
-            let _owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let _owner = admit_local_disk(&store.ctx, &disk, id, true, Some(&volume)).await?;
             disk.write_metadata("", &volume, &path, fi).await.map_err(Into::into)
         })
         .await
@@ -127,7 +127,7 @@ impl ECStore {
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
             let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
-            let owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let owner = admit_local_disk(&store.ctx, &disk, id, true, Some(&volume)).await?;
             let scope = super::bucket_heal_scope(&volume).ok_or_else(|| StorageError::other("missing bucket heal scope"))?;
             scope.check()?;
             disk.delete_with_namespace_owner(&volume, &path, opts, Some(Arc::new((scope, owner))))
@@ -159,7 +159,7 @@ impl ECStore {
                 .map_err(|error| DiskError::other(error.to_string()))?,
         );
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true, Some(target.0)).await?;
         if fence.is_lock_lost() {
             return Err(DiskError::other("bucket heal incarnation fence was lost"));
         }
@@ -283,7 +283,7 @@ impl ECStore {
     ) -> DiskResult<crate::disk::multipart_source::MultipartSourceResponse> {
         request.validate()?;
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
-        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation()).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation(), None).await?;
         let Disk::Local(wrapper) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
         };
@@ -356,6 +356,7 @@ async fn admit_local_disk(
     disk: &DiskStore,
     disk_id: Option<Uuid>,
     mutates_namespace: bool,
+    bucket: Option<&str>,
 ) -> DiskResult<Option<Arc<NamespaceCommitGuard>>> {
     if !matches!(disk.as_ref(), Disk::Local(_)) {
         return Err(DiskError::DiskNotFound);
@@ -378,7 +379,10 @@ async fn admit_local_disk(
     }
     // Admission linearizes under the registry read: replacement/quarantine
     // before this point rejects; later changes do not revoke physical I/O.
-    Ok(mutates_namespace.then(|| ctx.begin_namespace_commit()))
+    Ok(mutates_namespace.then(|| match bucket {
+        Some(bucket) => ctx.begin_namespace_commit_for_bucket(bucket),
+        None => ctx.begin_namespace_commit(),
+    }))
 }
 
 async fn rename_local_data_with_ctx(
@@ -398,7 +402,18 @@ async fn rename_local_data_with_ctx(
     }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
     let admit_started = rustfs_io_metrics::put_stage_timer();
-    let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let owner = admit_local_disk(
+        ctx,
+        &disk,
+        disk_id,
+        mutates_namespace,
+        Some(if !is_meta_bucketname(destination.0) {
+            destination.0
+        } else {
+            source.0
+        }),
+    )
+    .await?;
     if source.0 == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
         let Disk::Local(wrapper) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
@@ -444,7 +459,7 @@ async fn undo_local_write_with_ctx(
         return Err(DiskError::other("target undo requires undo_write"));
     }
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
-    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume)).await?;
+    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume), Some(volume)).await?;
     let physical_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
     let result = disk
         .undo_write_with_namespace_owner(volume, path, fi, opts, physical_owner)
@@ -874,7 +889,7 @@ mod tests {
             }
             drop(entries);
             assert!(
-                matches!(admit_local_disk(&ctx, &disk, None, true).await, Err(DiskError::DiskNotFound)),
+                matches!(admit_local_disk(&ctx, &disk, None, true, None).await, Err(DiskError::DiskNotFound)),
                 "{state}"
             );
             assert!(!ctx.namespace_commits_pending());

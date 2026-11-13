@@ -553,6 +553,10 @@ pub mod runtime {
         global_lock_client, global_lock_clients, global_tier_config_mgr, local_disk_map_read, object_store_handle, region,
         rustfs_port, setup_is_dist_erasure, setup_is_erasure, setup_is_erasure_sd, transition_state_handle,
     };
+    pub use crate::runtime::usage_watch::{
+        SCANNER_USAGE_WATCH_COVERAGE_VERSION, SCANNER_USAGE_WATCH_LEASE_MS, ScannerUsageWatchKnown, ScannerUsageWatchObservation,
+        ScannerUsageWatchRequest,
+    };
 }
 
 pub mod layout {
@@ -636,6 +640,25 @@ pub mod rio {
 }
 
 pub mod rpc {
+    #[cfg(all(feature = "test-util", feature = "internode-transport"))]
+    pub mod test_util {
+        /// Build a remote disk using a controlled transport and no health monitor.
+        ///
+        /// # Errors
+        /// Returns the normal remote-disk construction error for the supplied endpoint.
+        pub async fn remote_disk_with_transport(
+            endpoint: &crate::layout::endpoint::Endpoint,
+            transport: std::sync::Arc<dyn super::InternodeDataTransport>,
+        ) -> crate::disk::error::Result<crate::disk::DiskStore> {
+            let options = crate::disk::DiskOption {
+                cleanup: false,
+                health_check: false,
+            };
+            let disk = crate::cluster::rpc::remote_disk::RemoteDisk::new(endpoint, &options, transport).await?;
+            Ok(std::sync::Arc::new(crate::disk::Disk::Remote(Box::new(disk))))
+        }
+    }
+
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
@@ -648,13 +671,16 @@ pub mod rpc {
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
         node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
         rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
-        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_tier_registry_generation,
-        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
-        verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer, verify_put_file_capability,
-        verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_durable_progress,
+        sign_ns_scanner_capability_with_tier_registry_generation, sign_ns_scanner_capability_with_usage_capabilities,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+        verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
+        verify_ns_scanner_capability_with_durable_progress, verify_ns_scanner_capability_with_tier_registry_generation,
+        verify_ns_scanner_capability_with_usage_capabilities, verify_ns_scanner_usage_watch_capability,
+        verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
+        verify_tonic_rpc_response_proof, verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 

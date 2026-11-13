@@ -20,6 +20,8 @@ use crate::test_metrics::CapturingRecorder;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 use std::time::SystemTime;
 
+mod native_compatibility;
+
 async fn stop_reporting_fixture(store: &crate::store::ECStore) {
     if let Some(cancel) = store.ctx.background_cancel_token() {
         cancel.cancel();
@@ -90,6 +92,10 @@ async fn install_reporting_snapshot(
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn durable_quota_reporting_retires_degraded_floors_without_changing_ledger_admission() {
+    assert_durable_quota_reporting_preserves_admission().await;
+}
+
+async fn assert_durable_quota_reporting_preserves_admission() {
     let recorder = CapturingRecorder::default();
     let _recorder = metrics::set_default_local_recorder(&recorder);
     for protocol in [1, 2] {
@@ -196,6 +202,11 @@ async fn durable_quota_reporting_retires_degraded_floors_without_changing_ledger
                 .expect("fixture cache cleanup");
             crate::data_usage::invalidate_data_usage_snapshot_cache().await;
             stop_reporting_fixture(&store).await;
+            for dir in _dirs {
+                let path = dir.path().to_path_buf();
+                dir.close().expect("remove durable quota reporting fixture");
+                assert!(!path.exists());
+            }
         }
     }
 }
@@ -203,6 +214,10 @@ async fn durable_quota_reporting_retires_degraded_floors_without_changing_ledger
 #[tokio::test]
 #[serial]
 async fn snapshot_quota_admission_retains_degraded_floors_until_migration() {
+    assert_snapshot_quota_preserves_degraded_floors().await;
+}
+
+async fn assert_snapshot_quota_preserves_degraded_floors() {
     for source in ["missing", "legacy", "incomplete", "observed"] {
         let (_dirs, store, _) = isolated_durable_quota_store().await;
         let bucket = format!("quota-compat-{}", Uuid::new_v4().simple());
@@ -233,12 +248,21 @@ async fn snapshot_quota_admission_retains_degraded_floors_until_migration() {
             .expect("fixture cache cleanup");
         crate::data_usage::invalidate_data_usage_snapshot_cache().await;
         stop_reporting_fixture(&store).await;
+        for dir in _dirs {
+            let path = dir.path().to_path_buf();
+            dir.close().expect("remove legacy quota reporting fixture");
+            assert!(!path.exists());
+        }
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn quota_without_limit_keeps_the_zero_usage_io_fast_path() {
+    assert_unlimited_quota_preserves_fast_path().await;
+}
+
+async fn assert_unlimited_quota_preserves_fast_path() {
     let (_dirs, store, sys) = isolated_durable_quota_store().await;
     let bucket = format!("quota-unlimited-{}", Uuid::new_v4().simple());
     create_bucket_with_quota_json(
@@ -259,6 +283,11 @@ async fn quota_without_limit_keeps_the_zero_usage_io_fast_path() {
     assert_eq!(recorder.counter_value(METRIC_QUOTA_USAGE_REPORT_UNAVAILABLE_TOTAL, &[]), 0);
     assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket), 0);
     stop_reporting_fixture(&store).await;
+    for dir in _dirs {
+        let path = dir.path().to_path_buf();
+        dir.close().expect("remove unlimited quota reporting fixture");
+        assert!(!path.exists());
+    }
 }
 
 #[tokio::test]
