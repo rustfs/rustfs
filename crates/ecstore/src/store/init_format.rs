@@ -2208,7 +2208,10 @@ mod tests {
 
         let (_directory, disks) = local_disks(1).await;
         let disk = disks[0].as_ref().expect("replacement fixture disk");
-        let destination = disk.path().join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE);
+        let destination = disk
+            .get_object_path_for_io_if_local(RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE)
+            .expect("format publication uses a real local backend")
+            .expect("format publication path");
         let renamed = Arc::new(AtomicUsize::new(0));
         let observed = renamed.clone();
         let _hook = install_at(Stage::Rename, &destination, move || {

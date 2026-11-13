@@ -163,9 +163,9 @@ async fn bootstrap_intent_anchor_is_durable_before_fanout() {
     let anchor = disks[0]
         .as_ref()
         .expect("anchor disk")
-        .path()
-        .join(RUSTFS_META_BUCKET)
-        .join(FORMAT_BOOTSTRAP_FILE);
+        .get_object_path_for_io_if_local(RUSTFS_META_BUCKET, FORMAT_BOOTSTRAP_FILE)
+        .expect("format bootstrap uses a real local backend")
+        .expect("format bootstrap publication path");
     let (arrived, arrival) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let _hook = install_at(Stage::PreparedRename, &anchor, move || {
