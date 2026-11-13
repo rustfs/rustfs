@@ -9635,6 +9635,7 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-gateway",
  "rustfs-gateway-adapter",
+ "rustfs-gateway-stream",
  "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
