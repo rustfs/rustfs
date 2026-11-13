@@ -20,7 +20,6 @@
 #![allow(clippy::all)]
 
 use http::HeaderMap;
-use s3s::dto::ETag;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
@@ -29,7 +28,7 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
-use s3s::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 
 //#[derive(Clone)]
 pub struct PutObjReader {
@@ -150,24 +149,6 @@ pub fn new_getobjectreader<'a>(
     })
 }
 
-/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
-///
-/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
-pub fn to_s3s_etag(etag: &str) -> ETag {
-    if let Some(rest) = etag.strip_prefix("W/\"") {
-        if let Some(body) = rest.strip_suffix('"') {
-            return ETag::Weak(body.to_string());
-        }
-        return ETag::Weak(rest.to_string());
-    }
-
-    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        return ETag::Strong(body.to_string());
-    }
-
-    ETag::Strong(etag.to_string())
-}
-
 pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
     metadata
         .get("etag")
@@ -232,28 +213,42 @@ mod tests {
     }
 
     #[test]
-    fn test_to_s3s_etag() {
-        // Test unquoted ETag - should become strong etag
-        assert_eq!(
-            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
+    fn test_new_getobjectreader_rejects_a_range_past_the_object_as_invalid_range() {
+        let oi = multipart_object_info();
+        let past_the_end = Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: oi.size,
+            end: oi.size + 10,
+        });
 
-        assert_eq!(
-            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
+        let err = new_getobjectreader(&past_the_end, &oi, &ObjectOptions::default(), &HeaderMap::new())
+            .err()
+            .expect("a range starting at the object size must be rejected");
 
-        assert_eq!(
-            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
+        assert_eq!(err.code, S3ErrorCode::InvalidRange);
+        assert_eq!(err.code.as_str(), "InvalidRange");
+        assert_eq!(err.key, None);
+        assert_eq!(err.bucket_name, None);
+    }
 
-        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
+    #[test]
+    fn test_new_getobjectreader_rejects_an_unknown_size_without_a_range_as_invalid_range() {
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: -1,
+            ..Default::default()
+        };
 
-        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
+        let err = new_getobjectreader(&None, &oi, &ObjectOptions::default(), &HeaderMap::new())
+            .err()
+            .expect("an object of unknown size cannot be read without a range");
 
-        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
+        assert_eq!(err.code, S3ErrorCode::InvalidRange);
+        assert_eq!(err.code.as_str(), "InvalidRange");
+        assert_eq!(err.message, "Invalid range");
+        assert_eq!(err.key.as_deref(), Some("object"));
+        assert_eq!(err.bucket_name.as_deref(), Some("bucket"));
     }
 
     #[test]

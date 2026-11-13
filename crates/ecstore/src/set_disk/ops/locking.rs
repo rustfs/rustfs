@@ -536,7 +536,7 @@ impl SetDisks {
             .as_ref()
             .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
 
-        let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
+        let (new_disk, fm) = match self.connect_endpoint(ep, previous_health).await {
             Ok(res) => res,
             Err(e) => {
                 warn!("renew_disk: connect_endpoint err {:?}", &e);
@@ -690,9 +690,10 @@ impl SetDisks {
             return Err(Error::other("DriveID: offline"));
         }
 
-        for i in 0..self.format.erasure.sets.len() {
-            for j in 0..self.format.erasure.sets[0].len() {
-                if fm.erasure.this == self.format.erasure.sets[i][j] {
+        let set_drive_count = self.format.erasure.sets[0].len();
+        for (i, set) in self.format.erasure.sets.iter().enumerate() {
+            for (j, drive) in set.iter().enumerate().take(set_drive_count) {
+                if fm.erasure.this == *drive {
                     return Ok((i, j));
                 }
             }
@@ -702,6 +703,7 @@ impl SetDisks {
     }
 
     pub(in crate::set_disk) async fn connect_endpoint(
+        &self,
         ep: &Endpoint,
         reconnect: Option<disk::disk_store::ReconnectDiskHealthState>,
     ) -> disk::error::Result<(DiskStore, FormatV3)> {
@@ -712,6 +714,8 @@ impl SetDisks {
                 health_check: true,
             },
             reconnect,
+            #[cfg(feature = "internode-transport")]
+            Some(&self.ctx),
         )
         .await?;
 

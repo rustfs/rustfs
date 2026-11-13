@@ -22,6 +22,8 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
+use crate::app::storage_api::s3::dto::StreamingBlob;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -138,7 +140,7 @@ async fn validate_internal_write_target(key: &str, bucket: &str, headers: &Heade
         headers.get("content-type").and_then(|value| value.to_str().ok()),
         headers.get("content-encoding").and_then(|value| value.to_str().ok()),
     )
-    .map_err(api_error_from_s3)
+    .map_err(|err| api_error_from_s3(err.into()))
 }
 
 fn internal_events_wanted() -> bool {
@@ -788,8 +790,8 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
     };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
@@ -880,27 +882,27 @@ mod tests {
         };
         let mut metadata = (*metadata).clone();
         metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
-        metadata.versioning_config = Some(VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        metadata.versioning_config = Some(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
 
         if let Some(target) = target {
-            let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
-                tag: Some(Tag {
+            let filter = required_tag.map(|(key, value)| PersistedReplicationFilter {
+                tag: Some(PersistedReplicationTag {
                     key: Some(key.to_string()),
                     value: Some(value.to_string()),
                 }),
                 ..Default::default()
             });
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
-                    delete_marker_replication: Some(DeleteMarkerReplication {
-                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+                rules: vec![PersistedReplicationRule {
+                    delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                        status: Some(Status::DISABLED.to_string()),
                     }),
                     delete_replication: None,
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: target.to_string(),
                         ..Default::default()
                     },
@@ -910,7 +912,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             };
             metadata.replication_config_xml = serialize(&config).expect("replication test config should serialize");

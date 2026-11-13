@@ -19,6 +19,10 @@ use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecis
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
+use crate::app::storage_api::s3::dto::{
+    ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectOutput, ServerSideEncryption, Timestamp, TimestampFormat,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use crate::app::trailer_adapter::trailer_source;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
@@ -2773,8 +2777,9 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::StdError;
+    use crate::app::storage_api::s3::dto::{ObjectLockRetentionMode, StreamingBlob};
     use http::{HeaderMap, HeaderName, HeaderValue};
-    use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
@@ -3560,7 +3565,7 @@ mod tests {
                 S3ErrorCode::RequestTimeout,
             ),
             (
-                io::Error::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }),
+                io::Error::other(crate::app::storage_api::s3::BodySizeLimitExceeded { size: 6, limit: 5 }),
                 S3ErrorCode::EntityTooLarge,
             ),
             (io::Error::other(UploadLimitExceeded { limit: 5 }), S3ErrorCode::EntityTooLarge),
@@ -3968,8 +3973,8 @@ mod tests {
         ]);
         let mut opts = ObjectOptions::default();
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -4007,8 +4012,8 @@ mod tests {
             ),
         ];
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -4090,8 +4095,8 @@ mod tests {
             ("non-exact-null-version-id", pax_record("minio.versionId", b"NULL")),
         ];
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -4157,8 +4162,8 @@ mod tests {
         ]);
         let mut opts = ObjectOptions::default();
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -4202,8 +4207,8 @@ mod tests {
             .overlay_record("minio.metadata.x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00-02:00")
             .expect("offset retention date should parse");
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -4276,8 +4281,8 @@ mod tests {
         let mut entry = entries.next().await.unwrap().unwrap();
         let mut metadata = HashMap::new();
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),

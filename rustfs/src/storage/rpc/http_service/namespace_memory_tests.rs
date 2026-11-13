@@ -15,7 +15,7 @@
 //! Full namespace POST coverage. The response tap retains an actual server-side
 //! output owner; a network client's Bytes would not own that reservation.
 
-use super::{Body, InternodeRpcService, NS_SCANNER_PATH, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_SERVER_EPOCH, StreamingBlob};
+use super::{Body, InternodeRpcService, NS_SCANNER_PATH, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_SERVER_EPOCH};
 use crate::storage::storage_api::ecstore_config::com::{read_config, save_config};
 use crate::storage::storage_api::ecstore_rpc::gen_signature_headers;
 use crate::storage::storage_api::rpc_consumer::http_service::DiskAPI as _;
@@ -204,10 +204,7 @@ async fn run_namespace_case(mode: &str) {
                         *retained.lock().expect("output owner") = Some(bytes.slice(bytes.len() - 1..));
                     }
                 });
-                Ok::<_, Infallible>(Response::from_parts(
-                    parts,
-                    Body::from(StreamingBlob::wrap(tapped.map_err(std::io::Error::other))),
-                ))
+                Ok::<_, Infallible>(Response::from_parts(parts, Body::from_stream(tapped.map_err(std::io::Error::other))))
             }
         });
         // Body errors intentionally reset the connection in the denial cases.

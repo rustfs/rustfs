@@ -55,8 +55,40 @@ const STARTUP_THREAD_NAME: &str = "rustfs-main";
 /// release build; 8 MiB keeps the budget Linux and macOS already had.
 const STARTUP_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+#[cfg(feature = "internode-transport")]
+use crate::storage_api::startup::storage::{
+    ExternalControlService, InstalledControlService, InstanceContext, InternodeDataTransport, PeerControlClient,
+};
+#[cfg(feature = "internode-transport")]
+use std::sync::Arc;
+
+#[cfg(feature = "internode-transport")]
+type BuildPeerTransport = Box<dyn FnOnce(Arc<InstanceContext>) -> Result<Arc<InstalledControlService>> + Send>;
+
+/// Runs the server with one instance-owned peer stream provider. The factory receives
+/// the node's authenticated control client after its topology has been initialized.
+/// Outbound selection uses the configured internode transport. The provider handles
+/// inbound controls until server shutdown, which waits for its workers by a deadline.
+#[cfg(feature = "internode-transport")]
+pub fn run_process_with_peer_transport<T>(build: impl FnOnce(PeerControlClient) -> Result<Arc<T>> + Send + 'static) -> ExitCode
+where
+    T: InternodeDataTransport + ExternalControlService + 'static,
+{
+    let install = Box::new(move |instance: Arc<InstanceContext>| {
+        let provider = build(PeerControlClient::new(&instance))?;
+        let control = InstalledControlService::new(provider.clone(), instance.clone())?;
+        instance.install_internode_data_transport(provider)?;
+        Ok(Arc::new(control))
+    });
+    run_on_startup_thread(move || run_process_on_current_thread(Some(install)))
+}
+
 pub fn run_process() -> ExitCode {
-    run_on_startup_thread(run_process_on_current_thread)
+    #[cfg(not(feature = "internode-transport"))]
+    let run = run_process_on_current_thread;
+    #[cfg(feature = "internode-transport")]
+    let run = || run_process_on_current_thread(None);
+    run_on_startup_thread(run)
 }
 
 /// Run `f` on a thread whose stack is [`STARTUP_THREAD_STACK_SIZE`] on every
@@ -74,10 +106,13 @@ fn run_on_startup_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stat
     }
 }
 
-fn run_process_on_current_thread() -> ExitCode {
+fn run_process_on_current_thread(#[cfg(feature = "internode-transport")] build: Option<BuildPeerTransport>) -> ExitCode {
     // Building the process runtime is a startup fatal boundary.
     let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
-    let result = runtime.block_on(async_main());
+    let result = runtime.block_on(async_main(
+        #[cfg(feature = "internode-transport")]
+        build,
+    ));
 
     // Preserve the existing trace flush/seal order before runtime teardown.
     // A disabled telemetry guard remains a no-op.
@@ -109,7 +144,7 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
     eprintln!("{}", format_fatal_stderr_message(context, error));
 }
 
-async fn async_main() -> Result<()> {
+async fn async_main(#[cfg(feature = "internode-transport")] build: Option<BuildPeerTransport>) -> Result<()> {
     #[cfg(feature = "e2e-test-hooks")]
     if let Ok(nonce) = std::env::var("RUSTFS_E2E_STARTUP_CAS_PROBE") {
         let nonce = uuid::Uuid::parse_str(&nonce).map_err(Error::other)?;
@@ -207,7 +242,13 @@ async fn async_main() -> Result<()> {
         Err(StartupServerPreflightError::Other(err)) => return Err(err),
     }
 
-    match run(*config).await {
+    match run(
+        *config,
+        #[cfg(feature = "internode-transport")]
+        build,
+    )
+    .await
+    {
         Ok(_) => Ok(()),
         Err(e) => {
             error!(
@@ -1983,20 +2024,55 @@ fn print_license_report(report: &crate::connect::LicenseReport) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip(config))]
-async fn run(config: Config) -> Result<()> {
+#[instrument(skip_all)]
+async fn run(config: Config, #[cfg(feature = "internode-transport")] build: Option<BuildPeerTransport>) -> Result<()> {
     // Single-instance startup threads the process bootstrap context through
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.
     let instance_ctx = bootstrap_instance_ctx();
+    let listen = init_startup_listen_context(&config, &instance_ctx).await?;
+    let endpoint_pools = init_startup_storage_foundation(&listen.server_address, &config.volumes, &instance_ctx).await?;
+    #[cfg(not(feature = "internode-transport"))]
+    let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
+    #[cfg(feature = "internode-transport")]
+    let mut peer_control = build.map(|install| install(instance_ctx.clone())).transpose()?;
+    #[cfg(feature = "internode-transport")]
+    let server_ctx = ServerContextSlot::with_peer_control(instance_ctx.clone(), peer_control.as_ref());
+    let result = run_server(
+        config,
+        listen,
+        endpoint_pools,
+        instance_ctx,
+        server_ctx,
+        #[cfg(feature = "internode-transport")]
+        &mut peer_control,
+    )
+    .await;
+    #[cfg(feature = "internode-transport")]
+    if let Some(control) = peer_control {
+        let shutdown = control.shutdown(Instant::now() + Duration::from_secs(10)).await;
+        return match (result, shutdown) {
+            (Err(run), Err(close)) => Err(Error::new(run.kind(), format!("{run}; peer transport shutdown: {close}"))),
+            (result, Ok(())) => result,
+            (Ok(()), Err(close)) => Err(close),
+        };
+    }
+    result
+}
+
+async fn run_server(
+    config: Config,
+    listen: StartupListenContext,
+    endpoint_pools: crate::storage_api::startup::storage::EndpointServerPools,
+    instance_ctx: std::sync::Arc<crate::storage_api::startup::storage::InstanceContext>,
+    server_ctx: std::sync::Arc<ServerContextSlot>,
+    #[cfg(feature = "internode-transport")] peer_control: &mut Option<Arc<InstalledControlService>>,
+) -> Result<()> {
     let StartupListenContext {
         readiness,
         server_addr,
         server_address,
-    } = init_startup_listen_context(&config, &instance_ctx).await?;
-
-    let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes, &instance_ctx).await?;
-    let server_ctx = ServerContextSlot::with_instance_context(instance_ctx.clone());
+    } = listen;
     let StartupHttpServers {
         state_manager,
         s3_shutdown_tx,
@@ -2048,17 +2124,21 @@ async fn run(config: Config) -> Result<()> {
     )
     .await?;
 
-    run_startup_runtime_lifecycle(StartupRuntimeLifecycle {
-        server_address,
-        state_manager,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        capacity_tasks,
-        service_runtime,
-        store,
-        shutdown_token: ctx,
-        readiness,
-    })
+    run_startup_runtime_lifecycle(
+        StartupRuntimeLifecycle {
+            server_address,
+            state_manager,
+            s3_shutdown_tx,
+            console_shutdown_tx,
+            capacity_tasks,
+            service_runtime,
+            store,
+            shutdown_token: ctx,
+            readiness,
+        },
+        #[cfg(feature = "internode-transport")]
+        peer_control,
+    )
     .await
 }
 

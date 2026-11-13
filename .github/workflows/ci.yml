@@ -16,7 +16,9 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main ]
+    # gateway/integration receives the daily merge of main as a direct push
+    # (rustfs/backlog#2734), so its pushes must prove the result like main's.
+    branches: [ main, gateway/integration ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -44,11 +46,6 @@ on:
   schedule:
     - cron: "11 0 * * *" # Nightly 00:11 UTC, after the 22:41 UTC cache-warm run
   workflow_dispatch:
-    inputs:
-      rehearse_workspace_shards:
-        description: Compare one full execution with at most two resource-safe shards of the same archive
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -86,13 +83,16 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
       plan: ${{ steps.scope.outputs.plan }}
       connect: ${{ steps.scope.outputs.connect || 'true' }}
       packages: ${{ steps.scope.outputs.packages }}
       full_validation: ${{ steps.scope.outputs.full_validation || 'true' }}
-      rehearse_shards: ${{ steps.scope.outputs.rehearse_shards || 'false' }}
+      gateway_smoke: ${{ steps.scope.outputs.gateway_smoke || 'true' }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
@@ -103,8 +103,13 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_EVENT_ACTION: ${{ github.event.action }}
-          CI_REHEARSE_SHARDS: ${{ inputs.rehearse_workspace_shards && 'true' || 'false' }}
+          # A push whose tree a successful merge-group run already passed skips
+          # the validation jobs; the lookup answers null on any doubt.
+          PROOF_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
+          # Without a token (every event but push) the lookup answers null at once.
+          CI_MERGE_GROUP_PROOF="$(GITHUB_TOKEN="$PROOF_TOKEN" python3 -I scripts/ci_merge_group_proof.py)" || CI_MERGE_GROUP_PROOF=null
+          export CI_MERGE_GROUP_PROOF
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             python3 -I scripts/ci_gate.py select
           elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
@@ -113,8 +118,8 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=3$' "$GITHUB_OUTPUT"; then
-            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=7$' "$GITHUB_OUTPUT"; then
+            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
       - name: Retain verification plan
@@ -168,6 +173,67 @@ jobs:
       - name: Run shared quick checks
         uses: ./.github/actions/quick-checks
 
+  # Clippy runs beside the test-binary build instead of in front of it. The two
+  # share no compiler output: Clippy writes check-mode metadata, the archive
+  # needs codegen and linked test binaries, and both restore the third-party
+  # artifacts of their own mode from ci-dev. As one job the lint held the
+  # archive, and every test that consumes it, back by its whole duration.
+  # scripts/ci_gate.py keeps this job in the Test and Lint aggregate and out
+  # of the archive consumer's dependency chain.
+  workspace-clippy:
+    name: Workspace Clippy
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
+    # Reads the ci-dev cache that cache-warm.yml writes on this image, and the
+    # all-targets check of the workspace does not fit a hosted runner's disk.
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          # Checkout otherwise writes the token into .git/config, where a PR's
+          # own build.rs or proc-macro could read it back out.
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          # Read-only, like every other ci-dev reader; cache-warm.yml warms the
+          # check artifacts of this exact invocation.
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      # Clippy gates every event, pull requests included. When it ran only after
+      # merge, a lint regression merged freely and then failed every main run
+      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
+      # writes the same invocation's check artifacts into ci-dev, so a pull
+      # request re-checks only the crates its diff touches. Main keeps the step
+      # because pull requests can merge without being up to date with main.
+      - name: Run clippy lints
+        run: |
+          ./scripts/ci/resource_sampler.sh start clippy
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          python3 scripts/ci_test_artifact.py cargo lint --configuration workspace
+
+      - name: Upload lint diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-clippy-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/workspace
+          retention-days: 3
+          if-no-files-found: error
+
+  # Keeps its job ID and check name: it is the archive producer that
+  # workspace-tests and scripts/check_test_wiring.py bind to. The lint half
+  # is workspace-clippy above; this job builds the test archive, then runs
+  # the doctests and the log-analyzer anchor check on the same build output.
   workspace-lint-and-build:
     name: Workspace Lint and Build
     if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
@@ -192,7 +258,7 @@ jobs:
           # Every lane reads its cache; cache-warm.yml remains the sole writer
           # with the matching feature closure. Tests never compete to replace
           # shared caches, including when a PR attempt is cancelled.
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
@@ -208,18 +274,6 @@ jobs:
             echo "runner=${RUNNER_NAME}"
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/workspace/run-metadata.txt
-
-      # Clippy gates every event, pull requests included. When it ran only after
-      # merge, a lint regression merged freely and then failed every main run
-      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
-      # writes the same invocation's check artifacts into ci-dev, so a pull
-      # request re-checks only the crates its diff touches. Main keeps the step
-      # because pull requests can merge without being up to date with main.
-      - name: Run clippy lints
-        run: |
-          ./scripts/ci/resource_sampler.sh start clippy
-          trap './scripts/ci/resource_sampler.sh stop' EXIT
-          python3 scripts/ci_test_artifact.py cargo lint --configuration workspace
 
       - name: Archive workspace test binaries
         env:
@@ -271,7 +325,7 @@ jobs:
       # rustfs/backlog#1289: fail if a seed rule's log anchor no longer exists
       # verbatim in the source tree (log message drifted without updating the
       # rule). Placed here where the workspace — including the la-dump-anchors
-      # bin — is already built by the clippy/test steps above.
+      # bin's dependencies — is already built by the test archive step above.
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
 
@@ -282,8 +336,6 @@ jobs:
     # requires the same runner image until the hosted-runtime pilot passes.
     runs-on: sm-standard-4
     timeout-minutes: 90
-    outputs:
-      workspace_shards: ${{ steps.shards.outputs.workspace_shards || '[]' }}
     env:
       CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
     steps:
@@ -372,89 +424,6 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-      - name: Prepare bounded shards from this candidate's observed durations
-        id: shards
-        if: needs.classify-changes.outputs.rehearse_shards == 'true'
-        run: |
-          python3 scripts/ci_test_shards.py prepare \
-            --listing artifacts/workspace/core-test-listing.json \
-            --junit target/nextest/ci/junit.xml --output artifacts/workspace-shard-plan
-      - name: Upload same-run shard plan
-        if: needs.classify-changes.outputs.rehearse_shards == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: workspace-shard-plan-${{ github.run_attempt }}
-          path: artifacts/workspace-shard-plan
-          retention-days: 3
-          if-no-files-found: error
-
-  workspace-shards:
-    name: Workspace shards (${{ matrix.shard }})
-    if: needs.classify-changes.outputs.rehearse_shards == 'true'
-    needs: [classify-changes, workspace-tests]
-    # Reuse the producer image and checkout path for the full RustFS archive.
-    runs-on: sm-standard-4
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        shard: ${{ fromJSON(needs.workspace-tests.outputs.workspace_shards || '[]') }}
-    env:
-      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/test-runtime
-      - name: Protect Connect test home
-        run: chmod go-w "$(realpath "$HOME")"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: workspace-test-binaries-${{ github.run_attempt }}
-          path: ${{ runner.temp }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: workspace-shard-plan-${{ github.run_attempt }}
-          path: artifacts/workspace-shard-plan
-      - name: Verify and execute this shard without compilation
-        env:
-          SHARD_INDEX: ${{ matrix.shard }}
-        run: |
-          python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
-          python3 scripts/ci_test_shards.py execute --plan artifacts/workspace-shard-plan \
-            --archive "$RUNNER_TEMP/workspace-tests.tar.zst" --index "$SHARD_INDEX" --output artifacts/workspace-shard-result
-      - name: Retain shard evidence including failures
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: workspace-shard-result-${{ matrix.shard }}-${{ github.run_attempt }}
-          path: artifacts/workspace-shard-result
-          retention-days: 3
-          if-no-files-found: error
-
-  workspace-shard-evidence:
-    name: Workspace shard completeness
-    if: always() && needs.classify-changes.outputs.rehearse_shards == 'true'
-    needs: [classify-changes, workspace-tests, workspace-shards]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: workspace-shard-plan-${{ github.run_attempt }}
-          path: artifacts/workspace-shard-plan
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: workspace-shard-result-*-${{ github.run_attempt }}
-          path: artifacts/workspace-shards
-      - name: Require the exact union of successful shard executions
-        run: |
-          python3 scripts/ci_test_shards.py verify --plan artifacts/workspace-shard-plan --evidence artifacts/workspace-shards
-          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace-shard-plan/listing.json artifacts/workspace-shards/combined.xml
 
   connect-feature-boundaries:
     name: Connect Feature Boundaries
@@ -474,7 +443,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
@@ -646,6 +615,10 @@ jobs:
             flags: "--features sftp"
           - name: http3
             flags: "--features http3,swift"
+          - name: internode-transport
+            flags: "--features rustfs/internode-transport"
+            packages: "-p rustfs-ecstore -p rustfs-rio"
+            tests: "--no-tests fail -E 'test(peer_transport_)'"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -671,7 +644,7 @@ jobs:
         run: |
           ./scripts/ci/resource_sampler.sh start clippy
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
+          cargo clippy -p rustfs ${{ matrix.features.packages || '-p rustfs-protocols' }} --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
         id: protocol-tests
@@ -688,7 +661,7 @@ jobs:
           mkdir -p artifacts/protocol-tests
           ./scripts/ci/resource_sampler.sh start nextest
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }} \
+          cargo nextest run --profile ci -p rustfs ${{ matrix.features.packages || '-p rustfs-protocols' }} ${{ matrix.features.flags }} ${{ matrix.features.tests }} \
             2>&1 | tee artifacts/protocol-tests/nextest.log
 
       - name: Upload protocol test reports and diagnostics
@@ -721,7 +694,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
@@ -965,6 +938,8 @@ jobs:
     # Retain the producer image and fixture paths until the runtime pilot passes.
     runs-on: sm-standard-4
     timeout-minutes: 30
+    env:
+      RUSTFS_S3_STACK: legacy
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -1085,18 +1060,137 @@ jobs:
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
           retention-days: 3
 
+  # The same e2e-smoke suite against the same debug binary with the gateway
+  # S3 stack selected (rustfs/backlog#2734). Report-only: it is outside the
+  # Test and Lint aggregate and becomes required at T2.10. The test-binary
+  # download, identity, membership, run and completeness steps must stay
+  # identical to e2e-tests; scripts/ci_gate.py enforces that.
+  #
+  # When it runs: every push to main or gateway/integration, merge group,
+  # nightly schedule and manual dispatch, and every pull request that changes a
+  # gateway-stack input (GATEWAY_SMOKE_PATHS and the rustfs-gateway pins in
+  # scripts/ci_gate.py, published by Select CI scope as gateway_smoke).
+  # Why it is skipped on every other pull request: until T2.10 the gateway
+  # stack does not serve the whole smoke suite, so the lane fails on any
+  # revision. A pull request that touches none of its inputs can neither cause
+  # nor fix that failure, and a red check there says nothing about the change.
+  # Skipped is the honest state; a failure must never be rendered green, so no
+  # step here may carry continue-on-error. A selection that is missing or
+  # unreadable runs the lane. At T2.10, when the lane becomes required, it
+  # must run on every pull request again: delete the selection, do not extend
+  # it.
+  e2e-tests-gateway:
+    name: e2e-smoke (gateway, report-only until T2.10)
+    needs: [ classify-changes, build-rustfs-debug-binary ]
+    if: github.event_name != 'pull_request' || needs.classify-changes.outputs.gateway_smoke != 'false'
+    runs-on: sm-standard-2
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      RUSTFS_S3_STACK: gateway
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Install verification runtime
+        uses: ./.github/actions/test-runtime
+
+      - name: Download E2E test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-test-binaries
+          path: ${{ runner.temp }}
+
+      - name: Verify E2E archive identity
+        run: python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
+      # Download after the cache restore so the freshly built binary from the
+      # build job always wins over anything restored into target/debug.
+      - name: Download debug binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      # Build the e2e test graph once. The archive is reused by the smoke
+      # selection guard, security exact-count check, and run below, avoiding a
+      # second compile of the same e2e_test target on cold runners (backlog#1645).
+      - name: Verify e2e smoke test membership
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/e2e-tests.tar.zst
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+        run: |
+          cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
+          ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
+
+      # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
+      # profile.e2e-smoke default-filter in .config/nextest.toml is the single
+      # wiring mechanism for e2e tests in CI — extend that filter instead of
+      # adding new e2e jobs here. Each test spawns its own rustfs server on a
+      # random port and reuses the downloaded debug binary above.
+      - name: Run e2e smoke suite
+        env:
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/e2e-tests.tar.zst
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
+          SAMPLER_INTERVAL_SECS: "15"
+        run: |
+          ./scripts/ci/resource_sampler.sh start e2e-smoke
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --status-level all --final-status-level all --failure-output final
+
+      - name: Verify e2e smoke execution completeness
+        run: python3 scripts/ci_test_artifact.py evidence "$RUNNER_TEMP/rustfs-e2e-smoke-list.json" target/nextest/e2e-smoke/junit.xml
+
+      - name: Upload e2e smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-smoke-gateway-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/rustfs-e2e-smoke-logs/
+            ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+          if-no-files-found: warn
+
+      - name: Upload e2e smoke JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-smoke-gateway-junit-${{ github.run_number }}-${{ github.run_attempt }}
+          path: target/nextest/e2e-smoke/junit.xml
+          if-no-files-found: warn
+
   e2e-full:
     name: End-to-End Tests (full merge gate)
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main pushes, the merge queue, and manual
-    # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
-    # owned by other lanes (see .config/nextest.toml profile.e2e-full).
+    # every PR, so it is gated to main and gateway/integration pushes, the merge
+    # queue, and manual dispatch. protocols / the 7 cluster suites / replication
+    # / #[ignore] are owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/gateway/integration'))
     needs: [ build-rustfs-debug-binary ]
     # Retain the producer image and fixture paths until the runtime pilot passes.
     runs-on: sm-standard-4
@@ -1462,10 +1556,9 @@ jobs:
       - classify-changes
       - typos
       - quick-checks
+      - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
-      - workspace-shards
-      - workspace-shard-evidence
       - core-contract
       - connect-feature-boundaries
       - fips-provider
@@ -1500,6 +1593,7 @@ jobs:
       - required-checks
       - typos
       - quick-checks
+      - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
       - core-contract

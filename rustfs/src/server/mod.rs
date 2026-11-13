@@ -20,6 +20,7 @@ mod health;
 mod http;
 mod hybrid;
 mod layer;
+mod legacy_compat;
 mod module_switch;
 mod prefix;
 pub mod rate_limit;
@@ -56,6 +57,7 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub use crate::shared_types::RemoteAddr;
 pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
@@ -95,9 +97,6 @@ pub(crate) use readiness::snapshot_dependency_readiness_report;
 #[cfg(test)]
 pub(crate) use readiness::wait_for_runtime_readiness_with;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
-pub(crate) use ssec_transport::NativeTlsTransport;
-
-pub use crate::shared_types::RemoteAddr;
 
 pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
     if host.ends_with(']') {

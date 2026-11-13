@@ -66,6 +66,8 @@ pub mod bucket {
         }
 
         pub mod bucket_lifecycle_ops {
+            pub use rustfs_lifecycle::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
+
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
@@ -137,7 +139,7 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::lifecycle::{
                 Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
                 ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
-                object_opts_from_object_info,
+                format_lifecycle_date, object_opts_from_object_info, parse_lifecycle_date,
             };
         }
 
@@ -240,7 +242,7 @@ pub mod bucket {
     }
 
     pub mod object_lock {
-        pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+        pub use crate::bucket::object_lock::ObjectLockApi;
 
         pub mod types {
             pub use crate::bucket::object_lock::types::{
@@ -335,9 +337,9 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
-            check_valid_bucket_name_strict, deserialize, has_bad_path_component, has_xml_invalid_control_characters,
-            is_meta_bucketname, is_valid_object_prefix, serialize,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
+            has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 
@@ -364,7 +366,7 @@ pub mod capacity {
 }
 
 pub mod object_api_utils {
-    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader};
 }
 
 pub mod cluster {
@@ -636,7 +638,14 @@ pub mod rio {
 }
 
 pub mod rpc {
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::http_auth::ExternalStreamAuth;
     pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::cluster::rpc::internode_data_transport::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
+    };
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
@@ -697,6 +706,8 @@ pub mod store_list {
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
+    #[cfg(feature = "internode-transport")]
+    pub use crate::store::external_rpc_disk;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
         all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,

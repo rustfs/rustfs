@@ -25,8 +25,8 @@ pub mod sql;
 #[cfg(test)]
 mod test;
 
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
-use s3s::dto::SelectObjectContentInput;
 use std::sync::{Arc, LazyLock};
 
 use crate::{
@@ -89,11 +89,11 @@ pub async fn create_fresh_db() -> QueryResult<Arc<dyn DatabaseManagerSystem + Se
         sse_customer_algorithm: None,
         sse_customer_key: None,
         sse_customer_key_md5: None,
-        request: s3s::dto::SelectObjectContentRequest {
+        request: rustfs_s3select_api::request::SelectObjectContentRequest {
             expression: "SELECT * FROM S3Object".to_string(),
-            expression_type: s3s::dto::ExpressionType::from_static("SQL"),
-            input_serialization: s3s::dto::InputSerialization::default(),
-            output_serialization: s3s::dto::OutputSerialization::default(),
+            expression_type: rustfs_s3select_api::request::ExpressionType::from("SQL"),
+            input_serialization: rustfs_s3select_api::request::InputSerialization::default(),
+            output_serialization: rustfs_s3select_api::request::OutputSerialization::default(),
             request_progress: None,
             scan_range: None,
         },

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<WebsiteConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <IndexDocument>
+    <Suffix>index.html</Suffix>
+  </IndexDocument>
+  <ErrorDocument>
+    <Key>error.html</Key>
+  </ErrorDocument>
+  <RoutingRules>
+    <RoutingRule>
+      <Condition>
+        <KeyPrefixEquals>docs/</KeyPrefixEquals>
+        <HttpErrorCodeReturnedEquals>404</HttpErrorCodeReturnedEquals>
+      </Condition>
+      <Redirect>
+        <Protocol>https</Protocol>
+        <HostName>www.example.com</HostName>
+        <ReplaceKeyPrefixWith>documents/</ReplaceKeyPrefixWith>
+        <HttpRedirectCode>301</HttpRedirectCode>
+      </Redirect>
+    </RoutingRule>
+  </RoutingRules>
+</WebsiteConfiguration>

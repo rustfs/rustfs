@@ -2533,6 +2533,7 @@ fn return_batch_delete_lock_error_with_accounting(
 }
 
 const EVENT_DETACHED_DELETE_FAILED: &str = "detached_delete_failed";
+const EVENT_BULK_DELETE_LOCK_ACQUIRE: &str = "bulk_delete_lock_acquire";
 const LOG_SUBSYSTEM_STORE_DELETE: &str = "store_delete";
 
 /// A detached delete only fails to join when it panicked or the runtime is
@@ -3536,6 +3537,10 @@ impl ECStore {
         Ok(RestoreAcceptGuard(guard))
     }
 
+    pub async fn check_restore_copyback_compatibility(&self) -> Result<()> {
+        crate::services::notification_sys::require_restore_copyback_fleet_capability().await
+    }
+
     /// Acquire the liveness lock for a newly generated restore UUID using the
     /// normal namespace-lock timeout. New generations cannot legitimately
     /// contend, but a distributed quorum can take longer than the short orphan
@@ -3563,12 +3568,10 @@ impl ECStore {
     }
 
     /// Acquire the per-object write locks a bulk delete needs before any
-    /// mutation, one batched lock round for the whole key set. Bulk delete is
-    /// the only multi-key write-lock holder, and the batched round is
-    /// deadlock-free by construction (one `lock_batch` RPC per lock client,
-    /// global key order at each server), so no optimistic wave or serial
-    /// fallback is needed. Outcomes are per key: a locked-out key fails alone
-    /// and the rest of the batch proceeds.
+    /// mutation. Each peer receives one batch of unresolved keys per round;
+    /// retries share the original deadline and require confirmed cleanup of
+    /// partial grants. Outcomes remain independent per key so other keys can
+    /// proceed when a contended key exhausts its budget.
     async fn acquire_delete_objects_write_locks(
         &self,
         bucket: &str,
@@ -3580,6 +3583,7 @@ impl ECStore {
         }
 
         let object_names = sorted_unique_delete_object_names(objects);
+        let acquire_started = Instant::now();
         let acquired = self.pools[0].disk_set[0]
             .acquire_object_write_locks_batch(bucket, &object_names, get_lock_acquire_timeout())
             .await;
@@ -3609,6 +3613,35 @@ impl ECStore {
                     failures.insert((*object).to_owned(), error);
                 }
             }
+        }
+        if failures.is_empty() {
+            debug!(
+                event = EVENT_BULK_DELETE_LOCK_ACQUIRE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_DELETE,
+                result = "success",
+                stage = "raw_acquire",
+                requested_objects = objects.len(),
+                unique_keys = object_names.len(),
+                successful_keys = guards.len(),
+                failed_keys = failures.len(),
+                elapsed_ms = acquire_started.elapsed().as_millis(),
+                "Bulk delete namespace lock acquisition completed"
+            );
+        } else {
+            warn!(
+                event = EVENT_BULK_DELETE_LOCK_ACQUIRE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_DELETE,
+                result = "partial_failure",
+                stage = "raw_acquire",
+                requested_objects = objects.len(),
+                unique_keys = object_names.len(),
+                successful_keys = guards.len(),
+                failed_keys = failures.len(),
+                elapsed_ms = acquire_started.elapsed().as_millis(),
+                "Bulk delete namespace lock acquisition failed for some keys"
+            );
         }
         opts.no_lock = true;
         for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
@@ -9665,8 +9698,8 @@ mod tests {
     #[test]
     fn batch_delete_identifies_only_latest_versioned_markers() {
         let versioned = DeleteReplicationConfigSnapshot::from_configs_for_test(
-            s3s::dto::VersioningConfiguration {
-                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             None,
@@ -9777,7 +9810,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_null_version_cas_distinguishes_absent_and_replacement_pools() {
-        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
@@ -9786,7 +9819,7 @@ mod tests {
         let bucket = RUSTFS_META_BUCKET;
         let suspended_snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                status: Some("Suspended".to_owned()),
                 ..Default::default()
             },
             None,
@@ -14401,8 +14434,7 @@ mod batch_delete_lock_tests {
         let second = run(second);
 
         // Whatever mix of per-key lock outcomes the overlap produces, both
-        // batches must finish: the batched round is deadlock-free by
-        // construction (global key order at each lock server).
+        // batches must finish within their acquisition and mutation budgets.
         for batch in [first, second] {
             let (_, errors, _) = tokio::time::timeout(Duration::from_secs(30), batch)
                 .await

@@ -94,6 +94,7 @@ swift = [
     "dep:futures",
     "dep:http-body-util",
     "dep:tokio-util",
+    "dep:sync_wrapper",
     "dep:serde",
     "dep:urlencoding",
     "dep:md-5",
@@ -107,7 +108,7 @@ swift = [
     "dep:async-compression",
 ]
 webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64-simd", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
-sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
+sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2", "dep:urlencoding"]
 
 [dependencies]
 hotpath.workspace = true
@@ -138,7 +139,8 @@ time = { workspace = true, features = ["parsing", "formatting", "macros", "serde
 bytes = { workspace = true, features = ["serde"] }
 
 # S3 API dependencies
-s3s = { workspace = true, features = ["minio"] }
+rustfs-s3-types = { workspace = true }
+rustfs-gateway-stream = { workspace = true }
 
 # FTPS specific dependencies (optional)
 libunftp = { workspace = true, optional = true, features = ["experimental"] }
@@ -148,6 +150,7 @@ rustls = { workspace = true, default-features = false, optional = true, features
 # Swift specific dependencies (optional)
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
+rustfs-gateway-types = { workspace = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true, features = ["timeout"] }
@@ -158,6 +161,9 @@ uuid = { workspace = true, optional = true, features = ["v4", "fast-rng", "macro
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
+# Lends `Sync` to the Send-only streams that `Body::from_stream` and the
+# storage writer take; the stream is only ever polled through `&mut`.
+sync_wrapper = { workspace = true, optional = true, features = ["futures"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }

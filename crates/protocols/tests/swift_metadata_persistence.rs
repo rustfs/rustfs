@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 
 use rustfs_credentials::Credentials;
+use rustfs_gateway_types::cors_tagging::PersistedTag;
 use rustfs_protocols::swift::container::{ContainerMapper, update_container_metadata};
 use rustfs_protocols::swift::{MetadataUpdate, SwiftError, account, container};
 use rustfs_test_utils::TestECStoreEnv;
@@ -120,8 +121,10 @@ async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
         .tagging_config
         .clone()
         .unwrap_or_default();
-    ordinary_tags.tag_set =
-        serde_json::from_value(json!([{"key": "swift-meta-owner", "value": "blue"}])).expect("ordinary tag fixture");
+    ordinary_tags.tag_set = vec![PersistedTag {
+        key: Some("swift-meta-owner".to_owned()),
+        value: Some("blue".to_owned()),
+    }];
     update_s3_tagging_config(s3_only, Some(ordinary_tags.clone()), None)
         .await
         .expect("S3-only buckets accept Swift-like names");
@@ -150,7 +153,10 @@ async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
     let mut s3_tags = get_s3_tagging_config(&bucket).await.expect("initial S3 view").0;
     assert!(s3_tags.tag_set.is_empty(), "Swift fields must be absent from the initial S3 view");
     s3_tags.tag_set = (0..50)
-        .map(|index| serde_json::from_value(json!({"key": format!("team-{index}"), "value": "blue"})).expect("S3 tag fixture"))
+        .map(|index| PersistedTag {
+            key: Some(format!("team-{index}")),
+            value: Some("blue".to_owned()),
+        })
         .collect();
     update_s3_tagging_config(&bucket, Some(s3_tags.clone()), None)
         .await

@@ -31,15 +31,16 @@
 use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, emit as emit_audit,
 };
-use super::admin_json_response;
 use super::iam_error::iam_error_to_s3_error;
+use super::owned_admin_json_response;
 use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_req};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_envelope};
 use crate::admin::service::caller_identity::{CallerIdentity, oidc_profile_fields};
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
 use http::StatusCode;
@@ -84,8 +85,8 @@ struct SelfAccountInfoResponse {
 
 #[async_trait::async_trait]
 impl Operation for SelfAccountInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let caller = CallerIdentity::resolve(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
         let iam_store =
             current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
@@ -109,7 +110,7 @@ impl Operation for SelfAccountInfoHandler {
 
         // Reported inline rather than behind a second round trip, so a client
         // can render the whole security surface from one response.
-        let mfa = match object_store_from_req(&req) {
+        let mfa = match object_store_from_envelope(req.envelope()) {
             Some(store) => {
                 let status = mfa_service::status(store, &caller.access_key, OffsetDateTime::now_utc())
                     .await
@@ -151,7 +152,7 @@ impl Operation for SelfAccountInfoHandler {
             email,
         };
 
-        admin_json_response(req.uri.path(), &caller.credentials.secret_key, StatusCode::OK, &info)
+        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &info)
     }
 }
 
@@ -160,16 +161,15 @@ pub struct ChangeOwnPasswordHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ChangeOwnPasswordHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let signing_secret = req
-            .credentials
-            .as_ref()
+            .credentials()
             .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?
-            .secret_key
-            .expose()
+            .require_secret_key()
+            .map_err(|_| s3::error(S3ErrorCode::AccessDenied, "the request credential carries no secret key"))?
             .to_string();
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
         if let Err(err) = caller.ensure_credential_mutation_allowed() {
             emit_audit(
@@ -185,9 +185,10 @@ impl Operation for ChangeOwnPasswordHandler {
             return Err(err);
         }
 
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: ChangePasswordRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid change-password request: {e}")))?;
 
@@ -302,7 +303,7 @@ impl Operation for ChangeOwnPasswordHandler {
         })
         .await?;
 
-        admin_json_response(
+        owned_admin_json_response(
             &path,
             &caller.credentials.secret_key,
             StatusCode::OK,
@@ -331,8 +332,8 @@ struct SetUserSecretKeyQuery {
 
 #[async_trait::async_trait]
 impl Operation for SetUserSecretKeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query: SetUserSecretKeyQuery = match req.uri.query() {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query: SetUserSecretKeyQuery = match req.uri().query() {
             Some(query) => serde_urlencoded::from_str(query)
                 .map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "failed to decode query"))?,
             None => SetUserSecretKeyQuery::default(),
@@ -342,8 +343,8 @@ impl Operation for SetUserSecretKeyHandler {
             return Err(s3::error(S3ErrorCode::InvalidArgument, "access key is empty"));
         }
 
-        let caller = CallerIdentity::resolve(&req).await?;
-        let audit = AccountAuditContext::from_request(&req);
+        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let audit = AccountAuditContext::from_envelope(req.envelope());
 
         // The root identity is provisioned from the environment; its secret is a
         // process-wide `OnceLock` that also derives the internode RPC secret, so
@@ -366,12 +367,12 @@ impl Operation for SetUserSecretKeyHandler {
         }
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &caller.credentials,
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            crate::admin::auth::policy_source_addr(&req.extensions),
+            req.policy_source_addr(),
         )
         .await
         .inspect_err(|_| {
@@ -387,9 +388,10 @@ impl Operation for SetUserSecretKeyHandler {
             );
         })?;
 
-        let path = req.uri.path().to_string();
+        let path = req.uri().path().to_string();
         let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                .await?;
         let request: SetUserSecretKeyRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid set-user-secret-key request: {e}")))?;
 
@@ -449,7 +451,7 @@ impl Operation for SetUserSecretKeyHandler {
         })
         .await?;
 
-        admin_json_response(
+        owned_admin_json_response(
             &path,
             &caller.credentials.secret_key,
             StatusCode::OK,
@@ -539,6 +541,23 @@ fn validate_new_secret_key(request: &ChangePasswordRequest) -> S3Result<()> {
 mod tests {
     use super::*;
     use crate::server::ADMIN_PREFIX;
+
+    #[tokio::test]
+    async fn change_own_password_without_a_secret_key_is_access_denied() {
+        let req = crate::admin::operation::test_support::TestRequest::new(
+            Method::POST,
+            format!("{ADMIN_PREFIX}/v3/change-own-password")
+                .parse::<http::Uri>()
+                .expect("uri"),
+        )
+        .credentials_without_secret("account-user", None)
+        .build();
+        let err = ChangeOwnPasswordHandler {}
+            .call(req, Params::new())
+            .await
+            .expect_err("a credential without a secret key cannot rotate its password");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
     use rustfs_madmin::account::{AccountMutability, CredentialsSource};
 
     #[test]

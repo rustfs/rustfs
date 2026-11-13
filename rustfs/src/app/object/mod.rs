@@ -137,6 +137,7 @@ use rustfs_audit::ObjectVersion as AuditObjectVersion;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
+use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
@@ -169,21 +170,8 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-use s3s::StdError;
-use s3s::dto::{
-    CacheControl, Checksum, ChecksumAlgorithm, ChecksumType, ContentDisposition, ContentEncoding, ContentLanguage, ContentType,
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
-    DeleteObjectsOutput, DeletedObject, ETag, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
-    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
-    PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreRequestType, SSECustomerAlgorithm,
-    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
-    ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
-    WebsiteRedirectLocation,
-};
-use s3s::header::X_AMZ_RESTORE;
-use s3s::stream::{ByteStream, RemainingLength};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::dto::{SelectObjectContentInput, SelectObjectContentOutput};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
     S3Error::with_message(code, message)

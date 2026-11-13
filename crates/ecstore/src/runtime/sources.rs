@@ -44,10 +44,10 @@ use crate::{
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_lock::client::LockClient;
-use s3s::dto::BucketLifecycleConfiguration;
-use s3s::region::Region;
+use rustfs_s3_types::Region;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
@@ -371,7 +371,7 @@ pub fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
     get_global_tier_config_mgr()
 }
 
-pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<BucketLifecycleConfiguration> {
+pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<PersistedLifecycleConfiguration> {
     GLOBAL_LIFECYCLE_SYS.get(bucket).await
 }
 
@@ -526,7 +526,7 @@ pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disk
     let mut global_local_disk_map = map.write().await;
     for disk in disks {
         let path = disk.endpoint().to_string();
-        global_local_disk_map.insert(path, Some(disk.clone()));
+        global_local_disk_map.insert(path, Some(disk));
     }
 }
 
@@ -625,7 +625,7 @@ pub(crate) async fn initialize_local_disk_maps(
             })?;
 
             global_local_disk_map.insert(path, Some(disk.clone()));
-            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk.clone());
+            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk);
         }
     }
 

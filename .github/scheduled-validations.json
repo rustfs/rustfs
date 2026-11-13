@@ -871,6 +871,33 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/reference-parity.yml",
+      "name": "Reference Parity",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 1 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "reference-parity.yml",
+      "disposition": "s3-tests per-node-id parity of branch candidates against the pinned reference release",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/functional-chain-health.yml",
       "name": "Functional chain health",
       "roles": [
@@ -994,6 +1021,26 @@
       "monitor_reason": "Event-driven or operator-requested work has no periodic freshness obligation.",
       "policy_reason": "Preserve operator-disabled state; enabling requires a separate policy decision.",
       "origin": "baseline"
+    },
+    {
+      "workflow": ".github/workflows/manual-main-packages.yml",
+      "name": "Manual main packages",
+      "roles": [
+        "manual"
+      ],
+      "events": [
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "manual-main-packages.yml",
+      "disposition": "Packages the origin/main tip as workflow artifacts only. No GitHub Release or download-channel writes.",
+      "monitor_reason": "Operator-requested packaging has no periodic freshness obligation.",
+      "origin": "manual-main-packages"
     },
     {
       "workflow": ".github/workflows/minio-interop.yml",

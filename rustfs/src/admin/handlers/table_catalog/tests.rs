@@ -2,6 +2,8 @@
 mod catalog_migration_scope;
 
 use super::*;
+use crate::admin::operation::test_support::TestRequest;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
@@ -13,6 +15,7 @@ use datafusion::{
     },
     parquet::arrow::ArrowWriter,
 };
+use rustfs_s3_types::Body;
 use std::sync::Arc;
 
 use crate::table_catalog::test_support::{
@@ -47,17 +50,52 @@ impl KmsInterface for RequestKms {
     }
 }
 
-fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> S3Request<Body> {
+const LOAD_TABLE_URI: &str = "/iceberg/v1/warehouse/namespaces/analytics/tables/events";
+
+/// A handler request whose server slot holds `context`; `credentials` `None`
+/// leaves the request anonymous.
+fn table_catalog_request_builder(
+    context: Arc<AppContext>,
+    credentials: Option<(&str, &str)>,
+    method: Method,
+    uri: &str,
+) -> TestRequest {
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context));
+    let request = TestRequest::new(method, uri).extension(slot);
+    match credentials {
+        Some((access_key, secret_key)) => request.credentials(access_key, secret_key, None),
+        None => request,
+    }
+}
+
+fn load_table_request_builder(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> TestRequest {
+    table_catalog_request_builder(context, Some((access_key, secret_key)), Method::GET, LOAD_TABLE_URI)
+}
+
+fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> AdminRequest {
+    load_table_request_builder(context, access_key, secret_key).build()
+}
+
+/// Converts a legacy request the way the admin router edge does, without its body.
+fn legacy_request_view(req: &s3s::S3Request<s3s::Body>) -> AdminRequest {
+    AdminRequest::new(RequestEnvelope::from_s3s(req), Body::empty())
+}
+
+/// Builds a legacy request to exercise conversion into the owned request.
+fn legacy_table_catalog_handler_request(
+    context: Arc<AppContext>,
+    access_key: &str,
+    secret_key: &str,
+) -> s3s::S3Request<s3s::Body> {
     let slot = ServerContextSlot::new();
     assert!(slot.install(context));
     let mut extensions = http::Extensions::new();
     extensions.insert(slot);
-    S3Request {
-        input: Body::empty(),
+    s3s::S3Request {
+        input: s3s::Body::empty(),
         method: Method::GET,
-        uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events"
-            .parse()
-            .expect("load table URI"),
+        uri: LOAD_TABLE_URI.parse().expect("load table URI"),
         headers: HeaderMap::new(),
         extensions,
         credentials: Some(s3s::auth::Credentials {
@@ -70,87 +108,96 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     }
 }
 
-fn with_access_delegation(mut request: S3Request<Body>, values: &[&str]) -> S3Request<Body> {
-    for value in values {
-        request.headers.append(
-            ICEBERG_ACCESS_DELEGATION_HEADER,
-            HeaderValue::from_str(value).expect("access delegation header should be valid"),
-        );
-    }
-    request
+fn with_access_delegation(request: TestRequest, values: &[&str]) -> AdminRequest {
+    values
+        .iter()
+        .fold(request, |request, value| request.header(ICEBERG_ACCESS_DELEGATION_HEADER, value))
+        .build()
 }
 
-async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+/// Buffers an owned response into its status, headers and body bytes.
+async fn response_parts(response: AdminResponse) -> (StatusCode, HeaderMap, Bytes) {
+    let (status, headers, body) = response.into_parts();
+    let body = http_body_util::BodyExt::collect(body)
+        .await
+        .expect("response body should buffer")
+        .to_bytes();
+    (status, headers, body)
+}
+
+async fn call_load_table_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}", ())
         .expect("load table test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("load table test route should match");
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
-async fn call_catalog_restore_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_catalog_restore_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/catalog/restore", ())
         .expect("restore test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("restore test route should match");
     RestoreTableCatalogBackupHandler {}.call(request, matched.params).await
 }
 
-async fn call_catalog_backup_export_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_catalog_backup_export_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
         router
             .insert(format!("{prefix}/{{warehouse}}/catalog/backup/export"), ())
             .expect("backup export test route should insert");
     }
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("backup export test route should match");
     ExportTableCatalogBackupHandler {}.call(request, matched.params).await
 }
 
-async fn call_catalog_backup_import_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_catalog_backup_import_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
         router
             .insert(format!("{prefix}/{{warehouse}}/catalog/backup/import"), ())
             .expect("backup import test route should insert");
     }
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("backup import test route should match");
     ImportTableCatalogBackupHandler {}.call(request, matched.params).await
 }
 
-async fn call_catalog_backup_prepare_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_catalog_backup_prepare_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
         router
             .insert(format!("{prefix}/{{warehouse}}/catalog/backup/prepare"), ())
             .expect("backup preparation test route should insert");
     }
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("backup preparation test route should match");
     PrepareTableCatalogBackupObjectHandler {}.call(request, matched.params).await
 }
 
-async fn call_disable_table_bucket_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+/// Calls the disable handler with a request converted the same way the admin router edge converts it.
+async fn call_disable_table_bucket_handler(request: s3s::S3Request<s3s::Body>) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router.insert("/iceberg/v1/buckets/{warehouse}", ()).unwrap();
     router.insert("/_iceberg/v1/buckets/{warehouse}", ()).unwrap();
     let path = request.uri.path().to_string();
     let matched = router.at(&path).unwrap();
-    DisableTableBucketHandler {}.call(request, matched.params).await
+    let owned = AdminRequest::new(RequestEnvelope::from_s3s(&request), request.input.into());
+    DisableTableBucketHandler {}.call(owned, matched.params).await
 }
 
-async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+async fn call_maintenance_worker_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router
         .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run", ())
         .expect("worker test route should insert");
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).expect("worker test route should match");
     RunTableMaintenanceWorkerHandler {}.call(request, matched.params).await
 }
@@ -1061,22 +1108,10 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     assert!(context.publish_action_credentials(credentials.clone()));
     let slot = ServerContextSlot::new();
     assert!(slot.install(context));
-    let mut extensions = http::Extensions::new();
-    extensions.insert(slot);
-    let request = S3Request {
-        input: Body::empty(),
-        method: Method::GET,
-        uri: "/table-context".parse().expect("test URI"),
-        headers: HeaderMap::new(),
-        extensions,
-        credentials: Some(s3s::auth::Credentials {
-            access_key: user_access_key.to_string(),
-            secret_key: s3s::auth::SecretKey::from(user_secret_key.to_string()),
-        }),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
+    let request = TestRequest::new(Method::GET, "/table-context")
+        .extension(slot.clone())
+        .credentials(user_access_key, user_secret_key, None)
+        .build();
 
     let principal = table_catalog_request_principal(&request)
         .await
@@ -1094,31 +1129,29 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     assert!(Arc::ptr_eq(&issuer.iam_store, &iam));
     assert_eq!(issuer.token_signing_key.as_deref(), Some("request-root-secret-key"));
     let resolved_store =
-        runtime_sources::object_store_from_extensions(&request.extensions).expect("request object store should resolve");
+        runtime_sources::object_store_from_envelope(request.envelope()).expect("request object store should resolve");
     assert!(Arc::ptr_eq(&resolved_store, &store));
 
-    let mut request = request;
     iam.set_policy(policy_name, Policy::parse_config(br#"{
         "Version":"2012-10-17","Statement":[
             {"Effect":"Allow","Action":["admin:GetTable","admin:CreatePluginDelegation"]},
             {"Effect":"Deny","Action":["admin:GetTable","admin:CreatePluginDelegation"],"Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}
         ]
     }"#).unwrap()).await.unwrap();
-    request
-        .extensions
-        .insert(Some(crate::server::RemoteAddr("10.1.2.3:4567".parse().unwrap())));
-    request.headers.insert("x-forwarded-for", "10.1.2.3".parse().unwrap());
     for (client, allowed) in [
         (None, true),
         (Some("203.0.113.17:7890"), false),
         (Some("10.8.7.6:7890"), true),
     ] {
-        request.extensions.remove::<rustfs_trusted_proxies::ClientInfo>();
+        let mut request = TestRequest::new(Method::GET, "/table-context")
+            .extension(slot.clone())
+            .credentials(user_access_key, user_secret_key, None)
+            .extension(Some(crate::server::RemoteAddr("10.1.2.3:4567".parse().unwrap())))
+            .header("x-forwarded-for", "10.1.2.3");
         if let Some(client) = client {
-            request
-                .extensions
-                .insert(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
+            request = request.extension(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
         }
+        let request = request.build();
         let unscoped = authorize_table_catalog_request(&request, AdminAction::GetTableAction).await;
         let scoped = authorize_table_catalog_resource_request(&request, &resource, AdminAction::GetTableAction).await;
         let delegated =
@@ -1133,11 +1166,17 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
             assert_eq!(delegated.err().expect("external client is denied").code(), &S3ErrorCode::AccessDenied);
         }
     }
-    request.method = Method::POST;
-    request.uri = "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-        .parse()
-        .expect("worker URI");
-    request.input = Body::from(br#"{"expected-job-id":"job-a","expected-attempt":0}"#.to_vec());
+    let request = TestRequest::new(
+        Method::POST,
+        "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+    )
+    .extension(slot)
+    .credentials(user_access_key, user_secret_key, None)
+    .extension(Some(crate::server::RemoteAddr("10.1.2.3:4567".parse().unwrap())))
+    .header("x-forwarded-for", "10.1.2.3")
+    .extension(rustfs_trusted_proxies::ClientInfo::direct("10.8.7.6:7890".parse().unwrap()))
+    .body(Body::from(br#"{"expected-job-id":"job-a","expected-attempt":0}"#.to_vec()))
+    .build();
     let err = call_maintenance_worker_handler(request)
         .await
         .expect_err("table read permission must not authorize a conditional maintenance worker");
@@ -1225,11 +1264,9 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
             iam.set_temp_user(&credential.access_key, &credential, None)
                 .await
                 .expect("store temporary credential");
-            let mut request = table_catalog_handler_request(context.clone(), &credential.access_key, &credential.secret_key);
-            request.headers.insert(
-                "x-amz-security-token",
-                HeaderValue::from_str(&credential.session_token).expect("session token header"),
-            );
+            let request = load_table_request_builder(context.clone(), &credential.access_key, &credential.secret_key)
+                .header("x-amz-security-token", &credential.session_token)
+                .build();
             let unscoped = authorize_table_catalog_request(&request, AdminAction::GetTableAction).await;
             let scoped = authorize_table_catalog_resource_request(
                 &request,
@@ -1260,6 +1297,10 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
 #[tokio::test]
 async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    store
+        .make_bucket("warehouse", &MakeBucketOptions::default())
+        .await
+        .expect("create warehouse bucket");
     rustfs_iam::store::object::ObjectStore::new(store.clone())
         .save_iam_config(
             serde_json::json!({"version": 1}),
@@ -1297,6 +1338,18 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     iam.policy_db_set(access_key, UserType::Reg, false, "location-creator")
         .await
         .expect("attach location policy");
+    iam.set_policy(
+        "owned-object-policy",
+        Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::warehouse/owned/*"},{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::warehouse/owned/writable"}]}"#,
+        )
+        .expect("parse object policy"),
+    )
+    .await
+    .expect("store object policy");
+    iam.policy_db_set(access_key, UserType::Reg, false, "location-creator,owned-object-policy")
+        .await
+        .expect("attach object policy");
     let context = Arc::new(AppContext::new(store, Arc::new(RequestIam { handle: iam }), Arc::new(RequestKms)));
     assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
         access_key: "location-root".to_string(),
@@ -1304,6 +1357,183 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         status: "on".to_string(),
         ..Default::default()
     }));
+    // Exercise the actual owned internal authorization path, including its temporary target.
+    let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    let mut owned = legacy_request_view(&legacy);
+    let principal = table_catalog_request_principal(&owned).await.expect("resolve principal");
+    // Both request boundaries retain the effective region and the authenticated principal.
+    {
+        let mut legacy_region = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        legacy_region.region = Some("eu-west-1".parse().expect("valid legacy region"));
+        let legacy_request = legacy_request_view(&legacy_region);
+        let owned_request = load_table_request_builder(context.clone(), access_key, secret_key)
+            .region(Some("eu-west-1".to_owned()))
+            .build();
+        let preserved_request = load_table_request_builder(context.clone(), access_key, secret_key)
+            .region(Some("eu-west-1".to_owned()))
+            .extension(ReqInfo {
+                region: Some("ap-south-1".parse().expect("valid existing region")),
+                bucket: Some("original-bucket".to_owned()),
+                ..Default::default()
+            })
+            .build();
+        for (mut request, expected_region, expected_bucket) in [
+            (legacy_request, "eu-west-1", None),
+            (owned_request, "eu-west-1", None),
+            (preserved_request, "ap-south-1", Some("original-bucket")),
+        ] {
+            let resolved = table_catalog_request_principal(&request)
+                .await
+                .expect("resolve actual IAM principal");
+            assert_eq!(resolved.credentials.access_key, access_key);
+            assert!(!resolved.owner);
+            install_table_catalog_s3_request_info(&mut request, &resolved).expect("install request identity");
+            let info = request.req_info().expect("request info");
+            assert_eq!(info.region.as_ref().map(|value| value.as_str()), Some(expected_region));
+            assert_eq!(info.bucket.as_deref(), expected_bucket);
+            assert_eq!(info.cred.as_ref().map(|value| value.access_key.as_str()), Some(access_key));
+            assert!(!info.is_owner);
+            authorize_table_catalog_s3_actions(&mut request, "warehouse", "owned/allowed", &[S3Action::GetObjectAction])
+                .await
+                .expect("the real IAM policy allows the object");
+            let info = request.req_info().expect("request info after authorization");
+            assert_eq!(info.region.as_ref().map(|value| value.as_str()), Some(expected_region));
+            assert_eq!(info.bucket.as_deref(), expected_bucket);
+        }
+    }
+    install_table_catalog_s3_request_info(&mut owned, &principal).expect("install authorization context");
+    let info = owned.req_info_mut().expect("request info");
+    info.bucket = Some("original-bucket".to_owned());
+    info.object = Some("original-object".to_owned());
+    info.version_id = Some("original-version".to_owned());
+    for (object, allowed) in [("owned/allowed", true), ("shared/denied", false)] {
+        let result = authorize_table_catalog_s3_actions(&mut owned, "warehouse", object, &[S3Action::GetObjectAction]).await;
+        if allowed {
+            result.expect("the exact owned object should be allowed");
+        } else {
+            assert_eq!(result.expect_err("the other object should be denied").code(), &S3ErrorCode::AccessDenied);
+        }
+        let info = owned.envelope().req_info().expect("request info remains installed");
+        assert_eq!(info.bucket.as_deref(), Some("original-bucket"));
+        assert_eq!(info.object.as_deref(), Some("original-object"));
+        assert_eq!(info.version_id.as_deref(), Some("original-version"));
+    }
+    // The exact-key check selects internal-object mode: a request header the object
+    // write does not apply (a malformed x-amz-tagging) must not reach the decision,
+    // while the ordinary owned entry point still evaluates it and rejects it.
+    let mut tagged = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+    tagged
+        .headers
+        .insert("x-amz-tagging", http::HeaderValue::from_static("classification=%ZZ"));
+    let mut tagged = legacy_request_view(&tagged);
+    install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
+    authorize_table_catalog_s3_actions(&mut tagged, "warehouse", "owned/writable", &[S3Action::PutObjectAction])
+        .await
+        .expect("internal-object mode ignores request options the write does not apply");
+    let info = tagged.req_info_mut().expect("request info");
+    info.bucket = Some("warehouse".to_owned());
+    info.object = Some("owned/writable".to_owned());
+    crate::app::authorize_owned_request(
+        tagged.envelope_mut(),
+        rustfs_policy::policy::action::Action::S3Action(S3Action::PutObjectAction),
+        None,
+    )
+    .await
+    .expect_err("ordinary mode evaluates the malformed tagging header");
+    let objects = TestTableCatalogObjectBackend::default();
+    objects
+        .seed_object("warehouse", "owned/read-only", b"readable".to_vec())
+        .await;
+    objects.seed_object("warehouse", "shared/denied", b"unchanged".to_vec()).await;
+    let backend = || {
+        let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
+        let mut request = legacy_request_view(&legacy);
+        install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
+        TableCommitObjectBackend::for_request(objects.clone(), request)
+    };
+    let allowed = backend();
+    let object = allowed
+        .read_object("warehouse", "owned/read-only")
+        .await
+        .expect("authorized read")
+        .expect("seeded object");
+    assert_eq!(object.data, b"readable");
+    allowed
+        .put_object(
+            "warehouse",
+            "owned/writable",
+            b"written".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("authorized write");
+    assert_eq!(
+        objects
+            .read_object("warehouse", "owned/writable")
+            .await
+            .expect("read stored object")
+            .expect("written object")
+            .data,
+        b"written"
+    );
+    for (object, write) in [("shared/denied", false), ("owned/read-only", true), ("shared/denied", true)] {
+        let denied = backend();
+        let result = if write {
+            denied
+                .put_object(
+                    "warehouse",
+                    object,
+                    b"modified".to_vec(),
+                    crate::table_catalog::TableCatalogPutPrecondition::Any,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            denied.read_object("warehouse", object).await.map(|_| ())
+        };
+        assert!(result.is_err(), "unauthorized {object} operation must fail");
+        assert_eq!(
+            denied.finish(Ok(())).await.expect_err("retain authorization error").code(),
+            &S3ErrorCode::AccessDenied
+        );
+    }
+    assert_eq!(
+        objects
+            .read_object("warehouse", "owned/read-only")
+            .await
+            .expect("read object")
+            .expect("seeded object")
+            .data,
+        b"readable"
+    );
+    assert_eq!(
+        objects
+            .read_object("warehouse", "shared/denied")
+            .await
+            .expect("read object")
+            .expect("seeded object")
+            .data,
+        b"unchanged"
+    );
+    let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+    install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
+    let real_backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(context.object_store());
+    let commit = TableCommitObjectBackend::for_request(real_backend, request);
+    commit
+        .put_object(
+            "warehouse",
+            "owned/writable",
+            b"persisted through real IAM".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .expect("authorized ECStore write");
+    let persisted = commit
+        .read_object("warehouse", "owned/writable")
+        .await
+        .expect("authorized ECStore read")
+        .expect("written object exists");
+    assert_eq!(persisted.data, b"persisted through real IAM");
     let request = || table_catalog_handler_request(context.clone(), access_key, secret_key);
     for location in ["s3://warehouse/owned", "s3://warehouse/owned/", "s3://warehouse/owned/child"] {
         authorize_table_warehouse_location_request(&request(), "warehouse", location)
@@ -1320,8 +1550,7 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
             .expect_err("namespace create grant cannot authorize another prefix");
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
     }
-    let mut anonymous = request();
-    anonymous.credentials = None;
+    let anonymous = table_catalog_request_builder(context.clone(), None, Method::GET, LOAD_TABLE_URI).build();
     assert!(
         authorize_table_warehouse_location_request(&anonymous, "warehouse", "s3://warehouse/owned")
             .await
@@ -1348,7 +1577,10 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         ("s3://warehouse/owned", true),
         ("s3://warehouse/shared", false),
     ] {
-        let backend = TableCommitObjectBackend::for_request(TestTableCatalogObjectBackend::default(), request());
+        let backend = TableCommitObjectBackend::for_request(
+            TestTableCatalogObjectBackend::default(),
+            legacy_request_view(&legacy_table_catalog_handler_request(context.clone(), access_key, secret_key)),
+        );
         let mut target = metadata.clone();
         target["location"] = serde_json::json!(location);
         let result = validate_table_metadata_snapshot_graph(&backend, "warehouse", &entry, Some(&metadata), &target).await;
@@ -1422,16 +1654,17 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
                 ..Default::default()
             }));
             let request = |body: serde_json::Value| {
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::POST;
-                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-                    .parse()
-                    .expect("worker URI");
-                request.input = Body::from(serde_json::to_vec(&body).expect("worker request JSON"));
-                request
+                table_catalog_request_builder(
+                    context.clone(),
+                    Some((access_key, secret_key)),
+                    Method::POST,
+                    "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+                )
+                .body(Body::from(serde_json::to_vec(&body).expect("worker request JSON")))
+                .build()
             };
             let setup = request(serde_json::json!({}));
-            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
+            let backend = table_catalog_backend_from_envelope(setup.envelope()).expect("request catalog backend");
             let catalog = table_catalog_store_from_backend(backend.clone()).expect("object-backed catalog");
             enable_table_bucket_marker(object_store.as_ref(), "warehouse")
                 .await
@@ -1523,9 +1756,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(claim.clone()))
                 .await
                 .expect("authorized conditional claim");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let completed: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered worker response")).expect("worker report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let completed: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("worker report");
             assert_eq!(completed.job.job_id, queued.job.job_id);
             assert_eq!(completed.job.attempt, 1);
             assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
@@ -1544,9 +1777,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(claim))
                 .await
                 .expect("same-worker replay");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let replay: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered replay response")).expect("replayed report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let replay: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("replayed report");
             assert_eq!(replay, completed);
             assert_eq!(inventory(&backend).await, committed);
 
@@ -1571,10 +1804,9 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
             let response = call_maintenance_worker_handler(request(serde_json::json!({})))
                 .await
                 .expect("legacy unconditional request remains supported");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let legacy: TableMetadataMaintenanceReport =
-                serde_json::from_slice(&response.output.1.bytes().expect("buffered legacy response"))
-                    .expect("legacy worker report");
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let legacy: TableMetadataMaintenanceReport = serde_json::from_slice(&body).expect("legacy worker report");
             assert_ne!(legacy.job.job_id, completed.job.job_id);
             assert_eq!(legacy.job.worker_id.as_deref(), Some(DEFAULT_TABLE_MAINTENANCE_WORKER_ID));
             assert_eq!(legacy.job.status, TableMetadataMaintenanceJobStatus::Successful);
@@ -1659,7 +1891,7 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let setup_request = table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key);
     let metadata_backend =
-        table_catalog_backend_from_extensions(&setup_request.extensions).expect("table catalog backend should resolve");
+        table_catalog_backend_from_envelope(setup_request.envelope()).expect("table catalog backend should resolve");
     let catalog_store = table_catalog_store_from_backend(metadata_backend.clone()).expect("table catalog store should resolve");
     enable_table_bucket_marker(object_store.as_ref(), "warehouse")
         .await
@@ -1704,28 +1936,27 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
     })
     .await
     .expect("metadata-only caller should load without requesting delegation");
-    assert!(absent.headers.get(http::header::CACHE_CONTROL).is_none());
-    let absent_json: serde_json::Value =
-        serde_json::from_slice(&absent.output.1.bytes().expect("absent delegation body should be buffered"))
-            .expect("absent delegation response should parse");
+    let (_, absent_headers, absent_body) = response_parts(absent).await;
+    assert!(absent_headers.get(http::header::CACHE_CONTROL).is_none());
+    let absent_json: serde_json::Value = serde_json::from_slice(&absent_body).expect("absent delegation response should parse");
     assert_eq!(absent_json["storage-credentials"], serde_json::json!([]));
 
     let disabled = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, None::<&str>)], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["vended-credentials"],
         ))
         .await
     })
     .await
     .expect("disabled vending should not add a credential permission requirement");
+    let (_, disabled_headers, disabled_body) = response_parts(disabled).await;
     assert_eq!(
-        disabled.headers.get(http::header::CACHE_CONTROL),
+        disabled_headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
     let disabled_json: serde_json::Value =
-        serde_json::from_slice(&disabled.output.1.bytes().expect("disabled vending body should be buffered"))
-            .expect("disabled vending response should parse");
+        serde_json::from_slice(&disabled_body).expect("disabled vending response should parse");
     assert_eq!(
         disabled_json["config"][CREDENTIAL_VENDING_REASON_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_DISABLED_REASON.to_string())
@@ -1734,32 +1965,28 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let remote_signing = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["remote-signing"],
         ))
         .await
     })
     .await
     .expect("unrequested vending should preserve metadata-only access");
-    assert!(remote_signing.headers.get(http::header::CACHE_CONTROL).is_none());
+    let (_, remote_signing_headers, _) = response_parts(remote_signing).await;
+    assert!(remote_signing_headers.get(http::header::CACHE_CONTROL).is_none());
 
     let not_authorized = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            load_table_request_builder(context.clone(), metadata_access_key, metadata_secret_key),
             &["vended-credentials"],
         ))
         .await
     })
     .await
     .expect("credential denial should fall back to the authorized metadata response");
-    let not_authorized_json: serde_json::Value = serde_json::from_slice(
-        &not_authorized
-            .output
-            .1
-            .bytes()
-            .expect("credential denial body should be buffered"),
-    )
-    .expect("credential denial response should parse");
+    let (_, _, not_authorized_body) = response_parts(not_authorized).await;
+    let not_authorized_json: serde_json::Value =
+        serde_json::from_slice(&not_authorized_body).expect("credential denial response should parse");
     assert_eq!(
         not_authorized_json["config"][CREDENTIAL_VENDING_REASON_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_NOT_AUTHORIZED_REASON.to_string())
@@ -1768,23 +1995,22 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
 
     let issued = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(with_access_delegation(
-            table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key),
+            load_table_request_builder(context.clone(), vended_access_key, vended_secret_key),
             &["remote-signing", "unknown, vended-credentials"],
         ))
         .await
     })
     .await
     .expect("credential-authorized caller should receive vended credentials");
-    assert_eq!(issued.output.0, StatusCode::OK);
+    let (issued_status, issued_headers, issued_body) = response_parts(issued).await;
+    assert_eq!(issued_status, StatusCode::OK);
     assert_eq!(
-        issued.headers.get(http::header::CACHE_CONTROL),
+        issued_headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
-    assert_eq!(issued.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
-    assert_eq!(issued.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
-    let issued_json: serde_json::Value =
-        serde_json::from_slice(&issued.output.1.bytes().expect("issued credential body should be buffered"))
-            .expect("issued credential response should parse");
+    assert_eq!(issued_headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(issued_headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    let issued_json: serde_json::Value = serde_json::from_slice(&issued_body).expect("issued credential response should parse");
     assert_eq!(
         issued_json["config"][CREDENTIAL_VENDING_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_VENDING_SUPPORTED.to_string())
@@ -1817,18 +2043,18 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
         }
     }
     let delegated = &issued_json["storage-credentials"][0]["config"];
-    let mut storage_request = table_catalog_handler_request(
+    let storage_request = load_table_request_builder(
         context.clone(),
         delegated[S3_ACCESS_KEY_ID_CONFIG_KEY].as_str().expect("vended access key"),
         delegated[S3_SECRET_ACCESS_KEY_CONFIG_KEY]
             .as_str()
             .expect("vended secret key"),
-    );
-    storage_request.headers.insert(
+    )
+    .header(
         "x-amz-security-token",
-        HeaderValue::from_str(delegated[S3_SESSION_TOKEN_CONFIG_KEY].as_str().expect("vended session token"))
-            .expect("session token header"),
-    );
+        delegated[S3_SESSION_TOKEN_CONFIG_KEY].as_str().expect("vended session token"),
+    )
+    .build();
     let error = call_load_table_handler(storage_request)
         .await
         .expect_err("vended storage credentials must not enter the catalog handler");
@@ -1836,8 +2062,8 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
     let reloaded = call_load_table_handler(table_catalog_handler_request(context, vended_access_key, vended_secret_key))
         .await
         .expect("the parent catalog identity remains authorized");
-    let reloaded_json: serde_json::Value =
-        serde_json::from_slice(&reloaded.output.1.bytes().expect("reloaded table body")).expect("parse reloaded table");
+    let (_, _, reloaded_body) = response_parts(reloaded).await;
+    let reloaded_json: serde_json::Value = serde_json::from_slice(&reloaded_body).expect("parse reloaded table");
     assert_eq!(reloaded_json["metadata-location"], issued_json["metadata-location"]);
     assert_eq!(reloaded_json["metadata"], issued_json["metadata"]);
 }
@@ -2153,10 +2379,10 @@ fn table_catalog_handlers_require_table_admin_actions() {
         .find("authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;")
         .expect("warehouse-aware backfill authorization");
     let marker = block
-        .find("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
+        .find("ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;")
         .expect("table bucket marker check");
     let store = block
-        .find("table_catalog_object_store_from_extensions(&req.extensions)?;")
+        .find("table_catalog_object_store_from_envelope(req.envelope())?;")
         .expect("request catalog store");
     assert!(
         warehouse < resource && resource < authorize && authorize < marker && marker < store,
@@ -2208,12 +2434,12 @@ fn table_catalog_handlers_require_table_admin_actions() {
 fn standard_rest_handlers_wire_strict_response_guards() {
     let src = table_catalog_handler_source();
     let drop_table = operation_block(&src, "RestDropTableHandler");
-    assert!(drop_table.contains("rest_purge_requested_from_query(&req.uri)?"));
+    assert!(drop_table.contains("rest_purge_requested_from_query(req.uri())?"));
     assert!(drop_table.contains("if purge_requested"));
     assert!(drop_table.contains("StatusCode::NOT_ACCEPTABLE"));
 
     let load_table = operation_block(&src, "RestLoadTableHandler");
-    assert!(load_table.contains("rest_table_snapshot_selection_from_query(&req.uri)?"));
+    assert!(load_table.contains("rest_table_snapshot_selection_from_query(req.uri())?"));
     assert!(load_table.contains("apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);"));
 
     let credentials = operation_block(&src, "RestLoadCredentialsHandler");
@@ -2224,12 +2450,12 @@ fn standard_rest_handlers_wire_strict_response_guards() {
 fn table_bucket_handlers_resolve_state_from_the_request_context() {
     let src = table_catalog_handler_source();
     let enable = operation_block(&src, "EnableTableBucketHandler");
-    assert!(enable.contains("table_catalog_backend_from_extensions(&req.extensions)?;"));
-    assert!(enable.contains("runtime_sources::object_store_from_req(&req)"));
+    assert!(enable.contains("table_catalog_backend_from_envelope(req.envelope())?;"));
+    assert!(enable.contains("runtime_sources::object_store_from_envelope(req.envelope())"));
 
     let get = operation_block(&src, "GetTableBucketHandler");
-    assert!(get.contains("table_catalog_store_from_extensions(&req.extensions)?;"));
-    assert!(get.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"));
+    assert!(get.contains("table_catalog_store_from_envelope(req.envelope())?;"));
+    assert!(get.contains("table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;"));
 }
 
 #[test]
@@ -2238,15 +2464,15 @@ fn table_catalog_list_handlers_parse_standard_pagination() {
     for (handler, helper_call) in [
         (
             "RestListNamespacesHandler",
-            "list_namespaces_response(&store, &warehouse, parent.as_ref(), &req.uri).await?",
+            "list_namespaces_response(&store, &warehouse, parent.as_ref(), req.uri()).await?",
         ),
         (
             "RestListTablesHandler",
-            "list_tables_response(&store, &warehouse, &namespace, &req.uri).await?",
+            "list_tables_response(&store, &warehouse, &namespace, req.uri()).await?",
         ),
         (
             "RestListViewsHandler",
-            "list_views_response(&store, &warehouse, &namespace, &req.uri).await?",
+            "list_views_response(&store, &warehouse, &namespace, req.uri()).await?",
         ),
     ] {
         let block = operation_block(&src, handler);
@@ -2354,8 +2580,8 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     ] {
         let block = operation_block(&src, handler);
         assert!(
-            block.contains("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
-                || block.contains("table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;"),
+            block.contains("ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;")
+                || block.contains("table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;"),
             "{handler} should require the table bucket metadata marker before catalog state access"
         );
     }
@@ -2531,7 +2757,7 @@ fn table_catalog_resource_builds_policy_object_scope() {
 
 fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
     let marker = format!("impl Operation for {handler}");
-    let block = src.split_once(&marker).expect("handler impl should exist").1;
+    let block = src.split_once(&marker).expect("owned handler impl should exist").1;
     let end = block
         .find("\npub struct ")
         .or_else(|| block.find("\n#[cfg(test)]"))
@@ -2613,6 +2839,7 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
 
     assert_operation::<EnableTableBucketHandler>();
+    assert_operation::<DisableTableBucketHandler>();
     assert_operation::<GetTableBucketHandler>();
     assert_operation::<RestListNamespacesHandler>();
     assert_operation::<RestCreateNamespaceHandler>();
@@ -2635,6 +2862,8 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     assert_operation::<RestReplaceViewHandler>();
     assert_operation::<RestDropViewHandler>();
     assert_operation::<ListTableRefsHandler>();
+    assert_operation::<PutTableRefHandler>();
+    assert_operation::<DeleteTableRefHandler>();
     assert_operation::<GetTableMetadataLocationHandler>();
     assert_operation::<UpdateTableMetadataLocationHandler>();
     assert_operation::<RestTableMetadataMaintenanceHandler>();
@@ -2999,23 +3228,36 @@ impl BackupTransferHandlerFixture {
         }
     }
 
-    fn request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
-        let mut request = table_catalog_handler_request(self.context.clone(), &self.root.access_key, &self.root.secret_key);
-        request.method = Method::POST;
-        request.uri = format!("{prefix}/{}/catalog/backup/{operation}", self.bucket)
-            .parse()
-            .expect("transfer request URI");
-        request.input = Body::from(data);
-        request
+    /// A transfer request against `bucket` presented as `access_key`.
+    fn request_builder(
+        &self,
+        prefix: &str,
+        bucket: &str,
+        operation: &str,
+        data: Vec<u8>,
+        (access_key, secret_key): (&str, &str),
+    ) -> TestRequest {
+        table_catalog_request_builder(
+            self.context.clone(),
+            Some((access_key, secret_key)),
+            Method::POST,
+            &format!("{prefix}/{bucket}/catalog/backup/{operation}"),
+        )
+        .body(Body::from(data))
     }
 
-    fn operator_request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
-        let mut request = self.request(prefix, operation, data);
-        request.credentials = Some(s3s::auth::Credentials {
-            access_key: "backup-transfer-operator".to_string(),
-            secret_key: s3s::auth::SecretKey::from("backup-transfer-operator-secret".to_string()),
-        });
-        request
+    fn root_credentials(&self) -> (&str, &str) {
+        (&self.root.access_key, &self.root.secret_key)
+    }
+
+    fn request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> AdminRequest {
+        self.request_builder(prefix, &self.bucket, operation, data, self.root_credentials())
+            .build()
+    }
+
+    fn operator_request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> AdminRequest {
+        self.request_builder(prefix, &self.bucket, operation, data, BACKUP_TRANSFER_OPERATOR)
+            .build()
     }
 
     async fn inventory(&self) -> BTreeMap<(String, String), (Vec<u8>, Option<String>)> {
@@ -3040,15 +3282,21 @@ impl BackupTransferHandlerFixture {
     }
 }
 
-fn assert_backup_transfer_response_is_private(response: &S3Response<(StatusCode, Body)>) {
-    assert_eq!(response.output.0, StatusCode::OK);
-    assert_eq!(response.headers.get(CONTENT_TYPE), Some(&HeaderValue::from_static(JSON_CONTENT_TYPE)));
+const BACKUP_TRANSFER_OPERATOR: (&str, &str) = ("backup-transfer-operator", "backup-transfer-operator-secret");
+const BACKUP_TRANSFER_READER: (&str, &str) = ("backup-transfer-reader", "backup-transfer-reader-secret");
+
+/// Asserts the transfer response is a private JSON `200` and returns its body.
+async fn private_backup_transfer_body(response: AdminResponse) -> Bytes {
+    let (status, headers, body) = response_parts(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(CONTENT_TYPE), Some(&HeaderValue::from_static(JSON_CONTENT_TYPE)));
     assert_eq!(
-        response.headers.get(http::header::CACHE_CONTROL),
+        headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
-    assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
-    assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    assert_eq!(headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    body
 }
 
 #[test]
@@ -3099,8 +3347,8 @@ async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_pub
                 let exported = call_catalog_backup_export_handler(source.operator_request(prefix, "export", export_body.clone()))
                     .await
                     .expect("warehouse-authorized operator can export");
-                assert_backup_transfer_response_is_private(&exported);
-                assert_eq!(exported.output.1.bytes().expect("raw export body").as_ref(), artifact.data.as_slice());
+                let exported = private_backup_transfer_body(exported).await;
+                assert_eq!(exported.as_ref(), artifact.data.as_slice());
                 assert_eq!(source.inventory().await, source_before, "export modified the saved artifact or catalog");
             }
 
@@ -3121,11 +3369,9 @@ async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_pub
                     } else {
                         artifact.data.clone()
                     };
-                    let mut request = target.request(prefix, operation, data);
-                    request.credentials = Some(s3s::auth::Credentials {
-                        access_key: "backup-transfer-reader".to_string(),
-                        secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
-                    });
+                    let request = target
+                        .request_builder(prefix, &target.bucket, operation, data, BACKUP_TRANSFER_READER)
+                        .build();
                     let error = if operation == "export" {
                         call_catalog_backup_export_handler(request).await
                     } else {
@@ -3144,8 +3390,7 @@ async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_pub
             ))
             .await
             .expect("import should only save the candidate artifact");
-            assert_backup_transfer_response_is_private(&imported);
-            let imported: serde_json::Value = serde_json::from_slice(&imported.output.1.bytes().expect("import body")).unwrap();
+            let imported: serde_json::Value = serde_json::from_slice(&private_backup_transfer_body(imported).await).unwrap();
             assert_eq!(imported["status"], "CREATED");
             assert_eq!(imported["backup_id"], backup.backup_id);
             assert_eq!(imported["created_at"], backup.created_at);
@@ -3171,17 +3416,16 @@ async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_pub
                     call_catalog_backup_import_handler(target.operator_request(prefix, "import", artifact.data.clone()))
                         .await
                         .expect("identical import should be idempotent");
-                assert_backup_transfer_response_is_private(&repeated);
                 let mut repeated: serde_json::Value =
-                    serde_json::from_slice(&repeated.output.1.bytes().expect("repeat body")).unwrap();
+                    serde_json::from_slice(&private_backup_transfer_body(repeated).await).unwrap();
                 assert_eq!(repeated["status"], "ALREADY_PRESENT");
                 repeated["status"] = imported["status"].clone();
                 assert_eq!(repeated, imported, "retry changed the saved timestamp or report");
                 let exported = call_catalog_backup_export_handler(target.operator_request(prefix, "export", export_body.clone()))
                     .await
                     .expect("a saved candidate is exportable before restore");
-                assert_backup_transfer_response_is_private(&exported);
-                assert_eq!(exported.output.1.bytes().expect("target export").as_ref(), artifact.data.as_slice());
+                let exported = private_backup_transfer_body(exported).await;
+                assert_eq!(exported.as_ref(), artifact.data.as_slice());
                 assert_eq!(target.inventory().await, target_after, "retry or export rewrote object bytes or ETags");
             }
 
@@ -3199,10 +3443,9 @@ async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_pub
                 } else {
                     artifact.data.clone()
                 };
-                let mut request = target.operator_request(TABLE_CATALOG_PREFIX, operation, data);
-                request.uri = format!("{TABLE_CATALOG_PREFIX}/{foreign_bucket}/catalog/backup/{operation}")
-                    .parse()
-                    .unwrap();
+                let request = target
+                    .request_builder(TABLE_CATALOG_PREFIX, &foreign_bucket, operation, data, BACKUP_TRANSFER_OPERATOR)
+                    .build();
                 let error = if operation == "export" {
                     call_catalog_backup_export_handler(request).await
                 } else {
@@ -3299,10 +3542,9 @@ async fn catalog_backup_transfer_handlers_reject_invalid_bodies_and_disabled_buc
                 } else {
                     stored.data.clone()
                 };
-                let mut request = fixture.request(TABLE_CATALOG_PREFIX, operation, data);
-                request.uri = format!("{TABLE_CATALOG_PREFIX}/{disabled_bucket}/catalog/backup/{operation}")
-                    .parse()
-                    .unwrap();
+                let request = fixture
+                    .request_builder(TABLE_CATALOG_PREFIX, &disabled_bucket, operation, data, fixture.root_credentials())
+                    .build();
                 let error = if operation == "export" {
                     call_catalog_backup_export_handler(request).await
                 } else {
@@ -3322,19 +3564,9 @@ async fn catalog_backup_transfer_handlers_reject_invalid_bodies_and_disabled_buc
 async fn catalog_backup_transfer_handlers_authenticate_before_store_access() {
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
         for operation in ["export", "import"] {
-            let request = S3Request {
-                input: Body::from(b"not-an-artifact".to_vec()),
-                method: Method::POST,
-                uri: format!("{prefix}/warehouse/catalog/backup/{operation}")
-                    .parse()
-                    .expect("transfer URI"),
-                headers: HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            let request = TestRequest::new(Method::POST, format!("{prefix}/warehouse/catalog/backup/{operation}"))
+                .body(Body::from(b"not-an-artifact".to_vec()))
+                .build();
             let error = if operation == "export" {
                 call_catalog_backup_export_handler(request).await
             } else {
@@ -3382,17 +3614,9 @@ fn catalog_backup_object_prepare_request_is_strict() {
 #[tokio::test]
 async fn catalog_backup_prepare_handler_authenticates_before_store_or_body_access() {
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
-        let request = S3Request {
-            input: Body::from(b"not-json".to_vec()),
-            method: Method::POST,
-            uri: format!("{prefix}/warehouse/catalog/backup/prepare").parse().unwrap(),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = TestRequest::new(Method::POST, format!("{prefix}/warehouse/catalog/backup/prepare"))
+            .body(Body::from(b"not-json".to_vec()))
+            .build();
         let error = call_catalog_backup_prepare_handler(request)
             .await
             .expect_err("preparation must authenticate first");
@@ -3423,15 +3647,13 @@ async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_pu
             ))
             .await
             .expect("target must accept the candidate artifact before object preparation");
-            assert_backup_transfer_response_is_private(&imported);
+            private_backup_transfer_body(imported).await;
             let request_body = backup_object_prepare_body(&backup.backup_id, &backup.object, &backup.data);
             let before = target.inventory().await;
             for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
-                let mut request = target.request(prefix, "prepare", request_body.clone());
-                request.credentials = Some(s3s::auth::Credentials {
-                    access_key: "backup-transfer-reader".to_string(),
-                    secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
-                });
+                let request = target
+                    .request_builder(prefix, &target.bucket, "prepare", request_body.clone(), BACKUP_TRANSFER_READER)
+                    .build();
                 let error = call_catalog_backup_prepare_handler(request)
                     .await
                     .expect_err("reader cannot prepare backup objects");
@@ -3445,8 +3667,7 @@ async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_pu
             ))
             .await
             .expect("warehouse-authorized operator can prepare the exact source payload");
-            assert_backup_transfer_response_is_private(&prepared);
-            let prepared: serde_json::Value = serde_json::from_slice(&prepared.output.1.bytes().unwrap()).unwrap();
+            let prepared: serde_json::Value = serde_json::from_slice(&private_backup_transfer_body(prepared).await).unwrap();
             assert_eq!(prepared["status"], "PREPARED");
             assert_eq!(prepared["table_bucket"], bucket);
             assert_eq!(prepared["backup_id"], backup.backup_id);
@@ -3468,8 +3689,8 @@ async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_pu
                     call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", request_body.clone()))
                         .await
                         .expect("exact preparation retries must remain idempotent");
-                assert_backup_transfer_response_is_private(&repeated);
-                let mut repeated: serde_json::Value = serde_json::from_slice(&repeated.output.1.bytes().unwrap()).unwrap();
+                let mut repeated: serde_json::Value =
+                    serde_json::from_slice(&private_backup_transfer_body(repeated).await).unwrap();
                 assert_eq!(repeated["status"], "ALREADY_PRESENT");
                 repeated["status"] = prepared["status"].clone();
                 assert_eq!(repeated, prepared);
@@ -3505,8 +3726,9 @@ async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_pu
             enable_table_bucket_marker(&target_store, &foreign_bucket).await.unwrap();
             let before_foreign = target.inventory().await;
             for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
-                let mut request = target.operator_request(prefix, "prepare", request_body.clone());
-                request.uri = format!("{prefix}/{foreign_bucket}/catalog/backup/prepare").parse().unwrap();
+                let request = target
+                    .request_builder(prefix, &foreign_bucket, "prepare", request_body.clone(), BACKUP_TRANSFER_OPERATOR)
+                    .build();
                 let error = call_catalog_backup_prepare_handler(request)
                     .await
                     .expect_err("warehouse permission must not authorize another warehouse");
@@ -3594,11 +3816,10 @@ async fn catalog_backup_prepare_handler_rejects_strict_json_base64_limits_and_di
             .expect_err("the JSON body must be bounded before deserialization");
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
             assert_eq!(target.inventory().await, before);
-            let mut length_request = target.operator_request(TABLE_CATALOG_PREFIX, "prepare", Vec::new());
-            length_request.headers.insert(
-                http::header::CONTENT_LENGTH,
-                HeaderValue::from_str(&(CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1).to_string()).unwrap(),
-            );
+            let length_request = target
+                .request_builder(TABLE_CATALOG_PREFIX, &target.bucket, "prepare", Vec::new(), BACKUP_TRANSFER_OPERATOR)
+                .header("content-length", &(CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1).to_string())
+                .build();
             let error = call_catalog_backup_prepare_handler(length_request).await.unwrap_err();
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
             assert!(error.message().unwrap_or_default().contains("request body is too large"));
@@ -3613,8 +3834,9 @@ async fn catalog_backup_prepare_handler_rejects_strict_json_base64_limits_and_di
                 .unwrap();
             let before_disabled = target.inventory().await;
             for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
-                let mut request = target.request(prefix, "prepare", b"not-json".to_vec());
-                request.uri = format!("{prefix}/{disabled_bucket}/catalog/backup/prepare").parse().unwrap();
+                let request = target
+                    .request_builder(prefix, &disabled_bucket, "prepare", b"not-json".to_vec(), target.root_credentials())
+                    .build();
                 let error = call_catalog_backup_prepare_handler(request).await.unwrap_err();
                 assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert!(error.message().unwrap_or_default().contains("not table-enabled"));
@@ -3664,17 +3886,9 @@ async fn catalog_restore_handler_authenticates_legacy_and_identified_requests_be
         r#"{"backup-id":"backup-a"}"#,
         r#"{"backup-id":"backup-a","restore-id":"restore-a"}"#,
     ] {
-        let request = S3Request {
-            input: Body::from(body.as_bytes().to_vec()),
-            method: Method::POST,
-            uri: "/iceberg/v1/warehouse/catalog/restore".parse().expect("restore URI"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = TestRequest::new(Method::POST, "/iceberg/v1/warehouse/catalog/restore")
+            .body(Body::from(body.as_bytes().to_vec()))
+            .build();
         let error = call_catalog_restore_handler(request)
             .await
             .expect_err("restore requires authentication before resolving an object store");
@@ -3747,15 +3961,17 @@ async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes(
                 .create_catalog_backup(&bucket, None)
                 .await
                 .expect("backup should be created");
-            let request = |body: serde_json::Value| {
-                let mut request = table_catalog_handler_request(context.clone(), root_access_key, root_secret_key);
-                request.method = Method::POST;
-                request.uri = format!("/iceberg/v1/{bucket}/catalog/restore")
-                    .parse()
-                    .expect("restore request URI");
-                request.input = Body::from(serde_json::to_vec(&body).expect("restore request body"));
-                request
+            let request_as = |credentials: Option<(&str, &str)>, body: serde_json::Value| {
+                table_catalog_request_builder(
+                    context.clone(),
+                    credentials,
+                    Method::POST,
+                    &format!("/iceberg/v1/{bucket}/catalog/restore"),
+                )
+                .body(Body::from(serde_json::to_vec(&body).expect("restore request body")))
+                .build()
             };
+            let request = |body: serde_json::Value| request_as(Some((root_access_key, root_secret_key)), body);
             let inventory = || async {
                 let mut objects = BTreeMap::new();
                 for path in backend
@@ -3786,19 +4002,14 @@ async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes(
             }
             let body = serde_json::json!({"backup-id": backup.backup_id, "restore-id": "restore-a"});
             let before = inventory().await;
-            let mut unauthenticated = request(body.clone());
-            unauthenticated.credentials = None;
+            let unauthenticated = request_as(None, body.clone());
             let error = call_catalog_restore_handler(unauthenticated)
                 .await
                 .expect_err("unauthenticated restore must be rejected");
             assert!(error.message().unwrap_or_default().contains("authentication required"));
             assert_eq!(inventory().await, before, "unauthenticated restore mutated catalog objects");
 
-            let mut unauthorized = request(body.clone());
-            unauthorized.credentials = Some(s3s::auth::Credentials {
-                access_key: "restore-request-reader".to_string(),
-                secret_key: s3s::auth::SecretKey::from("restore-request-reader-secret".to_string()),
-            });
+            let unauthorized = request_as(Some(("restore-request-reader", "restore-request-reader-secret")), body.clone());
             let error = call_catalog_restore_handler(unauthorized)
                 .await
                 .expect_err("unprivileged restore caller must be rejected");
@@ -3808,11 +4019,8 @@ async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes(
             let initial = call_catalog_restore_handler(request(body.clone()))
                 .await
                 .expect("identified restore should succeed");
-            assert_eq!(initial.output.0, StatusCode::OK);
-            let initial = http_body_util::BodyExt::collect(initial.output.1)
-                .await
-                .expect("initial receipt body")
-                .to_bytes();
+            let (initial_status, _, initial) = response_parts(initial).await;
+            assert_eq!(initial_status, StatusCode::OK);
             let initial: serde_json::Value = serde_json::from_slice(&initial).expect("initial receipt JSON");
             let state_path = crate::table_catalog::TableCatalogObjectPaths::default().catalog_restore_state_path(&bucket);
             let barrier = backend
@@ -3826,11 +4034,8 @@ async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes(
             let repeated = call_catalog_restore_handler(request(body))
                 .await
                 .expect("same restore id should replay");
-            assert_eq!(repeated.output.0, StatusCode::OK);
-            let repeated = http_body_util::BodyExt::collect(repeated.output.1)
-                .await
-                .expect("repeated receipt body")
-                .to_bytes();
+            let (repeated_status, _, repeated) = response_parts(repeated).await;
+            assert_eq!(repeated_status, StatusCode::OK);
             let mut repeated: serde_json::Value = serde_json::from_slice(&repeated).expect("repeated receipt JSON");
             assert_eq!(repeated["status"], "ALREADY_RESTORED");
             repeated["status"] = initial["status"].clone();
@@ -3854,19 +4059,14 @@ async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes(
 #[tokio::test]
 async fn table_maintenance_worker_handler_requires_authentication_for_both_request_forms() {
     for body in [r#"{}"#, r#"{"expected-job-id":"job-a","expected-attempt":0}"#] {
-        let request = S3Request {
-            input: Body::from(body.as_bytes().to_vec()),
-            method: Method::POST,
-            uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
-                .parse()
-                .expect("worker URI"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let request = crate::admin::operation::test_support::TestRequest::new(
+            Method::POST,
+            "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run",
+        )
+        .headers(HeaderMap::new())
+        .extensions(http::Extensions::new())
+        .body(Body::from(body.as_bytes().to_vec()))
+        .build();
         let err = call_maintenance_worker_handler(request)
             .await
             .expect_err("worker requires authentication");
@@ -4061,6 +4261,7 @@ async fn rename_table_body_rejects_declared_and_streamed_oversize_payloads() {
     .await
     .expect_err("oversized streamed body should fail");
     assert_eq!(streamed.code(), &S3ErrorCode::InvalidRequest);
+    assert_eq!(streamed.message(), Some("failed to read request body: length limit exceeded"));
 }
 
 fn assert_rejects_unknown_field<T>(target: &str, value: serde_json::Value)
@@ -4287,14 +4488,10 @@ async fn namespace_property_update_body_is_bounded_and_required() {
 
 #[tokio::test(start_paused = true)]
 async fn generic_json_body_readers_time_out_stalled_streams() {
-    let required_stream = futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>();
-    let required = tokio::spawn(read_json_body::<serde_json::Value>(Body::http_body(http_body_util::StreamBody::new(
-        required_stream,
-    ))));
-    let optional_stream = futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>();
-    let optional = tokio::spawn(read_json_body_or_default::<serde_json::Value>(Body::http_body(
-        http_body_util::StreamBody::new(optional_stream),
-    )));
+    let required_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+    let required = tokio::spawn(read_json_body::<serde_json::Value>(Body::from_stream(required_stream)));
+    let optional_stream = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+    let optional = tokio::spawn(read_json_body_or_default::<serde_json::Value>(Body::from_stream(optional_stream)));
     tokio::task::yield_now().await;
     tokio::time::advance(TABLE_CATALOG_REQUEST_BODY_TIMEOUT).await;
 
@@ -10836,7 +11033,7 @@ async fn row_level_conflict_allows_overwrite_when_deleted_file_is_current() {
     )
     .await
     .expect_err("deleted file sequence must not change");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
     seed_test_snapshot_manifest(
         &metadata_backend,
@@ -10918,7 +11115,7 @@ async fn row_level_conflict_rejects_embedded_manifests_for_v2_snapshot() {
     .await
     .expect_err("new v2 snapshots must use a manifest list");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -11183,7 +11380,7 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     .await
     .expect_err("inherited manifest identity must not change");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -12249,7 +12446,7 @@ async fn row_level_conflict_rejects_stale_or_historical_manifest_sequences() {
             panic!("[{case}] {failure}");
         };
 
-        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest, "[{case}] {failure}");
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest, "[{case}] {failure}");
         let unchanged = store
             .load_table("warehouse", "analytics", "events")
             .await
@@ -12484,7 +12681,7 @@ async fn row_level_conflict_rejects_delete_of_non_current_file() {
     .await
     .expect_err("stale row-level delete should conflict");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::Custom(ICEBERG_ERROR_COMMIT_FAILED.into()));
     assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
@@ -12543,7 +12740,7 @@ async fn row_level_conflict_rejects_append_with_delete_files() {
     .await
     .expect_err("append must not add delete files");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -12651,7 +12848,7 @@ async fn row_level_conflict_rejects_missing_manifest_before_pointer_update() {
     .await
     .expect_err("missing manifest-list should fail before pointer update");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -12759,7 +12956,7 @@ async fn row_level_conflict_rejects_manifest_outside_table_warehouse() {
     .await
     .expect_err("outside manifest-list should fail before pointer update");
 
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     let unchanged = store
         .load_table("warehouse", "analytics", "events")
         .await
@@ -14354,7 +14551,7 @@ async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     )
     .await
     .expect_err("retention refs should require force delete");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
     let force_delete: DeleteTableRefRequest =
         serde_json::from_value(serde_json::json!({ "force": true })).expect("ref force delete should parse");
@@ -14380,7 +14577,7 @@ async fn table_ref_write_responses_use_commit_guard_and_protect_deletes() {
     let error = delete_table_ref_response(&store, &metadata_backend, "warehouse", &namespace, "events", "main", main_delete)
         .await
         .expect_err("main ref should remain protected");
-    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
 }
 
 #[test]
@@ -14869,13 +15066,14 @@ async fn credential_response_serializes_sensitive_config_only_inside_storage_cre
 fn credential_http_response_disables_caching() {
     let response = build_sensitive_json_response(StatusCode::OK, &serde_json::json!({"storage-credentials": []}))
         .expect("sensitive response should build");
+    let (_, headers, _) = response.into_parts();
 
     assert_eq!(
-        response.headers.get(http::header::CACHE_CONTROL),
+        headers.get(http::header::CACHE_CONTROL),
         Some(&HeaderValue::from_static("no-store, private"))
     );
-    assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
-    assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    assert_eq!(headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
 }
 
 #[tokio::test]
@@ -15931,24 +16129,11 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
                 .expect("namespace should be seeded");
 
             let request = |namespace: &str, body: serde_json::Value| {
-                let mut extensions = http::Extensions::new();
-                extensions.insert(slot.clone());
-                S3Request {
-                    input: Body::from(serde_json::to_vec(&body).expect("request body should serialize")),
-                    method: Method::POST,
-                    uri: format!("/iceberg/v1/{bucket}/namespaces/{namespace}/properties")
-                        .parse()
-                        .expect("request URI should parse"),
-                    headers: HeaderMap::new(),
-                    extensions,
-                    credentials: Some(s3s::auth::Credentials {
-                        access_key: root_access_key.to_string(),
-                        secret_key: s3s::auth::SecretKey::from(root_secret_key.to_string()),
-                    }),
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                }
+                TestRequest::new(Method::POST, format!("/iceberg/v1/{bucket}/namespaces/{namespace}/properties"))
+                    .extension(slot.clone())
+                    .body(Body::from(serde_json::to_vec(&body).expect("request body should serialize")))
+                    .credentials(root_access_key, root_secret_key, None)
+                    .build()
             };
             let mut params_router = matchit::Router::new();
             params_router
@@ -15972,11 +16157,8 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
                 )
                 .await
                 .expect("handler should update object-backed namespace properties");
-            assert_eq!(response.output.0, StatusCode::OK);
-            let body = http_body_util::BodyExt::collect(response.output.1)
-                .await
-                .expect("response body should collect")
-                .to_bytes();
+            let (status, _, body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).expect("response body should decode"),
                 serde_json::json!({
@@ -17909,6 +18091,74 @@ async fn cleanup_empty_table_bucket_reclaims_twenty_dropped_tables_and_allows_bu
 
 #[tokio::test]
 #[serial_test::serial]
+async fn cleanup_empty_table_bucket_retries_a_retained_table_config_after_validating_all_resources() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{IdentifierSegment, Namespace, TableCatalogObjectPaths, TableMaintenanceConfig};
+
+    let (_temp, _disks, storage) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("cleanup-config-{}", Uuid::new_v4().simple());
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend.clone(),
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let metadata = create_dropped_empty_tables_for_cleanup(&catalog, &backend, &storage, &bucket, 1).await;
+    let object = backend.read_object(&bucket, &metadata[0]).await.unwrap().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&object.data).unwrap();
+    let table_id = json["location"].as_str().unwrap().rsplit('/').next().unwrap();
+    let paths = TableCatalogObjectPaths::default();
+    let namespace = Namespace::parse("analytics").unwrap();
+    let table = IdentifierSegment::parse("events_00").unwrap();
+    let config = paths.table_maintenance_config_path(&bucket, &namespace, &table, table_id);
+    let bytes = serde_json::to_vec(&TableMaintenanceConfig::default()).unwrap();
+    backend.seed_object(RUSTFS_META_BUCKET, &config, bytes.clone()).await;
+
+    for blocker in [
+        paths.table_entry_path(&bucket, &namespace, &table),
+        paths.table_maintenance_current_job_path(&bucket, &namespace, &table, table_id),
+        paths.table_bucket_maintenance_config_path(&bucket),
+        format!("{}/maintenance/invalid/config.json", config.rsplit_once("/maintenance/").unwrap().0),
+    ] {
+        backend.seed_object(RUSTFS_META_BUCKET, &blocker, bytes.clone()).await;
+        let publication = TableCommitObjectBackend::trusted(backend.clone());
+        assert!(
+            cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+                .await
+                .is_err()
+        );
+        assert!(backend.object_exists(&bucket, &metadata[0]).await.unwrap());
+        assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+        backend.delete_object(RUSTFS_META_BUCKET, &blocker).await.unwrap();
+    }
+    backend.seed_object(RUSTFS_META_BUCKET, &config, b"{}".to_vec()).await;
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+            .await
+            .is_err()
+    );
+    assert!(backend.object_exists(&bucket, &metadata[0]).await.unwrap());
+
+    backend.seed_object(RUSTFS_META_BUCKET, &config, bytes).await;
+    backend.fail_delete_attempt(RUSTFS_META_BUCKET, &config, 1).await;
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    let error = cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    assert!(
+        !cleanup_empty_table_bucket_response(&catalog, &publication, &storage, &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn cleanup_empty_table_bucket_validates_directory_candidate_path_and_body_before_deletion() {
     use crate::admin::storage_api::RUSTFS_META_BUCKET;
     use crate::table_catalog::{TableCatalogObjectPaths, TableCatalogPutPrecondition};
@@ -18091,7 +18341,7 @@ async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions(
             let metadata_objects =
                 create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
             let request = |prefix: &str| {
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+                let mut request = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
                 request.method = Method::DELETE;
                 request.uri = format!("{prefix}/v1/buckets/{bucket}?cleanup=true").parse().unwrap();
                 request
@@ -18130,9 +18380,15 @@ async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions(
 
                 let result = call_disable_table_bucket_handler(request(if allowed { "/_iceberg" } else { "/iceberg" })).await;
                 if allowed {
-                    let response = result.expect("request-scoped object permissions should authorize cleanup");
-                    assert_eq!(response.output.0, StatusCode::OK);
-                    let body: serde_json::Value = serde_json::from_slice(&response.output.1.bytes().unwrap()).unwrap();
+                    let (status, _, body) = result
+                        .expect("request-scoped object permissions should authorize cleanup")
+                        .into_parts();
+                    assert_eq!(status, StatusCode::OK);
+                    let body = http_body_util::BodyExt::collect(body)
+                        .await
+                        .expect("cleanup response body")
+                        .to_bytes();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(body["enabled"], false);
                     for object in &metadata_objects {
                         assert!(!backend.object_exists(&bucket, object).await.unwrap());
@@ -18729,7 +18985,7 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
         ..Default::default()
     }));
     let setup = table_catalog_handler_request(context.clone(), access_key, secret_key);
-    let backend = table_catalog_backend_from_extensions(&setup.extensions).unwrap();
+    let backend = table_catalog_backend_from_envelope(setup.envelope()).unwrap();
     let configured = table_catalog_store_from_backend(backend.clone()).unwrap();
     enable_table_bucket_marker(object_store.as_ref(), "warehouse").await.unwrap();
     ensure_table_bucket_entry(&configured, "warehouse", true).await.unwrap();
@@ -18772,18 +19028,17 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
                 .insert(format!("{prefix}/{{warehouse}}/catalog/directory"), ())
                 .unwrap();
             let uri = format!("{prefix}/warehouse/catalog/directory");
-            let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-            request.method = Method::DELETE;
-            request.uri = uri.parse().unwrap();
+            let directory_request = |method: Method| {
+                table_catalog_request_builder(context.clone(), Some((access_key, secret_key)), method, &uri).build()
+            };
+            let request = directory_request(Method::DELETE);
             let matched = router.at(&uri).unwrap();
             let result = DisableTableDirectoryHandler {}.call(request, matched.params).await;
             if allowed {
-                assert_eq!(result.unwrap().output.0, StatusCode::OK);
+                assert_eq!(result.unwrap().into_parts().0, StatusCode::OK);
             } else {
                 assert_eq!(result.unwrap_err().code(), &S3ErrorCode::AccessDenied);
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::POST;
-                request.uri = uri.parse().unwrap();
+                let request = directory_request(Method::POST);
                 let matched = router.at(&uri).unwrap();
                 assert_eq!(
                     AdvanceTableDirectoryHandler {}
@@ -18796,21 +19051,20 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
             }
             if allowed {
                 for expected_phase in ["building", "ready"] {
-                    let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                    request.method = Method::POST;
-                    request.uri = uri.parse().unwrap();
+                    let request = directory_request(Method::POST);
                     let matched = router.at(&uri).unwrap();
                     let response = AdvanceTableDirectoryHandler {}.call(request, matched.params).await.unwrap();
-                    assert_eq!(response.output.0, StatusCode::OK);
-                    let bytes = http_body_util::BodyExt::collect(response.output.1).await.unwrap().to_bytes();
+                    let (status, _, bytes) = response_parts(response).await;
+                    assert_eq!(status, StatusCode::OK);
                     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(value["phase"], expected_phase);
                 }
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::DELETE;
-                request.uri = uri.parse().unwrap();
+                let request = directory_request(Method::DELETE);
                 let matched = router.at(&uri).unwrap();
-                assert_eq!(DisableTableDirectoryHandler {}.call(request, matched.params).await.unwrap().output.0, StatusCode::OK);
+                assert_eq!(
+                    DisableTableDirectoryHandler {}.call(request, matched.params).await.unwrap().into_parts().0,
+                    StatusCode::OK
+                );
             }
             let object_catalog = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
             assert!(
@@ -18825,4 +19079,39 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
         }
     }
     }).await;
+}
+
+/// An injected server slot that has not finished startup must fail closed
+/// rather than fall back to the ambient process context.
+#[tokio::test]
+async fn envelope_helpers_fail_closed_on_an_empty_server_slot() {
+    let request = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/tables")
+        .extension(ServerContextSlot::new())
+        .build();
+    let envelope = request.envelope();
+
+    let backend = table_catalog_backend_from_envelope(envelope)
+        .map(|_| ())
+        .expect_err("empty slot has no context");
+    assert_eq!(backend.message(), Some("request application context is not initialized"));
+    assert_eq!(
+        table_catalog_store_from_envelope(envelope)
+            .map(|_| ())
+            .expect_err("store needs a context")
+            .message(),
+        backend.message()
+    );
+    assert!(table_catalog_object_store_from_envelope(envelope).is_err());
+
+    let enabled = table_bucket_enabled_from_envelope(envelope, "probe")
+        .await
+        .expect_err("empty slot has no store");
+    assert_eq!(enabled.message(), Some("request object store is not initialized"));
+    assert_eq!(
+        ensure_table_bucket_enabled_from_envelope(envelope, "probe")
+            .await
+            .expect_err("ensure fails closed too")
+            .message(),
+        enabled.message()
+    );
 }

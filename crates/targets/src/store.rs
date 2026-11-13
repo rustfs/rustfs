@@ -15,12 +15,13 @@
 use crate::error::StoreError;
 use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
 use rustfs_config::{
-    DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, DEFAULT_TARGET_STORE_MAX_BYTES, ENV_TARGET_STORE_COMPRESS,
-    ENV_TARGET_STORE_MAX_BYTES, EnableState,
+    AUDIT_DEFAULT_DIR, DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, DEFAULT_TARGET_STORE_MAX_BYTES, ENV_TARGET_STORE_COMPRESS,
+    ENV_TARGET_STORE_DIR, ENV_TARGET_STORE_MAX_BYTES, EVENT_DEFAULT_DIR, EnableState,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::File,
     io::Write,
@@ -153,6 +154,46 @@ fn resolve_queue_store_compression_from_env_value(value: Option<&str>) -> bool {
 fn queue_store_compression_enabled() -> bool {
     let value = std::env::var(ENV_TARGET_STORE_COMPRESS).ok();
     resolve_queue_store_compression_from_env_value(value.as_deref())
+}
+
+/// Map a configured target `queue_dir` to the directory this node opens.
+///
+/// `EVENT_DEFAULT_DIR` and `AUDIT_DEFAULT_DIR` are persisted cluster-wide as logical
+/// defaults, so every node resolves them locally. `RUSTFS_TARGET_STORE_DIR` relocates
+/// their root on any platform. Without it, Windows uses `%ProgramData%\RustFS`, because
+/// the Unix literal has no drive prefix and is not an absolute path there. Every other
+/// value, including an explicit operator path, is returned unchanged.
+pub fn resolve_queue_dir(queue_dir: &str) -> Cow<'_, str> {
+    let store_root = std::env::var(ENV_TARGET_STORE_DIR).ok();
+    resolve_queue_dir_with(queue_dir, store_root.as_deref(), platform_queue_root().as_deref())
+}
+
+#[cfg(windows)]
+fn platform_queue_root() -> Option<PathBuf> {
+    std::env::var_os("ProgramData")
+        .filter(|root| !root.is_empty())
+        .map(|root| PathBuf::from(root).join("RustFS"))
+}
+
+#[cfg(not(windows))]
+fn platform_queue_root() -> Option<PathBuf> {
+    None
+}
+
+fn resolve_queue_dir_with<'a>(queue_dir: &'a str, store_root: Option<&str>, platform_root: Option<&Path>) -> Cow<'a, str> {
+    let leaf = match queue_dir {
+        EVENT_DEFAULT_DIR => "events",
+        AUDIT_DEFAULT_DIR => "audit",
+        _ => return Cow::Borrowed(queue_dir),
+    };
+    let root = match store_root.map(str::trim).filter(|root| !root.is_empty()) {
+        Some(root) => Path::new(root),
+        None => match platform_root {
+            Some(root) => root,
+            None => return Cow::Borrowed(queue_dir),
+        },
+    };
+    Cow::Owned(root.join(leaf).to_string_lossy().into_owned())
 }
 
 /// Represents a key for an entry in the store
@@ -1365,6 +1406,56 @@ mod tests {
         thread,
     };
 
+    #[test]
+    fn logical_default_queue_dirs_resolve_under_the_configured_root() {
+        let root = Path::new("/srv/rustfs-queues");
+        let platform = Path::new("/platform/RustFS");
+        assert_eq!(
+            resolve_queue_dir_with(EVENT_DEFAULT_DIR, Some("/srv/rustfs-queues"), Some(platform)),
+            root.join("events").to_string_lossy()
+        );
+        assert_eq!(
+            resolve_queue_dir_with(AUDIT_DEFAULT_DIR, Some(" /srv/rustfs-queues "), None),
+            root.join("audit").to_string_lossy()
+        );
+        assert_eq!(
+            resolve_queue_dir_with(EVENT_DEFAULT_DIR, Some("  "), Some(platform)),
+            platform.join("events").to_string_lossy(),
+            "a blank override must fall back to the platform root"
+        );
+    }
+
+    #[test]
+    fn explicit_and_unmapped_queue_dirs_are_preserved() {
+        let platform = Path::new("/platform/RustFS");
+        for explicit in [
+            "/var/lib/rustfs/events",
+            "/opt/rustfs/events/",
+            "/opt/rustfs",
+            "",
+            "relative/queue",
+        ] {
+            assert_eq!(
+                resolve_queue_dir_with(explicit, Some("/srv/rustfs-queues"), Some(platform)),
+                explicit,
+                "only the exact logical defaults may be relocated"
+            );
+        }
+        assert_eq!(resolve_queue_dir_with(EVENT_DEFAULT_DIR, None, None), EVENT_DEFAULT_DIR);
+        assert_eq!(resolve_queue_dir_with(AUDIT_DEFAULT_DIR, None, None), AUDIT_DEFAULT_DIR);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_logical_default_queue_dirs_are_absolute_without_an_override() {
+        let platform = platform_queue_root().expect("Windows defines ProgramData");
+        for default in [EVENT_DEFAULT_DIR, AUDIT_DEFAULT_DIR] {
+            let resolved = resolve_queue_dir_with(default, None, Some(&platform));
+            assert!(Path::new(resolved.as_ref()).is_absolute(), "{default} resolved to {resolved}");
+            assert!(resolved.contains("RustFS"), "{default} resolved to {resolved}");
+        }
+    }
+
     fn temp_store_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
     }
@@ -1456,7 +1547,13 @@ mod tests {
         store.put_failed_raw("failed-event", &[4; 16]).unwrap();
         assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 48);
         let failed = store.failed_dir().join("failed-event");
-        File::open(&failed).unwrap().set_modified(UNIX_EPOCH).unwrap();
+        // Windows needs write-attribute access on the handle to change mtime.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&failed)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
         assert_eq!(store.prune_failed_store().unwrap(), 1);
         assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 32);
         std::fs::create_dir(store.failed_dir().join("cannot-replace-directory")).unwrap();

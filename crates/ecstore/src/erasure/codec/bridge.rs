@@ -439,7 +439,7 @@ mod tests {
             reconstruct_with(&engine, &mut shards).expect("restore missing data and parity");
             assert_eq!(shards, expected, "every restored byte must match at width {}", shards.len());
 
-            let mut corrupt = expected.clone();
+            let mut corrupt = expected;
             corrupt[0] = None;
             corrupt[data_shards] = None;
             corrupt[data_shards + 1].as_mut().expect("surplus parity present")[0] ^= 1;

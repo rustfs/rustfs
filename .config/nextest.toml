@@ -137,7 +137,7 @@ filter = '(package(rustfs) & test(/^(admin::handlers::replication::target_repair
 setup = 'ecstore-base-stack'
 
 [[profile.default.scripts]]
-filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::complete::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
 setup = 'ecstore-base-stack'
 
 # These handler/store fixtures and the relocated-pool GET compose deep storage
@@ -356,6 +356,12 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-ecstore) & test(=store::init::tests::dispatch_manifest_rollback_bounded_concurrency_reaches_tail_behind_slow_member)'
 threads-required = "num-test-threads"
 
+# These short-deadline real-disk progress probes need the test run's capacity
+# for scanner and object-lock handoffs; keep their assertions and deadlines.
+[[profile.default.overrides]]
+filter = '(package(rustfs-scanner) & (test(=scanner::tests::cycle_persist_failure::later_cycle_post_commit_failure_reloads_durable_state) | test(=scanner::tests::running_main_loop_catches_up_pause_cleared_after_startup_observe))) | (package(rustfs-ecstore) & test(=store::init::tests::restored_transitioned_delete_causally_enqueues_free_version))'
+threads-required = "num-test-threads"
+
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
 # ---------------------------------------------------------------------------
@@ -424,6 +430,12 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
 threads-required = "num-test-threads"
 
+# Keep short-deadline real-disk progress probes from competing with unrelated
+# tests for scanner and object-lock capacity. Assertions and deadlines stay on.
+[[profile.ci.overrides]]
+filter = '(package(rustfs-scanner) & (test(=scanner::tests::cycle_persist_failure::later_cycle_post_commit_failure_reloads_durable_state) | test(=scanner::tests::running_main_loop_catches_up_pause_cleared_after_startup_observe))) | (package(rustfs-ecstore) & test(=store::init::tests::restored_transitioned_delete_causally_enqueues_free_version))'
+threads-required = "num-test-threads"
+
 # Emit this expensive fixture's stage timings in CI and use tmpfs when safe.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(=store::init::tests::decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page)'
@@ -443,7 +455,7 @@ filter = '(package(rustfs) & test(/^(admin::handlers::replication::target_repair
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
-filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::complete::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
@@ -698,6 +710,14 @@ test-group = 'ecstore-serial-flaky'
 # the PR-lane e2e coverage for scanner usage snapshots consumed by quota and
 # admin surfaces. It uses the same single-node, random-port, isolated-temp-dir
 # fixture as the existing smoke modules.
+#
+# Dual-stack differential (rustfs/backlog#2740): `dual_stack_differential::`
+# starts two single-node servers from the same binary, one per
+# RUSTFS_S3_STACK value, on random ports with isolated temp dirs, and runs one
+# SDK script covering every operation of `impl S3 for FS` against both. Its
+# comparator unit tests need no server. It meets the admission criteria
+# unchanged; the module clause admits a new differential test without another
+# filter edit.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
@@ -706,6 +726,7 @@ default-filter = """
         | test(/^reliant::lifecycle::/)
         | test(/^conditional_delete_objects_test::/)
         | test(/^reliant::tiering::/)
+        | test(/^dual_stack_differential::/)
         | test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
         | test(/^on_demand_migration::(get_basic_test::(get_miss_pulls_inline_and_serves_locally_afterwards|head_miss_answers_from_the_source_without_persisting)|interaction_test::test_odm_admin_config_is_redacted_and_status_counts_match_the_source)$/)
     )
@@ -925,6 +946,10 @@ path = "junit.xml"
 # parallel-safe — the same property e2e-smoke relies on. The exceptions are the
 # 4-disk reliability / degraded-read fault-injection tests, multi-node heal
 # clusters, and the fixed-port Vault tests, all serialized below.
+# `dual_stack_differential::reference::` holds hermetic unit tests of how the
+# differential picks side A (shell-script stand-ins, no server, no reference
+# binary). They already run on every pull request in e2e-smoke, so e2e-full
+# excludes them to keep its selection digest unchanged.
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
@@ -935,6 +960,7 @@ default-filter = """
     & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)
     & !test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
+    & !test(/^dual_stack_differential::reference::/)
 """
 fail-fast = false
 

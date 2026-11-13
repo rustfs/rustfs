@@ -15,6 +15,10 @@
 //! RestoreObject path.
 
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
+use crate::app::storage_api::s3::dto::{RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreRequestType};
+use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use rustfs_filemeta::RestoreStatus;
 
 // RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.
@@ -195,6 +199,8 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        let rreq = restore_request_from_wire(rreq);
+
         // Validate the request shape before taking any lock or reading the
         // object: a malformed request or an illegal `Days` value is a client
         // error, and the validator messages are static — they carry no
@@ -352,6 +358,10 @@ impl DefaultObjectUsecase {
         // Scopes the accept-guarded metadata write: everything below runs
         // inside the accept critical section, which is released right after.
         {
+            if !already_restored {
+                store.check_restore_copyback_compatibility().await.map_err(ApiError::from)?;
+            }
+
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {

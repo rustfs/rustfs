@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use sha2::{Digest, Sha256};
 use std::{
@@ -799,6 +800,7 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
+    #[serde(default, deserialize_with = "crate::lifecycle_cache::deserialize")]
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
@@ -824,7 +826,7 @@ pub struct DataUsageCacheInfo {
     pub scan_coverage_receipt: Option<DataUsageScanCoverageReceipt>,
     #[serde(default)]
     pub pending_heals: Vec<PendingScannerHeal>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::object_lock_cache::deserialize")]
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
     #[serde(default)]
     pub leader_epoch: u64,
@@ -912,7 +914,7 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
         state.serialize_entry("last_update", &self.last_update)?;
         state.serialize_entry("skip_healing", &self.skip_healing)?;
-        state.serialize_entry("lifecycle", &self.lifecycle)?;
+        state.serialize_entry("lifecycle", &crate::lifecycle_cache::LifecycleCache(&self.lifecycle))?;
         state.serialize_entry("replication", &self.replication)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("scan_resume_after", &self.scan_resume_after)?;
@@ -936,7 +938,7 @@ impl Serialize for DataUsageCacheInfo {
             state.serialize_entry("scan_coverage_receipt", receipt)?;
         }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
-        state.serialize_entry("object_lock", &self.object_lock)?;
+        state.serialize_entry("object_lock", &crate::object_lock_cache::ObjectLockCache(&self.object_lock))?;
         state.serialize_entry("source", &self.source)?;
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;

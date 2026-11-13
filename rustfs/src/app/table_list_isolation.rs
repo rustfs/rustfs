@@ -650,10 +650,17 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("create test bucket");
+        // A literal key shaped like a cache marker. Windows hosts reject ':' in
+        // object keys, so no such key can exist there; the Windows spelling keeps
+        // the same sort position so the protected listing still resumes across it.
+        #[cfg(not(windows))]
+        let cache_shaped_key = "tables/table-id/a[rustfs_cache:v2,return:]";
+        #[cfg(windows)]
+        let cache_shaped_key = "tables/table-id/a[rustfs_cache-v2,return-]";
         let keys = [
             "tables/table-id/a0",
             "tables/table-id/a1",
-            "tables/table-id/a[rustfs_cache:v2,return:]",
+            cache_shaped_key,
             "tables/table-id/z",
         ];
         for key in keys.into_iter().chain(["tables/zz-denied/hidden"]) {

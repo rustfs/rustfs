@@ -1,0 +1,96 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Reference RustFS binary"
+description: "Download the pinned reference RustFS release, verify its sha256 and expose the executable path. A missing pin, missing asset or digest mismatch fails the step."
+
+inputs:
+  pin-file:
+    description: "Pin file naming the reference release (repository-relative)"
+    required: false
+    default: ".config/reference-binary.toml"
+  platform:
+    description: "Platform table in the pin file"
+    required: false
+    default: "linux-x86_64-gnu"
+  destination:
+    description: "Directory that receives the executable; defaults to $RUNNER_TEMP/reference-binary"
+    required: false
+    default: ""
+
+outputs:
+  path:
+    description: "Absolute path of the verified executable"
+    value: ${{ steps.unpack.outputs.path }}
+  version:
+    description: "Pinned reference version"
+    value: ${{ steps.pin.outputs.version }}
+  sha256:
+    description: "Pinned and verified archive sha256"
+    value: ${{ steps.pin.outputs.sha256 }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve reference pin
+      id: pin
+      shell: bash
+      env:
+        PIN_TOOL: ${{ github.action_path }}/reference_binary.py
+        PIN_FILE: ${{ inputs.pin-file }}
+        PIN_PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        resolved="$(python3 "$PIN_TOOL" resolve --pin "$PIN_FILE" --platform "$PIN_PLATFORM")"
+        printf '%s\n' "$resolved"
+        printf '%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+
+    - name: Download and verify reference archive
+      id: download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ASSET_DOWNLOADER: ${{ github.action_path }}/../setup/download_release_asset.py
+        REF_REPOSITORY: ${{ steps.pin.outputs.repository }}
+        REF_TAG: ${{ steps.pin.outputs.tag }}
+        REF_ASSET: ${{ steps.pin.outputs.asset }}
+        REF_SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+        archive="$RUNNER_TEMP/reference-archive/$REF_ASSET"
+        # Fails unless the release lists exactly one asset of this name whose
+        # published digest equals the pin and whose downloaded bytes match it.
+        python3 "$ASSET_DOWNLOADER" --repository "$REF_REPOSITORY" --tag "$REF_TAG" \
+          --asset "$REF_ASSET" --output "$archive" --sha256 "$REF_SHA256"
+        echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+    - name: Unpack reference executable
+      id: unpack
+      shell: bash
+      env:
+        PIN_TOOL: ${{ github.action_path }}/reference_binary.py
+        REF_ARCHIVE: ${{ steps.download.outputs.archive }}
+        REF_SHA256: ${{ steps.pin.outputs.sha256 }}
+        REF_EXECUTABLE: ${{ steps.pin.outputs.executable }}
+        REF_DESTINATION: ${{ inputs.destination }}
+      run: |
+        set -euo pipefail
+        destination="${REF_DESTINATION:-$RUNNER_TEMP/reference-binary}"
+        unpacked="$(python3 "$PIN_TOOL" unpack --archive "$REF_ARCHIVE" --sha256 "$REF_SHA256" \
+          --executable "$REF_EXECUTABLE" --destination "$destination")"
+        path="${unpacked#path=}"
+        test -x "$path"
+        echo "Reference executable: $path"
+        "$path" --version
+        echo "path=$path" >> "$GITHUB_OUTPUT"

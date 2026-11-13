@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::AdminResponse;
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 use tokio::sync::Semaphore;
@@ -42,15 +43,21 @@ pub(crate) fn is_compat_admin_request(path: &str) -> bool {
 }
 
 pub(crate) async fn read_compatible_admin_body(
-    mut input: Body,
+    input: impl Into<rustfs_s3_types::Body>,
     max_len: usize,
     path: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    let body = input
-        .store_all_limited(max_len)
-        .await
-        .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+    // Legacy handlers still hand over the s3s body; owned handlers pass the
+    // RustFS body. Both read through the owned type so one limit applies.
+    let mut input: rustfs_s3_types::Body = input.into();
+    let body = input.store_all_limited(max_len).await.map_err(|e| {
+        if e.is::<rustfs_s3_types::BodyTooLarge>() {
+            s3_error!(InvalidRequest, "failed to read request body: length limit exceeded")
+        } else {
+            s3_error!(InvalidRequest, "failed to read request body: {}", e)
+        }
+    })?;
 
     if is_compat_admin_request(path) {
         let permit = ADMIN_DECRYPT_PERMITS.acquire();
@@ -92,12 +99,12 @@ pub(crate) fn encode_compatible_admin_payload(path: &str, secret_key: &str, data
 /// the body. Serialization failure is reported as `InternalError`; the
 /// response structs the admin handlers pass here are plain owned data, so that
 /// arm is unreachable in practice.
-pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
+pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(value)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(data), headers))
 }
 
 /// A bodiless admin response carrying only `status`.
@@ -105,8 +112,8 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Re
 /// Used by the endpoints whose success answer is the status code itself
 /// (`204 No Content`, or a `200 OK` acknowledgement with nothing to report).
 /// No `Content-Type` is set, because there is no content to type.
-pub(crate) fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::empty()))
+pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
+    AdminResponse::new(status, rustfs_s3_types::Body::empty())
 }
 
 /// Collect a request URI's query string into a parameter map.
@@ -130,7 +137,7 @@ pub(crate) fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use rustfs_crypto::encrypt_data;
-    use s3s::Body;
+    use rustfs_s3_types::Body;
 
     #[test]
     fn has_space_be_detects_any_whitespace() {
@@ -181,11 +188,53 @@ mod tests {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 
-        let decoded = read_compatible_admin_body(Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
+        let decoded = read_compatible_admin_body(s3s::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
             .await
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn owned_empty_response_carries_only_the_status() {
+        let (status, headers, mut body) = owned_empty_response(StatusCode::NO_CONTENT).into_parts();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(headers.is_empty());
+        assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_owned_body_past_the_limit() {
+        let err =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("nine bytes!"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect_err("eleven bytes exceed an eight byte limit");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
+
+        let legacy_body = s3s::Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
+        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("legacy streaming bodies retain the same limit error");
+        assert_eq!(legacy_err.code(), err.code());
+        assert_eq!(legacy_err.message(), err.message());
+
+        let exact =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect("the exact byte limit is allowed");
+        assert_eq!(exact, b"12345678");
+
+        let failed_body = rustfs_s3_types::Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+            std::io::Error::other("transport failed"),
+        )]));
+        let stream_err = read_compatible_admin_body(failed_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("transport errors remain distinct from the byte limit");
+        assert_eq!(stream_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(stream_err.message(), Some("failed to read request body: transport failed"));
     }
 
     #[tokio::test]
@@ -253,7 +302,7 @@ mod tests {
         });
     }
 
-    async fn body_bytes(mut body: Body) -> Vec<u8> {
+    async fn body_bytes(mut body: rustfs_s3_types::Body) -> Vec<u8> {
         body.store_all_limited(64 * 1024).await.expect("body should read").to_vec()
     }
 
@@ -261,35 +310,33 @@ mod tests {
     /// the requested status, `application/json`, and the serialized bytes
     /// verbatim — nothing else.
     #[tokio::test]
-    async fn json_response_carries_status_content_type_and_serialized_body() {
+    async fn owned_json_response_carries_status_content_type_and_serialized_body() {
         #[derive(Serialize)]
         struct Payload {
             success: bool,
             message: &'static str,
         }
 
-        let response = json_response(
+        let (status, headers, body) = owned_json_response(
             StatusCode::ACCEPTED,
             &Payload {
                 success: true,
                 message: "queued",
             },
         )
-        .expect("payload should serialize");
+        .expect("payload should serialize")
+        .into_parts();
 
-        assert_eq!(response.output.0, StatusCode::ACCEPTED);
-        assert_eq!(
-            response.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
-            Some("application/json")
-        );
-        assert_eq!(response.headers.len(), 1);
-        assert_eq!(body_bytes(response.output.1).await, br#"{"success":true,"message":"queued"}"#.to_vec());
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()), Some("application/json"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(body_bytes(body).await, br#"{"success":true,"message":"queued"}"#.to_vec());
     }
 
     /// A serialization failure must surface as `InternalError` rather than a
     /// panic or a half-written body.
     #[test]
-    fn json_response_reports_serialization_failure_as_internal_error() {
+    fn owned_json_response_reports_serialization_failure_as_internal_error() {
         struct Unserializable;
 
         impl Serialize for Unserializable {
@@ -298,7 +345,7 @@ mod tests {
             }
         }
 
-        let err = json_response(StatusCode::OK, &Unserializable).expect_err("serialization must fail");
+        let err = owned_json_response(StatusCode::OK, &Unserializable).expect_err("serialization must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert!(err.message().unwrap_or_default().contains("failed to serialize response"));
     }
@@ -306,12 +353,12 @@ mod tests {
     /// The bodiless answer must stay bodiless and must not claim a content
     /// type: callers use it for `204 No Content` and bare acknowledgements.
     #[tokio::test]
-    async fn empty_response_has_no_body_and_no_headers() {
-        for status in [StatusCode::OK, StatusCode::NO_CONTENT] {
-            let response = empty_response(status);
-            assert_eq!(response.output.0, status);
-            assert!(response.headers.is_empty());
-            assert!(body_bytes(response.output.1).await.is_empty());
+    async fn owned_empty_response_has_no_body_and_no_headers() {
+        for expected in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (status, headers, mut body) = owned_empty_response(expected).into_parts();
+            assert_eq!(status, expected);
+            assert!(headers.is_empty());
+            assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
         }
     }
 

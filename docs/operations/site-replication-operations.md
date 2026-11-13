@@ -302,6 +302,8 @@ it. A bucket-replication target configured with its own credentials needs the
 same `s3:ForceDeleteObject` grant on the target side, or its force-deletes are
 rejected and counted as replication failures.
 
+The same policy grants `kms:GenerateDataKey` on every key, because a site running with `RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true` authorizes each SSE-KMS replica write against the key it resolves to. An account whose stored policy predates this grant is refreshed the same way; until that happens SSE-KMS objects stay `FAILED` with `AccessDenied` from the peer and catch up afterwards. The account holds no `kms:Decrypt`, so a read proxied to a peer for an SSE-KMS object that has not arrived yet is refused under enforcement. See [Per-key KMS authorization](kms-per-key-authorization.md#sse-kms-data-path).
+
 Treat IAM divergence as a security incident: a user deleted on one site can
 remain usable on an unreachable peer until replay or repair completes. A peer
 whose IAM entry is escalated does not receive scheduled snapshots either -
@@ -312,12 +314,34 @@ including the one a bulk import schedules - until the repair settles it.
 | Source form | Replication behavior | Fail-closed condition |
 |---|---|---|
 | SSE-S3 | The source decrypts the object; the request sends only `AES256` intent; the destination encrypts with its own KMS. Source envelope material never leaves the site. | The destination cannot satisfy the encryption request, or the source metadata is incomplete/unsupported. The replica is `FAILED`; plaintext is not silently stored. |
-| SSE-KMS | The source decrypts the object; the request sends `aws:kms` intent without the source-local key ID; the destination selects its own configured KMS key. | Either side cannot decrypt/encrypt, or the metadata mixes incompatible encryption evidence. |
+| SSE-KMS | The source decrypts the object and the destination re-encrypts it; envelope material and the encryption context never leave the site. To a site-replication peer the request sends `aws:kms` and the name of the key the source object was sealed under, and the peer seals the replica under its own key of that name (see [KMS keys must carry the same name on every site](#kms-keys-must-carry-the-same-name-on-every-site)). To a bucket-replication remote target the request sends `aws:kms` intent only, and the destination selects its bucket default or site default key. | Either side cannot decrypt/encrypt, the peer holds no key of that name, or the metadata mixes incompatible encryption evidence. |
 | SSE-C | Stored ciphertext and the required SSE-C replication transport metadata pass through. RustFS verifies target evidence before accepting the replica. | The target does not echo the customer-algorithm evidence, required material/layout is absent, or the metadata is ambiguous. |
 
 Unknown MinIO/RustFS encryption markers are never forwarded as ordinary user
 metadata. They fail replication so an operator must migrate or repair the
 object with a supported format.
+
+### KMS keys must carry the same name on every site
+
+**Delivery requirement.** Site replication copies bucket default-encryption configuration verbatim, including `KMSMasterKeyID`, copies IAM policies verbatim, including key-scoped `kms:*` resources, and sends the key name of every SSE-KMS object with its replica write. It never copies KMS keys or KMS configuration. Each site therefore resolves a synchronized key name in its own KMS, so every key name that appears in a bucket default, in a policy, or in a write request must exist on every site before it is used. This is a deployment precondition; RustFS does not translate key names between sites.
+
+- Create each key in every site's KMS under the same name. The key material is independent per site: a replica is always re-encrypted under the receiving site's key of that name, as the table above describes. This holds whichever way the key was chosen on the source: a request header, the bucket default, or the site default. A caller scoped to one key name can therefore read the object on every site.
+- Give every site the same default key name (`RUSTFS_KMS_DEFAULT_KEY_ID`). An `aws:kms` object written without naming a key is sealed under the site default and replicated under that name, and a bucket default of `aws:kms` set without a `KMSMasterKeyID` is stored with the originating site's default key name and synchronized in that form, so differing default key names break the peer the same way a missing named key does.
+- A key-scoped policy statement needs one resource per key name, `arn:aws:kms:::key/<name>`; the synchronized policy then names the same key on every site.
+- When one site uses AWS KMS, AWS decides the names. AWS assigns key IDs and RustFS does not manage aliases, so the AWS site cannot adopt another site's key name. Create the key in AWS first, then create a key on every Vault site whose name is the AWS key ID (the bare UUID, not the ARN). Configure the AWS site's default key as the bare key ID too.
+
+What a missing key looks like on the site that lacks it, observed on a Vault and AWS KMS pair:
+
+| Request | Result |
+|---|---|
+| `PUT` with no SSE headers, or with `aws:kms` and no key ID, into a bucket whose synchronized default names the missing key | `400 KMS.NotFoundException`; no object is created. |
+| `PUT` with an explicit `AES256` header into the same bucket | `200`; the object is sealed under the local default key. |
+| SSE-KMS object written on the site that has the key, whether the key came from a request header, the bucket default, or the site default | The `PUT` returns `200`, but the source replication status stays `FAILED` and is retried every scanner cycle; the peer stores nothing. Creating the key on the peer lets the retry succeed. |
+| `GET` of that object on the peer | `200` with the correct bytes, proxied from the source site. This is not evidence of a replica: check `HEAD` for `x-amz-replication-status: REPLICA` (`GET` does not return that header). |
+
+The object-level failure is silent to the writer, so verify key names before enabling a bucket default rather than relying on client errors. Bucket replication through remote targets is not affected by this requirement: it synchronizes no bucket configuration and sends no key name, so the destination bucket's own default, or the destination's site default, decides the key.
+
+Replicas written before a site sent key names stay sealed under the key the peer selected at the time. They remain readable and are not rewritten.
 
 ## Rolling upgrades and rollback
 

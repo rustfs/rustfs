@@ -135,6 +135,72 @@ mod tests {
         Ok(())
     }
 
+    /// A comma-separated region list widens the regions `CreateBucket`
+    /// accepts without changing the server's own region (the first entry): a
+    /// listed region creates the bucket, an unlisted one is still rejected,
+    /// and `GetBucketLocation` keeps reporting the site region.
+    #[tokio::test]
+    async fn test_create_bucket_accepts_listed_regions() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec!["--region", "us-east-1,ap-southeast-2,us-west-2"])
+            .await?;
+
+        for region in ["us-east-1", "ap-southeast-2", "us-west-2"] {
+            let client = Client::from_conf(
+                env.create_s3_client()
+                    .config()
+                    .to_builder()
+                    .region(Region::new(region))
+                    .build(),
+            );
+            let bucket = format!("additional-region-{region}");
+            client
+                .create_bucket()
+                .bucket(&bucket)
+                .create_bucket_configuration(
+                    CreateBucketConfiguration::builder()
+                        .location_constraint(BucketLocationConstraint::from(region))
+                        .build(),
+                )
+                .send()
+                .await
+                .expect("a listed region must create the bucket");
+            let location = client.get_bucket_location().bucket(&bucket).send().await?;
+            assert_eq!(
+                location.location_constraint().map(|value| value.as_str()),
+                Some(""),
+                "GetBucketLocation keeps reporting the site region (us-east-1)"
+            );
+        }
+
+        let client = env.create_s3_client();
+        let error = client
+            .create_bucket()
+            .bucket("unlisted-region")
+            .create_bucket_configuration(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from("eu-west-1"))
+                    .build(),
+            )
+            .send()
+            .await
+            .expect_err("a region missing from the region list must be rejected");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(400));
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("InvalidLocationConstraint")
+        );
+        let missing = client
+            .head_bucket()
+            .bucket("unlisted-region")
+            .send()
+            .await
+            .expect_err("rejected bucket must not exist");
+        assert_eq!(missing.raw_response().map(|response| response.status().as_u16()), Some(404));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_create_bucket_uses_configured_region() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();

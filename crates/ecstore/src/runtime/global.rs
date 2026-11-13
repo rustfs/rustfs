@@ -275,16 +275,16 @@ pub(crate) type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 ///
 /// # Returns
 /// * None
-pub fn set_global_region(region: s3s::region::Region) {
+pub fn set_global_region(region: rustfs_s3_types::Region) {
     current_ctx().set_region(region);
 }
 
 /// Get the global region
 ///
 /// # Returns
-/// * `Option<s3s::region::Region>` - The global region, if set
+/// * `Option<rustfs_s3_types::Region>` - The global region, if set
 ///
-pub fn get_global_region() -> Option<s3s::region::Region> {
+pub fn get_global_region() -> Option<rustfs_s3_types::Region> {
     current_ctx().region()
 }
 

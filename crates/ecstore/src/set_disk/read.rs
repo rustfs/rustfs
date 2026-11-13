@@ -40,7 +40,7 @@ use crate::diagnostics::get::{
     get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::{DiskAPI, new_disk};
+use crate::disk::{DiskAPI, new_disk_for_instance};
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
@@ -419,7 +419,8 @@ impl SetDisks {
         // An unregistered probe must not leave a health monitor running after
         // failure/cancellation. Only an identity-validated published handle gets
         // monitoring. No replacement formatting or healing is initiated here.
-        let probe = new_disk(
+        let probe = new_disk_for_instance(
+            &self.ctx,
             endpoint,
             &DiskOption {
                 cleanup: false,
@@ -431,7 +432,8 @@ impl SetDisks {
         if self.find_disk_index(&format)? != (self.set_index, index) {
             return Err(Error::CorruptedFormat);
         }
-        let disk = new_disk(
+        let disk = new_disk_for_instance(
+            &self.ctx,
             endpoint,
             &DiskOption {
                 cleanup: false,

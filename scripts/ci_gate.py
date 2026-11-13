@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import posixpath
 import os
@@ -16,7 +17,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -33,12 +34,12 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "3"
+PLAN_CONTRACT = "7"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -47,9 +48,66 @@ E2E_SELECTION_FILES = {
         "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
     )
 }
-SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
-OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
+# Clippy and the test-binary archive share no compiler output, so the lint runs
+# beside the archive producer instead of in front of it. LINT_JOB is the only
+# job that may lint the workspace; nothing downstream of ARCHIVE_PRODUCER may
+# wait for it, or the lint is back on the path every workspace test waits on.
+LINT_JOB = "workspace-clippy"
+ARCHIVE_PRODUCER = "workspace-lint-and-build"
+ARCHIVE_CONSUMERS = ("workspace-tests",)
+SETUP = "./.github/actions/setup"
+# The condition every cache-warm.yml build carries: Rust-cache does not save over an exact key match.
+HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
+LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
+OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
+# Report-only lanes stay outside the aggregate until their milestone makes them
+# required. Each reruns a required job's suite with one environment change, so
+# the named steps must stay identical to that job's and the change must stay.
+# The last field names the `select` output that scopes the lane on pull
+# requests: it runs wherever its required job runs, except on a pull request
+# whose selection is the literal `false`. Every other event runs it.
+REPORT_ONLY_JOBS = {
+    # rustfs/backlog#2734: required at T2.10.
+    "e2e-tests-gateway": (
+        "e2e-tests",
+        (
+            "Download E2E test binaries",
+            "Verify E2E archive identity",
+            "Verify e2e smoke test membership",
+            "Run e2e smoke suite",
+            "Verify e2e smoke execution completeness",
+        ),
+        "RUSTFS_S3_STACK: gateway",
+        "gateway_smoke",
+    ),
+}
+# Inputs that decide what the gateway S3 stack serves or how the lane starts
+# it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that stack,
+# so a pull request that changes none of these learns nothing from the lane
+# and is not shown its failure. The suite's own contents (crates/e2e_test, the
+# nextest profile, the smoke selection) are deliberately not inputs: feature
+# pull requests change them constantly, and what the suite contains carries no
+# signal while the stack cannot serve it. fnmatch's `*` also matches `/`. Some
+# of these paths exist only on branches that are still assembling the stack.
+#
+# At T2.10, when the lane becomes required, it must run on every pull request
+# again — delete this selection, do not extend it.
+GATEWAY_SMOKE_PATHS = (
+    "crates/gateway-adapter/*",
+    "rustfs/src/server/gateway_stack.rs", "rustfs/src/server/gateway_stack/*",
+    "rustfs/src/server/gateway_handlers.rs", "rustfs/src/server/gateway_handlers/*",
+    "rustfs/src/server/stack.rs", "rustfs/src/server/stack/*",
+    "rustfs/src/config/config_struct.rs",  # parses RUSTFS_S3_STACK
+    "rustfs/Cargo.toml",
+    ".github/workflows/ci.yml", ".github/actions/test-runtime/*",
+    "scripts/ci_gate.py", "scripts/e2e_binary.py",
+)
+# Shared manifests change in most dependency updates; only their gateway pins
+# are inputs of the lane.
+GATEWAY_PIN_FILES = ("Cargo.toml", "Cargo.lock")
+GATEWAY_PACKAGE_PREFIX = "rustfs-gateway"
+INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
 def documentation_path(path: str) -> bool:
@@ -130,6 +188,40 @@ def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
         return normalized[0] == normalized[1]
     except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
         return False
+
+
+def gateway_pins(root: Path, revision: str, path: str) -> list:
+    """The entries of a shared manifest that pin a gateway crate, in file order."""
+    document = tomllib.loads(git_file(root, revision, path))
+    if path == "Cargo.lock":
+        return [package for package in document.get("package", []) if str(package.get("name", "")).startswith(GATEWAY_PACKAGE_PREFIX)]
+    tables = {"workspace.dependencies": document.get("workspace", {}).get("dependencies", {}), "replace": document.get("replace", {})}
+    tables.update({f"patch.{source}": table for source, table in document.get("patch", {}).items()})
+    return [(table, name, spec) for table, entries in tables.items() for name, spec in entries.items()
+            if GATEWAY_PACKAGE_PREFIX in name or (isinstance(spec, dict) and str(spec.get("package", "")).startswith(GATEWAY_PACKAGE_PREFIX))]
+
+
+def gateway_smoke_selection(root: Path, event: str, base: str, head: str, changed: list[str]) -> dict:
+    """Decide whether the report-only gateway lane has anything to say about this run.
+
+    Only a pull request with a known change set that touches no gateway-stack
+    input is skipped; an unreadable manifest or lockfile counts as touched.
+    """
+    if event != "pull_request":
+        return {"run": True, "reason": f"{event} validates the complete candidate"}
+    if not changed or changed == [""]:
+        return {"run": True, "reason": "change set unavailable"}
+    for path in changed:
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in GATEWAY_SMOKE_PATHS):
+            return {"run": True, "reason": f"gateway-stack input changed: {path}"}
+        if path in GATEWAY_PIN_FILES:
+            try:
+                same = gateway_pins(root, base, path) == gateway_pins(root, head, path)
+            except (OSError, subprocess.CalledProcessError, UnicodeError, AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                return {"run": True, "reason": f"gateway pin changed: {path}"}
+    return {"run": False, "reason": "no gateway-stack input changed"}
 
 
 def dependency_tables(document: dict):
@@ -219,22 +311,20 @@ def closure(seeds: set[str], graph: dict[str, set[str]], reverse: bool = False) 
         reached = expanded
 
 
-def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "", rehearse_shards: bool = False) -> dict[str, str]:
+def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "") -> dict[str, str]:
     if event not in EVENTS:
         raise ValueError(f"unsupported CI event: {event!r}")
-    if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
+    # `proven`: a push whose tree a successful merge-group run already validated.
+    if mode not in ("docs", "e2e", "full", "proven") or (mode != "full" and event != ("push" if mode == "proven" else "pull_request")):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
-    if type(rehearse_shards) is not bool or (rehearse_shards and event != "workflow_dispatch"):
-        raise ValueError("shard rehearsal requires an explicit manual event")
     expected = {job: "success" for job in ALWAYS_JOBS}
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
     nightly = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
     expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
     expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
     expected["e2e-full"] = "success" if full else "skipped"
-    expected.update({job: "success" if rehearse_shards else "skipped" for job in SHARD_JOBS})
     if event == "pull_request" and action == "closed":
         return {job: "skipped" for job in expected}
     return expected
@@ -252,8 +342,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "workspace-lint-and-build", "dev", []),
-        ("workspace-tests", "workspace-lint-and-build", "test", []),
+        ("workspace-lint", LINT_JOB, "dev", []),
+        ("workspace-tests", ARCHIVE_PRODUCER, "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -287,7 +377,7 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
              "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
 
 
-def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False) -> dict:
+def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", *, proof: dict | None = None) -> dict:
     if event not in EVENTS or not SHA.fullmatch(head):
         raise ValueError("unsupported event or missing candidate SHA")
     tree = git(root, "rev-parse", f"{head}^{{tree}}").strip()
@@ -379,19 +469,25 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
     reasons.append("selected changed packages, reverse dependencies and fixed core contracts")
     reasons.append("Connect boundary or a shared input changed" if connect else "Connect has no changed credential/configuration dependency")
     proposed = {"packages": sorted(selected), "connect": connect, "full_validation": full, "reasons": reasons,
-                "jobs": expected_results(mode, event, ref, connect, action, rehearse_shards)}
+                "jobs": expected_results(mode, event, ref, connect, action)}
     shadow = policy is None or policy["rollout"] == "shadow"
     effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
     effective_connect = mode == "full" if shadow else connect
     effective_full = mode == "full" if shadow else full
-    jobs = expected_results(mode, event, ref, effective_connect, action, rehearse_shards)
+    proven = event == "push" and isinstance(proof, dict) and proof.get("tree") == tree
+    if proven:
+        mode, effective_connect, effective_full = "proven", False, False
+        reasons.append(f"merge_group run {proof['url']} already validated tree {tree}")
+    jobs = expected_results(mode, event, ref, effective_connect, action)
     plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
             "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
-            "rehearse_shards": rehearse_shards,
+            "gateway_smoke": gateway_smoke_selection(root, event, base, head, changed),
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
-            "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
+            "not_applicable": {job: f"proven by {proof['url']}" if proven else f"not required for {mode}/{event}"
+                               for job, result in jobs.items() if result == "skipped"},
+            "proven_by": proof if proven else None}
     return plan
 
 
@@ -411,7 +507,7 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
             raise ValueError(f"invalid plan {field}")
     if (head and plan["head"] != head) or (tree and plan["tree"] != tree):
         raise ValueError("plan candidate identity does not match this run")
-    if any(type(plan.get(name)) is not bool for name in ("connect", "full_validation", "rehearse_shards")):
+    if any(type(plan.get(name)) is not bool for name in ("connect", "full_validation")):
         raise ValueError("invalid plan selection flags")
     policy = plan.get("policy")
     if not isinstance(policy, dict) or policy.get("rollout") not in ("shadow", "enforced") or not isinstance(policy.get("revision"), str) or not SHA.fullmatch(policy["revision"]):
@@ -423,7 +519,14 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
         raise ValueError("invalid plan packages")
     if plan.get("mode") != "docs" and not packages:
         raise ValueError("code validation plan must not be empty")
-    expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""), plan["rehearse_shards"])
+    proof = plan.get("proven_by")
+    if (proof is not None or plan.get("mode") == "proven") and not (
+            isinstance(proof, dict) and plan.get("mode") == "proven" and proof.get("tree") == plan["tree"]
+            and not plan["connect"] and not plan["full_validation"]
+            and type(proof.get("run_id")) is int and proof["run_id"] > 0
+            and re.fullmatch(rf"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/{proof['run_id']}", str(proof.get("url")))):
+        raise ValueError("a proven push requires the merge-group run that validated its tree")
+    expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""))
     if plan.get("jobs") != expected:
         raise ValueError("plan job contract differs from selected responsibilities")
     if plan.get("configurations") != configurations(expected):
@@ -448,7 +551,7 @@ def verify_results(needs: object, event: str, ref: str, head: str = "", tree: st
             expected = validate_plan(plan, event, ref, head, tree, base, action)
             if outputs.get("mode") != plan["mode"]:
                 raise ValueError("plan mode differs from scheduling output")
-            for name in ("connect", "full_validation", "rehearse_shards"):
+            for name in ("connect", "full_validation"):
                 if name in outputs and outputs[name] != str(plan[name]).lower():
                     raise ValueError(f"plan {name} differs from scheduling output")
             if outputs.get("packages") and json.loads(outputs["packages"]) != plan["packages"]:
@@ -583,6 +686,91 @@ def condition(expression: str | bool, context: dict) -> bool:
     return bool(result)
 
 
+def job_needs(jobs: dict, job: str) -> list[str]:
+    dependencies = jobs.get(job, {}).get("needs", [])
+    return [dependencies] if isinstance(dependencies, str) else list(dependencies)
+
+
+def check_lint_lane(jobs: dict) -> list[str]:
+    """Keep workspace Clippy gating every code event without delaying the test archive."""
+    errors = []
+    lint_steps = {job: [step for step in block.get("steps", [])
+                        if any(command in step.get("run", "") for command in LINT_COMMANDS)]
+                  for job, block in jobs.items()}
+    clippy = lint_steps.get(LINT_JOB, [])
+    if len(clippy) != 1 or any("if" in step for step in clippy):
+        errors.append("workspace Clippy must run on every code event, pull requests included")
+    if any(steps for job, steps in lint_steps.items() if job != LINT_JOB):
+        errors.append(f"workspace Clippy belongs to {LINT_JOB} alone")
+    lint, producer = jobs.get(LINT_JOB, {}), jobs.get(ARCHIVE_PRODUCER, {})
+    # The lint replaces a step of the producer; it must keep that job's scope.
+    if not lint or lint.get("if") != producer.get("if"):
+        errors.append(f"{LINT_JOB} must run under the same condition as {ARCHIVE_PRODUCER}")
+    for job in (ARCHIVE_PRODUCER, *ARCHIVE_CONSUMERS):
+        reached, pending = set(), [job]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(job_needs(jobs, current))
+        if LINT_JOB in reached:
+            errors.append(f"{job} must not wait for {LINT_JOB}")
+    if ARCHIVE_PRODUCER not in job_needs(jobs, "workspace-tests"):
+        errors.append(f"workspace-tests must consume the archive of {ARCHIVE_PRODUCER}")
+    return errors
+
+
+def ci_dev_workflows(root: Path) -> tuple[dict[str, dict], dict]:
+    """The jobs of every workflow that reads ci-dev, by file name, and cache-warm.yml's jobs."""
+    readers = {name: workflow_document((root / ".github/workflows" / name).read_text())["jobs"] for name in ("ci.yml", "reference-parity.yml")}
+    return readers, workflow_document((root / ".github/workflows/cache-warm.yml").read_text())["jobs"]
+
+
+def cache_warm_errors(readers: dict[str, dict], warm_jobs: dict) -> list[str]:
+    """Keep ci-dev holding the readers' own builds under a key they share, and stop warm jobs rebuilding a stored key.
+
+    `readers` maps each workflow that reads ci-dev to its jobs; ci.yml's archive builds define the selections.
+    """
+    errors = []
+    # Only the steps that run whenever the key is written count; the --timings step runs on request.
+    builds = [step.get("run", "") for step in warm_jobs.get("warm-ci-dev", {}).get("steps", []) if step.get("if") == HIT_SKIP]
+
+    def selections(command: str, text: str) -> set[str]:
+        return set(re.findall(rf"scripts/ci_test_artifact\.py {command} --configuration[= ](\S+)", text))
+
+    archived = {name for block in readers["ci.yml"].values() for step in block.get("steps", []) for name in selections("build", step.get("run", ""))}
+    warmed = selections("cargo warm", "\n".join(builds))
+    errors += [f"warm-ci-dev must build the {name} archive selection" for name in sorted(archived - warmed)]
+    errors += [f"warm-ci-dev builds the {name} selection, which no ci.yml job archives" for name in sorted(warmed - archived)]
+    if not any(LINT_COMMANDS[1] in run for run in builds):
+        errors.append("warm-ci-dev must run the workspace lint command")
+    # Rust-cache keeps an entry until its key changes. The key names a digest of the warm commands, so changing
+    # what is warmed writes a new entry instead of leaving readers on the old one; every reader names the same key.
+    key = "ci-dev-" + hashlib.sha256(json.dumps(builds).encode()).hexdigest()[:12]
+    for workflow, jobs in {"cache-warm.yml": {"warm-ci-dev": warm_jobs.get("warm-ci-dev", {})}, **readers}.items():
+        for job, block in jobs.items():
+            used = next((step.get("with", {}).get("cache-shared-key") for step in block.get("steps", []) if step.get("uses") == SETUP), None)
+            if (job == "warm-ci-dev" or str(used).startswith("ci-dev")) and used != key:
+                errors.append(f"{workflow} {job} uses cache key {used}; the ci-dev key for these warm commands is {key}")
+    # Rust-cache does not save over an exact key match, so such a build is lost.
+    for job, block in warm_jobs.items():
+        steps = block.get("steps", [])
+        restored = any(step.get("id") == "setup" and step.get("uses") == SETUP for step in steps)
+        if any(re.search(r"(^|\s)cargo\s|ci_test_artifact\.py", step.get("run", ""), re.M) and step.get("if") != "inputs.emit_timings"
+               and (not restored or step.get("if") != HIT_SKIP) for step in steps):
+            errors.append(f"{job} builds after an exact cache hit")
+    return errors
+
+
+def check_plan_contract_marker(jobs: dict) -> list[str]:
+    """The workflow's fallback must test for the marker this revision's planner emits."""
+    scopes = [step for step in jobs.get("classify-changes", {}).get("steps", []) if step.get("id") == "scope"]
+    markers = re.findall(r"grep -q '\^plan_contract=([^$']*)\$'", scopes[0].get("run", "")) if len(scopes) == 1 else []
+    if markers != [PLAN_CONTRACT]:
+        return [f"classify-changes must fall back to the full matrix unless the plan carries contract {PLAN_CONTRACT}"]
+    return []
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -593,8 +781,42 @@ def check_workflow(root: Path) -> list[str]:
         return [str(error)]
     errors = []
     required = set(ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS)
-    if set(jobs) - NON_VALIDATION_JOBS != required:
+    if set(jobs) - NON_VALIDATION_JOBS - set(REPORT_ONLY_JOBS) != required:
         errors.append("CI verification jobs and the required gate contract differ")
+    for job, (mirror, steps, env, selection) in REPORT_ONLY_JOBS.items():
+        block, mirrored = jobs.get(job), jobs.get(mirror)
+        if not isinstance(block, dict) or not isinstance(mirrored, dict):
+            errors.append(f"report-only {job} and its required {mirror} must both exist")
+            continue
+        # A failed suite must render as a failed, non-blocking job: never as a
+        # blocking one, and never as a green one behind a tolerated step.
+        if block.get("continue-on-error") != "true":
+            errors.append(f"{job} must stay report-only with job-level continue-on-error")
+        if any(isinstance(item, dict) and "continue-on-error" in item for item in block.get("steps") or []):
+            errors.append(f"{job} cannot hide a failed step behind continue-on-error")
+        # The selection reaches the job's condition only through a declared
+        # output of a job it needs; otherwise the expression reads an empty
+        # string and the lane silently runs everywhere.
+        dependencies = block.get("needs", [])
+        if "classify-changes" not in ([dependencies] if isinstance(dependencies, str) else dependencies):
+            errors.append(f"{job} must need classify-changes to read {selection}")
+        published = (jobs.get("classify-changes", {}).get("outputs") or {}).get(selection, "")
+        if not isinstance(published, str) or f"steps.scope.outputs.{selection}" not in published:
+            errors.append(f"classify-changes must publish {selection} from the scope step")
+        if re.search(r"\b(always|success|failure|cancelled)\s*\(", re.sub(r"'(?:[^']|'')*'", "", str(block.get("if", "")))):
+            errors.append(f"{job} must not override its prerequisites with a status function")
+        key, _, value = env.partition(": ")
+        if (block.get("env") or {}).get(key) != value:
+            errors.append(f"{job} must set {env}")
+
+        def named(job_block, step):
+            matches = [item for item in job_block.get("steps") or [] if isinstance(item, dict) and item.get("name") == step]
+            return matches[0] if len(matches) == 1 else None
+
+        for step in steps:
+            ours, theirs = named(block, step), named(mirrored, step)
+            if ours is None or theirs is None or ours != theirs:
+                errors.append(f"{job} step {step!r} must match {mirror}")
     for job in required | {"required-checks"}:
         block = jobs.get(job, {})
         for item in [block, *block.get("steps", [])]:
@@ -610,22 +832,20 @@ def check_workflow(root: Path) -> list[str]:
         if not isinstance(block.get("name"), str):
             errors.append(f"{job} needs a stable display name")
         name = block.get("name", "")
-        if "${{" in name and any(value.strip() not in ("matrix.features.name", "matrix.shard") for value in re.findall(r"\$\{\{(.*?)\}\}", name)):
+        if "${{" in name and any(value.strip() not in ("matrix.features.name",) for value in re.findall(r"\$\{\{(.*?)\}\}", name)):
             errors.append(f"{job} has an unverifiable dynamic display name")
     verifiers = [step for step in gate.get("steps", []) if "scripts/ci_gate.py verify" in step.get("run", "")]
     if len(verifiers) != 1 or (verifiers[0].get("run", "").strip() != "python3 scripts/ci_gate.py verify"
                               or verifiers[0].get("env", {}).get("CI_NEEDS") != "${{ toJSON(needs) }}"
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
-    lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
-              if any(command in step.get("run", "") for command in lint_commands)]
-    if not clippy or any("if" in step for step in clippy):
-        errors.append("workspace Clippy must run on every code event, pull requests included")
+    errors.extend(check_lint_lane(jobs))
+    errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
     if not isinstance(features, list) or {item.get("name"): item.get("flags") for item in features} != {
-            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift"} or len(features) != 3:
+            "swift": "--features swift", "sftp": "--features sftp", "http3": "--features http3,swift",
+            "internode-transport": "--features rustfs/internode-transport"} or len(features) != 4:
         errors.append("protocol matrix must retain every required feature configuration")
     triggers = document.get("on", {})
     if isinstance(triggers, dict) and isinstance(triggers.get("pull_request"), dict) and any(key in triggers["pull_request"] for key in ("paths", "paths-ignore")):
@@ -633,16 +853,14 @@ def check_workflow(root: Path) -> list[str]:
     if (root / ".github/workflows/ci-docs-only.yml").exists():
         errors.append("the duplicate required-status companion must be removed")
     # Truth tables protect behavior while allowing equivalent expression and YAML formatting.
-    for event, rehearse_shards in [(event, rehearsal) for event in EVENTS
-                                   for rehearsal in ((False, True) if event == "workflow_dispatch" else (False,))]:
-        for mode in (("docs", "e2e", "full") if event == "pull_request" else ("full",)):
+    for event in EVENTS:
+        for mode in {"pull_request": ("docs", "e2e", "full"), "push": ("full", "proven")}.get(event, ("full",)):
             for ref in ("refs/heads/main", "refs/heads/release"):
                 for connect in (True, False) if event == "pull_request" and mode == "full" else (mode == "full",):
                     for action in ("opened", "closed") if event == "pull_request" else ("",):
-                        expected = expected_results(mode, event, ref, connect, action, rehearse_shards)
+                        expected = expected_results(mode, event, ref, connect, action)
                         context = {"github.event_name": event, "github.ref": ref, "github.event.action": action,
                                    "needs.classify-changes.outputs.mode": mode, "needs.classify-changes.outputs.connect": str(connect).lower(),
-                                   "needs.classify-changes.outputs.rehearse_shards": str(rehearse_shards).lower(),
                                    "success": True}
                         evaluated, evaluating = {}, set()
 
@@ -675,6 +893,27 @@ def check_workflow(root: Path) -> list[str]:
                                 continue
                             if actual != should_run:
                                 errors.append(f"{job} condition differs from plan for {event}/{mode}/{connect}/{action}/{ref}")
+                        for job, (mirror, _, _, selection) in REPORT_ONLY_JOBS.items():
+                            block = jobs.get(job)
+                            if not isinstance(block, dict) or mirror not in jobs:
+                                continue
+                            for selected in ("true", "false", ""):
+                                try:
+                                    dependencies = block.get("needs", [])
+                                    ready = all(scheduled(dependency) for dependency in ([dependencies] if isinstance(dependencies, str) else dependencies))
+                                    actual = ready and condition(block.get("if", "success()"), dict(
+                                        context, **{f"needs.classify-changes.outputs.{selection}": selected}))
+                                except (KeyError, TypeError, ValueError) as error:
+                                    errors.append(f"{job}: {error}")
+                                    continue
+                                wanted = scheduled(mirror) and (event != "pull_request" or selected != "false")
+                                if actual and not wanted:
+                                    errors.append(f"{job} runs on pull requests that change no gateway-stack input" if scheduled(mirror)
+                                                  else f"{job} runs where {mirror} does not")
+                                elif wanted and not actual:
+                                    errors.append(f"{job} is skipped on {event}" if event != "pull_request" else
+                                                  f"{job} is skipped on a pull request " + (
+                                                      "that changes a gateway-stack input" if selected == "true" else "whose selection is unknown"))
                         for status in ("failure", "cancelled"):
                             context.update(success=False, failure=status == "failure", cancelled=status == "cancelled")
                             try:
@@ -691,14 +930,19 @@ def main() -> int:
         return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
     if sys.argv[1:] == ["select"]:
         try:
+            # scripts/ci_merge_group_proof.py output; select_plan accepts it only for a push of the same tree.
+            try:
+                proof = json.loads(os.environ.get("CI_MERGE_GROUP_PROOF") or "null")
+            except ValueError:
+                proof = None
             plan = select_plan(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""),
-                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""),
-                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true")
+                               os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""), Path.cwd(),
+                               os.environ.get("CI_EVENT_ACTION", ""), proof=proof)
             with open(os.environ["GITHUB_OUTPUT"], "a") as output:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
-                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("gateway_smoke", str(plan["gateway_smoke"]["run"]).lower()),
                                     ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))
@@ -720,11 +964,24 @@ def main() -> int:
                 base = (payload["pull_request"]["base"]["sha"] if event == "pull_request" else
                         payload["merge_group"]["base_sha"] if event == "merge_group" else payload.get("before", ""))
                 action = payload.get("action", "")
-            errors = verify_results(json.loads(os.environ["CI_NEEDS"]), event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            needs = json.loads(os.environ["CI_NEEDS"])
+            errors = verify_results(needs, event, os.environ.get("GITHUB_REF", ""), head, tree, base, action)
+            plan = json.loads(needs["classify-changes"]["outputs"].get("plan") or "null")
+            if not errors and isinstance(plan, dict) and plan["mode"] == "proven":
+                # The check list shows these jobs as skipped like any other; say why.
+                note = f"Validation jobs were skipped as proven: merge_group run {plan['proven_by']['url']} passed tree {plan['tree']}."
+                print(note)
+                if os.environ.get("GITHUB_STEP_SUMMARY"):
+                    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                        summary.write(note + "\n")
         except (OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as error:
             errors = [str(error)]
     elif sys.argv[1:] == ["--check-workflow"]:
         errors = check_workflow(ROOT)
+        try:
+            errors += cache_warm_errors(*ci_dev_workflows(ROOT))
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            errors.append(f"ci-dev cache: {error}")
     else:
         print("usage: ci_gate.py {select|verify|--check-workflow|--self-test}", file=sys.stderr)
         return 2

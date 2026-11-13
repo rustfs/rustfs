@@ -1684,7 +1684,7 @@ mod tests {
     fn malformed_size_blocks_size_dependent_transition_but_allows_time_only_expiry() {
         let size_filtered = BucketLifecycleConfiguration {
             rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -1723,7 +1723,7 @@ mod tests {
             rules: vec![
                 size_filtered.rules[0].clone(),
                 LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -1780,7 +1780,7 @@ mod tests {
         assert!(lifecycle_rule_has_size_filter(
             &BucketLifecycleConfiguration {
                 rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,

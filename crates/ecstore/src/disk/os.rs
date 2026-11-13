@@ -21,7 +21,7 @@ use futures::TryStreamExt;
 use parking_lot::Mutex;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
@@ -350,6 +350,14 @@ pub(crate) mod prepared_publication_test_hooks {
         Rollback,
         #[cfg(test)]
         DirFsync,
+        #[cfg(test)]
+        CreateDirectory,
+        #[cfg(test)]
+        NativeRootIdentity,
+        #[cfg(all(test, target_os = "linux"))]
+        DirectWriteOpen,
+        #[cfg(all(test, target_os = "linux"))]
+        BeforeDataUsageLayout,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -384,14 +392,11 @@ pub(crate) mod prepared_publication_test_hooks {
     }
 
     pub(crate) fn has_any_hooks() -> bool {
-        if !BEFORE_PUBLICATION.lock().is_empty() {
-            return true;
-        }
         #[cfg(test)]
         if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
             return true;
         }
-        false
+        !BEFORE_PUBLICATION.lock().is_empty()
     }
 
     #[cfg(test)]
@@ -603,16 +608,17 @@ pub(crate) mod prepare_rename_test_hooks {
             .push_back(Box::new(hook));
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_hooks() -> bool {
+        AFTER_COMPONENT_OPENED.lock().values().any(|q| !q.is_empty())
+    }
+
     pub(crate) fn run_after_component_opened(path: &Path) {
         let hook = AFTER_COMPONENT_OPENED.lock().get_mut(path).and_then(VecDeque::pop_front);
         if let Some(hook) = hook {
             let _pause = super::enter_blocking_test_hook();
             hook();
         }
-    }
-
-    pub(crate) fn has_after_component_opened() -> bool {
-        !AFTER_COMPONENT_OPENED.lock().is_empty()
     }
 
     /// Hooks keyed by a directory component name, run before a Windows
@@ -1282,6 +1288,28 @@ pub(crate) fn fsync_dir_limited_std(dir: &Path) -> io::Result<()> {
     #[cfg(all(test, unix))]
     fsync_dir_recorder::record_limited(dir);
     fsync_dir_std(dir)
+}
+
+pub(crate) fn fsync_commit_ancestor_directory_limited_std(
+    dir: &Path,
+    base_dir: &Path,
+    step_from_destination: usize,
+    guard: &RenameCommitGuard,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if base_dir == guard.directories.destination_base
+        && guard.directories.destination_path.ancestors().nth(1 + step_from_destination) == Some(dir)
+        && let Some(ancestors) = guard.directories.destination_ancestors.get()
+        && let Some(idx) = ancestors.len().checked_sub(1 + step_from_destination)
+        && let Some(file) = ancestors.get(idx)
+    {
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(dir);
+        return fsync_directory_handle_std(dir, Some(file));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (base_dir, step_from_destination, guard);
+    fsync_dir_limited_std(dir)
 }
 
 /// Reuse the published directory without bypassing group commit or sync admission.
@@ -2165,6 +2193,226 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
     })
 }
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<RwLock<()>>> = LazyLock::new(ShardedPathLockRegistry::new);
+
+#[cfg(windows)]
+type NativeRootIdentity = (u64, [u8; 16]);
+#[cfg(not(windows))]
+type NativeRootIdentity = (u64, u64);
+
+// Publication history outlives disk handles, cleanup, and metadata snapshots.
+// Reusing a pathname or descriptor for another physical root is not new proof.
+#[derive(Debug, Default)]
+struct NativePublicationHistory {
+    roots: HashMap<NativeRootIdentity, NativeRootHistory>,
+    aliases: HashMap<PathBuf, HashSet<NativeRootIdentity>>,
+}
+
+#[derive(Debug, Default)]
+struct NativeRootHistory {
+    unknown: bool,
+    started: HashSet<String>,
+}
+
+static NATIVE_PUBLICATION_HISTORY: LazyLock<Mutex<NativePublicationHistory>> =
+    LazyLock::new(|| Mutex::new(NativePublicationHistory::default()));
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativePublicationRegistration {
+    identity: NativeRootIdentity,
+    root: PathBuf,
+    io_root: PathBuf,
+}
+
+/// Opaque, process-local observation. Unsupported disks cannot construct it.
+#[derive(Clone, Debug)]
+pub struct NativeBucketCreationWitness {
+    registration: NativePublicationRegistration,
+    backend: Arc<dyn super::local::LocalIoBackend>,
+    bucket: String,
+    disk_id: uuid::Uuid,
+}
+
+fn native_root_identity(path: &Path) -> Option<NativeRootIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(test)]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::NativeRootIdentity, path);
+        let metadata = std::fs::metadata(path).ok()?;
+        metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        // Resolve and validate the same directory anchor used for publication;
+        // keep its volume and complete 128-bit file ID in the history key.
+        let (_, directory) = open_windows_publication_root(path).ok()?;
+        windows_file_identity(directory.handle.as_ref()).ok()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> Option<NativePublicationRegistration> {
+    let identity = native_root_identity(root)?;
+    if native_root_identity(io_root) != Some(identity) {
+        return None;
+    }
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    history.roots.entry(identity).or_default();
+    for alias in [root, io_root] {
+        let alias: PathBuf = alias.components().collect();
+        let previous = history.aliases.entry(alias).or_default();
+        let collisions: Vec<_> = previous.iter().copied().filter(|old| *old != identity).collect();
+        previous.insert(identity);
+        if !collisions.is_empty() {
+            history.roots.get_mut(&identity)?.unknown = true;
+            for old in collisions {
+                history.roots.get_mut(&old)?.unknown = true;
+            }
+        }
+    }
+    Some(NativePublicationRegistration {
+        identity,
+        root: root.to_path_buf(),
+        io_root: io_root.to_path_buf(),
+    })
+}
+
+/// Record before queueing filesystem work. Cancellation never removes Started.
+pub(crate) fn record_native_publication(path: &Path) {
+    let aliases: Vec<_> = {
+        let history = NATIVE_PUBLICATION_HISTORY.lock();
+        path.ancestors()
+            .filter(|alias| history.aliases.contains_key(*alias))
+            .map(Path::to_path_buf)
+            .collect()
+    };
+    // Physical lookups must never hold the process-wide publication mutex.
+    let observations: Vec<_> = aliases
+        .into_iter()
+        .filter_map(|alias| {
+            let relative = path.strip_prefix(&alias).ok()?;
+            let mut components = relative.components().filter(|part| !matches!(part, Component::CurDir));
+            let first = components.next()?;
+            let bucket = match first {
+                Component::Normal(bucket) if components.all(|part| matches!(part, Component::Normal(_))) => {
+                    bucket.to_str().map(str::to_owned)
+                }
+                _ => None,
+            };
+            let physical = native_root_identity(&alias);
+            Some((alias, physical, bucket))
+        })
+        .collect();
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    for (alias, physical, bucket) in observations {
+        // Aliases only accumulate identities. Include registration concurrent
+        // with the stat, rather than using a stale captured identity list.
+        let identities = history.aliases.get(&alias).cloned().unwrap_or_default();
+        if physical.is_none() || identities.iter().any(|identity| Some(*identity) != physical) {
+            for identity in identities {
+                history.roots.entry(identity).or_default().unknown = true;
+            }
+            if let Some(identity) = physical {
+                history.roots.entry(identity).or_default().unknown = true;
+            }
+        } else if let Some(identity) = physical {
+            let root = history.roots.entry(identity).or_default();
+            match bucket {
+                Some(bucket) => {
+                    root.started.insert(bucket);
+                }
+                None => root.unknown = true,
+            }
+        }
+    }
+}
+
+impl NativePublicationRegistration {
+    pub(crate) fn invalidate(&self) {
+        if let Some(root) = NATIVE_PUBLICATION_HISTORY.lock().roots.get_mut(&self.identity) {
+            root.unknown = true;
+        }
+    }
+
+    pub(crate) fn witness(
+        &self,
+        bucket: &str,
+        disk_id: uuid::Uuid,
+        backend: Arc<dyn super::local::LocalIoBackend>,
+    ) -> Option<NativeBucketCreationWitness> {
+        if disk_id.is_nil()
+            || !matches!(Path::new(bucket).components().next(), Some(Component::Normal(_)))
+            || Path::new(bucket).components().count() != 1
+        {
+            return None;
+        }
+        let witness = NativeBucketCreationWitness {
+            registration: self.clone(),
+            backend,
+            bucket: bucket.to_owned(),
+            disk_id,
+        };
+        validate_native_creation_witnesses(std::slice::from_ref(&witness)).then_some(witness)
+    }
+}
+
+impl NativeBucketCreationWitness {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.registration.identity == other.registration.identity
+            && Arc::ptr_eq(&self.backend, &other.backend)
+            && self.disk_id == other.disk_id
+            && self.bucket == other.bucket
+    }
+
+    fn physical_root_is_current(&self) -> bool {
+        let root = native_root_identity(&self.registration.root);
+        let io_root = native_root_identity(&self.registration.io_root);
+        if root == Some(self.registration.identity) && io_root == Some(self.registration.identity) {
+            return true;
+        }
+        let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+        history.roots.entry(self.registration.identity).or_default().unknown = true;
+        for identity in [root, io_root].into_iter().flatten() {
+            history.roots.entry(identity).or_default().unknown = true;
+        }
+        false
+    }
+
+    fn valid_in(&self, history: &NativePublicationHistory) -> bool {
+        history
+            .roots
+            .get(&self.registration.identity)
+            .is_some_and(|root| !root.unknown && !root.started.contains(&self.bucket))
+    }
+}
+
+pub(crate) fn validate_native_creation_witnesses(witnesses: &[NativeBucketCreationWitness]) -> bool {
+    if witnesses.is_empty() || !witnesses.iter().all(NativeBucketCreationWitness::physical_root_is_current) {
+        return false;
+    }
+    let history = NATIVE_PUBLICATION_HISTORY.lock();
+    witnesses.iter().all(|witness| witness.valid_in(&history))
+}
+
+pub(crate) fn consume_native_creation_witnesses(witnesses: &[NativeBucketCreationWitness]) -> bool {
+    if witnesses.is_empty() || !witnesses.iter().all(NativeBucketCreationWitness::physical_root_is_current) {
+        return false;
+    }
+    let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+    if !witnesses.iter().all(|witness| witness.valid_in(&history)) {
+        return false;
+    }
+    for witness in witnesses {
+        if let Some(root) = history.roots.get_mut(&witness.registration.identity) {
+            root.started.insert(witness.bucket.clone());
+        }
+    }
+    true
+}
 type NamespaceMutationLock = AsyncMutex<()>;
 static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
     LazyLock::new(ShardedPathLockRegistry::new);
@@ -2204,8 +2452,31 @@ pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
-const FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
+const DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 256;
+const MAX_FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
+
+const ENV_FSYNC_WORKER_IDLE_SPIN_ITERS: &str = "RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS";
+const ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE: &str = "RUSTFS_EXPERIMENTAL_FSYNC_WORKER_KEEP_MULTIPLE_IDLE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsyncWorkerIdlePolicy {
+    spin_iters: usize,
+    keep_multiple_idle: bool,
+}
+
+impl FsyncWorkerIdlePolicy {
+    fn from_env() -> Self {
+        Self {
+            spin_iters: rustfs_utils::get_env_usize(ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, DEFAULT_FSYNC_WORKER_IDLE_SPIN_ITERS)
+                .min(MAX_FSYNC_WORKER_IDLE_SPIN_ITERS),
+            keep_multiple_idle: rustfs_utils::get_env_bool(ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE, true),
+        }
+    }
+}
+
+// Resolve once so each queue uses one policy throughout worker retirement and respawn.
+static FSYNC_WORKER_IDLE_POLICY: LazyLock<FsyncWorkerIdlePolicy> = LazyLock::new(FsyncWorkerIdlePolicy::from_env);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiskBlockingLane {
@@ -2243,6 +2514,9 @@ struct DiskBlockingQueueLane {
 
 pub(crate) struct DiskBlockingQueue {
     lanes: [DiskBlockingQueueLane; 3],
+    fsync_idle_policy: FsyncWorkerIdlePolicy,
+    #[cfg(test)]
+    before_idle_spin: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2309,8 +2583,15 @@ impl Drop for DiskBlockingWorkerGuard {
 
 impl DiskBlockingQueue {
     fn new() -> Arc<Self> {
+        Self::with_fsync_idle_policy(*FSYNC_WORKER_IDLE_POLICY)
+    }
+
+    fn with_fsync_idle_policy(fsync_idle_policy: FsyncWorkerIdlePolicy) -> Arc<Self> {
         Arc::new(Self {
             lanes: std::array::from_fn(|_| DiskBlockingQueueLane::default()),
+            fsync_idle_policy,
+            #[cfg(test)]
+            before_idle_spin: Mutex::new(None),
         })
     }
 
@@ -2385,6 +2666,9 @@ impl DiskBlockingQueue {
             state: DiskBlockingWorkerState::Submitted,
         };
         let worker = move || {
+            let worker_metrics = (lane == DiskBlockingLane::Fsync)
+                .then(rustfs_io_metrics::start_disk_fsync_worker_metrics)
+                .flatten();
             let mut guard = guard;
             #[cfg(any(test, feature = "test-util"))]
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
@@ -2413,7 +2697,9 @@ impl DiskBlockingQueue {
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
                     if job.is_none() {
-                        if lane != DiskBlockingLane::Fsync && state.idle_workers > 0 {
+                        if (lane != DiskBlockingLane::Fsync || !queue.fsync_idle_policy.keep_multiple_idle)
+                            && state.idle_workers > 0
+                        {
                             state.active_workers = state.active_workers.saturating_sub(1);
                             guard.state = DiskBlockingWorkerState::Retired;
                             return;
@@ -2431,16 +2717,32 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
+                    #[cfg(test)]
+                    {
+                        let hook = queue.before_idle_spin.lock().clone();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                     let spin_iters = if lane == DiskBlockingLane::Fsync {
-                        FSYNC_WORKER_IDLE_SPIN_ITERS
+                        queue.fsync_idle_policy.spin_iters
                     } else {
                         WORKER_IDLE_SPIN_ITERS
                     };
+                    let spin_metrics = worker_metrics
+                        .as_ref()
+                        .filter(|_| spin_iters > 0)
+                        .map(|metrics| metrics.start_idle_spin());
+                    let mut spun = 0;
                     for _ in 0..spin_iters {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
                         std::hint::spin_loop();
+                        spun += 1;
+                    }
+                    if let Some(metrics) = spin_metrics {
+                        metrics.finish(spun);
                     }
                     // Recheck and retire under the same mutex used by enqueue.
                     idle_polled = true;
@@ -3699,6 +4001,7 @@ pub(in crate::disk) async fn rename_with_namespace_owner(
     dst: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
+    record_native_publication(dst);
     if namespace_owner.is_none() {
         return tokio::fs::rename(src, dst).await;
     }
@@ -3720,12 +4023,19 @@ pub(in crate::disk) async fn create_dir_all_with_namespace_owner(
     path: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
+    record_native_publication(path);
     if namespace_owner.is_none() {
         return tokio::fs::create_dir_all(path).await;
     }
     let path = path.to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
-    run_blocking_namespace_operation(lease, move || std::fs::create_dir_all(path)).await
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(test, not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::CreateDirectory, &path);
+        record_native_publication(&path);
+        std::fs::create_dir_all(path)
+    })
+    .await
 }
 
 #[tracing::instrument(name = "rename_all", level = "debug", skip_all)]
@@ -3736,6 +4046,7 @@ pub(crate) async fn rename_all_with_owner(
     publication_root: &PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
     rename_all_with_lease(src_file_path, dst_file_path, base_dir, publication_root, lease).await
 }
@@ -3747,6 +4058,7 @@ pub(crate) async fn rename_all_with_lease(
     publication_root: &PublicationRoot,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     reliable_rename_inner_with_lease(
         src_file_path.as_ref().to_path_buf(),
         dst_file_path.as_ref().to_path_buf(),
@@ -3804,7 +4116,8 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
     if let Some(check) = precondition {
         check()?;
     }
-    let preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
@@ -3824,10 +4137,10 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
         {
             let pinned = preparation
                 .parent_guard
-                .as_ref()
-                .and_then(|guard| guard.last())
+                .as_mut()
+                .and_then(Vec::pop)
                 .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
-            let opened = std::fs::File::from(pinned.try_clone()?);
+            let opened = std::fs::File::from(pinned);
             fsync_directory_handle_std(parent, Some(&opened))?;
         }
         #[cfg(not(unix))]
@@ -3847,6 +4160,7 @@ pub(crate) async fn rename_reconciled_metadata(
     owner: Option<Arc<dyn Send + Sync>>,
     authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
 ) -> Result<()> {
+    record_native_publication(&destination);
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
     run_blocking_namespace_operation_with_sync(lease, true, move || {
         let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
@@ -4102,21 +4416,27 @@ fn open_existing_directory_below_base_std(
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{ResolveFlags, openat2};
-        use std::os::fd::AsFd;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let owned_base;
-        let base_fd = if base == publication_root.io_path.as_path() || base == publication_root.path.as_path() {
-            publication_root.directory.as_fd()
-        } else {
-            owned_base = std::os::fd::OwnedFd::from(publication_root.open_directory(base)?);
-            owned_base.as_fd()
-        };
-        let target = if relative.as_os_str().is_empty() {
+        let base_relative = publication_root.relative_path(base)?;
+        if linux_relative_path_has_invalid_component(base_relative) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = publication_root.relative_path(directory)?;
+        if linux_relative_path_has_invalid_component(target) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
+        }
+        let target = if target.as_os_str().is_empty() {
             Path::new(".")
         } else {
-            relative
+            target
         };
-        match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match openat2(
+            &*publication_root.directory,
+            target,
+            flags,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
             Ok(leaf) => return Ok(vec![leaf]),
             Err(rustix::io::Errno::NOSYS) => {}
             Err(err) => return Err(err.into()),
@@ -4276,7 +4596,7 @@ pub(crate) mod multipart_source_syscall_failures {
         );
         FailureGuard { key, failure }
     }
-    pub(super) fn check(stage: Stage, path: &Path) -> io::Result<()> {
+    pub(crate) fn check(stage: Stage, path: &Path) -> io::Result<()> {
         if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
             failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
             return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
@@ -4502,6 +4822,7 @@ pub(crate) async fn rename_all_with_prepared_source(
     commit_guard: &RenameCommitGuard,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
@@ -4548,6 +4869,7 @@ pub(crate) async fn rename_all_with_commit_guard(
     commit_guard: &RenameCommitGuard,
     lease: Arc<NamespaceMutationLease>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     #[cfg(target_os = "linux")]
     {
         let source = src_file_path.as_ref().to_path_buf();
@@ -4601,6 +4923,7 @@ pub(crate) async fn rename_all_ignore_missing_source_with_owner(
     publication_root: &PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let src_file_path = src_file_path.as_ref();
     let lease = acquire_namespace_mutation_lease_with_owner(dst_file_path.as_ref(), namespace_owner).await;
     match reliable_rename_inner_with_lease(
@@ -4655,6 +4978,7 @@ async fn reliable_rename_inner(
     publication_root: &PublicationRoot,
     warn_on_missing_source: bool,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path.as_ref());
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
@@ -4678,6 +5002,7 @@ async fn reliable_rename_inner_with_lease(
     warn_on_missing_source: bool,
     lease: Arc<NamespaceMutationLease>,
 ) -> io::Result<()> {
+    record_native_publication(&dst_file_path);
     let operation = {
         let src_file_path = src_file_path.clone();
         let dst_file_path = dst_file_path.clone();
@@ -4982,7 +5307,23 @@ fn prepare_rename_with_retry(
 ) -> io::Result<RenamePreparation> {
     let parent_guard = dst_file_path
         .parent()
-        .map(|parent| prepare_destination_parent_with_retry(parent, base_dir, publication_root))
+        .map(|parent| {
+            #[cfg(target_os = "linux")]
+            {
+                #[cfg(test)]
+                let has_hooks = prepare_rename_test_hooks::has_hooks();
+                #[cfg(not(test))]
+                let has_hooks = false;
+                if !has_hooks
+                    && existing_base_directory_suffix(parent, base_dir)
+                        .is_ok_and(|rel| rel.as_os_str().as_encoded_bytes().contains(&b'/'))
+                    && let Ok(guard) = open_existing_directory_below_base_std(parent, base_dir, publication_root)
+                {
+                    return Ok(guard);
+                }
+            }
+            prepare_destination_parent_with_retry(parent, base_dir, publication_root)
+        })
         .transpose()?;
     Ok(RenamePreparation {
         parent_guard,
@@ -5170,6 +5511,7 @@ fn rename_into_existing_parent(
     parent_guard: Option<&ExistingBaseDirectoryGuard>,
     #[cfg(target_os = "linux")] source_parent: &std::fs::File,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path);
     use rustix::fs::renameat;
 
     let Some(parent_guard) = parent_guard else {
@@ -5223,6 +5565,7 @@ fn rename_into_existing_parent(
     parent_guard: Option<&ExistingBaseDirectoryGuard>,
     source: &winapi_util::Handle,
 ) -> io::Result<()> {
+    record_native_publication(dst_file_path);
     use std::{
         mem::size_of,
         os::windows::{ffi::OsStrExt, io::AsRawHandle},
@@ -5512,6 +5855,7 @@ impl PublicationRoot {
     }
 
     pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {
+        record_native_publication(path);
         #[cfg(target_os = "linux")]
         {
             use rustix::fs::{Mode, OFlags};
@@ -5522,6 +5866,7 @@ impl PublicationRoot {
     }
 
     pub(crate) fn create_truncate_with_parent(&self, path: &Path) -> io::Result<(std::fs::File, Option<std::fs::File>)> {
+        record_native_publication(path);
         #[cfg(target_os = "linux")]
         {
             use rustix::fs::{Mode, OFlags};
@@ -5546,7 +5891,7 @@ impl PublicationRoot {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
+    pub(crate) fn open_directory(&self, path: &Path) -> io::Result<std::fs::File> {
         self.open_relative(
             path,
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
@@ -5748,6 +6093,7 @@ struct LinuxCommitDirectories {
     destination_path: PathBuf,
     source: LinuxCommitDirectory,
     destination: std::sync::OnceLock<LinuxCommitDirectory>,
+    destination_ancestors: std::sync::OnceLock<Vec<std::fs::File>>,
     destination_base: PathBuf,
 }
 
@@ -5764,6 +6110,8 @@ impl LinuxCommitDirectories {
                 .ok_or_else(|| io::Error::other("missing destination directory guard"))?,
         );
         let directory = LinuxCommitDirectory::new(directory)?;
+        let ancestors = parents.into_iter().map(std::fs::File::from).collect();
+        let _ = self.destination_ancestors.set(ancestors);
         Ok(self.destination.get_or_init(|| directory))
     }
 
@@ -5773,7 +6121,7 @@ impl LinuxCommitDirectories {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"))
     }
 
-    fn validate(&self) -> io::Result<()> {
+    fn validate(&self, check_destination: bool) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         // A pinned directory may have been unlinked or replaced. Do not report a
         // successful publication into a detached object tree.
@@ -5782,8 +6130,9 @@ impl LinuxCommitDirectories {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if (self.source.device, self.source.inode) != (destination.device, destination.inode)
-            || self.source_path.as_os_str() != self.destination_path.as_os_str()
+        if check_destination
+            && ((self.source.device, self.source.inode) != (destination.device, destination.inode)
+                || self.source_path.as_os_str() != self.destination_path.as_os_str())
         {
             let current = self.root.open_directory(&self.destination_path)?.metadata()?;
             if (current.dev(), current.ino()) != (destination.device, destination.inode) {
@@ -5794,10 +6143,12 @@ impl LinuxCommitDirectories {
     }
 
     fn rename(&self, source: &Path, destination: &Path, prepared: Option<&PreparedRenameSource>) -> io::Result<()> {
+        record_native_publication(destination);
         let source_name = self.file_name(source, true)?;
         let destination_name = self.file_name(destination, false)?;
+        let destination_was_prepared = self.destination.get().is_some();
         let destination_parent = self.prepare_destination()?;
-        self.validate()?;
+        self.validate(destination_was_prepared)?;
         let mut attempt = 0;
         loop {
             if let Some(prepared) = prepared {
@@ -6019,7 +6370,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
     source_parent: &Path,
 ) -> io::Result<RenameCommitGuard> {
     let original = &metadata_guard.directories;
-    original.validate()?;
+    original.validate(true)?;
     let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
     let destination = original.prepare_destination()?;
     // Clone the pinned file identity, never recapture the target pathname
@@ -6036,6 +6387,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
             destination_path: original.destination_path.clone(),
             source,
             destination: std::sync::OnceLock::from(destination),
+            destination_ancestors: std::sync::OnceLock::new(),
             destination_base: original.destination_base.clone(),
         }),
     })
@@ -6117,6 +6469,7 @@ pub(crate) fn prepare_rename_commit_guard(
                 destination_path: destination_parent.to_path_buf(),
                 source,
                 destination,
+                destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: destination_base.to_path_buf(),
             }),
         })
@@ -7041,7 +7394,7 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 || reparse_tag == IO_REPARSE_TAG_DEDUP
 }
 
-fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
+pub(crate) fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
     #[cfg(target_os = "linux")]
     {
         let relative = rustfs_utils::path::unix_normalized_path_strip_prefix(dir_path, base_dir).ok_or_else(|| {
@@ -7204,16 +7557,45 @@ pub(crate) fn pin_multipart_source_directory(
 
 fn same_parent_commit_guard(
     parent: &Path,
+    create_base: Option<&Path>,
     base: &Path,
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
 ) -> io::Result<RenameCommitGuard> {
     #[cfg(target_os = "linux")]
-    if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+    let same_dir = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
         let dir = &directory_guard.directories.source;
+        Some((
+            directory_guard.directories.root.clone(),
+            LinuxCommitDirectory {
+                file: Arc::clone(&dir.file),
+                device: dir.device,
+                inode: dir.inode,
+            },
+        ))
+    } else if let Some(fd) = leaf_fd {
+        existing_base_directory_suffix(parent, base)?;
+        Some((publication_root.clone(), LinuxCommitDirectory::new(std::fs::File::from(fd))?))
+    } else if let Some(staging_base) = create_base {
+        existing_base_directory_suffix(parent, base)?;
+        let file = match publication_root.open_directory(parent) {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let mut parents = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+                std::fs::File::from(parents.pop().ok_or_else(|| io::Error::other("missing directory guard"))?)
+            }
+            Err(err) => return Err(err),
+        };
+        Some((publication_root.clone(), LinuxCommitDirectory::new(file)?))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if let Some((root, dir)) = same_dir {
         return Ok(RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
-                root: directory_guard.directories.root.clone(),
+                root,
                 source_path: parent.to_path_buf(),
                 destination_path: parent.to_path_buf(),
                 source: LinuxCommitDirectory {
@@ -7221,17 +7603,21 @@ fn same_parent_commit_guard(
                     device: dir.device,
                     inode: dir.inode,
                 },
-                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                }),
+                destination: std::sync::OnceLock::from(dir),
+                destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: base.to_path_buf(),
             }),
         });
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = leaf_fd;
     #[cfg(not(target_os = "linux"))]
-    let _ = directory_guard;
+    {
+        if let Some(staging_base) = create_base {
+            let _ = mkdir_all_below_existing_base_std(parent, staging_base, publication_root)?;
+        }
+        let _ = directory_guard;
+    }
     prepare_rename_commit_guard(parent, parent, base, publication_root)
 }
 
@@ -7243,7 +7629,54 @@ pub(crate) fn replace_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    replace_multipart_source_metadata_with_guard(path, bytes, base, publication_root, None)
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_creating_parent(
+    path: &Path,
+    bytes: &[u8],
+    create_base: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        Some(create_base),
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+pub(crate) fn replace_multipart_source_metadata_with_leaf_fd(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        None,
+        #[cfg(unix)]
+        leaf_fd,
+    )
 }
 
 pub(crate) fn replace_multipart_source_metadata_with_guard(
@@ -7253,10 +7686,43 @@ pub(crate) fn replace_multipart_source_metadata_with_guard(
     publication_root: &PublicationRoot,
     directory_guard: Option<&RenameCommitGuard>,
 ) -> io::Result<()> {
+    replace_multipart_source_metadata_inner(
+        path,
+        bytes,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+fn replace_multipart_source_metadata_inner(
+    path: &Path,
+    bytes: &[u8],
+    create_base: Option<&Path>,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+    #[cfg(unix)] leaf_fd: Option<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
     #[cfg(not(target_os = "linux"))]
-    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let _pinned = if create_base.is_none() {
+        Some(pin_multipart_source_directory(parent, base, publication_root)?)
+    } else {
+        None
+    };
+    let guard = same_parent_commit_guard(
+        parent,
+        create_base,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        leaf_fd,
+    )?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
     let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
     prepared.write_all(bytes, true)?;
@@ -7433,7 +7899,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
-    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root, None)
 }
 
 pub(crate) fn sync_multipart_owned_record_parents_options(
@@ -7443,6 +7909,7 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
     sync_source_root: bool,
     base: &Path,
     publication_root: &PublicationRoot,
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))] mut pinned_parents: Option<ExistingBaseDirectoryGuard>,
 ) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
@@ -7454,6 +7921,9 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid native record parent depth"));
+    }
+    if depth == 0 && !include_leaf {
+        return Ok(());
     }
     let mut directory = if include_leaf {
         record_parent
@@ -7469,16 +7939,20 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
         if directory == source && !sync_source_root {
             return Ok(());
         }
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
-        {
+        if let Some(fd) = pinned_parents.as_mut().and_then(Vec::pop) {
+            let opened = std::fs::File::from(fd);
+            fsync_directory_handle_std(directory, Some(&opened))?;
+        } else {
+            let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
             let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty native directory guard"))?);
             fsync_directory_handle_std(directory, Some(&opened))?;
         }
         #[cfg(not(unix))]
-        fsync_dir_std(directory)?;
-        drop(pinned);
+        {
+            let _pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+            fsync_dir_std(directory)?;
+        }
         if directory == source {
             return Ok(());
         }
@@ -7507,7 +7981,15 @@ pub(crate) fn install_multipart_prepared_head(
     }
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
+    let guard = same_parent_commit_guard(
+        parent,
+        None,
+        base,
+        publication_root,
+        directory_guard,
+        #[cfg(unix)]
+        None,
+    )?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;
@@ -8254,6 +8736,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     base_dir: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<ExistingBaseDirectoryGuard> {
+    record_native_publication(dir_path);
     let relative = existing_base_directory_suffix(dir_path, base_dir)?;
 
     #[cfg(unix)]
@@ -8264,37 +8747,7 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         #[cfg(target_os = "linux")]
-        let base = {
-            use rustix::fs::{ResolveFlags, openat2};
-            use std::os::fd::AsFd;
-
-            let owned_base = (base_dir != publication_root.io_path.as_path() && base_dir != publication_root.path.as_path())
-                .then(|| publication_root.open_directory(base_dir).map(std::os::fd::OwnedFd::from))
-                .transpose()?;
-            #[cfg(test)]
-            let has_hook = prepare_rename_test_hooks::has_after_component_opened();
-            #[cfg(not(test))]
-            let has_hook = false;
-            if !has_hook {
-                let base_fd = owned_base
-                    .as_ref()
-                    .map_or_else(|| publication_root.directory.as_fd(), AsFd::as_fd);
-                let target = if relative.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    relative
-                };
-                match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
-                    Ok(leaf) => return Ok(vec![leaf]),
-                    Err(Errno::NOENT | Errno::NOSYS) => {}
-                    Err(err) => return Err(err.into()),
-                }
-            }
-            match owned_base {
-                Some(base) => base,
-                None => publication_root.open_directory(base_dir)?.into(),
-            }
-        };
+        let base = publication_root.open_directory(base_dir)?.into();
         #[cfg(not(target_os = "linux"))]
         let base = {
             // The configured endpoint is trusted; every component beneath it
@@ -10072,6 +10525,77 @@ mod tests {
         .expect_err("a supported extended rename failure must replace the stale legacy error");
         assert_eq!(attempts, 2);
         assert_eq!(err.raw_os_error(), Some(disk_full));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_root_identity_matches_directory_handles() {
+        let temp = tempdir().expect("create native identity fixture");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).expect("create first root");
+        std::fs::create_dir(&second).expect("create second root");
+        let (_, first_anchor) = open_windows_publication_root(&first).expect("open first directory anchor");
+        let (_, second_anchor) = open_windows_publication_root(&second).expect("open second directory anchor");
+        let first_identity = windows_file_identity(first_anchor.handle.as_ref()).expect("query full first identity");
+        let second_identity = windows_file_identity(second_anchor.handle.as_ref()).expect("query full second identity");
+
+        assert_eq!(native_root_identity(&first), Some(first_identity));
+        assert_eq!(native_root_identity(&first.join(".")), Some(first_identity));
+        assert_eq!(native_root_identity(&second), Some(second_identity));
+        assert_ne!(first_identity, second_identity, "distinct physical roots must have distinct identities");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_native_creation_witness_retains_started_history() {
+        let temp = tempdir().expect("create native witness fixture");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical native root");
+        let _publication_root = PublicationRoot::new(&root).expect("retain native directory anchor");
+        let registration = register_native_publication_root(&root, &root.join(".")).expect("register same physical root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let disk_id = uuid::Uuid::new_v4();
+        let witness = registration
+            .witness("published", disk_id, Arc::clone(&backend))
+            .expect("fresh native witness");
+        let bucket = root.join("published");
+
+        super::super::fs::mkdir(&bucket)
+            .await
+            .expect("publish through the actual native entry");
+        assert!(bucket.is_dir(), "the production entry must create the directory");
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness)));
+        std::fs::remove_dir(&bucket).expect("remove published directory");
+        assert!(registration.witness("published", disk_id, Arc::clone(&backend)).is_none());
+        let reconnected = register_native_publication_root(&root, &root).expect("reconnect same physical root");
+        assert!(reconnected.witness("published", disk_id, Arc::clone(&backend)).is_none());
+
+        let unstarted = reconnected
+            .witness("unstarted", disk_id, Arc::clone(&backend))
+            .expect("untouched bucket keeps its witness");
+        assert!(consume_native_creation_witnesses(std::slice::from_ref(&unstarted)));
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&unstarted)));
+        assert!(reconnected.witness("unstarted", disk_id, backend).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_creation_witness_rejects_unknown_roots() {
+        let temp = tempdir().expect("create unknown identity fixture");
+        let root = temp.path().join("root");
+        let other = temp.path().join("other");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&root).expect("create native root");
+        std::fs::create_dir(&other).expect("create distinct native root");
+        std::fs::write(&file, b"not a directory").expect("create regular file");
+
+        assert!(native_root_identity(&temp.path().join("missing")).is_none());
+        assert!(native_root_identity(&file).is_none());
+        assert!(register_native_publication_root(&root, &other).is_none());
+        let registration = register_native_publication_root(&root, &root).expect("register actual native root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root));
+        registration.invalidate();
+        assert!(registration.witness("unstarted", uuid::Uuid::new_v4(), backend).is_none());
     }
 
     #[cfg(windows)]
@@ -12621,55 +13145,97 @@ mod tests {
         assert_eq!(completed, 257, "yielding must not discard hot-disk jobs");
     }
 
+    fn fsync_idle_test_policies() -> impl Iterator<Item = FsyncWorkerIdlePolicy> {
+        [0, 256, 1024].into_iter().flat_map(|spin_iters| {
+            [false, true].map(|keep_multiple_idle| FsyncWorkerIdlePolicy {
+                spin_iters,
+                keep_multiple_idle,
+            })
+        })
+    }
+
+    #[test]
+    fn disk_blocking_queue_fsync_idle_policy_parses_and_bounds_configuration() {
+        for (spin_value, multiple_value, expected_spins, expected_multiple) in [
+            (None, None, 256, true),
+            (Some("256"), Some("false"), 256, false),
+            (Some("1024"), Some("true"), 1024, true),
+            (Some("0"), Some("false"), 0, false),
+            (Some("1025"), Some("true"), 1024, true),
+            (Some("invalid"), Some("invalid"), 256, true),
+            (Some("-1"), None, 256, true),
+            (Some("184467440737095516160"), None, 256, true),
+        ] {
+            temp_env::with_vars(
+                [
+                    (ENV_FSYNC_WORKER_IDLE_SPIN_ITERS, spin_value),
+                    (ENV_FSYNC_WORKER_KEEP_MULTIPLE_IDLE, multiple_value),
+                ],
+                || {
+                    assert_eq!(
+                        FsyncWorkerIdlePolicy::from_env(),
+                        FsyncWorkerIdlePolicy {
+                            spin_iters: expected_spins,
+                            keep_multiple_idle: expected_multiple,
+                        },
+                        "unexpected policy for spin={spin_value:?}, multiple={multiple_value:?}",
+                    );
+                },
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn disk_blocking_queue_drains_bursts_across_worker_retirement() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
-            let queue = DiskBlockingQueue::new();
-            let completed = Arc::new(AtomicUsize::new(0));
-            for _ in 0..8 {
-                let mut producers = tokio::task::JoinSet::new();
+        for policy in fsync_idle_test_policies() {
+            for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
+                let queue = DiskBlockingQueue::with_fsync_idle_policy(policy);
+                let completed = Arc::new(AtomicUsize::new(0));
                 for _ in 0..8 {
-                    let queue = Arc::clone(&queue);
-                    let completed = Arc::clone(&completed);
-                    producers.spawn(async move {
-                        for _ in 0..64 {
-                            let completed = Arc::clone(&completed);
-                            queue
-                                .run_on_lane(
-                                    lane,
-                                    "burst dispatch failed",
-                                    DiskBlockingQueue::test_stages_for_lane(lane),
-                                    move |_| {
-                                        completed.fetch_add(1, Ordering::Relaxed);
-                                        Ok(())
-                                    },
-                                )
-                                .await?;
-                        }
-                        Ok::<_, io::Error>(())
-                    });
-                }
-                while let Some(result) = producers.join_next().await {
-                    result.expect("producer joined").expect("all jobs drained");
-                }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        {
-                            let state = queue.lane(lane).state.lock();
-                            if state.active_workers == 0 {
-                                assert!(state.jobs.is_empty());
-                                assert!(!queue.lane(lane).ready.load(Ordering::Relaxed));
-                                break;
+                    let mut producers = tokio::task::JoinSet::new();
+                    for _ in 0..8 {
+                        let queue = Arc::clone(&queue);
+                        let completed = Arc::clone(&completed);
+                        producers.spawn(async move {
+                            for _ in 0..64 {
+                                let completed = Arc::clone(&completed);
+                                queue
+                                    .run_on_lane(
+                                        lane,
+                                        "burst dispatch failed",
+                                        DiskBlockingQueue::test_stages_for_lane(lane),
+                                        move |_| {
+                                            completed.fetch_add(1, Ordering::Relaxed);
+                                            Ok(())
+                                        },
+                                    )
+                                    .await?;
                             }
-                        }
-                        tokio::task::yield_now().await;
+                            Ok::<_, io::Error>(())
+                        });
                     }
-                })
-                .await
-                .expect("idle worker retires without stranded jobs");
+                    while let Some(result) = producers.join_next().await {
+                        result.expect("producer joined").expect("all jobs drained");
+                    }
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            {
+                                let state = queue.lane(lane).state.lock();
+                                if state.active_workers == 0 {
+                                    assert!(state.jobs.is_empty());
+                                    assert!(!queue.lane(lane).ready.load(Ordering::Relaxed));
+                                    break;
+                                }
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("idle worker retires without stranded jobs");
+                }
+                assert_eq!(completed.load(Ordering::Relaxed), 8 * 8 * 64);
             }
-            assert_eq!(completed.load(Ordering::Relaxed), 8 * 8 * 64);
         }
     }
 
@@ -12744,78 +13310,204 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_fsync_idle_policy_retains_selected_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for keep_multiple_idle in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let queue = DiskBlockingQueue::with_fsync_idle_policy(FsyncWorkerIdlePolicy {
+                    spin_iters: 256,
+                    keep_multiple_idle,
+                });
+                let idle_entries = Arc::new(AtomicUsize::new(0));
+                let (idle_entered_tx, mut idle_entered_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut idle_release_txs = Vec::new();
+                let mut idle_release_rxs = VecDeque::new();
+                for _ in 0..2 {
+                    let (tx, rx) = oneshot::channel();
+                    idle_release_txs.push(tx);
+                    idle_release_rxs.push_back(rx);
+                }
+                let idle_release_rxs = Mutex::new(idle_release_rxs);
+                *queue.before_idle_spin.lock() = Some(Arc::new({
+                    let idle_entries = Arc::clone(&idle_entries);
+                    move || {
+                        let release = idle_release_rxs
+                            .lock()
+                            .expect("lock idle releases")
+                            .pop_front()
+                            .expect("only the two controlled workers enter idle");
+                        idle_entries.fetch_add(1, Ordering::SeqCst);
+                        let _ = idle_entered_tx.send(());
+                        // Dropping the test future releases this worker on assertion or timeout.
+                        let _ = release.blocking_recv();
+                    }
+                }));
+
+                let mut job_releases = VecDeque::new();
+                let mut jobs = VecDeque::new();
+                for _ in 0..2 {
+                    let (started_tx, started_rx) = oneshot::channel();
+                    let (release_tx, release_rx) = oneshot::channel();
+                    let worker_queue = Arc::clone(&queue);
+                    jobs.push_back(tokio::spawn(async move {
+                        worker_queue
+                            .run_on_lane(
+                                DiskBlockingLane::Fsync,
+                                "controlled fsync job failed",
+                                DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                                move |_| {
+                                    let _ = started_tx.send(());
+                                    let _ = release_rx.blocking_recv();
+                                    Ok(())
+                                },
+                            )
+                            .await
+                    }));
+                    job_releases.push_back(release_tx);
+                    started_rx.await.expect("controlled worker started");
+                }
+
+                job_releases
+                    .pop_front()
+                    .expect("first job release")
+                    .send(())
+                    .expect("release first job");
+                idle_entered_rx.recv().await.expect("first worker entered idle");
+                job_releases
+                    .pop_front()
+                    .expect("second job release")
+                    .send(())
+                    .expect("release second job");
+                for job in jobs {
+                    job.await
+                        .expect("controlled worker joined")
+                        .expect("controlled job completed");
+                }
+
+                let expected_idle = if keep_multiple_idle { 2 } else { 1 };
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == expected_idle
+                            && state.idle_workers == expected_idle
+                            && idle_entries.load(Ordering::SeqCst) == expected_idle
+                        {
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+
+                *queue.before_idle_spin.lock() = None;
+                for release in idle_release_txs {
+                    let _ = release.send(());
+                }
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == 0 {
+                            assert_eq!(state.idle_workers, 0);
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    queue
+                        .run_on_lane(
+                            DiskBlockingLane::Fsync,
+                            "post-idle fsync job failed",
+                            DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                            |_| Ok(17),
+                        )
+                        .await
+                        .expect("queue restarts after all workers retire"),
+                    17,
+                );
+            })
+            .await
+            .expect("controlled idle policy and restart must complete");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn disk_blocking_queue_fsync_lane_scales_workers_and_retires_idle() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let queue = DiskBlockingQueue::new();
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_seen = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(AtomicUsize::new(0));
-        let (all_entered_tx, all_entered_rx) = oneshot::channel();
-        let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
-        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        for policy in fsync_idle_test_policies() {
+            let queue = DiskBlockingQueue::with_fsync_idle_policy(policy);
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(AtomicUsize::new(0));
+            let (all_entered_tx, all_entered_rx) = oneshot::channel();
+            let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
+            let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-        let mut handles = Vec::new();
-        for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
-            let q = Arc::clone(&queue);
-            let active = Arc::clone(&active);
-            let max_seen = Arc::clone(&max_seen);
-            let entered = Arc::clone(&entered);
-            let all_entered_tx = Arc::clone(&all_entered_tx);
-            let mut release_rx = release_tx.subscribe();
-            handles.push(tokio::spawn(async move {
-                use_current_runtime_for_fsync();
-                q.run_on_lane(
-                    DiskBlockingLane::Fsync,
-                    "fsync scale test failed",
-                    DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
-                    move |_| {
-                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        max_seen.fetch_max(cur, Ordering::SeqCst);
-                        let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
-                        if ord == MAX_FSYNC_WORKERS_PER_DISK
-                            && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
-                        {
-                            let _ = tx.send(());
-                        }
-                        if ord <= MAX_FSYNC_WORKERS_PER_DISK {
-                            let _ = release_rx.blocking_recv();
-                        }
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        Ok(i)
-                    },
-                )
-                .await
-            }));
-        }
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
-            .await
-            .expect("all fsync workers should enter within timeout")
-            .expect("all_entered channel");
-        let _ = release_tx.send(());
-        for (i, handle) in handles.into_iter().enumerate() {
-            assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
-        }
-        assert_eq!(
-            max_seen.load(Ordering::SeqCst),
-            MAX_FSYNC_WORKERS_PER_DISK,
-            "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                {
-                    let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
-                    if state.active_workers == 0 && state.idle_workers == 0 {
-                        assert!(state.jobs.is_empty());
-                        break;
-                    }
-                }
-                tokio::task::yield_now().await;
+            let mut handles = Vec::new();
+            for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
+                let q = Arc::clone(&queue);
+                let active = Arc::clone(&active);
+                let max_seen = Arc::clone(&max_seen);
+                let entered = Arc::clone(&entered);
+                let all_entered_tx = Arc::clone(&all_entered_tx);
+                let mut release_rx = release_tx.subscribe();
+                handles.push(tokio::spawn(async move {
+                    use_current_runtime_for_fsync();
+                    q.run_on_lane(
+                        DiskBlockingLane::Fsync,
+                        "fsync scale test failed",
+                        DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                        move |_| {
+                            let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(cur, Ordering::SeqCst);
+                            let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                            if ord == MAX_FSYNC_WORKERS_PER_DISK
+                                && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            if ord <= MAX_FSYNC_WORKERS_PER_DISK {
+                                let _ = release_rx.blocking_recv();
+                            }
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            Ok(i)
+                        },
+                    )
+                    .await
+                }));
             }
-        })
-        .await
-        .expect("all fsync workers must retire with zero idle count");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
+                .await
+                .expect("all fsync workers should enter within timeout")
+                .expect("all_entered channel");
+            let _ = release_tx.send(());
+            for (i, handle) in handles.into_iter().enumerate() {
+                assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
+            }
+            assert_eq!(
+                max_seen.load(Ordering::SeqCst),
+                MAX_FSYNC_WORKERS_PER_DISK,
+                "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    {
+                        let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                        if state.active_workers == 0 && state.idle_workers == 0 {
+                            assert!(state.jobs.is_empty());
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all fsync workers must retire with zero idle count");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13120,6 +13812,328 @@ mod tests {
             assert_eq!(overwrite_cache.with_get(&same_shard_paths[0], |v| *v), Some(101));
             assert_eq!(overwrite_cache.with_get(&same_shard_paths[1], |v| *v), Some(200));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_creation_history_tests {
+    use super::*;
+
+    struct NativeFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        registration: NativePublicationRegistration,
+        backend: Arc<dyn super::super::local::LocalIoBackend>,
+        disk_id: uuid::Uuid,
+    }
+
+    impl NativeFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("native root");
+            let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+            let registration = register_native_publication_root(&root, &root).expect("native registration");
+            let backend = Arc::new(super::super::local::StdBackend::new(root.clone()));
+            Self {
+                _temp: temp,
+                root,
+                registration,
+                backend,
+                disk_id: uuid::Uuid::new_v4(),
+            }
+        }
+
+        fn witness(&self, bucket: &str) -> Option<NativeBucketCreationWitness> {
+            self.registration.witness(bucket, self.disk_id, Arc::clone(&self.backend))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_native_directory_publication_entry_invalidates_retry() {
+        let fixture = NativeFixture::new();
+        for operation in [
+            "recursive",
+            "single",
+            "open",
+            "rename",
+            "rename_std",
+            "fallback",
+            "owned_mkdir",
+            "owned_rename",
+            "handle_relative",
+            "root_create",
+            "root_create_with_parent",
+            "guarded_rename",
+            "guarded_prepared_rename",
+        ] {
+            let bucket = format!("native-{operation}-{}", uuid::Uuid::new_v4());
+            let path = fixture.root.join(&bucket);
+            let witness = fixture.witness(&bucket).expect("fresh native witness");
+            match operation {
+                "recursive" => super::super::fs::make_dir_all(path.join("object/child"))
+                    .await
+                    .expect("recursive mkdir"),
+                "single" => super::super::fs::mkdir(&path).await.expect("single mkdir"),
+                "open" => {
+                    let file = super::super::fs::open_file(&path, super::super::fs::O_CREATE | super::super::fs::O_WRONLY)
+                        .await
+                        .expect("create file");
+                    drop(file);
+                }
+                "rename" | "rename_std" | "owned_rename" => {
+                    let source = fixture.root.join(format!("source-{}", uuid::Uuid::new_v4()));
+                    std::fs::create_dir(&source).expect("rename source");
+                    match operation {
+                        "rename" => super::super::fs::rename(&source, &path).await.expect("async rename"),
+                        "rename_std" => super::super::fs::rename_std(&source, &path).expect("sync rename"),
+                        _ => rename_with_namespace_owner(&source, &path, Some(Arc::new(())))
+                            .await
+                            .expect("owned rename"),
+                    }
+                }
+                "fallback" => make_dir_all(path.join("object/child"), &path)
+                    .await
+                    .expect("implicit volume fallback"),
+                "owned_mkdir" => create_dir_all_with_namespace_owner(&path.join("child"), Some(Arc::new(())))
+                    .await
+                    .expect("owned recursive mkdir"),
+                "handle_relative" => {
+                    let publication_root = PublicationRoot::new(&fixture.root).expect("publication root");
+                    let guard = mkdir_all_below_existing_base_std(&path.join("child"), &fixture.root, &publication_root)
+                        .expect("first-level handle-relative mkdir");
+                    drop(guard);
+                }
+                "root_create" | "root_create_with_parent" => {
+                    let publication_root = PublicationRoot::new(&fixture.root).expect("publication root");
+                    if operation == "root_create" {
+                        drop(publication_root.create_truncate(&path).expect("root-relative creation"));
+                    } else {
+                        drop(
+                            publication_root
+                                .create_truncate_with_parent(&path)
+                                .expect("root-relative creation with parent"),
+                        );
+                    }
+                }
+                "guarded_rename" | "guarded_prepared_rename" => {
+                    let publication_root = PublicationRoot::new(&fixture.root).expect("publication root");
+                    let source_parent = fixture.root.join(format!("source-{}", uuid::Uuid::new_v4()));
+                    std::fs::create_dir(&source_parent).expect("source directory");
+                    std::fs::create_dir(&path).expect("existing destination directory");
+                    let guard = prepare_rename_commit_guard(&source_parent, &path, &fixture.root, &publication_root)
+                        .expect("existing commit directories");
+                    let source = source_parent.join("xl.meta");
+                    let destination = path.join("xl.meta");
+                    assert!(
+                        validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                        "preparing existing directories must not mask the publication entry"
+                    );
+                    let lease = acquire_namespace_mutation_lease(&destination).await;
+                    if operation == "guarded_rename" {
+                        std::fs::write(&source, b"metadata").expect("source metadata");
+                        rename_all_with_commit_guard(&source, &destination, &fixture.root, &publication_root, &guard, lease)
+                            .await
+                            .expect("guarded publication");
+                    } else {
+                        let mut staged = create_prepared_rename_source_with_commit_guard(&source, &destination, &guard)
+                            .expect("prepared source");
+                        staged.write_all(b"metadata", false).expect("source metadata");
+                        rename_all_with_prepared_source(
+                            staged,
+                            &source,
+                            &destination,
+                            &fixture.root,
+                            &publication_root,
+                            &guard,
+                            lease,
+                        )
+                        .await
+                        .expect("prepared guarded publication");
+                    }
+                    assert_eq!(std::fs::read(&destination).expect("published metadata"), b"metadata");
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                "{operation}: old proof remains live"
+            );
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).expect("remove published directory");
+            } else {
+                std::fs::remove_file(&path).expect("remove published file");
+            }
+            assert!(fixture.witness(&bucket).is_none(), "{operation}: removal must not regrant proof");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_namespace_waiter_cannot_restore_native_proof() {
+        let fixture = NativeFixture::new();
+        let bucket = format!("native-cancel-{}", uuid::Uuid::new_v4());
+        let path = fixture.root.join(&bucket);
+        let witness = fixture.witness(&bucket).expect("fresh witness");
+        let lease = acquire_namespace_mutation_lease(&path).await;
+        let mut attempt = Box::pin(create_dir_all_with_namespace_owner(&path, Some(Arc::new(()))));
+        assert!(matches!(futures::poll!(&mut attempt), std::task::Poll::Pending));
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "Started must precede admission wait"
+        );
+        assert!(!path.exists(), "the namespace wait must still precede the syscall");
+        drop(attempt);
+        drop(lease);
+        assert!(fixture.witness(&bucket).is_none(), "cancellation cannot undo an admitted attempt");
+    }
+
+    #[tokio::test]
+    async fn queued_mkdir_cancellation_retains_lease_and_consumed_history() {
+        use futures::FutureExt;
+        use std::sync::mpsc;
+
+        let fixture = NativeFixture::new();
+        let bucket = format!("native-queued-cancel-{}", uuid::Uuid::new_v4());
+        let path = fixture.root.join(&bucket);
+        let witness = fixture.witness(&bucket).expect("fresh witness");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::CreateDirectory,
+            &path,
+            move || {
+                entered_tx.send(()).expect("signal real executor entry");
+                let _ = release_rx.recv();
+            },
+        );
+        let operation_path = path.clone();
+        let operation =
+            tokio::spawn(async move { create_dir_all_with_namespace_owner(&operation_path, Some(Arc::new(()))).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(30)))
+            .await
+            .expect("entry waiter")
+            .expect("the real blocking executor must enter");
+        operation.abort();
+        assert!(operation.await.expect_err("cancel the async waiter").is_cancelled());
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "queued publication is permanently Started"
+        );
+        assert!(
+            acquire_namespace_mutation_lease(&path).now_or_never().is_none(),
+            "the actual blocked executor must still own the namespace lease"
+        );
+        release_tx.send(()).expect("release the syscall");
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(30), acquire_namespace_mutation_lease(&path))
+            .await
+            .expect("the lease must drain with the syscall");
+        drop(drained);
+        assert!(path.is_dir(), "the cancelled waiter cannot discard the already queued syscall");
+        std::fs::remove_dir_all(&path).expect("remove the published directory");
+        assert!(fixture.witness(&bucket).is_none(), "drain and removal cannot restore proof");
+    }
+
+    #[tokio::test]
+    async fn publication_detects_retargeted_physical_alias_without_registration() {
+        let source = NativeFixture::new();
+        let destination = NativeFixture::new();
+        let bucket = format!("native-retarget-{}", uuid::Uuid::new_v4());
+        let witness = destination.witness(&bucket).expect("destination witness");
+        let retired = source.root.with_extension("retired");
+        std::fs::rename(&source.root, &retired).expect("move the original physical root");
+        std::os::unix::fs::symlink(&destination.root, &source.root).expect("retarget the registered alias");
+        super::super::fs::mkdir(source.root.join(&bucket))
+            .await
+            .expect("publish through the changed alias");
+        assert!(
+            !validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+            "publication-time alias drift must invalidate the actual destination root"
+        );
+        std::fs::remove_dir(destination.root.join(&bucket)).expect("remove the published bucket");
+        assert!(destination.witness(&bucket).is_none(), "removal must not undo alias uncertainty");
+        std::fs::remove_file(&source.root).expect("remove the symlink");
+        std::fs::rename(retired, &source.root).expect("restore the test root");
+    }
+
+    #[test]
+    fn blocked_physical_identity_lookup_does_not_block_other_publication() {
+        use std::sync::mpsc;
+        let stalled = NativeFixture::new();
+        let healthy = NativeFixture::new();
+        let witness = stalled.witness("unpublished").expect("stalled root witness");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let _hook = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &stalled.root,
+            move || {
+                entered_tx.send(()).expect("signal physical lookup");
+                let _ = release_rx.recv();
+            },
+        );
+        let validator = std::thread::spawn(move || validate_native_creation_witnesses(&[witness]));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("enter the actual identity lookup");
+        let (published_tx, published_rx) = mpsc::channel();
+        let path = healthy.root.join("published");
+        let publisher = std::thread::spawn(move || {
+            record_native_publication(&path);
+            published_tx.send(()).expect("signal independent publication");
+        });
+        let published = published_rx.recv_timeout(std::time::Duration::from_secs(5));
+        release_tx.send(()).expect("release the identity lookup");
+        validator.join().expect("identity lookup thread");
+        publisher.join().expect("publication thread");
+        assert!(
+            published.is_ok(),
+            "a slow physical lookup must not retain the process-wide publication mutex"
+        );
+    }
+
+    #[test]
+    fn native_consume_is_atomic_and_history_survives_reconnect() {
+        let fixture = NativeFixture::new();
+        let first = format!("native-first-{}", uuid::Uuid::new_v4());
+        let second = format!("native-second-{}", uuid::Uuid::new_v4());
+        let first_witness = fixture.witness(&first).expect("first witness");
+        let second_witness = fixture.witness(&second).expect("second witness");
+        record_native_publication(&fixture.root.join(&second));
+        assert!(!consume_native_creation_witnesses(&[first_witness.clone(), second_witness]));
+        assert!(
+            validate_native_creation_witnesses(std::slice::from_ref(&first_witness)),
+            "failed cohort consume must be atomic"
+        );
+        assert!(consume_native_creation_witnesses(std::slice::from_ref(&first_witness)));
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&first_witness)));
+        let reconnected = register_native_publication_root(&fixture.root, &fixture.root).expect("reconnected registration");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(fixture.root.clone()));
+        assert!(
+            reconnected.witness(&first, fixture.disk_id, backend).is_none(),
+            "reconnect must retain Started"
+        );
+    }
+
+    #[test]
+    fn physical_alias_reuse_is_unknown_and_backend_identity_is_real() {
+        let temp = tempfile::tempdir().expect("alias parent");
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).expect("first physical root");
+        let old = register_native_publication_root(&root, &root).expect("first registration");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> = Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let id = uuid::Uuid::new_v4();
+        let witness = old.witness("same-name", id, Arc::clone(&backend)).expect("old witness");
+        let other_backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(root.clone()));
+        let other = old.witness("same-name", id, other_backend).expect("new backend witness");
+        assert!(!witness.matches(&other), "a different actual backend cannot reuse a pending observation");
+        std::fs::rename(&root, temp.path().join("retired-root")).expect("retire physical root");
+        std::fs::create_dir(&root).expect("replacement root at the same alias");
+        let replacement = register_native_publication_root(&root, &root).expect("replacement registration");
+        assert!(replacement.witness("same-name", id, backend).is_none(), "alias reuse must remain Unknown");
+        assert!(
+            !validate_native_creation_witnesses(&[witness]),
+            "old physical identity must not validate at a new root"
+        );
     }
 }
 

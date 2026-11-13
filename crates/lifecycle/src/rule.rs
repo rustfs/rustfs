@@ -11,7 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use s3s::dto::{LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionTransition, Tag, Transition};
+use rustfs_gateway_types::persistence::{
+    PersistedLifecycleAnd, PersistedLifecycleFilter, PersistedLifecycleTag, PersistedNoncurrentVersionTransition,
+    PersistedTransition,
+};
+
 use time::OffsetDateTime;
 
 use crate::tagging;
@@ -27,7 +31,7 @@ pub trait Filter {
     fn by_size(&self, sz: i64) -> bool;
 }
 
-impl Filter for LifecycleRuleFilter {
+impl Filter for PersistedLifecycleFilter {
     fn test_tags(&self, user_tags: &str) -> bool {
         if !requires_tag_matching(self) {
             return true;
@@ -48,7 +52,7 @@ impl Filter for LifecycleRuleFilter {
     }
 }
 
-fn requires_tag_matching(filter: &LifecycleRuleFilter) -> bool {
+fn requires_tag_matching(filter: &PersistedLifecycleFilter) -> bool {
     filter.tag.is_some()
         || filter
             .and
@@ -57,7 +61,7 @@ fn requires_tag_matching(filter: &LifecycleRuleFilter) -> bool {
             .is_some_and(|tags| !tags.is_empty())
 }
 
-fn tag_matches(tag: &Tag, user_tags: &std::collections::HashMap<String, String>) -> bool {
+fn tag_matches(tag: &PersistedLifecycleTag, user_tags: &std::collections::HashMap<String, String>) -> bool {
     let Some(key) = tag.key.as_deref() else {
         return false;
     };
@@ -68,13 +72,13 @@ fn tag_matches(tag: &Tag, user_tags: &std::collections::HashMap<String, String>)
     user_tags.get(key).is_some_and(|actual| actual == value)
 }
 
-fn and_tags_match(and: &LifecycleRuleAndOperator, user_tags: &std::collections::HashMap<String, String>) -> bool {
+fn and_tags_match(and: &PersistedLifecycleAnd, user_tags: &std::collections::HashMap<String, String>) -> bool {
     and.tags
         .as_ref()
         .is_none_or(|tags| tags.iter().all(|tag| tag_matches(tag, user_tags)))
 }
 
-fn and_size_matches(and: &LifecycleRuleAndOperator, sz: i64) -> bool {
+fn and_size_matches(and: &PersistedLifecycleAnd, sz: i64) -> bool {
     and.object_size_greater_than.is_none_or(|min| sz > min) && and.object_size_less_than.is_none_or(|max| sz < max)
 }
 
@@ -90,7 +94,7 @@ fn is_midnight(date: OffsetDateTime) -> bool {
     date.hour() == 0 && date.minute() == 0 && date.second() == 0 && date.nanosecond() == 0
 }
 
-impl TransitionOps for Transition {
+impl TransitionOps for PersistedTransition {
     fn validate(&self) -> Result<(), std::io::Error> {
         if self
             .storage_class
@@ -106,7 +110,7 @@ impl TransitionOps for Transition {
             return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
         }
         if let Some(date) = self.date.clone() {
-            let date = OffsetDateTime::from(date);
+            let date = crate::core::parse_lifecycle_date(&date).map_err(|_| std::io::Error::other(ERR_TRANSITION_INVALID))?;
             if date.unix_timestamp() <= 0 || !is_midnight(date) {
                 return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
             }
@@ -115,7 +119,7 @@ impl TransitionOps for Transition {
     }
 }
 
-impl NoncurrentVersionTransitionOps for NoncurrentVersionTransition {
+impl NoncurrentVersionTransitionOps for PersistedNoncurrentVersionTransition {
     fn validate(&self) -> Result<(), std::io::Error> {
         if self
             .storage_class
@@ -142,29 +146,29 @@ mod test {
 
     #[test]
     fn lifecycle_rule_filter_matches_single_tag() {
-        let filter = LifecycleRuleFilter {
-            tag: Some(Tag {
+        let filter = PersistedLifecycleFilter {
+            tag: Some(PersistedLifecycleTag {
                 key: Some("env".to_string()),
                 value: Some("prod".to_string()),
             }),
             ..Default::default()
         };
 
-        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
-        assert!(!<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=dev&team=storage"));
-        assert!(!<LifecycleRuleFilter as Filter>::test_tags(&filter, "team=storage"));
+        assert!(<PersistedLifecycleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
+        assert!(!<PersistedLifecycleFilter as Filter>::test_tags(&filter, "env=dev&team=storage"));
+        assert!(!<PersistedLifecycleFilter as Filter>::test_tags(&filter, "team=storage"));
     }
 
     #[test]
     fn lifecycle_rule_filter_matches_all_and_tags() {
-        let filter = LifecycleRuleFilter {
-            and: Some(LifecycleRuleAndOperator {
+        let filter = PersistedLifecycleFilter {
+            and: Some(PersistedLifecycleAnd {
                 tags: Some(vec![
-                    Tag {
+                    PersistedLifecycleTag {
                         key: Some("env".to_string()),
                         value: Some("prod".to_string()),
                     },
-                    Tag {
+                    PersistedLifecycleTag {
                         key: Some("team".to_string()),
                         value: Some("storage".to_string()),
                     },
@@ -174,13 +178,13 @@ mod test {
             ..Default::default()
         };
 
-        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
-        assert!(!<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=prod&team=platform"));
+        assert!(<PersistedLifecycleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
+        assert!(!<PersistedLifecycleFilter as Filter>::test_tags(&filter, "env=prod&team=platform"));
     }
 
     #[test]
     fn lifecycle_rule_filter_respects_size_bounds() {
-        let filter = LifecycleRuleFilter {
+        let filter = PersistedLifecycleFilter {
             object_size_greater_than: Some(5),
             object_size_less_than: Some(10),
             ..Default::default()
@@ -193,12 +197,12 @@ mod test {
 
     #[test]
     fn lifecycle_rule_filter_without_tag_constraints_accepts_any_tags() {
-        let filter = LifecycleRuleFilter {
+        let filter = PersistedLifecycleFilter {
             object_size_greater_than: Some(5),
             ..Default::default()
         };
 
-        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
-        assert!(<LifecycleRuleFilter as Filter>::test_tags(&filter, ""));
+        assert!(<PersistedLifecycleFilter as Filter>::test_tags(&filter, "env=prod&team=storage"));
+        assert!(<PersistedLifecycleFilter as Filter>::test_tags(&filter, ""));
     }
 }

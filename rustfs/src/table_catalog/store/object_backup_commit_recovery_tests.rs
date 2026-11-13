@@ -312,7 +312,7 @@ fn backup_commit_policy_preserves_paired_history_left_after_an_object_table_drop
     let before = objects.clone();
     store
         .validate_backup_commit_recovery("analytics", &objects)
-        .expect("normal object drop retains paired history without a current owner");
+        .expect("backups can retain paired history from an earlier drop");
     assert_eq!(objects, before);
 }
 

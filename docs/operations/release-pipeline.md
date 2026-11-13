@@ -14,7 +14,7 @@ The builder workflows (`build.yml`, `package.yml`, `docker.yml`, `helm-package.y
 
 ## Freeze and build
 
-Select a reviewed source commit whose Cargo version equals the intended final version. Finish exact-source CI before dispatching the candidate. The candidate workflow itself must run from upstream main. Unrelated main commits do not require rebuilding an accepted source.
+Select a reviewed source commit whose Cargo version equals the intended final version. Finish exact-source CI before dispatching the candidate: a successful `push` or `workflow_dispatch` run of `ci.yml` for that commit on `main` or the release branch whose `Quick Checks`, `Test and Lint` and `End-to-End Tests (full merge gate)` all succeeded. A commit that landed through the merge queue has a push run whose validation jobs were skipped as proven; `Quick Checks` and `Test and Lint` must still succeed there, and the evidence recorded is the successful `merge_group` run of that branch's queue whose head commit has the same tree, which must itself have passed all three jobs. `scripts/ci_merge_group_proof.py` defines that match for both the push plan and the candidate. The candidate workflow itself must run from upstream main. Unrelated main commits do not require rebuilding an accepted source.
 
 ```bash
 gh workflow run release-candidate.yml --ref main \

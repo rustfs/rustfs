@@ -578,7 +578,7 @@ async fn periodic_nested_snapshot_checks_suspended_ancestors_before_certifying_f
                 .new_cache
                 .copy_with_children(&scanner.old_cache, &hash_path(frontier), &Some(hash_path("bucket")));
         }
-        let root_entry = scanner.new_cache.root().expect("suspended root owner").clone();
+        let root_entry = scanner.new_cache.root().expect("suspended root owner");
         let mut ancestor_entry = scanner.new_cache.find(ancestor).expect("suspended subtree owner").clone();
         ancestor_entry.objects = 1;
         ancestor_entry.size = 2;

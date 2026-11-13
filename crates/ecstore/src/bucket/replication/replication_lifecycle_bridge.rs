@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::ReplicationConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 
 use super::replication_config_boundary::ReplicationConfigurationExt as _;
 use super::replication_filemeta_boundary::{
@@ -42,7 +42,7 @@ impl ReplicationLifecycleBridge {
         dead_code,
         reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
     )]
-    pub(crate) fn new_config(config: ReplicationConfiguration) -> ReplicationLifecycleConfig {
+    pub(crate) fn new_config(config: PersistedReplicationConfiguration) -> ReplicationLifecycleConfig {
         ReplicationConfig::new(Some(config), None)
     }
 
@@ -118,16 +118,17 @@ impl ReplicationLifecycleBridge {
 
 #[cfg(test)]
 mod tests {
-    use s3s::dto::{Destination, ReplicationRule, ReplicationRuleStatus};
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{PersistedReplicationDestination, PersistedReplicationRule};
 
     use super::super::replication_filemeta_boundary::{ReplicateTargetDecision, VersionPurgeStatusType};
     use super::*;
 
-    fn replication_rule() -> ReplicationRule {
-        ReplicationRule {
+    fn replication_rule() -> PersistedReplicationRule {
+        PersistedReplicationRule {
             delete_marker_replication: None,
             delete_replication: None,
-            destination: Destination {
+            destination: PersistedReplicationDestination {
                 bucket: "arn:aws:s3:::target-bucket".to_string(),
                 ..Default::default()
             },
@@ -137,13 +138,13 @@ mod tests {
             prefix: Some(String::new()),
             priority: Some(1),
             source_selection_criteria: None,
-            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            status: Status::ENABLED.to_string(),
         }
     }
 
     #[test]
     fn has_pending_version_purge_preserves_replication_active_rule_behavior() {
-        let config = ReplicationLifecycleBridge::new_config(ReplicationConfiguration {
+        let config = ReplicationLifecycleBridge::new_config(PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![replication_rule()],
         });

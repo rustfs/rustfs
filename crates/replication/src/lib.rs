@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod config;
+pub mod config_cache_serde;
 pub mod delete;
 mod filemeta;
 mod http;

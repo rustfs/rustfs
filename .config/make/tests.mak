@@ -38,6 +38,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_entrypoint_directories.sh
 	./scripts/test_internode_grpc_ab_bench.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_grpc_window.py
 	./scripts/test_object_batch_bench_enhanced.sh
 	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
@@ -60,9 +61,20 @@ script-tests: ## Run shell script tests
 	./scripts/test_python_bin.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	./scripts/check_embedded_secrets.sh --self-test
+	./scripts/check_s3s_footprint.sh --self-test
+	./scripts/test_check_test_count_ratchet.sh
+	./scripts/test_guard_source_set.sh
+	./scripts/test_split_guard_rules.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_bucket_usecase.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_ecfs_legacy_edge.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_lifecycle_transition_api_test.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_reference_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_build_workflow.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/release -p "test_*.py"
@@ -72,7 +84,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_artifact.py
-	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_shards.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_group_proof.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
@@ -86,8 +98,12 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_validation_runner.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_junit_diff.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_dual_stack.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_api_coverage.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_reference_parity.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test

@@ -24,9 +24,10 @@
 #
 # Supports cross-compilation for amd64 and arm64 via TARGETPLATFORM.
 
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-ARG TARGETARCH
+# Do not declare TARGETPLATFORM, BUILDPLATFORM or TARGETARCH here: a global
+# declaration without a value shadows BuildKit's automatic values, so the
+# stage-level re-declarations below see empty strings. They are only
+# declared inside the stage that uses them.
 ARG RUSTFS_BUILD_FEATURES=""
 ARG RC_RELEASE=latest
 
@@ -169,7 +170,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ;; \
     esac
 
-RUN sh /usr/src/rustfs/scripts/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /usr/local/bin/rc
+# TARGETARCH is only provided by BuildKit. Fall back to TARGETPLATFORM (for
+# example set by docker-compose) and then to the build host, like the cargo
+# step above, so every path that builds this file passes a real architecture.
+RUN set -eu; \
+    rc_arch="${TARGETARCH:-}"; \
+    if [ -z "${rc_arch}" ]; then \
+    case "${TARGETPLATFORM:-}" in \
+    linux/amd64) rc_arch=amd64 ;; \
+    linux/arm64) rc_arch=arm64 ;; \
+    *) \
+    case "$(uname -m)" in \
+    x86_64) rc_arch=amd64 ;; \
+    aarch64|arm64) rc_arch=arm64 ;; \
+    *) echo "TARGETARCH is empty and TARGETPLATFORM='${TARGETPLATFORM:-}' is not linux/amd64 or linux/arm64; cannot choose an rc architecture on $(uname -m)" >&2; exit 1 ;; \
+    esac ;; \
+    esac; \
+    fi; \
+    sh /usr/src/rustfs/scripts/download_rc.sh "${rc_arch}" musl "${RC_RELEASE}" /usr/local/bin/rc
 
 # -----------------------------
 # Development stage (keeps toolchain)

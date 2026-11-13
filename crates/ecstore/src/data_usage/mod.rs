@@ -1512,7 +1512,7 @@ async fn normalize_loaded_data_usage(
             && !cfg.role.is_empty()
         {
             data_usage_info.replication_info.insert(
-                cfg.role.clone(),
+                cfg.role,
                 BucketTargetUsageInfo {
                     replication_failed_size: bui.replication_failed_size_v1,
                     replication_failed_count: bui.replication_failed_count_v1,
@@ -1725,7 +1725,7 @@ fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapsh
         match aggregated.buckets_usage.entry(bucket.clone()) {
             Entry::Occupied(mut entry) => entry.get_mut().merge(&usage),
             Entry::Vacant(entry) => {
-                entry.insert(usage.clone());
+                entry.insert(usage);
             }
         }
 

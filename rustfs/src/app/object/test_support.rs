@@ -15,6 +15,7 @@
 //! Test-only scaffolding shared by the object use-case test modules.
 
 use super::*;
+use crate::app::storage_api::s3::S3Request;
 use http::{Extensions, HeaderMap, Method, Uri};
 use std::sync::Arc;
 

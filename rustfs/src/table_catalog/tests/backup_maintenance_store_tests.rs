@@ -252,10 +252,13 @@ async fn backup_restores_terminal_maintenance_bytes_and_replays_its_original_cou
         max_retry_attempts: 2,
         ..Default::default()
     };
-    source_store
-        .put_table_bucket_maintenance_config("analytics", config.clone())
-        .await
-        .expect("persist bucket maintenance config");
+    source
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &source_store.paths.table_bucket_maintenance_config_path("analytics"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .await;
     source_store
         .put_table_maintenance_config("analytics", "sales", "orders", config.clone())
         .await
