@@ -12,39 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nightly both-stack e2e diff (rustfs/backlog#2772, T3.1).
+# Nightly both-stack diff of the two e2e profiles only ci.yml runs, e2e-smoke
+# and e2e-full (rustfs/backlog#2772, T3.1). The other profiles carry a `stack`
+# dimension in their own workflows, where the existing lane is the legacy leg.
 #
-# Every e2e nextest profile that runs on a schedule or on main (the table is
-# .config/dual-stack-profiles.toml, checked against .config/nextest.toml) runs
-# once with RUSTFS_S3_STACK=legacy and once with RUSTFS_S3_STACK=gateway on the
-# same binary. `summary` diffs each profile's two JUnit reports case by case
-# with scripts/junit_diff.py and publishes one dated artifact and a job-summary
-# table: cases, passed on both, failed on both, legacy-only failures and
-# gateway-only failures, named.
+# One build serves every leg. One preflight starts that binary with
+# RUSTFS_S3_STACK=gateway (scripts/dual_stack.py preflight); without a proven
+# gateway start the gateway legs do not run and the summary says `skipped:
+# gateway stack refuses startup: <why>`. Which stack a leg ran is read from the
+# servers' own start-up line. The gateway legs are report-only until T2.10.
 #
-# What a leg's result means:
-#   * A leg goes red only when its measurement is not trustworthy: the build
-#     failed, a server started on the other stack, or no server of the
-#     requested stack started. Test verdicts are data, never a
-#     reason to stop before the JUnit is collected.
-#   * Which stack ran is read from the `server_starting` line every server logs
-#     (scripts/dual_stack.py stack), not from the variable set here. Servers of
-#     older releases that the upgrade cases start log no stack and are counted
-#     as unstamped.
-#   * The gateway legs are report-only until T2.10: job-level continue-on-error.
-#     A gateway server that refuses to start is reported as "server did not
-#     start: <its message>", and its cases are not compared; the same leg is a
-#     red leg, never a pass.
-#   * A side whose JUnit is missing or empty is "no result for <stack>" and
-#     fails the summary job; it is never an empty comparison.
-#
-# The selection digests (check_test_wiring.py --check-profile) stay with the
-# profile's own workflow. Here a drifted selection is the same on both stacks,
-# and a selection that matches nothing leaves a JUnit without cases, which is
-# "no result", not a pass.
-#
-# Not a gate and not a pull-request check. Runner labels and per-profile setup
-# are those of the profile's own workflow (the `source` column of the table).
+# Left out of both stacks: `dual_stack_differential::` (servers with an explicit
+# stack), `fake_s3_target::`, the upgrade write-readiness cases and one deadline
+# case (no server), and `distributed_startup_regression_test::` (needs ci.yml's
+# hooks-binary manifest). e2e-full runs without the mc, Vault and iptables
+# tools ci.yml installs: their cases fail on both stacks.
 
 name: dual-stack-nightly
 
@@ -67,40 +49,16 @@ defaults:
     shell: bash
 
 jobs:
-  plan:
-    name: Plan profile x stack legs
+  build:
+    name: Build once and probe the gateway stack
     if: github.repository == 'rustfs/rustfs'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The runner and cache of ci.yml's build-rustfs-debug-binary.
+    runs-on: sm-standard-4
+    timeout-minutes: 60
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Build the matrix from the profile table
-        id: matrix
-        run: |
-          set -euo pipefail
-          matrix="$(python3 scripts/dual_stack.py matrix --config .config/dual-stack-profiles.toml)"
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-
-  leg:
-    name: ${{ matrix.profile }} (${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
-    needs: [ plan ]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout_minutes }}
-    # Report-only until T2.10: the gateway stack cannot serve the suites yet.
-    continue-on-error: ${{ matrix.stack == 'gateway' }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      stacks: ${{ steps.plan.outputs.stacks }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      NO_PROXY: 127.0.0.1,localhost,::1
-      LEG_DIR: ${{ github.workspace }}/leg
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -111,184 +69,123 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # One key per profile: the runner label is fixed per profile, and the
-          # legs of a profile build the same binary and test archive.
-          cache-shared-key: ci-dual-stack-${{ matrix.profile }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.stack == 'legacy' }}
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      # --- per-profile setup, as in the profile's source workflow ------------
+      - name: Build the rustfs binary
+        run: python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dual-stack-binary
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
+          if-no-files-found: error
+          retention-days: 1
+
+      # Its verdict decides whether the gateway legs run; it is not a leg's result.
+      - name: Gateway preflight
+        id: preflight
+        continue-on-error: true
+        run: python3 scripts/dual_stack.py preflight --binary target/debug/rustfs --out "$RUNNER_TEMP/preflight/stack.json"
+
+      # Without a proven gateway start there is no gateway leg to run.
+      - name: Choose the stacks to run
+        id: plan
+        env:
+          PREFLIGHT: ${{ steps.preflight.outcome }}
+        run: |
+          if [ "$PREFLIGHT" = success ]; then stacks='["legacy","gateway"]'; else stacks='["legacy"]'; fi
+          echo "stacks=${stacks}" >> "$GITHUB_OUTPUT"
+
+      # The evidence stands in for a gateway leg that is skipped; a leg that runs overwrites it.
+      - name: Upload the preflight evidence for e2e-smoke
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dual-stack-leg-e2e-smoke-gateway
+          path: ${{ runner.temp }}/preflight
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload the preflight evidence for e2e-full
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dual-stack-leg-e2e-full-gateway
+          path: ${{ runner.temp }}/preflight
+          if-no-files-found: warn
+          retention-days: 7
+
+  leg:
+    name: ${{ matrix.profile }} (${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
+    needs: [ build ]
+    runs-on: sm-standard-4
+    timeout-minutes: 120
+    # Report-only until T2.10: the gateway stack cannot serve the suites yet.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [ e2e-smoke, e2e-full ]
+        stack: ${{ fromJSON(needs.build.outputs.stacks) }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Download the binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dual-stack-binary
+          path: target/debug
+
       - name: Set up Python
-        if: contains(matrix.setup, 'awscurl')
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Install awscurl
-        if: contains(matrix.setup, 'awscurl')
         run: |
           python3 -m pip install --user --upgrade pip "awscurl==0.44"
           echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
           test -x "$HOME/.local/bin/awscurl"
 
-      - name: Install network fault-injection tools, mc and Vault
-        if: contains(matrix.setup, 'full-tools')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MC_VERSION: RELEASE.2025-08-13T08-35-41Z
-          MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
-          VAULT_VERSION: 1.17.6
-          VAULT_SHA256: 0cddc1fbbb88583b5ba5b845f9f8fae47c6fb39a6d48cd543c6ba6fd3ac1a669
-        run: |
-          set -euo pipefail
-          sudo apt-get install -y iptables
-          sudo -n iptables --version
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y gh
-          fi
-          python3 .github/actions/setup/download_release_asset.py --repository minio/mc --tag "$MC_VERSION" \
-            --asset "mc.linux-amd64.${MC_VERSION}" --output "$RUNNER_TEMP/mc" --sha256 "$MC_SHA256"
-          chmod +x "$RUNNER_TEMP/mc"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          archive="vault_${VAULT_VERSION}_linux_amd64.zip"
-          curl -fsSLo "$RUNNER_TEMP/$archive" "https://releases.hashicorp.com/vault/${VAULT_VERSION}/${archive}"
-          echo "${VAULT_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --status
-          unzip -q "$RUNNER_TEMP/$archive" -d "$RUNNER_TEMP/vault-bin"
-          echo "RUSTFS_TEST_VAULT_BIN=$RUNNER_TEMP/vault-bin/vault" >> "$GITHUB_ENV"
-
-      - name: Install the protocol socket oracle
-        if: contains(matrix.setup, 'protocols-tools')
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq iproute2
-          ss -tn state CLOSE-WAIT >/dev/null
-
-      # Same pin as e2e-distributed.yml; the pools need a VM runner (tmpfs).
-      - name: Prepare isolated pool filesystems and the previous release
-        if: contains(matrix.setup, 'pools')
-        env:
-          UPGRADE_SOURCE_VERSION: 1.0.0-rc.2
-          UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.2.zip
-          UPGRADE_SOURCE_SHA256: 7c789386bf85278f865b8e0d359bf4edb84d5aa408cc3fa54a18c25ca74cd6e7
-        run: |
-          set -euo pipefail
-          roots=()
-          for pool in 0 1 2 3; do
-            mountpoint="${RUNNER_TEMP}/rustfs-e2e-pools/pool-${pool}"
-            mkdir -p "${mountpoint}"
-            sudo mount -t tmpfs -o size=1G,nosuid,nodev,mode=1777 tmpfs "${mountpoint}"
-            sudo chmod 1777 "${mountpoint}"
-            roots+=("${mountpoint}")
-          done
-          printf -v joined_roots '%s:' "${roots[@]}"
-          echo "RUSTFS_E2E_POOL_ROOTS=${joined_roots%:}" >> "${GITHUB_ENV}"
-          source_dir="${RUNNER_TEMP}/rustfs-upgrade-source"
-          mkdir -p "$source_dir"
-          curl --fail --location --retry 3 --output "$source_dir/$UPGRADE_SOURCE_ASSET" \
-            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
-          echo "$UPGRADE_SOURCE_SHA256  $source_dir/$UPGRADE_SOURCE_ASSET" | sha256sum --check --strict
-          unzip -q "$source_dir/$UPGRADE_SOURCE_ASSET" -d "$source_dir"
-          chmod +x "$source_dir/rustfs"
-          echo "RUSTFS_UPGRADE_SOURCE_BINARY=$source_dir/rustfs" >> "$GITHUB_ENV"
-
-      # The MinIO source of the migration interop cases, as in
-      # on-demand-migration-interop.yml; the RustFS servers under test are
-      # started by the cases themselves.
-      - name: Start the MinIO source
-        if: contains(matrix.setup, 'minio')
-        run: |
-          set -euo pipefail
-          docker build -t rustfs-odm-interop-minio \
-            -f crates/rio-v2/tests/minio_fixture_lab/Dockerfile crates/rio-v2/tests/minio_fixture_lab
-          docker run -d --name rustfs-odm-interop-minio --entrypoint /usr/local/bin/minio \
-            -e MINIO_ROOT_USER=rustfsodminterop -e MINIO_ROOT_PASSWORD=rustfsodminteropsecret \
-            -p 9100:9000 rustfs-odm-interop-minio server /data
-          for _ in $(seq 1 120); do
-            curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1 && break
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:9100/minio/health/live
-          AWS_ACCESS_KEY_ID=rustfsodminterop AWS_SECRET_ACCESS_KEY=rustfsodminteropsecret AWS_DEFAULT_REGION=us-east-1 \
-            aws --endpoint-url http://127.0.0.1:9100 s3api create-bucket --bucket odm-interop-source
-
-      # --- build, select, run ------------------------------------------------
-      - name: Build the rustfs binary
-        env:
-          FEATURES: ${{ matrix.features }}
-        run: python3 scripts/e2e_binary.py build --bins --features "$FEATURES"
-
-      # Test failures are data: the step ends normally so the JUnit and the
-      # server logs are collected whatever the verdicts were. A missing JUnit
-      # is not hidden; the summary reports it as "no result".
       - name: Run the profile on the ${{ matrix.stack }} stack
         env:
           PROFILE: ${{ matrix.profile }}
-          FEATURES: ${{ matrix.features }}
-          FILTER: ${{ matrix.filter }}
-          NEXTEST_ARGS: ${{ matrix.nextest_args }}
           RUSTFS_S3_STACK: ${{ matrix.stack }}
-          # Servers that do not set a log level themselves (the protocol cases)
-          # must still log the start-up line the proof reads.
-          RUST_LOG: rustfs=info
-          RUSTFS_E2E_LOG_DIR: ${{ github.workspace }}/leg/server-logs
-          RUSTFS_ODM_INTEROP_PROVIDER: minio
-          RUSTFS_ODM_INTEROP_ENDPOINT: http://127.0.0.1:9100
-          RUSTFS_ODM_INTEROP_REGION: auto
-          RUSTFS_ODM_INTEROP_BUCKET: odm-interop-source
-          RUSTFS_ODM_INTEROP_PATH_STYLE: path
-          RUSTFS_ODM_INTEROP_ACCESS_KEY: rustfsodminterop
-          RUSTFS_ODM_INTEROP_SECRET_KEY: rustfsodminteropsecret
-          RUSTFS_ODM_INTEROP_BACKFILL_OBJECTS: "5000"
-          RUSTFS_ODM_INTEROP_REPORT_DIR: ${{ github.workspace }}/leg/odm-cases
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/server-logs
         run: |
-          # The shell runs with -e; a failing profile or diff is data to report, not a stop.
-          set +e -u -o pipefail
-          mkdir -p "$RUSTFS_E2E_LOG_DIR"
-          junit="target/nextest/${PROFILE}/junit.xml"
-          rm -f "$junit"
-          args=(--profile "$PROFILE" -p e2e_test)
-          if [ -n "$FILTER" ]; then args+=(-E "$FILTER"); fi
-          # shellcheck disable=SC2086  # NEXTEST_ARGS is a flag list that must be word-split
-          python3 scripts/e2e_binary.py run --features "$FEATURES" -- cargo nextest run "${args[@]}" $NEXTEST_ARGS 2>&1 | tee "$LEG_DIR/nextest.log"
-          echo "nextest_exit=${PIPESTATUS[0]}" > "$LEG_DIR/nextest-exit.txt"
-          # Servers that inherit nextest's stdout (--no-capture) log there, not
-          # in RUSTFS_E2E_LOG_DIR; keep only their start-up and error lines.
-          grep -h -E '"event":"server_starting"|"level":"ERROR"' "$LEG_DIR/nextest.log" > "$RUSTFS_E2E_LOG_DIR/inherited-stdout.log" || rm -f "$RUSTFS_E2E_LOG_DIR/inherited-stdout.log"
-          if [ -s "$junit" ]; then cp "$junit" "$LEG_DIR/junit.xml"; fi
+          chmod +x target/debug/rustfs
+          filter='not test(/^(dual_stack_differential|fake_s3_target|distributed_startup_regression_test)::/)'
+          filter="$filter & not test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)"
+          filter="$filter & not test(=list_objects_v2_pagination_test::tests::test_list_objects_v2_deadline_rejects_unresponsive_peer)"
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile "$PROFILE" -p e2e_test -E "$filter"
 
-      - name: Prove which stack the servers selected
-        env:
-          STACK: ${{ matrix.stack }}
-        run: python3 scripts/dual_stack.py stack --expect "$STACK" --out "$LEG_DIR/stack.json" "$LEG_DIR/server-logs"
-
-      - name: Upload the leg
+      - name: Prove the stack and upload the leg
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dual-stack-leg-${{ matrix.profile }}-${{ matrix.stack }}
-          overwrite: true
-          path: ${{ github.workspace }}/leg
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Remove the pool filesystems and the MinIO source
-        if: always()
-        run: |
-          if [[ "$SETUP" == *pools* ]]; then
-            for pool in 0 1 2 3; do
-              mountpoint="${RUNNER_TEMP}/rustfs-e2e-pools/pool-${pool}"
-              if mountpoint --quiet "${mountpoint}"; then sudo umount "${mountpoint}"; fi
-            done
-          fi
-          if [[ "$SETUP" == *minio* ]]; then docker rm -f rustfs-odm-interop-minio >/dev/null 2>&1 || true; fi
-        env:
-          SETUP: ${{ join(matrix.setup, ' ') }}
+        uses: ./.github/actions/dual-stack-leg
+        with: { profile: "${{ matrix.profile }}", stack: "${{ matrix.stack }}", logs: "${{ runner.temp }}/server-logs" }
 
   summary:
     name: Both-stack diff summary
-    needs: [ plan, leg ]
-    if: always() && needs.plan.result == 'success'
+    needs: [ build, leg ]
+    if: github.repository == 'rustfs/rustfs' && always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -297,32 +194,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the legs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: ./.github/actions/dual-stack-summary
         with:
-          pattern: dual-stack-leg-*
-          path: legs
-
-      - name: Diff every profile and write the summary
-        id: summary
-        run: |
-          # The shell runs with -e; a failing profile or diff is data to report, not a stop.
-          set +e -u -o pipefail
-          date="$(date -u +%F)"
-          echo "date=${date}" >> "$GITHUB_OUTPUT"
-          mkdir -p legs
-          python3 scripts/dual_stack.py summary --config .config/dual-stack-profiles.toml \
-            --legs legs --date "$date" --out-dir dual-stack
-          status=$?
-          if [ -f dual-stack/summary.md ]; then cat dual-stack/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
-          exit "$status"
-
-      - name: Upload the dated summary
-        if: always() && steps.summary.outputs.date != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dual-stack-summary-${{ steps.summary.outputs.date }}
-          overwrite: true
-          path: dual-stack
-          if-no-files-found: error
-          retention-days: 30
+          profiles: e2e-smoke,e2e-full

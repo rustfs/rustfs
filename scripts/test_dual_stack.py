@@ -15,7 +15,8 @@
 """Contract tests for dual_stack.py: the profile table, the stack proof and the per-profile summary."""
 
 import json
-import re
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,8 +25,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "dual_stack.py"
-CONFIG = ROOT / ".config" / "dual-stack-profiles.toml"
-NEXTEST = ROOT / ".config" / "nextest.toml"
 REFUSAL = "gateway stack is not assembled yet (rustfs/backlog#2734 T2.5)"
 
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -62,12 +61,6 @@ class Tree:
     def __init__(self, tmp, profile="e2e-smoke"):
         self.root = Path(tmp)
         self.profile = profile
-        self.config = self.root / "profiles.toml"
-        self.config.write_text(
-            "schema = 1\n[[profile]]\n"
-            f'name = "{profile}"\nsource = "s"\nrunner = "r"\ntimeout_minutes = 1\n'
-            'features = ""\nsetup = []\nnextest_args = ""\nfilter = ""\n'
-        )
 
     def leg(self, stack):
         return self.root / "legs" / f"dual-stack-leg-{self.profile}-{stack}"
@@ -83,43 +76,10 @@ class Tree:
         return code
 
     def summary(self):
-        code, out, err = run("summary", "--config", str(self.config), "--legs", str(self.root / "legs"),
+        code, out, err = run("summary", "--profiles", self.profile, "--legs", str(self.root / "legs"),
                              "--date", "2026-11-13", "--out-dir", str(self.root / "out"))
         report = self.root / "out" / "2026-11-13.json"
         return code, out + err, json.loads(report.read_text()) if report.is_file() else None
-
-
-class ProfileTableTests(unittest.TestCase):
-    def test_table_lists_exactly_the_e2e_profiles_of_nextest(self):
-        declared = set(re.findall(r"^\[profile\.(e2e-[a-z0-9-]+)\]$", NEXTEST.read_text(), re.MULTILINE))
-        listed = {item["name"] for item in dual_stack.load_profiles(CONFIG)}
-        self.assertEqual(listed, declared)
-
-    def test_matrix_runs_every_profile_on_both_stacks(self):
-        include = dual_stack.matrix(dual_stack.load_profiles(CONFIG))["include"]
-        pairs = {(item["profile"], item["stack"]) for item in include}
-        self.assertEqual(len(include), len(pairs))
-        self.assertEqual({stack for _, stack in pairs}, {"legacy", "gateway"})
-        self.assertEqual(len(pairs), 2 * len(dual_stack.load_profiles(CONFIG)))
-
-    def test_malformed_tables_are_refused(self):
-        entry = ('name = "e2e-a"\nsource = "s"\nrunner = "r"\ntimeout_minutes = 1\n'
-                 'features = ""\nsetup = []\nnextest_args = ""\nfilter = ""\n')
-        bad = {
-            "unknown key": f"schema = 1\n[[profile]]\n{entry}extra = 1\n",
-            "duplicate name": f"schema = 1\n[[profile]]\n{entry}[[profile]]\n{entry}",
-            "not an e2e name": f"schema = 1\n[[profile]]\n{entry.replace('e2e-a', 'ci')}",
-            "unknown setup tag": f"schema = 1\n[[profile]]\n{entry.replace('setup = []', 'setup = [\"x\"]')}",
-            "zero timeout": f"schema = 1\n[[profile]]\n{entry.replace('timeout_minutes = 1', 'timeout_minutes = 0')}",
-            "no profiles": "schema = 1\n",
-            "wrong schema": f"schema = 2\n[[profile]]\n{entry}",
-        }
-        for label, text in bad.items():
-            with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "p.toml"
-                path.write_text(text)
-                code, _, err = run("matrix", "--config", str(path))
-                self.assertEqual(code, 2, (label, err))
 
 
 class StackProofTests(unittest.TestCase):
@@ -162,6 +122,16 @@ class StackProofTests(unittest.TestCase):
     def test_missing_path_is_an_input_error(self):
         code, _, _ = run("stack", "--expect", "legacy", "--out", "/dev/null", "/nonexistent-dual-stack-logs")
         self.assertEqual(code, 2)
+
+    def test_runner_output_without_log_events_is_not_a_server_log(self):
+        files = {"a.log": server_log(started("Legacy")), "nextest.log": "PASS [ 1.0s] some::test\nSummary [ 2s] 1 test run\n"}
+        code, evidence, _ = self.prove("legacy", files)
+        self.assertEqual((code, evidence["logs_without_start"]), (0, 0))
+
+    def test_a_plain_text_prefix_does_not_hide_the_event_or_split_the_message(self):
+        line = "[FATAL] Server runtime failed: x" + json.dumps({"level": "ERROR", "error": REFUSAL}) + "\n"
+        code, evidence, _ = self.prove("gateway", {"a.log": line, "b.log": line})
+        self.assertEqual((code, evidence["not_started"]), (1, [{"message": REFUSAL, "logs": 2}]))
 
     def test_every_server_on_the_requested_stack_passes(self):
         files = {"a.log": server_log(started("Legacy")), "b.log": server_log(started("Legacy"), started("Legacy"))}
@@ -220,6 +190,44 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("###", text)
         self.assertEqual(report["profiles"][0]["gateway"]["status"], "not_started")
         self.assertIsNone(report["profiles"][0]["diff"])
+
+    def test_gateway_skipped_after_a_refused_preflight_is_reported_as_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Tree(tmp)
+            tree.write("legacy", self.CASES)
+            directory = tree.leg("gateway")
+            directory.mkdir(parents=True)
+            logs = Path(tmp) / "pre"
+            logs.mkdir()
+            (logs / "server.log").write_text(server_log({"level": "ERROR", "message": "Server runtime failed", "error": REFUSAL}))
+            run("stack", "--expect", "gateway", "--out", str(directory / "stack.json"), str(logs))
+            code, text, report = tree.summary()
+        self.assertEqual(code, 0, text)
+        self.assertIn(f"skipped: gateway stack refuses startup: {REFUSAL}", text)
+        self.assertEqual(report["profiles"][0]["gateway"]["status"], "skipped")
+
+    def test_a_skipped_legacy_side_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Tree(tmp)
+            tree.write("legacy", self.CASES, evidence=server_log({"level": "ERROR", "message": "boom"}))
+            (tree.leg("legacy") / "junit.xml").unlink()
+            tree.write("gateway", self.CASES)
+            code, _, report = tree.summary()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["profiles"][0]["legacy"]["status"], "not_started")
+
+    def test_a_proven_leg_states_how_many_server_logs_prove_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.tree(tmp)
+            _, text, _ = tree.summary()
+        self.assertIn("ran; 1 of 1 server logs prove legacy, 0 without a start, 0 unstamped starts", text)
+
+    def test_a_case_only_the_gateway_ran_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = self.tree(tmp, gateway={**self.CASES, "extra": "pass"})
+            _, _, report = tree.summary()
+        diff = report["profiles"][0]["diff"]
+        self.assertEqual((diff["cases"], len(diff["other_differences"])), (5, 1))
 
     def test_legacy_that_never_started_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,6 +290,45 @@ class SummaryTests(unittest.TestCase):
         diff = report["profiles"][0]["diff"]
         self.assertEqual((diff["cases"], diff["passed_on_both"], diff["failed_on_both"]), (4, 2, 1))
         self.assertNotIn("###", text)
+
+
+class PreflightTests(unittest.TestCase):
+    """`preflight` starts a binary once on the gateway stack; the binaries here are scripts that log what a server logs."""
+
+    def preflight(self, body):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "server"
+            binary.write_text(f"#!{sys.executable}\nimport json, os, sys, time\n{body}\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            out = Path(tmp) / "out" / "stack.json"
+            code, _, _ = run("preflight", "--binary", str(binary), "--out", str(out))
+            return code, json.loads(out.read_text())
+
+    def test_a_refusing_binary_is_not_a_proven_start(self):
+        body = ('print(json.dumps({"level": "ERROR", "message": "Server runtime failed", "error": %r}), flush=True)\n'
+                "sys.exit(1)") % REFUSAL
+        code, evidence = self.preflight(body)
+        self.assertEqual(code, 1)
+        self.assertEqual(evidence["not_started"][0]["message"], REFUSAL)
+
+    def test_a_binary_that_starts_on_the_gateway_stack_passes_and_is_stopped(self):
+        body = ('print(json.dumps({"event": "server_starting", "s3_stack": os.environ["RUSTFS_S3_STACK"].capitalize()}), flush=True)\n'
+                "time.sleep(300)")
+        code, evidence = self.preflight(body)
+        self.assertEqual((code, evidence["started"]), (0, {"gateway": 1}))
+
+    def test_a_binary_that_ignores_the_request_and_starts_legacy_fails(self):
+        body = 'print(json.dumps({"event": "server_starting", "s3_stack": "Legacy"}), flush=True)\ntime.sleep(300)'
+        code, evidence = self.preflight(body)
+        self.assertEqual((code, evidence["foreign_starts"]), (1, 1))
+
+    def test_a_binary_that_exits_silently_proves_nothing(self):
+        code, evidence = self.preflight("sys.exit(0)")
+        self.assertEqual((code, evidence["started"]), (1, {}))
+
+    def test_a_missing_binary_is_an_input_error(self):
+        code, _, _ = run("preflight", "--binary", "/nonexistent-dual-stack-binary", "--out", "/dev/null")
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
