@@ -99,9 +99,11 @@ pub(crate) fn owner() -> Owner {
 /// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
 /// converts it here, and none drops, rewrites or refuses one.
 ///
-/// A tag the gateway's reader accepts is read as it reads it (a surrounding quote pair or a `W/`
-/// prefix is the store's spelling of it); any other, empty or carrying a control character, is
-/// carried byte for byte.
+/// It reads the stored spelling exactly as the legacy edge always has (`to_s3s_etag`): `W/"…"` is
+/// a weak tag and one surrounding quote pair is the store's spelling of a strong one; the tag
+/// inside is kept byte for byte, so the legacy stack's answer does not change. A weak tag whose
+/// inside the gateway's reader refuses or rewrites cannot stay weak (the gateway has no lossless
+/// weak constructor) and is carried as a strong stored tag.
 #[cfg_attr(
     not(test),
     expect(
@@ -110,7 +112,18 @@ pub(crate) fn owner() -> Owner {
     )
 )]
 pub(crate) fn stored_etag(stored: &str) -> ETag {
-    ETag::new(stored.to_owned()).unwrap_or_else(|_| ETag::from_stored(stored.to_owned()))
+    if let Some(rest) = stored.strip_prefix("W/\"") {
+        let inside = rest.strip_suffix('"').unwrap_or(rest);
+        return ETag::new_weak(inside.to_owned())
+            .ok()
+            .filter(|etag| etag.opaque_tag() == inside)
+            .unwrap_or_else(|| ETag::from_stored(inside.to_owned()));
+    }
+    let inside = stored
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(stored);
+    ETag::from_stored(inside.to_owned())
 }
 
 /// A stored bucket configuration as the gateway DTO holds it: the bytes RustFS persists, read by
@@ -252,23 +265,60 @@ mod tests {
         assert_eq!((converted.secs(), converted.subsec_nanos()), (1_700_000_000, 123_000_000));
     }
 
+    /// Stored tag spellings retain their expected forms across conversions and renderers.
     #[test]
-    fn a_stored_tag_is_carried_as_stored_in_every_spelling_the_store_writes() {
-        for stored in ["0123abcd", "\"0123abcd\"", "0123abcd-2", "W/\"0123abcd\""] {
-            let etag = stored_etag(stored);
+    fn a_stored_tag_is_answered_as_main_answers_it_on_both_edges() {
+        use crate::app::storage_api::object_usecase::object_utils::to_s3s_etag;
+        use rustfs_gateway_types::EtagRender;
+        use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
 
-            assert_eq!(etag.opaque_tag(), stored.trim_start_matches("W/").trim_matches('"'), "{stored}");
-            assert_eq!(etag.is_weak(), stored.starts_with("W/"), "{stored}");
+        // Stored spelling, legacy header, gateway header, and XML text.
+        let rows: [(&str, &str, &str, &str); 11] = [
+            ("abc", r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#""abc""#, r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#"W/"abc""#, r#"W/"abc""#, r#"W/"abc""#, r#""abc""#),
+            ("abc-3", r#""abc-3""#, r#""abc-3""#, r#""abc-3""#),
+            (r#""""#, r#""""#, r#""""#, r#""""#),
+            ("", r#""""#, r#""""#, r#""""#),
+            ("W/abc", r#""W/abc""#, r#""W/abc""#, r#""W/abc""#),
+            ("a&b", r#""a&b""#, r#""a&b""#, r#""a&b""#),
+            (r#""abc"#, r#"""abc""#, r#""\"abc""#, r#"""abc""#),
+            (r#"""abc"""#, r#"""abc"""#, r#""\"abc\"""#, r#"""abc"""#),
+            (r#"w/"abc""#, r#""w/"abc"""#, r#""w/\"abc\"""#, r#""w/"abc"""#),
+        ];
+        // Every row is checked before the test fails, so one run names every row that differs.
+        let mut differing = Vec::new();
+        for (stored, main_header, gateway_header, xml) in rows {
+            let etag = stored_etag(stored);
+            let legacy = to_s3s_etag(stored);
+            let answered = (
+                etag_to_s3s(&etag) == legacy,
+                legacy.to_http_header().is_ok_and(|header| header == main_header),
+                etag.render(EtagRender::HeaderQuoted) == gateway_header,
+                etag.render(EtagRender::XmlQuoted) == xml,
+            );
+            if answered != (true, true, true, true) {
+                differing.push((stored, answered));
+            }
         }
+        assert!(differing.is_empty(), "(legacy edge, main header, gateway header, XML): {differing:?}");
     }
 
     #[test]
-    fn a_stored_tag_the_reader_refuses_is_carried_byte_for_byte() {
-        for stored in ["", "\"\"", "abc\u{1}def", "abc\ndef"] {
+    fn stored_control_characters_are_preserved() {
+        for stored in ["abc\u{1}def", "abc\ndef"] {
             let etag = stored_etag(stored);
-
             assert_eq!(etag.opaque_tag(), stored, "{stored:?}");
             assert!(!etag.is_weak(), "{stored:?}");
         }
+    }
+
+    /// A weak spelling with an empty tag remains readable.
+    #[test]
+    fn a_weak_stored_tag_the_gateway_cannot_hold_weak_is_answered_strong() {
+        let etag = stored_etag(r#"W/"""#);
+
+        assert!(!etag.is_weak());
+        assert_eq!(etag.opaque_tag(), "");
     }
 }

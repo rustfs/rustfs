@@ -183,4 +183,20 @@ mod tests {
 
         assert_eq!(registered, rows(OPERATIONS).map(|row| row.name).collect());
     }
+
+    /// An invalid header value does not alter the response status or other headers.
+    #[test]
+    fn a_stored_tag_a_header_cannot_hold_is_left_out_and_the_answer_stands() {
+        for stored in ["a\rb", "a\nb", "a\0b"] {
+            let etag = crate::app::dto_values::stored_etag(stored);
+            let rendered = etag.render(rustfs_gateway_types::EtagRender::HeaderQuoted);
+            let mut response = rustfs_gateway::EncodedResponse::of(200);
+            response.set_header("etag", &rendered);
+            response.set_header("x-amz-version-id", "null");
+
+            assert_eq!(response.status, http::StatusCode::OK, "{stored:?}");
+            assert!(response.headers.get(http::header::ETAG).is_none(), "{stored:?}");
+            assert_eq!(response.headers.get("x-amz-version-id").map(|value| value.as_bytes()), Some(&b"null"[..]));
+        }
+    }
 }
