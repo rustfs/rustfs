@@ -78,7 +78,6 @@ repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.99.0"
 version = "1.0.5"
 homepage = "https://rustfs.com"
-description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
 authors = ["RustFS Team"]
@@ -93,7 +92,6 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rustfs = { path = "./rustfs", version = "1.0.5" }
 rustfs-gateway-adapter = { path = "crates/gateway-adapter", version = "1.0.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.5" }
