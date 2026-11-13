@@ -617,6 +617,7 @@ use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning::VersioningApi;
 use crate::disk::DiskAPI;
 use crate::object_api::ScannerPublicationCommitScopeGuard;
+use crate::object_api::{GetObjectSinkSegments, GetObjectSinkWriter};
 use crate::set_disk::coding;
 use crate::set_disk::core::io_primitives::GetCodecStreamingReaderBuildOutcome;
 use crate::set_disk::mem;
@@ -3686,6 +3687,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let duplex_buffer_size = adaptive_duplex_buffer_size(object_info.size);
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
+        // A caller-provided sink replaces the pipe's write end: the producer writes
+        // decoded bytes into it, the pipe's read end sees EOF at once, and the
+        // returned reader then only waits for the producer's terminal result.
+        // Only a plain body can bypass the pipe: compressed or encrypted objects
+        // are transformed by readers layered on the pipe's read end.
+        let sink_usable = !object_info.is_compressed() && !object_info.is_encrypted();
+        let caller_sink = opts.get_object_sink.as_ref().filter(|_| sink_usable).cloned();
+        let erasure_block_size = fi.erasure.block_size;
 
         let (producer_terminal_tx, producer_terminal_rx) = tokio::sync::oneshot::channel();
         let (mut reader, offset, length) =
@@ -3694,115 +3703,108 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
 
+        // A sink that offers segments takes the body as several concurrently
+        // produced, erasure-block-aligned ranges (each segment writer knows its
+        // offset), so one GET keeps several stripes in flight across cores.
+        let segment_ranges = caller_sink.as_ref().and_then(|sink| {
+            let segments = sink.segments()?;
+            let ranges =
+                plan_sink_segments(offset, length, erasure_block_size, segments.max_segments, segments.min_segment_bytes);
+            (ranges.len() >= 2).then_some(ranges)
+        });
+        let downstream = match (caller_sink, segment_ranges) {
+            (Some(sink), Some(ranges)) => match sink.take_segments() {
+                Some(segments) => {
+                    drop(wd);
+                    LegacyProducerDownstream::Segments(segments, ranges)
+                }
+                None => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
+            },
+            (Some(sink), None) => match sink.take() {
+                Some(writer) => {
+                    drop(wd);
+                    LegacyProducerDownstream::Writer(writer)
+                }
+                None => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
+            },
+            (None, _) => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
+        };
+
         // The producer is otherwise detached from the returned reader. Tie its
         // lifetime to the source stream so a cancelled copy (or an abandoned
         // GET) releases in-flight shard opens, response bodies, and the read
-        // lock immediately instead of waiting for a disk timeout.
-        let producer_cancellation = crate::set_disk::get_object_read_cancellation();
+        // lock immediately instead of waiting for a disk timeout. Segment
+        // producers always get a token so one failed segment stops the rest.
+        let mut producer_cancellation = crate::set_disk::get_object_read_cancellation();
+        if producer_cancellation.is_none() && matches!(downstream, LegacyProducerDownstream::Segments(..)) {
+            producer_cancellation = Some(CancellationToken::new());
+        }
         if let Some(cancellation) = producer_cancellation.as_ref() {
             reader.stream = Box::new(ProducerCancellationReader::new(reader.stream, cancellation.clone()));
         }
 
-        // let disks = disks.clone();
-        let bucket = bucket.to_owned();
-        let object = object.to_owned();
-        let set_index = self.set_index;
-        let pool_index = self.pool_index;
-        let skip_verify = opts.skip_verify_bitrot;
-        let suppress_read_repair = opts.suppress_read_repair;
         // The producer runs in a separate Tokio task, so carry the caller's
         // read policy across the task boundary explicitly. Tokio task-local
         // values are not inherited by spawned tasks.
-        let read_policy = crate::set_disk::get_object_read_policy();
-        let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
-        let producer = async move {
-            let _guard = read_lock_guard;
-            let mut writer = GetObjectDownstreamWriter::new(wd);
-            // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
-            // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
-            // would incorrectly treat downstream backpressure as disk-read latency.
-            // Disk read timeouts must be enforced at the actual disk I/O operations.
-            let producer_result = tokio::select! {
-                biased;
-                result = crate::set_disk::with_get_object_read_policy(
-                    read_policy,
-                    Self::get_object_with_fileinfo(
-                        &bucket,
-                        &object,
-                        erasure_cache,
-                        offset,
-                        length,
-                        &mut writer,
-                        fi,
-                        files,
-                        &disks,
-                        set_index,
-                        pool_index,
-                        skip_verify,
-                        suppress_read_repair,
-                        false,
-                        false,
-                        GET_OBJECT_PATH_LEGACY_DUPLEX,
-                        object_class.as_str(),
-                        size_bucket,
-                    ),
-                ) => result,
-                _ = async {
-                    if let Some(cancellation) = producer_cancellation.as_ref() {
-                        cancellation.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => Err(Error::OperationCanceled),
-            };
-            if let Err(e) = &producer_result
-                && !matches!(e, Error::OperationCanceled)
-            {
-                let reason = classify_storage_error(e);
-                if reason == GetObjectFailureReason::DownstreamClosed {
-                    debug!(
-                        event = EVENT_SET_DISK_WRITE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        bucket,
-                        object,
-                        pool_index,
-                        set_index,
-                        offset,
-                        requested_length = length,
-                        state = "downstream_closed",
-                        stage = GET_STAGE_EMIT,
-                        reason = reason.as_str(),
-                        error = ?e,
-                        "Set disk object read pipeline stopped after downstream closed"
-                    );
-                } else {
-                    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-                    error!(
-                        event = EVENT_SET_DISK_WRITE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        bucket,
-                        object,
-                        pool_index,
-                        set_index,
-                        offset,
-                        requested_length = length,
-                        skip_verify_bitrot = skip_verify,
-                        state = "read_pipeline_failed",
-                        stage = GET_STAGE_EMIT,
-                        reason = reason.as_str(),
-                        error = ?e,
-                        "Set disk object read pipeline failed"
-                    );
+        let context = Arc::new(LegacyProducerContext {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            erasure_cache: Arc::clone(&self.erasure_cache),
+            fi,
+            files,
+            disks,
+            set_index: self.set_index,
+            pool_index: self.pool_index,
+            skip_verify: opts.skip_verify_bitrot,
+            suppress_read_repair: opts.suppress_read_repair,
+            read_policy: crate::set_disk::get_object_read_policy(),
+            object_class: object_class.as_str(),
+            size_bucket,
+            cancellation: producer_cancellation,
+        });
+        match downstream {
+            LegacyProducerDownstream::Writer(writer) => {
+                let producer = async move {
+                    let _guard = read_lock_guard;
+                    let result = run_legacy_producer_segment(context, offset, length, writer).await;
+                    let _ = producer_terminal_tx.send(result);
+                };
+                #[cfg(feature = "diagnostic-local-batch")]
+                let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
+                tokio::spawn(producer);
+            }
+            LegacyProducerDownstream::Segments(segments, ranges) => {
+                let read_lock_guard = Arc::new(read_lock_guard);
+                let mut handles = Vec::with_capacity(ranges.len());
+                for (segment_offset, segment_length) in ranges {
+                    let relative = u64::try_from(segment_offset - offset).unwrap_or(u64::MAX);
+                    let writer = (segments.factory)(relative, u64::try_from(segment_length).unwrap_or(0));
+                    let context = Arc::clone(&context);
+                    let read_lock_guard = Arc::clone(&read_lock_guard);
+                    let producer = async move {
+                        let _guard = read_lock_guard;
+                        run_legacy_producer_segment(context, segment_offset, segment_length, writer).await
+                    };
+                    #[cfg(feature = "diagnostic-local-batch")]
+                    let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
+                    handles.push(tokio::spawn(producer));
                 }
-            };
-            let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
-        };
-        #[cfg(feature = "diagnostic-local-batch")]
-        let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
-        tokio::spawn(producer);
+                tokio::spawn(async move {
+                    let mut result = Ok(());
+                    for handle in handles {
+                        let segment_result = match handle.await {
+                            Ok(segment_result) => segment_result,
+                            Err(join) => Err(Error::other(format!("legacy GET segment producer task failed: {join}"))),
+                        };
+                        if result.is_ok() && segment_result.is_err() {
+                            result = segment_result;
+                        }
+                    }
+                    let _ = producer_terminal_tx.send(result);
+                });
+            }
+        }
 
         Ok(reader)
     }
@@ -3811,6 +3813,248 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         self.put_object_with_old_current_size(bucket, object, data, opts)
             .await
             .map(|(object_info, _)| object_info)
+    }
+}
+
+/// Where a legacy duplex GET producer writes: the pipe or caller sink as one
+/// sequential writer, or the caller's segment writers for a fanned-out body.
+enum LegacyProducerDownstream {
+    Writer(GetObjectSinkWriter),
+    Segments(GetObjectSinkSegments, Vec<(usize, i64)>),
+}
+
+/// Everything a legacy duplex producer needs besides its range and writer;
+/// shared by the segment producers of one GET.
+struct LegacyProducerContext {
+    bucket: String,
+    object: String,
+    erasure_cache: Arc<super::super::ErasureCache>,
+    fi: FileInfo,
+    files: Vec<FileInfo>,
+    disks: Vec<Option<DiskStore>>,
+    set_index: usize,
+    pool_index: usize,
+    skip_verify: bool,
+    suppress_read_repair: bool,
+    read_policy: super::super::GetObjectReadPolicy,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    cancellation: Option<CancellationToken>,
+}
+
+/// Runs one legacy duplex producer over `[offset, offset + length)` into
+/// `downstream`, with the caller's read policy and cancellation. A failing
+/// segment cancels its siblings through the shared token.
+async fn run_legacy_producer_segment(
+    context: Arc<LegacyProducerContext>,
+    offset: usize,
+    length: i64,
+    downstream: GetObjectSinkWriter,
+) -> Result<()> {
+    let (stream, emitter) = downstream.into_parts();
+    let mut writer = GetObjectDownstreamWriter::new(stream);
+    // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
+    // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
+    // would incorrectly treat downstream backpressure as disk-read latency.
+    // Disk read timeouts must be enforced at the actual disk I/O operations.
+    // A sink that can take shards out of arena memory (zero-copy emit) is
+    // offered to the decode loop for the whole read.
+    let read = crate::set_disk::with_get_object_read_policy(
+        context.read_policy,
+        SetDisks::get_object_with_fileinfo(
+            &context.bucket,
+            &context.object,
+            Arc::clone(&context.erasure_cache),
+            offset,
+            length,
+            &mut writer,
+            context.fi.clone(),
+            context.files.clone(),
+            &context.disks,
+            context.set_index,
+            context.pool_index,
+            context.skip_verify,
+            context.suppress_read_repair,
+            false,
+            false,
+            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            context.object_class,
+            context.size_bucket,
+        ),
+    );
+    let read = async move {
+        match emitter {
+            Some(emitter) => crate::erasure::codec::shard_emit::with_shard_emitter(emitter, read).await,
+            None => read.await,
+        }
+    };
+    let producer_result = tokio::select! {
+        biased;
+        result = read => result,
+        _ = async {
+            if let Some(cancellation) = context.cancellation.as_ref() {
+                cancellation.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => Err(Error::OperationCanceled),
+    };
+    if let Err(e) = &producer_result
+        && !matches!(e, Error::OperationCanceled)
+    {
+        if let Some(cancellation) = context.cancellation.as_ref() {
+            cancellation.cancel();
+        }
+        let reason = classify_storage_error(e);
+        if reason == GetObjectFailureReason::DownstreamClosed {
+            debug!(
+                event = EVENT_SET_DISK_WRITE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = context.bucket,
+                object = context.object,
+                pool_index = context.pool_index,
+                set_index = context.set_index,
+                offset,
+                requested_length = length,
+                state = "downstream_closed",
+                stage = GET_STAGE_EMIT,
+                reason = reason.as_str(),
+                error = ?e,
+                "Set disk object read pipeline stopped after downstream closed"
+            );
+        } else {
+            record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+            error!(
+                event = EVENT_SET_DISK_WRITE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = context.bucket,
+                object = context.object,
+                pool_index = context.pool_index,
+                set_index = context.set_index,
+                offset,
+                requested_length = length,
+                skip_verify_bitrot = context.skip_verify,
+                state = "read_pipeline_failed",
+                stage = GET_STAGE_EMIT,
+                reason = reason.as_str(),
+                error = ?e,
+                "Set disk object read pipeline failed"
+            );
+        }
+    }
+    producer_result.map(|_| ())
+}
+
+/// Splits `[offset, offset + length)` into at most `max_segments` contiguous
+/// ranges cut only at erasure-block boundaries (multiples of `block_size`
+/// from the object start), so no stripe is read by two segments, and no
+/// segment shorter than `min_segment_bytes` rounded up to whole blocks.
+/// Returns a single range when the request does not span two such segments
+/// or segmentation is off.
+fn plan_sink_segments(
+    offset: usize,
+    length: i64,
+    block_size: usize,
+    max_segments: usize,
+    min_segment_bytes: u64,
+) -> Vec<(usize, i64)> {
+    let Ok(length_usize) = usize::try_from(length) else {
+        return vec![(offset, length)];
+    };
+    if max_segments < 2 || block_size == 0 || length_usize == 0 {
+        return vec![(offset, length)];
+    }
+    let end = offset.saturating_add(length_usize);
+    let first_block = offset / block_size + 1;
+    let last_block = end.div_ceil(block_size);
+    let pieces = last_block.saturating_sub(first_block) + 1;
+    let min_blocks = usize::try_from(min_segment_bytes.div_ceil(block_size as u64))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let segments = max_segments.min(pieces / min_blocks);
+    if segments < 2 {
+        return vec![(offset, length)];
+    }
+    let mut ranges = Vec::with_capacity(segments);
+    let mut start = offset;
+    for index in 0..segments {
+        let boundary_block = first_block + (pieces * (index + 1)) / segments - 1;
+        let stop = if index + 1 == segments {
+            end
+        } else {
+            (boundary_block * block_size).min(end)
+        };
+        if stop > start {
+            ranges.push((start, (stop - start) as i64));
+        }
+        start = stop;
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod sink_segment_plan_tests {
+    use super::plan_sink_segments;
+
+    const BLOCK: usize = 48 << 20;
+
+    #[test]
+    fn single_block_or_segmentation_off_stays_whole() {
+        assert_eq!(plan_sink_segments(0, BLOCK as i64, BLOCK, 8, 0), vec![(0, BLOCK as i64)]);
+        assert_eq!(plan_sink_segments(10, 100, BLOCK, 8, 0), vec![(10, 100)]);
+        assert_eq!(plan_sink_segments(0, (4 * BLOCK) as i64, BLOCK, 1, 0), vec![(0, (4 * BLOCK) as i64)]);
+        assert_eq!(plan_sink_segments(0, (4 * BLOCK) as i64, 0, 8, 0), vec![(0, (4 * BLOCK) as i64)]);
+        assert_eq!(plan_sink_segments(0, -1, BLOCK, 8, 0), vec![(0, -1)]);
+    }
+
+    #[test]
+    fn whole_object_splits_on_block_boundaries_and_covers_everything() {
+        let total = 2usize << 30; // 2 GiB: 42 full blocks and a 32 MiB tail
+        let ranges = plan_sink_segments(0, total as i64, BLOCK, 8, 0);
+        assert_eq!(ranges.len(), 8);
+        let mut next = 0usize;
+        for (start, len) in &ranges {
+            assert_eq!(*start, next);
+            assert!(*len > 0);
+            next += *len as usize;
+            if next != total {
+                assert_eq!(next % BLOCK, 0, "segment ends on a block boundary");
+            }
+        }
+        assert_eq!(next, total);
+    }
+
+    #[test]
+    fn range_inside_object_cuts_only_at_block_boundaries() {
+        let offset = BLOCK + 1000;
+        let length = (3 * BLOCK) as i64;
+        let ranges = plan_sink_segments(offset, length, BLOCK, 8, 0);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0], (offset, (BLOCK - 1000) as i64));
+        assert_eq!(ranges[1], (2 * BLOCK, BLOCK as i64));
+        assert_eq!(ranges[3], (4 * BLOCK, 1000));
+    }
+
+    #[test]
+    fn minimum_segment_size_limits_the_count_and_keeps_short_ranges_whole() {
+        // 11 blocks at 4 blocks per segment: two segments, not eight.
+        let ranges = plan_sink_segments(0, (11 * BLOCK) as i64, BLOCK, 8, (4 * BLOCK) as u64);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (0, (5 * BLOCK) as i64));
+        assert_eq!(ranges[1], (5 * BLOCK, (6 * BLOCK) as i64));
+        // Fewer than two minimum-size segments: sequential.
+        assert_eq!(plan_sink_segments(0, (7 * BLOCK) as i64, BLOCK, 8, (4 * BLOCK) as u64).len(), 1);
+        // The minimum rounds up to whole blocks.
+        assert_eq!(plan_sink_segments(0, (4 * BLOCK) as i64, BLOCK, 8, (BLOCK + 1) as u64).len(), 2);
+    }
+
+    #[test]
+    fn segment_count_is_bounded_and_blocks_spread_evenly() {
+        let ranges = plan_sink_segments(0, (10 * BLOCK) as i64, BLOCK, 4, 0);
+        let lens: Vec<usize> = ranges.iter().map(|(_, len)| *len as usize / BLOCK).collect();
+        assert_eq!(lens, vec![2, 3, 2, 3]);
     }
 }
 

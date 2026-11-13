@@ -2408,6 +2408,10 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
     if !put_stage_metrics_enabled() {
         return;
     }
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("put", stage, "", "", duration_ms / 1000.0);
+        return;
+    }
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
 }
 
@@ -2646,6 +2650,10 @@ pub fn record_put_rename_quorum_wait_fanout(
 /// operations that are NOT part of the PUT object hot path.
 #[inline(always)]
 pub fn record_stage_duration(stage: &'static str, duration_ms: f64) {
+    if get_stage_local_summary_enabled() {
+        record_get_stage_local_summary("internal", stage, "", "", duration_ms / 1000.0);
+        return;
+    }
     if !metrics_enabled() {
         return;
     }
