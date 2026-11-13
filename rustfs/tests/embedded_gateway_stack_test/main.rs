@@ -542,3 +542,100 @@ fn the_legacy_stack_still_serves_writes_and_reads() {
         server.shutdown().await;
     });
 }
+
+/// HeadBucket's outcome with `x-amz-expected-bucket-owner` set to `owner`, or without it.
+async fn head_bucket_owned_by(client: &Client, bucket: &str, owner: Option<&str>) -> Result<(), Option<u16>> {
+    let sent = client
+        .head_bucket()
+        .bucket(bucket)
+        .set_expected_bucket_owner(owner.map(str::to_owned))
+        .send()
+        .await;
+    outcome(sent).map_err(|refusal| refusal.status)
+}
+
+/// ListBuckets' outcome with `x-amz-expected-bucket-owner` set to `owner`.
+async fn list_buckets_owned_by(client: &Client, owner: &str) -> Result<(), Option<u16>> {
+    let owner = owner.to_owned();
+    let sent = client
+        .list_buckets()
+        .customize()
+        .mutate_request(move |request| {
+            request.headers_mut().insert("x-amz-expected-bucket-owner", owner.clone());
+        })
+        .send()
+        .await;
+    outcome(sent).map_err(|refusal| refusal.status)
+}
+
+/// `x-amz-expected-bucket-owner` against the owner id the listing reports. `expected` is the
+/// outcome of the same id, another id and none, first on a bucket that exists and then on one that
+/// does not, then on a reserved-shaped bucket, and of the same id on ListBuckets.
+async fn expected_bucket_owner_answers(server: RustFSServer, expected: [Result<(), Option<u16>>; 10]) {
+    const OWNED: &str = "gateway-stack-owned";
+    const MISSING: &str = "gateway-stack-missing";
+    const RESERVED: &str = "sthree-gateway-stack-owned";
+    create_bucket_in_the_store(OWNED).await;
+    create_bucket_in_the_store(RESERVED).await;
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let listing = client.list_buckets().send().await.expect("signed ListBuckets");
+    let reported = listing
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("the listing names its owner")
+        .to_owned();
+    let other = format!("{reported}0");
+
+    let mut answered = Vec::new();
+    for bucket in [OWNED, MISSING, RESERVED] {
+        for owner in [Some(reported.as_str()), Some(other.as_str()), None] {
+            answered.push(head_bucket_owned_by(&client, bucket, owner).await);
+        }
+    }
+    answered.push(list_buckets_owned_by(&client, &reported).await);
+
+    assert_eq!(answered, expected, "same id, other id, absent for each bucket; ListBuckets");
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_serves_only_the_reported_bucket_owner() {
+    with_stack(GATEWAY, |server| {
+        expected_bucket_owner_answers(
+            server,
+            [
+                Ok(()),
+                Err(Some(403)),
+                Ok(()),
+                Err(Some(404)),
+                Err(Some(403)),
+                Err(Some(404)),
+                Ok(()),
+                Err(Some(403)),
+                Ok(()),
+                Err(Some(403)),
+            ],
+        )
+    });
+}
+
+#[test]
+fn the_legacy_stack_answers_expected_bucket_owner_requests() {
+    with_stack(LEGACY, |server| {
+        expected_bucket_owner_answers(
+            server,
+            [
+                Ok(()),
+                Ok(()),
+                Ok(()),
+                Err(Some(404)),
+                Err(Some(404)),
+                Err(Some(404)),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+            ],
+        )
+    });
+}
