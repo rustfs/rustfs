@@ -1453,7 +1453,7 @@ pub struct FilesInfo {
 /// Parsed restore status of a restored object: the value persisted under
 /// [`metadata_keys::RESTORE`]. filemeta owns this type so the persisted format
 /// does not depend on an HTTP library DTO (backlog#1735 A3c); the field names
-/// match the former `s3s::dto::RestoreStatus` so the rendered bytes are unchanged.
+/// match the former s3s `RestoreStatus` DTO so the rendered bytes are unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreStatus {
     /// `ongoing-request`; `None` reads as not in progress.
