@@ -2316,6 +2316,14 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     )
     .await?;
 
+    // Configuration updates enqueue existing due objects. Observe their commit
+    // before paging so eligibility stays stable across the source restart.
+    for idx in 0..2 {
+        let key = format!("{MANUAL_CONTINUATION_PREFIX}obj-{idx:02}");
+        wait_for_transition(&hot_client, MANUAL_CONTINUATION_BUCKET, &key, StdDuration::from_secs(90)).await?;
+    }
+    assert_eq!(cold_tier_object_count(&cold_client).await?, 2);
+
     let first = manual_transition_run_with_max(&hot, MANUAL_CONTINUATION_BUCKET, MANUAL_CONTINUATION_PREFIX, true, 1).await?;
     assert_eq!(first.state, "partial", "first continuation page: {first:#?}");
     assert_eq!(first.mode, "enqueue_only");
@@ -2323,8 +2331,10 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     assert_eq!(first.report.prefix, MANUAL_CONTINUATION_PREFIX);
     assert!(first.report.dry_run);
     assert_eq!(first.report.scanned, 1, "first continuation page: {first:#?}");
-    assert_eq!(first.report.eligible, 1, "first continuation page: {first:#?}");
-    assert_eq!(first.report.dry_run_eligible, 1, "first continuation page: {first:#?}");
+    assert_eq!(first.report.eligible, 0, "first continuation page: {first:#?}");
+    assert_eq!(first.report.dry_run_eligible, 0, "first continuation page: {first:#?}");
+    assert_eq!(first.report.skipped_already_transitioned, 1);
+    assert_eq!(first.report.enqueued, 0);
     assert_eq!(first.report.tier_failure, 0);
     assert!(!first.report.cancelled);
     assert!(first.report.truncated_by_limit);
@@ -2351,12 +2361,15 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     .await?;
     assert_eq!(second.state, "completed", "second continuation page: {second:#?}");
     assert_eq!(second.report.scanned, 1, "second continuation page: {second:#?}");
-    assert_eq!(second.report.eligible, 1, "second continuation page: {second:#?}");
-    assert_eq!(second.report.dry_run_eligible, 1, "second continuation page: {second:#?}");
+    assert_eq!(second.report.eligible, 0, "second continuation page: {second:#?}");
+    assert_eq!(second.report.dry_run_eligible, 0, "second continuation page: {second:#?}");
+    assert_eq!(second.report.skipped_already_transitioned, 1);
+    assert_eq!(second.report.enqueued, 0);
     assert_eq!(second.report.tier_failure, 0);
     assert!(!second.report.cancelled);
     assert!(!second.report.truncated_by_limit);
     assert!(second.report.continuation_token.is_none());
+    assert_eq!(cold_tier_object_count(&cold_client).await?, 2);
 
     Ok(())
 }
