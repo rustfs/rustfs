@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
 use super::ecfs::FS;
-use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
+use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -3339,67 +3340,10 @@ impl S3Access for FS {
         let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         #[cfg(test)]
         wait_for_object_generation_test_hook(&bucket).await;
-        // Preserve DeleteObject's established NoSuchBucket response instead of
-        // letting policy lookup turn a missing bucket into AccessDenied.
-        if let Err(err) = &bucket_generation
-            && err.code() == &S3ErrorCode::NoSuchBucket
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NoSuchBucket,
-                err.message().unwrap_or("The specified bucket does not exist").to_string(),
-            ));
-        }
-
-        let replica_request = req
-            .headers
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
-        // A replica delete may name its version through the source-version
-        // header; the policy decision must see the same version storage deletes.
-        // Storage consumes that header only for a replica request, so any other
-        // request is authorized for the version it names in the query alone.
-        let version_id = if replica_request {
-            super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers)
-        } else {
-            req.input.version_id.clone()
-        };
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = version_id;
-        let authenticated = req_info.is_owner || req_info.cred.is_some();
-        let action = delete_object_authorize_action(req_info.version_id.as_deref());
-
-        authorize_request(req, action).await?;
-
-        let force_delete = match force_delete_header(&req.headers) {
-            Ok(value) => value.unwrap_or(false),
-            Err(_) => return Err(invalid_force_delete_header()),
-        };
-        // The REPLICA header is caller-supplied, so it must not skip this
-        // check. s3:ReplicateDelete is still required separately for replica
-        // deletes; s3:* does not grant s3:ForceDeleteObject.
-        if force_delete {
-            authorize_request(req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
-        }
-        if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
-            audit_request_denial(
-                req,
-                DenialAuditor::global(),
-                "recursive_force_delete_requires_authenticated_caller",
-                Action::S3Action(S3Action::ForceDeleteObjectAction),
-            );
-            return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
-        }
-
-        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
-        if has_bypass_governance_header(&req.headers) {
-            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
-        }
-
-        req.install_pending_delete_bucket_generation(PendingDeleteBucketGenerationGuard::from_result(bucket_generation));
-
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        let guard = authorize_delete_object(req, &bucket, &key, version_id.as_deref(), bucket_generation).await?;
+        req.install_pending_delete_bucket_generation(guard);
         Ok(())
     }
 
