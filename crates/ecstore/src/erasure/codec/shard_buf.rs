@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Raw arena memory: the block handle owns a pointer into registered memory
-// (see `ArenaBlock::new` for the contract) and implements `BufMut` the way
-// `Vec<u8>` does.
+// SAFETY: raw arena memory. The block handle owns a pointer into registered
+// memory (see `ArenaBlock::new` for the contract) and implements `BufMut` the
+// way `Vec<u8>` does.
 #![allow(unsafe_code)]
 
 //! Shard buffers for the erasure read path.
