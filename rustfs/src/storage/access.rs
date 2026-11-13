@@ -3125,21 +3125,10 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
-
-        // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
-        // including the value `false`. Only a parsed `true` later skips the
-        // emptiness check. `s3:*` does not grant this action.
-        if force_delete_header(&req.headers)
-            .map_err(|_| invalid_force_delete_header())?
-            .is_some()
-        {
-            authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
-        }
-        Ok(())
+        let bucket = req.input.bucket.clone();
+        access_owned::bucket_core::authorize_delete_bucket(req, &bucket)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the DeleteBucketAnalyticsConfiguration request has accesses to the resources.

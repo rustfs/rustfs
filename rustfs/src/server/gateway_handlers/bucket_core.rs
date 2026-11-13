@@ -19,7 +19,7 @@ use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::{DefaultBucketUsecase, requested_location_constraint};
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::bucket_core::authorize_create_bucket;
+use crate::storage_api::server::http::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -31,6 +31,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListBuckets>(),
     row::<dto::HeadBucket>(),
     row::<dto::CreateBucket>(),
+    row::<dto::DeleteBucket>(),
 ];
 
 impl Served for dto::ListBuckets {
@@ -78,6 +79,21 @@ impl Served for dto::CreateBucket {
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_create_bucket(envelope, request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::DeleteBucket {
+    const METRIC: S3Operation = S3Operation::DeleteBucket;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        authorize_delete_bucket(envelope, request.input().bucket.as_str()).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_delete_bucket(envelope, request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

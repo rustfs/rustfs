@@ -40,9 +40,10 @@ use aws_sdk_s3::{Client, Config};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::{RustFSServer, RustFSServerBuilder, find_available_port, gateway_operations};
+use rustfs_ecstore::api::object::PutObjReader;
 use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, ObjectIO};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
@@ -207,6 +208,16 @@ async fn create_bucket_in_the_store(bucket: &str) {
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("create bucket in the store");
+}
+
+async fn put_object_in_the_store(bucket: &str, key: &str) {
+    let mut data = PutObjReader::from_vec(b"payload".to_vec());
+    get_global_app_context()
+        .expect("embedded server context")
+        .object_store()
+        .put_object(bucket, key, &mut data, &Default::default())
+        .await
+        .expect("put object in the store");
 }
 
 async fn bucket_exists_in_the_store(bucket: &str) -> bool {

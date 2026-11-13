@@ -35,7 +35,11 @@ fn bucket_create_and_delete_use_admitted_fresh_tasks() {
             "bucket creation",
             "execute_create_bucket_inner(envelope, input, mutation_permit).await",
         ),
-        ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
+        (
+            "execute_delete_bucket",
+            "bucket deletion",
+            "execute_delete_bucket_inner(envelope, input).await",
+        ),
     ] {
         let body = usecase_method_source(source, method);
         assert!(
