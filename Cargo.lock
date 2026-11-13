@@ -9633,6 +9633,8 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-extension-schema",
  "rustfs-filemeta",
+ "rustfs-gateway",
+ "rustfs-gateway-adapter",
  "rustfs-gateway-types",
  "rustfs-heal",
  "rustfs-heal-contracts",
