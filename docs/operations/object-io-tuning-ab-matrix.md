@@ -11,7 +11,7 @@ Scope: **parameter tuning** with a fixed binary. The code-change A/B gate that c
 2. Is the knob the real bottleneck, or is the stage slow for another reason?
 3. Does widening the knob buy throughput without an unacceptable memory (RSS) or tail-latency regression?
 
-The core discipline is **one variable per A/B cell**. A cell that changes two knobs is thrown away.
+For a main-effect comparison, vary one factor per A/B cell. The fsync worker experiment below also includes a declared two-factor combination to measure interaction after both individual factors have been compared.
 
 ## 2. Prerequisites
 
@@ -74,6 +74,39 @@ iostat -xz 5 > telemetry/iostat.txt &
 | `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB (`crates/config/src/constants/object.rs`) | Duplex pipe capacity (shared; PUT uses it less than GET) | `set_disk_encode` feed smoothness | Memory per in-flight request |
 | `RUSTFS_DURABILITY_MODE` / `RUSTFS_DRIVE_SYNC_ENABLE` | mode-dependent | Per-shard fsync/sync discipline on commit | `set_disk_rename` P99 | Weakening it changes the durability contract — a deliberate tradeoff, never a free win |
 | `RUSTFS_RUNTIME_WORKER_THREADS` / `RUSTFS_RUNTIME_MAX_BLOCKING_THREADS` | Tokio defaults | Async workers + `spawn_blocking` pool feeding per-block encode | `set_disk_encode` P95 + mpstat | Oversubscription |
+
+#### Fsync worker idle policy experiment
+
+The disk fsync queue exposes two independent experimental controls for measuring idle CPU cost. Both are cached at first queue creation and require restarting every participating server when changed. Their defaults retain the current worker policy.
+
+| Variable | Default | Values and effect |
+| --- | --- | --- |
+| `RUSTFS_EXPERIMENTAL_FSYNC_WORKER_IDLE_SPIN_ITERS` | `1024` | Spin budget per empty-queue episode, clamped to `0..=1024`. `0` immediately rechecks retirement under the queue mutex. Invalid values use the default. |
+| `RUSTFS_EXPERIMENTAL_FSYNC_WORKER_KEEP_MULTIPLE_IDLE` | `true` | `false` retires an empty fsync worker when another idle/reserved worker already exists. Invalid values use the default. |
+
+These controls affect the foreground fsync lane's idle policy. Its maximum execution concurrency remains eight workers per disk, and the namespace and isolated cleanup lanes retain their own policy. The queue's internal idle count includes worker reservations awaiting execution, so measure actual worker and spin activity through the diagnostics below.
+
+Use one fixed binary and the four cells below to distinguish the two factors and their interaction. Keep effective bucket durability at `strict`, and record inline admission, versioning, EC layout, CPU quota, storage mapping, background activity and build identity for each run. A historical release comparison also requires fixing that release's source and build inputs.
+
+| Cell | Spin iterations | Keep multiple idle workers |
+| --- | --- | --- |
+| Current default | 1024 | true |
+| Shorter spin | 256 | true |
+| Single idle reservation | 1024 | false |
+| Combined candidate | 256 | false |
+
+Before A1, record the acceptable baseline drift, minimum gain above measurement noise, and p99, RSS and error limits. Verify A/A stability, then compare each candidate with the default through A1/B1/B2/A2. Include sustained fresh 100 KiB PUT and short burst/idle/burst traffic. Track the dev-to-1.0.5 change and the beta.10 gap as separate outcomes.
+
+Collect detailed diagnostics in dedicated rounds with `RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED=true` and metrics export enabled. Include `disk_prepared_metadata_fdatasync` for inline `xl.meta`, `disk_fsync_worker_dispatch_wait`, `disk_fsync_worker_execute`, destination and ancestor directory sync stages, and actual worker/spin activity. Operation execution timers cover the job closure; idle-spin diagnostics cover the loop between jobs. Heavy syscall tracing and on/off-CPU profiling belong in these diagnostic rounds. Use the same lightweight observation settings for all acceptance rounds.
+
+| Metric | Meaning |
+| --- | --- |
+| `rustfs_disk_fsync_workers_current` / `rustfs_disk_fsync_workers_peak` | Actual started fsync workers across the process, including workers executing or waiting inside a job and workers spinning between jobs. Queued worker reservations are excluded. |
+| `rustfs_disk_fsync_spinning_workers_current` / `rustfs_disk_fsync_spinning_workers_peak` | Workers in the measured idle-spin phase across all disk fsync lanes. A zero spin budget bypasses this phase. |
+| `rustfs_disk_fsync_idle_spin_episodes` / `rustfs_disk_fsync_idle_spin_iterations` | Completed measured spin episodes and actual `spin_loop` calls, aggregated once per episode. |
+| `rustfs_disk_fsync_idle_spin_duration_ms` | Elapsed time in the spin loop, including any descheduling. Interpret alongside on-CPU profiles. |
+
+These metrics cover the disk queue's Fsync lane. Direct fsync dispatches and cleanup work on the Isolated lane require their own stage observations. Peak gauges are process-lifetime high-water marks for workers whose diagnostics started while the detailed PUT gate was enabled, including startup and warmup. A retiring closure and its replacement can briefly overlap in this count while execution concurrency remains bounded. Restart each server per leg to establish a fresh lifetime. Guards finish accounting on normal exit and panic, including when the gate is disabled while a measured worker remains alive. Diagnostics use atomic accounting and cached metric handles outside the disk queue mutex; the recorder may acquire its own publication locks. Hold this observation overhead consistent within diagnostic comparisons.
 
 ### 5.2 GET
 

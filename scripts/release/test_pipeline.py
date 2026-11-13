@@ -175,6 +175,56 @@ class SourceCITests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pipeline.source_ci("a" * 40, "1.2.3")
 
+    def test_a_queue_landed_push_is_accepted_only_through_the_queue_run_of_its_tree(self):
+        tree = "d" * 40
+        gate = ("Quick Checks", "Test and Lint", "End-to-End Tests (full merge gate)")
+        push = dict(run_metadata(60, "ci.yml", "a" * 40), event="push")
+
+        def queued(run_id, branch, tree_id=tree):
+            return dict(run_metadata(run_id, "ci.yml", "a" * 40), event="merge_group", run_attempt=3,
+                        head_branch=f"gh-readonly-queue/{branch}/pr-1-" + "c" * 40, head_commit={"tree_id": tree_id},
+                        html_url=f"https://github.com/{c.REPOSITORY}/actions/runs/{run_id}")
+        listing = [queued(62, "main", "e" * 40), queued(63, "release/1.2.3"), queued(61, "main")]
+        # Keyed by (run id, attempt): reading another attempt's jobs is a KeyError, not evidence.
+        jobs = {(60, 2): [{"name": name, "status": "completed", "conclusion": "skipped" if name == gate[2] else "success"} for name in gate]}
+        jobs.update({(run["id"], 3): [{"name": name, "status": "completed", "conclusion": "success"} for name in gate] for run in listing})
+
+        def api(path):
+            if "/jobs?" in path:
+                run_id, attempt = path.split("/runs/")[1].split("/jobs?")[0].split("/attempts/")
+                return {"jobs": jobs[(int(run_id), int(attempt))]}
+            return {"workflow_runs": listing if "event=merge_group" in path else [push]}
+
+        def source_ci():
+            with patch.object(c, "github", side_effect=api), patch.object(c, "command", return_value=tree) as git:
+                found = pipeline.source_ci("a" * 40, "1.2.3")
+            self.assertEqual(git.call_args.args[0], ["git", "rev-parse", "--verify", "--end-of-options", "a" * 40 + "^{tree}"])
+            return found
+        self.assertEqual(source_ci(), {"run_id": 61, "run_attempt": 3})
+        listing.reverse()
+        self.assertEqual(source_ci(), {"run_id": 61, "run_attempt": 3})
+        push["head_branch"] = "release/1.2.3"
+        self.assertEqual(source_ci(), {"run_id": 63, "run_attempt": 3})
+        del listing[listing.index(next(run for run in listing if run["id"] == 63))]
+        with self.assertRaises(ValueError):
+            source_ci()
+        push["head_branch"] = "main"
+        match = next(run for run in listing if run["id"] == 61)
+        refusals = [(match, "head_commit", {"tree_id": "e" * 40}), (match, "head_branch", "gh-readonly-queue/release/1.2.3/pr-1-x"),
+                    (match, "conclusion", "failure"), (match, "event", "push"), (push, "event", "workflow_dispatch")]
+        for record, key, wrong in refusals:
+            old = record[key]; record[key] = wrong
+            with self.subTest(key=key, wrong=wrong), self.assertRaises(ValueError):
+                source_ci()
+            record[key] = old
+        for key, index, conclusion in (((61, 3), 2, "skipped"), ((61, 3), 0, "failure"), ((60, 2), 1, "failure")):
+            old = jobs[key][index]["conclusion"]; jobs[key][index]["conclusion"] = conclusion
+            with self.subTest(run=key, job=gate[index]), self.assertRaises(ValueError):
+                source_ci()
+            jobs[key][index]["conclusion"] = old
+        del jobs[(61, 3)][2]
+        with self.assertRaises(ValueError):
+            source_ci()
 
 class SupplyChainTests(unittest.TestCase):
     def test_actual_generator_uses_frozen_lock_and_all_package_formats(self):
