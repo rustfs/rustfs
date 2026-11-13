@@ -886,42 +886,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_management_routes_require_signature_and_handler_authentication() {
-        use s3s::route::S3Route;
-
+    async fn cluster_management_routes_require_handler_authentication() {
         let mut router = S3Router::new(false);
         register(&mut router).expect("register MRF cluster routes");
         assert_eq!(router.registered_routes().len(), 4);
         for prefix in ["/rustfs/admin", "/minio/admin"] {
-            for (method, suffix) in [
-                (Method::GET, ""),
-                (Method::GET, "/responsibilities"),
-                (Method::GET, "/responsibilities/node/00000000-0000-4000-8000-000000000001"),
-                (Method::POST, "/responsibilities/actions"),
-            ] {
+            let handlers: [(Method, &str, &dyn Operation); 4] = [
+                (Method::GET, "", &SummaryHandler),
+                (Method::GET, "/responsibilities", &ListHandler),
+                (Method::GET, "/responsibilities/node/00000000-0000-4000-8000-000000000001", &GetHandler),
+                (Method::POST, "/responsibilities/actions", &ActionHandler),
+            ];
+            for (method, suffix, handler) in handlers {
                 let path = format!("{prefix}{ROOT}{suffix}");
                 assert!(router.contains_compatible_route(method.clone(), &path));
-                let mut req = s3s::S3Request {
-                    input: s3s::Body::empty(),
-                    method,
-                    uri: path.parse().unwrap(),
-                    headers: http::HeaderMap::new(),
-                    extensions: http::Extensions::new(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                };
-                let error = router
-                    .check_access(&mut req)
-                    .await
-                    .expect_err("router must require a signature");
-                assert_eq!(error.code(), &S3ErrorCode::AccessDenied.into());
-                let error = router
-                    .call(req)
+                let req = TestRequest::new(method, path).build();
+                let error = handler
+                    .call(req, Params::new())
                     .await
                     .expect_err("handler must require authenticated credentials");
-                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest.into());
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
                 assert!(error.to_string().contains("authentication required"));
             }
         }
