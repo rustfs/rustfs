@@ -63,3 +63,23 @@ jobs:
 
       - name: Check the nixl feature build
         run: cargo check --locked -p rustfs --features nixl
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [nixl-check]
+    # Only scheduled runs open or update the tracking issue; pull-request and
+    # manual runs stay quiet.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
