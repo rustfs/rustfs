@@ -32,6 +32,7 @@
 //! `odm-source-etag`.
 
 use super::*;
+use crate::app::storage_api::s3::S3ErrorCode;
 
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
 use crate::on_demand_migration::{
@@ -298,6 +299,7 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
 mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
+    use crate::app::storage_api::s3::dto::GetObjectInput;
     use crate::app::storage_api::s3::{
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,

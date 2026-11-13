@@ -1285,7 +1285,7 @@ impl SetDisks {
                             result.after.drives.push(HealDriveInfo {
                                 uuid: "".to_string(),
                                 endpoint: self.set_endpoints[index].to_string(),
-                                state: drive_state.to_string(),
+                                state: drive_state,
                             });
                         }
 
@@ -3102,7 +3102,7 @@ impl SetDisks {
             result.after.drives.push(HealDriveInfo {
                 uuid: "".to_string(),
                 endpoint,
-                state: drive_state.to_string(),
+                state: drive_state,
             });
         }
 
@@ -3147,7 +3147,7 @@ impl SetDisks {
                         _ => DriveState::Corrupt.to_string(),
                     },
                 };
-                result.after.drives[index].state = drive_state.to_string();
+                result.after.drives[index].state = drive_state;
             }
         }
 
@@ -10948,7 +10948,7 @@ mod heal_result_report_tests {
                     set.heal_object(bucket, object, "", &heal_opts),
                 );
                 let put_info = put_res.expect("overwrite must succeed under lock serialization");
-                last_etag = put_info.etag.clone().unwrap_or_default();
+                last_etag = put_info.etag.unwrap_or_default();
                 // Heal outcome is unconstrained (may hit the tail race and report a
                 // retryable error); the invariant is checked on the end state.
                 drop(heal_res);

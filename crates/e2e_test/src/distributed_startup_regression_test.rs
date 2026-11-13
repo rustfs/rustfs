@@ -1332,14 +1332,15 @@ mod tests {
                 .collect();
             assert_eq!(confirmed.len(), 1);
             let mut receivers = Vec::new();
-            for drive in 0..phase.disks.get(1).map_or(0, Vec::len) {
+            let receiver_endpoints = phase.disks.get(1).map_or(&[][..], |disks| &phase.endpoints[1][..disks.len()]);
+            for endpoint in receiver_endpoints {
                 for cas in [prepares[1], commits[1]] {
                     let matching: Vec<_> = events[1]
                         .iter()
                         .copied()
                         .filter(|event| {
                             event["kind"] == "receiver"
-                                && event["disk"] == phase.endpoints[1][drive]
+                                && event["disk"] == *endpoint
                                 && event["dst_volume"] == ".rustfs.sys"
                                 && event["dst_path"] == "pool.bin"
                                 && event["etag"] == cas["etag"]

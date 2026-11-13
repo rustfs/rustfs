@@ -15,6 +15,8 @@
 use super::*;
 use crate::app::object::request_body::{BodyReadControl, ObservedBody};
 use crate::app::storage_api::s3::Body as S3Body;
+use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+use crate::app::storage_api::s3::{S3ErrorCode, S3Request};
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::ObjectIO;
 use http_body::Frame;

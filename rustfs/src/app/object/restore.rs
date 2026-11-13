@@ -16,6 +16,9 @@
 
 use super::*;
 use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
+use crate::app::storage_api::s3::dto::{RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreRequestType};
+use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use rustfs_filemeta::RestoreStatus;
 
 // RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.

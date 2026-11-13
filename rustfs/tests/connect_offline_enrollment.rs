@@ -1199,7 +1199,7 @@ fn enrollment_opens_no_descriptor_and_is_a_pure_byte_transform() {
         fields.push((
             challenge.challenge_id.clone(),
             challenge.nonce.clone(),
-            challenge.challenge_proof.clone(),
+            challenge.challenge_proof,
             signed_octets(&serde_json::from_slice::<Value>(&response).expect("JSON")),
         ));
     }

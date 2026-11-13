@@ -574,7 +574,7 @@ mod tests {
             tonic::Status::internal("operation was canceled"),
         ] {
             assert!(
-                !Error::Storage(EcstoreError::from(status).clone()).is_recoverable_heal(),
+                !Error::Storage(EcstoreError::from(status)).is_recoverable_heal(),
                 "cancellation text alone must not change application error classification"
             );
         }
@@ -722,7 +722,7 @@ mod tests {
             for error in [
                 Error::Disk(DiskError::from(status.clone())),
                 Error::Storage(EcstoreError::from(status.clone())),
-                Error::Io(std::io::Error::from(DiskError::from(status.clone()))),
+                Error::Io(std::io::Error::from(DiskError::from(status))),
             ] {
                 assert!(!error.is_recoverable_heal(), "application RPC errors must stay terminal: {error:?}");
             }

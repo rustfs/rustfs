@@ -52,6 +52,8 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    pub(crate) use s3s::S3Response;
+    pub(crate) use s3s::StdError;
     #[cfg(test)]
     pub(crate) use s3s::access::S3Access;
     #[cfg(test)]
@@ -70,16 +72,19 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    pub(crate) use s3s::header;
+    pub(crate) use s3s::region;
+    pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    pub(crate) use s3s::stream;
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
-    #[cfg(test)]
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3, S3Response};
+    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 

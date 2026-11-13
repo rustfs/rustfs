@@ -13,6 +13,7 @@
 # Metric direction:
 #   reqps, throughput  -> higher is better; regression is a negative delta.
 #   latency (incl p99) -> lower is better;  regression is a positive delta.
+# --baseline-drift compares the magnitude in either direction to the budget.
 #
 # Input CSV header (from run_object_batch_bench_enhanced.sh compare_baseline):
 #   size,tool,concurrency,new_median_reqps,baseline_median_reqps,delta_reqps_pct,
@@ -27,6 +28,7 @@ FAIL_PCT=10
 WARN_PCT=5
 ALLOW_REGRESSION="false"
 REQUIRE_TAIL_ERROR="false"
+BASELINE_DRIFT="false"
 MARKDOWN_OUT=""
 EXEMPTION_REASON="deliberate correctness tradeoff"
 declare -a COMPARE_CSVS=()
@@ -46,6 +48,8 @@ Usage: hotpath_warp_ab_gate.sh --compare-csv <file> [--compare-csv <file> ...] [
                          correctness tradeoff); the gate then always exits 0.
   --require-tail-error   Require the extended p90/p99/error-rate schema and
                          reject missing tail/error or zero-success evidence.
+  --baseline-drift       Apply the budget to absolute deltas in either direction
+                         for baseline stability; excludes --allow-regression.
   --exemption-reason <s> Reason recorded when --allow-regression is set.
   --markdown <file>      Also write the result table as Markdown to <file>.
   -h, --help             Show this help.
@@ -64,12 +68,18 @@ while [[ $# -gt 0 ]]; do
     --warn-pct) WARN_PCT="$2"; shift 2 ;;
     --allow-regression) ALLOW_REGRESSION="true"; shift ;;
     --require-tail-error) REQUIRE_TAIL_ERROR="true"; shift ;;
+    --baseline-drift) BASELINE_DRIFT="true"; shift ;;
     --exemption-reason) EXEMPTION_REASON="$2"; shift 2 ;;
     --markdown) MARKDOWN_OUT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$BASELINE_DRIFT" == "true" && "$ALLOW_REGRESSION" == "true" ]]; then
+  echo "error: --baseline-drift cannot be combined with --allow-regression" >&2
+  exit 2
+fi
 
 if [[ ${#COMPARE_CSVS[@]} -eq 0 ]]; then
   echo "error: at least one --compare-csv is required" >&2
@@ -105,12 +115,13 @@ compare_labels="$(IFS="$label_separator"; echo "${COMPARE_LABELS[*]}")"
 # "verdict\tconfiguration\tworkload\tmetric\tdelta"
 # on stdout and a final "OVERALL\t<verdict>" line. Verdict is PASS/WARN/FAIL.
 gate_output="$(
-  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" -v strict="$REQUIRE_TAIL_ERROR" \
+  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" -v strict="$REQUIRE_TAIL_ERROR" -v baseline_drift="$BASELINE_DRIFT" \
       -v label_blob="$compare_labels" -v label_separator="$label_separator" '
     function classify(delta, higher_is_better,   regress) {
       if (delta == "" || delta == "N/A") return "SKIP"
       # Signed regression magnitude: positive means "worse than baseline".
       regress = higher_is_better ? -delta : delta
+      if (baseline_drift == "true") regress = abs(delta)
       if (regress > fail_pct) return "FAIL"
       if (regress > warn_pct) return "WARN"
       return "PASS"
@@ -200,9 +211,15 @@ fi
 emoji() { case "$1" in FAIL) echo '❌';; WARN) echo '⚠️';; PASS) echo '✅';; *) echo '';; esac; }
 
 render() {
-  echo "### Hotpath warp A/B gate — $(emoji "$effective") $effective"
-  echo
-  echo "Budget: regression > ${FAIL_PCT}% fails, > ${WARN_PCT}% warns (relative to baseline)."
+  if [[ "$BASELINE_DRIFT" == "true" ]]; then
+    echo "### Hotpath warp baseline drift gate — $(emoji "$effective") $effective"
+    echo
+    echo "Absolute drift > ${FAIL_PCT}% fails, > ${WARN_PCT}% warns (in either direction relative to baseline)."
+  else
+    echo "### Hotpath warp A/B gate — $(emoji "$effective") $effective"
+    echo
+    echo "Budget: regression > ${FAIL_PCT}% fails, > ${WARN_PCT}% warns (relative to baseline)."
+  fi
   if [[ "$exempted" == "true" ]]; then
     echo
     echo "> Gate FAIL exempted via \`--allow-regression\`: ${EXEMPTION_REASON}."
