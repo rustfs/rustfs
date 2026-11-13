@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{
-    ClusterHealthProbeKind, DependencyReadiness, DependencyReadinessReport, Endpoint, EndpointServerPools, StorageAdminApi,
+    ClusterHealthProbeKind, DependencyReadiness, DependencyReadinessReport, EndpointServerPools, StorageAdminApi,
     StorageWriteReadinessStatus, collect_peer_health_readiness, configured_readiness_topology,
     dependency_readiness_report_from_write_status, disk_is_online_for_readiness, exclusive_lock_quorum, is_dist_erasure,
     pool_metadata_write_readiness, pool_read_quorum, pool_write_quorum, runtime_sources,
@@ -272,15 +272,23 @@ async fn collect_lock_quorum_with(endpoints: &EndpointServerPools, mut probes: L
     let mut host_sets: HashMap<String, Vec<usize>> = HashMap::new();
     let mut votes_needed = Vec::new();
     for pool in endpoints.as_ref() {
-        for set_idx in 0..pool.set_count {
-            let hosts = pool
-                .endpoints
-                .as_ref()
-                .iter()
-                .filter(|endpoint| usize::try_from(endpoint.set_idx).ok() == Some(set_idx))
-                .map(Endpoint::host_port)
-                .filter(|host| !host.is_empty())
-                .collect::<HashSet<_>>();
+        if pool.set_count > pool.endpoints.as_ref().len() {
+            return false;
+        }
+        let mut set_hosts = vec![HashSet::new(); pool.set_count];
+        for endpoint in pool.endpoints.as_ref() {
+            let Some(hosts) = usize::try_from(endpoint.set_idx)
+                .ok()
+                .and_then(|index| set_hosts.get_mut(index))
+            else {
+                continue;
+            };
+            let host = endpoint.host_port();
+            if !host.is_empty() {
+                hosts.insert(host);
+            }
+        }
+        for hosts in set_hosts {
             if hosts.is_empty() {
                 return false;
             }
@@ -317,7 +325,7 @@ async fn collect_lock_quorum_with(endpoints: &EndpointServerPools, mut probes: L
 mod tests {
     use super::super::{aggregate_lock_quorum_status, storage_read_ready_from_runtime_state, storage_ready_from_runtime_state};
     use super::*;
-    use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
+    use crate::storage_api::server::readiness::{Endpoint, Endpoints, PoolEndpoints};
     use std::future;
     use std::sync::{
         Arc,
@@ -707,6 +715,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_lock_set_count_is_rejected_before_allocation() {
+        let (_, mut endpoints) = topology(&[(1, 16, 4)]);
+        endpoints.as_mut()[0].set_count = usize::MAX;
+        assert!(!collect_lock_quorum_with(&endpoints, LockProbes::new()).await);
     }
 
     #[tokio::test]
