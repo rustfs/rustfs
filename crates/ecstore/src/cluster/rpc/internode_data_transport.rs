@@ -2290,15 +2290,18 @@ mod tests {
             ]
         );
 
-        for configured in [DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP] {
+        for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
             let transport = build_internode_data_transport(Some(configured)).unwrap();
+            // NIXL builds everywhere and serves reads over TCP/HTTP until a node
+            // installs its receive pool; every other known name is the TCP transport.
+            let expected = if *configured == INTERNODE_DATA_TRANSPORT_NIXL {
+                INTERNODE_DATA_TRANSPORT_NIXL
+            } else {
+                DEFAULT_INTERNODE_DATA_TRANSPORT
+            };
 
-            assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+            assert_eq!(transport.name(), expected);
         }
-        // NIXL builds everywhere and serves reads over TCP/HTTP until a node
-        // installs its receive pool.
-        let transport = build_internode_data_transport(Some(INTERNODE_DATA_TRANSPORT_NIXL)).unwrap();
-        assert_eq!(transport.name(), INTERNODE_DATA_TRANSPORT_NIXL);
     }
 
     #[test]

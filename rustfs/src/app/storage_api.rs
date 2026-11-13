@@ -52,6 +52,8 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+    pub(crate) use s3s::Body;
     pub(crate) use s3s::S3Response;
     pub(crate) use s3s::StdError;
     #[cfg(test)]
@@ -84,7 +86,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
+    pub(crate) use s3s::{BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
@@ -1766,6 +1768,10 @@ pub(crate) mod object_usecase {
     }
 
     /// Process-wide runtime facts the object use case reads (cuObject S3-over-RDMA addressing).
+    /// ECStore surface of the S3-over-RDMA object transport.
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use crate::storage::storage_api::ecstore_rdma as rdma;
+
     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) mod runtime {
         pub(crate) use super::super::runtime::get_global_endpoints_opt;

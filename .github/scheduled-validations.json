@@ -297,6 +297,34 @@
       "alert_contract": "scheduled-validation"
     },
     {
+      "workflow": ".github/workflows/rdma-feature-check.yml",
+      "name": "S3-over-RDMA feature check",
+      "roles": [
+        "pr",
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "weekly",
+      "timezone": "UTC",
+      "schedule": [
+        "37 5 * * 1"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 192,
+      "result_owner": "rdma-feature-check.yml",
+      "disposition": "compiles the nixl feature on Linux; the feature is off in every other build",
+      "failure_owner": "workflow",
+      "origin": "added",
+      "alert_contract": "scheduled-validation"
+    },
+    {
       "workflow": ".github/workflows/rustfs-validation-sweep.yml",
       "name": "RustFS Validation Sweep",
       "roles": [

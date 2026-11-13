@@ -20,7 +20,6 @@
 //! with a NIXL WRITE before answering with the byte count. The request's
 //! signature is checked by the internode dispatcher before it reaches here.
 
-use crate::app::object::cuobject::nixl_server;
 use crate::storage::storage_api::rpc_consumer::nixl_read::{
     Disk, DiskAPI as _, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, WRITE_FILE_NIXL_PATH, check_and_record_signed_rpc_nonce,
     find_local_disk_by_ref_for_rpc,
@@ -29,11 +28,26 @@ use http::{HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use rustfs_io_metrics::internode_metrics::{INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_RDMA};
 use rustfs_nixl::RdmaToken;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
+
+/// This node's NIXL agent, installed by the S3-over-RDMA service once it runs.
+/// It lives here, below the app layer, so these handlers can reach it.
+static NIXL_SERVER: OnceLock<Arc<rustfs_nixl::NixlServer>> = OnceLock::new();
+
+/// Records this node's NIXL agent; the first installation wins.
+pub(crate) fn install_nixl_server(server: Arc<rustfs_nixl::NixlServer>) {
+    let _ = NIXL_SERVER.set(server);
+}
+
+/// This node's NIXL agent, once the transport service is running.
+pub(crate) fn nixl_server() -> Option<Arc<rustfs_nixl::NixlServer>> {
+    NIXL_SERVER.get().cloned()
+}
 
 /// Finishes one segment's file. A flush is not enough: the direct-I/O disk
 /// writer writes its trailing sub-alignment bytes only on shutdown, so a

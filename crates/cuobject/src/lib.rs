@@ -25,6 +25,11 @@
 //! RustFS's pool of registered, page-aligned host staging buffers: the regular
 //! read path fills a staging chunk and
 //! [`CuObjectServer::write_to_client_owned`] pushes it.
+//!
+//! Everything below needs the `server` feature, which compiles the
+//! NVIDIA cuObject server bindings; without it the crate is empty, so a
+//! workspace build does not need the cuObject SDK.
+#![cfg(feature = "server")]
 
 use bytes::Bytes;
 use cuobject::{Channel, Completion, RegisteredBuffer, Server, ServerOptions, SgBuffer, SgEntry, Source};
@@ -642,6 +647,8 @@ impl CuObjectServer {
     /// Moves `local` with the library's asynchronous mode: the GET is
     /// submitted on a channel of its own and the task waits on that channel's
     /// completion descriptor instead of holding a blocking thread.
+    // SAFETY: the allowance covers only this function; its two unsafe calls
+    // each state the invariant they rely on.
     #[allow(unsafe_code)]
     async fn get_async(
         &self,

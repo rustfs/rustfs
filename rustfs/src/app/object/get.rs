@@ -4151,7 +4151,7 @@ impl DefaultObjectUsecase {
                     extra_headers.push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
                 }
                 http_content_length = 0;
-                StreamingBlob::from(s3s::Body::empty())
+                StreamingBlob::from(crate::app::storage_api::s3::Body::empty())
             }
             #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
             Some(never) => match never {},

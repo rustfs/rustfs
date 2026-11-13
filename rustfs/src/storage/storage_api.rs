@@ -655,6 +655,14 @@ pub(crate) mod ecstore_rio {
     };
 }
 
+/// ECStore surface of the S3-over-RDMA object transport (`cuobject`/`nixl` features).
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) mod ecstore_rdma {
+    pub(crate) use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
+    #[cfg(feature = "nixl")]
+    pub(crate) use rustfs_ecstore::api::rpc::nixl::{NixlRecvBuffer, NixlRecvPool, install_nixl_recv_pool};
+}
+
 #[cfg(feature = "internode-transport")]
 pub(crate) mod ecstore_internode {
     pub use ecstore_rpc::{

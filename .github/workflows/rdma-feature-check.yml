@@ -1,0 +1,65 @@
+name: S3-over-RDMA feature check
+
+# The `nixl` and `cuobject` features are off in every other build, so the code
+# behind them is compiled nowhere else. This job compiles the `nixl` half on
+# Linux; nixl-sys builds through its stub fallback, so no NIXL SDK is needed.
+# The cuObject half needs the NVIDIA cuObject SDK and is not compiled here.
+# Not a required check and not part of the `Test and Lint` aggregate.
+
+on:
+  pull_request:
+    paths:
+      - "crates/nixl/**"
+      - "crates/cuobject/**"
+      - "rustfs/src/storage/rpc/nixl*"
+      - "rustfs/src/app/object/cuobject.rs"
+      - "rustfs/src/app/object/get.rs"
+      - "rustfs/src/app/object/put.rs"
+      - "rustfs/src/app/multipart_usecase/upload_part.rs"
+      - "Cargo.toml"
+      - "rustfs/Cargo.toml"
+      - ".github/workflows/rdma-feature-check.yml"
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdma-feature-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nixl-check:
+    name: cargo check (nixl)
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-feat-nixl
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Install only missing native build tools
+        run: |
+          packages=()
+          command -v g++ >/dev/null || packages+=(g++)
+          ldconfig -p | grep -q 'libclang' || packages+=(libclang-dev)
+          if (( ${#packages[@]} )); then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y "${packages[@]}"
+          fi
+
+      - name: Check the nixl feature build
+        run: cargo check --locked -p rustfs --features nixl

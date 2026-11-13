@@ -2,6 +2,9 @@
 //! surface of the crate lives here: disjoint range views and the
 //! memory-region trait the binding needs.
 
+// SAFETY: the allowance is scoped to this module: the two range views state
+// their invariant inline, and `as_ptr` is the binding's required unsafe
+// trait method returning the mapping's own pointer.
 #![allow(unsafe_code)]
 
 use crate::NixlError;

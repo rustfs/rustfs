@@ -55,11 +55,11 @@ pub(crate) mod transport {
         library_version,
     };
 }
-use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
+use crate::app::storage_api::object_usecase::rdma::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
+use crate::app::storage_api::s3::dto::StreamingBlob;
+use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
-use s3s::dto::StreamingBlob;
-use s3s::stream::{ByteStream, RemainingLength};
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::collections::VecDeque;
 use std::io;
 #[cfg(not(feature = "nixl"))]
@@ -331,6 +331,10 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         library = format_args!("{major}.{minor}"),
         "s3-over-rdma transport service started"
     );
+    #[cfg(feature = "nixl")]
+    if let Some(server) = servers.first() {
+        crate::storage::rpc::nixl_read::install_nixl_server(Arc::clone(server));
+    }
     let _ = SERVICE.set(Arc::new(CuObjectService {
         servers,
         inflight_writes,
@@ -439,12 +443,6 @@ async fn checked_nixl_devices(candidates: Vec<String>, max_link_drops: u64, flap
     Ok(check.kept)
 }
 
-/// This node's NIXL agent, once the transport service is running.
-#[cfg(feature = "nixl")]
-pub(crate) fn nixl_server() -> Option<Arc<CuObjectServer>> {
-    SERVICE.get()?.servers.first().cloned()
-}
-
 /// Receive buffers for internode NIXL reads: staging chunks of this node's agent.
 #[cfg(feature = "nixl")]
 struct NixlRecvPoolAdapter {
@@ -457,7 +455,7 @@ struct NixlRecvPoolAdapter {
 struct NixlRecvChunk(StagingChunk);
 
 #[cfg(feature = "nixl")]
-impl rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer for NixlRecvChunk {
+impl crate::app::storage_api::object_usecase::rdma::NixlRecvBuffer for NixlRecvChunk {
     fn descriptor(&self) -> String {
         self.descriptor_for(self.0.capacity())
     }
@@ -480,7 +478,7 @@ impl rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer for NixlRecvChunk {
 }
 
 #[cfg(feature = "nixl")]
-impl rustfs_ecstore::api::rpc::nixl::NixlRecvPool for NixlRecvPoolAdapter {
+impl crate::app::storage_api::object_usecase::rdma::NixlRecvPool for NixlRecvPoolAdapter {
     fn agent_name(&self) -> &str {
         self.server.name()
     }
@@ -499,11 +497,12 @@ impl rustfs_ecstore::api::rpc::nixl::NixlRecvPool for NixlRecvPoolAdapter {
 
     fn reserve(
         &self,
-    ) -> futures::future::BoxFuture<'static, io::Result<Box<dyn rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer>>> {
+    ) -> futures::future::BoxFuture<'static, io::Result<Box<dyn crate::app::storage_api::object_usecase::rdma::NixlRecvBuffer>>>
+    {
         let server = Arc::clone(&self.server);
         Box::pin(async move {
             let chunk = server.reserve(STAGING_RESERVE_TIMEOUT).await.map_err(io::Error::other)?;
-            Ok(Box::new(NixlRecvChunk(chunk)) as Box<dyn rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer>)
+            Ok(Box::new(NixlRecvChunk(chunk)) as Box<dyn crate::app::storage_api::object_usecase::rdma::NixlRecvBuffer>)
         })
     }
 }
@@ -523,7 +522,7 @@ fn install_nixl_recv_pool(servers: &[Arc<CuObjectServer>]) -> io::Result<()> {
         metadata_base64: base64_simd::STANDARD.encode_to_string(&metadata),
         metadata_sha256_hex: crate::storage::rpc::nixl_read::sha256_hex(&metadata),
     };
-    rustfs_ecstore::api::rpc::nixl::install_nixl_recv_pool(Arc::new(adapter));
+    crate::app::storage_api::object_usecase::rdma::install_nixl_recv_pool(Arc::new(adapter));
     Ok(())
 }
 
@@ -785,12 +784,12 @@ pub(crate) async fn serve_get_over_rdma(
 /// client's buffer into staging, one chunk ahead of the consumer, and handed
 /// to the normal PUT pipeline as an ordinary byte stream.
 struct RdmaPutBody {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, s3s::StdError>> + Send + Sync + 'static>>,
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static>>,
     remaining: usize,
 }
 
 impl Stream for RdmaPutBody {
-    type Item = Result<Bytes, s3s::StdError>;
+    type Item = Result<Bytes, StdError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = self.inner.as_mut().poll_next(cx);
@@ -894,7 +893,7 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_cop
             Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
         }
     });
-    let stream = futures::TryStreamExt::map_err(stream, |error: io::Error| -> s3s::StdError { Box::new(error) });
+    let stream = futures::TryStreamExt::map_err(stream, |error: io::Error| -> StdError { Box::new(error) });
     let body = RdmaPutBody {
         inner: Box::pin(stream),
         remaining: usize::try_from(total)

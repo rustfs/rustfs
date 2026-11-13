@@ -15,8 +15,12 @@ documentation = "https://docs.rs/rustfs-cuobject/latest/rustfs_cuobject/"
 workspace = true
 
 [dependencies]
-bytes = { workspace = true }
-cuobject = { workspace = true }
-parking_lot = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+bytes = { workspace = true, optional = true }
+cuobject = { workspace = true, default-features = false, optional = true }
+parking_lot = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"], optional = true }
+
+[features]
+# Compiles the cuObject server bindings (needs the NVIDIA cuObject SDK).
+server = ["dep:bytes", "dep:cuobject", "cuobject/server", "dep:parking_lot", "dep:thiserror", "dep:tokio"]

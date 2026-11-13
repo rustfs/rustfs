@@ -91,7 +91,7 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 # `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
 gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
-cuobject = ["dep:rustfs-cuobject"]
+cuobject = ["dep:rustfs-cuobject", "rustfs-cuobject/server"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
 nixl = ["dep:rustfs-nixl"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
