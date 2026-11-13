@@ -34,18 +34,17 @@ use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
 use crate::server::{
     ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
 };
-use crate::storage::storage_api::persisted_to_s3s;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::persistence::PersistedNotificationConfiguration;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::{error, info, warn};
@@ -278,55 +277,34 @@ fn subscription_target_arn(params: &Params<'_, '_>, region: &str) -> S3Result<St
 
 fn collect_target_subscriptions(
     bucket: &str,
-    config: s3s::dto::NotificationConfiguration,
+    config: &PersistedNotificationConfiguration,
     target_arn: &str,
-) -> S3Result<Vec<TargetSubscription>> {
-    let value = serde_json::to_value(config).map_err(|e| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
-    })?;
-    let mut subscriptions = Vec::new();
-    for key in [
-        "queue_configurations",
-        "topic_configurations",
-        "lambda_function_configurations",
-    ] {
-        if let Some(entries) = value.get(key).and_then(Value::as_array) {
-            for entry in entries {
-                let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
+) -> Vec<TargetSubscription> {
+    let routes = config.behavior();
+    [routes.queue_routes, routes.topic_routes, routes.lambda_routes]
+        .into_iter()
+        .flatten()
+        .filter(|route| route.destination == target_arn)
+        .map(|route| {
+            let filter_value = |name: &str| {
+                route
+                    .filter_rules
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .find_map(|field| entry.get(field).and_then(Value::as_str));
-                if arn != Some(target_arn) {
-                    continue;
-                }
-                let filters = entry
-                    .get("filter")
-                    .and_then(|v| v.get("key"))
-                    .and_then(|v| v.get("filter_rules"))
-                    .and_then(Value::as_array);
-                let filter_value = |name: &str| {
-                    filters.and_then(|rules| {
-                        rules.iter().find_map(|rule| {
-                            (rule.get("name").and_then(Value::as_str) == Some(name))
-                                .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
-                                .flatten()
-                        })
-                    })
-                };
-                subscriptions.push(TargetSubscription {
-                    bucket: bucket.to_string(),
-                    id: entry.get("id").and_then(Value::as_str).map(str::to_string),
-                    events: entry
-                        .get("events")
-                        .and_then(Value::as_array)
-                        .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                        .unwrap_or_default(),
-                    prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
-                    suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
-                });
+                    .find_map(|(rule_name, value)| (rule_name.as_deref() == Some(name)).then(|| value.clone()).flatten())
+            };
+            let prefix = filter_value("Prefix").or_else(|| filter_value("prefix"));
+            let suffix = filter_value("Suffix").or_else(|| filter_value("suffix"));
+            TargetSubscription {
+                bucket: bucket.to_string(),
+                id: route.id,
+                events: route.events,
+                prefix,
+                suffix,
             }
-        }
-    }
-    Ok(subscriptions)
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -350,7 +328,7 @@ impl Operation for ListTargetSubscriptions {
             else {
                 continue;
             };
-            subscriptions.extend(collect_target_subscriptions(&bucket.name, persisted_to_s3s(&config)?, &target_arn)?);
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, &config, &target_arn));
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
@@ -685,6 +663,7 @@ mod tests {
     use rustfs_config::server_config::{KV, KVS};
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
     use rustfs_targets::arn::TargetID;
+    use serde_json::Value;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
@@ -1213,60 +1192,84 @@ mod tests {
         }
     }
 
+    /// A stored configuration as the handler loads it from bucket metadata.
+    fn stored_notification(xml: &str) -> PersistedNotificationConfiguration {
+        rustfs_gateway_types::persistence::parse_notification(xml.as_bytes()).expect("stored notification XML should parse")
+    }
+
+    fn subscriptions_json(bucket: &str, xml: &str, target_arn: &str) -> Value {
+        let config = stored_notification(xml);
+        let subscriptions = collect_target_subscriptions(bucket, &config, target_arn);
+        serde_json::to_value(subscriptions).expect("subscriptions should serialize")
+    }
+
     #[test]
     fn target_subscriptions_match_all_config_kinds_without_crossing_target_identity() {
-        let config: s3s::dto::NotificationConfiguration = serde_json::from_value(serde_json::json!({
-            "queue_configurations": [
-                {
-                    "id": "uploads",
-                    "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook",
-                    "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                    "filter": { "key": { "filter_rules": [
-                        { "name": "prefix", "value": "photos/" },
-                        { "name": "suffix", "value": ".jpg" }
-                    ] } }
-                },
-                { "id": "other-service", "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:kafka", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-target", "queue_arn": "arn:rustfs:sqs:eu-west-1:secondary:webhook", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-region", "queue_arn": "arn:rustfs:sqs:us-east-1:primary:webhook", "events": ["s3:ObjectCreated:*"] }
-            ],
-            "topic_configurations": [
-                { "id": "topic", "topic_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectCreated:Put"] }
-            ],
-            "lambda_function_configurations": [
-                { "lambda_function_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectRemoved:Delete"] }
-            ]
-        }))
-        .expect("notification DTO should deserialize");
+        let xml = r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>uploads</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:webhook</Queue>
+                <Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>photos/</Value></FilterRule>
+                    <FilterRule><Name>suffix</Name><Value>.jpg</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>other-service</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:kafka</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-target</Id><Queue>arn:rustfs:sqs:eu-west-1:secondary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-region</Id><Queue>arn:rustfs:sqs:us-east-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <TopicConfiguration><Id>topic</Id><Topic>arn:rustfs:sqs:eu-west-1:primary:webhook</Topic><Event>s3:ObjectCreated:Put</Event></TopicConfiguration>
+            <CloudFunctionConfiguration><CloudFunction>arn:rustfs:sqs:eu-west-1:primary:webhook</CloudFunction><Event>s3:ObjectRemoved:Delete</Event></CloudFunctionConfiguration>
+        </NotificationConfiguration>"#;
         let router = subscription_router();
         for target_type in ["webhook", "notify_webhook"] {
             let path = format!("/v3/target/{target_type}/primary/subscriptions");
             let params = router.at(&path).expect("subscription route should match").params;
             let arn = subscription_target_arn(&params, "eu-west-1").expect("webhook ARN should resolve");
-            let subscriptions =
-                collect_target_subscriptions("photos", config.clone(), &arn).expect("subscriptions should collect");
             assert_eq!(
-                serde_json::to_value(subscriptions).expect("subscriptions should serialize"),
+                subscriptions_json("photos", xml, &arn),
                 serde_json::json!([
                     { "bucket": "photos", "id": "uploads", "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], "prefix": "photos/", "suffix": ".jpg" },
                     { "bucket": "photos", "id": "topic", "events": ["s3:ObjectCreated:Put"], "prefix": null, "suffix": null },
                     { "bucket": "photos", "id": null, "events": ["s3:ObjectRemoved:Delete"], "prefix": null, "suffix": null }
                 ])
             );
-            assert!(
-                collect_target_subscriptions("photos", config.clone(), "arn:rustfs:sqs:eu-west-1:unused:webhook")
-                    .expect("unmatched subscriptions should collect")
-                    .is_empty()
+            assert_eq!(
+                subscriptions_json("photos", xml, "arn:rustfs:sqs:eu-west-1:unused:webhook"),
+                serde_json::json!([])
             );
         }
-        assert!(
-            collect_target_subscriptions(
-                "empty",
-                s3s::dto::NotificationConfiguration::default(),
-                "arn:rustfs:sqs::primary:webhook"
-            )
-            .expect("empty configuration should collect")
-            .is_empty()
+        assert_eq!(
+            subscriptions_json("empty", "<NotificationConfiguration/>", "arn:rustfs:sqs::primary:webhook"),
+            serde_json::json!([])
+        );
+    }
+
+    /// The capitalized rule name wins over the lowercase one wherever it
+    /// stands, a rule without a value never supplies one, and the destination
+    /// is compared exactly.
+    #[test]
+    fn target_subscriptions_read_filter_rules_by_exact_name_and_skip_valueless_rules() {
+        const ARN: &str = "arn:rustfs:sqs:eu-west-1:primary:webhook";
+        let xml = format!(
+            r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>ordered</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>lower/</Value></FilterRule>
+                    <FilterRule><Name>Prefix</Name></FilterRule>
+                    <FilterRule><Name>Prefix</Name><Value>upper/</Value></FilterRule>
+                    <FilterRule><Name>SUFFIX</Name><Value>.shout</Value></FilterRule>
+                    <FilterRule><Value>.nameless</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>valueless</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key><FilterRule><Name>suffix</Name></FilterRule></S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>case</Id><Queue>ARN:rustfs:sqs:eu-west-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>padded</Id><Queue>{ARN} </Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+        </NotificationConfiguration>"#
+        );
+        assert_eq!(
+            subscriptions_json("photos", &xml, ARN),
+            serde_json::json!([
+                { "bucket": "photos", "id": "ordered", "events": ["s3:ObjectCreated:*"], "prefix": "upper/", "suffix": null },
+                { "bucket": "photos", "id": "valueless", "events": ["s3:ObjectCreated:*"], "prefix": null, "suffix": null }
+            ])
         );
     }
 

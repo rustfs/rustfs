@@ -28,6 +28,7 @@
 use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
+use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
     AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
 };
@@ -40,10 +41,12 @@ use crate::app::storage_api::context::{
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
-use http::{Extensions, HeaderMap, Method, Uri};
+use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_ops::S3Operation;
 use rustfs_trusted_proxies::ClientInfo;
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -595,6 +598,39 @@ impl RequestEnvelope {
             self.remote_addr(),
             self.request_context(),
         )
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the operation batches of rustfs/backlog#2749 are its first callers (task H2)"
+    )
+)]
+impl RequestEnvelope {
+    /// Runs `handler` on this request and records its outcome as an audit-only
+    /// entry for `op`, the owned form of the legacy edge's `audit_only_operation`.
+    ///
+    /// The entry is started before the request is handed over; a success is
+    /// recorded with `success_status` and no added response headers. An operation
+    /// that adds response headers builds its helper with
+    /// [`OperationHelper::audit_only_from_view`] and calls
+    /// [`OperationHelper::complete_owned`] itself.
+    pub(crate) async fn audit_only_operation<O, F, Fut>(
+        req: Self,
+        op: S3Operation,
+        success_status: StatusCode,
+        handler: F,
+    ) -> rustfs_s3_types::S3Result<O>
+    where
+        F: FnOnce(Self) -> Fut,
+        Fut: Future<Output = rustfs_s3_types::S3Result<O>>,
+    {
+        let helper = OperationHelper::audit_only_from_view(&req.audit_view(), op);
+        let result = handler(req).await;
+        let _helper = helper.complete_owned(&result, success_status, &HeaderMap::new());
+        result
     }
 }
 

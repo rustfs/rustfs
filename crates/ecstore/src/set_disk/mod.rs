@@ -700,7 +700,16 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
         _ => 8 * MB,                        // > 256MB: 8MB
     };
     let object_cap = usize::try_from(object_size).ok().filter(|size| *size > 0).unwrap_or(target);
-    target.min(object_cap.max(64 * KB)).min(get_duplex_buffer_size())
+    let configured = get_duplex_buffer_size();
+    // An explicit `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` above the default raises the
+    // pipe for large objects (so the decoder can run a whole erasure block ahead
+    // of a slow consumer); the default or a smaller value only caps it.
+    let target = if configured > rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE && object_size > 268_435_456 {
+        configured
+    } else {
+        target
+    };
+    target.min(object_cap.max(64 * KB)).min(configured)
 }
 
 // ============================================================================

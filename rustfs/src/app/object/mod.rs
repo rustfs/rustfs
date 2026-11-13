@@ -26,6 +26,7 @@ use super::storage_api::object_usecase::access::{
     recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
     retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
+use super::storage_api::object_usecase::bucket::lockless_cache::is_lockless_cache_bucket;
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
@@ -34,6 +35,7 @@ use super::storage_api::object_usecase::bucket::replication::ReplicationState;
 use super::storage_api::object_usecase::bucket::replication::replication_statuses_map;
 use super::storage_api::object_usecase::bucket::{
     VersioningConfigExt as _,
+    etag::bucket_uses_xxh3_etag,
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
@@ -84,7 +86,9 @@ use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_mess
 use super::storage_api::object_usecase::helper::{
     OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
 };
-use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::object_usecase::io::{
+    DynReader, EtagAlgorithm, HashReader, WritePlan, compression_metadata_value, wrap_reader,
+};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]

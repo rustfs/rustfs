@@ -343,6 +343,14 @@ pub(crate) mod bucket {
     };
     use std::sync::Arc;
 
+    pub(crate) mod etag {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::etag::bucket_uses_xxh3_etag;
+    }
+
+    pub(crate) mod lockless_cache {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
+    }
+
     pub(crate) trait ObjectLockConfigExt {
         fn enabled(&self) -> bool;
     }
@@ -1627,7 +1635,7 @@ pub(crate) mod io {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
     pub(crate) use crate::storage::storage_api::{
-        DynReader, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+        DynReader, EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
 }
 
@@ -1847,6 +1855,7 @@ pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
+    pub(crate) use super::helper::OperationHelper;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,

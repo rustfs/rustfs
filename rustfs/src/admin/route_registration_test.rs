@@ -311,6 +311,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
         admin_route_sample(Method::PUT, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::GET, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
@@ -391,6 +394,14 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
         admin_route(Method::POST, "/v3/replication/diff"),
         admin_route(Method::GET, "/v3/replication/mrf"),
+        // S3-shaped extension routes (handlers::s3_extension), keyed `?<sub-resource>/<bucket>`.
+        route_sample(Method::PUT, "?replication-reset/{bucket}", "?replication-reset/demo-bucket"),
+        route_sample(Method::GET, "?replication-reset-status/{bucket}", "?replication-reset-status/demo-bucket"),
+        route_sample(Method::GET, "?replication-metrics=2/{bucket}", "?replication-metrics=2/demo-bucket"),
+        route_sample(Method::GET, "?replication-metrics/{bucket}", "?replication-metrics/demo-bucket"),
+        route_sample(Method::GET, "?replication-check/{bucket}", "?replication-check/demo-bucket"),
+        route(Method::GET, "?events/"),
+        route_sample(Method::GET, "?events/{bucket}", "?events/demo-bucket"),
         admin_route(Method::GET, "/v3/integrity/readiness"),
         admin_route_sample(Method::GET, "/v3/integrity/{bucket}/inventory", "/v3/integrity/example/inventory"),
         admin_route_sample(Method::POST, "/v3/integrity/{bucket}/jobs", "/v3/integrity/example/jobs"),
@@ -1437,6 +1448,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/bucket-etag/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/bucket-etag/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-etag/test-bucket"));
     assert_route(&router, Method::PUT, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));

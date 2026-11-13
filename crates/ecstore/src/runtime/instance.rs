@@ -248,6 +248,10 @@ pub struct InstanceContext {
     /// Write-once like the process global it replaces: startup sets it exactly
     /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
     region: OnceLock<Region>,
+    /// Further regions this instance accepts as a bucket `LocationConstraint`
+    /// besides [`Self::region`] - the tail of a comma-separated `RUSTFS_REGION`.
+    /// Write-once like `region`.
+    additional_regions: OnceLock<Vec<Region>>,
     /// This instance's deployment id (Phase 5 Slice 5, backlog#939).
     ///
     /// Write-once identity, mirrored by `ECStore::id` (both come from the same
@@ -463,6 +467,7 @@ impl InstanceContext {
             internode_data_transport: OnceLock::new(),
             lock_manager,
             region: OnceLock::new(),
+            additional_regions: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
             multipart_proof_topology: OnceLock::new(),
@@ -879,6 +884,22 @@ impl InstanceContext {
     /// This instance's S3 region, if it has been set.
     pub fn region(&self) -> Option<Region> {
         self.region.get().cloned()
+    }
+
+    /// Set the further regions this instance accepts as a bucket
+    /// `LocationConstraint` besides its own [`Self::region`].
+    ///
+    /// Write-once: panics on a second write, like [`Self::set_region`].
+    pub fn set_additional_regions(&self, regions: Vec<Region>) {
+        self.additional_regions
+            .set(regions)
+            .expect("instance additional regions should be initialized once during startup");
+    }
+
+    /// The further regions this instance accepts as a bucket
+    /// `LocationConstraint`; empty unless startup set some.
+    pub fn additional_regions(&self) -> Vec<Region> {
+        self.additional_regions.get().cloned().unwrap_or_default()
     }
 
     /// Set this instance's deployment id.
@@ -1661,6 +1682,23 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_region(region("us-east-1"));
         ctx.set_region(region("eu-west-1"));
+    }
+
+    // Additional regions default to none and are write-once like the region.
+    #[tokio::test]
+    async fn additional_regions_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.additional_regions().is_empty());
+        ctx.set_additional_regions(vec![region("ap-southeast-2"), region("us-west-2")]);
+        assert_eq!(ctx.additional_regions(), vec![region("ap-southeast-2"), region("us-west-2")]);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_additional_regions_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_additional_regions(vec![region("us-west-2")]);
+        ctx.set_additional_regions(vec![region("eu-west-1")]);
     }
 
     // A fresh context has no deployment id until set; set-then-get round-trips.

@@ -33,10 +33,9 @@ use rustfs_config::{
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
 use rustfs_notify::NotificationError;
-use rustfs_s3_types::EventName;
+use rustfs_s3_types::{EventName, s3_error};
 use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::get_env_usize;
-use s3s::s3_error;
 use std::env;
 use std::io::Error;
 use std::sync::Arc;

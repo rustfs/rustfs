@@ -397,6 +397,13 @@ impl DefaultBucketUsecase {
         self.context.as_ref().and_then(|context| context.region().get())
     }
 
+    fn additional_regions(&self) -> Vec<Region> {
+        self.context
+            .as_ref()
+            .map(|context| context.region().additional())
+            .unwrap_or_default()
+    }
+
     fn object_store(&self) -> Option<Arc<ECStore>> {
         current_object_store_handle_for_context(self.context.as_deref())
     }
