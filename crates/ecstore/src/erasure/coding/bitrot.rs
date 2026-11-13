@@ -1519,6 +1519,10 @@ impl BitrotWriterWrapper {
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(buf).await?;
         }
+        self.write_framed(buf).await
+    }
+
+    async fn write_framed(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // The encoder hands us one complete EC shard for each layout stripe.
         // A bounded read quantum stores that shard as several independently
         // authenticated frames, so split only at this boundary.  The selected
@@ -1550,6 +1554,19 @@ impl BitrotWriterWrapper {
     ) -> std::io::Result<(usize, Option<[u8; 32]>)> {
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(&buf).await?;
+        }
+        if buf.len() > self.bitrot_writer.shard_size {
+            // A bounded read quantum stores the shard as several frames, which
+            // the single-frame local fast path cannot write. Protected writes
+            // never select a bounded quantum, so refuse rather than drop the
+            // integrity digest.
+            if integrity_spec.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "protected shard writes do not support bounded bitrot frames",
+                ));
+            }
+            return self.write_framed(&buf).await.map(|n| (n, None));
         }
         self.bitrot_writer.write_shard_bytes(buf, integrity_spec).await
     }
