@@ -128,7 +128,7 @@ For a custom administrator, grant both actions. The following policy permits del
 }
 ```
 
-Self-service uses the existing `admin:CreateServiceAccount` permission. Delegation requires a named allow in the built-in policy engine. Upgrading preserves the scope of custom `admin:*` grants. Deploy the new server version to all nodes before installing policies that name the new action or condition.
+Self-service uses the existing `admin:CreateServiceAccount` permission. Delegation requires a named allow in the built-in policy engine. Custom policies created before or after an upgrade must name `admin:CreateServiceAccountForUser` even when they already grant `admin:*`. Deploy the new server version to all nodes before installing policies that name the new action or condition.
 
 ## Validation
 
