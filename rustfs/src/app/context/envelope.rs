@@ -572,6 +572,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn staged_multipart_part(&self) -> bool {
         self.staged_multipart_part_authorization().is_some()
     }
+    fn set_staged_multipart_part(&mut self, staged: bool) {
+        self.staged_multipart_part_authorization = staged.then_some(StagedMultipartPartAuthorization);
+    }
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
         self.requested_object_lock_retention()
     }

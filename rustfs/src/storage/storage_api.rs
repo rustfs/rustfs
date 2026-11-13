@@ -177,7 +177,8 @@ pub(crate) mod owned_parity_consumer {
         AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo,
         RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
         RequestedObjectTags, TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
-        authorize_request, bucket_config_mutation_incarnation, parity_test_support,
+        authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+        authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;

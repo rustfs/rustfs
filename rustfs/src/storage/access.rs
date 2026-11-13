@@ -130,8 +130,11 @@ fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
         || rustfs_utils::http::has_ssec_transport_headers(headers)
 }
 
-async fn authorize_replication_only_put_headers<T>(req: &mut S3Request<T>) -> S3Result<()> {
-    if !has_replication_only_put_headers(&req.headers) {
+/// Asks `s3:ReplicateObject` when the request headers carry a replication-only header, and on
+/// Allow marks the request as an authorized replication request for the use case. A POST form
+/// cannot carry these headers, so the request headers are read, not the policy headers.
+pub(crate) async fn authorize_replication_only_put_headers<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
+    if !has_replication_only_put_headers(req.headers()) {
         return Ok(());
     }
 
@@ -1082,6 +1085,7 @@ pub(crate) trait AuthorizationRequest {
     fn internal_object_authorization(&self) -> bool;
     fn multipart_staging(&self) -> bool;
     fn staged_multipart_part(&self) -> bool;
+    fn set_staged_multipart_part(&mut self, staged: bool);
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention>;
     fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil>;
     fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
@@ -1173,6 +1177,13 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn staged_multipart_part(&self) -> bool {
         self.extensions.get::<StagedMultipartPartAuthorization>().is_some()
+    }
+    fn set_staged_multipart_part(&mut self, staged: bool) {
+        if staged {
+            self.extensions.insert(StagedMultipartPartAuthorization);
+        } else {
+            self.extensions.remove::<StagedMultipartPartAuthorization>();
+        }
     }
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
         self.extensions.get::<RequestedObjectLockRetention>()
@@ -2141,12 +2152,12 @@ pub(crate) async fn authorize_copy_object_tags(
 
 /// A specific destination ETag reveals stored content and requires read access.
 /// Wildcard existence conditions retain the existing write-only contract.
-async fn authorize_write_etag_condition<T>(req: &mut S3Request<T>, specific_dto_etag: bool) -> S3Result<()> {
-    let headers = req
-        .extensions
-        .get::<PostObjectPolicyHeaders>()
-        .map_or(&req.headers, |form| &form.0);
-    let specific_header_etag = headers
+pub(crate) async fn authorize_write_etag_condition<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    specific_dto_etag: bool,
+) -> S3Result<()> {
+    let specific_header_etag = req
+        .policy_headers()
         .get_all(http::header::IF_MATCH)
         .iter()
         .any(|value| value.to_str().map_or(true, |value| value.trim() != "*"));
@@ -2493,10 +2504,12 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
 
 // Multipart parts are staged and become visible only after CompleteMultipartUpload,
 // which uses the normal publication-fenced authorization path.
-async fn authorize_staged_multipart_part<T>(req: &mut S3Request<T>) -> S3Result<()> {
-    req.extensions.insert(StagedMultipartPartAuthorization);
+/// Authorizes `s3:PutObject` for one staged multipart part: the part creates no object, and the
+/// staged-part marker is set only for this decision.
+pub(crate) async fn authorize_staged_multipart_part<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
+    req.set_staged_multipart_part(true);
     let result = authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await;
-    req.extensions.remove::<StagedMultipartPartAuthorization>();
+    req.set_staged_multipart_part(false);
     result
 }
 
