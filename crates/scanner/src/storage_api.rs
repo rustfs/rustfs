@@ -427,6 +427,7 @@ pub(crate) mod scanner_io {
     pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions, NsScannerCapabilities};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
     pub(crate) use rustfs_ecstore::api::runtime::{
         ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest,
     };

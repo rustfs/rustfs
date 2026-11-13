@@ -5,7 +5,9 @@
 //! These witnesses do not acknowledge dirty work or certify a published root.
 use super::*;
 use crate::scanner::{LOCAL_SCANNER_ACTIVITY_NODE, ScannerActivitySnapshot, probe_scanner_activity};
-use crate::storage_api::scanner_io::{ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest};
+use crate::storage_api::scanner_io::{
+    EndpointServerPools, ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -637,7 +639,7 @@ async fn query_watch(
 /// and binds its own full endpoint layout, so a globally self-consistent but
 /// different cluster cannot stand in for a missing source.
 fn watch_instance_layout_digest(
-    endpoints: &crate::EndpointServerPools,
+    endpoints: &EndpointServerPools,
     activity: &ScannerActivitySnapshot,
     distributed: bool,
 ) -> Option<DataUsageScanPlanDigest> {
