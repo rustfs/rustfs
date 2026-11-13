@@ -9744,7 +9744,6 @@ dependencies = [
  "base64-simd",
  "bytes",
  "crc-fast",
- "hotpath",
  "http 1.5.0",
  "md-5",
  "pretty_assertions",
@@ -9758,7 +9757,6 @@ name = "rustfs-common"
 version = "1.0.5"
 dependencies = [
  "arc-swap",
- "hotpath",
  "metrics",
  "smallvec",
  "thiserror 2.0.21",
@@ -9786,7 +9784,6 @@ name = "rustfs-config"
 version = "1.0.5"
 dependencies = [
  "const-str",
- "hotpath",
  "serde",
  "serde_json",
 ]
@@ -9809,7 +9806,6 @@ version = "1.0.5"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
- "hotpath",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -9825,7 +9821,6 @@ dependencies = [
  "argon2",
  "base64-simd",
  "chacha20poly1305",
- "hotpath",
  "jsonwebtoken",
  "pbkdf2 0.13.0",
  "rand 0.10.3",
@@ -9991,7 +9986,6 @@ dependencies = [
 name = "rustfs-extension-schema"
 version = "1.0.5"
 dependencies = [
- "hotpath",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -10492,7 +10486,6 @@ version = "1.0.5"
 dependencies = [
  "chrono",
  "flate2",
- "hotpath",
  "regex",
  "serde",
  "serde_json",
@@ -10602,7 +10595,6 @@ version = "1.0.5"
 dependencies = [
  "bytes",
  "criterion",
- "hotpath",
  "metrics",
  "metrics-util",
  "moka",
@@ -10806,7 +10798,6 @@ version = "1.0.5"
 dependencies = [
  "byteorder",
  "bytes",
- "hotpath",
  "regex",
  "rmp",
  "rmp-serde",
@@ -10947,7 +10938,6 @@ version = "1.0.5"
 dependencies = [
  "bytes",
  "futures-core",
- "hotpath",
  "http 1.5.0",
  "http-body",
  "http-body-util",
@@ -11094,7 +11084,6 @@ dependencies = [
 name = "rustfs-security-governance"
 version = "1.0.5"
 dependencies = [
- "hotpath",
  "thiserror 2.0.21",
 ]
 
@@ -11295,7 +11284,6 @@ dependencies = [
  "hex-simd",
  "highway",
  "hmac 0.13.0",
- "hotpath",
  "http 1.5.0",
  "hyper",
  "local-ip-address",
