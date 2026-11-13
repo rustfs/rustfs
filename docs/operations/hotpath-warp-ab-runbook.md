@@ -40,9 +40,17 @@ Sizes are passed to the driver as `--sizes` (one per cell); any size in the driv
 
 `scripts/hotpath_warp_ab_gate.sh` compares each metric against baseline: a regression beyond `--fail-pct` (default `FAIL_PCT=10`) fails, beyond `--warn-pct` (default `WARN_PCT=5`) warns. `--allow-regression --exemption-reason "<why>"` records a FAIL as an exempted WARN and exits 0; use it only for a deliberate correctness trade (for example paying write cost to restore power-loss durability).
 
+For A2 versus A1, the ABBA runner passes `--baseline-drift` to compare the absolute magnitude of every evaluated delta with the same budgets. A faster baseline or a lower baseline latency beyond the budget fails stability just as a slower baseline does. The runner retains `--require-tail-error` evidence validation. Candidate comparisons keep their directional regression rule and any explicitly requested candidate exemption. Directly combining `--baseline-drift` with `--allow-regression` is rejected.
+
 ## Deploy-hook contract (external / cluster mode)
 
 In external mode (`--endpoint <host:port>`) the rig never starts or restarts RustFS. Before each phase or leg it runs `--deploy-hook <cmd>` with the context below in the environment, then waits for `http://<endpoint><health-path>` (default `/health`). A non-zero hook exit aborts the run.
+
+A non-zero load-driver exit aborts the runner with the same exit code before any later leg is deployed or measured. The local-mode EXIT handler stops its server. External service restoration remains the responsibility of the deploy hook's caller or an outer lifecycle wrapper. The schedule retains the attempted leg, and a failed measurement produces no completed-run summary or gate report.
+
+For container-based experiments, pass a repeatable `--node-docker-container node=container` mapping. The runner forwards every mapping to the load driver for before/after Docker CPU, memory, network and block I/O snapshots in each leg's `node_resources/` directory and `node_resource_captures.csv`. Use container names that the deploy hook recreates consistently across legs; the driver records the resolved container and image identities per leg. Node names must be unique.
+
+Docker snapshots expose instantaneous CPU percentages and resource samples. Computing CPU/object requires cumulative process or cgroup CPU counters aligned with the Warp measurement window and its completed object count. The current `--require-node-telemetry` failure gate applies to SSH snapshots; inspect Docker capture statuses explicitly because Docker snapshot failures are reported as warnings. A container lab's shared host and storage topology must be recorded with the results.
 
 | Variable | Quick A/B | ABBA | Value |
 | --- | --- | --- | --- |
@@ -139,7 +147,7 @@ Attach to the PR or issue: `summary.md`, `candidate_gate.md`, `baseline_drift_ga
 | FAIL | FAIL on the same workload | Environment drift is high; rerun on a quieter runner or raise duration and rounds. |
 | PASS | FAIL | Rig unstable; do not quote the numbers as proof of improvement. |
 
-Rules that override the table: a candidate result is actionable only when the `A2` drift for the same workload passes or is materially smaller than the `B1`/`B2` delta; never report a win or loss for a workload whose drift gate failed without a rerun. When `B1` and `B2` disagree, the cell is inconclusive even if the gate passes. Report only measured facts: deltas, drift, saturation, failed workloads.
+A candidate result is actionable only when the `A2` drift for the same workload passes. A drift failure in either direction requires a rerun before attributing improvement or regression. When `B1` and `B2` disagree, the cell is inconclusive even if the gate passes. Report the measured deltas, drift, saturation and failed workloads.
 
 ### CPU and memory evidence
 

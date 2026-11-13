@@ -16,6 +16,8 @@
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::bucket::{ObjectLockConfigExt as _, VersioningConfigExt as _};
+use crate::app::storage_api::s3::dto::{GetBucketVersioningInput, PutBucketVersioningInput, PutBucketVersioningOutput};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
     config.suspended()

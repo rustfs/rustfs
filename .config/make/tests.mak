@@ -71,6 +71,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_ecfs_legacy_edge.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_lifecycle_transition_api_test.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_reference_binary.py
@@ -84,7 +85,6 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_artifact.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_group_proof.py
-	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_test_shards.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test

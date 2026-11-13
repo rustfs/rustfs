@@ -15,6 +15,10 @@
 //! UploadPartCopy.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    CopyPartResult, CopySource, ETag, ServerSideEncryption, Timestamp, UploadPartCopyInput, UploadPartCopyOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option<String>> {
     match version_id {

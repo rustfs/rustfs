@@ -20,6 +20,8 @@
 //! sends is left out of the comparison. Values minted per process (upload IDs, timestamps) are
 //! never recorded, and the comparator reduces a version ID to whether it is `null`.
 
+mod extra;
+
 use super::compare::Observation;
 use crate::common::{RustFSTestEnvironment, build_test_s3_config};
 use aws_sdk_s3::Client;
@@ -363,6 +365,7 @@ pub(crate) async fn run(env: &RustFSTestEnvironment) -> Vec<Observation> {
     Box::pin(multipart(&mut s, &c)).await;
     Box::pin(object_extras(&mut s, &c)).await;
     Box::pin(deletes_and_listings(&mut s, &c)).await;
+    Box::pin(extra::cases(&mut s, &c)).await;
     s.observations
 }
 
