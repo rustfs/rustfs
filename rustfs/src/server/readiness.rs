@@ -327,6 +327,7 @@ struct LockQuorumObservation {
 
 #[derive(Debug, Clone)]
 struct ClusterHealthReportCacheEntry {
+    generation: u64,
     captured_at: Instant,
     report: DependencyReadinessReport,
 }
@@ -437,31 +438,32 @@ async fn load_cached_storage_readiness() -> Option<StorageWriteReadinessStatus> 
     None
 }
 
-async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+fn cluster_health_report_is_fresh(entry: &ClusterHealthReportCacheEntry) -> bool {
     let ttl = health_readiness_cache_ttl();
-    if ttl.is_zero() {
-        return None;
-    }
-
-    let cache = cluster_health_report_cache(kind).lock().await;
-    let entry = cache.as_ref()?;
-    if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.report.clone());
-    }
-
-    None
+    !ttl.is_zero() && entry.captured_at.elapsed() <= ttl
 }
 
-async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
-    if health_readiness_cache_ttl().is_zero() {
-        return;
-    }
+#[cfg(test)]
+async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+    let cache = cluster_health_report_cache(kind).lock().await;
+    cache
+        .as_ref()
+        .filter(|entry| cluster_health_report_is_fresh(entry))
+        .map(|entry| entry.report.clone())
+}
 
-    let mut cache = cluster_health_report_cache(kind).lock().await;
+fn publish_cluster_health_report(cache: &mut Option<ClusterHealthReportCacheEntry>, report: DependencyReadinessReport) {
+    let generation = cache.as_ref().map_or(1, |entry| entry.generation.wrapping_add(1));
     *cache = Some(ClusterHealthReportCacheEntry {
+        generation,
         captured_at: Instant::now(),
         report,
     });
+}
+
+async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
+    let mut cache = cluster_health_report_cache(kind).lock().await;
+    publish_cluster_health_report(&mut cache, report);
 }
 
 async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
@@ -988,14 +990,26 @@ where
     // cannot overwrite the next collector's newer cache entry.
     let mut singleflight = None;
     let outcome = tokio::time::timeout_at(deadline, async {
-        if let Some(cached) = load_cached_cluster_health_report(kind).await {
-            return (cached, false);
-        }
+        let previous_generation = {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && cluster_health_report_is_fresh(entry)
+            {
+                return (entry.report.clone(), false);
+            }
+            cache.as_ref().map(|entry| entry.generation)
+        };
 
-        // Queueing consumes the caller's budget even when caching is disabled.
+        // Completed-cache reuse and sharing an overlapping flight are separate:
+        // TTL=0 still joins a round that finished while this caller was waiting.
         singleflight = Some(cluster_health_singleflight(kind).lock().await);
-        if let Some(cached) = load_cached_cluster_health_report(kind).await {
-            return (cached, false);
+        {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && (Some(entry.generation) != previous_generation || cluster_health_report_is_fresh(entry))
+            {
+                return (entry.report.clone(), false);
+            }
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -1016,13 +1030,9 @@ where
             // Publishing a failed collection is best-effort after its deadline.
             if collection_started.is_some()
                 && singleflight.is_some()
-                && !health_readiness_cache_ttl().is_zero()
                 && let Ok(mut cache) = cluster_health_report_cache(kind).try_lock()
             {
-                *cache = Some(ClusterHealthReportCacheEntry {
-                    captured_at: Instant::now(),
-                    report: report.clone(),
-                });
+                publish_cluster_health_report(&mut cache, report.clone());
             }
             (report, true)
         }
@@ -1869,6 +1879,35 @@ mod tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 1, "expired waiters must not begin another collection");
             },
         )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_uncached_burst_shares_one_round_but_later_request_is_fresh() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let calls = AtomicUsize::new(0);
+            let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let request = || {
+                collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ready.clone()
+                })
+            };
+            let reports = futures::future::join_all((0..100).map(|_| request())).await;
+            assert!(reports.iter().all(|report| report == &ready));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "overlapping uncached callers must share the same round");
+            assert_eq!(request().await, ready);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "a later uncached caller must start a new observation");
+        })
         .await;
         reset_cluster_health_report_caches().await;
     }

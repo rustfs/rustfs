@@ -1257,11 +1257,11 @@ impl ECStore {
     }
 
     #[instrument(skip(self))]
-    pub(super) async fn handle_local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+    pub(super) async fn handle_local_storage_info(&self, include_metrics: bool) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
-            futures.push(pool.local_storage_info_snapshot())
+            futures.push(pool.local_storage_info_snapshot(include_metrics))
         }
 
         let results = join_all(futures).await;
@@ -1269,7 +1269,7 @@ impl ECStore {
         let mut disks = Vec::new();
 
         for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
+            disks.extend(res.disks);
         }
 
         // 🔧 Defensive deduplication: when aggregating disks from all pools, drop duplicate

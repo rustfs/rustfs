@@ -477,18 +477,18 @@ impl Sets {
         }
     }
 
-    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+    pub(crate) async fn local_storage_info_snapshot(&self, include_metrics: bool) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.disk_set.len());
 
         for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info_snapshot())
+            futures.push(set.local_storage_info_snapshot(include_metrics))
         }
 
         let results = join_all(futures).await;
         let mut disks = Vec::new();
 
         for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
+            disks.extend(res.disks);
         }
 
         rustfs_madmin::StorageInfo {

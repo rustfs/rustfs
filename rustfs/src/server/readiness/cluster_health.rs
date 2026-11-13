@@ -14,9 +14,9 @@
 
 use super::{
     ClusterHealthProbeKind, DependencyReadiness, DependencyReadinessReport, Endpoint, EndpointServerPools, StorageAdminApi,
-    StorageWriteReadinessStatus, aggregate_lock_quorum_status, collect_peer_health_readiness, configured_readiness_topology,
-    dependency_readiness_report_from_write_status, is_dist_erasure, pool_metadata_write_readiness, runtime_sources,
-    storage_read_ready_from_runtime_state, storage_ready_from_runtime_state,
+    StorageWriteReadinessStatus, collect_peer_health_readiness, configured_readiness_topology,
+    dependency_readiness_report_from_write_status, disk_is_online_for_readiness, exclusive_lock_quorum, is_dist_erasure,
+    pool_metadata_write_readiness, pool_read_quorum, pool_write_quorum, runtime_sources,
 };
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rustfs_madmin::{BackendInfo, Disk, StorageInfo};
@@ -35,6 +35,19 @@ enum ObservationMember {
 struct StorageObservation {
     member: ObservationMember,
     info: Option<StorageInfo>,
+}
+
+struct ConfiguredDiskSlot {
+    endpoint: String,
+    member: ObservationMember,
+    set_index: usize,
+    observed: bool,
+}
+
+struct StorageQuorum {
+    slots: HashMap<DiskSlot, ConfiguredDiskSlot>,
+    votes_needed: Vec<usize>,
+    unsatisfied_sets: usize,
 }
 
 /// Observe fresh storage and lock replies until every configured set has quorum.
@@ -77,7 +90,7 @@ pub(super) async fn collect_cluster_probe_report(kind: ClusterHealthProbeKind) -
         async move {
             StorageObservation {
                 member: ObservationMember::Local,
-                info: Some(StorageAdminApi::local_storage_info(store.as_ref()).await),
+                info: Some(StorageAdminApi::local_storage_info_with_metrics(store.as_ref(), false).await),
             }
         }
         .boxed(),
@@ -94,7 +107,7 @@ pub(super) async fn collect_cluster_probe_report(kind: ClusterHealthProbeKind) -
                 async move {
                     StorageObservation {
                         member: ObservationMember::Peer(member),
-                        info: peer.local_storage_info().await.ok(),
+                        info: peer.local_storage_info_with_metrics(false).await.ok(),
                     }
                 }
                 .boxed(),
@@ -115,9 +128,13 @@ pub(super) async fn collect_cluster_probe_report(kind: ClusterHealthProbeKind) -
     dependency_readiness_report_from_write_status(readiness, metadata)
 }
 
-fn configured_disk_slots(backend: &BackendInfo, endpoints: &EndpointServerPools) -> Option<HashMap<DiskSlot, Endpoint>> {
+fn configured_storage_quorum(
+    kind: ClusterHealthProbeKind,
+    backend: BackendInfo,
+    endpoints: &EndpointServerPools,
+) -> Option<StorageQuorum> {
     let shape = StorageInfo {
-        backend: backend.clone(),
+        backend,
         ..Default::default()
     };
     let (total_sets, drives_per_set) = configured_readiness_topology(&shape)?;
@@ -127,6 +144,7 @@ fn configured_disk_slots(backend: &BackendInfo, endpoints: &EndpointServerPools)
 
     let mut slots = HashMap::new();
     let mut identities = HashSet::new();
+    let mut votes_needed = Vec::new();
     for (pool_idx, pool) in endpoints.as_ref().iter().enumerate() {
         let set_count = total_sets[pool_idx];
         let drive_count = drives_per_set[pool_idx];
@@ -136,34 +154,54 @@ fn configured_disk_slots(backend: &BackendInfo, endpoints: &EndpointServerPools)
         {
             return None;
         }
+        let quorum = match kind {
+            ClusterHealthProbeKind::Write => pool_write_quorum(&shape, pool_idx, drive_count),
+            ClusterHealthProbeKind::Read => pool_read_quorum(&shape, pool_idx, drive_count),
+        }?;
+        let set_offset = votes_needed.len();
+        votes_needed.resize(set_offset.checked_add(set_count)?, quorum);
         for endpoint in pool.endpoints.as_ref() {
+            let set_idx = usize::try_from(endpoint.set_idx).ok()?;
+            let host = endpoint.host_port();
+            let member = if endpoint.is_local {
+                ObservationMember::Local
+            } else {
+                ObservationMember::Peer(host.clone())
+            };
             if usize::try_from(endpoint.pool_idx).ok() != Some(pool_idx)
-                || usize::try_from(endpoint.set_idx).ok().is_none_or(|index| index >= set_count)
+                || set_idx >= set_count
                 || usize::try_from(endpoint.disk_idx)
                     .ok()
                     .is_none_or(|index| index >= drive_count)
-                || !identities.insert((endpoint.host_port(), endpoint.get_file_path()))
+                || !identities.insert((host, endpoint.get_file_path()))
                 || slots
-                    .insert((endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx), endpoint.clone())
+                    .insert(
+                        (endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx),
+                        ConfiguredDiskSlot {
+                            endpoint: endpoint.to_string(),
+                            member,
+                            set_index: set_offset + set_idx,
+                            observed: false,
+                        },
+                    )
                     .is_some()
             {
                 return None;
             }
         }
     }
-    Some(slots)
+    Some(StorageQuorum {
+        unsatisfied_sets: votes_needed.len(),
+        votes_needed,
+        slots,
+    })
 }
 
 fn disk_slot(disk: &Disk) -> DiskSlot {
     (disk.pool_index, disk.set_index, disk.disk_index)
 }
 
-fn accept_storage_observation(
-    observation: StorageObservation,
-    configured: &HashMap<DiskSlot, Endpoint>,
-    observed_slots: &mut HashSet<DiskSlot>,
-    storage: &mut StorageInfo,
-) {
+fn accept_storage_observation(observation: StorageObservation, quorum: &mut StorageQuorum) {
     let Some(info) = observation.info else {
         return;
     };
@@ -173,17 +211,27 @@ fn accept_storage_observation(
     }
     for disk in info.disks {
         let slot = disk_slot(&disk);
-        let Some(endpoint) = configured.get(&slot) else {
+        let Some(configured) = quorum.slots.get_mut(&slot) else {
             continue;
-        };
-        let owns_slot = match &observation.member {
-            ObservationMember::Local => endpoint.is_local,
-            ObservationMember::Peer(host) => !endpoint.is_local && endpoint.host_port() == *host,
         };
         // The configured endpoint carries the disk identity and path. The
         // reported mount path can differ inside a peer's container namespace.
-        if owns_slot && disk.endpoint == endpoint.to_string() && observed_slots.insert(slot) {
-            storage.disks.push(disk);
+        if configured.observed || configured.member != observation.member || disk.endpoint != configured.endpoint {
+            continue;
+        }
+        configured.observed = true;
+        if disk_is_online_for_readiness(&disk) {
+            count_quorum_vote(&mut quorum.votes_needed, &mut quorum.unsatisfied_sets, configured.set_index);
+        }
+    }
+}
+
+fn count_quorum_vote(votes_needed: &mut [usize], unsatisfied_sets: &mut usize, set_index: usize) {
+    let needed = &mut votes_needed[set_index];
+    if *needed > 0 {
+        *needed -= 1;
+        if *needed == 0 {
+            *unsatisfied_sets -= 1;
         }
     }
 }
@@ -194,21 +242,12 @@ async fn collect_storage_quorum(
     endpoints: &EndpointServerPools,
     mut probes: StorageProbes,
 ) -> bool {
-    let Some(configured) = configured_disk_slots(&backend, endpoints) else {
+    let Some(mut quorum) = configured_storage_quorum(kind, backend, endpoints) else {
         return false;
     };
-    let mut storage = StorageInfo {
-        backend,
-        ..Default::default()
-    };
-    let mut observed_slots = HashSet::new();
     while let Some(observation) = probes.next().await {
-        accept_storage_observation(observation, &configured, &mut observed_slots, &mut storage);
-        let ready = match kind {
-            ClusterHealthProbeKind::Write => storage_ready_from_runtime_state(&storage),
-            ClusterHealthProbeKind::Read => storage_read_ready_from_runtime_state(&storage),
-        };
-        if ready {
+        accept_storage_observation(observation, &mut quorum);
+        if quorum.unsatisfied_sets == 0 {
             return true;
         }
     }
@@ -230,14 +269,45 @@ async fn collect_lock_quorum(endpoints: &EndpointServerPools) -> bool {
 }
 
 async fn collect_lock_quorum_with(endpoints: &EndpointServerPools, mut probes: LockProbes) -> bool {
-    let mut online_hosts = HashSet::new();
-    while let Some((host, online)) = probes.next().await {
-        if online {
-            online_hosts.insert(host);
-            // Cluster read health retains its existing exclusive-lock threshold.
-            if aggregate_lock_quorum_status(endpoints, &online_hosts).ready {
-                return true;
+    let mut host_sets: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut votes_needed = Vec::new();
+    for pool in endpoints.as_ref() {
+        for set_idx in 0..pool.set_count {
+            let hosts = pool
+                .endpoints
+                .as_ref()
+                .iter()
+                .filter(|endpoint| usize::try_from(endpoint.set_idx).ok() == Some(set_idx))
+                .map(Endpoint::host_port)
+                .filter(|host| !host.is_empty())
+                .collect::<HashSet<_>>();
+            if hosts.is_empty() {
+                return false;
             }
+            let set_index = votes_needed.len();
+            // Cluster read health retains its existing exclusive-lock threshold.
+            votes_needed.push(exclusive_lock_quorum(hosts.len()));
+            for host in hosts {
+                host_sets.entry(host).or_default().push(set_index);
+            }
+        }
+    }
+    let mut unsatisfied_sets = votes_needed.len();
+    if unsatisfied_sets == 0 {
+        return false;
+    }
+    while let Some((host, online)) = probes.next().await {
+        if !online {
+            continue;
+        }
+        let Some(sets) = host_sets.remove(&host) else {
+            continue;
+        };
+        for set_index in sets {
+            count_quorum_vote(&mut votes_needed, &mut unsatisfied_sets, set_index);
+        }
+        if unsatisfied_sets == 0 {
+            return true;
         }
     }
     false
@@ -245,6 +315,7 @@ async fn collect_lock_quorum_with(endpoints: &EndpointServerPools, mut probes: L
 
 #[cfg(test)]
 mod tests {
+    use super::super::{aggregate_lock_quorum_status, storage_read_ready_from_runtime_state, storage_ready_from_runtime_state};
     use super::*;
     use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
     use std::future;
@@ -443,11 +514,77 @@ mod tests {
                     configured.pop();
                 }
             }
-            assert!(configured_disk_slots(&backend, &invalid_endpoints).is_none());
+            assert!(configured_storage_quorum(ClusterHealthProbeKind::Write, backend.clone(), &invalid_endpoints).is_none());
         }
         let mut missing_shape = backend;
         missing_shape.total_sets.clear();
-        assert!(configured_disk_slots(&missing_shape, &endpoints).is_none());
+        assert!(configured_storage_quorum(ClusterHealthProbeKind::Write, missing_shape, &endpoints).is_none());
+    }
+
+    #[test]
+    fn incremental_storage_votes_match_the_inventory_quorum_for_every_subset() {
+        for layouts in [
+            &[(1, 4, 2)][..],
+            &[(2, 4, 2)][..],
+            &[(1, 4, 2), (1, 3, 1)][..],
+            &[(2, 4, 2), (1, 3, 1)][..],
+        ] {
+            let (backend, endpoints) = topology(layouts);
+            let positions = endpoints
+                .as_ref()
+                .iter()
+                .flat_map(|pool| pool.endpoints.as_ref())
+                .enumerate()
+                .map(|(position, endpoint)| ((endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx), position))
+                .collect::<HashMap<_, _>>();
+            for subset in 0..(1_usize << positions.len()) {
+                for kind in [ClusterHealthProbeKind::Read, ClusterHealthProbeKind::Write] {
+                    let mut quorum = configured_storage_quorum(kind, backend.clone(), &endpoints).expect("valid test topology");
+                    let mut inventory = StorageInfo {
+                        backend: backend.clone(),
+                        ..Default::default()
+                    };
+                    for node in 0..4 {
+                        let mut reply = observation(&endpoints, node);
+                        let disks = &mut reply.info.as_mut().expect("test inventory").disks;
+                        for disk in disks.iter_mut() {
+                            let position = positions[&disk_slot(disk)];
+                            if subset & (1_usize << position) == 0 {
+                                disk.runtime_state = Some("suspect".to_string());
+                            } else {
+                                match position % 3 {
+                                    0 => disk.runtime_state = Some("returning".to_string()),
+                                    1 => {
+                                        disk.state = "unformatted".to_string();
+                                        disk.runtime_state = None;
+                                    }
+                                    _ => disk.state = "ONLINE".to_string(),
+                                }
+                            }
+                        }
+                        inventory.disks.extend(disks.iter().cloned());
+                        accept_storage_observation(reply, &mut quorum);
+                        let expected = match kind {
+                            ClusterHealthProbeKind::Read => storage_read_ready_from_runtime_state(&inventory),
+                            ClusterHealthProbeKind::Write => storage_ready_from_runtime_state(&inventory),
+                        };
+                        assert_eq!(
+                            quorum.unsatisfied_sets == 0,
+                            expected,
+                            "layouts={layouts:?}, subset={subset}, kind={kind:?}, node={node}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_storage_members_cannot_supply_extra_votes() {
+        let (backend, endpoints) = topology(&[(1, 4, 2)]);
+        assert!(
+            !collect_storage_quorum(ClusterHealthProbeKind::Read, backend, &endpoints, ready_probes(&endpoints, &[0, 0]),).await
+        );
     }
 
     #[tokio::test]
@@ -522,6 +659,54 @@ mod tests {
             !collect_lock_quorum_with(&multiple_sets, probes).await,
             "one set's quorum cannot substitute for another set"
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_lock_votes_match_the_existing_quorum_for_every_host_subset() {
+        let (_, mut disjoint_sets) = topology(&[(2, 4, 2)]);
+        for endpoint in disjoint_sets.as_mut()[0]
+            .endpoints
+            .as_mut()
+            .iter_mut()
+            .filter(|endpoint| endpoint.set_idx == 1)
+        {
+            endpoint
+                .url
+                .set_host(Some(&format!("other-node-{}", endpoint.disk_idx)))
+                .expect("disjoint second-set host");
+            endpoint.is_local = false;
+        }
+        for endpoints in [topology(&[(1, 16, 4)]).1, topology(&[(2, 4, 2), (1, 3, 1)]).1, disjoint_sets] {
+            let mut hosts = endpoints
+                .as_ref()
+                .iter()
+                .flat_map(|pool| pool.endpoints.as_ref())
+                .map(Endpoint::host_port)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            hosts.sort();
+            for subset in 0..(1_usize << hosts.len()) {
+                let online_hosts = hosts
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| subset & (1_usize << position) != 0)
+                    .map(|(_, host)| host.clone())
+                    .collect::<HashSet<_>>();
+                let probes = LockProbes::new();
+                for host in &hosts {
+                    let online = online_hosts.contains(host);
+                    probes.push(future::ready((host.clone(), online)).boxed());
+                    probes.push(future::ready((host.clone(), online)).boxed());
+                }
+                probes.push(future::ready(("unknown-node:9000".to_string(), true)).boxed());
+                assert_eq!(
+                    collect_lock_quorum_with(&endpoints, probes).await,
+                    aggregate_lock_quorum_status(&endpoints, &online_hosts).ready,
+                    "hosts={hosts:?}, subset={subset}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -36,6 +36,14 @@ pub trait StorageAdminApi: Send + Sync + Debug {
     async fn backend_info(&self) -> Self::BackendInfo;
     async fn storage_info(&self) -> Self::StorageInfo;
     async fn local_storage_info(&self) -> Self::StorageInfo;
+
+    /// Collect local inventory, optionally including per-operation disk metrics.
+    /// Implementations that do not expose optional metrics keep their existing
+    /// inventory behavior through this default.
+    async fn local_storage_info_with_metrics(&self, _include_metrics: bool) -> Self::StorageInfo {
+        self.local_storage_info().await
+    }
+
     async fn disk_set_inventory(&self, selector: DiskSetSelector) -> Result<Vec<Option<Self::Disk>>, Self::Error>;
     fn set_drive_counts(&self) -> Vec<usize>;
 }
@@ -121,6 +129,8 @@ mod tests {
 
         assert_eq!(api.backend_info().await.drives_per_set, vec![2]);
         assert_eq!(api.storage_info().await.disk_count, 2);
+        assert_eq!(api.local_storage_info_with_metrics(false).await.disk_count, 2);
+        assert_eq!(api.local_storage_info_with_metrics(true).await.disk_count, 2);
         assert_eq!(api.set_drive_counts(), vec![2]);
         assert_eq!(disks.len(), 2);
         assert_eq!(disks[0].as_ref().map(|disk| disk.uuid.as_str()), Some("disk-0"));
