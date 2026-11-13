@@ -292,7 +292,7 @@ fn validate_cursor(cursor: &Cursor, fingerprint: &str, nodes: &[Target]) -> S3Re
     Ok(())
 }
 
-fn invalid_cursor() -> s3s::S3Error {
+fn invalid_cursor() -> crate::admin::storage_api::s3::S3Error {
     admin_error(S3ErrorCode::InvalidArgument, "invalid MRF page or topology changed; restart observation")
 }
 
@@ -473,7 +473,7 @@ mod tests {
             uri: path.parse().expect("MRF request URI"),
             headers: HeaderMap::new(),
             extensions: http::Extensions::new(),
-            credentials: key.map(|key| s3s::auth::Credentials {
+            credentials: key.map(|key| crate::admin::storage_api::s3::auth::Credentials {
                 access_key: key.into(),
                 secret_key: "mrf-test-user-secret".into(),
             }),
