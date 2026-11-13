@@ -27,7 +27,7 @@ use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use rustfs_common::GlobalReadiness;
 use rustfs_madmin::{BackendInfo, Disk, StorageInfo};
 use std::future::Future;
@@ -44,6 +44,7 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, info};
 
+mod cluster_health;
 mod peer_readmission;
 pub(crate) use peer_readmission::observe_peer_drive_admission;
 
@@ -80,6 +81,8 @@ const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_READINESS: &str = "readiness";
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
+const METRIC_CLUSTER_HEALTH_READY: &str = "rustfs_cluster_health_ready";
+const METRIC_CLUSTER_HEALTH_DURATION_SECONDS: &str = "rustfs_cluster_health_duration_seconds";
 
 pub use crate::shared_types::{
     DependencyReadiness, DependencyReadinessReport, MissingReadinessDrive, ReadinessDegradedReason, StorageReadinessDetails,
@@ -774,6 +777,7 @@ pub(crate) fn record_readiness_overlay_reason(reason: ReadinessDegradedReason) {
     counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
+#[cfg(test)]
 fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {
     DependencyReadinessReport {
         degraded_reasons: degraded_reasons(readiness),
@@ -837,11 +841,17 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 }
 
 pub async fn collect_cluster_write_health_report() -> DependencyReadinessReport {
-    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, collect_dependency_readiness_report).await
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Write)
+    })
+    .await
 }
 
 pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
-    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, collect_cluster_read_dependency_readiness_report).await
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Read)
+    })
+    .await
 }
 
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
@@ -971,20 +981,71 @@ where
     LoadFn: FnMut() -> Fut,
     Fut: Future<Output = DependencyReadinessReport>,
 {
-    if let Some(cached) = load_cached_cluster_health_report(kind).await {
-        return cached;
-    }
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + health_cluster_timeout();
+    let mut collection_started = None;
+    // Retain flight ownership through timeout publication so an expired leader
+    // cannot overwrite the next collector's newer cache entry.
+    let mut singleflight = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
+        if let Some(cached) = load_cached_cluster_health_report(kind).await {
+            return (cached, false);
+        }
 
-    let _singleflight = cluster_health_singleflight(kind).lock().await;
-    if let Some(cached) = load_cached_cluster_health_report(kind).await {
-        return cached;
-    }
+        // Queueing consumes the caller's budget even when caching is disabled.
+        singleflight = Some(cluster_health_singleflight(kind).lock().await);
+        if let Some(cached) = load_cached_cluster_health_report(kind).await {
+            return (cached, false);
+        }
 
-    let report = match tokio::time::timeout(health_cluster_timeout(), load_report()).await {
-        Ok(report) => report,
-        Err(_) => cluster_health_timeout_report(),
+        if tokio::time::Instant::now() >= deadline {
+            return (cluster_health_timeout_report(), true);
+        }
+        collection_started = Some(tokio::time::Instant::now());
+        let report = load_report().await;
+        update_cluster_health_report_cache(kind, report.clone()).await;
+        (report, true)
+    })
+    .await;
+
+    let (report, record_observation) = match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let report = cluster_health_timeout_report();
+            // A waiting caller must not overwrite a leader's healthy result.
+            // Publishing a failed collection is best-effort after its deadline.
+            if collection_started.is_some()
+                && singleflight.is_some()
+                && !health_readiness_cache_ttl().is_zero()
+                && let Ok(mut cache) = cluster_health_report_cache(kind).try_lock()
+            {
+                *cache = Some(ClusterHealthReportCacheEntry {
+                    captured_at: Instant::now(),
+                    report: report.clone(),
+                });
+            }
+            (report, true)
+        }
     };
-    update_cluster_health_report_cache(kind, report.clone()).await;
+    if record_observation {
+        record_readiness_report(&report);
+    }
+    let probe = match kind {
+        ClusterHealthProbeKind::Write => "write",
+        ClusterHealthProbeKind::Read => "read",
+    };
+    let ready = report.degraded_reasons.is_empty()
+        && report.readiness.storage_ready
+        && report.readiness.iam_ready
+        && report.readiness.lock_quorum_ready
+        && report.readiness.peer_health_ready;
+    gauge!(METRIC_CLUSTER_HEALTH_READY, "probe" => probe).set(if ready { 1.0 } else { 0.0 });
+    let wait_duration = collection_started.unwrap_or_else(tokio::time::Instant::now) - started_at;
+    histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "wait").record(wait_duration.as_secs_f64());
+    if let Some(collection_started) = collection_started {
+        histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "collect")
+            .record(collection_started.elapsed().as_secs_f64());
+    }
     report
 }
 
@@ -999,22 +1060,6 @@ fn cluster_health_timeout_report() -> DependencyReadinessReport {
         degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
         storage_details: None,
     }
-}
-
-pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready_raw = runtime_sources::current_iam_ready();
-    let storage_ready = collect_storage_read_readiness_uncached().await;
-    let lock_quorum_status = collect_lock_quorum_status().await;
-
-    let readiness = DependencyReadiness {
-        storage_ready,
-        iam_ready: iam_ready_raw,
-        lock_quorum_ready: lock_quorum_status.ready,
-        peer_health_ready: collect_peer_health_readiness(),
-    };
-    let report = dependency_readiness_report_from_readiness(readiness);
-    record_readiness_report(&report);
-    report
 }
 
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
@@ -1056,15 +1101,6 @@ async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStat
         }
     } else {
         StorageWriteReadinessStatus::default()
-    }
-}
-
-async fn collect_storage_read_readiness_uncached() -> bool {
-    if let Some(store) = runtime_sources::current_object_store_handle() {
-        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-        storage_read_ready_from_runtime_state(&storage_info)
-    } else {
-        false
     }
 }
 
@@ -1804,6 +1840,213 @@ mod tests {
             },
         )
         .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_deadline_includes_uncached_concurrent_waiters() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let started_at = tokio::time::Instant::now();
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let (first, second, third) = tokio::join!(request(), request(), request());
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(second, first);
+                assert_eq!(third, first);
+                assert_eq!(tokio::time::Instant::now() - started_at, Duration::from_millis(20));
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "expired waiters must not begin another collection");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_waiter_timeout_does_not_poison_the_cache() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let _leader = cluster_health_singleflight(ClusterHealthProbeKind::Write).lock().await;
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("waiter must expire before entering the collector")
+                })
+                .await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(
+                    load_cached_cluster_health_report(ClusterHealthProbeKind::Write)
+                        .await
+                        .is_none()
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_cancelled_leader_releases_the_flight() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let started = AtomicUsize::new(0);
+            let mut leader = Box::pin(collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                started.fetch_add(1, Ordering::SeqCst);
+                future::pending().await
+            }));
+            assert!(futures::poll!(leader.as_mut()).is_pending());
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            drop(leader);
+
+            let expected = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { expected.clone() }).await;
+            assert_eq!(report, expected);
+        })
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_publication_retains_flight_ownership() {
+        use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Default)]
+        struct PublicationRecorder(AtomicBool);
+
+        impl Recorder for PublicationRecorder {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                if key.name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                    && key
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout")
+                {
+                    assert!(
+                        cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_err(),
+                        "an expired leader must retain the flight through timeout publication"
+                    );
+                    let cache = cluster_health_report_cache(ClusterHealthProbeKind::Write)
+                        .try_lock()
+                        .expect("timeout cache must have been published without retaining its mutex");
+                    assert_eq!(cache.as_ref().expect("published timeout").report, cluster_health_timeout_report());
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Counter::noop()
+            }
+
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        reset_cluster_health_report_caches().await;
+        let recorder = PublicationRecorder::default();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(recorder.0.load(Ordering::SeqCst), "the recorder must observe timeout publication");
+                assert!(
+                    cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_ok(),
+                    "the completed caller must release the flight"
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_records_once_and_cached_failure_is_not_recounted() {
+        reset_cluster_health_report_caches().await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                let cached = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("fresh cached timeout must avoid another collection")
+                })
+                .await;
+                assert_eq!(cached, report);
+
+                let read_ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                assert_eq!(
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async { read_ready.clone() }).await,
+                    read_ready,
+                    "read and write caches and flights must remain separate"
+                );
+            },
+        )
+        .await;
+        let entries = snapshotter.snapshot().into_vec();
+        let timeout_count = entries.iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout"))
+            .then_some(value)
+        });
+        assert!(matches!(timeout_count, Some(DebugValue::Counter(1))));
+        for (probe, expected) in [("write", 0.0), ("read", 1.0)] {
+            let ready = entries.iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == METRIC_CLUSTER_HEALTH_READY
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "probe" && label.value() == probe))
+                .then_some(value)
+            });
+            assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == expected));
+        }
         reset_cluster_health_report_caches().await;
     }
 
