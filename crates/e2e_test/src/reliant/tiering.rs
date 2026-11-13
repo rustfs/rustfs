@@ -412,6 +412,7 @@ struct ManualTransitionRunReport {
     skipped_delete_marker: u64,
     skipped_directory: u64,
     skipped_replication: u64,
+    skipped_already_transitioned: u64,
     skipped_already_in_flight: u64,
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
@@ -1214,9 +1215,16 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert!(!due.report.dry_run);
     assert!(due.report.lifecycle_config_found);
     assert_eq!(due.report.scanned, 1, "due report: {:#?}", due.report);
-    assert_eq!(due.report.eligible, 1, "due report: {:#?}", due.report);
+    // PUT can enqueue this object before the manual scan. Account for each
+    // terminal outcome without depending on how fast the tier worker runs.
     assert_eq!(
-        due.report.enqueued + due.report.skipped_already_in_flight,
+        due.report.eligible + due.report.skipped_already_transitioned,
+        1,
+        "due report: {:#?}",
+        due.report
+    );
+    assert_eq!(
+        due.report.enqueued + due.report.skipped_already_in_flight + due.report.skipped_already_transitioned,
         1,
         "due report: {:#?}",
         due.report
@@ -1225,12 +1233,34 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(due.report.skipped_delete_marker, 0);
     assert_eq!(due.report.skipped_directory, 0);
     assert_eq!(due.report.skipped_replication, 0);
+    assert_eq!(due.report.skipped_queue_full, 0);
+    assert_eq!(due.report.skipped_queue_closed, 0);
+    assert_eq!(due.report.skipped_queue_timeout, 0);
     assert_eq!(due.report.tier_failure, 0);
     assert!(!due.report.cancelled);
     assert!(!due.report.truncated_by_limit);
     assert!(!due.report.truncated_by_duration);
     wait_for_transition(&hot_client, MANUAL_DUE_BUCKET, MANUAL_DUE_KEY, StdDuration::from_secs(90)).await?;
     let remote_count_after_due = cold_tier_object_count(&cold_client).await?;
+    assert_eq!(remote_count_after_due, 1, "due object must have exactly one remote copy");
+
+    // Once HEAD observes the committed transition, a repeated manual scan must
+    // report the completed object and leave both local reads and the tier intact.
+    let repeated = manual_transition_run(&hot, MANUAL_DUE_BUCKET, "manual-due/", false).await?;
+    assert_eq!(repeated.state, "completed", "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.scanned, 1, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.eligible, 0, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.enqueued, 0, "repeated report: {:#?}", repeated.report);
+    assert_eq!(repeated.report.skipped_already_transitioned, 1);
+    assert_eq!(repeated.report.skipped_already_in_flight, 0);
+    assert_eq!(cold_tier_object_count(&cold_client).await?, remote_count_after_due);
+    let due_object = hot_client
+        .get_object()
+        .bucket(MANUAL_DUE_BUCKET)
+        .key(MANUAL_DUE_KEY)
+        .send()
+        .await?;
+    assert_eq!(due_object.body.collect().await?.into_bytes().as_ref(), b"manual due object");
 
     hot_client.create_bucket().bucket(MANUAL_DRY_RUN_BUCKET).send().await?;
     enable_bucket_versioning(&hot_client, MANUAL_DRY_RUN_BUCKET).await?;
