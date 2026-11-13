@@ -1639,6 +1639,51 @@ impl PeerRestClient {
         Err(Error::NotImplemented)
     }
 
+    /// Routes one authorized MRF operation without retrying ambiguous mutations.
+    /// `None` means the selected node predates this protocol; it is never an empty result.
+    pub async fn mrf_lifecycle(
+        &self,
+        topology: String,
+        node_id: String,
+        command: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        use rustfs_protos::proto_gen::node_service::MrfLifecycleRequest;
+        use rustfs_protos::{MRF_LIFECYCLE_MAX_COMMAND_BYTES, MRF_LIFECYCLE_MAX_MESSAGE_BYTES, MRF_LIFECYCLE_PROTOCOL_VERSION};
+        if command.len() > MRF_LIFECYCLE_MAX_COMMAND_BYTES {
+            return Err(Error::other("MRF command exceeds size limit"));
+        }
+        let payload = MrfLifecycleRequest {
+            protocol_version: MRF_LIFECYCLE_PROTOCOL_VERSION,
+            topology_fingerprint: topology,
+            node_id,
+            command: command.into(),
+            challenge: Uuid::new_v4().as_bytes().to_vec().into(),
+        };
+        let mut request = Request::new(payload.clone());
+        request.set_timeout(timeout);
+        set_tonic_mutation_body_digest(&mut request)?;
+        let mut client = self
+            .get_client()
+            .await?
+            .max_decoding_message_size(MRF_LIFECYCLE_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MRF_LIFECYCLE_MAX_MESSAGE_BYTES);
+        let response = match client.mrf_lifecycle(request).await {
+            Ok(response) => response.into_inner(),
+            // RUSTFS_COMPAT_TODO(backlog-3177): old peers lack MRF management. Remove after every supported peer implements this RPC.
+            Err(status) if status.code() == tonic::Code::Unimplemented => return Ok(None),
+            Err(status) => return Err(status.into()),
+        };
+        let canonical = rustfs_protos::canonical_mrf_lifecycle_response_body(&payload, &response)
+            .map_err(|_| Error::other("MRF response is too large to authenticate"))?;
+        verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+            .map_err(|_| Error::other("MRF response authentication failed"))?;
+        if response.protocol_version != MRF_LIFECYCLE_PROTOCOL_VERSION {
+            return Err(Error::other("unsupported MRF response protocol"));
+        }
+        Ok(Some(response.result.to_vec()))
+    }
+
     pub async fn background_heal_status(&self) -> Result<Option<Vec<u8>>> {
         self.finalize_result(
             async {
