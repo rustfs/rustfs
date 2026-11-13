@@ -301,14 +301,8 @@ where
     output_to_s3s(output).map(S3Response::new).map_err(seam_error)
 }
 
-/// A value this edge and the gateway's types disagree on, answered as a server fault. The seam's
-/// bucket and key conversions become typed with rustfs/gateway#1610; after that re-pin a name the
-/// gateway's floor refuses maps here to the client error the legacy edge answers.
-pub(in crate::storage) fn seam_error(error: ConversionError) -> S3Error {
-    S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!("failed to convert through the gateway compatibility seam: {error}"),
-    )
+fn seam_error(error: ConversionError) -> S3Error {
+    crate::app::dto_values::seam_error(error).into()
 }
 
 // The bodies of the methods below, one file per migration batch (rustfs/backlog#2765).

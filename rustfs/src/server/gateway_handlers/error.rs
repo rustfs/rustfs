@@ -26,7 +26,7 @@
 //! RustFS did not say.
 
 use http::{HeaderName, HeaderValue};
-use rustfs_gateway::{ErrorHeader, HandlerError, HttpDate, RedirectTarget, RegionLabel, VersionIdLabel};
+use rustfs_gateway::{ErrorHeader, HandlerError, HttpDate, RedirectTarget, RegionLabel, StoredHeaderValue, VersionIdLabel};
 use rustfs_gateway_types::{ErrorCode, Timestamp, TimestampFormat};
 use rustfs_s3_types::S3Error;
 use std::borrow::Cow;
@@ -75,6 +75,18 @@ fn error_header(name: &HeaderName, value: &HeaderValue) -> Option<ErrorHeader> {
         "x-amz-delete-marker" => (value == "true").then_some(ErrorHeader::DeleteMarker),
         "x-amz-version-id" => Some(ErrorHeader::VersionId {
             version_id: VersionIdLabel::new(value).ok()?,
+        }),
+        "cache-control" => Some(ErrorHeader::CacheControl {
+            value: StoredHeaderValue::new(value).ok()?,
+        }),
+        "content-location" => Some(ErrorHeader::ContentLocation {
+            value: StoredHeaderValue::new(value).ok()?,
+        }),
+        "expires" => Some(ErrorHeader::Expires {
+            value: StoredHeaderValue::new(value).ok()?,
+        }),
+        "vary" => Some(ErrorHeader::Vary {
+            value: StoredHeaderValue::new(value).ok()?,
         }),
         "last-modified" => {
             let seconds = Timestamp::parse(value, TimestampFormat::HttpDate).ok()?.secs();
@@ -171,6 +183,10 @@ mod tests {
                 (HeaderName::from_static("x-amz-delete-marker"), "true"),
                 (HeaderName::from_static("x-amz-version-id"), "null"),
                 (header::LAST_MODIFIED, "Tue, 14 Nov 2023 22:13:20 GMT"),
+                (header::CACHE_CONTROL, "max-age=60"),
+                (header::CONTENT_LOCATION, "/bucket/key"),
+                (header::EXPIRES, "Wed, 15 Nov 2023 22:13:20 GMT"),
+                (header::VARY, "Origin"),
             ],
         );
 
@@ -185,6 +201,10 @@ mod tests {
                 HeaderName::from_static("x-amz-delete-marker"),
                 HeaderName::from_static("x-amz-version-id"),
                 header::LAST_MODIFIED,
+                header::CACHE_CONTROL,
+                header::CONTENT_LOCATION,
+                header::EXPIRES,
+                header::VARY,
             ]
         );
         assert!(
@@ -214,6 +234,7 @@ mod tests {
             (HeaderName::from_static("x-amz-delete-marker"), "false"),
             (HeaderName::from_static("x-amz-bucket-region"), ""),
             (header::LAST_MODIFIED, "yesterday"),
+            (header::VARY, " Origin"),
         ] {
             let mapped = with_headers(S3ErrorCode::SlowDown, &[(name.clone(), value)]);
 
