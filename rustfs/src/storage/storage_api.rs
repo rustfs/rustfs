@@ -146,6 +146,12 @@ pub(crate) use super::sse::{
 };
 
 pub(crate) mod access_consumer {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::access::access_owned;
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::access::{
+        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+    };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
         MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
@@ -169,7 +175,7 @@ pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::{
         ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
-        TableDataPlanePublicationGuards, authorize_request, parity_test_support,
+        TableDataPlanePublicationGuards, authorize_object_request, authorize_request, parity_test_support,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
@@ -373,16 +379,12 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
-            parse_list_object_versions_params, parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
+            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
-            pub(crate) mod bucket {
-                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
-            }
-
             pub(crate) mod list {
                 pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
             }
@@ -395,6 +397,7 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod common {
         pub(crate) use super::super::super::s3_api::common::rustfs_owner;
+        pub(crate) use super::super::super::s3_api::common::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
     }
 
     pub(crate) mod multipart {
@@ -481,8 +484,8 @@ pub(crate) mod ecstore_bucket {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
-        remote_s3_client, replication, tagging, target, utils,
+        bandwidth, bucket_target_sys, durability, etag, lifecycle, lockless_cache, metadata, metadata_sys, migration,
+        object_lock, policy_sys, remote_s3_client, replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{config_parse_mode, quota, versioning, versioning_sys};
 }
@@ -632,7 +635,7 @@ pub(crate) mod ecstore_rio {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rio::{DecryptReader, EncryptReader, HardLimitReader, Reader, boxed_reader};
     pub(crate) use rustfs_ecstore::api::rio::{
-        DynReader, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+        DynReader, EtagAlgorithm, HashReader, ReadStream, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
 }
 
@@ -815,6 +818,7 @@ pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
+pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;

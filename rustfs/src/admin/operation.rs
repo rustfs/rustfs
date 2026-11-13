@@ -119,6 +119,12 @@ impl AdminRequest {
     pub(crate) fn into_body(self) -> Body {
         self.body
     }
+
+    /// The request facts without the body, for a caller that outlives the
+    /// request's dispatch and must not keep the body's stream alive.
+    pub(crate) fn into_envelope(self) -> RequestEnvelope {
+        self.envelope
+    }
 }
 
 /// The raw HTTP response produced by an owned admin operation.

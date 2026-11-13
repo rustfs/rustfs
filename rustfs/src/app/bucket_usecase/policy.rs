@@ -15,6 +15,11 @@
 //! Bucket policy and policy status use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    DeleteBucketPolicyInput, DeleteBucketPolicyOutput, GetBucketPolicyInput, GetBucketPolicyOutput, GetBucketPolicyStatusInput,
+    GetBucketPolicyStatusOutput, PolicyStatus, PutBucketPolicyInput, PutBucketPolicyOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use rustfs_policy::policy::Validator;
 
 impl DefaultBucketUsecase {

@@ -1,0 +1,3 @@
+# Tests the bucket_core slice retires (rustfs/backlog#2765); format and checks: scripts/check_test_retirements.py.
+# <crate> | <module path>::<test fn> | <kind: test, differential or e2e> | <replacement> | <reason>
+# The retired test must still exist when its entry is added; the change that deletes it deletes the entry.

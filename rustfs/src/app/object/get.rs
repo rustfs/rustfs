@@ -21,6 +21,14 @@ use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
     with_get_object_read_condition,
 };
+use crate::app::storage_api::s3::dto::{
+    Checksum, ChecksumType, ContentType, ETag, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
+    GetObjectInput, GetObjectOutput, ObjectAttributes, ObjectPart, SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId,
+    ServerSideEncryption, StorageClass, StreamingBlob, Timestamp,
+};
+use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
+use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use crate::on_demand_migration::WriteBackBody;
 
 struct ConditionalRead {
@@ -2821,9 +2829,15 @@ impl DefaultObjectUsecase {
             rs,
         } = validated;
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
             .await
             .map_err(ApiError::from)?;
+        if is_lockless_cache_bucket(&bucket) {
+            // Content-addressed cache objects never change once written, so the
+            // read needs neither the object read lock nor a fresh metadata quorum.
+            opts.no_lock = true;
+            opts.metadata_cache_safe = true;
+        }
 
         Ok(GetObjectRequestContext {
             version_id_for_event: version_id.unwrap_or_default(),
@@ -6221,6 +6235,7 @@ mod on_demand_migration_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::{HeadObjectInput, Range};
     use http::{HeaderMap, HeaderValue, Method};
     use std::pin::Pin;
     use std::sync::Arc;

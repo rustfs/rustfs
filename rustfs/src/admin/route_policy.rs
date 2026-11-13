@@ -435,6 +435,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/on-demand-migration/{bucket}",
         SET_BUCKET_ON_DEMAND_MIGRATION,
         RouteRiskLevel::High,
@@ -2012,6 +2030,18 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/list-remote-targets",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
+    // S3-shaped extension routes (handlers::s3_extension), keyed `?<sub-resource>/<bucket>`.
+    // Each authorizes one S3 action on the bucket: reset and reset-status
+    // s3:ResetBucketReplicationState, check s3:PutReplicationConfiguration, both
+    // metrics s3:GetReplicationConfiguration; the listen routes
+    // s3:ListenNotification and s3:ListenBucketNotification.
+    deferred(HttpMethod::Put, "?replication-reset/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-reset-status/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-check/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics=2/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/{bucket}", DeferredRoutePolicyReason::S3Action),
 ];
 
 #[allow(

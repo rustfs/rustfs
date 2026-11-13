@@ -16,6 +16,10 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+#[cfg(feature = "gateway-stack")]
+mod gateway_handlers;
+#[cfg(feature = "gateway-stack")]
+mod gateway_stack;
 mod health;
 mod http;
 mod hybrid;
@@ -29,6 +33,8 @@ mod runtime;
 pub(crate) mod runtime_sources;
 mod service_state;
 mod ssec_transport;
+#[cfg(feature = "gateway-stack")]
+mod stack;
 pub mod tls_material;
 pub(crate) mod tls_publish;
 
@@ -74,7 +80,15 @@ pub(crate) use health::{
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub use layer::s3_http_request_guard;
-pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
+pub(crate) use layer::{RequestContextLayer, is_control_plane_route, is_sts_query_request};
+
+/// The S3 operations the gateway stack serves.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn gateway_operations() -> Vec<&'static str> {
+    gateway_handlers::rows(gateway_handlers::OPERATIONS)
+        .map(|row| row.name)
+        .collect()
+}
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
     current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,

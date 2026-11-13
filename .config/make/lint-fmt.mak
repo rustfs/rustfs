@@ -70,6 +70,11 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	@echo "📦 Checking s3s footprint ratchet..."
 	./scripts/check_s3s_footprint.sh
 
+.PHONY: release-feature-boundary-check
+release-feature-boundary-check: ## Check no release-reachable feature enables a debug-only one
+	@echo "🚧 Checking release feature boundaries..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --features-only
+
 .PHONY: test-count-ratchet-check
 test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
 	@echo "🧪 Checking per-crate test-count ratchet..."
@@ -79,6 +84,11 @@ test-count-ratchet-check: ## Check no workspace crate fell below its test floor 
 test-seams-check: ## Check tests outside an operation's owner call its use-case only through rustfs/src/app/test_seams
 	@echo "🧪 Checking cross-owner test seams..."
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py
+
+.PHONY: test-retirements-check
+test-retirements-check: ## Check every test retired by a migration slice names a replacement that exists
+	@echo "🧪 Checking test retirement tables..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py
 
 .PHONY: fips-wording-check
 fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities

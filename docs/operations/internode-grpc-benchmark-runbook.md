@@ -70,6 +70,8 @@ The lifetime guards cover ReadAll, WriteAll, ReadMultiple and BatchReadVersion. 
 
 All names are defined in `crates/io-metrics/src/internode_metrics.rs`.
 
+Explicit channel dial metrics start after endpoint settings validate and cover TLS configuration, waiting for its blocking task, and connection establishment. Each completed or cancelled attempt records one result. TLS configuration errors and acquisition cancellation contribute to `rustfs_system_network_internode_dial_errors_total`. Only connection failures follow the existing peer-unreachable classification. Cache hits reuse the existing channel, and coalesced callers share the dial owner's result. Tonic's internal TCP reconnects and HTTP/2 PING outcomes require their own transport observations.
+
 | Metric | Stage signal |
 | --- | --- |
 | `rustfs_system_network_internode_operation_duration_ms{operation,backend}` | control-plane RTT (P0), lock/bulk latency (P1), first-op latency (P3) |

@@ -34,6 +34,45 @@ use uuid::Uuid;
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
+/// Bucket holding RustFS's own metadata objects; they always use `BLOCK_SIZE_V2`.
+const SYSTEM_META_BUCKET_PREFIX: &str = ".rustfs.sys/";
+
+static CONFIGURED_ERASURE_SHARD_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Shard size override from `RUSTFS_ERASURE_SHARD_BYTES` (`0` = none), read once.
+pub fn configured_erasure_shard_bytes() -> usize {
+    *CONFIGURED_ERASURE_SHARD_BYTES.get_or_init(|| {
+        let raw = rustfs_utils::get_env_usize(rustfs_config::ENV_ERASURE_SHARD_BYTES, rustfs_config::DEFAULT_ERASURE_SHARD_BYTES);
+        if raw == 0 {
+            return 0;
+        }
+        if !raw.is_multiple_of(4096) || raw > rustfs_config::MAX_ERASURE_SHARD_BYTES {
+            tracing::warn!(
+                setting = rustfs_config::ENV_ERASURE_SHARD_BYTES,
+                value = raw,
+                "ignoring erasure shard size: must be a multiple of 4096 and at most {} bytes",
+                rustfs_config::MAX_ERASURE_SHARD_BYTES
+            );
+            return 0;
+        }
+        raw
+    })
+}
+
+/// Erasure block for a new object: `data_blocks x` the configured shard size,
+/// or `BLOCK_SIZE_V2` when no shard size is configured or the object is system
+/// metadata.
+pub fn erasure_block_size_for(object: &str, data_blocks: usize) -> usize {
+    erasure_block_size_with(configured_erasure_shard_bytes(), object, data_blocks)
+}
+
+fn erasure_block_size_with(shard_bytes: usize, object: &str, data_blocks: usize) -> usize {
+    if shard_bytes == 0 || data_blocks == 0 || object.starts_with(SYSTEM_META_BUCKET_PREFIX) {
+        return BLOCK_SIZE_V2;
+    }
+    shard_bytes.saturating_mul(data_blocks)
+}
+
 pub(crate) const MAX_ERASURE_SHARDS: usize = 16;
 const MAX_FILEINFO_PARTS: usize = 10_000;
 const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
@@ -804,7 +843,7 @@ impl FileInfo {
                 algorithm: String::from(ERASURE_ALGORITHM),
                 data_blocks,
                 parity_blocks,
-                block_size: BLOCK_SIZE_V2,
+                block_size: erasure_block_size_for(object, data_blocks),
                 distribution: indices,
                 ..Default::default()
             },
@@ -1453,7 +1492,7 @@ pub struct FilesInfo {
 /// Parsed restore status of a restored object: the value persisted under
 /// [`metadata_keys::RESTORE`]. filemeta owns this type so the persisted format
 /// does not depend on an HTTP library DTO (backlog#1735 A3c); the field names
-/// match the former `s3s::dto::RestoreStatus` so the rendered bytes are unchanged.
+/// match the former s3s `RestoreStatus` DTO so the rendered bytes are unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreStatus {
     /// `ongoing-request`; `None` reads as not in progress.
@@ -1588,6 +1627,22 @@ pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_shard_bytes_derive_the_block_and_keep_shards_aligned() {
+        let shard = 4 * 1024 * 1024;
+        assert_eq!(super::erasure_block_size_with(shard, "bucket/object", 12), 48 * 1024 * 1024);
+        assert_eq!(calc_shard_size(super::erasure_block_size_with(shard, "bucket/object", 12), 12), shard);
+        assert_eq!(super::erasure_block_size_with(shard, "bucket/object", 14), 56 * 1024 * 1024);
+        assert_eq!(calc_shard_size(super::erasure_block_size_with(shard, "bucket/object", 14), 14), shard);
+    }
+
+    #[test]
+    fn unset_shard_bytes_and_system_metadata_keep_the_legacy_block() {
+        assert_eq!(super::erasure_block_size_with(0, "bucket/object", 12), BLOCK_SIZE_V2);
+        assert_eq!(super::erasure_block_size_with(4 * 1024 * 1024, ".rustfs.sys/pool.bin", 2), BLOCK_SIZE_V2);
+        assert_eq!(super::erasure_block_size_with(4 * 1024 * 1024, "bucket/object", 0), BLOCK_SIZE_V2);
+    }
+
     use super::*;
     use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;

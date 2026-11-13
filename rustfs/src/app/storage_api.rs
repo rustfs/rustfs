@@ -52,6 +52,8 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    pub(crate) use s3s::S3Response;
+    pub(crate) use s3s::StdError;
     #[cfg(test)]
     pub(crate) use s3s::access::S3Access;
     #[cfg(test)]
@@ -70,16 +72,19 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    pub(crate) use s3s::header;
+    pub(crate) use s3s::region;
+    pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    pub(crate) use s3s::stream;
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
-    #[cfg(test)]
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3, S3Response};
+    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
@@ -337,6 +342,14 @@ pub(crate) mod bucket {
         RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
     };
     use std::sync::Arc;
+
+    pub(crate) mod etag {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::etag::bucket_uses_xxh3_etag;
+    }
+
+    pub(crate) mod lockless_cache {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
+    }
 
     pub(crate) trait ObjectLockConfigExt {
         fn enabled(&self) -> bool;
@@ -1622,7 +1635,7 @@ pub(crate) mod io {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
     pub(crate) use crate::storage::storage_api::{
-        DynReader, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
+        DynReader, EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader,
     };
 }
 
@@ -1677,11 +1690,12 @@ pub(crate) mod timeout_wrapper {
 pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
-            parse_list_object_versions_params, parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
+            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
+        pub(crate) use crate::storage::storage_api::s3_api_consumer::common::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
     }
 
     pub(crate) mod multipart {
@@ -1834,7 +1848,8 @@ pub(crate) mod owned_parity {
         DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
         ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
         RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
-        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_object_request, authorize_request,
+        parity_test_support,
     };
 }
 
@@ -1842,6 +1857,7 @@ pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
+    pub(crate) use super::helper::OperationHelper;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,

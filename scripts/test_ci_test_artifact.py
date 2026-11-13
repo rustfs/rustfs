@@ -189,6 +189,22 @@ class ArtifactIdentityTests(unittest.TestCase):
                 self.assertEqual(artifact.main(), 0)
                 self.assertEqual(run.call_args.args[0], ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"])
 
+    def test_warm_builds_exactly_the_archive_selection_without_archiving(self):
+        # cache-warm.yml runs this so that ci-dev holds the archive build's own
+        # dependency artifacts; any other selection resolves features differently.
+        for configuration in artifact.CONFIGURATIONS:
+            for environment in ({}, {"CI_PACKAGES": '["rustfs"]'} if configuration == "workspace" else {}):
+                with self.subTest(configuration=configuration, environment=environment), \
+                        patch.object(sys, "argv", ["ci_test_artifact.py", "cargo", "warm", "--configuration", configuration]), \
+                        patch.dict(os.environ, environment, clear=True), patch.object(artifact.subprocess, "run") as run:
+                    self.assertEqual(artifact.main(), 0)
+                    self.assertEqual(run.call_args.args[0], ["cargo", "test", "--locked", "--no-run", *artifact.package_args(configuration)])
+                    self.assertTrue(run.call_args.kwargs["check"])
+        with patch.object(sys, "argv", ["ci_test_artifact.py", "cargo", "warm", "--configuration", "workspace"]), \
+                patch.dict(os.environ, {}, clear=True), patch.object(sys, "stderr", io.StringIO()), \
+                patch.object(artifact.subprocess, "run", side_effect=subprocess.CalledProcessError(101, "cargo")):
+            self.assertEqual(artifact.main(), 1)
+
     def test_doctests_are_an_independent_command(self):
         with patch.object(sys, "argv", ["ci_test_artifact.py", "cargo", "doc", "--configuration", "workspace"]), \
                 patch.dict(os.environ, {}, clear=True), patch.object(artifact.subprocess, "run") as run:

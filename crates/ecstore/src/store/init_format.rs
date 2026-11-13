@@ -19,17 +19,20 @@ use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
 use crate::core::pools::PoolMetaBootstrapAuthority;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
+#[cfg(test)]
+use crate::disk::format::FormatBackend;
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
+use crate::layout::format::{legacy_format_max_bytes, validate_format_erasure_layout};
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources::{
-    quarantine_local_disks, quarantine_local_disks_preserving_bootstrap_routes, reconcile_local_disk_ids,
+    PreparedLocalDisk, prepare_disks, publish_local_disks, quarantine_local_disks,
+    quarantine_local_disks_preserving_bootstrap_routes, reconcile_local_disk_ids,
 };
 use crate::{
     disk::{
-        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
-        error::DiskError,
-        format::{FormatBackend, FormatErasureVersion, FormatMetaVersion, FormatV3},
+        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET, error::DiskError,
+        format::FormatV3,
     },
     layout::endpoints::Endpoints,
 };
@@ -43,54 +46,104 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const LEGACY_FORMAT_READ_CONCURRENCY: usize = 16;
-const LEGACY_FORMAT_BASE_MAX_BYTES: usize = 16 * 1024;
-const LEGACY_FORMAT_MAX_BYTES_PER_DISK: usize = 64;
 
 pub async fn init_disks(
     instance_ctx: &InstanceContext,
     eps: &Endpoints,
     opt: &DiskOption,
 ) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
-    let mut futures = Vec::with_capacity(eps.as_ref().len());
-    let local_disk_map = instance_ctx.local_disk_map();
-    let local_disks = local_disk_map.read().await;
-
-    for ep in eps.as_ref().iter() {
-        // Foundation disks may already serve RPC writes. Opening them again
-        // with startup cleanup can move live staging out from under a writer.
-        let registered = if ep.is_local {
-            local_disks.get(&ep.to_string()).cloned().flatten()
-        } else {
-            None
+    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    let results = prepare_disks(instance_ctx, eps.as_ref(), opt).await;
+    let mut disks = vec![None; results.len()];
+    let mut errors = vec![None; results.len()];
+    let mut prepared = Vec::new();
+    let mut publication_indices = Vec::new();
+    for (index, opened) in results.into_iter().enumerate() {
+        let disk = match opened.result {
+            Ok(disk) => Some(disk),
+            Err(error) => {
+                errors[index] = Some(error);
+                None
+            }
         };
-        futures.push(async move {
-            match registered {
-                Some(disk) if disk.endpoint() == *ep => Ok(disk),
-                Some(_) => Err(DiskError::InconsistentDisk),
-                None => crate::disk::new_disk_for_instance(instance_ctx, ep, opt).await,
+        let registration = match opened.registration {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                // A raw opener owns no runtime membership to publish.
+                disks[index] = disk;
+                continue;
             }
-        });
-    }
-    drop(local_disks);
-
-    let mut res = Vec::with_capacity(eps.as_ref().len());
-    let mut errors = Vec::with_capacity(eps.as_ref().len());
-
-    let results = join_all(futures).await;
-    for result in results {
-        match result {
-            Ok(s) => {
-                res.push(Some(s));
-                errors.push(None);
+            Err(error) => {
+                errors[index].get_or_insert(error);
+                continue;
             }
-            Err(e) => {
-                res.push(None);
-                errors.push(Some(e));
+        };
+        match PreparedLocalDisk::new(registration, disk) {
+            Ok(registration) => {
+                prepared.push(registration);
+                publication_indices.push(index);
+            }
+            Err(error) => {
+                errors[index].get_or_insert_with(|| error.narrow_to_disk().unwrap_or_else(DiskError::other));
             }
         }
     }
+    match publish_local_disks(instance_ctx, prepared).await {
+        Ok(published) => {
+            for (index, disk) in publication_indices.into_iter().zip(published) {
+                if disk.is_none() && errors[index].is_none() {
+                    errors[index] = Some(DiskError::DiskNotFound);
+                }
+                disks[index] = disk;
+            }
+        }
+        Err(error) => {
+            let error = error.narrow_to_disk().unwrap_or_else(DiskError::other);
+            for index in publication_indices {
+                errors[index].get_or_insert_with(|| error.clone());
+            }
+        }
+    }
+    (disks, errors)
+}
 
-    (res, errors)
+pub(crate) async fn refresh_missing_local_disks(
+    instance_ctx: &Arc<InstanceContext>,
+    eps: &Endpoints,
+    disks: &mut [Option<DiskStore>],
+) -> Result<()> {
+    if eps.as_ref().len() != disks.len() {
+        return Err(Error::CorruptedFormat);
+    }
+    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    let pending = eps
+        .as_ref()
+        .iter()
+        .enumerate()
+        .filter(|(index, endpoint)| disks[*index].is_none() && endpoint.is_local)
+        .map(|(index, endpoint)| (index, endpoint.clone()))
+        .collect::<Vec<_>>();
+    let endpoints = pending.iter().map(|(_, endpoint)| endpoint.clone()).collect::<Vec<_>>();
+    let opened = prepare_disks(
+        instance_ctx,
+        &endpoints,
+        &DiskOption {
+            cleanup: false,
+            health_check: true,
+        },
+    )
+    .await;
+    let mut prepared = Vec::with_capacity(opened.len());
+    for opened in opened {
+        prepared.push(opened.into_local_registration()?);
+    }
+    let published = publish_local_disks(instance_ctx, prepared).await?;
+    for ((index, _), disk) in pending.into_iter().zip(published) {
+        if let Some(disk) = disk {
+            disks[index] = Some(disk);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -608,13 +661,6 @@ fn select_persisted_migration_format(
     Err(write_error.map_or(quorum_error, Into::into))
 }
 
-pub(super) fn legacy_format_max_bytes(disk_count: usize) -> Result<usize> {
-    disk_count
-        .checked_mul(LEGACY_FORMAT_MAX_BYTES_PER_DISK)
-        .and_then(|size| size.checked_add(LEGACY_FORMAT_BASE_MAX_BYTES))
-        .ok_or_else(|| Error::other("legacy format size limit overflow"))
-}
-
 pub(super) async fn read_legacy_format_bytes(
     reader: impl tokio::io::AsyncRead + Unpin,
     max_bytes: usize,
@@ -806,58 +852,6 @@ fn check_format_erasure_value_for_topology(format: &FormatV3, format_count: usiz
         });
     }
     Ok(())
-}
-
-fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
-    if format.version != FormatMetaVersion::V1 {
-        return Err(Error::other("invalid FormatMetaVersion"));
-    }
-
-    if !matches!(format.format, FormatBackend::Erasure | FormatBackend::ErasureSingle) {
-        return Err(Error::other("invalid FormatBackend"));
-    }
-
-    if format.id.is_nil() || format.id == Uuid::max() {
-        return Err(Error::other("invalid deployment ID"));
-    }
-
-    if format.erasure.version != FormatErasureVersion::V3 {
-        return Err(Error::other("invalid FormatErasureVersion"));
-    }
-    Ok(())
-}
-
-fn validate_format_erasure_layout(format: &FormatV3) -> Result<usize> {
-    check_format_erasure_value(format)?;
-
-    let set_drive_count = format
-        .erasure
-        .sets
-        .first()
-        .map(Vec::len)
-        .filter(|count| *count > 0)
-        .ok_or_else(|| Error::other("erasure.sets must contain at least one drive"))?;
-    if format.erasure.sets.iter().any(|set| set.len() != set_drive_count) {
-        return Err(Error::other("erasure.sets must be rectangular"));
-    }
-    let drive_count = format
-        .erasure
-        .sets
-        .len()
-        .checked_mul(set_drive_count)
-        .ok_or_else(|| Error::other("erasure set drive count overflow"))?;
-    let mut disk_ids = HashSet::with_capacity(drive_count);
-
-    for disk_id in format.erasure.sets.iter().flatten() {
-        if disk_id.is_nil() || *disk_id == Uuid::max() {
-            return Err(Error::other("erasure.sets contains an invalid disk UUID"));
-        }
-        if !disk_ids.insert(*disk_id) {
-            return Err(Error::other("erasure.sets contains a duplicate disk UUID"));
-        }
-    }
-
-    Ok(set_drive_count)
 }
 
 // load_format_erasure_all reads all format.json files
@@ -1078,6 +1072,318 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_missing_local_disks_restores_format_quorum_and_bootstrap_routes() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        let (directory, original_disks) = local_disks(4).await;
+        let format = FormatV3::new(1, 4);
+        for (index, disk) in original_disks.iter().enumerate() {
+            let mut disk_format = format.clone();
+            disk_format.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(disk_format))
+                .await
+                .expect("seed existing format");
+        }
+        let endpoints = Endpoints::from(
+            original_disks
+                .iter()
+                .flatten()
+                .map(|disk| disk.endpoint())
+                .collect::<Vec<_>>(),
+        );
+        drop(original_disks);
+        for index in 1..4 {
+            tokio::fs::rename(
+                directory.path().join(format!("disk-{index}")),
+                directory.path().join(format!("disk-{index}.offline")),
+            )
+            .await
+            .expect("take a startup drive offline");
+        }
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: true,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: endpoints.clone(),
+            cmd_line: "startup-format-retry".to_string(),
+            platform: String::new(),
+        }]);
+        let context = Arc::new(InstanceContext::new());
+        crate::runtime::sources::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+            .await
+            .expect("register the surviving local drive");
+        let (mut disks, _) = init_disks(&context, &endpoints, &DiskOption::default()).await;
+        let healthy = disks[0].clone().expect("surviving drive handle");
+        let staging = healthy.path().join(RUSTFS_META_BUCKET).join("tmp/live-startup-writer");
+        tokio::fs::write(&staging, b"live staging").await.expect("seed live staging");
+        assert!(matches!(
+            connect_load_init_formats_with_instance_ctx(&context, true, &mut disks, 1, 4, None).await,
+            Err(Error::ErasureReadQuorum)
+        ));
+
+        tokio::fs::rename(directory.path().join("disk-1.offline"), directory.path().join("disk-1"))
+            .await
+            .expect("restore a drive while startup waits for quorum");
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect("refresh returned local drives");
+        assert!(Arc::ptr_eq(&healthy, disks[0].as_ref().expect("preserved healthy handle")));
+        let returned = disks[1].as_ref().expect("returned drive handle").clone();
+        let registered = context.local_disk_map();
+        let registered = registered.read().await;
+        assert!(Arc::ptr_eq(
+            &returned,
+            registered
+                .get(&endpoints.as_ref()[1].to_string())
+                .and_then(Option::as_ref)
+                .expect("returned drive bootstrap route")
+        ));
+        drop(registered);
+        let registered_slots = context.local_disk_set_drives();
+        let registered_slots = registered_slots.read().await;
+        assert!(Arc::ptr_eq(
+            &returned,
+            registered_slots[0][0][1].as_ref().expect("returned drive original slot")
+        ));
+        drop(registered_slots);
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&context, true, &mut disks, 1, 4, None)
+            .await
+            .expect("returned drive restores existing-format read quorum");
+        assert_eq!(loaded.format.shared_identity(), format.shared_identity());
+        assert!(matches!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None));
+        assert!(disks[2..].iter().all(Option::is_none));
+        assert_eq!(tokio::fs::read(staging).await.expect("preserved staging"), b"live staging");
+    }
+
+    #[tokio::test]
+    async fn refresh_missing_local_disks_preserves_remote_slots_and_rejects_bad_local_format() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        let directory = tempfile::tempdir().expect("startup retry fixture");
+        let path = directory.path().join("disk-0");
+        let mut local = Endpoint::try_from(path.to_str().expect("UTF-8 local endpoint")).expect("local endpoint");
+        let mut remote = Endpoint::try_from("http://remote.invalid:9000/disk-1").expect("remote endpoint");
+        local.set_pool_index(0);
+        local.set_set_index(0);
+        local.set_disk_index(0);
+        remote.set_pool_index(0);
+        remote.set_set_index(0);
+        remote.set_disk_index(1);
+        let endpoints = Endpoints::from(vec![local, remote]);
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: true,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: endpoints.clone(),
+            cmd_line: "startup-format-retry".to_string(),
+            platform: String::new(),
+        }]);
+        let context = Arc::new(InstanceContext::new());
+        crate::runtime::sources::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+            .await
+            .expect("missing local drive remains registered offline");
+        let mut disks = vec![None, None];
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect("missing local and remote slots remain offline");
+        assert!(disks.iter().all(Option::is_none));
+
+        tokio::fs::create_dir_all(path.join(RUSTFS_META_BUCKET))
+            .await
+            .expect("restore metadata directory");
+        tokio::fs::write(path.join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE), b"invalid-format")
+            .await
+            .expect("corrupt returned format");
+        refresh_missing_local_disks(&context, &endpoints, &mut disks)
+            .await
+            .expect_err("returned corrupt format must retain its startup error");
+        assert!(disks.iter().all(Option::is_none));
+        assert!(context.local_disk_map().read().await[&endpoints.as_ref()[0].to_string()].is_none());
+    }
+
+    #[tokio::test]
+    async fn init_disks_registers_drive_returned_after_foundation_before_format_loading() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType};
+
+        let (directory, originals) = local_disks(4).await;
+        let format = FormatV3::new(1, 4);
+        for (index, disk) in originals.iter().enumerate() {
+            let mut current = format.clone();
+            current.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(current)).await.expect("seed existing format");
+        }
+        let endpoints = Endpoints::from(originals.iter().flatten().map(|disk| disk.endpoint()).collect::<Vec<_>>());
+        let pool = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: endpoints.clone(),
+            cmd_line: "returned-during-startup".to_string(),
+            platform: String::new(),
+        };
+        let missing = directory.path().join("disk-1");
+        let parked = directory.path().join("parked-disk-1");
+        tokio::fs::rename(&missing, &parked)
+            .await
+            .expect("remove disk before foundation");
+        let context = Arc::new(InstanceContext::new());
+        context.update_erasure_type(SetupType::DistErasure).await;
+        crate::runtime::sources::initialize_local_disk_maps(
+            &context,
+            EndpointServerPools::from(vec![pool.clone()]),
+            &DiskOption::default(),
+        )
+        .await
+        .expect("register surviving disks");
+        assert!(context.local_disk_map().read().await[&endpoints.as_ref()[1].to_string()].is_none());
+        tokio::fs::rename(&parked, &missing)
+            .await
+            .expect("return disk before initial format load");
+
+        let (mut disks, errors) = init_disks(
+            &context,
+            &endpoints,
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "initial disk errors: {errors:?}");
+        let returned = disks[1].clone().expect("returned disk handle");
+        let routes = context.local_disk_map();
+        assert!(Arc::ptr_eq(
+            &returned,
+            routes.read().await[&endpoints.as_ref()[1].to_string()]
+                .as_ref()
+                .expect("returned RPC route")
+        ));
+        let slots = context.local_disk_set_drives();
+        assert!(Arc::ptr_eq(&returned, slots.read().await[0][0][1].as_ref().expect("returned slot")));
+        let loaded = connect_load_init_formats_with_instance_ctx(&context, true, &mut disks, 1, 4, None)
+            .await
+            .expect("first format load succeeds without retry");
+        let sets = crate::core::sets::Sets::new_with_instance_ctx(disks, &pool, &loaded.format, 0, 2, context)
+            .await
+            .expect("construct distributed erasure set");
+        let active = sets.disk_set[0].disks.read().await;
+        assert!(Arc::ptr_eq(&returned, active[1].as_ref().expect("returned drive is immediately active")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_disks_reopens_a_replaced_registered_root_without_cleaning_staging() {
+        let (directory, originals) = local_disks(1).await;
+        let original = originals[0].clone().expect("original disk");
+        let endpoint = original.endpoint();
+        let context = Arc::new(InstanceContext::new());
+        record_local_disks(&context, vec![original.clone()]).await;
+        let root = original.path();
+        tokio::fs::rename(&root, directory.path().join("retired-root"))
+            .await
+            .expect("replace configured root");
+        let metadata = root.join(RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&metadata)
+            .await
+            .expect("replacement metadata directory");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(metadata.join(FORMAT_CONFIG_FILE), format.to_json().expect("replacement format"))
+            .await
+            .expect("persist replacement format");
+        let staging = metadata.join("tmp/live-replacement/xl.meta");
+        tokio::fs::create_dir_all(staging.parent().expect("staging parent"))
+            .await
+            .expect("replacement staging directory");
+        tokio::fs::write(&staging, b"replacement staging")
+            .await
+            .expect("seed replacement staging");
+
+        let (disks, errors) = init_disks(
+            &context,
+            &Endpoints::from(vec![endpoint.clone()]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "replacement initialization errors: {errors:?}");
+        let replacement = disks[0].as_ref().expect("replacement disk");
+        assert!(!Arc::ptr_eq(&original, replacement), "a stale physical root must not be reused");
+        assert_eq!(replacement.get_disk_id().await.expect("replacement identity"), Some(format.erasure.this));
+        assert!(Arc::ptr_eq(
+            replacement,
+            context.local_disk_map().read().await[&endpoint.to_string()]
+                .as_ref()
+                .expect("replacement RPC route")
+        ));
+        assert_eq!(
+            tokio::fs::read(staging).await.expect("preserved replacement staging"),
+            b"replacement staging"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_disks_clears_stale_registration_when_reopened_root_fails() {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints};
+
+        for corrupt_replacement in [false, true] {
+            let (directory, original) = local_disks(1).await;
+            let endpoint = original[0].as_ref().expect("original disk").endpoint();
+            let context = Arc::new(InstanceContext::new());
+            let endpoints = Endpoints::from(vec![endpoint.clone()]);
+            let pools = EndpointServerPools::from(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: endpoints.clone(),
+                cmd_line: "failed-reopen".to_string(),
+                platform: String::new(),
+            }]);
+            crate::runtime::sources::initialize_local_disk_maps(&context, pools, &DiskOption::default())
+                .await
+                .expect("register original root");
+            let root = std::path::PathBuf::from(endpoint.get_file_path());
+            tokio::fs::rename(&root, directory.path().join("retired-root"))
+                .await
+                .expect("remove registered root");
+            if corrupt_replacement {
+                let metadata = root.join(RUSTFS_META_BUCKET);
+                tokio::fs::create_dir_all(&metadata)
+                    .await
+                    .expect("replacement metadata directory");
+                let nil_identity = FormatV3::new(1, 1).to_json().expect("nil identity format");
+                tokio::fs::write(metadata.join(FORMAT_CONFIG_FILE), nil_identity)
+                    .await
+                    .expect("seed corrupt replacement");
+            }
+
+            let (disks, errors) = init_disks(&context, &endpoints, &DiskOption::default()).await;
+
+            let expected = if corrupt_replacement {
+                DiskError::CorruptedFormat
+            } else {
+                DiskError::DiskNotFound
+            };
+            assert_eq!(errors[0], Some(expected), "the original endpoint error must be preserved");
+            assert!(disks[0].is_none());
+            assert!(
+                context.local_disk_map().read().await[&endpoint.to_string()].is_none(),
+                "stale RPC route must be withdrawn"
+            );
+            assert!(
+                context.local_disk_set_drives().read().await[0][0][0].is_none(),
+                "stale erasure slot must be withdrawn"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn init_disks_preserves_live_staging_on_registered_local_disks() {
         let (temp_dir, disks) = local_disks(1).await;
         let registered = disks[0].as_ref().expect("registered disk should exist");
@@ -1137,6 +1443,43 @@ mod tests {
         assert!(errors.iter().all(Option::is_none), "disk initialization failed: {errors:?}");
         assert!(disks[0].is_some());
         assert!(!staging.exists(), "a fresh disk open must still clear stale staging");
+    }
+
+    #[tokio::test]
+    async fn init_disks_preserves_registered_raw_endpoint_without_geometry() {
+        let directory = tempfile::tempdir().expect("raw local endpoint fixture");
+        let endpoint = Endpoint::try_from(directory.path().to_str().expect("UTF-8 raw endpoint")).expect("raw endpoint");
+        assert_eq!((endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx), (-1, -1, -1));
+        let original = crate::disk::new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("open raw endpoint");
+        let context = Arc::new(InstanceContext::new());
+        record_local_disks(&context, vec![original.clone()]).await;
+        let staging = directory.path().join(RUSTFS_META_BUCKET).join("tmp/raw-live-staging");
+        tokio::fs::write(&staging, b"live raw staging")
+            .await
+            .expect("seed raw live staging");
+
+        let (opened, errors) = init_disks(
+            &context,
+            &Endpoints::from(vec![endpoint.clone()]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "raw endpoint errors: {errors:?}");
+        assert!(Arc::ptr_eq(opened[0].as_ref().expect("raw handle remains available"), &original));
+        assert!(Arc::ptr_eq(
+            context.local_disk_map().read().await[&endpoint.to_string()]
+                .as_ref()
+                .expect("raw registration remains available"),
+            &original,
+        ));
+        assert!(context.local_disk_set_drives().read().await.is_empty());
+        assert_eq!(tokio::fs::read(staging).await.expect("preserved raw staging"), b"live raw staging");
     }
 
     #[tokio::test]

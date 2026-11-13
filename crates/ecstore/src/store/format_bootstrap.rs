@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use super::init_format::{
-    check_format_erasure_values, formats_match_reference_slots, legacy_format_max_bytes, read_legacy_format_bytes,
-    retain_format_quorum_members, write_format_file,
+    check_format_erasure_values, formats_match_reference_slots, read_legacy_format_bytes, retain_format_quorum_members,
+    write_format_file,
 };
 use crate::disk::{DiskAPI, DiskStore, RUSTFS_META_BUCKET, error::DiskError, format::FormatV3};
 use crate::error::{Error, Result};
+use crate::layout::format::legacy_format_max_bytes;
 use crate::runtime::instance::InstanceContext;
 use futures::{StreamExt, future::join_all, stream};
 use std::sync::Arc;
