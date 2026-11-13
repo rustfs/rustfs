@@ -149,14 +149,14 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 # engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.40.0", default-features = false }
-rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.2.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "66193a809d79a6e340625444a2c05ea69329b9a3", version = "0.40.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "66193a809d79a6e340625444a2c05ea69329b9a3", version = "0.2.0", default-features = false }
 # The gateway framework itself, consumed for its extension traits by the ring-2
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
-rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.62.0", default-features = false }
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "66193a809d79a6e340625444a2c05ea69329b9a3", version = "0.63.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
-rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", default-features = false }
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "66193a809d79a6e340625444a2c05ea69329b9a3", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

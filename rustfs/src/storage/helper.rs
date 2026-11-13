@@ -370,11 +370,13 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        record_s3_op(op);
         Self::from_view(&AuditRequestView::legacy(req), event, op)
     }
 
     /// [`Self::new`] for a request whose audit facts an owned edge decoded
-    /// (`RequestEnvelope::audit_view`).
+    /// (`RequestEnvelope::audit_view`). It does not count the operation: the owned edge already
+    /// did, once, before calling the use case.
     pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
@@ -440,10 +442,6 @@ impl OperationHelper {
             .and_then(|info| info.bucket.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
-
-        if !audit_only {
-            record_s3_op(op);
-        }
 
         // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {

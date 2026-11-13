@@ -40,16 +40,15 @@ static OWNERS: LazyLock<parking_lot::Mutex<HashMap<PhysicalRoot, Weak<IndexOwner
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 pub(super) struct IndexOwner {
-    // Only the path: holding the disk's pinned root handle here would keep the
-    // mount alive past the last disk owner, which the disk lifecycle forbids.
+    // Revalidate the configured path against this owner's physical identity.
     root_path: Arc<PathBuf>,
     physical: PhysicalRoot,
     #[cfg(unix)]
     _identity_pin: std::fs::File,
+    // Linux names _identity_pin so retiring a caller's root cannot retarget it.
     base: PathBuf,
     epoch: Uuid,
-    // Keep the original pinned-fd alias registered while a detached bootstrap
-    // or reconnect still owns this physical disk's index.
+    // Retain this physical owner's queue across bootstrap and disk-handle gaps.
     blocking_queue: Arc<os::DiskBlockingQueue>,
     // No persisted readiness is trusted: an old binary may have written while
     // this process was stopped. Same-process handles share the continuous owner.
@@ -264,14 +263,22 @@ impl IndexOwner {
             }
             pin
         };
+        #[cfg(target_os = "linux")]
+        let base = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", identity_pin.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let base = base.to_owned();
+        let blocking_queue = os::register_disk_blocking_queue(logical_root, &base);
         let owner = Arc::new(Self {
             root_path: Arc::new(root.path().to_path_buf()),
             physical: key,
             #[cfg(unix)]
             _identity_pin: identity_pin,
-            base: base.to_owned(),
+            base,
             epoch: Uuid::new_v4(),
-            blocking_queue: os::register_disk_blocking_queue(logical_root, base),
+            blocking_queue,
             initialized: OnceLock::new(),
             driving: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
@@ -1632,6 +1639,97 @@ mod tests {
         drop(old);
         let new = os::acquire_namespace_mutation_lease_with_owner(&reconnected.io_root.join(INDEX), None).await;
         assert!(Arc::ptr_eq(&new.blocking_queue_for_test(), &reconnected.blocking_queue));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn multipart_index_owner_queue_survives_reassigned_caller_alias() {
+        const CHILD: &str = "RUSTFS_TEST_INDEX_OWNER_QUEUE_ALIAS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Alias reassignment mutates a process-wide registry. Isolate it
+            // from concurrent tests that may reuse the retired fd number.
+            let mut child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .arg("--exact")
+                .arg("disk::local::multipart_index::tests::multipart_index_owner_queue_survives_reassigned_caller_alias")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("start isolated queue-alias regression");
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+                loop {
+                    poll.tick().await;
+                    if child.try_wait().expect("poll queue-alias regression").is_some() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if completed.is_err() {
+                child.kill().expect("stop blocked queue-alias regression");
+            }
+            let output = child.wait_with_output().expect("collect queue-alias regression");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(completed.is_ok(), "queue-alias regression must finish within its deadline");
+            assert!(output.status.success(), "queue-alias regression failed: {stdout} {stderr}");
+            assert!(stdout.contains("1 passed"), "the child must execute the queue-alias regression: {stdout}");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("original disk root");
+        let (path, info) = upload("bucket", "legacy");
+        seed_legacy(root.path(), &path, info);
+        let publication = os::PublicationRoot::new(root.path()).expect("original caller root");
+        let caller_alias = publication.io_path().to_path_buf();
+        let owner = IndexOwner::acquire(&publication, root.path(), &caller_alias).expect("original physical owner");
+        let original_queue = owner.blocking_queue.clone();
+        let other_root = tempfile::tempdir().expect("other disk root");
+        let other_publication = os::PublicationRoot::new(other_root.path()).expect("other pinned root");
+        drop(publication);
+
+        // A retired caller's fd number can be reused by another disk. Assign
+        // its alias explicitly so the test does not depend on fd allocation.
+        let other_queue = os::register_disk_blocking_queue(other_root.path(), &caller_alias);
+        let other_attached = os::register_disk_blocking_queue(other_root.path(), other_publication.io_path());
+        assert!(Arc::ptr_eq(&other_queue, &other_attached));
+        assert!(!Arc::ptr_eq(&original_queue, &other_queue));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), owner.initialize())
+            .await
+            .expect("bootstrap completes after the caller alias is reassigned");
+        assert!(Arc::ptr_eq(
+            owner.observed_rebuild_queue.lock().as_ref().expect("actual rebuild queue"),
+            &original_queue,
+        ));
+        assert_eq!(
+            owner
+                .page("bucket", None, Uuid::new_v4())
+                .await
+                .expect("original disk index coverage")
+                .roots
+                .len(),
+            1,
+        );
+
+        let reconnect = os::PublicationRoot::new(root.path()).expect("reconnected caller root");
+        let attached = owner.attach_blocking_queue(root.path(), reconnect.io_path());
+        assert!(Arc::ptr_eq(&attached, &original_queue));
+        for (path, expected_queue) in [
+            (owner.base.join(INDEX), &original_queue),
+            (reconnect.io_path().join(INDEX), &original_queue),
+            (root.path().join(INDEX), &original_queue),
+            (other_publication.io_path().join(INDEX), &other_queue),
+            (other_root.path().join(INDEX), &other_queue),
+        ] {
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&path, None).await;
+            assert!(
+                Arc::ptr_eq(&lease.blocking_queue_for_test(), expected_queue),
+                "queue routing for {path:?}"
+            );
+        }
     }
 
     #[test]

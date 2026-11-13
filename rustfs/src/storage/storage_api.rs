@@ -146,6 +146,12 @@ pub(crate) use super::sse::{
 };
 
 pub(crate) mod access_consumer {
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::access::access_owned;
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) use super::super::access::{
+        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+    };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
         MultipartStagingOperation, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
@@ -169,7 +175,7 @@ pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access::{
         ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
-        TableDataPlanePublicationGuards, authorize_request, parity_test_support,
+        TableDataPlanePublicationGuards, authorize_object_request, authorize_request, parity_test_support,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
@@ -374,16 +380,12 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
-            parse_list_object_versions_params, parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
+            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
-            pub(crate) mod bucket {
-                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
-            }
-
             pub(crate) mod list {
                 pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
             }
@@ -396,6 +398,7 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod common {
         pub(crate) use super::super::super::s3_api::common::rustfs_owner;
+        pub(crate) use super::super::super::s3_api::common::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
     }
 
     pub(crate) mod multipart {

@@ -20,8 +20,9 @@
 //! bounds are unchanged and helper access is via inherent calls.
 
 use super::super::{
-    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
-    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, load_format_erasure, warn,
+    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, LockResult, NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks,
+    StorageError, debug, disk, load_format_erasure, warn,
 };
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::disk::{DiskAPI, new_disk};
@@ -31,11 +32,17 @@ use futures::{StreamExt, stream, stream::FuturesUnordered};
 use rand::prelude::SliceRandom;
 use rustfs_heal_contracts::heal_channel::{create_auto_replacement_disks_request, send_heal_request};
 use rustfs_utils::path::object_name_disk_identity;
-#[cfg(test)]
 use uuid::Uuid;
 
 // Bound batching when another reconnect is still pending.
 const REPLACEMENT_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const EVENT_SET_DISK_RECONNECT: &str = "set_disk_reconnect";
+
+#[derive(Clone, Copy)]
+enum LocalReconnectFormat {
+    Formatted(Uuid),
+    Unformatted,
+}
 
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
@@ -532,6 +539,25 @@ impl SetDisks {
                 .find(|disk| disk.endpoint() == *ep)
                 .cloned()
         };
+        let previous_registration = if ep.is_local {
+            match runtime_sources::snapshot_local_disk_registration(&self.ctx, ep).await {
+                Ok(registration) => Some(registration),
+                Err(error) => {
+                    warn!(
+                        event = EVENT_SET_DISK_RECONNECT,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        state = "registration_rejected",
+                        endpoint = %ep,
+                        error = %error,
+                        "Local reconnect registration rejected"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         let previous_health = previous_disk
             .as_ref()
             .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
@@ -580,7 +606,7 @@ impl SetDisks {
             return false;
         }
 
-        let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
+        let _ = new_disk.set_disk_id_state(Some(fm.erasure.this)).await;
 
         if !new_disk.is_local() {
             let displaced = {
@@ -607,29 +633,77 @@ impl SetDisks {
             return false;
         }
 
-        new_disk.enable_health_check();
-
-        if new_disk.is_local() {
-            if let crate::disk::Disk::Local(wrapper) = new_disk.as_ref() {
-                wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
-            }
-            let local_disk_map = runtime_sources::local_disk_map_handle();
-            let mut global_local_disk_map = local_disk_map.write().await;
-            let path = new_disk.endpoint().to_string();
-            global_local_disk_map.insert(path, Some(new_disk.clone()));
-
-            if runtime_sources::setup_is_dist_erasure().await {
-                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-                let mut local_set_drives = local_disk_set_drives.write().await;
-                local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
-            }
+        let Some(previous_registration) = previous_registration else {
+            return false;
+        };
+        if let Err(error) = self
+            .publish_local_reconnect(
+                disk_idx,
+                previous_disk.as_ref(),
+                previous_registration,
+                new_disk,
+                LocalReconnectFormat::Formatted(fm.erasure.this),
+            )
+            .await
+        {
+            warn!(
+                event = EVENT_SET_DISK_RECONNECT,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "publication_failed",
+                endpoint = %ep,
+                error = %error,
+                "Local reconnect publication failed"
+            );
         }
-
-        debug!("renew_disk: update {:?}", fm.erasure.this);
-
-        let mut disk_lock = self.disks.write().await;
-        disk_lock[disk_idx] = Some(new_disk);
         false
+    }
+
+    async fn publish_local_reconnect(
+        &self,
+        disk_index: usize,
+        expected_set_disk: Option<&DiskStore>,
+        expected_registration: runtime_sources::LocalDiskRegistration,
+        candidate: DiskStore,
+        format: LocalReconnectFormat,
+    ) -> disk::error::Result<bool> {
+        let endpoint = candidate.endpoint();
+        let registration = runtime_sources::PreparedLocalDisk::new(expected_registration, Some(candidate))
+            .map_err(|error| error.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        // Registration writers precede the set inventory and global inventories.
+        // Filesystem preparation completes before these publication locks.
+        let _registration = self.ctx.local_disk_registration_lock().lock().await;
+        let mut disks = self.disks.write().await;
+        let Some(slot) = disks.get_mut(disk_index) else {
+            return Err(DiskError::InconsistentDisk);
+        };
+        if slot.as_ref().is_some_and(|current| current.endpoint() != endpoint) {
+            return Err(DiskError::InconsistentDisk);
+        }
+        if !runtime_sources::same_local_disk(slot.as_ref(), expected_set_disk) {
+            return Ok(false);
+        }
+        let published = runtime_sources::publish_local_disks(&self.ctx, vec![registration])
+            .await
+            .map_err(|error| error.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        let Some(disk) = published.into_iter().next().flatten() else {
+            return Ok(false);
+        };
+        if matches!(format, LocalReconnectFormat::Formatted(_)) {
+            disk.enable_health_check();
+        }
+        *slot = Some(disk);
+        drop(disks);
+        if let LocalReconnectFormat::Formatted(disk_id) = format {
+            // Registry publication is complete. A cancelled cache insert is
+            // recoverable through the RPC resolver's cold identity lookup.
+            self.ctx
+                .local_disk_id_map()
+                .write()
+                .await
+                .insert(disk_id, endpoint.to_string());
+        }
+        Ok(true)
     }
 
     /// Attach a replacement target only after proving that the exact local slot
@@ -648,6 +722,10 @@ impl SetDisks {
             return Ok(false);
         };
 
+        let previous_disk = self.disks.read().await.get(disk_idx).cloned().flatten();
+        let previous_registration = runtime_sources::snapshot_local_disk_registration(&self.ctx, ep)
+            .await
+            .map_err(|error| error.narrow_to_disk().unwrap_or_else(DiskError::other))?;
         let replacement = new_disk(
             ep,
             &DiskOption {
@@ -662,28 +740,14 @@ impl SetDisks {
             Err(err) => return Err(err),
         }
 
-        {
-            let mut disks = self.disks.write().await;
-            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
-                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
-                return Ok(false);
-            }
-            disks[disk_idx] = Some(replacement.clone());
-        }
-
-        let local_disk_map = runtime_sources::local_disk_map_handle();
-        local_disk_map
-            .write()
-            .await
-            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
-
-        if runtime_sources::setup_is_dist_erasure().await {
-            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-            let mut local_set_drives = local_disk_set_drives.write().await;
-            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
-        }
-
-        Ok(true)
+        self.publish_local_reconnect(
+            disk_idx,
+            previous_disk.as_ref(),
+            previous_registration,
+            replacement,
+            LocalReconnectFormat::Unformatted,
+        )
+        .await
     }
 
     pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
@@ -804,6 +868,13 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
+    fn local_disk(disk: &DiskStore) -> Arc<crate::disk::local::LocalDisk> {
+        let disk::Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("usage binding fixture must use a local disk");
+        };
+        wrapper.get_disk()
+    }
+
     async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
@@ -829,6 +900,276 @@ mod tests {
             .expect("format should be saved");
 
         (dir, endpoint, disk)
+    }
+
+    async fn isolated_reconnect_set() -> (TempDir, Arc<SetDisks>, DiskStore) {
+        use crate::layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType};
+        use crate::runtime::instance::InstanceContext;
+
+        let directory = tempfile::tempdir().expect("isolated reconnect root");
+        let metadata = directory.path().join(disk::RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&metadata)
+            .await
+            .expect("reconnect metadata directory");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(metadata.join(disk::FORMAT_CONFIG_FILE), format.to_json().expect("reconnect format bytes"))
+            .await
+            .expect("persist reconnect format without touching an ambient cache");
+        let mut endpoint =
+            Endpoint::try_from(directory.path().to_str().expect("UTF-8 reconnect root")).expect("isolated reconnect endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let pool = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: vec![endpoint.clone()].into(),
+            cmd_line: "isolated-reconnect".to_string(),
+            platform: "test".to_string(),
+        };
+        let context = Arc::new(InstanceContext::new());
+        context.update_erasure_type(SetupType::Erasure).await;
+        runtime_sources::initialize_local_disk_maps(
+            &context,
+            EndpointServerPools(vec![pool]),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("initialize isolated reconnect registry");
+        let original = context.local_disk_map().read().await[&endpoint.to_string()]
+            .clone()
+            .expect("registered original disk");
+        let set = SetDisks::new_with_instance_ctx(
+            "isolated-reconnect".to_string(),
+            Arc::new(RwLock::new(vec![Some(original.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+            context,
+        )
+        .await;
+        (directory, set, original)
+    }
+
+    #[tokio::test]
+    async fn local_reconnect_updates_only_the_owning_instance_id_cache() {
+        let (_directory, set, original) = isolated_reconnect_set().await;
+        let endpoint = original.endpoint();
+        let disk_id = set.format.erasure.sets[0][0];
+        let ambient_cache = crate::runtime::global::current_ctx().local_disk_id_map();
+        let before = ambient_cache.read().await.get(&disk_id).cloned();
+        let other = crate::runtime::instance::InstanceContext::new();
+        let request = crate::runtime::usage_watch::ScannerUsageWatchRequest {
+            bucket: "reconnect-bucket".to_owned(),
+            bucket_incarnation: Uuid::from_u128(2),
+            watch_id: None,
+            release: false,
+            session_id: None,
+        };
+        let owner = Uuid::from_u128(1);
+        let untouched = other
+            .usage_watches
+            .observe(owner, &request)
+            .expect("independent instance watch");
+        let old_binding = local_disk(&original).usage_watch_binding.clone();
+        assert!(old_binding.matches(&set.instance_ctx().usage_watches));
+        let old_tail = old_binding.owner(&request.bucket, None).expect("old handle physical tail");
+
+        set.renew_disk(&endpoint).await;
+
+        let ambient_after = ambient_cache.read().await.get(&disk_id).cloned();
+        assert_eq!(
+            ambient_after, before,
+            "an explicit instance reconnect must leave the ambient cache intact"
+        );
+        assert_eq!(
+            set.instance_ctx().local_disk_id_map().read().await.get(&disk_id),
+            Some(&endpoint.to_string()),
+        );
+        let renewed = set.disk_inventory().await[0].clone().expect("renewed local slot");
+        assert!(!Arc::ptr_eq(&renewed, &original));
+        let registered = set.instance_ctx().local_disk_map().read().await[&endpoint.to_string()]
+            .clone()
+            .expect("renewed local RPC route");
+        assert!(Arc::ptr_eq(&renewed, &registered));
+        let renewed_binding = local_disk(&renewed).usage_watch_binding.clone();
+        assert!(renewed_binding.matches(&set.instance_ctx().usage_watches));
+        assert!(!renewed_binding.matches(&other.usage_watches));
+        let new_tail = renewed_binding
+            .owner(&request.bucket, None)
+            .expect("renewed handle physical tail");
+        let watches = &set.instance_ctx().usage_watches;
+        assert_eq!(
+            watches
+                .observe(owner, &request)
+                .expect("both physical tails retained")
+                .inflight,
+            2
+        );
+        drop(old_tail);
+        assert_eq!(watches.observe(owner, &request).expect("renewed tail remains").inflight, 1);
+        drop(new_tail);
+        assert_eq!(watches.observe(owner, &request).expect("all physical tails drained").inflight, 0);
+        assert!(
+            other
+                .usage_watches
+                .observe(owner, &request)
+                .expect("independent instance remains clean")
+                .unchanged_since(&untouched)
+        );
+        renewed.close().await.expect("stop renewed health monitor");
+    }
+
+    #[tokio::test]
+    async fn unformatted_local_reconnect_binds_usage_watch_before_publication() {
+        let (directory, set, original) = isolated_reconnect_set().await;
+        let endpoint = original.endpoint();
+        tokio::fs::remove_file(directory.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE))
+            .await
+            .expect("turn the known local target into an unformatted replacement");
+        assert!(
+            set.attach_unformatted_replacement_disk(&endpoint)
+                .await
+                .expect("attach verified unformatted target")
+        );
+        let replacement = set.disk_inventory().await[0]
+            .clone()
+            .expect("unformatted target published to set");
+        assert!(!Arc::ptr_eq(&replacement, &original));
+        assert!(
+            local_disk(&replacement)
+                .usage_watch_binding
+                .matches(&set.instance_ctx().usage_watches)
+        );
+        let registry = set.instance_ctx().local_disk_map();
+        assert!(Arc::ptr_eq(
+            registry.read().await[&endpoint.to_string()]
+                .as_ref()
+                .expect("published unformatted route"),
+            &replacement
+        ));
+    }
+
+    #[tokio::test]
+    async fn superseded_local_reconnect_preserves_the_winning_handle_and_id_cache() {
+        let (_directory, set, original) = isolated_reconnect_set().await;
+        let endpoint = original.endpoint();
+        let disk_id = set.format.erasure.sets[0][0];
+        let registration = runtime_sources::snapshot_local_disk_registration(set.instance_ctx(), &endpoint)
+            .await
+            .expect("capture original registration");
+        let (candidate, _) = set
+            .connect_endpoint(&endpoint, None)
+            .await
+            .expect("prepare competing candidate");
+        candidate
+            .set_disk_id_state(Some(disk_id))
+            .await
+            .expect("set candidate identity privately");
+        let losing_binding = local_disk(&candidate).usage_watch_binding.clone();
+
+        set.renew_disk(&endpoint).await;
+        let winner = set.disk_inventory().await[0].clone().expect("winning renewed disk");
+        let cache = set.instance_ctx().local_disk_id_map();
+        cache.write().await.remove(&disk_id);
+        let accepted = set
+            .publish_local_reconnect(0, Some(&original), registration, candidate, LocalReconnectFormat::Formatted(disk_id))
+            .await
+            .expect("superseded publication is a normal CAS loss");
+
+        assert!(!accepted);
+        assert!(!losing_binding.matches(&set.instance_ctx().usage_watches));
+        assert!(
+            local_disk(&winner)
+                .usage_watch_binding
+                .matches(&set.instance_ctx().usage_watches)
+        );
+        assert!(
+            !cache.read().await.contains_key(&disk_id),
+            "a losing candidate must not publish an ID-cache entry"
+        );
+        assert!(Arc::ptr_eq(&winner, set.disk_inventory().await[0].as_ref().expect("winning set slot")));
+        let registered = set.instance_ctx().local_disk_map().read().await[&endpoint.to_string()]
+            .clone()
+            .expect("winning RPC route");
+        assert!(Arc::ptr_eq(&winner, &registered));
+        let slots = set.instance_ctx().local_disk_set_drives();
+        assert!(Arc::ptr_eq(&winner, slots.read().await[0][0][0].as_ref().expect("winning topology slot")));
+        winner.close().await.expect("stop winning health monitor");
+    }
+
+    #[tokio::test]
+    async fn local_reconnect_registry_cas_loss_preserves_the_existing_set_and_cache() {
+        let (_directory, set, original) = isolated_reconnect_set().await;
+        let endpoint = original.endpoint();
+        let disk_id = set.format.erasure.sets[0][0];
+        let stale_registration = runtime_sources::snapshot_local_disk_registration(set.instance_ctx(), &endpoint)
+            .await
+            .expect("capture registration before native preparation");
+        let (candidate, _) = set.connect_endpoint(&endpoint, None).await.expect("prepare losing reconnect");
+        candidate
+            .set_disk_id_state(Some(disk_id))
+            .await
+            .expect("private candidate identity");
+        let losing_binding = local_disk(&candidate).usage_watch_binding.clone();
+        let (winner, _) = set
+            .connect_endpoint(&endpoint, None)
+            .await
+            .expect("prepare registry replacement");
+        {
+            let _registration = set.instance_ctx().local_disk_registration_lock().lock().await;
+            let registration = runtime_sources::snapshot_local_disk_registration(set.instance_ctx(), &endpoint)
+                .await
+                .expect("capture registry writer's current member");
+            let prepared = runtime_sources::PreparedLocalDisk::new(registration, Some(winner.clone()))
+                .expect("prepare replacement publication");
+            let published = runtime_sources::publish_local_disks(set.instance_ctx(), vec![prepared])
+                .await
+                .expect("a registry writer publishes before the set reconnect");
+            assert!(published[0].is_some());
+        }
+
+        let accepted = set
+            .publish_local_reconnect(
+                0,
+                Some(&original),
+                stale_registration,
+                candidate,
+                LocalReconnectFormat::Formatted(disk_id),
+            )
+            .await
+            .expect("a stale registry token is a normal CAS loss");
+
+        assert!(!accepted);
+        assert!(!losing_binding.matches(&set.instance_ctx().usage_watches));
+        assert!(
+            local_disk(&winner)
+                .usage_watch_binding
+                .matches(&set.instance_ctx().usage_watches)
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            set.disk_inventory().await[0].as_ref().expect("existing set handle")
+        ));
+        assert!(!set.instance_ctx().local_disk_id_map().read().await.contains_key(&disk_id));
+        let registered = set.instance_ctx().local_disk_map().read().await[&endpoint.to_string()]
+            .clone()
+            .expect("registry writer's replacement");
+        assert!(Arc::ptr_eq(&winner, &registered));
+        let slots = set.instance_ctx().local_disk_set_drives();
+        assert!(Arc::ptr_eq(
+            &winner,
+            slots.read().await[0][0][0].as_ref().expect("replacement topology slot")
+        ));
     }
 
     #[tokio::test]
@@ -1466,6 +1807,24 @@ mod tests {
             Vec::new(),
         )
         .await;
+
+        let foreign = set_disks.get_disks_internal().await[0]
+            .as_ref()
+            .expect("existing disk in another slot")
+            .clone();
+        set_disks.disks.write().await[disk_count - 1] = Some(foreign.clone());
+        let result = set_disks.attach_unformatted_replacement_disk(&replacement_endpoint).await;
+        assert!(
+            matches!(result, Err(DiskError::InconsistentDisk)),
+            "an occupied foreign slot must be rejected"
+        );
+        assert!(Arc::ptr_eq(
+            set_disks.get_disks_internal().await[disk_count - 1]
+                .as_ref()
+                .expect("foreign slot remains occupied"),
+            &foreign,
+        ));
+        set_disks.disks.write().await[disk_count - 1] = None;
 
         assert!(
             set_disks

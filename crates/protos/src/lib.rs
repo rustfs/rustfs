@@ -3566,6 +3566,17 @@ async fn build_channel_until(
     .map_err(channel_acquisition_timeout)?
 }
 
+struct GrpcDialMetricsGuard {
+    started_at: Instant,
+    connected: bool,
+}
+
+impl Drop for GrpcDialMetricsGuard {
+    fn drop(&mut self) {
+        runtime_sources::record_grpc_dial_result(self.started_at.elapsed(), self.connected);
+    }
+}
+
 async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
@@ -3622,6 +3633,10 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         connector = connector.initial_connection_window_size(conn_window);
     }
 
+    let mut dial_metrics = GrpcDialMetricsGuard {
+        started_at: dial_started_at,
+        connected: false,
+    };
     let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         let outbound_tls = runtime_sources::outbound_tls_state().await;
@@ -3641,14 +3656,13 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
 
     let channel = match connector.connect().await {
         Ok(channel) => {
-            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), true);
+            dial_metrics.connected = true;
             // A successful dial marks the peer online (grpc-optimization P3). Keyed by the real
             // peer address, so control and bulk channels to one peer share health state.
             runtime_sources::record_peer_reachable(dial_addr);
             channel
         }
         Err(err) => {
-            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), false);
             runtime_sources::record_peer_unreachable(dial_addr, internode_offline_failure_threshold());
             return Err(err.into());
         }
@@ -4226,6 +4240,43 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn tls02_invalid_tls_configuration_records_one_failure_per_attempt() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+        publish_global_outbound_tls_state(
+            TlsGeneration(generation - 1),
+            &OutboundTlsMaterial {
+                root_ca_pem: b"invalid certificate fixture".to_vec(),
+                mtls_identity: Some(rustfs_common::MtlsIdentityPem {
+                    cert_pem: b"invalid client certificate fixture".to_vec(),
+                    key_pem: b"invalid client key fixture".to_vec(),
+                }),
+            },
+        )
+        .await;
+        let before = runtime_sources::grpc_dial_errors_total();
+        let addr = "https://127.0.0.1:1";
+        let control = build_channel(addr, addr).await;
+        let bulk = build_channel(addr, &bulk_cache_key(addr, 0)).await;
+        let recorded = runtime_sources::grpc_dial_errors_total() - before;
+        let cached = rustfs_common::has_cached_connection(addr).await;
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+        assert!(
+            control.is_err() && bulk.is_err(),
+            "malformed client identity rejects both channel classes"
+        );
+        assert!(!cached, "failed configuration leaves no cached control channel");
+        assert_eq!(recorded, 2, "each failed TLS setup contributes exactly one dial failure");
+    }
+
     #[test]
     fn tls02_queued_tls_configuration_obeys_acquisition_deadline() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4258,8 +4309,10 @@ mod tests {
                 release_rx.recv().expect("release occupied blocking worker");
             });
             started_rx.await.expect("blocking worker is occupied");
+            let errors_before = runtime_sources::grpc_dial_errors_total();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
             let result = build_channel_until(&addr, &addr, deadline, internode_rpc_timeout()).await;
+            let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
             let timed_out = result
                 .as_ref()
                 .err()
@@ -4277,6 +4330,7 @@ mod tests {
             assert!(timed_out, "queued TLS configuration shares the original acquisition deadline");
             assert!(!cached, "timed-out TLS setup leaves no published channel");
             assert!(!registered, "timed-out TLS setup releases its dial registry entry");
+            assert_eq!(dial_failures, 1, "a cancelled TLS setup contributes one dial failure");
         });
         // Runtime retirement joins the queued certificate work before inspecting its side effects.
         drop(runtime);
@@ -4291,6 +4345,7 @@ mod tests {
     async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
         use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
         let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let errors_before = runtime_sources::grpc_dial_errors_total();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind HTTP/2 test server");
@@ -4332,11 +4387,13 @@ mod tests {
         // already-established sockets out of the listener's accept queue.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let connections = accepted.load(Ordering::SeqCst);
+        let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
         evict_connection_with_log_level(&addr, ConnectionEvictionLogLevel::Debug).await;
         evict_connection_with_log_level(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
         server.abort();
         let _ = server.await;
         assert_eq!(connections, 2, "TLS02_INVARIANT 32 misses per control/bulk key dial once each");
+        assert_eq!(dial_failures, 0, "successful coalesced dials keep the error counter flat");
     }
 
     #[tokio::test]

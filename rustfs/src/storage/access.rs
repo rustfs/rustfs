@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
 use super::ecfs::FS;
-use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
+use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::facts::{
     AuthzFacts, AuthzPrincipal, AuthzTarget, base_conditions, build_args, build_conditions, forward_secret_headers,
 };
@@ -70,6 +71,14 @@ use std::sync::OnceLock;
 use time::OffsetDateTime;
 use url::Url;
 
+/// The authorization shapes one migration batch owns; a child module so they reach the guard
+/// state this module keeps private.
+#[path = "access_owned/mod.rs"]
+pub(crate) mod access_owned;
+#[cfg(test)]
+#[path = "access_readers_test.rs"]
+mod readers_test;
+
 fn iam_authorization_error(err: IamError) -> ApiError {
     match err {
         IamError::IAMActionNotAllowed => ApiError::access_denied(),
@@ -102,10 +111,8 @@ pub(crate) struct ReqInfo {
     pub suppress_denial_audit: bool,
 }
 
-pub(crate) fn replication_request_authorized<T>(req: &S3Request<T>) -> bool {
-    req.extensions
-        .get::<ReqInfo>()
-        .is_some_and(|req_info| req_info.replication_request_authorized)
+pub(crate) fn replication_request_authorized<R: AuthorizationRequest + ?Sized>(req: &R) -> bool {
+    req.req_info().is_some_and(|req_info| req_info.replication_request_authorized)
 }
 
 fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
@@ -432,9 +439,12 @@ pub(crate) struct BucketConfigMutationSnapshot {
     incarnation_id: uuid::Uuid,
 }
 
-pub(crate) fn bucket_config_mutation_incarnation<T>(req: &S3Request<T>, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
-    let Some(snapshot) = req.extensions.get::<BucketConfigMutationSnapshot>() else {
-        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
+pub(crate) fn bucket_config_mutation_incarnation<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    bucket: &str,
+) -> S3Result<Option<uuid::Uuid>> {
+    let Some(snapshot) = req.bucket_config_mutation() else {
+        if req.server_context().is_some() {
             return Err(s3_error!(InternalError, "bucket config mutation snapshot is missing"));
         }
         return Ok(None);
@@ -556,12 +566,12 @@ impl PendingDeleteBucketGenerationGuard {
     }
 }
 
-pub(crate) async fn load_bucket_generation_from_store<T>(
+pub(crate) async fn load_bucket_generation_from_store<R: AuthorizationRequest + ?Sized>(
     store: &crate::storage::storage_api::ECStore,
-    req: &S3Request<T>,
+    req: &R,
     bucket: &str,
 ) -> S3Result<BucketGenerationGuard> {
-    if let Some(existing) = req.extensions.get::<BucketGenerationGuard>() {
+    if let Some(existing) = req.bucket_generation() {
         return if existing.bucket == bucket {
             Ok(existing.clone())
         } else {
@@ -576,9 +586,15 @@ pub(crate) async fn load_bucket_generation_from_store<T>(
     })
 }
 
-async fn load_bucket_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) -> S3Result<BucketGenerationGuard> {
-    let store = fs
-        .server_ctx()
+/// Loads the bucket incarnation through `server_ctx`'s object store, or returns the guard the
+/// request already carries. The legacy hooks pass `FS::server_ctx`; the gateway edge passes the
+/// envelope's server context.
+pub(crate) async fn load_bucket_generation<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &R,
+    bucket: &str,
+) -> S3Result<BucketGenerationGuard> {
+    let store = server_ctx
         .object_store()
         .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
     load_bucket_generation_from_store(store.as_ref(), req, bucket).await
@@ -610,33 +626,39 @@ fn odm_read_source_configured(bucket: &str) -> bool {
     sys.is_module_enabled() && sys.state(bucket).is_some()
 }
 
-async fn capture_odm_read_generation<T>(fs: &FS, req: &S3Request<T>, bucket: &str) -> OdmReadGenerationGuard {
+/// The on-demand-migration source generation a read may consult, captured before its
+/// authorization. A capture failure is kept in the guard and surfaces only on a source miss.
+pub(crate) async fn capture_odm_read_generation<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &R,
+    bucket: &str,
+) -> OdmReadGenerationGuard {
     if !odm_read_source_configured(bucket) {
         return OdmReadGenerationGuard::Unavailable;
     }
-    OdmReadGenerationGuard::from_result(load_bucket_generation(fs, req, bucket).await)
+    OdmReadGenerationGuard::from_result(load_bucket_generation(server_ctx, req, bucket).await)
 }
 
 /// Direct usecase callers have no access middleware; capture at their entry.
 /// A server request without the access marker must never bind to a later source.
-pub(crate) async fn prepare_odm_read_generation<T>(
+pub(crate) async fn prepare_odm_read_generation<R: AuthorizationRequest + ?Sized>(
     store: &crate::storage::storage_api::ECStore,
-    req: &mut S3Request<T>,
+    req: &mut R,
     bucket: &str,
 ) {
-    if req.extensions.get::<OdmReadGenerationGuard>().is_some() {
+    if req.odm_read_generation().is_some() {
         return;
     }
-    let guard = if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() || !odm_read_source_configured(bucket) {
+    let guard = if req.server_context().is_some() || !odm_read_source_configured(bucket) {
         OdmReadGenerationGuard::Unavailable
     } else {
         OdmReadGenerationGuard::from_result(load_bucket_generation_from_store(store, req, bucket).await)
     };
-    req.extensions.insert(guard);
+    req.install_odm_read_generation(guard);
 }
 
-pub(crate) fn odm_read_generation<T>(req: &S3Request<T>, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
-    match req.extensions.get::<OdmReadGenerationGuard>() {
+pub(crate) fn odm_read_generation<R: AuthorizationRequest + ?Sized>(req: &R, bucket: &str) -> S3Result<Option<uuid::Uuid>> {
+    match req.odm_read_generation() {
         Some(OdmReadGenerationGuard::Ready(guard)) if guard.bucket == bucket => Ok(Some(guard.incarnation_id)),
         Some(OdmReadGenerationGuard::Ready(_)) => {
             Err(s3_error!(InternalError, "source generation guard does not match request bucket"))
@@ -658,60 +680,72 @@ async fn load_copy_source_bucket_generation(fs: &FS, bucket: &str) -> S3Result<C
     })
 }
 
-pub(crate) fn apply_bucket_generation_guard<T>(req: &S3Request<T>, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
-    let pending_guard = req.extensions.get::<PendingDeleteBucketGenerationGuard>();
-    let guard = match pending_guard {
+pub(crate) fn apply_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    bucket: &str,
+    opts: &mut ObjectOptions,
+) -> S3Result<()> {
+    let guard = match req.pending_delete_bucket_generation() {
         Some(PendingDeleteBucketGenerationGuard::Ready(guard)) => Some(guard),
         Some(PendingDeleteBucketGenerationGuard::Failed { code, message }) => {
             return Err(S3Error::with_message(code.clone(), message.clone()));
         }
-        None => req.extensions.get::<BucketGenerationGuard>(),
+        None => req.bucket_generation(),
     };
-    let Some(guard) = guard else {
-        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
-            return Err(s3_error!(InternalError, "bucket generation guard is missing"));
-        }
-        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
-            publication_guards.add_lock_loss_fences(opts);
-        }
-        return Ok(());
-    };
-    if guard.bucket != bucket {
-        return Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"));
-    }
-    opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
-    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
-        publication_guards.add_lock_loss_fences(opts);
-    }
-    Ok(())
+    apply_generation_fence(
+        req,
+        guard.map(|guard| (guard.bucket.as_str(), guard.incarnation_id)),
+        bucket,
+        opts,
+        "bucket generation guard",
+    )
 }
 
-pub(crate) fn retained_table_data_plane_publication_guards<T>(req: &S3Request<T>) -> Option<TableDataPlanePublicationGuards> {
-    req.extensions.get::<TableDataPlanePublicationGuards>().cloned()
+pub(crate) fn retained_table_data_plane_publication_guards<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+) -> Option<TableDataPlanePublicationGuards> {
+    req.publication_guards().cloned()
 }
 
-pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
-    req: &S3Request<T>,
+pub(crate) fn apply_copy_source_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
+    req: &R,
     bucket: &str,
     opts: &mut ObjectOptions,
 ) -> S3Result<()> {
-    let Some(guard) = req.extensions.get::<CopySourceBucketGenerationGuard>() else {
-        if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
-            return Err(s3_error!(InternalError, "copy source bucket generation guard is missing"));
+    let guard = req.copy_source_bucket_generation();
+    apply_generation_fence(
+        req,
+        guard.map(|guard| (guard.bucket.as_str(), guard.incarnation_id)),
+        bucket,
+        opts,
+        "copy source bucket generation guard",
+    )
+}
+
+/// Binds `opts` to the captured incarnation of `bucket` and to the retained table publication
+/// locks. A server request without a captured guard is refused: only direct use-case callers,
+/// which carry no server context, run unfenced.
+fn apply_generation_fence<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    guard: Option<(&str, uuid::Uuid)>,
+    bucket: &str,
+    opts: &mut ObjectOptions,
+    guard_name: &str,
+) -> S3Result<()> {
+    match guard {
+        Some((guarded, _)) if guarded != bucket => {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("{guard_name} does not match request bucket"),
+            ));
         }
-        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
-            publication_guards.add_lock_loss_fences(opts);
+        Some((_, incarnation_id)) => opts.expected_bucket_incarnation_id = Some(incarnation_id),
+        None if req.server_context().is_some() => {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, format!("{guard_name} is missing")));
         }
-        return Ok(());
-    };
-    if guard.bucket != bucket {
-        return Err(s3_error!(
-            InternalError,
-            "copy source bucket generation guard does not match request bucket"
-        ));
+        None => {}
     }
-    opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
-    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+    if let Some(publication_guards) = req.publication_guards() {
         publication_guards.add_lock_loss_fences(opts);
     }
     Ok(())
@@ -721,12 +755,12 @@ fn missing_req_info_error() -> S3Error {
     s3_error!(InternalError, "ReqInfo not found in request extensions")
 }
 
-pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
-    req.extensions.get::<ReqInfo>().ok_or_else(missing_req_info_error)
+pub(crate) fn req_info_ref<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<&ReqInfo> {
+    req.req_info().ok_or_else(missing_req_info_error)
 }
 
-pub(crate) fn req_info_mut<T>(req: &mut S3Request<T>) -> S3Result<&mut ReqInfo> {
-    req.extensions.get_mut::<ReqInfo>().ok_or_else(missing_req_info_error)
+pub(crate) fn req_info_mut<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<&mut ReqInfo> {
+    req.req_info_mut().ok_or_else(missing_req_info_error)
 }
 
 fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
@@ -735,17 +769,10 @@ fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
 
 /// Extract the canonical `RequestContext` from a request, checking both
 /// the request extensions directly and the `ReqInfo.request_context` field.
-pub(crate) fn request_context_from_req<T>(req: &S3Request<T>) -> Option<RequestContext> {
-    request_context_from_extensions(&req.extensions)
-}
-
-/// Same lookup against the extensions alone, for callers that have already
-/// moved a field out of the request and can no longer borrow it whole.
-pub(crate) fn request_context_from_extensions(extensions: &http::Extensions) -> Option<RequestContext> {
-    extensions
-        .get::<RequestContext>()
+pub(crate) fn request_context_from_req<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<RequestContext> {
+    req.request_context()
         .cloned()
-        .or_else(|| extensions.get::<ReqInfo>().and_then(|ri| ri.request_context.clone()))
+        .or_else(|| req.req_info().and_then(|req_info| req_info.request_context.clone()))
 }
 
 #[derive(Clone, Debug)]
@@ -978,11 +1005,25 @@ fn merge_request_object_tag_conditions(
 /// owned `RequestEnvelope` implements it in the app layer.
 pub(crate) trait AuthorizationRequest {
     fn headers(&self) -> &HeaderMap;
+    fn headers_mut(&mut self) -> &mut HeaderMap;
     fn uri(&self) -> &http::Uri;
     fn remote_addr(&self) -> Option<std::net::SocketAddr>;
     fn client_info(&self) -> Option<&ClientInfo>;
     fn server_context(&self) -> Option<&Arc<ServerContextSlot>>;
     fn req_info(&self) -> Option<&ReqInfo>;
+    fn req_info_mut(&mut self) -> Option<&mut ReqInfo>;
+    fn request_context(&self) -> Option<&RequestContext>;
+    fn bucket_generation(&self) -> Option<&BucketGenerationGuard>;
+    fn install_bucket_generation(&mut self, guard: BucketGenerationGuard);
+    fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard>;
+    fn install_pending_delete_bucket_generation(&mut self, guard: PendingDeleteBucketGenerationGuard);
+    fn copy_source_bucket_generation(&self) -> Option<&CopySourceBucketGenerationGuard>;
+    fn odm_read_generation(&self) -> Option<&OdmReadGenerationGuard>;
+    fn install_odm_read_generation(&mut self, guard: OdmReadGenerationGuard);
+    fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot>;
+    /// The extensions no typed accessor covers, for test-only payloads.
+    #[cfg(test)]
+    fn test_extensions(&self) -> &http::Extensions;
     fn internal_object_authorization(&self) -> bool;
     fn multipart_staging(&self) -> bool;
     fn staged_multipart_part(&self) -> bool;
@@ -1005,6 +1046,9 @@ impl<T> AuthorizationRequest for S3Request<T> {
     fn headers(&self) -> &HeaderMap {
         &self.headers
     }
+    fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
+    }
     fn uri(&self) -> &http::Uri {
         &self.uri
     }
@@ -1021,6 +1065,40 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn req_info(&self) -> Option<&ReqInfo> {
         self.extensions.get::<ReqInfo>()
+    }
+    fn req_info_mut(&mut self) -> Option<&mut ReqInfo> {
+        self.extensions.get_mut::<ReqInfo>()
+    }
+    fn request_context(&self) -> Option<&RequestContext> {
+        self.extensions.get::<RequestContext>()
+    }
+    fn bucket_generation(&self) -> Option<&BucketGenerationGuard> {
+        self.extensions.get::<BucketGenerationGuard>()
+    }
+    fn install_bucket_generation(&mut self, guard: BucketGenerationGuard) {
+        self.extensions.insert(guard);
+    }
+    fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard> {
+        self.extensions.get::<PendingDeleteBucketGenerationGuard>()
+    }
+    fn install_pending_delete_bucket_generation(&mut self, guard: PendingDeleteBucketGenerationGuard) {
+        self.extensions.insert(guard);
+    }
+    fn copy_source_bucket_generation(&self) -> Option<&CopySourceBucketGenerationGuard> {
+        self.extensions.get::<CopySourceBucketGenerationGuard>()
+    }
+    fn odm_read_generation(&self) -> Option<&OdmReadGenerationGuard> {
+        self.extensions.get::<OdmReadGenerationGuard>()
+    }
+    fn install_odm_read_generation(&mut self, guard: OdmReadGenerationGuard) {
+        self.extensions.insert(guard);
+    }
+    fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot> {
+        self.extensions.get::<BucketConfigMutationSnapshot>()
+    }
+    #[cfg(test)]
+    fn test_extensions(&self) -> &http::Extensions {
+        &self.extensions
     }
     fn internal_object_authorization(&self) -> bool {
         self.extensions.get::<InternalObjectAuthorization>().is_some()
@@ -1336,12 +1414,11 @@ fn retain_internal_object_authorization_conditions(
 /// Lives here rather than at the call site because this module already owns the request
 /// plumbing every such decision needs: the verified client address and `ReqInfo`. The KMS
 /// grammar has no bucket/object/tag conditions, so none of the S3 merges apply.
-pub(crate) fn resource_free_condition_values<T>(
-    req: &S3Request<T>,
+pub(crate) fn resource_free_condition_values<R: AuthorizationRequest + ?Sized>(
+    req: &R,
     cred: &rustfs_credentials::Credentials,
 ) -> HashMap<String, Vec<String>> {
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    get_condition_values_with_client_info(&req.headers, cred, None, None, remote_addr, req.extensions.get::<ClientInfo>())
+    get_condition_values_with_client_info(req.headers(), cred, None, None, req.remote_addr(), req.client_info())
 }
 
 fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
@@ -1372,6 +1449,182 @@ fn request_iam_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<
             format!("authorize_request {:?}", IamError::IamSysNotInitialized),
         )
     })
+}
+
+/// What an edge's signature verification established about a request, as the access phase
+/// records it for the readers of [`VerifiedSigV4Request`] and [`VerifiedPresignedRequest`].
+///
+/// Each edge derives it from its own verdict; the legacy edge from the signature form s3s verified.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VerifiedSignature {
+    /// A SigV4 signature covered the request line, in the header or the query.
+    pub(crate) sigv4: bool,
+    /// The SigV4 signature was carried in the query.
+    pub(crate) presigned: bool,
+}
+
+impl VerifiedSignature {
+    /// The legacy edge's reading: s3s verified the signature form these headers name.
+    pub(crate) fn from_auth_type(auth_type: AuthType) -> Self {
+        Self {
+            sigv4: matches!(auth_type, AuthType::Presigned | AuthType::Signed),
+            presigned: matches!(auth_type, AuthType::Presigned),
+        }
+    }
+}
+
+/// The payloads the access phase hands every later reader of a request: the signature markers
+/// and, for an operation that stages an upload, [`MultipartStagingOperation`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccessMarkers {
+    staging: Option<MultipartStagingOperation>,
+    signature: VerifiedSignature,
+}
+
+impl AccessMarkers {
+    /// The markers of the S3 operation named `operation`, signed as `signature` says.
+    pub(crate) fn new(operation: &str, signature: VerifiedSignature) -> Self {
+        Self {
+            staging: MultipartStagingOperation::for_operation(operation),
+            signature,
+        }
+    }
+
+    pub(crate) fn install(self, extensions: &mut http::Extensions) {
+        if let Some(staging) = self.staging {
+            extensions.insert(staging);
+        }
+        if self.signature.presigned {
+            extensions.insert(VerifiedPresignedRequest);
+        }
+        if self.signature.sigv4 {
+            extensions.insert(VerifiedSigV4Request);
+        }
+    }
+}
+
+/// Resolves the caller of one request as the access phase of either edge needs it: the credential
+/// IAM holds for `access_key` (validated against `session_token`), whether it owns the deployment,
+/// and the request-scoped facts later authorization steps read.
+///
+/// `access_key` is the key whose signature the edge verified; `None` is an anonymous request.
+/// Resolved against `server_ctx` so each embedded server reads its own IAM domain.
+///
+/// # Errors
+///
+/// What [`check_key_valid_with_context`] refuses: an unknown, disabled or expired credential, a
+/// session token that does not belong to it, or an IAM system that is not initialized.
+pub(crate) async fn resolve_req_info(
+    server_ctx: &Arc<ServerContextSlot>,
+    access_key: Option<&str>,
+    session_token: &str,
+    request_context: Option<RequestContext>,
+) -> S3Result<ReqInfo> {
+    let app_context = server_ctx.app_context();
+    let (cred, is_owner) = match access_key {
+        Some(access_key) => {
+            let (cred, is_owner) = check_key_valid_with_context(session_token, access_key, app_context.as_deref()).await?;
+            (Some(cred), is_owner)
+        }
+        None => (None, false),
+    };
+    let region = match app_context.as_deref() {
+        Some(context) => context.region().get(),
+        None => runtime_sources::current_region(),
+    };
+    Ok(ReqInfo {
+        cred,
+        is_owner,
+        region,
+        request_context,
+        ..Default::default()
+    })
+}
+
+/// The operation-aware admission every S3 request passes after its caller is resolved and before
+/// its own authorization: a signed upload-size capability is refused on any operation but the one
+/// it is scoped to, and the license must be valid.
+///
+/// # Errors
+///
+/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
+/// `InternalError` when the license cannot be checked.
+pub(crate) fn admit_operation(
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+    operation: &str,
+    signature: VerifiedSignature,
+) -> S3Result<()> {
+    // The size capability is intentionally scoped to the single-object
+    // PutObject operation. Validate this at the operation-aware access
+    // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
+    // ignore a signed capability query.
+    if parse_presigned_put_max_content_length(headers, raw_query, signature.presigned)?.is_some() && operation != "PutObject" {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        ));
+    }
+    if parse_presigned_multipart_max_total_object_size(headers, raw_query, signature.sigv4)?.is_some()
+        && operation != "CreateMultipartUpload"
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        ));
+    }
+    license_check().map_err(|er| match er.kind() {
+        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        _ => {
+            tracing::error!("license check failed due to unexpected error: {er}");
+            s3_error!(InternalError, "License validation failed")
+        }
+    })
+}
+
+#[cfg(test)]
+mod access_phase_tests {
+    use super::{
+        AccessMarkers, AuthType, MultipartStagingOperation, VerifiedPresignedRequest, VerifiedSigV4Request, VerifiedSignature,
+    };
+
+    #[test]
+    fn only_a_sigv4_header_or_query_signature_is_marked_verified() {
+        for (auth_type, expected) in [
+            (AuthType::Signed, (true, false)),
+            (AuthType::Presigned, (true, true)),
+            (AuthType::SignedV2, (false, false)),
+            (AuthType::PresignedV2, (false, false)),
+            (AuthType::StreamingSigned, (false, false)),
+            (AuthType::PostPolicy, (false, false)),
+            (AuthType::Anonymous, (false, false)),
+        ] {
+            let signature = VerifiedSignature::from_auth_type(auth_type.clone());
+            assert_eq!((signature.sigv4, signature.presigned), expected, "{auth_type:?}");
+        }
+    }
+
+    #[test]
+    fn each_marker_is_installed_exactly_when_its_fact_holds() {
+        for (operation, sigv4, presigned) in [
+            ("ListBuckets", false, false),
+            ("ListBuckets", true, false),
+            ("ListBuckets", true, true),
+            ("CreateMultipartUpload", false, false),
+            ("UploadPart", true, true),
+            ("UploadPartCopy", true, false),
+            ("CompleteMultipartUpload", true, false),
+            ("PutObject", true, true),
+        ] {
+            let mut extensions = http::Extensions::new();
+            AccessMarkers::new(operation, VerifiedSignature { sigv4, presigned }).install(&mut extensions);
+
+            let staging = matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy");
+            assert_eq!(extensions.get::<MultipartStagingOperation>().is_some(), staging, "{operation}");
+            assert_eq!(extensions.get::<VerifiedSigV4Request>().is_some(), sigv4, "{operation}");
+            assert_eq!(extensions.get::<VerifiedPresignedRequest>().is_some(), presigned, "{operation}");
+        }
+    }
 }
 
 pub(crate) struct ListBucketsIamAuthorization {
@@ -1413,8 +1666,10 @@ impl ListBucketsIamAuthorization {
 
 /// Prepare the IAM-only authorization used to decide which buckets are visible in ListBuckets.
 /// Bucket policies are intentionally excluded from this discovery decision, matching MinIO.
-pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>) -> S3Result<ListBucketsIamAuthorization> {
-    let req_info = req_info_ref(req)?;
+pub(crate) async fn prepare_list_buckets_iam_authorization<R: AuthorizationRequest + ?Sized>(
+    req: &R,
+) -> S3Result<ListBucketsIamAuthorization> {
+    let req_info = req.req_info().ok_or_else(missing_req_info_error)?;
     let Some(cred) = req_info.cred.as_ref() else {
         return Err(ApiError::access_denied().into());
     };
@@ -1467,8 +1722,8 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<T>(req: &S3Request<T>
 
 /// Preserve the top-level IAM denial audit emitted before ListBuckets falls back
 /// to bucket-level visibility checks.
-pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Result<()> {
-    let req_info = req_info_ref(req)?;
+pub(crate) fn log_list_buckets_iam_implicit_deny<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<()> {
+    let req_info = req.req_info().ok_or_else(missing_req_info_error)?;
     let denial = DenialContext {
         quiet: true,
         suppress_audit: true,
@@ -1501,7 +1756,7 @@ pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action
 /// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
 /// `s3:GetObject` request. It only broadens a Version grant toward current
 /// reads, never the reverse.
-fn versioned_read_action(version_id: Option<&str>) -> Action {
+pub(crate) fn versioned_read_action(version_id: Option<&str>) -> Action {
     if version_id.is_some() {
         Action::S3Action(S3Action::GetObjectVersionAction)
     } else {
@@ -1509,7 +1764,7 @@ fn versioned_read_action(version_id: Option<&str>) -> Action {
     }
 }
 
-fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
+pub(crate) fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
     let action = if version_id.is_some() {
         match action {
             S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
@@ -1693,15 +1948,56 @@ impl BulkDenialAudit {
 }
 
 /// Authorizes the request based on the action and credentials.
-pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+pub(crate) async fn authorize_request<R: AuthorizationRequest + ?Sized>(req: &mut R, action: Action) -> S3Result<()> {
     // Restore the `x-amz-meta-*` user metadata the SigV4 presigners hoist into
     // the query string. This runs after s3s has verified the signature — its own
     // verifier rejects an `x-amz-*` header outside `SignedHeaders`, which is
     // exactly what a hoisted parameter becomes — and before policy evaluation and
     // the handler read request properties, so every operation sees one request
     // shape (rustfs/rustfs#9142).
-    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
-    authorize_request_with_location_constraint(req, action, None).await
+    let query = req.uri().query().map(str::to_owned);
+    crate::auth::hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+    let internal_object_authorization = req.internal_object_authorization();
+    authorize_request_core(req, action, None, internal_object_authorization).await
+}
+
+/// Authorizes `action` on `bucket` for either edge: the whole access hook of an operation that
+/// names one bucket and asks one action, such as HeadBucket.
+///
+/// # Errors
+///
+/// `InternalError` when the access phase installed no `ReqInfo`; otherwise what
+/// [`authorize_request`] refuses.
+pub(crate) async fn authorize_bucket_request<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    action: Action,
+) -> S3Result<()> {
+    req.req_info_mut().ok_or_else(missing_req_info_error)?.bucket = Some(bucket.to_owned());
+    authorize_request(req, action).await
+}
+
+/// Authorizes `action` on one object version for either edge: the whole access hook of an
+/// operation that names a bucket, a key and an optional version and asks one action, such as
+/// GetObjectAcl. A caller whose action depends on the version picks it first
+/// ([`versioned_read_action`], [`versioned_tagging_action`]).
+///
+/// # Errors
+///
+/// `InternalError` when the access phase installed no `ReqInfo`; otherwise what
+/// [`authorize_request`] refuses.
+pub(crate) async fn authorize_object_request<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    action: Action,
+) -> S3Result<()> {
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+    req_info.version_id = version_id.map(str::to_owned);
+    authorize_request(req, action).await
 }
 
 /// Authorize the exact tag set selected by CopyObject's source reader before publication.
@@ -2693,86 +2989,21 @@ impl S3Access for FS {
         // second embedded server validates keys against its own root identity
         // and IAM domain; the slot resolves the process default when it has
         // not been installed, keeping single-instance behavior unchanged.
-        let app_context = self.server_ctx().app_context();
-        let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
-            let (cred, is_owner) = check_key_valid_with_context(
-                get_session_token(cx.uri(), cx.headers()).unwrap_or_default(),
-                &input_cred.access_key,
-                app_context.as_deref(),
-            )
-            .await?;
-            (Some(cred), is_owner)
-        } else {
-            (None, false)
-        };
-
+        let access_key = cx.credentials().map(|credentials| credentials.access_key.clone());
+        let session_token = get_session_token(cx.uri(), cx.headers()).unwrap_or_default().to_owned();
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
+        let req_info = resolve_req_info(self.server_ctx(), access_key.as_deref(), &session_token, request_context).await?;
 
-        let region = match app_context.as_deref() {
-            Some(context) => context.region().get(),
-            None => runtime_sources::current_region(),
-        };
-
-        let req_info = ReqInfo {
-            cred,
-            is_owner,
-            region,
-            request_context,
-            ..Default::default()
-        };
-
-        let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
-        let verified_presigned = matches!(auth_type, AuthType::Presigned);
-        let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
-        let multipart_staging_operation = MultipartStagingOperation::for_operation(cx.s3_op().name());
+        let signature = VerifiedSignature::from_auth_type(get_request_auth_type_with_query(cx.headers(), cx.uri().query()));
+        let markers = AccessMarkers::new(cx.s3_op().name(), signature);
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
-        {
-            let ext = cx.extensions_mut();
-            ext.insert(self.server_ctx().clone());
-            ext.insert(req_info);
-            if let Some(operation) = multipart_staging_operation {
-                ext.insert(operation);
-            }
-            if verified_presigned {
-                ext.insert(VerifiedPresignedRequest);
-            }
-            if verified_sigv4 {
-                ext.insert(VerifiedSigV4Request);
-            }
-        }
+        let ext = cx.extensions_mut();
+        ext.insert(self.server_ctx().clone());
+        ext.insert(req_info);
+        markers.install(ext);
 
-        // The size capability is intentionally scoped to the single-object
-        // PutObject operation. Validate this at the operation-aware access
-        // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
-        // ignore a signed capability query.
-        if parse_presigned_put_max_content_length(cx.headers(), cx.uri().query(), verified_presigned)?.is_some()
-            && cx.s3_op().name() != "PutObject"
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
-            ));
-        }
-        if parse_presigned_multipart_max_total_object_size(cx.headers(), cx.uri().query(), verified_sigv4)?.is_some()
-            && cx.s3_op().name() != "CreateMultipartUpload"
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
-            ));
-        }
-        license_check().map_err(|er| match er.kind() {
-            std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
-            _ => {
-                tracing::error!("license check failed due to unexpected error: {er}");
-                s3_error!(InternalError, "License validation failed")
-            }
-        })?;
-
-        // Verify uniformly here? Or verify separately below?
-
-        Ok(())
+        admit_operation(cx.headers(), cx.uri().query(), cx.s3_op().name(), signature)
     }
 
     /// Checks whether the CreateBucket request has accesses to the resources.
@@ -2798,13 +3029,13 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
         authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -2813,7 +3044,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2822,7 +3053,7 @@ impl S3Access for FS {
         let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
         authorize_write_etag_condition(req, specific_etag).await?;
         authorize_replication_only_put_headers(req).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -2831,7 +3062,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let (src_bucket, src_key, version_id) = match &req.input.copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
@@ -2927,14 +3158,14 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
         }
 
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2954,7 +3185,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
         }
 
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -3106,71 +3337,13 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         #[cfg(test)]
         wait_for_object_generation_test_hook(&bucket).await;
-        // Preserve DeleteObject's established NoSuchBucket response instead of
-        // letting policy lookup turn a missing bucket into AccessDenied.
-        if let Err(err) = &bucket_generation
-            && err.code() == &S3ErrorCode::NoSuchBucket
-        {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NoSuchBucket,
-                err.message().unwrap_or("The specified bucket does not exist").to_string(),
-            ));
-        }
-
-        let replica_request = req
-            .headers
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
-        // A replica delete may name its version through the source-version
-        // header; the policy decision must see the same version storage deletes.
-        // Storage consumes that header only for a replica request, so any other
-        // request is authorized for the version it names in the query alone.
-        let version_id = if replica_request {
-            super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers)
-        } else {
-            req.input.version_id.clone()
-        };
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = version_id;
-        let authenticated = req_info.is_owner || req_info.cred.is_some();
-        let action = delete_object_authorize_action(req_info.version_id.as_deref());
-
-        authorize_request(req, action).await?;
-
-        let force_delete = match force_delete_header(&req.headers) {
-            Ok(value) => value.unwrap_or(false),
-            Err(_) => return Err(invalid_force_delete_header()),
-        };
-        // The REPLICA header is caller-supplied, so it must not skip this
-        // check. s3:ReplicateDelete is still required separately for replica
-        // deletes; s3:* does not grant s3:ForceDeleteObject.
-        if force_delete {
-            authorize_request(req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
-        }
-        if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
-            audit_request_denial(
-                req,
-                DenialAuditor::global(),
-                "recursive_force_delete_requires_authenticated_caller",
-                Action::S3Action(S3Action::ForceDeleteObjectAction),
-            );
-            return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
-        }
-
-        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
-        if has_bypass_governance_header(&req.headers) {
-            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
-        }
-
-        req.extensions
-            .insert(PendingDeleteBucketGenerationGuard::from_result(bucket_generation));
-
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        let guard = authorize_delete_object(req, &bucket, &key, version_id.as_deref(), bucket_generation).await?;
+        req.install_pending_delete_bucket_generation(guard);
         Ok(())
     }
 
@@ -3420,7 +3593,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -3429,7 +3602,7 @@ impl S3Access for FS {
         // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
         // s3:GetObjectVersion, not s3:GetObject.
         authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
-        req.extensions.insert(source_generation);
+        req.install_odm_read_generation(source_generation);
         Ok(())
     }
 
@@ -3437,12 +3610,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_acl(&self, req: &mut S3Request<GetObjectAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_object_request(req, &bucket, &key, version_id.as_deref(), Action::S3Action(S3Action::GetObjectAclAction)).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -3469,12 +3638,15 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_legal_hold(&self, req: &mut S3Request<GetObjectLegalHoldInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::GetObjectLegalHoldAction)).await
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_object_request(
+            req,
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            Action::S3Action(S3Action::GetObjectLegalHoldAction),
+        )
+        .await
     }
 
     /// Checks whether the GetObjectLockConfiguration request has accesses to the resources.
@@ -3491,12 +3663,15 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_retention(&self, req: &mut S3Request<GetObjectRetentionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::GetObjectRetentionAction)).await
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_object_request(
+            req,
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            Action::S3Action(S3Action::GetObjectRetentionAction),
+        )
+        .await
     }
 
     /// Checks whether the GetObjectTagging request has accesses to the resources.
@@ -3536,10 +3711,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_bucket(&self, req: &mut S3Request<HeadBucketInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::ListBucketAction)).await
     }
 
     /// Checks whether the HeadObject request has accesses to the resources.
@@ -3547,7 +3720,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -3561,7 +3734,7 @@ impl S3Access for FS {
             req_info_mut(req)?.replication_request_authorized = true;
         }
 
-        req.extensions.insert(source_generation);
+        req.install_odm_read_generation(source_generation);
         Ok(())
     }
 
@@ -3618,13 +3791,13 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await?;
         prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketMultipartUploadsAction).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -3655,12 +3828,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self, req, &bucket).await;
+        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await?;
-        req.extensions.insert(source_generation);
+        req.install_odm_read_generation(source_generation);
         Ok(())
     }
 
@@ -3669,13 +3842,13 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
         authorize_request(req, list_parts_authorize_action()).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -3893,7 +4066,7 @@ impl S3Access for FS {
             let bucket = req.input.bucket.clone();
             // Snapshot before authorization, but preserve AccessDenied precedence
             // by exposing any bucket-state error only after authorization succeeds.
-            let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+            let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
             #[cfg(test)]
             let bucket_generation = if PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
                 Err(ApiError::from(StorageError::ErasureReadQuorum).into())
@@ -3906,7 +4079,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
             let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
             authorize_write_etag_condition(req, specific_etag).await?;
-            req.extensions.insert(bucket_generation?);
+            req.install_bucket_generation(bucket_generation?);
 
             if req.method != http::Method::POST {
                 authorize_replication_only_put_headers(req).await?;
@@ -3929,12 +4102,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_acl(&self, req: &mut S3Request<PutObjectAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_object_request(req, &bucket, &key, version_id.as_deref(), Action::S3Action(S3Action::PutObjectAclAction)).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
@@ -3949,9 +4118,9 @@ impl S3Access for FS {
         req_info.version_id = req.input.version_id.clone();
 
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -3973,7 +4142,7 @@ impl S3Access for FS {
         req_info.version_id = req.input.version_id.clone();
 
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         set_requested_object_lock_retention(req);
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
@@ -3982,7 +4151,7 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
         }
 
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -4018,7 +4187,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         #[cfg(test)]
         wait_for_object_generation_test_hook(&bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
@@ -4027,7 +4196,7 @@ impl S3Access for FS {
         req_info.version_id = req.input.version_id.clone();
 
         authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -4047,13 +4216,13 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
         authorize_staged_multipart_part(req).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 
@@ -4062,7 +4231,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
         let (src_bucket, src_key, version_id) = match &req.input.copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
@@ -4095,7 +4264,7 @@ impl S3Access for FS {
         req_info.version_id = None;
 
         authorize_staged_multipart_part(req).await?;
-        req.extensions.insert(bucket_generation?);
+        req.install_bucket_generation(bucket_generation?);
         Ok(())
     }
 

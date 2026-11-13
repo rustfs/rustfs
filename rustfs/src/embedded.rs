@@ -421,6 +421,13 @@ impl Drop for RustFSServer {
     }
 }
 
+/// The S3 operations a server on the gateway stack serves. It answers every other operation
+/// `501 NotImplemented`.
+#[cfg(feature = "gateway-stack")]
+pub fn gateway_operations() -> Vec<&'static str> {
+    crate::server::gateway_operations()
+}
+
 /// Find an available TCP port on localhost.
 ///
 /// Binds to port `0`, reads the OS-assigned port, then releases the socket.

@@ -34,6 +34,11 @@ pub(crate) fn record_grpc_dial_result(duration: Duration, success: bool) {
     global_internode_metrics().record_dial_result(duration, success);
 }
 
+#[cfg(test)]
+pub(crate) fn grpc_dial_errors_total() -> u64 {
+    global_internode_metrics().snapshot().dial_errors_total
+}
+
 /// Mark an internode peer reachable (online) after a successful dial (grpc-optimization P3).
 pub(crate) fn record_peer_reachable(addr: &str) {
     rustfs_io_metrics::internode_metrics::record_peer_reachable(addr);

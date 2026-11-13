@@ -13,15 +13,14 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::storage_api::s3_api_consumer::bucket::contract::{
-    bucket::BucketInfo,
-    list::{ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info},
+use crate::storage::storage_api::s3_api_consumer::bucket::contract::list::{
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
 use crate::storage::storage_api::s3_api_consumer::bucket::to_s3s_xml_etag;
 use percent_encoding::percent_decode_str;
 use s3s::dto::{
-    Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
-    ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
+    CommonPrefix, DeleteMarkerEntry, EncodingType, ListObjectVersionsOutput, ListObjectsOutput, ListObjectsV2Output, Object,
+    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
 };
 use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
@@ -122,23 +121,6 @@ pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker:
         is_truncated: v2.is_truncated,
         marker,
         next_marker,
-        ..Default::default()
-    }
-}
-
-pub(crate) fn build_list_buckets_output(bucket_infos: &[BucketInfo]) -> ListBucketsOutput {
-    let buckets: Vec<Bucket> = bucket_infos
-        .iter()
-        .map(|bucket_info| Bucket {
-            creation_date: Some(Timestamp::from(bucket_info.created.unwrap_or(time::OffsetDateTime::UNIX_EPOCH))),
-            name: Some(bucket_info.name.clone()),
-            ..Default::default()
-        })
-        .collect();
-
-    ListBucketsOutput {
-        buckets: Some(buckets),
-        owner: Some(rustfs_owner()),
         ..Default::default()
     }
 }
@@ -450,19 +432,16 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_buckets_output,
-        build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params,
-        to_s3s_xml_etag,
+        ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_object_versions_output,
+        build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+        parse_list_object_versions_params, parse_list_objects_v2_params, to_s3s_xml_etag,
     };
     use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
-    use crate::storage::storage_api::s3_api_consumer::bucket::contract::bucket::BucketInfo;
     use rustfs_filemeta::FileInfo;
     use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
-    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[test]
@@ -523,36 +502,6 @@ mod tests {
             assert!(output.contains("&lt;/ETag&gt;&lt;Contents&gt;"), "{output}");
             assert!(output.contains("&amp;amp;"), "existing entities must remain literal: {output}");
         }
-    }
-
-    #[test]
-    fn test_build_list_buckets_output_maps_bucket_infos_and_owner() {
-        let bucket_infos = vec![
-            BucketInfo {
-                name: "bucket-a".to_string(),
-                created: Some(OffsetDateTime::UNIX_EPOCH),
-                ..Default::default()
-            },
-            BucketInfo {
-                name: "bucket-b".to_string(),
-                created: None,
-                ..Default::default()
-            },
-        ];
-
-        let output = build_list_buckets_output(&bucket_infos);
-        let buckets = output.buckets.as_ref().expect("buckets should be present");
-        let owner = output.owner.as_ref().expect("owner should be present");
-
-        assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0].name.as_deref(), Some("bucket-a"));
-        assert_eq!(buckets[0].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
-        assert_eq!(buckets[1].name.as_deref(), Some("bucket-b"));
-        assert_eq!(buckets[1].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
-
-        let expected_owner = rustfs_owner();
-        assert_eq!(owner.display_name, expected_owner.display_name);
-        assert_eq!(owner.id, expected_owner.id);
     }
 
     #[test]

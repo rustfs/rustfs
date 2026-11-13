@@ -344,6 +344,10 @@ pub(crate) mod prepared_publication_test_hooks {
         Rename,
         Remove,
         NativeReadOpen,
+        #[cfg(all(test, not(windows)))]
+        FormatReadOpen,
+        #[cfg(all(test, not(windows)))]
+        DiskInfoRead,
         MetadataReadAfterOpen,
         MetadataReadAfterRead,
         #[cfg(test)]
@@ -2332,6 +2336,11 @@ pub(crate) fn record_native_publication(path: &Path) {
 }
 
 impl NativePublicationRegistration {
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn matches_current_root(&self, configured_root: &Path) -> bool {
+        native_root_identity(configured_root) == Some(self.identity)
+    }
+
     pub(crate) fn invalidate(&self) {
         if let Some(root) = NATIVE_PUBLICATION_HISTORY.lock().roots.get_mut(&self.identity) {
             root.unknown = true;
@@ -5816,7 +5825,7 @@ impl PublicationRoot {
 
     pub(crate) fn open_readonly(&self, path: &Path) -> io::Result<std::fs::File> {
         #[cfg(target_os = "linux")]
-        return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
+        return self.open_relative(path, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK, rustix::fs::Mode::empty());
         #[cfg(windows)]
         return open_windows_readonly(path);
         #[cfg(not(any(target_os = "linux", windows)))]
