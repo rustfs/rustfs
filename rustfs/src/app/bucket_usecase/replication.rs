@@ -16,10 +16,10 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, GetBucketReplicationInput, PutBucketReplicationInput,
-    PutBucketReplicationOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
 };
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_gateway_types::persistence::parse_replication_dto;
 
 fn validate_replication_config_targets(targets: &BucketTargets, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
@@ -291,30 +291,31 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
-    /// Answers the stored configuration in the engine's shape; the s3s edge
-    /// (`storage::ecfs`) converts it into the `GetBucketReplication` output.
+    /// The stored replication configuration as the gateway's answer holds it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized or the stored document cannot be
+    /// represented; the lookup's storage error, `NoSuchBucket` among them;
+    /// `ReplicationConfigurationNotFoundError` when none is stored.
     pub async fn execute_get_bucket_replication(
         &self,
-        req: S3Request<GetBucketReplicationInput>,
-    ) -> S3Result<PersistedReplicationConfiguration> {
-        let GetBucketReplicationInput { bucket, .. } = req.input;
-
+        input: gateway_dto::GetBucketReplicationInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketReplicationOutput> {
+        let bucket = input.bucket.as_str();
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
+        let replication_configuration = match metadata_sys::get_replication_config(bucket).await {
             Ok((cfg, _created)) => cfg,
             Err(StorageError::ConfigNotFound) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::ReplicationConfigurationNotFoundError,
-                    "replication not found".to_string(),
-                ));
+                return Err(rustfs_s3_types::s3_error!(ReplicationConfigurationNotFoundError, "replication not found"));
             }
             Err(err) => {
                 warn!(
@@ -329,7 +330,9 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(replication_configuration)
+        Ok(gateway_dto::GetBucketReplicationOutput {
+            replication_configuration: Some(dto_values::stored_config(&replication_configuration, parse_replication_dto)?),
+        })
     }
 
     /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
@@ -848,16 +851,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_replication_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketReplicationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
+        let input = gateway_dto::GetBucketReplicationInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_replication(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_replication(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

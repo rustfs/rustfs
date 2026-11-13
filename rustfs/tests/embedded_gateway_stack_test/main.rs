@@ -42,7 +42,7 @@ use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::{RustFSServer, RustFSServerBuilder, find_available_port, gateway_operations};
 use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, MakeBucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
@@ -207,6 +207,15 @@ async fn create_bucket_in_the_store(bucket: &str) {
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("create bucket in the store");
+}
+
+async fn bucket_exists_in_the_store(bucket: &str) -> bool {
+    get_global_app_context()
+        .expect("embedded server context")
+        .object_store()
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .is_ok()
 }
 
 async fn create_user_without_a_policy(access_key: &str) {

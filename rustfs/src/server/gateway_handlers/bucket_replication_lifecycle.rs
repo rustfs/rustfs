@@ -13,6 +13,68 @@
 // limitations under the License.
 
 //! The gateway operations of migration batch A3 (rustfs/backlog#2765): bucket lifecycle, replication and object lock configuration.
-//! None is served yet; the batch appends its rows here.
 
-pub(super) const ROWS: &[super::OpRow] = &[];
+use super::{OpRow, Served, row};
+use crate::app::RequestEnvelope;
+use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::runtime_sources::AppContext;
+use crate::storage_api::server::http::access::authorize_bucket_request;
+use rustfs_gateway::{Req, Resp, dto};
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::S3Result;
+use std::sync::Arc;
+
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::GetBucketLifecycleConfiguration>(),
+    row::<dto::GetBucketReplication>(),
+    row::<dto::GetObjectLockConfiguration>(),
+];
+
+impl Served for dto::GetBucketLifecycleConfiguration {
+    const METRIC: S3Operation = S3Operation::GetBucketLifecycleConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketLifecycleAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_lifecycle_configuration(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketReplication {
+    const METRIC: S3Operation = S3Operation::GetBucketReplication;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetReplicationConfigurationAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_replication(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetObjectLockConfiguration {
+    const METRIC: S3Operation = S3Operation::GetObjectLockConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_object_lock_configuration(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}

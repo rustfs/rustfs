@@ -17,8 +17,9 @@
 
 use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
-use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::bucket_usecase::{DefaultBucketUsecase, requested_location_constraint};
 use crate::runtime_sources::AppContext;
+use crate::storage_api::server::http::access::access_owned::bucket_core::authorize_create_bucket;
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -26,7 +27,11 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::ListBuckets>(), row::<dto::HeadBucket>()];
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::ListBuckets>(),
+    row::<dto::HeadBucket>(),
+    row::<dto::CreateBucket>(),
+];
 
 impl Served for dto::ListBuckets {
     const METRIC: S3Operation = S3Operation::ListBuckets;
@@ -55,6 +60,24 @@ impl Served for dto::HeadBucket {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_head_bucket(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::CreateBucket {
+    const METRIC: S3Operation = S3Operation::CreateBucket;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        let location_constraint = requested_location_constraint(input).map(str::to_owned);
+        let object_lock_enabled = input.object_lock_enabled_for_bucket.is_some_and(|enabled| enabled);
+        authorize_create_bucket(envelope, input.bucket.as_str(), location_constraint, object_lock_enabled).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_create_bucket(envelope, request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

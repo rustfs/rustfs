@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::{StreamExt, stream};
-
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, OnceLock, RwLock as StdRwLock},
@@ -28,12 +26,9 @@ use crate::{
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, ReplicationStats},
     config::{get_global_storage_class, get_global_storage_class_snapshot, set_global_storage_class, storageclass},
-    disk::{DiskAPI, DiskOption, DiskStore, error::DiskError, new_disk},
+    disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     error::{Error, Result},
-    layout::{
-        disks_layout::MAX_ERASURE_SET_DRIVE_COUNT,
-        endpoints::{EndpointServerPools, SetupType},
-    },
+    layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
         TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
@@ -58,10 +53,6 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use tonic::transport::Channel;
 use uuid::Uuid;
-
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_RUNTIME_SOURCES: &str = "runtime_sources";
-const EVENT_LOCAL_DISK_REGISTRATION: &str = "local_disk_registration";
 
 #[cfg(test)]
 const TEST_RPC_SECRET: &str = "test-rpc-secret";
@@ -419,6 +410,10 @@ pub(crate) fn local_disk_id_map_handle() -> Arc<RwLock<HashMap<Uuid, String>>> {
     crate::runtime::global::current_ctx().local_disk_id_map()
 }
 
+pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrives>> {
+    crate::runtime::global::current_ctx().local_disk_set_drives()
+}
+
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     get_global_tier_config_mgr()
 }
@@ -490,84 +485,49 @@ pub(crate) async fn quarantine_local_disks_preserving_bootstrap_routes(
         return Err(Error::CorruptedFormat);
     }
     let bootstrap_routes = unformatted_bootstrap_routes.iter().collect::<HashSet<_>>();
-    let targets = endpoints
+    let slots = endpoints
         .iter()
         .map(|endpoint| {
             Ok((
-                endpoint.to_string(),
-                (
-                    usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
-                    usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
-                    usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
-                ),
+                usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
+                usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // All registry writers follow registration -> set layout -> endpoint map.
-    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
+    let local_disk_map = instance_ctx.local_disk_map();
+    let mut local_disks = local_disk_map.write().await;
+    for endpoint in endpoints {
+        if !bootstrap_routes.contains(endpoint) {
+            local_disks.insert(endpoint.to_string(), None);
+        }
+    }
+    drop(local_disks);
+
     let set_drives = instance_ctx.local_disk_set_drives();
-    let map = instance_ctx.local_disk_map();
-    let mut slots = set_drives.write().await;
-    let mut disks = map.write().await;
-    let standalone = slots.is_empty();
-    for (endpoint, (key, (pool, set, index))) in endpoints.iter().zip(&targets) {
-        if !disks.contains_key(key) && !standalone {
-            return Err(Error::CorruptedFormat);
-        }
-        if !slots.is_empty() {
-            let slot = slots
-                .get(*pool)
-                .and_then(|sets| sets.get(*set))
-                .and_then(|drives| drives.get(*index))
-                .ok_or(Error::CorruptedFormat)?;
-            if slot.as_ref().is_some_and(|disk| disk.endpoint() != *endpoint) {
-                return Err(DiskError::InconsistentDisk.into());
-            }
-        }
+    let mut local_set_drives = set_drives.write().await;
+    if local_set_drives.is_empty() {
+        return Ok(());
     }
-    let mut displaced = Vec::new();
-    for (endpoint, (key, (pool, set, index))) in endpoints.iter().zip(targets) {
-        if !bootstrap_routes.contains(endpoint)
-            && let Some(Some(previous)) = disks.insert(key, None)
-        {
-            displaced.push(previous);
-        }
-        if !slots.is_empty()
-            && let Some(previous) = slots[pool][set][index].take()
-        {
-            displaced.push(previous);
-        }
+    for (pool_idx, set_idx, disk_idx) in slots {
+        let disk = local_set_drives
+            .get_mut(pool_idx)
+            .and_then(|sets| sets.get_mut(set_idx))
+            .and_then(|disks| disks.get_mut(disk_idx))
+            .ok_or(Error::CorruptedFormat)?;
+        *disk = None;
     }
-    drop(disks);
-    drop(slots);
-    drop(displaced);
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disks: Vec<DiskStore>) {
-    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let standalone = set_drives.read().await.is_empty();
     let map = instance_ctx.local_disk_map();
-    let mut registered = map.write().await;
-    let mut displaced = Vec::new();
+    let mut global_local_disk_map = map.write().await;
     for disk in disks {
         let path = disk.endpoint().to_string();
-        if !standalone {
-            match registered.get(&path) {
-                None => continue,
-                Some(Some(current)) if !Arc::ptr_eq(current, &disk) => continue,
-                _ => {}
-            }
-        }
-        if let Some(Some(previous)) = registered.insert(path, Some(disk)) {
-            displaced.push(previous);
-        }
+        global_local_disk_map.insert(path, Some(disk));
     }
-    drop(registered);
-    drop(displaced);
 }
 
 pub(crate) async fn local_disk_set_drive(
@@ -607,435 +567,68 @@ pub(crate) async fn local_disk_entries() -> Vec<Option<DiskStore>> {
     local_disk_map_handle().read().await.values().cloned().collect()
 }
 
-pub(crate) const LOCAL_DISK_OPEN_CONCURRENCY: usize = MAX_ERASURE_SET_DRIVE_COUNT;
-
-#[derive(Clone, Copy)]
-struct LocalDiskSlot {
-    pool: usize,
-    set: usize,
-    disk: usize,
-}
-
-impl LocalDiskSlot {
-    fn from_endpoint(endpoint: &Endpoint) -> Result<Self> {
-        Ok(Self {
-            pool: usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?,
-            set: usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?,
-            disk: usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?,
-        })
-    }
-
-    fn get<'a>(&self, slots: &'a [Vec<Vec<Option<DiskStore>>>], endpoint: &Endpoint) -> Result<&'a Option<DiskStore>> {
-        let slot = slots
-            .get(self.pool)
-            .and_then(|sets| sets.get(self.set))
-            .and_then(|drives| drives.get(self.disk))
-            .ok_or(Error::CorruptedFormat)?;
-        if slot.as_ref().is_some_and(|disk| disk.endpoint() != *endpoint) {
-            return Err(DiskError::InconsistentDisk.into());
-        }
-        Ok(slot)
-    }
-}
-
-/// Publication authority captured before disk I/O. A path-only registration
-/// supports callers that own a local set without a full instance layout.
-pub(crate) struct LocalDiskRegistration {
-    endpoint: Endpoint,
-    expected: Option<DiskStore>,
-    slot: Option<LocalDiskSlot>,
-}
-
-impl LocalDiskRegistration {
-    fn new(endpoint: &Endpoint, expected: Option<DiskStore>, layout: &[Vec<Vec<Option<DiskStore>>>]) -> Result<Self> {
-        if !endpoint.is_local {
-            return Err(DiskError::InconsistentDisk.into());
-        }
-        let slot = LocalDiskSlot::from_endpoint(endpoint)?;
-        Ok(Self {
-            endpoint: endpoint.clone(),
-            expected,
-            slot: (!layout.is_empty()).then_some(slot),
-        })
-    }
-}
-
-/// Capture the expected route before a reconnect prepares a new physical handle.
-pub(crate) async fn snapshot_local_disk_registration(
-    instance_ctx: &InstanceContext,
-    endpoint: &Endpoint,
-) -> Result<LocalDiskRegistration> {
-    // Snapshot readers follow the publication order: layout, then endpoint map.
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let map = instance_ctx.local_disk_map();
-    let slots = set_drives.read().await;
-    let disks = map.read().await;
-    if !slots.is_empty() && !disks.contains_key(&endpoint.to_string()) {
-        return Err(DiskError::DiskNotFound.into());
-    }
-    let registration = LocalDiskRegistration::new(endpoint, disks.get(&endpoint.to_string()).cloned().flatten(), &slots)?;
-    if let Some(slot) = registration.slot {
-        slot.get(&slots, endpoint)?;
-    }
-    Ok(registration)
-}
-
-pub(crate) struct PreparedLocalDisk {
-    registration: LocalDiskRegistration,
-    pub(crate) disk: Option<DiskStore>,
-}
-
-impl PreparedLocalDisk {
-    pub(crate) fn new(registration: LocalDiskRegistration, disk: Option<DiskStore>) -> Result<Self> {
-        if disk.as_ref().is_some_and(|disk| disk.endpoint() != registration.endpoint) {
-            return Err(DiskError::InconsistentDisk.into());
-        }
-        Ok(Self { registration, disk })
-    }
-}
-
-pub(crate) struct PreparedDisk {
-    pub(crate) endpoint: Endpoint,
-    pub(crate) result: crate::disk::error::Result<DiskStore>,
-    pub(crate) registration: crate::disk::error::Result<Option<LocalDiskRegistration>>,
-}
-
-impl PreparedDisk {
-    /// Retry admits missing or inaccessible roots as offline while retaining
-    /// the membership snapshot captured before physical preparation.
-    pub(crate) fn into_local_registration(self) -> Result<PreparedLocalDisk> {
-        let disk = local_disk_or_offline(self.result)?;
-        let registration = match self.registration? {
-            Some(registration) => registration,
-            None => LocalDiskRegistration::new(&self.endpoint, None, &[])?,
-        };
-        PreparedLocalDisk::new(registration, disk)
-    }
-}
-
-fn local_disk_or_offline(result: crate::disk::error::Result<DiskStore>) -> Result<Option<DiskStore>> {
-    match result {
-        Ok(disk) => Ok(Some(disk)),
-        Err(DiskError::DiskNotFound | DiskError::FileAccessDenied) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Open or reuse one local endpoint while retaining its original disk error.
-/// Registry readers are never held across root validation or filesystem work.
-async fn prepare_local_disk(
-    instance_ctx: &InstanceContext,
-    endpoint: &Endpoint,
-    registered: Option<DiskStore>,
-    opt: &DiskOption,
-) -> crate::disk::error::Result<DiskStore> {
-    let reusable = match registered.as_ref() {
-        Some(disk) if disk.endpoint() != *endpoint => return Err(DiskError::InconsistentDisk),
-        Some(disk) => match disk.as_ref() {
-            crate::disk::Disk::Local(wrapper) => wrapper.get_disk().has_current_root().await,
-            crate::disk::Disk::Remote(_) => return Err(DiskError::InconsistentDisk),
-        },
-        None => false,
-    };
-    let disk = match registered {
-        Some(disk) if reusable => disk,
-        previous => {
-            // A registered root can still own live staging. A fresh handle
-            // for that endpoint must not run startup cleanup against it.
-            let options = DiskOption {
-                cleanup: opt.cleanup && previous.is_none(),
-                health_check: opt.health_check,
-            };
-            new_disk(endpoint, &options).await?
-        }
-    };
-    if let Some(authority) = instance_ctx.bound_multipart_proof_verification_context()
-        && let crate::disk::Disk::Local(wrapper) = disk.as_ref()
-    {
-        wrapper.get_disk().bind_multipart_proof_authority(&authority)?;
-    }
-    Ok(disk)
-}
-
-/// Snapshot once, then open independent disks with bounded concurrency and
-/// retain their original order and errors. The caller holds the registration
-/// lock until publication; inventory readers remain available during disk I/O.
-pub(crate) async fn prepare_disks(instance_ctx: &InstanceContext, endpoints: &[Endpoint], opt: &DiskOption) -> Vec<PreparedDisk> {
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let map = instance_ctx.local_disk_map();
-    let snapshots = {
-        let slots = set_drives.read().await;
-        let disks = map.read().await;
-        endpoints
-            .iter()
-            .map(|endpoint| {
-                let entry = endpoint.is_local.then(|| disks.get(&endpoint.to_string())).flatten();
-                let previous = entry.cloned().flatten();
-                let registration = if !endpoint.is_local || (slots.is_empty() && entry.is_none()) {
-                    Ok(None)
-                } else if entry.is_none() {
-                    Err(DiskError::DiskNotFound)
-                } else {
-                    match LocalDiskRegistration::new(endpoint, previous.clone(), &slots) {
-                        Ok(registration) => Ok(Some(registration)),
-                        Err(_) if slots.is_empty() => Ok(None),
-                        Err(error) => Err(error.narrow_to_disk().unwrap_or_else(DiskError::other)),
-                    }
-                };
-                (endpoint.clone(), previous, registration)
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut prepared = stream::iter(snapshots.into_iter().enumerate())
-        .map(|(index, (endpoint, previous, registration))| async move {
-            let result = if endpoint.is_local {
-                prepare_local_disk(instance_ctx, &endpoint, previous, opt).await
-            } else {
-                crate::disk::new_disk_for_instance(instance_ctx, &endpoint, opt).await
-            };
-            (
-                index,
-                PreparedDisk {
-                    endpoint,
-                    result,
-                    registration,
-                },
-            )
-        })
-        .buffer_unordered(LOCAL_DISK_OPEN_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    prepared.sort_unstable_by_key(|(index, _)| *index);
-    prepared.into_iter().map(|(_, disk)| disk).collect()
-}
-
-pub(crate) fn same_local_disk(left: Option<&DiskStore>, right: Option<&DiskStore>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-/// Publish a prepared batch while its caller holds the registration lock.
-/// Lock order is registration, set layout, then endpoint map. All validation
-/// precedes mutation, and displaced handles are dropped outside inventory locks.
-pub(crate) async fn publish_local_disks(
-    instance_ctx: &InstanceContext,
-    prepared: Vec<PreparedLocalDisk>,
-) -> Result<Vec<Option<DiskStore>>> {
-    if prepared.is_empty() {
-        return Ok(Vec::new());
-    }
-    let set_drives = instance_ctx.local_disk_set_drives();
-    let map = instance_ctx.local_disk_map();
-    let mut slots = set_drives.write().await;
-    let mut disks = map.write().await;
-    let mut accepted = Vec::with_capacity(prepared.len());
-    for prepared in &prepared {
-        let registration = &prepared.registration;
-        let key = registration.endpoint.to_string();
-        let current = disks.get(&key);
-        if let Some(slot) = registration.slot {
-            slot.get(&slots, &registration.endpoint)?;
-        } else if !slots.is_empty() {
-            // A path-only token cannot cross a concurrent topology installation.
-            return Err(DiskError::InconsistentDisk.into());
-        }
-        if current
-            .and_then(Option::as_ref)
-            .is_some_and(|disk| disk.endpoint() != registration.endpoint)
-        {
-            return Err(DiskError::InconsistentDisk.into());
-        }
-        accepted.push(
-            (current.is_some() || registration.slot.is_none())
-                && same_local_disk(current.and_then(Option::as_ref), registration.expected.as_ref()),
-        );
-    }
-    let mut published = Vec::with_capacity(prepared.len());
-    let mut displaced = Vec::new();
-    for (prepared, accept) in prepared.into_iter().zip(accepted) {
-        if !accept {
-            published.push(None);
-            continue;
-        }
-        let registration = prepared.registration;
-        if let Some(slot) = registration.slot
-            && let Some(previous) = std::mem::replace(&mut slots[slot.pool][slot.set][slot.disk], prepared.disk.clone())
-        {
-            displaced.push(previous);
-        }
-        if let Some(Some(previous)) = disks.insert(registration.endpoint.to_string(), prepared.disk.clone()) {
-            displaced.push(previous);
-        }
-        published.push(prepared.disk);
-    }
-    drop(disks);
-    drop(slots);
-    drop(displaced);
-    Ok(published)
-}
-
 pub(crate) async fn initialize_local_disk_maps(
     instance_ctx: &Arc<InstanceContext>,
     endpoint_pools: EndpointServerPools,
     opt: &DiskOption,
 ) -> Result<()> {
-    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
-    initialize_local_disk_maps_locked(instance_ctx, endpoint_pools, opt).await
-}
-
-/// Public store constructors and the foundation share one complete registry.
-/// Install membership before the constructor opens disks so its per-disk error
-/// and quorum decisions remain intact. Existing handles retain live staging.
-pub(crate) async fn ensure_local_disk_maps(
-    instance_ctx: &Arc<InstanceContext>,
-    endpoint_pools: EndpointServerPools,
-) -> Result<()> {
-    let _registration = instance_ctx.local_disk_registration_lock().lock().await;
-    {
-        let set_drives = instance_ctx.local_disk_set_drives();
-        let map = instance_ctx.local_disk_map();
-        let slots = set_drives.read().await;
-        let disks = map.read().await;
-        if local_disk_layout_matches(&endpoint_pools, &slots, &disks) {
-            return Ok(());
-        }
-    }
-    instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
-    let mut next_slots = local_disk_layout(&endpoint_pools);
-    let mut next_disks = HashMap::new();
-    let map = instance_ctx.local_disk_map();
-    let registered = map.read().await;
-    for endpoint in endpoint_pools
-        .as_ref()
-        .iter()
-        .flat_map(|pool| pool.endpoints.as_ref())
-        .filter(|endpoint| endpoint.is_local)
-    {
-        let slot = LocalDiskSlot::from_endpoint(endpoint)?;
-        slot.get(&next_slots, endpoint)?;
-        let disk = registered
-            .get(&endpoint.to_string())
-            .cloned()
-            .flatten()
-            .filter(|disk| disk.endpoint() == *endpoint);
-        next_slots[slot.pool][slot.set][slot.disk] = disk.clone();
-        next_disks.insert(endpoint.to_string(), disk);
-    }
-    drop(registered);
-    replace_local_disk_inventory(instance_ctx, next_slots, next_disks).await;
-    Ok(())
-}
-
-fn local_disk_layout_matches(
-    endpoint_pools: &EndpointServerPools,
-    slots: &[Vec<Vec<Option<DiskStore>>>],
-    disks: &HashMap<String, Option<DiskStore>>,
-) -> bool {
-    let local_endpoint_count = endpoint_pools
-        .as_ref()
-        .iter()
-        .flat_map(|pool| pool.endpoints.as_ref())
-        .filter(|endpoint| endpoint.is_local)
-        .count();
-    if slots.len() != endpoint_pools.as_ref().len() || disks.len() != local_endpoint_count {
-        return false;
-    }
-    for (pool, sets) in endpoint_pools.as_ref().iter().zip(slots) {
-        if sets.len() != pool.set_count || sets.iter().any(|set| set.len() != pool.drives_per_set) {
-            return false;
-        }
-        for endpoint in pool.endpoints.as_ref().iter().filter(|endpoint| endpoint.is_local) {
-            let Ok(slot) = LocalDiskSlot::from_endpoint(endpoint) else {
-                return false;
-            };
-            if slot.get(slots, endpoint).is_err() {
-                return false;
-            }
-            let Some(registered) = disks.get(&endpoint.to_string()) else {
-                return false;
-            };
-            if registered.as_ref().is_some_and(|disk| disk.endpoint() != *endpoint) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn local_disk_layout(endpoint_pools: &EndpointServerPools) -> TypeLocalDiskSetDrives {
-    endpoint_pools
-        .as_ref()
-        .iter()
-        .map(|pool| vec![vec![None; pool.drives_per_set]; pool.set_count])
-        .collect()
-}
-
-/// Replace both projections while the caller holds the registration lock.
-async fn replace_local_disk_inventory(
-    instance_ctx: &InstanceContext,
-    next_slots: TypeLocalDiskSetDrives,
-    next_disks: HashMap<String, Option<DiskStore>>,
-) {
-    // Publication order is registration, set layout, then endpoint map.
+    let multipart_authority = instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
+    // Every caller passes the FULL topology, so (re)initialization must replace
+    // any previous registration wholesale: appending would leave the pool/set
+    // vectors sized for a stale topology and panic on wider disk indices (seen
+    // as cross-test contamination under single-process `cargo test`).
     let set_drives = instance_ctx.local_disk_set_drives();
+    let mut global_set_drives = set_drives.write().await;
+    global_set_drives.clear();
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
+        for _ in 0..pool_eps.set_count {
+            set_count_drives.push(vec![None; pool_eps.drives_per_set]);
+        }
+
+        global_set_drives.push(set_count_drives);
+    }
+
     let map = instance_ctx.local_disk_map();
-    let mut slots = set_drives.write().await;
-    let mut disks = map.write().await;
-    let previous_slots = std::mem::replace(&mut *slots, next_slots);
-    let previous_disks = std::mem::replace(&mut *disks, next_disks);
-    drop(disks);
-    drop(slots);
-    drop(previous_disks);
-    drop(previous_slots);
-}
+    let mut global_local_disk_map = map.write().await;
+    global_local_disk_map.clear();
 
-async fn initialize_local_disk_maps_locked(
-    instance_ctx: &Arc<InstanceContext>,
-    endpoint_pools: EndpointServerPools,
-    opt: &DiskOption,
-) -> Result<()> {
-    instance_ctx.bind_multipart_proof_topology(&endpoint_pools)?;
-    let endpoints = endpoint_pools
-        .as_ref()
-        .iter()
-        .flat_map(|pool| pool.endpoints.as_ref().iter())
-        .filter(|endpoint| endpoint.is_local)
-        .cloned()
-        .collect::<Vec<_>>();
-    let prepared = prepare_disks(instance_ctx, &endpoints, opt).await;
-    let mut next_slots = local_disk_layout(&endpoint_pools);
-    let mut next_disks = HashMap::with_capacity(prepared.len());
-    for prepared in prepared {
-        // The complete target topology grants membership independently of the
-        // previous registry, which may belong to a different topology.
-        let disk = local_disk_or_offline(prepared.result)?;
-        let endpoint = prepared.endpoint;
-        let slot = LocalDiskSlot::from_endpoint(&endpoint)?;
-        slot.get(&next_slots, &endpoint)?;
-        next_slots[slot.pool][slot.set][slot.disk] = disk.clone();
-        next_disks.insert(endpoint.to_string(), disk);
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        for ep in pool_eps.endpoints.as_ref().iter() {
+            if !ep.is_local {
+                continue;
+            }
+
+            let disk = match new_disk(ep, opt).await {
+                Ok(disk) => disk,
+                Err(crate::disk::error::DiskError::FileAccessDenied) => {
+                    // LocalDisk already logged the filesystem cause and repair
+                    // hint. Keep this slot unavailable so ECStore initialization
+                    // can apply its existing fatal-error and quorum rules.
+                    global_local_disk_map.insert(ep.to_string(), None);
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if let crate::disk::Disk::Local(wrapper) = disk.as_ref() {
+                wrapper.get_disk().bind_multipart_proof_authority(&multipart_authority)?;
+            }
+            let path = disk.endpoint().to_string();
+            let pool_idx = usize::try_from(ep.pool_idx).map_err(|err| {
+                crate::error::Error::other(format!("store init failed to convert pool index `{}`: {err}", ep.pool_idx))
+            })?;
+            let set_idx = usize::try_from(ep.set_idx).map_err(|err| {
+                crate::error::Error::other(format!("store init failed to convert set index `{}`: {err}", ep.set_idx))
+            })?;
+            let disk_idx = usize::try_from(ep.disk_idx).map_err(|err| {
+                crate::error::Error::other(format!("store init failed to convert disk index `{}`: {err}", ep.disk_idx))
+            })?;
+
+            global_local_disk_map.insert(path, Some(disk.clone()));
+            global_set_drives[pool_idx][set_idx][disk_idx] = Some(disk);
+        }
     }
-    let configured_disks = next_disks.len();
-    let offline_disks = next_disks.values().filter(|disk| disk.is_none()).count();
 
-    // Keep the existing snapshot readable during disk I/O. The replacement is
-    // published only after the complete validated topology has been prepared.
-    replace_local_disk_inventory(instance_ctx, next_slots, next_disks).await;
-
-    if offline_disks > 0 {
-        tracing::warn!(
-            event = EVENT_LOCAL_DISK_REGISTRATION,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_RUNTIME_SOURCES,
-            state = "degraded",
-            configured_disks,
-            offline_disks,
-            "Local disk registration completed with unavailable slots"
-        );
-    }
     Ok(())
 }
 
@@ -1056,21 +649,13 @@ pub(crate) async fn init_tier_config_mgr_handle(handle: Arc<RwLock<TierConfigMgr
 }
 
 #[cfg(test)]
-#[path = "local_disk_startup_tests.rs"]
-mod local_disk_startup_tests;
-
-#[cfg(test)]
 mod tests {
     use super::{
         LockRegistry, ScannerDirtyUsageMutationSource, clear_local_disk_id_map_for_test, local_disk_path_by_id, local_node_name,
         notify_scanner_dirty_usage_mutation, reconcile_local_disk_ids, replace_local_disk_id, set_local_node_name,
         set_scanner_dirty_usage_mutation_observer,
     };
-    use crate::{
-        disk::{DiskAPI, DiskOption, endpoint::Endpoint},
-        layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-        runtime::instance::InstanceContext,
-    };
+    use crate::disk::{DiskAPI, endpoint::Endpoint};
     use rustfs_lock::{LocalClient, LockClient};
     use std::{
         collections::HashMap,
@@ -1086,388 +671,6 @@ mod tests {
             set_idx: 0,
             disk_idx: 0,
         }
-    }
-
-    fn distributed_startup_pools(directory: &std::path::Path) -> EndpointServerPools {
-        let mut endpoints = Vec::with_capacity(16);
-        for disk_index in 0..16 {
-            let mut endpoint = if disk_index < 4 {
-                let path = directory.join(format!("disk-{disk_index}"));
-                Endpoint::try_from(path.to_str().expect("startup disk path should be UTF-8"))
-                    .expect("local startup endpoint should parse")
-            } else {
-                url_endpoint(&format!("http://node-{}.invalid:9000/data/disk-{}", disk_index / 4, disk_index % 4))
-            };
-            endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(disk_index);
-            endpoints.push(endpoint);
-        }
-        EndpointServerPools(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 16,
-            endpoints: Endpoints::from(endpoints),
-            cmd_line: "degraded-startup-test".to_string(),
-            platform: "test".to_string(),
-        }])
-    }
-
-    #[tokio::test]
-    async fn prepared_disks_preserve_endpoint_order_and_original_raw_errors() {
-        let directory = tempfile::tempdir().expect("ordered disk preparation fixture");
-        let roots = [
-            directory.path().join("healthy"),
-            directory.path().join("missing"),
-            directory.path().join("corrupt"),
-        ];
-        std::fs::create_dir(&roots[0]).expect("healthy local root");
-        let metadata = roots[2].join(crate::disk::RUSTFS_META_BUCKET);
-        std::fs::create_dir_all(&metadata).expect("corrupt local root");
-        std::fs::write(
-            metadata.join(crate::disk::FORMAT_CONFIG_FILE),
-            crate::disk::format::FormatV3::new(1, 1)
-                .to_json()
-                .expect("nil disk identity format"),
-        )
-        .expect("persist invalid disk identity");
-        let endpoints = roots
-            .iter()
-            .map(|path| Endpoint::try_from(path.to_str().expect("UTF-8 raw endpoint")).expect("raw endpoint"))
-            .collect::<Vec<_>>();
-        let context = InstanceContext::new();
-        let _registration = context.local_disk_registration_lock().lock().await;
-
-        let prepared = super::prepare_disks(&context, &endpoints, &DiskOption::default()).await;
-
-        assert_eq!(prepared.len(), endpoints.len());
-        for (disk, endpoint) in prepared.iter().zip(&endpoints) {
-            assert_eq!(&disk.endpoint, endpoint);
-            assert!(
-                matches!(disk.registration, Ok(None)),
-                "raw preparation must not create registry membership"
-            );
-        }
-        assert!(prepared[0].result.is_ok(), "healthy raw endpoint opens");
-        assert!(matches!(prepared[1].result, Err(crate::disk::error::DiskError::DiskNotFound)));
-        assert!(matches!(prepared[2].result, Err(crate::disk::error::DiskError::CorruptedFormat)));
-        assert!(context.local_disk_map().read().await.is_empty());
-        assert!(context.local_disk_set_drives().read().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn ensuring_local_disk_layout_accepts_a_new_complete_topology_on_the_same_context() {
-        let directory = tempfile::tempdir().expect("constructor topology replacement fixture");
-        let topology = |label: &str, count: usize| {
-            let endpoints = (0..count)
-                .map(|index| {
-                    let name = if index == 0 {
-                        "shared".to_string()
-                    } else {
-                        format!("{label}-{index}")
-                    };
-                    let root = directory.path().join(name);
-                    let mut endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 endpoint")).expect("local endpoint");
-                    endpoint.set_pool_index(0);
-                    endpoint.set_set_index(0);
-                    endpoint.set_disk_index(index);
-                    endpoint
-                })
-                .collect::<Vec<_>>();
-            EndpointServerPools::from(vec![PoolEndpoints {
-                legacy: false,
-                set_count: 1,
-                drives_per_set: count,
-                endpoints: endpoints.into(),
-                cmd_line: label.to_string(),
-                platform: String::new(),
-            }])
-        };
-        let previous = topology("previous", 2);
-        for endpoint in previous.0[0].endpoints.as_ref() {
-            std::fs::create_dir(endpoint.get_file_path()).expect("previous disk root");
-        }
-        let context = Arc::new(InstanceContext::new());
-        super::initialize_local_disk_maps(&context, previous.clone(), &DiskOption::default())
-            .await
-            .expect("previous topology");
-        let shared = context.local_disk_map().read().await[&previous.0[0].endpoints.as_ref()[0].to_string()]
-            .clone()
-            .expect("shared registered handle");
-        let next = topology("next", 4);
-
-        super::ensure_local_disk_maps(&context, next.clone())
-            .await
-            .expect("a complete constructor topology can replace the previous membership");
-
-        let disks = context.local_disk_map();
-        let disks = disks.read().await;
-        assert_eq!(disks.len(), 4);
-        assert!(!disks.contains_key(&previous.0[0].endpoints.as_ref()[1].to_string()));
-        assert!(Arc::ptr_eq(
-            disks[&next.0[0].endpoints.as_ref()[0].to_string()]
-                .as_ref()
-                .expect("shared route"),
-            &shared,
-        ));
-        for endpoint in next.0[0].endpoints.as_ref().iter().skip(1) {
-            assert!(disks[&endpoint.to_string()].is_none());
-            assert!(
-                !std::path::Path::new(&endpoint.get_file_path()).exists(),
-                "membership installation performs no disk I/O"
-            );
-        }
-        drop(disks);
-        let slots = context.local_disk_set_drives();
-        let slots = slots.read().await;
-        assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 4));
-        assert!(Arc::ptr_eq(slots[0][0][0].as_ref().expect("shared topology slot"), &shared));
-        assert!(slots[0][0][1..].iter().all(Option::is_none));
-    }
-
-    #[tokio::test]
-    async fn unknown_member_snapshot_cannot_gain_authority_from_later_offline_registration() {
-        let directory = tempfile::tempdir().expect("unknown member snapshot fixture");
-        let previous = distributed_startup_pools(&directory.path().join("previous"));
-        let next = distributed_startup_pools(&directory.path().join("next"));
-        let endpoint = &next.0[0].endpoints.as_ref()[0];
-        let context = Arc::new(InstanceContext::new());
-        super::ensure_local_disk_maps(&context, previous)
-            .await
-            .expect("configured offline topology");
-
-        let error = super::snapshot_local_disk_registration(&context, endpoint)
-            .await
-            .err()
-            .expect("an unknown configured member has no publication token");
-        assert!(matches!(error.narrow_to_disk(), Ok(crate::disk::error::DiskError::DiskNotFound)));
-        let prepared = {
-            let _registration = context.local_disk_registration_lock().lock().await;
-            super::prepare_disks(&context, std::slice::from_ref(endpoint), &DiskOption::default()).await
-        };
-        assert!(matches!(prepared[0].registration, Err(crate::disk::error::DiskError::DiskNotFound)));
-
-        super::ensure_local_disk_maps(&context, next.clone())
-            .await
-            .expect("a later authoritative topology may register the member offline");
-
-        assert!(context.local_disk_map().read().await[&endpoint.to_string()].is_none());
-        for prepared in prepared {
-            let error = prepared
-                .into_local_registration()
-                .err()
-                .expect("a stale unknown-member snapshot remains unauthorized");
-            assert!(matches!(error.narrow_to_disk(), Ok(crate::disk::error::DiskError::DiskNotFound)));
-        }
-        super::snapshot_local_disk_registration(&context, endpoint)
-            .await
-            .expect("only a new snapshot can observe the later membership");
-    }
-
-    #[tokio::test]
-    async fn ensuring_local_disk_layout_defers_physical_errors_to_the_opener() {
-        let directory = tempfile::tempdir().expect("direct constructor membership fixture");
-        let mut endpoints = Vec::new();
-        for index in 0..2 {
-            let root = directory.path().join(format!("disk-{index}"));
-            std::fs::create_dir(&root).expect("local root fixture");
-            let mut endpoint = Endpoint::try_from(root.to_str().expect("UTF-8 local endpoint")).expect("local endpoint");
-            endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(index);
-            endpoints.push(endpoint);
-        }
-        let metadata = directory.path().join("disk-0").join(crate::disk::RUSTFS_META_BUCKET);
-        std::fs::create_dir(&metadata).expect("corrupt disk metadata fixture");
-        std::fs::write(metadata.join(crate::disk::FORMAT_CONFIG_FILE), b"invalid-format").expect("corrupt format fixture");
-        let pools = EndpointServerPools::from(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 2,
-            endpoints: endpoints.clone().into(),
-            cmd_line: "direct-constructor-membership".to_string(),
-            platform: String::new(),
-        }]);
-        let context = Arc::new(InstanceContext::new());
-
-        super::ensure_local_disk_maps(&context, pools)
-            .await
-            .expect("membership installation must preserve later per-disk error aggregation");
-
-        assert_eq!(context.local_disk_map().read().await.len(), 2);
-        assert!(context.local_disk_set_drives().read().await[0][0].iter().all(Option::is_none));
-        assert!(!directory.path().join("disk-1").join(crate::disk::RUSTFS_META_BUCKET).exists());
-        let (disks, errors) = crate::store::init_format::init_disks(&context, &endpoints.into(), &DiskOption::default()).await;
-        assert!(disks[0].is_none());
-        assert!(errors[0].is_some(), "corrupt disk keeps its own open error");
-        assert!(disks[1].is_some(), "healthy disk remains available to the quorum loader");
-        assert!(errors[1].is_none());
-    }
-
-    #[tokio::test]
-    async fn initializing_local_disk_maps_preserves_missing_drive_slots() {
-        for missing_index in 0..4 {
-            let directory = tempfile::tempdir().expect("startup test directory should be created");
-            let pools = distributed_startup_pools(directory.path());
-            let endpoints = pools.0[0].endpoints.as_ref();
-            for (index, endpoint) in endpoints.iter().take(4).enumerate() {
-                if index != missing_index {
-                    std::fs::create_dir(endpoint.get_file_path()).expect("healthy startup disk should be created");
-                }
-            }
-            let context = Arc::new(InstanceContext::new());
-            super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
-                .await
-                .expect("one missing local drive must not abort disk registration");
-
-            let entries = context.local_disk_map();
-            let entries = entries.read().await;
-            assert_eq!(entries.len(), 4, "every local endpoint must remain registered");
-            let slots = context.local_disk_set_drives();
-            let slots = slots.read().await;
-            assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
-            for (index, endpoint) in endpoints.iter().take(4).enumerate() {
-                let entry = entries
-                    .get(&endpoint.to_string())
-                    .expect("local endpoint must retain its registration");
-                let slot = &slots[0][0][index];
-                if index == missing_index {
-                    assert!(entry.is_none(), "the missing drive must remain unavailable");
-                    assert!(slot.is_none(), "the missing drive must retain its original slot");
-                    assert!(
-                        !std::path::Path::new(&endpoint.get_file_path()).exists(),
-                        "registration must not recreate a missing drive root"
-                    );
-                } else {
-                    let disk = entry.as_ref().expect("healthy local drive should be registered");
-                    assert_eq!(disk.endpoint(), *endpoint);
-                    assert!(Arc::ptr_eq(disk, slot.as_ref().expect("healthy slot should be populated")));
-                }
-            }
-            assert!(slots[0][0][4..].iter().all(Option::is_none));
-        }
-    }
-
-    #[tokio::test]
-    async fn initializing_local_disk_maps_allows_all_local_drives_to_be_missing() {
-        let directory = tempfile::tempdir().expect("startup test directory should be created");
-        let pools = distributed_startup_pools(directory.path());
-        let context = Arc::new(InstanceContext::new());
-
-        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
-            .await
-            .expect("missing local drives must allow subsequent cluster quorum evaluation");
-
-        let entries = context.local_disk_map();
-        let entries = entries.read().await;
-        assert_eq!(entries.len(), 4);
-        for endpoint in pools.0[0].endpoints.as_ref().iter().take(4) {
-            assert!(
-                entries
-                    .get(&endpoint.to_string())
-                    .expect("missing local endpoint must retain its registration")
-                    .is_none()
-            );
-        }
-        let slots = context.local_disk_set_drives();
-        let slots = slots.read().await;
-        assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
-        assert!(slots[0][0].iter().all(Option::is_none));
-        assert_eq!(std::fs::read_dir(directory.path()).expect("list startup directory").count(), 0);
-    }
-
-    #[tokio::test]
-    async fn reinitializing_local_disk_maps_registers_a_returned_drive() {
-        let directory = tempfile::tempdir().expect("startup test directory should be created");
-        let pools = distributed_startup_pools(directory.path());
-        let endpoints = pools.0[0].endpoints.as_ref();
-        for (index, endpoint) in endpoints.iter().take(4).enumerate() {
-            if index != 1 {
-                std::fs::create_dir(endpoint.get_file_path()).expect("healthy startup disk should be created");
-            }
-        }
-        let context = Arc::new(InstanceContext::new());
-        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
-            .await
-            .expect("missing local drive must allow registration");
-        assert!(
-            context
-                .local_disk_map()
-                .read()
-                .await
-                .get(&endpoints[1].to_string())
-                .expect("missing endpoint must retain its registration")
-                .is_none()
-        );
-
-        std::fs::create_dir(endpoints[1].get_file_path()).expect("returned disk root should be created");
-        super::initialize_local_disk_maps(&context, pools.clone(), &DiskOption::default())
-            .await
-            .expect("returned drive must register in the original topology");
-
-        let entries = context.local_disk_map();
-        let entries = entries.read().await;
-        assert_eq!(entries.len(), 4);
-        let slots = context.local_disk_set_drives();
-        let slots = slots.read().await;
-        assert_eq!((slots.len(), slots[0].len(), slots[0][0].len()), (1, 1, 16));
-        for (index, endpoint) in endpoints.iter().take(4).enumerate() {
-            let disk = entries
-                .get(&endpoint.to_string())
-                .expect("original endpoint must remain registered")
-                .as_ref()
-                .expect("returned and healthy drives should be online");
-            assert_eq!(disk.endpoint(), *endpoint);
-            assert!(Arc::ptr_eq(disk, slots[0][0][index].as_ref().expect("original slot must be populated")));
-        }
-    }
-
-    #[tokio::test]
-    async fn initializing_local_disk_maps_rejects_corrupt_format() {
-        let directory = tempfile::tempdir().expect("startup test directory should be created");
-        let pools = distributed_startup_pools(directory.path());
-        for endpoint in pools.0[0].endpoints.as_ref().iter().take(4) {
-            std::fs::create_dir(endpoint.get_file_path()).expect("startup disk should be created");
-        }
-        let metadata = directory.path().join("disk-1/.rustfs.sys");
-        std::fs::create_dir(&metadata).expect("metadata directory should be created");
-        let format_path = metadata.join("format.json");
-        std::fs::write(&format_path, b"invalid-format").expect("corrupt format should be written");
-        let context = Arc::new(InstanceContext::new());
-
-        super::initialize_local_disk_maps(&context, pools, &DiskOption::default())
-            .await
-            .expect_err("corrupt format must remain a startup error");
-
-        assert_eq!(
-            std::fs::read(&format_path).expect("corrupt format should remain readable"),
-            b"invalid-format",
-            "disk registration must preserve the corrupt format for diagnosis"
-        );
-    }
-
-    #[tokio::test]
-    async fn initializing_local_disk_maps_rejects_nil_format_identity() {
-        let directory = tempfile::tempdir().expect("startup fixture");
-        let pools = distributed_startup_pools(directory.path());
-        let endpoint = &pools.0[0].endpoints.as_ref()[0];
-        let meta = std::path::PathBuf::from(endpoint.get_file_path()).join(crate::disk::RUSTFS_META_BUCKET);
-        std::fs::create_dir_all(&meta).expect("metadata fixture");
-        let format = crate::disk::format::FormatV3::new(1, 16);
-        let bytes = format.to_json().expect("format with nil disk identity");
-        let path = meta.join(crate::disk::FORMAT_CONFIG_FILE);
-        std::fs::write(&path, &bytes).expect("persist nil disk identity");
-        let instance = Arc::new(InstanceContext::new());
-
-        let error = super::initialize_local_disk_maps(&instance, pools, &DiskOption::default())
-            .await
-            .expect_err("a persisted nil identity is a fatal format error");
-
-        assert_eq!(
-            error.narrow_to_disk().expect("preserved disk error type"),
-            crate::disk::error::DiskError::CorruptedFormat
-        );
-        assert_eq!(std::fs::read_to_string(path).expect("preserved format"), bytes);
     }
 
     #[test]
