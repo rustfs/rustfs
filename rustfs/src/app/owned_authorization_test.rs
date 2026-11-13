@@ -20,6 +20,7 @@
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::FS;
+use crate::app::storage_api::owned_parity::authorize_create_bucket;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
 use crate::app::storage_api::owned_parity::{
@@ -574,7 +575,7 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     iam.set_policy(
         "location-create-policy",
         Policy::parse_config(
-            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::location-policy-bucket","Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}}]}"#,
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":["arn:aws:s3:::location-policy-bucket","arn:aws:s3:::location-lock-bucket"],"Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},{"Effect":"Allow","Action":["s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"arn:aws:s3:::location-lock-bucket"}]}"#,
         )
         .expect("parse location policy"),
     )
@@ -625,6 +626,56 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
                 &rustfs_s3_types::S3ErrorCode::AccessDenied,
             );
         }
+    }
+
+    // The whole composite hook: the legacy `S3Access` hook against what the gateway edge runs on
+    // the facts it decodes, with the same decision and the same bucket handed on, both ways.
+    let fs = FS::with_server_ctx(Arc::clone(&slot));
+    for (bucket, region, object_lock, allowed) in [
+        ("location-policy-bucket", Some("eu-west-1"), false, true),
+        ("location-policy-bucket", Some("us-west-2"), false, false),
+        ("location-policy-bucket", None, false, false),
+        ("location-policy-bucket", Some("eu-west-1"), true, false),
+        ("location-lock-bucket", Some("eu-west-1"), true, true),
+        ("location-lock-bucket", Some("us-west-2"), true, false),
+    ] {
+        let mut legacy = build_request(
+            CreateBucketInput {
+                bucket: bucket.to_owned(),
+                create_bucket_configuration: region.map(|region| CreateBucketConfiguration {
+                    location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
+                    ..Default::default()
+                }),
+                object_lock_enabled_for_bucket: Some(object_lock),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        legacy.extensions.insert(Arc::clone(&slot));
+        legacy.extensions.insert(ReqInfo {
+            cred: Some(credentials.clone()),
+            ..Default::default()
+        });
+        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+        let input =
+            rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::create_bucket::input_from_s3s(legacy.input.clone())
+                .expect("a valid CreateBucket input");
+        let location = crate::app::bucket_usecase::requested_location_constraint(&input).map(str::to_owned);
+        let lock = input.object_lock_enabled_for_bucket.is_some_and(|enabled| enabled);
+
+        let legacy_result = fs.create_bucket(&mut legacy).await;
+        let owned_result = authorize_create_bucket(&mut owned, input.bucket.as_str(), location, lock).await;
+
+        let case = format!("{bucket} {region:?} lock={object_lock}");
+        assert_eq!(legacy_result.is_ok(), allowed, "legacy: {case}");
+        assert_eq!(owned_result.is_ok(), allowed, "owned: {case}");
+        if let (Err(legacy_error), Err(owned_error)) = (&legacy_result, &owned_result) {
+            assert_eq!(legacy_error.code().as_str(), owned_error.code().as_str(), "{case}");
+        }
+        let handed_on = |req_info: Option<&ReqInfo>| req_info.and_then(|info| info.bucket.clone());
+        assert_eq!(handed_on(legacy.extensions.get::<ReqInfo>()), Some(bucket.to_owned()), "{case}");
+        assert_eq!(handed_on(owned.req_info()), Some(bucket.to_owned()), "{case}");
+        assert_eq!(legacy.headers, *owned.headers(), "{case}");
     }
 }
 
