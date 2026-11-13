@@ -65,7 +65,7 @@ fn companion_only_snapshot_never_exposes_mixed_values_in_primary_maps() {
         observational_data_usage_info(&results[..1], &sources, &buckets, &[], TEST_PLAN_DIGEST, 8, 3).is_none(),
         "missing source cannot become zero"
     );
-    let mut mismatch = results.clone();
+    let mut mismatch = results;
     mismatch[0]
         .info
         .scan_bucket_incarnations

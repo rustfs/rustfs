@@ -141,7 +141,7 @@ fn every_owner_and_stable_start_field_is_required_for_renewal() {
             "changed or missing field {field} must retain strict coverage"
         );
     }
-    let mut fewer = routes.clone();
+    let mut fewer = routes;
     fewer.remove(&Uuid::from_u128(2));
     let mut replies = responses(&proof);
     replies.remove(&Uuid::from_u128(2));

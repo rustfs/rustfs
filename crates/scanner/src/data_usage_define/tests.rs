@@ -4281,10 +4281,10 @@ fn durable_progress_rejects_reset_regression_and_uncommitted_discovery() {
     let mut replaced = committed.clone();
     replaced.identity.as_mut().expect("identity").publication_epoch += 1;
     assert!(!replaced.advanced_from(&before));
-    replaced = committed.clone();
+    replaced = committed;
     replaced.started_plan = Some(DataUsageScanPlanDigest([99; 32]));
     assert!(!replaced.advanced_from(&before), "plan changes alone cannot earn another turn");
-    let mut previous = before.clone();
+    let mut previous = before;
     previous.raw.clear();
     previous.frontier = Some("bucket/a/z".to_string());
     let mut next = previous.clone();
