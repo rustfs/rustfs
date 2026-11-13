@@ -73,8 +73,8 @@
 # serving-side s3s references out of the storage engine (ARCHITECTURE.md
 # invariant 4); the S3-consuming client already moved to crates/s3-client.
 #
-# Two comparisons, both LOWER-ONLY (rustfs/backlog#2765 ruling for the
-# parallel operation slices):
+# The baseline is a CEILING everywhere; pull requests are additionally held to
+# their base revision (rustfs/backlog#2765 rulings for the parallel slices):
 #
 #   --base <rev> (pull requests and merge groups; Quick Checks passes the base
 #   SHA): this script measures the tree at <rev> the same way and fails when
@@ -83,15 +83,18 @@
 #   passes without editing the baseline, and no slice can spend the slack
 #   another one created, because the bar is the base, not the baseline.
 #
-#   without --base (push and scheduled runs, local runs) the baseline is exact:
+#   without --base (push and scheduled runs, local runs):
 #   measured > baseline  fails with "s3s footprint grew: <measured> > <baseline>".
 #                        Route the new code through the gateway abstractions
 #                        instead of importing s3s. Raising a baseline value is
 #                        never the fix: rustfs/rustfs#5964 raised the s3_error!
 #                        ceiling to go green.
-#   measured < baseline  fails and prints the line to put in the baseline
-#                        ("lower the baseline to: <key>=<measured>"); whoever
-#                        merges the drop lowers it.
+#   measured < baseline  passes and prints the line to put in the baseline
+#                        ("lower the baseline to: <key>=<measured>", a
+#                        ::notice:: on GitHub Actions); the migration
+#                        coordinator lowers the lines in batches. No slice can
+#                        spend that slack: every change reaches main through a
+#                        pull request or merge group compared with its base.
 #   measured = baseline  passes.
 #
 # End state: when all three values reach 0 the baseline file is retired and
@@ -498,15 +501,25 @@ self_test() {
         SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
     fi
 
-    # Without --base (push and scheduled runs) a tree below the baseline fails
-    # and names the lowered line for every counter that dropped, and only those.
+    # Without --base (push and scheduled runs) the baseline is a ceiling: a tree
+    # below it passes and names the lowered line for every counter that
+    # dropped, and only those; a tree above it fails.
     self_test_tree n0-below-baseline
     out="$(self_test_run n0-below-baseline 3 1 2)" && status=0 || status=$?
-    if ((status != 0)) && [[ "$out" == *"lower the baseline to: files=1"* ]] \
+    if ((status == 0)) && [[ "$out" == *"lower the baseline to: files=1"* ]] \
         && [[ "$out" == *"lower the baseline to: ecstore_files=0"* ]] && [[ "$out" != *"lower the baseline to: s3_error_lines"* ]]; then
-        echo "self-test ok: n0-below-baseline: a tree below the baseline fails and prints the lowered lines (exit $status)"
+        echo "self-test ok: n0-below-baseline: a tree below the baseline passes and prints the lowered lines (exit 0)"
     else
-        echo "self-test FAILED: n0-below-baseline: expected a failure printing the lowered lines, got exit $status:" >&2
+        echo "self-test FAILED: n0-below-baseline: expected a pass printing the lowered lines, got exit $status:" >&2
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
+    fi
+
+    out="$(self_test_run n0-below-baseline 0 1 0)" && status=0 || status=$?
+    if ((status != 0)) && [[ "$out" == *"s3s footprint grew: 1 > 0 (files importing s3s"* ]]; then
+        echo "self-test ok: n0-below-baseline: a tree above the baseline fails (exit $status)"
+    else
+        echo "self-test FAILED: n0-below-baseline: a tree above the baseline should fail, got exit $status:" >&2
         printf '%s\n' "$out" | sed 's/^/    /' >&2
         SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
     fi
@@ -850,9 +863,9 @@ check_counter() {
     elif [[ -n "$BASE_REV" ]]; then
         echo "s3s footprint OK: $label is $count (base revision $base, ceiling $key=$baseline)"
     elif ((count < baseline)); then
-        echo "❌ s3s footprint is below its baseline: $count < $baseline ($label)" >&2
-        echo "   lower the baseline to: $key=$count (in $BASELINE_FILE)" >&2
-        status=1
+        local hint="s3s footprint below its baseline: $label is $count < $baseline; lower the baseline to: $key=$count (in $BASELINE_FILE)"
+        if [[ -n "${GITHUB_ACTIONS:-}" ]]; then hint="::notice::$hint"; fi
+        echo "$hint"
     else
         echo "s3s footprint OK: $label is $count (baseline $key=$baseline)"
     fi
