@@ -15,6 +15,7 @@ use crate::cgroup_resources::live::{CpuCoreObservation, CpuQuotaSample, Resource
 use crate::storage_api::startup::background::{BackgroundMemoryBudget, ECStore, PhysicalDiskSample, PhysicalDiskSampler};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_RESOURCE_SAMPLE_DURATION: Duration = Duration::from_millis(20);
 pub(crate) const MAXIMUM: NonZeroU16 = NonZeroU16::new(256).expect("fixed nonzero scheduling bound");
 
 #[derive(Default)]
@@ -33,13 +34,47 @@ struct TimedResources {
     ended: Instant,
 }
 
+type ResourceReading = (ResourceSample, Vec<CpuQuotaSample>, Option<CpuCoreObservation>);
+
+fn collect_resources(
+    mut read: impl FnMut() -> std::io::Result<ResourceReading>,
+    mut clock: impl FnMut() -> Instant,
+) -> Option<TimedResources> {
+    let began = clock();
+    let (sample, quota_ancestors, cpu_cores) = match read() {
+        Ok(reading) => reading,
+        Err(_) => {
+            if clock().checked_duration_since(began)? >= MAX_RESOURCE_SAMPLE_DURATION {
+                return None;
+            }
+            // Revalidate every input without resetting the original read bracket.
+            let reading = read();
+            if rustfs_io_metrics::metrics_enabled() {
+                metrics::counter!(
+                    "rustfs_background_resource_rereads_total",
+                    "result" => if reading.is_ok() { "success" } else { "error" }
+                )
+                .increment(1);
+            }
+            reading.ok()?
+        }
+    };
+    Some(TimedResources {
+        sample,
+        quota_ancestors,
+        cpu_cores,
+        began,
+        ended: clock(),
+    })
+}
+
 impl TimedResources {
     fn rejection(&self, now: Instant) -> Option<&'static str> {
         if self.ended < self.began || self.ended > now {
             Some("invalid_timing")
         } else if now.duration_since(self.began) > SAMPLE_INTERVAL {
             Some("stale")
-        } else if self.ended.duration_since(self.began) > Duration::from_millis(20) {
+        } else if self.ended.duration_since(self.began) > MAX_RESOURCE_SAMPLE_DURATION {
             Some("wide")
         } else {
             None
@@ -424,16 +459,7 @@ pub(crate) fn start(
                 biased;
                 _ = cancel.cancelled() => break,
                 result = tokio::task::spawn_blocking(move || {
-                    let began = Instant::now();
-                    let sample = crate::cgroup_resources::live::sample_for_admission().ok().map(
-                        |(sample, quota_ancestors, cpu_cores)| TimedResources {
-                            sample,
-                            quota_ancestors,
-                            cpu_cores,
-                            began,
-                            ended: Instant::now(),
-                        },
-                    );
+                    let sample = collect_resources(crate::cgroup_resources::live::sample_for_admission, Instant::now);
                     (sample, disks.read())
                 }) => result.ok(),
             };
@@ -502,6 +528,211 @@ mod tests {
         assert_eq!(memory_capacity(sample), 50, "a hot shrink changes the absolute cap");
         sample.memory_limit = 0;
         assert_eq!(memory_capacity(sample), 0, "missing effective capacity cannot grant memory");
+    }
+
+    #[test]
+    fn resource_sampling_recovers_a_transient_read_with_fresh_limits() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut reads = 0;
+        let sample = collect_resources(
+            || {
+                reads += 1;
+                clock.set(start + Duration::from_millis(reads));
+                if reads == 1 {
+                    return Err(std::io::ErrorKind::NotFound.into());
+                }
+                assert_eq!(reads, 2, "a reread must remain bounded");
+                let mut current = resources();
+                current.cpu_millis = 1000;
+                current.memory_limit = 500;
+                current.memory_headroom = 150;
+                Ok((current, Vec::new(), None))
+            },
+            || clock.get(),
+        )
+        .expect("a complete fresh read recovers the transient failure");
+        assert_eq!(reads, 2);
+        assert_eq!(sample.began, start);
+        assert_eq!(sample.ended, start + Duration::from_millis(2));
+        assert_eq!(memory_capacity(sample.sample), 50, "only the fresh reduced limit may grant capacity");
+        let observation = Policy::default()
+            .observe(clock.get(), Some(sample), None, &queues(Some(0)))
+            .expect("the full read bracket is valid");
+        assert_eq!(observation.max_concurrency, 1);
+    }
+
+    #[test]
+    fn resource_sampling_success_is_not_repeated() {
+        let at = Instant::now();
+        let mut reads = 0;
+        let sample = collect_resources(
+            || {
+                reads += 1;
+                assert_eq!(reads, 1, "a successful read must not issue more resource I/O");
+                Ok((resources(), Vec::new(), None))
+            },
+            || at,
+        )
+        .expect("the first complete read is sufficient");
+        assert_eq!(reads, 1);
+        assert_eq!(memory_capacity(sample.sample), 100);
+    }
+
+    #[test]
+    fn resource_sampling_repeated_failures_keep_admission_closed() {
+        let at = Instant::now();
+        let mut reads = 0;
+        let sample = collect_resources(
+            || {
+                reads += 1;
+                assert!(reads <= 2, "a permanent failure must not loop");
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            },
+            || at,
+        );
+        assert_eq!(reads, 2);
+        assert!(sample.is_none());
+        let mut policy = Policy {
+            previous: Some(timed(at, resources())),
+            ..Policy::default()
+        };
+        assert!(policy.observe(at, sample, None, &queues(Some(0))).is_none());
+        assert!(policy.previous.is_none(), "old observations cannot replace a failed fresh read");
+    }
+
+    #[test]
+    fn resource_sampling_does_not_reread_after_the_time_budget() {
+        for elapsed in [Duration::from_millis(20), Duration::from_millis(20) + Duration::from_nanos(1)] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let mut reads = 0;
+            let sample = collect_resources(
+                || {
+                    reads += 1;
+                    assert_eq!(reads, 1, "an exhausted read bracket must not issue more resource I/O");
+                    clock.set(start + elapsed);
+                    Err(std::io::ErrorKind::NotFound.into())
+                },
+                || clock.get(),
+            );
+            assert!(sample.is_none());
+            assert_eq!(reads, 1);
+        }
+    }
+
+    #[test]
+    fn resource_sampling_does_not_reread_after_clock_reversal() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut reads = 0;
+        assert!(
+            collect_resources(
+                || {
+                    reads += 1;
+                    assert_eq!(reads, 1, "invalid timing cannot authorize more resource I/O");
+                    clock.set(start - Duration::from_nanos(1));
+                    Err(std::io::ErrorKind::NotFound.into())
+                },
+                || clock.get(),
+            )
+            .is_none()
+        );
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn resource_sampling_reread_keeps_the_original_time_bracket() {
+        for (elapsed, accepted) in [
+            (Duration::from_millis(20), true),
+            (Duration::from_millis(20) + Duration::from_nanos(1), false),
+        ] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let mut reads = 0;
+            let sample = collect_resources(
+                || {
+                    reads += 1;
+                    if reads == 1 {
+                        clock.set(start + Duration::from_millis(19));
+                        return Err(std::io::ErrorKind::NotFound.into());
+                    }
+                    clock.set(start + elapsed);
+                    Ok((resources(), Vec::new(), None))
+                },
+                || clock.get(),
+            )
+            .expect("the second read succeeds, independently of timing validity");
+            assert_eq!(reads, 2);
+            assert_eq!(sample.began, start, "a reread must not reset the clock");
+            assert_eq!(sample.ended, start + elapsed);
+            assert_eq!(
+                Policy::default()
+                    .observe(clock.get(), Some(sample), None, &queues(Some(0)))
+                    .is_some(),
+                accepted,
+                "the entire read bracket must fit the original 20 ms limit"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_sampling_reread_success_does_not_imply_admission() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics_were_enabled = rustfs_io_metrics::metrics_enabled();
+        metrics::with_local_recorder(&recorder, || {
+            for (metrics_enabled, succeeds, duration, accepted) in [
+                (false, true, Duration::from_millis(2), true),
+                (true, true, Duration::from_millis(2), true),
+                (true, false, Duration::from_millis(2), false),
+                (true, true, Duration::from_millis(21), false),
+            ] {
+                rustfs_io_metrics::set_metrics_enabled(metrics_enabled);
+                let start = Instant::now();
+                let clock = std::cell::Cell::new(start);
+                let mut reads = 0;
+                let sample = collect_resources(
+                    || {
+                        reads += 1;
+                        assert!(reads <= 2);
+                        clock.set(start + if reads == 1 { Duration::from_millis(1) } else { duration });
+                        if reads == 1 || !succeeds {
+                            Err(std::io::ErrorKind::NotFound.into())
+                        } else {
+                            Ok((resources(), Vec::new(), None))
+                        }
+                    },
+                    || clock.get(),
+                );
+                assert_eq!(reads, 2);
+                assert_eq!(
+                    Policy::default()
+                        .observe(clock.get(), sample, None, &queues(Some(0)))
+                        .is_some(),
+                    accepted
+                );
+            }
+        });
+        rustfs_io_metrics::set_metrics_enabled(metrics_were_enabled);
+        let counts = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "rustfs_background_resource_rereads_total")
+            .map(|(key, _, _, value)| {
+                let result = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "result")
+                    .expect("bounded result label");
+                let DebugValue::Counter(count) = value else { panic!("reread metric must be a counter") };
+                (result.value().to_owned(), count)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(counts, [("error".to_owned(), 1), ("success".to_owned(), 2)].into_iter().collect());
     }
 
     fn timed(at: Instant, sample: ResourceSample) -> TimedResources {
