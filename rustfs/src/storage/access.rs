@@ -6670,16 +6670,21 @@ mod tests {
     }
 
     /// The table-policy, anonymous table and force-delete exits live deep in the authorization
-    /// flow and need a table catalog to reach. This source-level guard fails if one stops
-    /// auditing; it does not execute them.
+    /// flow and need a table catalog to reach. This source-level guard reads each exit in the file
+    /// that holds it and fails if one stops auditing; it does not execute them.
     #[test]
     fn denial_exits_without_a_context_call_the_audit_function() {
         // Only the production code counts; the tests' own calls must not satisfy the guard.
-        let source = include_str!("access.rs").split("\nmod tests {").next().unwrap();
-        for reason in [
-            "\"table_resource_policy_denied\"",
-            "\"anonymous_table_data_plane_access\"",
-            "\"recursive_force_delete_requires_authenticated_caller\"",
+        let access = include_str!("access.rs").split("\nmod tests {").next().unwrap();
+        // DeleteObject's decision lives in the owned module both edges call.
+        let object_misc = include_str!("access_owned/object_misc.rs")
+            .split("\nmod tests;")
+            .next()
+            .unwrap();
+        for (source, reason) in [
+            (access, "\"table_resource_policy_denied\""),
+            (access, "\"anonymous_table_data_plane_access\""),
+            (object_misc, "\"recursive_force_delete_requires_authenticated_caller\""),
         ] {
             let call = source
                 .match_indices("audit_request_denial(")
