@@ -452,3 +452,32 @@ async fn object_request_without_req_info_is_refused_in_both_forms() {
         assert_eq!(err.message(), Some("ReqInfo not found in request extensions"));
     }
 }
+
+#[test]
+fn a_forked_envelope_reads_like_the_original_and_installs_alone() {
+    let original = RequestEnvelope::from_s3s(&legacy(|ext| {
+        server_request(ext);
+        ext.insert(guard(BUCKET));
+        ext.insert(ReqInfo {
+            replication_request_authorized: true,
+            ..Default::default()
+        });
+    }));
+    let mut fork = original.fork_for_authorization();
+    assert_eq!(bucket_fence(&fork), bucket_fence(&original));
+    assert_eq!(bucket_fence(&fork), Ok(Some(incarnation())));
+    assert!(replication_request_authorized(&fork));
+
+    fork.install_bucket_generation(guard("other-bucket"));
+    fork.install_odm_read_generation(OdmReadGenerationGuard::Ready(guard(BUCKET)));
+    if let Some(req_info) = fork.req_info_mut() {
+        req_info.object = Some("member".to_owned());
+    }
+    assert_eq!(
+        bucket_fence(&fork),
+        refused(S3ErrorCode::InternalError, "bucket generation guard does not match request bucket")
+    );
+    assert_eq!(bucket_fence(&original), Ok(Some(incarnation())));
+    assert_eq!(odm(&original), Ok(None));
+    assert_eq!(original.req_info().and_then(|info| info.object.clone()), None);
+}

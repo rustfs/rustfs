@@ -14,16 +14,21 @@
 
 //! Stored values as the gateway's answer types hold them, for every use case that answers in them.
 //!
-//! Responsible for: the bucket name, timestamp and owner conversions a use case needs to build a
-//! gateway output from what the store returned, under the rule in [`crate::app`].
+//! Responsible for: the bucket name, timestamp, owner and stored-configuration conversions a use
+//! case needs to build a gateway output from what the store returned, under the rule in
+//! [`crate::app`]; and [`seam_error`], the one answer for a value the s3s compatibility seam
+//! refused.
 //! NOT responsible for: validating names a client sends (the edge that accepted the request did),
 //! or deciding what a use case lists.
 //! Upstream: the use cases in `crate::app`. Downstream: `rustfs_gateway_types`.
 
+use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, serialize};
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
+use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
-use rustfs_gateway_types::{BucketName, NamePolicy, NameValidator, Stricter, Timestamp};
+use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, Stricter, Timestamp};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use std::fmt::Display;
 use std::sync::{Arc, LazyLock};
 use time::OffsetDateTime;
 
@@ -58,6 +63,24 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
     })
 }
 
+/// What a legacy edge answers when the s3s compatibility seam refuses a value of an admitted request.
+///
+/// - An object key below the gateway's key floor (empty, over 1024 bytes, a NUL) is refused as
+///   `validate_object_key` refuses one: `400 InvalidArgument`, with a fixed message. An edge whose
+///   legacy answer names the key runs `validate_object_key` before the seam.
+/// - A bucket name below the bucket floor is a server fault: s3s admits only `[a-z0-9.-]{3,63}`,
+///   which the floor always accepts, so no bucket a request names reaches it.
+/// - Any other refusal is a value the gateway shape cannot hold: a server fault.
+pub(crate) fn seam_error(error: ConversionError) -> S3Error {
+    match error.name_kind() {
+        Some(NameRefusal::ObjectKey) => S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"),
+        Some(NameRefusal::BucketName) | None => S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to convert through the gateway compatibility seam: {error}"),
+        ),
+    }
+}
+
 /// `at` with its sub-second part.
 pub(crate) fn timestamp(at: OffsetDateTime) -> Timestamp {
     let seconds = at.unix_timestamp();
@@ -73,10 +96,49 @@ pub(crate) fn owner() -> Owner {
     }
 }
 
+/// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
+/// converts it here, and none drops, rewrites or refuses one.
+///
+/// A tag the gateway's reader accepts is read as it reads it (a surrounding quote pair or a `W/`
+/// prefix is the store's spelling of it); any other, empty or carrying a control character, is
+/// carried byte for byte.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the object reads of batch C and the listings of B2 are its first callers"
+    )
+)]
+pub(crate) fn stored_etag(stored: &str) -> ETag {
+    ETag::new(stored.to_owned()).unwrap_or_else(|_| ETag::from_stored(stored.to_owned()))
+}
+
+/// A stored bucket configuration as the gateway DTO holds it: the bytes RustFS persists, read by
+/// `parse`, one of the gateway's DTO bridges. The answer carries every stored member and no other.
+///
+/// # Errors
+///
+/// `InternalError` when the stored document does not encode or the bridge refuses it: a store
+/// defect, never a member to leave out.
+pub(crate) fn stored_config<T: BucketConfigXml, D, E: Display>(stored: &T, parse: fn(&[u8]) -> Result<D, E>) -> S3Result<D> {
+    let unreadable = |error: &dyn Display| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("a stored bucket configuration the gateway cannot represent: {error}"),
+        )
+    };
+    let bytes = serialize(stored).map_err(|error| unreadable(&error))?;
+    parse(&bytes).map_err(|error| unreadable(&error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::storage_api::ecstore_capacity::is_reserved_or_invalid_bucket;
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedReplicationConfiguration, parse_lifecycle_dto, parse_replication_dto,
+        serialize_lifecycle_dto, serialize_replication_dto,
+    };
 
     /// Names RustFS's create rule admits and the AWS bucket grammar refuses.
     const RUSTFS_ONLY_NAMES: [&str; 5] = ["a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3", "xn--abc"];
@@ -125,6 +187,62 @@ mod tests {
         }
     }
 
+    const STORED_LIFECYCLE: &[u8] = b"<LifecycleConfiguration><Rule><DelMarkerExpiration><Days>7</Days></DelMarkerExpiration>\
+<Expiration><Days>30</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration><Filter><Prefix>logs/</Prefix>\
+</Filter><ID>r1</ID><Status>Enabled</Status><Transition><Days>10</Days><StorageClass>WARM</StorageClass></Transition></Rule>\
+</LifecycleConfiguration>";
+
+    const STORED_REPLICATION: &[u8] = b"<ReplicationConfiguration><Role>arn:minio:replication::id:target</Role><Rule>\
+<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><DeleteReplication><Status>Enabled</Status>\
+</DeleteReplication><Destination><Bucket>arn:aws:s3:::dest</Bucket><StorageClass>STANDARD</StorageClass></Destination>\
+<ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication><Filter><Prefix>a/</Prefix></Filter><ID>r1</ID>\
+<Priority>1</Priority><SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status></ReplicaModifications>\
+</SourceSelectionCriteria><Status>Enabled</Status></Rule></ReplicationConfiguration>";
+
+    /// The answer holds what is stored: written back through the gateway's bridge, it is the
+    /// stored document byte for byte, the MinIO members and `Transition` included.
+    #[test]
+    fn a_stored_configuration_is_answered_with_every_stored_member() {
+        let lifecycle = PersistedLifecycleConfiguration::decode_config_xml(STORED_LIFECYCLE).expect("stored lifecycle");
+        let answered = stored_config(&lifecycle, parse_lifecycle_dto).expect("lifecycle answer");
+        assert_eq!(serialize_lifecycle_dto(&answered).expect("lifecycle bytes"), STORED_LIFECYCLE);
+        assert_eq!(serialize(&lifecycle).expect("stored bytes"), STORED_LIFECYCLE);
+
+        let replication = PersistedReplicationConfiguration::decode_config_xml(STORED_REPLICATION).expect("stored replication");
+        let answered = stored_config(&replication, parse_replication_dto).expect("replication answer");
+        assert_eq!(serialize_replication_dto(&answered).expect("replication bytes"), STORED_REPLICATION);
+    }
+
+    #[test]
+    fn a_stored_configuration_the_bridge_refuses_is_a_server_fault() {
+        let lifecycle = PersistedLifecycleConfiguration::decode_config_xml(STORED_LIFECYCLE).expect("stored lifecycle");
+
+        let error = stored_config(&lifecycle, |_| Err::<(), _>("refused")).expect_err("the bridge refused it");
+
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn a_seam_refusal_is_answered_as_the_legacy_edge_answers_it() {
+        use crate::app::storage_api::s3::dto::{HeadBucketInput, HeadObjectInput};
+        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{head_bucket, head_object};
+
+        let input = HeadObjectInput::builder()
+            .bucket("bucket".into())
+            .key("a\u{0}b".into())
+            .build()
+            .unwrap();
+        let key = head_object::input_from_s3s(input).expect_err("a NUL is below the key floor");
+        assert_eq!(seam_error(key).code(), &S3ErrorCode::InvalidArgument);
+
+        let input = HeadBucketInput::builder().bucket("a/b".into()).build().unwrap();
+        let bucket = head_bucket::input_from_s3s(input).expect_err("a separator is below the bucket floor");
+        assert_eq!(seam_error(bucket).code(), &S3ErrorCode::InternalError);
+
+        let input = HeadBucketInput::builder().bucket("sthree-x".into()).build().unwrap();
+        assert!(head_bucket::input_from_s3s(input).is_ok(), "a name the floor admits crosses the seam");
+    }
+
     #[test]
     fn a_timestamp_keeps_its_sub_second_part() {
         let at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_000_000).expect("valid timestamp");
@@ -132,5 +250,25 @@ mod tests {
         let converted = timestamp(at);
 
         assert_eq!((converted.secs(), converted.subsec_nanos()), (1_700_000_000, 123_000_000));
+    }
+
+    #[test]
+    fn a_stored_tag_is_carried_as_stored_in_every_spelling_the_store_writes() {
+        for stored in ["0123abcd", "\"0123abcd\"", "0123abcd-2", "W/\"0123abcd\""] {
+            let etag = stored_etag(stored);
+
+            assert_eq!(etag.opaque_tag(), stored.trim_start_matches("W/").trim_matches('"'), "{stored}");
+            assert_eq!(etag.is_weak(), stored.starts_with("W/"), "{stored}");
+        }
+    }
+
+    #[test]
+    fn a_stored_tag_the_reader_refuses_is_carried_byte_for_byte() {
+        for stored in ["", "\"\"", "abc\u{1}def", "abc\ndef"] {
+            let etag = stored_etag(stored);
+
+            assert_eq!(etag.opaque_tag(), stored, "{stored:?}");
+            assert!(!etag.is_weak(), "{stored:?}");
+        }
     }
 }

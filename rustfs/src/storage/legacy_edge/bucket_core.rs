@@ -20,7 +20,6 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
-use crate::app::dto_values::stored_bucket_name;
 use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
@@ -34,8 +33,7 @@ use crate::storage::{
     get_bucket_request_payment_config, get_bucket_website_config, update_bucket_metadata_config_if_incarnation,
 };
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
-use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_bucket;
-use rustfs_gateway_types::dto::HeadBucketInput as HeadBucketGatewayInput;
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{create_bucket, head_bucket};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -85,8 +83,12 @@ impl FS {
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        record_s3_op(S3Operation::CreateBucket);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_create_bucket(req).await
+        through_gateway_seam(req, create_bucket::input_from_s3s, create_bucket::output_to_s3s, |envelope, input| {
+            usecase.execute_create_bucket(envelope, input)
+        })
+        .await
     }
 
     /// Delete a bucket
@@ -212,15 +214,11 @@ impl FS {
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         record_s3_op(S3Operation::HeadBucket);
-        // Interim until the re-pin onto rustfs/gateway#1610: the seam's input conversion holds the
-        // bucket to the AWS grammar, which refuses names RustFS holds, so the name is taken under the
-        // floor here and only the output crosses the seam.
-        let input = HeadBucketGatewayInput {
-            bucket: stored_bucket_name(&req.input.bucket)?,
-            ..Default::default()
-        };
-        let output = s3_api::bucket_usecase_for(self).execute_head_bucket(input).await?;
-        Ok(S3Response::new(head_bucket::output_to_s3s(output).map_err(seam_error)?))
+        let usecase = s3_api::bucket_usecase_for(self);
+        through_gateway_seam(req, head_bucket::input_from_s3s, head_bucket::output_to_s3s, |_, input| {
+            usecase.execute_head_bucket(input)
+        })
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_accelerate_configuration_edge(

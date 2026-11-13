@@ -69,7 +69,7 @@ async fn auto_replacement_path_requires_a_non_root_mount() {
                 },
             )
             .await,
-            Err(DiskError::DiskNotFound)
+            Err(DiskError::VolumeNotFound)
         ),
         "a missing replacement path must be rejected before admission"
     );
