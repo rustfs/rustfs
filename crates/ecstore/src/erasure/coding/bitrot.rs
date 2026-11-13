@@ -789,6 +789,13 @@ impl BitrotWriter<CustomWriter> {
         }
         self.write(&buf).await.map(|n| (n, None))
     }
+
+    pub(crate) fn set_pending_integrity_index(&mut self, idx_file_name: &str, idx_payload: bytes::Bytes) -> bool {
+        if let Some(local) = self.inner.as_lazy_local_file_writer_mut() {
+            return local.set_pending_integrity_index(idx_file_name, idx_payload);
+        }
+        false
+    }
 }
 
 /// Read into `buf` until it is full or the reader hits EOF, returning the number
@@ -1178,6 +1185,10 @@ impl BitrotWriterWrapper {
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         self.bitrot_writer.shutdown().await
+    }
+
+    pub(crate) fn set_pending_integrity_index(&mut self, idx_file_name: &str, idx_payload: bytes::Bytes) -> bool {
+        self.bitrot_writer.set_pending_integrity_index(idx_file_name, idx_payload)
     }
 
     /// Extract the inline buffer data, consuming the wrapper

@@ -653,6 +653,36 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
+    pub(crate) async fn finish_and_shutdown(&mut self, total: usize) -> std::io::Result<()> {
+        let mut prewritten = Vec::new();
+        if let Some(integrity) = self.integrity.as_deref_mut() {
+            let prepared = integrity.prepare(total).await?;
+            if let Some(idx_bytes) = prepared.memory_bytes() {
+                let idx_name = prepared.part.file_name();
+                prewritten.resize(self.writers.len(), false);
+                for (index, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter()).enumerate() {
+                    if err.is_none()
+                        && let Some(writer) = writer_opt.as_mut()
+                    {
+                        prewritten[index] = writer.set_pending_integrity_index(&idx_name, idx_bytes.clone());
+                    }
+                }
+            }
+        }
+        self.shutdown().await?;
+        if let Some(integrity) = self.integrity.take()
+            && !prewritten.is_empty()
+        {
+            for (index, slot) in prewritten.iter_mut().enumerate() {
+                if self.errs[index].is_some() || self.writers[index].is_none() {
+                    *slot = false;
+                }
+            }
+            integrity.set_prewritten_disks(prewritten);
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         crate::hp_guard!("MultiWriter::shutdown");
         let budget = self.next_progress_budget();
@@ -866,7 +896,7 @@ impl Erasure {
         let mut mw = MultiWriter::new(writers, write_policy);
         mw.integrity = integrity;
         mw.write_block(&block).await?;
-        mw.shutdown().await?;
+        mw.finish_and_shutdown(total).await?;
         Ok((reader, total))
     }
 
@@ -1086,7 +1116,7 @@ impl Erasure {
 
         let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
-        writers.shutdown().await?;
+        writers.finish_and_shutdown(total).await?;
         record_internal_stage_if_enabled("erasure_encode_shutdown", shutdown_stage_start);
         Ok((reader, total))
     }
@@ -1232,7 +1262,7 @@ impl Erasure {
 
         let (reader, total) = task.join().await??;
         let shutdown_stage_start = stage_timer_if_enabled();
-        writers.shutdown().await?;
+        writers.finish_and_shutdown(total).await?;
         record_internal_stage_if_enabled("erasure_encode_batched_shutdown", shutdown_stage_start);
         Ok((reader, total))
     }

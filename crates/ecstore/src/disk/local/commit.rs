@@ -975,15 +975,33 @@ impl LocalDisk {
                 }
 
                 if no_inline {
-                    if sync_data_shards && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref() {
-                        let sync_result = if !probe_active && super::take_presynced_tmp_data_dir(src_data_path) {
-                            // The payload was synced, but its part.1 directory entry
-                            // must also be persisted before moving the data directory.
-                            os::fsync_dir_std(src_data_path)
-                        } else {
-                            os::sync_dir_files_std(src_data_path)
-                        };
-                        if let Err(err) = sync_result
+                    let presynced_data_dir = sync_data_shards
+                        && !probe_active
+                        && has_data_dir_path_owned
+                            .as_ref()
+                            .is_some_and(|(src_data_path, _)| super::take_presynced_tmp_data_dir(src_data_path));
+                    if !presynced_data_dir
+                        && sync_data_shards
+                        && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
+                        && let Err(err) = os::sync_dir_files_std(src_data_path)
+                        && err.kind() != ErrorKind::NotFound
+                    {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Err(err);
+                    }
+                    if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Err(err);
+                    }
+                    if presynced_data_dir && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref() {
+                        // The payload was synced, and prepared_metadata_source.sync_data()
+                        // committed the active journal transaction; persist src_data_path's
+                        // directory entry before moving the data directory.
+                        if let Err(err) = os::fsync_dir_std(src_data_path)
                             && err.kind() != ErrorKind::NotFound
                         {
                             if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
@@ -991,12 +1009,6 @@ impl LocalDisk {
                             }
                             return Err(err);
                         }
-                    }
-                    if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
-                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
-                            let _ = remove_file_if_exists(backup_path);
-                        }
-                        return Err(err);
                     }
                 } else if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
                     drop(prepared_metadata_source);
