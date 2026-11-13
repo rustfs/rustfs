@@ -489,7 +489,7 @@ async fn source_turn_dispatch_rotates_real_sources_and_retains_completed_roots()
 
 #[tokio::test]
 #[serial]
-async fn source_turn_zero_new_frontier_stops_requeueing_without_starving_other_sources() {
+async fn source_turn_zero_new_frontier_stops_requeuing_without_starving_other_sources() {
     temp_env::async_with_vars([(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("1"))], async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
         let (_dir, store) = setup_two_pool_scanner_store().await;
