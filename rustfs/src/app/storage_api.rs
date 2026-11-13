@@ -1847,6 +1847,7 @@ pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
+    pub(crate) use super::helper::OperationHelper;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
