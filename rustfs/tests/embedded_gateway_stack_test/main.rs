@@ -324,6 +324,11 @@ fn the_refusal_matrix_holds_on_the_legacy_stack() {
 /// Names RustFS creates and the AWS bucket grammar refuses. An IP-shaped name such as `256.1.1.1`
 /// is also outside the AWS grammar, but RustFS's own create rule refuses it, so no store holds one.
 const RUSTFS_ONLY_NAMES: [&str; 5] = ["a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3", "xn--abc"];
+/// HeadBucket statuses the legacy stack answers on `main` for names no store holds.
+const HEAD_UPPER: u16 = 400;
+const HEAD_DOTTED_QUAD: u16 = 404;
+const HEAD_TOO_SHORT: u16 = 400;
+const HEAD_TOO_LONG: u16 = 400;
 
 /// A listing names every bucket the store holds, as it is stored, with its date and the owner.
 async fn the_listing_names_every_stored_bucket(server: RustFSServer) {
@@ -358,6 +363,41 @@ fn the_gateway_stack_lists_every_stored_bucket() {
 #[test]
 fn the_legacy_stack_lists_every_stored_bucket() {
     with_stack(LEGACY, the_listing_names_every_stored_bucket);
+}
+
+/// HeadBucket on the legacy stack answers every name as before the use case moved onto the
+/// gateway's types: a stored name the AWS grammar refuses is found, a missing one is not, and a
+/// name the edge refuses is refused there. Never a server fault. The statuses were measured on
+/// `main` before this change.
+#[test]
+fn the_legacy_stack_heads_every_bucket_name_as_before() {
+    with_stack(LEGACY, |server| async move {
+        for name in RUSTFS_ONLY_NAMES {
+            create_bucket_in_the_store(name).await;
+        }
+        let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+        let too_long = "a".repeat(64);
+        let expected = RUSTFS_ONLY_NAMES.iter().map(|name| (*name, 200)).chain([
+            ("missing-bucket", 404),
+            ("UPPER", HEAD_UPPER),
+            ("256.1.1.1", HEAD_DOTTED_QUAD),
+            ("ab", HEAD_TOO_SHORT),
+            (too_long.as_str(), HEAD_TOO_LONG),
+        ]);
+
+        let mut answered = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, status) in expected {
+            let observed = match client.head_bucket().bucket(name).send().await {
+                Ok(_) => Some(200),
+                Err(error) => refusal(&error).1,
+            };
+            answered.push((name.to_owned(), observed));
+            wanted.push((name.to_owned(), Some(status)));
+        }
+        assert_eq!(answered, wanted);
+        server.shutdown().await;
+    });
 }
 
 /// The PutObject-only upload-size capability is refused on any other operation, before it is

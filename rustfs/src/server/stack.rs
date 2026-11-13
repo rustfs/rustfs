@@ -195,6 +195,11 @@ mod tests {
             (Method::DELETE, "/health"),
             (Method::GET, "/minio/health/x"),
             (Method::GET, "/minio/health/live"),
+            // Near misses of the RustFS extension routes: a wrong method, an object level.
+            (Method::POST, "/bucket?replication-reset"),
+            (Method::GET, "/bucket/key?events"),
+            (Method::PUT, "/bucket?events"),
+            (Method::GET, "/bucket?lambdaArn=arn"),
         ] {
             assert_eq!(
                 answered_by(&mut service, request(method.clone(), target)).await,
@@ -218,6 +223,10 @@ mod tests {
             (Method::GET, "/profile/cpu"),
             (Method::GET, "/profile/memory"),
             (Method::GET, "/bucket?replication-metrics"),
+            (Method::PUT, "/bucket?replication-reset"),
+            (Method::GET, "/bucket?events"),
+            (Method::GET, "/?events="),
+            (Method::GET, "/bucket/key?lambdaArn=arn"),
         ] {
             assert_eq!(
                 answered_by(&mut service, request(method.clone(), target)).await,
