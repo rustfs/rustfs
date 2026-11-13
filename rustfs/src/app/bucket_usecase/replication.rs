@@ -15,6 +15,11 @@
 //! Bucket replication configuration use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, GetBucketReplicationInput, PutBucketReplicationInput,
+    PutBucketReplicationOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn validate_replication_config_targets(targets: &BucketTargets, config: &PersistedReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets

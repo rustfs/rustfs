@@ -17,6 +17,8 @@
 //! configuration must be set before either process initializes the store.
 
 use super::*;
+use crate::app::storage_api::s3::S3ErrorCode;
+use crate::app::storage_api::s3::dto::GetObjectInput;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use futures::stream;
 use http::{HeaderValue, Method};

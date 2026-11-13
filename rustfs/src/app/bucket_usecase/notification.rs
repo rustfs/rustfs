@@ -15,6 +15,12 @@
 //! Bucket notification configuration use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    GetBucketNotificationConfigurationInput, NotificationConfiguration, NotificationConfigurationFilter,
+    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
+};
+use crate::app::storage_api::s3::region::Region;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn is_valid_notification_filter_value(value: &str) -> bool {
     if value.len() > 1024 || value.contains('\\') {
@@ -253,6 +259,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::storage_api::s3::dto::{FilterRule, FilterRuleName, QueueConfiguration, S3KeyFilter};
     use http::Method;
 
     #[test]

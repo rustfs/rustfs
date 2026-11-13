@@ -109,29 +109,9 @@ use rustfs_targets::{
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
-use s3s::dto::{
-    BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput,
-    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketLifecycleInput,
-    DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput, DeleteBucketPolicyOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
-    DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType, ExpirationStatus,
-    GetBucketCorsInput, GetBucketEncryptionInput, GetBucketLifecycleConfigurationInput, GetBucketLocationInput,
-    GetBucketLocationOutput, GetBucketNotificationConfigurationInput, GetBucketPolicyInput, GetBucketPolicyOutput,
-    GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput, GetBucketTaggingInput,
-    GetBucketVersioningInput, GetPublicAccessBlockInput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
-    ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration, NotificationConfigurationFilter, Object,
-    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput,
-    PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
-    PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
-    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput,
-    PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput,
-    PutPublicAccessBlockOutput, ServerSideEncryption, Timestamp, UserMetadata,
-};
+use s3s::dto::{ListBucketsInput, ListBucketsOutput};
 use s3s::region::Region;
-use s3s::xml;
-use s3s::xml::{SerResult, SerializeContent};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -165,16 +145,6 @@ mod tagging;
 mod test_support;
 mod versioning;
 mod website;
-
-// The files in `bucket_usecase/` reach the s3 wire crate through this alias (`use super::*;`),
-// which keeps the direct s3s footprint on this file alone.
-use s3s as s3s_crate;
-#[cfg(test)]
-use s3s::dto::{
-    BucketLifecycleConfiguration, CORSConfiguration, FilterRule, FilterRuleName, LifecycleExpiration,
-    NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter, Tag, Tagging, Transition,
-    TransitionStorageClass,
-};
 
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
@@ -479,6 +449,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
+    use crate::app::storage_api::s3::dto::CreateBucketInput;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
