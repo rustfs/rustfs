@@ -15,6 +15,11 @@
 //! Bucket lifecycle configuration use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus, GetBucketLifecycleConfigurationInput,
+    LifecycleRule, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
@@ -336,6 +341,10 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::storage_api::s3::dto;
+    use crate::app::storage_api::s3::dto::{
+        BucketLifecycleConfiguration, LifecycleExpiration, NoncurrentVersionTransition, Transition, TransitionStorageClass,
+    };
     use http::Method;
 
     #[test]
@@ -542,7 +551,7 @@ mod tests {
             rules: vec![LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: None,
-                abort_incomplete_multipart_upload: Some(s3s_crate::dto::AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: Some(dto::AbortIncompleteMultipartUpload {
                     days_after_initiation: Some(0),
                 }),
                 del_marker_expiration: None,

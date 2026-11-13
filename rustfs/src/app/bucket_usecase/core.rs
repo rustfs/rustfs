@@ -15,6 +15,12 @@
 //! Bucket create, delete, head and location use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
+    GetBucketLocationInput, GetBucketLocationOutput, HeadBucketInput, HeadBucketOutput,
+};
+use crate::app::storage_api::s3::region::Region;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 /// Answer a `CreateBucket` for a bucket that already exists.
 ///
@@ -307,6 +313,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, s3_op_total};
+    use crate::app::storage_api::s3::dto;
     use http::Method;
 
     #[test]
@@ -371,7 +378,7 @@ mod tests {
             ] {
                 let input = CreateBucketInput {
                     bucket: bucket.clone(),
-                    create_bucket_configuration: location.map(|location| s3s_crate::dto::CreateBucketConfiguration {
+                    create_bucket_configuration: location.map(|location| dto::CreateBucketConfiguration {
                         location_constraint: Some(BucketLocationConstraint::from(location.to_string())),
                         ..Default::default()
                     }),

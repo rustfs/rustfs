@@ -15,6 +15,7 @@
 //! Request fixtures shared by the bucket use-case tests.
 
 use super::*;
+use crate::app::storage_api::s3::S3Request;
 use http::{Extensions, HeaderMap, Method, Uri};
 
 pub(super) fn s3_op_total(op: S3Operation) -> u64 {

@@ -15,6 +15,13 @@
 //! CompleteMultipartUpload.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ETag, ServerSideEncryption,
+};
+use crate::app::storage_api::s3::header::{
+    X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn validate_complete_multipart_parts(parts: &[CompletePart]) -> rustfs_s3_types::S3Result<()> {
     if let Some(part) = parts
@@ -613,6 +620,7 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, CreateMultipartUploadInput, StreamingBlob, UploadPartInput};
 
     fn upload_metadata_with_checksum_type(recorded: &str) -> HashMap<String, String> {
         HashMap::from([(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(), recorded.to_string())])
