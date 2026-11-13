@@ -153,6 +153,7 @@ async fn bootstrap_intent_reuses_plan_when_no_formats_were_published() {
     assert_plan_published(&reopened, &plan).await;
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn bootstrap_intent_anchor_is_durable_before_fanout() {
     use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};

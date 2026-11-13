@@ -453,7 +453,7 @@ pub use object::{
 };
 mod peer;
 mod rebalance;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 

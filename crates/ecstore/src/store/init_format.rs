@@ -2200,6 +2200,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn replacement_format_publication_keeps_interoperable_rename_contract() {
         use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};
