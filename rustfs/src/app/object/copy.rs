@@ -16,6 +16,11 @@
 
 use super::*;
 use crate::app::storage_api::object_usecase::object_utils::to_s3s_xml_etag;
+use crate::app::storage_api::s3::dto::{
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag, MetadataDirective, StorageClass, TaggingDirective,
+    Timestamp,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use futures::FutureExt;
 use rustfs_utils::path::fold_object_name_path_separators;
 use tracing::Instrument;
@@ -933,6 +938,7 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
