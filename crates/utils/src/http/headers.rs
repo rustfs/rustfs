@@ -194,6 +194,8 @@ pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencryp
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
 
 pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
+/// Lowercase wire form of [`AMZ_TAGGING_DIRECTIVE`] for `HeaderMap` insertion.
+pub const AMZ_TAGGING_DIRECTIVE_LOWER: &str = "x-amz-tagging-directive";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";

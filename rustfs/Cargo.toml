@@ -443,14 +443,4 @@ rustfs-ecstore = { workspace = true, features = ["test-util"] }
 rustfs-heal = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
-http.workspace = true
-futures.workspace = true
-s3s = { workspace = true, features = ["minio"] }
-clap = { workspace = true, features = ["derive", "env"] }
-hyper-util = { workspace = true, features = [
-    "tokio",
-    "server-auto",
-    "server-graceful",
-    "tracing",
-] }
 shadow-rs = { workspace = true, default-features = false, features = ["build"] }

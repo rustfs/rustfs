@@ -78,7 +78,6 @@ repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.99.0"
 version = "1.0.5"
 homepage = "https://rustfs.com"
-description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
 categories = ["web-programming", "development-tools", "filesystem", "network-programming"]
 authors = ["RustFS Team"]
@@ -93,7 +92,6 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rustfs = { path = "./rustfs", version = "1.0.5" }
 rustfs-gateway-adapter = { path = "crates/gateway-adapter", version = "1.0.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.5" }
@@ -211,7 +209,7 @@ bytesize = "2.7.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
-prost = "0.14.5"
+prost = "0.14.6"
 quick-xml = "0.42.0"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -333,7 +331,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.3" }
 ratelimit = "2.0.0"
 rayon = "1.12.0"
-rustfs-erasure-codec = { version = "9.0.0" }
+rustfs-erasure-codec = { version = "9.1.0" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }

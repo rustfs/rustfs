@@ -235,6 +235,21 @@ async fn create_user_without_a_policy(access_key: &str) {
         .expect("create user without a policy");
 }
 
+/// Creates `access_key` with the user secret and attaches a policy granting `action` on `bucket`
+/// alone, so a call on any other bucket is a wrong-resource refusal.
+async fn create_user_allowed_on_one_bucket(access_key: &str, action: &str, bucket: &str) {
+    create_user_without_a_policy(access_key).await;
+    let document = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["{action}"],"Resource":["arn:aws:s3:::{bucket}"]}}]}}"#
+    );
+    let policy = rustfs_policy::policy::Policy::parse_config(document.as_bytes()).expect("parse policy");
+    let iam = get_global_app_context().expect("embedded server context").iam().handle();
+    iam.set_policy(access_key, policy).await.expect("store policy");
+    iam.policy_db_set(access_key, rustfs_iam::store::UserType::Reg, false, access_key)
+        .await
+        .expect("attach policy");
+}
+
 #[test]
 fn every_served_operation_has_one_matrix_row_and_every_row_a_served_operation() {
     let rows: Vec<&str> = matrix().map(|row| row.operation).collect();

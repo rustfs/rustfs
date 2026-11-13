@@ -1873,3 +1873,240 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
     }
     assert!(mismatches.is_empty(), "bucket config mutation mismatches:\n{}", mismatches.join("\n"));
 }
+
+/// The write-path checks whose decision and hand-on are compared across the two request forms.
+#[derive(Clone, Copy, Debug)]
+enum WriteShape {
+    ReplicationOnlyHeaders,
+    WriteEtag { specific_dto_etag: bool },
+    StagedPart,
+}
+
+/// The refusal code, if any, then the replication flag and the staged-part marker.
+type WriteOutcome = (Option<String>, bool, bool);
+
+/// Runs one write check and reports its decision and the state it leaves on the request.
+async fn run_write_shape<R: crate::app::storage_api::owned_parity::AuthorizationRequest + ?Sized>(
+    shape: WriteShape,
+    req: &mut R,
+) -> WriteOutcome {
+    use crate::app::storage_api::owned_parity::{
+        authorize_replication_only_put_headers, authorize_staged_multipart_part, authorize_write_etag_condition,
+        replication_request_authorized,
+    };
+    let result = match shape {
+        WriteShape::ReplicationOnlyHeaders => authorize_replication_only_put_headers(req).await,
+        WriteShape::WriteEtag { specific_dto_etag } => authorize_write_etag_condition(req, specific_dto_etag).await,
+        WriteShape::StagedPart => authorize_staged_multipart_part(req).await,
+    };
+    let decision = result.err().map(|err| err.code().as_str().to_owned());
+    (decision, replication_request_authorized(req), req.staged_multipart_part())
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
+    let (_store_dirs, _store, slot, user, owner) = decision_world().await;
+    let denied = Some("AccessDenied".to_owned());
+    let replication_status = |req: &mut S3Request<()>| {
+        req.headers
+            .insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
+    };
+    // The access phase marks every multipart upload step; a staged part is one.
+    let staging = |req: &mut S3Request<()>| {
+        req.extensions.insert(MultipartStagingOperation);
+    };
+    let if_match = |value: &'static str| {
+        move |req: &mut S3Request<()>| {
+            req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static(value));
+        }
+    };
+    // (name, shape, bucket, object, principal, request facts, expected decision and state)
+    type Case = (
+        &'static str,
+        WriteShape,
+        &'static str,
+        &'static str,
+        Principal,
+        Box<dyn Fn(&mut S3Request<()>)>,
+        WriteOutcome,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "replication headers, owner",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Owner,
+            Box::new(replication_status),
+            (None, true, false),
+        ),
+        (
+            "replication headers, user without ReplicateObject",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::User,
+            Box::new(replication_status),
+            (denied.clone(), false, false),
+        ),
+        (
+            "replication headers, anonymous",
+            WriteShape::ReplicationOnlyHeaders,
+            PUBLIC,
+            "open/obj",
+            Principal::Anonymous,
+            Box::new(replication_status),
+            (denied.clone(), false, false),
+        ),
+        (
+            "no replication headers asks nothing",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|_: &mut S3Request<()>| {}),
+            (None, false, false),
+        ),
+        (
+            "POST form replication field asks nothing",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|req: &mut S3Request<()>| {
+                let mut form = req.headers.clone();
+                form.insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
+                req.extensions.insert(PostObjectRequestMarker);
+                req.extensions.insert(PostObjectPolicyHeaders(form));
+            }),
+            (None, false, false),
+        ),
+        (
+            "specific If-Match, user may read",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::User,
+            Box::new(if_match("\"abc\"")),
+            (None, false, false),
+        ),
+        (
+            "specific If-Match, user denied the read",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "iam-denied",
+            Principal::User,
+            Box::new(if_match("\"abc\"")),
+            (denied.clone(), false, false),
+        ),
+        (
+            "specific If-Match, anonymous",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(if_match("\"abc\"")),
+            (denied.clone(), false, false),
+        ),
+        (
+            "specific DTO ETag, anonymous",
+            WriteShape::WriteEtag { specific_dto_etag: true },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|_: &mut S3Request<()>| {}),
+            (denied.clone(), false, false),
+        ),
+        (
+            "wildcard If-Match asks nothing",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(if_match("*")),
+            (None, false, false),
+        ),
+        (
+            "POST form If-Match wins over the header",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|req: &mut S3Request<()>| {
+                req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static("*"));
+                let mut form = req.headers.clone();
+                form.insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
+                req.extensions.insert(PostObjectRequestMarker);
+                req.extensions.insert(PostObjectPolicyHeaders(form));
+            }),
+            (denied.clone(), false, false),
+        ),
+        (
+            "staged part creates no object",
+            WriteShape::StagedPart,
+            PUBLIC,
+            "stage/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (None, false, false),
+        ),
+        (
+            "staged part outside the staged grant",
+            WriteShape::StagedPart,
+            PUBLIC,
+            "open/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (denied.clone(), false, false),
+        ),
+        (
+            "staged part on a private bucket",
+            WriteShape::StagedPart,
+            PRIVATE,
+            "stage/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (denied.clone(), false, false),
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (name, shape, bucket, object, principal, facts, expected) in cases {
+        let mut legacy = build_request((), Method::PUT);
+        legacy.uri = format!("/{bucket}/{object}").parse().expect("case uri");
+        legacy.extensions.insert(Arc::clone(&slot));
+        let (cred, is_owner) = match principal {
+            Principal::Anonymous => (None, false),
+            Principal::User => (Some(user.clone()), false),
+            Principal::Owner => (Some(owner.clone()), true),
+        };
+        legacy.extensions.insert(ReqInfo {
+            cred,
+            is_owner,
+            bucket: Some(bucket.to_owned()),
+            object: Some(object.to_owned()),
+            ..Default::default()
+        });
+        facts(&mut legacy);
+        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let legacy_outcome = run_write_shape(shape, &mut legacy).await;
+        let owned_outcome = run_write_shape(shape, &mut owned).await;
+        if legacy_outcome != expected || owned_outcome != expected {
+            mismatches.push(format!(
+                "{name}: expected {expected:?}, legacy {legacy_outcome:?}, owned {owned_outcome:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "write check mismatches:\n{}", mismatches.join("\n"));
+}

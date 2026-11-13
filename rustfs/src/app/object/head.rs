@@ -27,6 +27,13 @@ use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
 
+/// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
+fn tagging_directive_is_access(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"ACCESS"))
+}
+
 async fn head_metadata_action_allowed(req: &S3Request<HeadObjectInput>, action: S3Action) -> S3Result<bool> {
     let Ok(info) = req_info_ref(req) else {
         return Ok(false);
@@ -669,6 +676,16 @@ impl DefaultObjectUsecase {
             } else {
                 warn!("Failed to parse x-amz-tagging-count header; skipping");
             }
+            // MinIO `x-amz-tagging-directive: ACCESS`: a replication source
+            // compares the replica's tag set, which the count cannot express.
+            // Gated by the same authorization as the count above.
+            if tagging_directive_is_access(&req.headers)
+                && let Ok(header_value) = HeaderValue::from_str(&info.user_tags)
+            {
+                response
+                    .headers
+                    .insert(http::HeaderName::from_static(rustfs_utils::http::AMZ_OBJECT_TAGGING_LOWER), header_value);
+            }
         }
         let retention_allowed = replication_check
             || ([
@@ -1190,8 +1207,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                for version in [None, object.version_id.map(|version| version.to_string())] {
+                let version_id = object.version_id.map(|version| version.to_string());
+                for (version, tagging_directive) in [(None, false), (None, true), (version_id, true)] {
                     let mut req = head_input(&bucket, "protected", version);
+                    if tagging_directive {
+                        req.headers
+                            .insert(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER, HeaderValue::from_static("ACCESS"));
+                    }
                     req.extensions.insert(ReqInfo::default());
                     req.extensions.insert(slot.clone());
                     if replica {
@@ -1213,6 +1235,17 @@ mod tests {
                             "header {header}"
                         );
                     }
+                    // The tag set is returned only on request, under the same
+                    // authorization as the tag count.
+                    assert_eq!(
+                        response
+                            .headers
+                            .get(rustfs_utils::http::AMZ_OBJECT_TAGGING_LOWER)
+                            .map(HeaderValue::as_bytes),
+                        (tagging_directive && (replica || (grant && !explicit_deny)))
+                            .then_some(b"classification=secret".as_slice()),
+                        "tag set header, directive {tagging_directive}"
+                    );
                 }
             }
         });

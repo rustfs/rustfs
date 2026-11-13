@@ -230,6 +230,7 @@ async fn assert_unreadable_lifecycle_is_retained(corrupt: fn(&mut Value)) {
             after: None,
             limit: 10,
             response,
+            _permit: crate::heal::mrf_queue::management::read_permit().expect("MRF management read permit"),
         })
         .await
         .expect("query the actual consumer");
