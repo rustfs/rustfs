@@ -286,6 +286,7 @@ fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservat
         reserved_bytes: mimalloc_stat_current(&value, "reserved"),
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
+        allocated_bytes: mimalloc_stat_current(&value, "allocated"),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
         // Mimalloc statistics schema 6 emits scalar totals; older schemas can use an
         // object with a total. Neither representation reports live memory.
@@ -838,6 +839,27 @@ mod tests {
         assert_eq!(reclaim_stat_totals(parsed), [Some(0), Some(8192), Some(3), Some(4), Some(5), Some(6)]);
         assert_eq!(parsed.reserved_bytes, None);
         assert_eq!(parsed.committed_bytes, None);
+    }
+
+    #[test]
+    fn allocator_block_bytes_remain_distinct_from_requested_and_committed_bytes() {
+        for (allocated, expected) in [
+            (r#"{ "current": 64, "total": 4096 }"#, Some(64)),
+            (r#"{ "current": 0, "total": 4096 }"#, Some(0)),
+            (r#"{ "total": 4096 }"#, None),
+            (r#"{ "current": -1, "total": 4096 }"#, None),
+            (r#"{ "current": "18446744073709551616" }"#, None),
+            ("4096", None),
+            ("null", None),
+        ] {
+            let payload =
+                format!(r#"{{ "allocated": {allocated}, "committed": {{ "current": 8192 }}, "malloc_requested": 4096 }}"#);
+            let observation = parse_mimalloc_stats_json(&payload).expect("committed statistic remains available");
+            assert_eq!(observation.allocated_bytes, expected);
+            assert_eq!(observation.committed_bytes, Some(8192));
+            assert_eq!(observation.malloc_requested_bytes, None);
+            assert_eq!(observation.malloc_requested_total_bytes, Some(4096));
+        }
     }
 
     #[test]

@@ -2777,6 +2777,9 @@ pub struct AllocatorMemoryObservation {
     pub reserved_bytes: Option<u64>,
     pub committed_bytes: Option<u64>,
     pub page_committed_bytes: Option<u64>,
+    /// Allocator-reported block bytes, including size-class rounding and delayed statistics updates.
+    /// This is not live requested bytes or resident memory.
+    pub allocated_bytes: Option<u64>,
     pub malloc_requested_bytes: Option<u64>,
     pub malloc_requested_peak_bytes: Option<u64>,
     pub malloc_requested_total_bytes: Option<u64>,
@@ -2811,6 +2814,11 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
         .set(if observation.reserved_bytes.is_some() { 1.0 } else { 0.0 });
     gauge!("rustfs_memory_allocator_committed_bytes_available", "backend" => backend)
         .set(if observation.committed_bytes.is_some() { 1.0 } else { 0.0 });
+    gauge!("rustfs_memory_allocator_allocated_bytes_available", "backend" => backend)
+        .set(if observation.allocated_bytes.is_some() { 1.0 } else { 0.0 });
+    if let Some(allocated_bytes) = observation.allocated_bytes {
+        gauge!("rustfs_memory_allocator_allocated_bytes", "backend" => backend).set(allocated_bytes as f64);
+    }
     if let Some(reserved_bytes) = observation.reserved_bytes {
         gauge!("rustfs_memory_allocator_reserved_bytes", "backend" => backend).set(reserved_bytes as f64);
     }
@@ -3282,6 +3290,41 @@ mod tests {
                 Some(expected_availability),
             );
             assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), expected_value);
+        }
+    }
+
+    #[test]
+    fn allocator_block_bytes_preserve_decreases_missing_and_zero() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = [
+            (None, None, 0.0),
+            (Some(128), Some(128.0), 1.0),
+            (Some(64), Some(64.0), 1.0),
+            (None, Some(64.0), 0.0),
+            (Some(0), Some(0.0), 1.0),
+        ];
+        for (index, (_, expected, available)) in sequence.into_iter().enumerate() {
+            // Debugging snapshots consume values; replay each prefix before its only snapshot.
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                for (current, ..) in sequence.iter().take(index + 1) {
+                    record_allocator_memory_observation(
+                        "mimalloc",
+                        AllocatorMemoryObservation {
+                            allocated_bytes: *current,
+                            ..Default::default()
+                        },
+                    );
+                }
+                set_metrics_enabled(false);
+            });
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes_available"), Some(available));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes"), expected);
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes_available"), Some(0.0));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), None);
         }
     }
 

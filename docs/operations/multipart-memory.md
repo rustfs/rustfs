@@ -29,6 +29,8 @@ Use rustfs_memory_allocator_malloc_requested_bytes only when rustfs_memory_alloc
 
 A previously published gauge can remain visible after a statistic becomes unavailable. Filter it by the availability metric. The malloc_requested_total_bytes metric is cumulative allocation activity and can grow indefinitely in a healthy process. Do not use its slope as evidence of retained memory.
 
+The `rustfs_memory_allocator_allocated_bytes` gauge reports the allocator's `allocated.current` block accounting when `rustfs_memory_allocator_allocated_bytes_available` is one. It includes size-class rounding and can lag page or thread statistics merges. Availability means the field was present and valid, not that accounting was enabled. This observation is distinct from live requested bytes, committed bytes and RSS; zero or a change alone does not prove a drained heap or a leak.
+
 When live requested bytes are unavailable, capture a supported heap profile or allocation/free trace. Preserve attribution to allocation stacks and lifetime; committed bytes and RSS alone cannot establish a leak. Other raw allocator statistics, including page accounting, depend on the allocator build and are not interchangeable with live application bytes.
 
 ### Linux transparent huge pages

@@ -33,6 +33,28 @@ struct TimedResources {
     ended: Instant,
 }
 
+impl TimedResources {
+    fn rejection(&self, now: Instant) -> Option<&'static str> {
+        if self.ended < self.began || self.ended > now {
+            Some("invalid_timing")
+        } else if now.duration_since(self.began) > SAMPLE_INTERVAL {
+            Some("stale")
+        } else if self.ended.duration_since(self.began) > Duration::from_millis(20) {
+            Some("wide")
+        } else {
+            None
+        }
+    }
+}
+
+fn record_resource_observation(now: Instant, sample: Option<&TimedResources>) {
+    let result = sample.map_or("unavailable", |sample| sample.rejection(now).unwrap_or("valid"));
+    metrics::counter!("rustfs_background_resource_observations_total", "result" => result).increment(1);
+    if let Some(duration) = sample.and_then(|sample| sample.ended.checked_duration_since(sample.began)) {
+        metrics::histogram!("rustfs_background_resource_sample_duration_seconds").record(duration.as_secs_f64());
+    }
+}
+
 impl Policy {
     fn observe(
         &mut self,
@@ -41,15 +63,7 @@ impl Policy {
         foreground: Option<ForegroundWindow>,
         registry: &WorkloadAdmissionRegistrySnapshot,
     ) -> Option<FeedbackObservation> {
-        let Some(observation) = sample.filter(|sample| {
-            now.checked_duration_since(sample.began)
-                .is_some_and(|age| age <= SAMPLE_INTERVAL)
-                && sample
-                    .ended
-                    .checked_duration_since(sample.began)
-                    .is_some_and(|width| width <= Duration::from_millis(20))
-                && sample.ended <= now
-        }) else {
+        let Some(observation) = sample.filter(|sample| sample.rejection(now).is_none()) else {
             *self = Self::default();
             return None;
         };
@@ -426,8 +440,9 @@ pub(crate) fn start(
             let foreground = crate::foreground_observation::latest_window();
             let registry = provider.workload_admission_snapshot();
             // Recheck age after every input read, including a delayed provider.
+            let observed_at = Instant::now();
             let observation = policy.observe(
-                Instant::now(),
+                observed_at,
                 samples.as_ref().and_then(|(sample, _)| sample.clone()),
                 foreground,
                 &registry,
@@ -439,6 +454,9 @@ pub(crate) fn start(
             let decision = lifetime
                 .0
                 .update_with_probe(&mut controller, observation, physical.node_may_probe());
+            if rustfs_io_metrics::metrics_enabled() {
+                record_resource_observation(observed_at, samples.as_ref().and_then(|(sample, _)| sample.as_ref()));
+            }
             if let Some((_, disks)) = samples {
                 physical.publish(disks, observation.map_or(ResourcePressure::Unknown, |sample| sample.pressure));
             }
@@ -638,6 +656,75 @@ mod tests {
         );
         let future = timed(later, resources());
         assert!(policy.observe(at, Some(future), None, &queues(Some(0))).is_none());
+    }
+
+    #[test]
+    fn observation_metrics_distinguish_missing_stale_wide_and_invalid_samples() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let at = Instant::now();
+        let now = at + SAMPLE_INTERVAL;
+        let valid = TimedResources {
+            began: now - Duration::from_millis(20),
+            ended: now,
+            ..timed(now, resources())
+        };
+        let wide = TimedResources {
+            began: now - Duration::from_millis(20) - Duration::from_nanos(1),
+            ..valid.clone()
+        };
+        let stale = timed(at - Duration::from_nanos(1), resources());
+        let future = timed(now + Duration::from_nanos(1), resources());
+        let reversed = TimedResources {
+            ended: valid.began - Duration::from_nanos(1),
+            ..valid.clone()
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            for (sample, accepted) in [
+                (None, false),
+                (Some(&valid), true),
+                (Some(&wide), false),
+                (Some(&stale), false),
+                (Some(&future), false),
+                (Some(&reversed), false),
+            ] {
+                record_resource_observation(now, sample);
+                assert_eq!(
+                    Policy::default()
+                        .observe(now, sample.cloned(), None, &queues(Some(0)))
+                        .is_some(),
+                    accepted,
+                    "diagnostic classification must match admission eligibility"
+                );
+            }
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        let mut counts = std::collections::BTreeMap::new();
+        for (key, _, _, value) in rows {
+            if key.key().name() == "rustfs_background_resource_observations_total" {
+                let result = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "result")
+                    .expect("bounded result label");
+                let DebugValue::Counter(count) = value else { panic!("observation metric must be a counter") };
+                counts.insert(result.value().to_owned(), count);
+            }
+        }
+        assert_eq!(
+            counts,
+            [
+                ("invalid_timing".to_owned(), 2),
+                ("stale".to_owned(), 1),
+                ("unavailable".to_owned(), 1),
+                ("valid".to_owned(), 1),
+                ("wide".to_owned(), 1),
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]

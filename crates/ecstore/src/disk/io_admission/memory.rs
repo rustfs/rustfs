@@ -79,12 +79,21 @@ impl BackgroundMemoryBudget {
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> io::Result<Reservation> {
         let bytes = u64::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let used = state
-            .used
-            .checked_add(bytes)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, BackgroundMemoryExhausted))?;
-        if bytes != 0 && (Instant::now() >= state.valid_until || used > state.limit) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, BackgroundMemoryExhausted));
+        let expired = Instant::now() >= state.valid_until;
+        let exhausted = || {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                BackgroundMemoryExhausted {
+                    requested: bytes,
+                    used: state.used,
+                    limit: state.limit,
+                    expired,
+                },
+            )
+        };
+        let used = state.used.checked_add(bytes).ok_or_else(exhausted)?;
+        if bytes != 0 && (expired || used > state.limit) {
+            return Err(exhausted());
         }
         state.used = used;
         Ok(Reservation {
@@ -95,11 +104,20 @@ impl BackgroundMemoryBudget {
 }
 
 #[derive(Debug)]
-struct BackgroundMemoryExhausted;
+struct BackgroundMemoryExhausted {
+    requested: u64,
+    used: u64,
+    limit: u64,
+    expired: bool,
+}
 
 impl std::fmt::Display for BackgroundMemoryExhausted {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("background buffer memory budget exhausted")
+        write!(
+            formatter,
+            "background buffer memory budget exhausted (requested={}, used={}, limit={}, expired={})",
+            self.requested, self.used, self.limit, self.expired,
+        )
     }
 }
 
@@ -320,6 +338,31 @@ impl io::Write for BackgroundEncodeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_reservation_reports_capacity_and_expiration_without_charging() {
+        let owner = BackgroundMemoryBudget::new();
+        owner.set_sampled_limit(64, Duration::from_secs(3));
+        let held = owner.reserve(32).expect("initial reservation fits");
+        let error = owner.reserve(33).err().expect("one byte over remaining capacity");
+        assert!(is_memory_pressure(&error));
+        assert_eq!(
+            error.to_string(),
+            "background buffer memory budget exhausted (requested=33, used=32, limit=64, expired=false)"
+        );
+        assert_eq!(owner.snapshot().used, 32);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let error = owner.reserve(1).err().expect("expired lease rejects a fitting request");
+        assert!(is_memory_pressure(&error));
+        assert_eq!(
+            error.to_string(),
+            "background buffer memory budget exhausted (requested=1, used=32, limit=64, expired=true)"
+        );
+        assert_eq!(owner.snapshot().used, 32);
+        drop(held);
+        assert_eq!(owner.snapshot().used, 0);
+    }
 
     #[test]
     fn encoded_buffer_growth_retains_both_allocations_and_the_last_slice() {
