@@ -662,7 +662,10 @@ mod test {
             (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), true),
             (serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccount"}), false),
             (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), true),
-            (serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}), false),
+            (
+                serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}),
+                false,
+            ),
             (
                 serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"backup"}}}),
                 true,
