@@ -915,8 +915,8 @@ pub struct S3Router<T> {
 /// routes and every control-plane route.
 #[cfg(feature = "gateway-stack")]
 pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
-    parse_replication_extension_request(method, uri).is_some()
-        || parse_misc_extension_request(method, uri).is_some()
+    s3_extension::route_key(method, uri).is_some()
+        || parse_object_lambda_request(method, uri).is_some()
         || is_control_plane_route(method, uri, headers)
 }
 

@@ -20,6 +20,7 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
+use crate::app::dto_values::stored_bucket_name;
 use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
@@ -33,7 +34,6 @@ use crate::storage::{
     get_bucket_request_payment_config, get_bucket_website_config, update_bucket_metadata_config_if_incarnation,
 };
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
-use crate::app::dto_values::stored_bucket_name;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_bucket;
 use rustfs_gateway_types::dto::HeadBucketInput as HeadBucketGatewayInput;
 use rustfs_io_metrics::record_s3_op;
