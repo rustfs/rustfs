@@ -17,7 +17,7 @@ use crate::client::{ClientFactory, local::LocalClient};
 use crate::types::LockType;
 use crate::{GlobalLockManager, LockError, LockInfo, LockResponse, LockStats};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -224,6 +224,86 @@ impl crate::client::LockClient for FlakyAcquireClient {
 }
 
 #[derive(Debug)]
+struct ReaderBetweenRoundsClient {
+    inner: Arc<LocalClient>,
+    reader_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    writer_timeouts: Mutex<Vec<Duration>>,
+}
+
+impl ReaderBetweenRoundsClient {
+    fn new(manager: Arc<GlobalLockManager>) -> Self {
+        Self {
+            inner: Arc::new(LocalClient::with_manager(manager)),
+            reader_tasks: Mutex::new(Vec::new()),
+            writer_timeouts: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn finish_readers(&self) {
+        let tasks = std::mem::take(&mut *self.reader_tasks.lock().expect("reader task inventory"));
+        for task in tasks {
+            task.await.expect("each real reader must release its exact grant");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for ReaderBetweenRoundsClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        if request.lock_type == LockType::Exclusive {
+            self.writer_timeouts
+                .lock()
+                .expect("writer timeout inventory")
+                .push(request.acquire_timeout);
+            // A new reader arrives while the distributed writer is between
+            // peer rounds. The peer's real writer queue must outlive this reader.
+            let reader = LockRequest::new(request.resource.clone(), LockType::Shared, "reader-between-rounds")
+                .with_ttl(Duration::from_secs(30));
+            assert!(self.inner.acquire_lock(&reader).await.expect("new real reader").success);
+            let inner = Arc::clone(&self.inner);
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                assert!(inner.release(&reader.lock_id).await.expect("release real reader"));
+            });
+            self.reader_tasks.lock().expect("reader task inventory").push(task);
+        }
+        self.inner.acquire_lock(request).await
+    }
+
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.release(lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.refresh(lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.force_release(lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.inner.check_status(lock_id).await
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn is_online(&self) -> bool {
+        true
+    }
+
+    async fn is_local(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
 struct FlakyReleaseClient {
     inner: LocalClient,
     failed_releases_remaining: AtomicUsize,
@@ -297,6 +377,50 @@ fn create_test_object_key(bucket: &str, object: &str) -> ObjectKey {
         bucket: Arc::from(bucket),
         object: Arc::from(object),
         version: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn distributed_publication_writer_survives_read_arrivals_between_peer_rounds() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let contended = managers[..2]
+        .iter()
+        .map(|manager| Arc::new(ReaderBetweenRoundsClient::new(Arc::clone(manager))))
+        .collect::<Vec<_>>();
+    let clients: Vec<Arc<dyn LockClient>> = vec![
+        contended[0].clone(),
+        contended[1].clone(),
+        Arc::new(LocalClient::with_manager(Arc::clone(&managers[2]))),
+    ];
+    let lock = NamespaceLock::with_clients("publication-writer-progress".to_string(), clients);
+    let resource = create_test_object_key("bucket", rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH);
+    let started = tokio::time::Instant::now();
+    let writer = lock
+        .get_write_lock(resource.clone(), "publication-writer", Duration::from_secs(5))
+        .await;
+    let elapsed = started.elapsed();
+    let live_writer = writer.as_ref().is_ok_and(|guard| !guard.is_lock_lost());
+    let failure = writer.as_ref().err().map(ToString::to_string);
+    drop(writer);
+    for peer in &contended {
+        peer.finish_readers().await;
+    }
+    wait_until_all_managers_can_write(&managers, resource).await;
+
+    assert!(
+        live_writer,
+        "the distributed writer must retain its queue position long enough for 1.5s readers: elapsed={elapsed:?}, failure={failure:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "writer progress must fit the original caller budget");
+    for peer in &contended {
+        let timeouts = peer.writer_timeouts.lock().expect("writer timeout inventory");
+        assert!(timeouts.len() >= 2, "the regression must reach a later contention round");
+        assert_eq!(timeouts[0], Duration::from_secs(1), "the initial peer probe remains bounded");
+        assert_eq!(
+            timeouts[1],
+            Duration::from_secs(2),
+            "a contended writer must retain its queue position longer"
+        );
     }
 }
 
