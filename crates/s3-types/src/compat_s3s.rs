@@ -104,7 +104,16 @@ impl From<legacy_s3s::S3ErrorCode> for S3ErrorCode {
 impl From<S3Error> for legacy_s3s::S3Error {
     fn from(error: S3Error) -> Self {
         let parts = error.into_parts();
-        let mut out = Self::new(parts.code.into());
+        let code: legacy_s3s::S3ErrorCode = parts.code.into();
+        // An s3s error that crossed into this type earlier travels whole inside its cause
+        // (`LegacyCause`); crossing back hands that error on, so its typed cause is the cause
+        // again and not a wrapper a caller cannot downcast.
+        let (mut out, source) = match parts.source.map(|source| source.downcast::<LegacyCause>()) {
+            Some(Ok(cause)) if cause.0.code() == &code => (cause.0, None),
+            Some(Ok(cause)) => (Self::new(code), Some(cause as Box<dyn std::error::Error + Send + Sync>)),
+            Some(Err(source)) => (Self::new(code), Some(source)),
+            None => (Self::new(code), None),
+        };
         if let Some(message) = parts.message {
             out.set_message(message);
         }
@@ -114,7 +123,7 @@ impl From<S3Error> for legacy_s3s::S3Error {
         if let Some(status) = parts.status {
             out.set_status_code(status);
         }
-        if let Some(source) = parts.source {
+        if let Some(source) = source {
             out.set_source(source);
         }
         if let Some(headers) = parts.headers {
@@ -338,6 +347,52 @@ mod tests {
             assert_eq!(crossed.message(), native.message(), "{code}");
             assert_eq!(crossed.status_code(), native.status_code(), "{code}");
         }
+    }
+
+    /// An s3s error that crosses to ours and back keeps its typed cause, so a caller downcasting
+    /// the cause after an owned use case finds the storage error it found before; what our side
+    /// changed is applied, and what it left alone is exactly the original's. Re-coded on our side,
+    /// it keeps only the cause's text: the original error no longer answers.
+    #[test]
+    fn a_round_trip_hands_the_typed_cause_back_unless_the_code_changed() {
+        let mut legacy = legacy_s3s::S3Error::with_message(legacy_s3s::S3ErrorCode::ServiceUnavailable, "retry");
+        legacy.set_source(Box::new(io::Error::other("read quorum")));
+
+        let mut ours: S3Error = legacy.into();
+        ours.set_message("retry later".to_owned());
+        let back: legacy_s3s::S3Error = ours.into();
+        assert_eq!(back.code(), &legacy_s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(back.message(), Some("retry later"));
+        let cause = back.source().expect("the cause survives");
+        assert_eq!(cause.downcast_ref::<io::Error>().map(ToString::to_string).as_deref(), Some("read quorum"));
+
+        let mut original = legacy_s3s::S3Error::with_message(legacy_s3s::S3ErrorCode::SlowDown, "slow");
+        original.set_status_code(StatusCode::TOO_MANY_REQUESTS);
+        original.set_source(Box::new(io::Error::other("throttled")));
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("1"));
+        original.set_headers(headers.clone());
+        let untouched: legacy_s3s::S3Error = S3Error::from(original).into();
+        assert_eq!(untouched.code(), &legacy_s3s::S3ErrorCode::SlowDown);
+        assert_eq!(untouched.message(), Some("slow"));
+        assert_eq!(untouched.status_code(), Some(StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(untouched.headers(), Some(&headers));
+        assert!(
+            untouched
+                .source()
+                .is_some_and(|cause| cause.downcast_ref::<io::Error>().is_some())
+        );
+
+        let mut legacy = legacy_s3s::S3Error::new(legacy_s3s::S3ErrorCode::ServiceUnavailable);
+        legacy.set_source(Box::new(io::Error::other("read quorum")));
+        let ours: S3Error = legacy.into();
+        let mut recoded = S3Error::new(S3ErrorCode::InternalError);
+        recoded.set_source(ours.into_parts().source.expect("the crossed cause"));
+        let recoded: legacy_s3s::S3Error = recoded.into();
+        assert_eq!(recoded.code(), &legacy_s3s::S3ErrorCode::InternalError);
+        let cause = recoded.source().expect("the cause's text survives");
+        assert!(cause.downcast_ref::<io::Error>().is_none());
+        assert_eq!(cause.to_string(), "read quorum");
     }
 
     #[test]

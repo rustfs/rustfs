@@ -16,8 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    DeleteBucketPolicyInput, DeleteBucketPolicyOutput, GetBucketPolicyInput, GetBucketPolicyOutput, GetBucketPolicyStatusInput,
-    GetBucketPolicyStatusOutput, PolicyStatus, PutBucketPolicyInput, PutBucketPolicyOutput,
+    DeleteBucketPolicyInput, DeleteBucketPolicyOutput, PutBucketPolicyInput, PutBucketPolicyOutput,
 };
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use rustfs_policy::policy::Validator;
@@ -55,64 +54,61 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
+    /// The stored policy document, verbatim.
     pub async fn execute_get_bucket_policy(
         &self,
-        req: S3Request<GetBucketPolicyInput>,
-    ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        let GetBucketPolicyInput { bucket, .. } = req.input;
-
+        input: gateway_dto::GetBucketPolicyInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketPolicyOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(&bucket).await {
-            Ok(res) => res,
+        let (policy, _) = match metadata_sys::get_bucket_policy_raw(input.bucket.as_str()).await {
+            Ok(stored) => stored,
+            Err(StorageError::ConfigNotFound) => return Err(rustfs_s3_types::s3_error!(NoSuchBucketPolicy)),
             Err(err) => {
-                if StorageError::ConfigNotFound == err {
-                    return Err(s3_error!(NoSuchBucketPolicy));
-                }
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()));
+                return Err(rustfs_s3_types::S3Error::with_message(
+                    rustfs_s3_types::S3ErrorCode::InternalError,
+                    err.to_string(),
+                ));
             }
         };
 
-        Ok(S3Response::new(GetBucketPolicyOutput {
-            policy: Some(policy_str),
-        }))
+        Ok(gateway_dto::GetBucketPolicyOutput { policy: Some(policy) })
     }
 
     pub async fn execute_get_bucket_policy_status(
         &self,
-        req: S3Request<GetBucketPolicyStatusInput>,
-    ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        let GetBucketPolicyStatusInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        input: gateway_dto::GetBucketPolicyStatusInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketPolicyStatusOutput> {
+        let bucket = input.bucket.as_str();
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let client_info = req.extensions.get::<ClientInfo>();
         let conditions = get_condition_values_with_client_info(
-            &req.headers,
+            envelope.headers(),
             &rustfs_credentials::Credentials::default(),
             None,
             None,
-            remote_addr,
-            client_info,
+            envelope.remote_addr(),
+            envelope.client_info(),
         );
 
         let read_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
-            bucket: &bucket,
+            bucket,
             action: Action::S3Action(S3Action::ListBucketAction),
             is_owner: false,
             account: "",
@@ -124,7 +120,7 @@ impl DefaultBucketUsecase {
         .map_err(ApiError::from)?;
 
         let write_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
-            bucket: &bucket,
+            bucket,
             action: Action::S3Action(S3Action::PutObjectAction),
             is_owner: false,
             account: "",
@@ -136,14 +132,14 @@ impl DefaultBucketUsecase {
         .map_err(ApiError::from)?;
 
         let mut is_public = read_allowed || write_allowed;
-        let ignore_public_acls = match metadata_sys::get_public_access_block_config(&bucket).await {
+        let ignore_public_acls = match metadata_sys::get_public_access_block_config(bucket).await {
             Ok((config, _)) => config.ignore_public_acls.unwrap_or(false),
             Err(_) => false,
         };
 
         let _ = ignore_public_acls;
 
-        let policy_public = match metadata_sys::get_bucket_policy(&bucket).await {
+        let policy_public = match metadata_sys::get_bucket_policy(bucket).await {
             Ok((cfg, _)) => cfg.statements.iter().any(|statement| {
                 matches!(statement.effect, Effect::Allow)
                     && statement.principal.is_match("*")
@@ -163,13 +159,11 @@ impl DefaultBucketUsecase {
             is_public = true;
         }
 
-        let output = GetBucketPolicyStatusOutput {
-            policy_status: Some(PolicyStatus {
+        Ok(gateway_dto::GetBucketPolicyStatusOutput {
+            policy_status: Some(gateway_dto::PolicyStatus {
                 is_public: Some(is_public),
             }),
-        };
-
-        Ok(S3Response::new(output))
+        })
     }
 
     pub async fn execute_put_bucket_policy(
@@ -266,18 +260,36 @@ mod tests {
         assert_eq!(s3_op_total(S3Operation::DeleteBucketPolicy), before + 1);
     }
 
+    fn bucket(name: &str) -> rustfs_gateway_types::BucketName {
+        rustfs_gateway_types::BucketName::new(name).expect("valid bucket name")
+    }
+
     #[tokio::test]
     async fn execute_get_bucket_policy_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketPolicyInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
+        let input = gateway_dto::GetBucketPolicyInput {
+            bucket: bucket("test-bucket"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_policy(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_policy(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_get_bucket_policy_status_returns_internal_error_when_store_uninitialized() {
+        let input = gateway_dto::GetBucketPolicyStatusInput {
+            bucket: bucket("test-bucket"),
+            ..Default::default()
+        };
+        let req = build_request((), Method::GET);
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase
+            .execute_get_bucket_policy_status(RequestEnvelope::from_s3s(&req), input)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

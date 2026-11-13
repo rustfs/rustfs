@@ -81,7 +81,6 @@ use crate::app::runtime_sources::{
 use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
     cancel_site_replication_delete_bucket, commit_site_replication_delete_bucket, prepare_site_replication_delete_bucket,
     site_replication_bucket_meta_hook, site_replication_make_bucket_hook, with_site_replication_bucket_mutation_lock,
@@ -109,7 +108,6 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
-use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::region::Region;
@@ -129,6 +127,8 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 mod accelerate;
 mod acl;
 mod core;
+#[cfg(any(test, feature = "gateway-stack"))]
+pub(crate) use self::core::requested_location_constraint;
 mod cors;
 mod encryption;
 #[cfg(test)]

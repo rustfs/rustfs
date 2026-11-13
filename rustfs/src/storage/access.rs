@@ -2157,8 +2157,8 @@ async fn authorize_write_etag_condition<T>(req: &mut S3Request<T>, specific_dto_
     Ok(())
 }
 
-async fn authorize_request_with_location_constraint<T>(
-    req: &mut S3Request<T>,
+async fn authorize_request_with_location_constraint<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
     action: Action,
     location_constraint: Option<String>,
 ) -> S3Result<()> {
@@ -2956,19 +2956,12 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn create_bucket(&self, req: &mut S3Request<CreateBucketInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
+        let bucket = req.input.bucket.clone();
         let location_constraint = requested_bucket_location_constraint(&req.input);
-        authorize_request_with_location_constraint(req, Action::S3Action(S3Action::CreateBucketAction), location_constraint)
-            .await?;
-
-        if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
-            authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await?;
-            authorize_request(req, Action::S3Action(S3Action::PutBucketVersioningAction)).await?;
-        }
-
-        Ok(())
+        let object_lock_enabled = req.input.object_lock_enabled_for_bucket.is_some_and(|v| v);
+        access_owned::bucket_core::authorize_create_bucket(req, &bucket, location_constraint, object_lock_enabled)
+            .await
+            .map_err(Into::into)
     }
     /// Checks whether the AbortMultipartUpload request has accesses to the resources.
     ///
@@ -3329,10 +3322,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_acl(&self, req: &mut S3Request<GetBucketAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketAclAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketAclAction)).await
     }
 
     /// Checks whether the GetBucketAnalyticsConfiguration request has accesses to the resources.
@@ -3447,20 +3438,16 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy(&self, req: &mut S3Request<GetBucketPolicyInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, get_bucket_policy_authorize_action()).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, get_bucket_policy_authorize_action()).await
     }
 
     /// Checks whether the GetBucketPolicyStatus request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_policy_status(&self, req: &mut S3Request<GetBucketPolicyStatusInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPolicyStatusAction)).await
     }
 
     /// Checks whether the GetBucketReplication request has accesses to the resources.
@@ -3495,10 +3482,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_versioning(&self, req: &mut S3Request<GetBucketVersioningInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketVersioningAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketVersioningAction)).await
     }
 
     /// Checks whether the GetBucketWebsite request has accesses to the resources.
@@ -6670,16 +6655,21 @@ mod tests {
     }
 
     /// The table-policy, anonymous table and force-delete exits live deep in the authorization
-    /// flow and need a table catalog to reach. This source-level guard fails if one stops
-    /// auditing; it does not execute them.
+    /// flow and need a table catalog to reach. This source-level guard reads each exit in the file
+    /// that holds it and fails if one stops auditing; it does not execute them.
     #[test]
     fn denial_exits_without_a_context_call_the_audit_function() {
         // Only the production code counts; the tests' own calls must not satisfy the guard.
-        let source = include_str!("access.rs").split("\nmod tests {").next().unwrap();
-        for reason in [
-            "\"table_resource_policy_denied\"",
-            "\"anonymous_table_data_plane_access\"",
-            "\"recursive_force_delete_requires_authenticated_caller\"",
+        let access = include_str!("access.rs").split("\nmod tests {").next().unwrap();
+        // DeleteObject's decision lives in the owned module both edges call.
+        let object_misc = include_str!("access_owned/object_misc.rs")
+            .split("\nmod tests;")
+            .next()
+            .unwrap();
+        for (source, reason) in [
+            (access, "\"table_resource_policy_denied\""),
+            (access, "\"anonymous_table_data_plane_access\""),
+            (object_misc, "\"recursive_force_delete_requires_authenticated_caller\""),
         ] {
             let call = source
                 .match_indices("audit_request_denial(")

@@ -18,7 +18,9 @@
 //! Configurations are stored through the bucket metadata, not through their Put operations, so
 //! these tests do not depend on another increment being served.
 
-use super::{LEGACY, MatrixRow, Outcome, Refusal, USER_SECRET_KEY, create_bucket_in_the_store, outcome, s3_client, with_stack};
+use super::{
+    GATEWAY, LEGACY, MatrixRow, Outcome, Refusal, USER_SECRET_KEY, create_bucket_in_the_store, outcome, s3_client, with_stack,
+};
 use aws_sdk_s3::Client;
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
@@ -27,8 +29,28 @@ use rustfs_ecstore::api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPL
 use rustfs_ecstore::api::bucket::metadata_sys;
 use rustfs_iam::store::UserType;
 use rustfs_policy::policy::Policy;
+use rustfs_s3_ops::S3Operation;
 
-pub(crate) const MATRIX: &[MatrixRow] = &[];
+pub(crate) const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        operation: "GetBucketLifecycleConfiguration",
+        metric: S3Operation::GetBucketLifecycleConfiguration,
+        has_error_body: true,
+        call: stored::<0>,
+    },
+    MatrixRow {
+        operation: "GetBucketReplication",
+        metric: S3Operation::GetBucketReplication,
+        has_error_body: true,
+        call: stored::<1>,
+    },
+    MatrixRow {
+        operation: "GetObjectLockConfiguration",
+        metric: S3Operation::GetObjectLockConfiguration,
+        has_error_body: true,
+        call: stored::<2>,
+    },
+];
 
 /// Rules are disabled, so the stored documents change nothing another family's rows observe.
 const LIFECYCLE: &[u8] = b"<LifecycleConfiguration><Rule><Expiration><Days>30</Days></Expiration><Filter><Prefix>logs/</Prefix>\
@@ -51,6 +73,14 @@ async fn store_configurations(bucket: &str) {
             .await
             .unwrap_or_else(|error| panic!("store {file} on {bucket}: {error}"));
     }
+}
+
+/// The matrix serves root only where something is stored, so each row stores first.
+fn stored<'a, const READ: usize>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        store_configurations(bucket).await;
+        READS[READ](client, bucket).await
+    })
 }
 
 fn get_lifecycle<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -236,6 +266,11 @@ async fn assert_answers_what_is_stored(root: &Client, bucket: &str) {
         (retention.mode().map(|mode| mode.as_str()), retention.days(), retention.years()),
         (Some("GOVERNANCE"), Some(1), None)
     );
+}
+
+#[test]
+fn the_gateway_stack_answers_the_configuration_reads_as_stored() {
+    with_stack(GATEWAY, the_configuration_reads_answer_what_is_stored);
 }
 
 #[test]
