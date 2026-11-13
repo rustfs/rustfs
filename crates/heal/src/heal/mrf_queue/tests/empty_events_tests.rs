@@ -396,6 +396,77 @@ fn empty_events_keep_dirty_flush_failure_retry_and_cleanup_gates() {
 }
 
 #[test]
+fn legacy_park_replay_requires_committed_checkpoint() {
+    if isolated("legacy_park_replay_requires_committed_checkpoint") {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let (env, manager, mut runtime, anchor) = bound_runtime().await;
+            let original = runtime.partial_writes.checkpoint_records(intent_digest);
+            assert!(runtime.flush().await, "the active responsibility must be durable first");
+
+            // Losing the completed-task notice leaves the original active
+            // owner replayable. No physical result alone can discharge it.
+            let mut queue = MrfQueue::new(runtime.config.queue_capacity, runtime.config.journal_max_bytes);
+            let replay = replay_into(&manager, &mut queue, &mut None).await;
+            assert_eq!(replay.partial_writes.len(), original.len());
+            assert!(replay.partial_writes.iter().all(|(_, record)| {
+                !matches!(
+                    record.as_ref().expect("active companion").state,
+                    partial_write::ResponsibilityState::HeldUnverifiedLegacy { .. }
+                )
+            }));
+
+            note_mrf_unverified_legacy(MrfUnverifiedLegacyEvent { anchor: anchor.clone() });
+            runtime.discharge_durable_replay_anchors();
+            assert_eq!(runtime.partial_writes.lifecycle_summary().held_count, 1);
+            let paths = env
+                .disk_paths
+                .iter()
+                .map(|disk| (disk.join(".rustfs.sys"), disk.join(".mrf-park-sys-backup")))
+                .collect::<Vec<_>>();
+            for (path, backup) in &paths {
+                fs::rename(path, backup).expect("preserve committed active checkpoint");
+                fs::write(path, b"block held checkpoint publication").expect("inject publication failure");
+            }
+            let persisted = runtime.flush().await;
+            for (path, backup) in &paths {
+                fs::remove_file(path).expect("remove publication blocker");
+                fs::rename(backup, path).expect("restore committed active checkpoint");
+            }
+            assert!(!persisted);
+            assert!(runtime.dirty);
+            let mut queue = MrfQueue::new(runtime.config.queue_capacity, runtime.config.journal_max_bytes);
+            let replay = replay_into(&manager, &mut queue, &mut None).await;
+            let mut restored = replay
+                .partial_writes
+                .into_iter()
+                .map(|(_, record)| record.expect("previous active companion"))
+                .collect::<Vec<_>>();
+            let mut original = original;
+            restored.sort_by_key(|record| record.responsibility_id);
+            original.sort_by_key(|record| record.responsibility_id);
+            assert_eq!(restored, original, "a crash before commit may conservatively repeat Deep");
+
+            assert!(runtime.flush().await, "commit the held state after storage recovers");
+            let mut queue = MrfQueue::new(runtime.config.queue_capacity, runtime.config.journal_max_bytes);
+            let replay = replay_into(&manager, &mut queue, &mut None).await;
+            assert_eq!(replay.partial_writes.len(), original.len());
+            assert!(replay.partial_writes.iter().any(|(_, record)| {
+                matches!(
+                    record.as_ref().expect("committed held companion").state,
+                    partial_write::ResponsibilityState::HeldUnverifiedLegacy { .. }
+                )
+            }));
+            assert!(runtime.retained_replay_journal(), "parking never releases responsibility");
+        });
+}
+
+#[test]
 fn empty_events_real_consumer_stop_retains_unresolved_journal() {
     if isolated("empty_events_real_consumer_stop_retains_unresolved_journal") {
         return;

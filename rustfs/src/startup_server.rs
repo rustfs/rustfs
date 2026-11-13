@@ -41,7 +41,8 @@ const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
-const GATEWAY_STACK_NOT_ASSEMBLED: &str = "gateway stack is not assembled yet (rustfs/backlog#2734 T2.5)";
+#[cfg(not(feature = "gateway-stack"))]
+const GATEWAY_STACK_NOT_BUILT: &str = "RUSTFS_S3_STACK=gateway needs a binary built with the `gateway-stack` feature, which no release build enables (rustfs/backlog#2734)";
 
 pub(crate) struct StartupListenContext {
     pub(crate) readiness: Arc<GlobalReadiness>,
@@ -82,12 +83,7 @@ pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
 ) -> Result<StartupListenContext> {
-    match config.s3_stack {
-        S3Stack::Legacy => {}
-        // REPLACED BY T2.5
-        // Refuse before any listener or storage exists; never fall back to legacy.
-        S3Stack::Gateway => return Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_ASSEMBLED)),
-    }
+    refuse_unbuilt_stack(config.s3_stack)?;
     crate::server::init_console_prefix()?;
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
@@ -137,6 +133,18 @@ pub(crate) async fn init_startup_listen_context(
     })
 }
 
+/// Refuses a selected S3 stack this binary cannot serve, before any listener or storage exists.
+/// The selection is never replaced by another stack.
+fn refuse_unbuilt_stack(stack: S3Stack) -> Result<()> {
+    match stack {
+        S3Stack::Legacy => Ok(()),
+        #[cfg(feature = "gateway-stack")]
+        S3Stack::Gateway => Ok(()),
+        #[cfg(not(feature = "gateway-stack"))]
+        S3Stack::Gateway => Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_BUILT)),
+    }
+}
+
 pub(crate) async fn prepare_embedded_startup_config(
     address: String,
     access_key: String,
@@ -166,6 +174,10 @@ pub(crate) async fn prepare_embedded_startup_config(
     config.secret_key = secret_key.clone();
     config.region = Some(region.clone());
     config.console_enable = false;
+    // The stack is selected for the whole process, so an embedded server reads the same variable
+    // the binary does.
+    config.s3_stack = S3Stack::from_env()?;
+    refuse_unbuilt_stack(config.s3_stack)?;
 
     Ok(EmbeddedStartupConfig {
         config,
@@ -551,6 +563,26 @@ mod tests {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9002),
         ));
+    }
+
+    #[cfg(not(feature = "gateway-stack"))]
+    #[test]
+    fn a_binary_without_the_gateway_stack_refuses_to_select_it() {
+        let err = super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect_err("the gateway stack is not built");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("gateway-stack"), "{err}");
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    #[test]
+    fn a_binary_with_the_gateway_stack_accepts_its_selection() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect("the gateway stack is built");
+    }
+
+    #[test]
+    fn the_legacy_stack_is_always_selectable() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Legacy).expect("legacy is the default stack");
     }
 
     #[tokio::test]

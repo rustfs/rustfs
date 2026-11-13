@@ -80,7 +80,7 @@ impl FromStr for S3Stack {
 impl S3Stack {
     /// Unset selects the default; a set but invalid value, including an empty
     /// one, is a startup error.
-    fn from_env() -> std::io::Result<Self> {
+    pub(crate) fn from_env() -> std::io::Result<Self> {
         match std::env::var_os(ENV_RUSTFS_S3_STACK) {
             None => Ok(Self::default()),
             Some(value) => value

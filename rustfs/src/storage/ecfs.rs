@@ -13,17 +13,21 @@
 // limitations under the License.
 
 use super::{StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use crate::app::RequestEnvelope;
 use crate::error::ApiErrorDiagnostic;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
 use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
 use http::StatusCode;
+use rustfs_gateway_types::compat::ConversionError;
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_utils::http::headers::{AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::future::Future;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
@@ -280,6 +284,33 @@ pub(crate) fn validate_object_lock_configuration_input(input_cfg: &ObjectLockCon
     Ok(())
 }
 
+/// Runs a use case that speaks the request envelope and the gateway's types behind this edge: the
+/// input and the output cross the gateway's compatibility seam, and nothing else is converted.
+pub(in crate::storage) async fn through_gateway_seam<I, GatewayInput, GatewayOutput, O, F>(
+    req: S3Request<I>,
+    input_from_s3s: fn(I) -> Result<GatewayInput, ConversionError>,
+    output_to_s3s: fn(GatewayOutput) -> Result<O, ConversionError>,
+    use_case: impl FnOnce(RequestEnvelope, GatewayInput) -> F,
+) -> S3Result<S3Response<O>>
+where
+    F: Future<Output = rustfs_s3_types::S3Result<GatewayOutput>>,
+{
+    let envelope = RequestEnvelope::from_s3s(&req);
+    let input = input_from_s3s(req.input).map_err(seam_error)?;
+    let output = use_case(envelope, input).await?;
+    output_to_s3s(output).map(S3Response::new).map_err(seam_error)
+}
+
+/// A value this edge and the gateway's types disagree on, answered as a server fault. The seam's
+/// bucket and key conversions become typed with rustfs/gateway#1610; after that re-pin a name the
+/// gateway's floor refuses maps here to the client error the legacy edge answers.
+pub(in crate::storage) fn seam_error(error: ConversionError) -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::InternalError,
+        format!("failed to convert through the gateway compatibility seam: {error}"),
+    )
+}
+
 // The bodies of the methods below, one file per migration batch (rustfs/backlog#2765).
 #[path = "legacy_edge/mod.rs"]
 mod legacy_edge;
@@ -531,7 +562,15 @@ impl S3 for FS {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
         record_s3_op(S3Operation::ListBuckets);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_buckets(req).await
+        let mut response =
+            through_gateway_seam(req, list_buckets::input_from_s3s, list_buckets::output_to_s3s, |envelope, input| {
+                usecase.execute_list_buckets(envelope, input)
+            })
+            .await?;
+        // The seam writes a listing without buckets as an absent member. This edge has always
+        // answered the element, empty or not, and clients index the answer by it.
+        response.output.buckets.get_or_insert_with(Vec::new);
+        Ok(response)
     }
 
     async fn list_multipart_uploads(
