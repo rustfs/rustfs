@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+mod channel_reset_tests;
 pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.
@@ -3483,6 +3485,9 @@ pub enum ChannelClass {
 
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+// Quorum reads cancel RPCs in bursts. Retain their stream IDs through the
+// HTTP/2 grace period so late responses do not consume the protocol-error budget.
+const INTERNODE_RPC_RESET_STREAM_CAPACITY: usize = 8192;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
@@ -3808,6 +3813,7 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
         .concurrency_limit(concurrency_limit)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_RESET_STREAM_CAPACITY)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
         // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched

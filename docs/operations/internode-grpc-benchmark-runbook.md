@@ -72,6 +72,8 @@ All names are defined in `crates/io-metrics/src/internode_metrics.rs`.
 
 Explicit channel dial metrics start after endpoint settings validate and cover TLS configuration, waiting for its blocking task, and connection establishment. Each completed or cancelled attempt records one result. TLS configuration errors and acquisition cancellation contribute to `rustfs_system_network_internode_dial_errors_total`. Only connection failures follow the existing peer-unreachable classification. Cache hits reuse the existing channel, and coalesced callers share the dial owner's result. Tonic's internal TCP reconnects and HTTP/2 PING outcomes require their own transport observations.
 
+Internode clients retain up to 8,192 locally reset streams per connection so late responses to cancelled quorum reads can be ignored. The locked HTTP/2 library's one-second retention period and 1,024 local protocol-error reset limit remain unchanged. This increases bounded transport bookkeeping on both shared and bulk channels; measure memory alongside cancellation and GOAWAY counts. Responses arriving after expiration or beyond the retention capacity can still consume the error budget. This client-side setting requires no wire-format migration; rollback restores the previous capacity.
+
 | Metric | Stage signal |
 | --- | --- |
 | `rustfs_system_network_internode_operation_duration_ms{operation,backend}` | control-plane RTT (P0), lock/bulk latency (P1), first-op latency (P3) |
