@@ -539,10 +539,7 @@ pub mod default {
                         Statement {
                             sid: "".into(),
                             effect: Effect::Allow,
-                            actions: ActionSet(vec![
-                                Action::AdminAction(AdminAction::AllAdminActions),
-                                Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction),
-                            ]),
+                            actions: ActionSet(vec![Action::AdminAction(AdminAction::AllAdminActions)]),
                             not_actions: ActionSet(Default::default()),
                             resources: ResourceSet(Vec::new()),
                             conditions: Functions::default(),
@@ -648,7 +645,7 @@ mod test {
     use crate::policy::action::{AdminAction, KmsAction, S3Action};
 
     #[tokio::test]
-    async fn delegated_service_account_requires_a_named_grant_for_the_target() -> Result<()> {
+    async fn delegated_service_account_obeys_admin_wildcards_and_target_conditions() -> Result<()> {
         let conditions = HashMap::from([("TargetUser".into(), vec!["backup".into()])]);
         let args = Args {
             account: "operator",
@@ -662,9 +659,10 @@ mod test {
             deny_only: false,
         };
         for (statement, allowed) in [
-            (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), false),
+            (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), true),
             (serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccount"}), false),
-            (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), false),
+            (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), true),
+            (serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}), false),
             (
                 serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"backup"}}}),
                 true,
@@ -685,8 +683,13 @@ mod test {
             .find(|(name, _)| *name == "consoleAdmin")
             .expect("built-in admin policy");
         assert!(admin.1.is_allowed(&args).await);
-        let deny = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"admin:*"}]}"#)?;
-        assert!(!Policy::merge_policies(vec![admin.1.clone(), deny]).is_allowed(&args).await);
+        for denied_action in ["admin:*", "admin:CreateServiceAccountForUser"] {
+            let deny = Policy::parse_config(&serde_json::to_vec(&serde_json::json!({
+                "Version": DEFAULT_VERSION,
+                "Statement": [{"Effect": "Deny", "Action": denied_action}]
+            }))?)?;
+            assert!(!Policy::merge_policies(vec![admin.1.clone(), deny]).is_allowed(&args).await);
+        }
         Ok(())
     }
 

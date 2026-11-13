@@ -199,10 +199,12 @@ impl Action {
             // NotAction exclusions to cover every action family.
             return deny || Self::S3Action(S3Action::AllActions).is_match_for_effect(action, false);
         }
-        // Credential delegation and force-delete require a named Allow.
-        // Wildcard Deny statements continue to cover these actions.
-        if !deny && action_requires_explicit_grant(action) {
-            return self == action;
+        // Force-delete bypasses emptiness and version checks. A blanket `s3:*`
+        // / `*` Allow (including canned consoleAdmin) must not confer it; the
+        // statement has to name `s3:ForceDeleteBucket` or `s3:ForceDeleteObject`.
+        // The same wildcard on a Deny still matches, so explicit deny wins.
+        if !deny && matches!(self, Action::S3Action(S3Action::AllActions)) && action_requires_explicit_grant(action) {
+            return false;
         }
         wildcard::is_match::<&str, &str>(self.into(), action.into())
     }
@@ -212,7 +214,6 @@ fn action_requires_explicit_grant(action: &Action) -> bool {
     matches!(
         action,
         Action::S3Action(S3Action::ForceDeleteBucketAction | S3Action::ForceDeleteObjectAction)
-            | Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction)
     )
 }
 

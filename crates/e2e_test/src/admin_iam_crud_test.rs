@@ -357,11 +357,14 @@ async fn test_delegated_service_account_creation_through_console_sessions() -> T
     let target = "backup-user";
     let operator = "backup-operator";
     let operator_secret = "operatorSecret123";
+    let wildcard_admin = "backup-admin";
+    let wildcard_secret = "adminSecret123";
     let s3 = env.create_s3_client();
     s3.create_bucket().bucket(bucket).send().await?;
     for (name, secret) in [
         (target, "backupSecret123"),
         (operator, operator_secret),
+        (wildcard_admin, wildcard_secret),
         ("other-user", "otherUserSecret123"),
     ] {
         admin_ok(
@@ -380,7 +383,15 @@ async fn test_delegated_service_account_creation_through_console_sessions() -> T
             {"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":target}}}
         ]
     });
+    let wildcard = serde_json::json!({
+        "Version":"2012-10-17",
+        "Statement":[
+            {"Effect":"Allow","Action":"admin:*"},
+            {"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:s3:::*"}
+        ]
+    });
     for (user, name, policy) in [
+        (wildcard_admin, "backup-admin-wildcard", wildcard.to_string()),
         (target, "backup-writer", bucket_rw_policy(bucket)),
         (operator, "backup-key-manager", delegation.to_string()),
     ] {
@@ -401,6 +412,7 @@ async fn test_delegated_service_account_creation_through_console_sessions() -> T
     }
     for (name, secret) in [
         (operator, operator_secret),
+        (wildcard_admin, wildcard_secret),
         (env.access_key.as_str(), env.secret_key.as_str()),
     ] {
         let session = build_test_sts_client(&env.url, name, secret, None, "delegated-create")
@@ -433,11 +445,13 @@ async fn test_delegated_service_account_creation_through_console_sessions() -> T
             .await
             .expect_err("target cannot create unrelated buckets");
         assert_eq!(denied.as_service_error().and_then(|e| e.code()), Some("AccessDenied"));
+        if name != env.access_key {
+            let (status, _) = create(&env.access_key).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "delegated targets exclude root");
+        }
         if name == operator {
-            for excluded in [env.access_key.as_str(), "other-user"] {
-                let (status, _) = create(excluded).await?;
-                assert_eq!(status, StatusCode::FORBIDDEN, "outside delegated target");
-            }
+            let (status, _) = create("other-user").await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "outside delegated target");
         }
     }
     let restricted = build_test_sts_client(&env.url, &env.access_key, &env.secret_key, None, "restricted-root")
