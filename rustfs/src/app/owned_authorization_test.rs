@@ -672,8 +672,8 @@ fn owned_and_legacy_conditions_read_the_same_request_body_policy_inputs() {
     let legal_hold = ObjectLockLegalHold {
         status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
     };
-    body.extensions.insert(RequestedObjectLegalHold(legal_hold));
-    body.extensions.insert(RequestedObjectTags(Tagging {
+    body.extensions.insert(RequestedObjectLegalHold::from(&legal_hold));
+    body.extensions.insert(RequestedObjectTags::from(&Tagging {
         tag_set: vec![Tag {
             key: Some("body".to_owned()),
             value: Some("xml".to_owned()),
@@ -685,6 +685,85 @@ fn owned_and_legacy_conditions_read_the_same_request_body_policy_inputs() {
     }
     assert_eq!(values(&owned, "object-lock-legal-hold"), Some(vec!["ON".to_owned()]));
     assert_eq!(values(&owned, "RequestObjectTag/body"), Some(vec!["xml".to_owned()]));
+}
+
+#[test]
+fn installed_body_inputs_describe_the_request_the_same_on_both_forms() {
+    use crate::app::storage_api::owned_parity::AuthorizationRequest;
+
+    let credentials = rustfs_credentials::Credentials::default();
+    let principal = AuthzPrincipal::new(&credentials, "");
+    let target = |action| AuthzTarget {
+        action: Action::S3Action(action),
+        bucket: "bucket",
+        object: "object",
+        version_id: None,
+        location_constraint: None,
+    };
+    // The headers name other values; only the installed bodies may describe the request.
+    let mut legacy = build_request((), Method::PUT);
+    legacy
+        .headers
+        .insert("x-amz-tagging", HeaderValue::from_static("from=header"));
+    legacy
+        .headers
+        .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+    legacy
+        .headers
+        .insert("x-amz-object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
+    let tagging = Tagging {
+        tag_set: vec![
+            Tag {
+                key: Some("class".to_owned()),
+                value: Some("public".to_owned()),
+            },
+            // A tag without a value names no condition, on either form.
+            Tag {
+                key: Some("incomplete".to_owned()),
+                value: None,
+            },
+        ],
+    };
+    let retention = ObjectLockRetention {
+        mode: Some("GOVERNANCE".to_owned().into()),
+        retain_until_date: None,
+    };
+    let mut owned = RequestEnvelope::from_s3s(&legacy);
+    legacy.install_requested_object_tags(RequestedObjectTags::from(&tagging));
+    owned.install_requested_object_tags(RequestedObjectTags::from(&tagging));
+    legacy.install_requested_legal_hold(RequestedObjectLegalHold::default());
+    owned.install_requested_legal_hold(RequestedObjectLegalHold::default());
+    legacy.install_requested_retention(RequestedObjectLockRetention::from(&retention));
+    owned.install_requested_retention(RequestedObjectLockRetention::from(&retention));
+
+    for action in [
+        S3Action::PutObjectTaggingAction,
+        S3Action::PutObjectLegalHoldAction,
+        S3Action::PutObjectRetentionAction,
+    ] {
+        let legacy_conditions =
+            support::authorization_conditions(&legacy, &principal, &support::request_authz_facts(&legacy, target(action)))
+                .expect("legacy conditions");
+        let owned_conditions =
+            support::authorization_conditions(&owned, &principal, &support::request_authz_facts(&owned, target(action)))
+                .expect("owned conditions");
+        for key in [
+            "RequestObjectTag/class",
+            "RequestObjectTag/incomplete",
+            "RequestObjectTag/from",
+            "RequestObjectTagKeys",
+            "object-lock-legal-hold",
+            "object-lock-mode",
+        ] {
+            assert_eq!(owned_conditions.get(key), legacy_conditions.get(key), "{action:?} {key}");
+        }
+        // The installed body, not the headers, describes the request.
+        assert_eq!(owned_conditions.get("RequestObjectTagKeys"), Some(&vec!["class".to_owned()]));
+        assert_eq!(owned_conditions.get("RequestObjectTag/from"), None);
+        assert_eq!(owned_conditions.get("RequestObjectTag/incomplete"), None);
+        assert_eq!(owned_conditions.get("object-lock-legal-hold"), None);
+        assert_eq!(owned_conditions.get("object-lock-mode"), Some(&vec!["GOVERNANCE".to_owned()]));
+    }
 }
 
 #[test]
@@ -1081,7 +1160,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
             request(Extensions::new()),
             Action::S3Action(S3Action::PutObjectLegalHoldAction),
             |e| {
-                e.insert(RequestedObjectLegalHold(Default::default()));
+                e.insert(RequestedObjectLegalHold::default());
             },
         ),
         (
@@ -1089,7 +1168,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
             request(Extensions::new()),
             Action::S3Action(S3Action::PutObjectTaggingAction),
             |e| {
-                e.insert(RequestedObjectTags(Default::default()));
+                e.insert(RequestedObjectTags::default());
             },
         ),
         (
@@ -1097,7 +1176,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
             request(Extensions::new()),
             Action::S3Action(S3Action::PutObjectVersionTaggingAction),
             |e| {
-                e.insert(RequestedObjectTags(Default::default()));
+                e.insert(RequestedObjectTags::default());
             },
         ),
         (
@@ -1105,7 +1184,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
             request(Extensions::new()),
             Action::S3Action(S3Action::PutObjectRetentionAction),
             |e| {
-                e.insert(RequestedObjectLockRetention(Default::default()));
+                e.insert(RequestedObjectLockRetention::default());
             },
         ),
         ("post form", post(), put_object, |e| {
@@ -1388,7 +1467,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             facts: |req| {
                 req.headers
                     .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("OFF"));
-                req.extensions.insert(RequestedObjectLegalHold(ObjectLockLegalHold {
+                req.extensions.insert(RequestedObjectLegalHold::from(&ObjectLockLegalHold {
                     status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
                 }));
             },
@@ -1403,7 +1482,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             facts: |req| {
                 req.headers
                     .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
-                req.extensions.insert(RequestedObjectLegalHold(ObjectLockLegalHold {
+                req.extensions.insert(RequestedObjectLegalHold::from(&ObjectLockLegalHold {
                     status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
                 }));
             },
@@ -1417,7 +1496,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             action: S3Action::PutObjectTaggingAction,
             facts: |req| {
                 req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=secret"));
-                req.extensions.insert(RequestedObjectTags(Tagging {
+                req.extensions.insert(RequestedObjectTags::from(&Tagging {
                     tag_set: vec![Tag {
                         key: Some("class".to_owned()),
                         value: Some("public".to_owned()),
@@ -1434,7 +1513,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             action: S3Action::PutObjectTaggingAction,
             facts: |req| {
                 req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=public"));
-                req.extensions.insert(RequestedObjectTags(Tagging {
+                req.extensions.insert(RequestedObjectTags::from(&Tagging {
                     tag_set: vec![Tag {
                         key: Some("class".to_owned()),
                         value: Some("secret".to_owned()),
@@ -1553,8 +1632,9 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         });
         (case.facts)(&mut legacy);
         let mut owned = RequestEnvelope::from_s3s(&legacy);
-        // The object shape both edges' access hooks call: it must reach the same decision.
-        let mut owned_shape = RequestEnvelope::from_s3s(&legacy);
+        // The object shape both edges' access hooks call, on a forked envelope as an archive
+        // member is authorized: it must reach the same decision.
+        let mut owned_shape = RequestEnvelope::from_s3s(&legacy).fork_for_authorization();
         let action = Action::S3Action(case.action);
         let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
@@ -1594,7 +1674,7 @@ fn retain(req: &mut S3Request<()>, mode: &'static str, days: i64) {
         mode: Some(mode.to_owned().into()),
         ..Default::default()
     };
-    req.extensions.insert(RequestedObjectLockRetention(retention));
+    req.extensions.insert(RequestedObjectLockRetention::from(&retention));
     req.extensions.insert(RequestedObjectLockRetainUntil(
         time::OffsetDateTime::now_utc() + time::Duration::days(days),
     ));

@@ -147,11 +147,13 @@ where
 
 /// Own a parsed mutation through its storage and event/audit completion.
 /// Dropping the HTTP waiter does not cancel the operation. Streaming bodies
-/// must use their bounded upload owner instead of this entry point.
-pub(crate) async fn run_owned_mutation<T, F>(operation: F) -> S3Result<S3Response<T>>
+/// must use their bounded upload owner instead of this entry point. Generic
+/// over the result, so a legacy and an owned use case share it.
+pub(crate) async fn run_owned_mutation<R, E, F>(operation: F) -> Result<R, E>
 where
-    T: Send + 'static,
-    F: Future<Output = S3Result<S3Response<T>>> + Send + 'static,
+    R: Send + 'static,
+    E: From<rustfs_s3_types::S3Error> + Send + 'static,
+    F: Future<Output = Result<R, E>> + Send + 'static,
 {
     let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
     let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
@@ -167,7 +169,7 @@ where
     );
     super::request_context::spawn_traced_join(operation)
         .await
-        .map_err(|_| s3s::s3_error!(InternalError, "object mutation owner task failed"))?
+        .map_err(|_| E::from(rustfs_s3_types::s3_error!(InternalError, "object mutation owner task failed")))?
 }
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
