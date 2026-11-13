@@ -14,6 +14,7 @@
 
 use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
+use crate::erasure::codec::shard_buf::ShardAppend;
 use pin_project_lite::pin_project;
 use rustfs_utils::{HashAlgorithm, LogThrottle};
 use std::future::poll_fn;
@@ -184,7 +185,8 @@ where
 
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+        let verify = self.verify_scratch(need).await?;
+        let data = &self.buf[self.hash_algo.size()..need];
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(data).await?;
         }
@@ -322,6 +324,143 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
     Ok((data, verify))
 }
 
+/// Smallest frame verified off the decode task (see
+/// `RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES`), read once.
+fn verify_offload_min_bytes() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_BITROT_VERIFY_OFFLOAD_MIN_BYTES,
+            rustfs_config::DEFAULT_BITROT_VERIFY_OFFLOAD_MIN_BYTES,
+        )
+    })
+}
+
+fn should_offload_verify(skip_verify: bool, frame_len: usize) -> bool {
+    let min = verify_offload_min_bytes();
+    !skip_verify && min != 0 && frame_len >= min
+}
+
+fn join_error(error: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
+/// Verifies an owned frame (`hash || data`) on the blocking pool and returns
+/// the verification time; the caller still owns `frame` through the clone.
+/// Verifies an owned frame (`hash || data`) on the blocking pool and appends
+/// its data to `out` there, so the 4 MiB copy runs beside the hash on a
+/// blocking thread instead of serializing with the other shards of the
+/// stripe on the reader's task.
+async fn verify_and_append_off_thread<B: ShardAppend>(
+    hash_algo: &HashAlgorithm,
+    frame: bytes::Bytes,
+    hash_size: usize,
+    out: &mut B,
+) -> std::io::Result<Duration> {
+    let hash_algo = hash_algo.clone();
+    let mut taken = std::mem::take(out);
+    let (taken, result) = tokio::task::spawn_blocking(move || {
+        let result = split_and_verify(&hash_algo, false, &frame).map(|(_, verify)| verify);
+        if result.is_ok() {
+            taken.extend_from_slice(&frame[hash_size..]);
+        }
+        (taken, result)
+    })
+    .await
+    .map_err(join_error)?;
+    *out = taken;
+    result
+}
+
+/// Verifies a frame spread over `chunks` followed by `tail` (the chunk handoff
+/// path) against the hash in its first `hash_size` bytes.
+fn verify_chunked_frame(
+    hash_algo: &HashAlgorithm,
+    chunks: &[bytes::Bytes],
+    tail: &[u8],
+    hash_size: usize,
+    want: usize,
+) -> std::io::Result<Duration> {
+    let block_chunks = || {
+        chunks
+            .iter()
+            .map(|chunk| chunk.as_ref())
+            .chain((!tail.is_empty()).then_some(tail))
+    };
+    let verify_start = std::time::Instant::now();
+    let actual_hash = hash_algo.hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
+        let start = (*skip).min(chunk.len());
+        *skip -= start;
+        Some(&chunk[start..])
+    }));
+    let verify = verify_start.elapsed();
+    let mut hash_offset = 0;
+    let mut remaining = hash_size;
+    for chunk in block_chunks() {
+        let take = remaining.min(chunk.len());
+        if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
+            log_hash_mismatch(want);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+        }
+        hash_offset += take;
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(verify)
+}
+
+impl<R> BitrotReader<R> {
+    /// Verifies the frame held in `self.buf[..need]`, off-thread when it is large.
+    /// Verifies the scratch block and appends its data to `out`; both run on
+    /// the blocking pool when the block is large enough to offload.
+    async fn verify_scratch_appending<B: ShardAppend>(
+        &mut self,
+        need: usize,
+        hash_size: usize,
+        out: &mut B,
+    ) -> std::io::Result<Duration> {
+        if !should_offload_verify(self.skip_verify, need) {
+            let verify = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need]).map(|(_, verify)| verify)?;
+            out.extend_from_slice(&self.buf[hash_size..need]);
+            return Ok(verify);
+        }
+        let hash_algo = self.hash_algo.clone();
+        let buf = std::mem::take(&mut self.buf);
+        let mut taken = std::mem::take(out);
+        let (buf, taken, result) = tokio::task::spawn_blocking(move || {
+            let result = split_and_verify(&hash_algo, false, &buf[..need]).map(|(_, verify)| verify);
+            if result.is_ok() {
+                taken.extend_from_slice(&buf[hash_size..need]);
+            }
+            (buf, taken, result)
+        })
+        .await
+        .map_err(join_error)?;
+        self.buf = buf;
+        *out = taken;
+        result
+    }
+
+    async fn verify_scratch(&mut self, need: usize) -> std::io::Result<Duration> {
+        if !should_offload_verify(self.skip_verify, need) {
+            return split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need]).map(|(_, verify)| verify);
+        }
+        // Hand the scratch buffer to the blocking task and take it back after.
+        let hash_algo = self.hash_algo.clone();
+        let buf = std::mem::take(&mut self.buf);
+        let (buf, result) = tokio::task::spawn_blocking(move || {
+            let result = split_and_verify(&hash_algo, false, &buf[..need]).map(|(_, verify)| verify);
+            (buf, result)
+        })
+        .await
+        .map_err(join_error)?;
+        self.buf = buf;
+        result
+    }
+}
+
 impl<R> BitrotReader<R>
 where
     R: ShardSource,
@@ -337,9 +476,21 @@ where
     /// did not write is ever observable — the zeroing bought nothing.
     ///
     /// On return `out.len()` has grown by exactly the returned count.
-    pub async fn read_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+    pub async fn read_appending<B: ShardAppend>(&mut self, out: &mut B, want: usize) -> std::io::Result<usize> {
         let start = out.len();
+        let arena_in = out.lives_in_arena();
         let count = self.read_appending_frame(out, want).await?;
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            // Where the shard buffer lives before and after the frame read: a
+            // buffer that enters in the arena and leaves on the heap was moved
+            // by a reservation larger than its block.
+            let stage = match (arena_in, out.lives_in_arena()) {
+                (true, true) => "bitrot_arena_kept",
+                (true, false) => "bitrot_arena_lost",
+                (false, _) => "bitrot_heap_in",
+            };
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", stage, 0.0);
+        }
         if let Some(integrity) = &mut self.integrity
             && let Err(error) = integrity.verify(&out[start..]).await
         {
@@ -349,12 +500,15 @@ where
         Ok(count)
     }
 
-    async fn read_appending_frame(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+    async fn read_appending_frame<B: ShardAppend>(&mut self, out: &mut B, want: usize) -> std::io::Result<usize> {
         use bytes::BufMut as _;
         use tokio::io::AsyncReadExt as _;
 
         self.begin_read(want)?;
         out.reserve(want);
+        if rustfs_io_metrics::get_stage_metrics_enabled() && !out.lives_in_arena() {
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "bitrot_heap_after_reserve", want as f64);
+        }
         let hash_size = self.hash_algo.size();
 
         // No-hash path: read straight into `out`'s spare capacity. `read_buf`
@@ -379,8 +533,16 @@ where
         let need = hash_size + want;
 
         if let Some(block) = self.inner.try_take_block(need) {
-            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
-            out.extend_from_slice(data);
+            if rustfs_io_metrics::get_stage_metrics_enabled() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "bitrot_branch_block", block.len() as f64);
+            }
+            let verify = if should_offload_verify(self.skip_verify, block.len()) {
+                verify_and_append_off_thread(&self.hash_algo, block, hash_size, out).await?
+            } else {
+                let verify = split_and_verify(&self.hash_algo, self.skip_verify, &block)?.1;
+                out.extend_from_slice(&block[hash_size..]);
+                verify
+            };
             self.last_verify_duration = verify;
             return Ok(want);
         }
@@ -455,50 +617,44 @@ where
         if handed_off {
             if self.chunks.len() == 1 && self.buf.is_empty() {
                 let block = &self.chunks[0];
-                let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, block)?;
-                out.extend_from_slice(data);
+                let verify = if should_offload_verify(self.skip_verify, block.len()) {
+                    verify_and_append_off_thread(&self.hash_algo, block.clone(), hash_size, out).await?
+                } else {
+                    let verify = split_and_verify(&self.hash_algo, self.skip_verify, block)?.1;
+                    out.extend_from_slice(&block[hash_size..]);
+                    verify
+                };
                 self.last_verify_duration = verify;
                 return Ok(want);
             }
 
-            let block_chunks = || {
-                self.chunks
-                    .iter()
-                    .map(|chunk| chunk.as_ref())
-                    .chain((!self.buf.is_empty()).then_some(self.buf.as_slice()))
-            };
+            if should_offload_verify(self.skip_verify, need) {
+                // Move the chunks, the tail and the output to the blocking task
+                // and take them back: the copy is as long as the hash, and the
+                // stripe's other shards are doing the same on their own threads.
+                let hash_algo = self.hash_algo.clone();
+                let chunks = std::mem::take(&mut self.chunks);
+                let tail = std::mem::take(&mut self.buf);
+                let mut taken = std::mem::take(out);
+                let (chunks, tail, taken, result) = tokio::task::spawn_blocking(move || {
+                    let result = verify_chunked_frame(&hash_algo, &chunks, &tail, hash_size, want);
+                    if result.is_ok() {
+                        append_chunked_data(&mut taken, &chunks, &tail, hash_size);
+                    }
+                    (chunks, tail, taken, result)
+                })
+                .await
+                .map_err(join_error)?;
+                self.chunks = chunks;
+                self.buf = tail;
+                *out = taken;
+                self.last_verify_duration = result?;
+                return Ok(want);
+            }
             if !self.skip_verify {
-                let verify_start = std::time::Instant::now();
-                let actual_hash = self
-                    .hash_algo
-                    .hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
-                        let start = (*skip).min(chunk.len());
-                        *skip -= start;
-                        Some(&chunk[start..])
-                    }));
-                let verify = verify_start.elapsed();
-                let mut hash_offset = 0;
-                let mut remaining = hash_size;
-                for chunk in block_chunks() {
-                    let take = remaining.min(chunk.len());
-                    if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
-                        log_hash_mismatch(want);
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
-                    }
-                    hash_offset += take;
-                    remaining -= take;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-                self.last_verify_duration = verify;
+                self.last_verify_duration = verify_chunked_frame(&self.hash_algo, &self.chunks, &self.buf, hash_size, want)?;
             }
-            let mut skip = hash_size;
-            for chunk in block_chunks() {
-                let start = skip.min(chunk.len());
-                skip -= start;
-                out.extend_from_slice(&chunk[start..]);
-            }
+            append_chunked_data(out, &self.chunks, &self.buf, hash_size);
             return Ok(want);
         }
 
@@ -506,10 +662,24 @@ where
         // the sink differs (`extend_from_slice` into `out` instead of
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
-        out.extend_from_slice(data);
+        let verify = self.verify_scratch_appending(need, hash_size, out).await?;
         self.last_verify_duration = verify;
         Ok(want)
+    }
+}
+
+/// Appends the data of a chunked frame (`hash || data` spread over `chunks`
+/// and `tail`) to `out`.
+fn append_chunked_data<B: ShardAppend>(out: &mut B, chunks: &[bytes::Bytes], tail: &[u8], hash_size: usize) {
+    let mut skip = hash_size;
+    for chunk in chunks
+        .iter()
+        .map(|chunk| chunk.as_ref())
+        .chain((!tail.is_empty()).then_some(tail))
+    {
+        let start = skip.min(chunk.len());
+        skip -= start;
+        out.extend_from_slice(&chunk[start..]);
     }
 }
 

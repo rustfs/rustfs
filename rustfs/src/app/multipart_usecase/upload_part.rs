@@ -150,10 +150,12 @@ impl DefaultMultipartUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let multipart_info_started = rustfs_io_metrics::put_stage_timer();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(multipart_upload_api_error)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
@@ -239,10 +241,19 @@ impl DefaultMultipartUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         let mut write_plan = WritePlan::new();
+        let etag_algorithm = multipart_etag_algorithm(&fi.user_defined);
         let mut reader = if is_disk_compressed {
             let algorithm = CompressionAlgorithm::default();
-            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
-                .map_err(ApiError::from)?;
+            let mut hrd = HashReader::from_stream_with_etag(
+                body,
+                size,
+                actual_size,
+                md5hex.take(),
+                sha256hex.take(),
+                false,
+                etag_algorithm,
+            )
+            .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
                 return Err(ApiError::from(err).into());
@@ -252,7 +263,8 @@ impl DefaultMultipartUsecase {
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            HashReader::from_stream_with_etag(body, size, actual_size, md5hex, sha256hex, false, etag_algorithm)
+                .map_err(ApiError::from)?
         };
 
         if let Err(err) = reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), size < 0) {

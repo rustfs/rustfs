@@ -435,6 +435,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/on-demand-migration/{bucket}",
         SET_BUCKET_ON_DEMAND_MIGRATION,
         RouteRiskLevel::High,

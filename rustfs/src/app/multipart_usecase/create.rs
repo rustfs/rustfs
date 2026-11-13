@@ -134,6 +134,9 @@ impl DefaultMultipartUsecase {
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
         }
+        if bucket_uses_xxh3_etag(&bucket) {
+            insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
+        }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some()
             || object_lock_retain_until_date.is_some()

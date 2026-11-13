@@ -762,8 +762,7 @@ async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, buck
     let (pools, _) = EndpointServerPools::create_server_endpoints(&env.address, &layout).await?;
     let context = std::sync::Arc::new(InstanceContext::new());
     init_local_disks_with_instance_ctx(&context, pools.clone()).await?;
-    let address = env.address.parse()?;
-    let store = ECStore::new_with_instance_ctx(address, pools, Default::default(), context.clone()).await?;
+    let store = ECStore::new_with_instance_ctx(env.address.parse()?, pools, Default::default(), context.clone()).await?;
     let _cancel = context
         .background_cancel_token()
         .expect("store binds its shutdown token")
@@ -784,24 +783,8 @@ async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, buck
     Ok(())
 }
 
-#[test]
-fn test_bucket_tags_opa_contract() -> TestResult {
-    // Offline ECStore initialization needs space for nested debug poll frames,
-    // even when its outer future is boxed. Keep that budget local to this test.
-    std::thread::Builder::new()
-        .name("bucket-tags-opa-contract".to_owned())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(bucket_tags_opa_contract())
-        })?
-        .join()
-        .expect("bucket tag OPA contract thread should complete")
-}
-
-async fn bucket_tags_opa_contract() -> TestResult {
+#[tokio::test]
+async fn test_bucket_tags_opa_contract() -> TestResult {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, TaggingDirective, VersioningConfiguration,

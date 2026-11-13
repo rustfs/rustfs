@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::s3::dto::{
     BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    GetBucketLocationInput, GetBucketLocationOutput, HeadBucketInput, HeadBucketOutput,
+    GetBucketLocationInput, GetBucketLocationOutput,
 };
 use crate::app::storage_api::s3::region::Region;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
@@ -279,21 +279,27 @@ impl DefaultBucketUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        record_s3_op(S3Operation::HeadBucket);
-        let input = req.input;
-
+    /// Answers whether `input.bucket` exists, for either edge. The access phase has authorized it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized; otherwise the storage error of the
+    /// lookup, `NoSuchBucket` among them.
+    #[instrument(level = "debug", skip(self, input))]
+    pub async fn execute_head_bucket(
+        &self,
+        input: gateway_dto::HeadBucketInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::HeadBucketOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        Ok(gateway_dto::HeadBucketOutput::default())
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -496,15 +502,17 @@ mod tests {
 
     #[tokio::test]
     async fn execute_head_bucket_returns_internal_error_when_store_uninitialized() {
-        let input = HeadBucketInput::builder().bucket("test-bucket".to_string()).build().unwrap();
-
-        let req = build_request(input, Method::HEAD);
+        let input = gateway_dto::HeadBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
         let before = s3_op_total(S3Operation::HeadBucket);
 
-        let err = usecase.execute_head_bucket(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(s3_op_total(S3Operation::HeadBucket), before + 1);
+        let err = usecase.execute_head_bucket(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+        // Each edge counts the operation once, before it calls the use case.
+        assert_eq!(s3_op_total(S3Operation::HeadBucket), before);
     }
 
     #[tokio::test]

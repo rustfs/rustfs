@@ -690,7 +690,7 @@ class GateTests(unittest.TestCase):
         warm_key = key(json.loads(original)['cache-warm.yml'], 'warm-ci-dev')['cache-shared-key']
         readers = [(workflow, job) for workflow in ('ci.yml', 'reference-parity.yml') for job, block in json.loads(original)[workflow].items()
                    if any(item.get('with', {}).get('cache-shared-key') == warm_key for item in block.get('steps', []))]
-        self.assertEqual(len(readers), 6)
+        self.assertEqual(len(readers), 7)
         for workflow, job in (('cache-warm.yml', 'warm-ci-dev'), ('ci.yml', 'workspace-clippy'), ('reference-parity.yml', 'build-candidate')):
             mutations.append((lambda d, workflow=workflow, job=job: key(d[workflow], job).update({'cache-shared-key': 'ci-dev-0'}),
                               f'{workflow} {job} uses cache key ci-dev-0; the ci-dev key for these warm commands is {warm_key}'))

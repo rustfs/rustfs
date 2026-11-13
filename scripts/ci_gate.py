@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
     "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-rio-v2",
-    "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
+    "test-and-lint-protocols", "test-and-lint-gateway-stack", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 # Specialized boundary, hardware and alternate-feature lanes do not gate a
@@ -34,7 +34,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "7"
+PLAN_CONTRACT = "8"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -371,6 +371,8 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
         ("protocol-sftp-tests", "test-and-lint-protocols", "test", ["sftp"]),
         ("protocol-http3-lint", "test-and-lint-protocols", "dev", ["http3", "swift"]),
         ("protocol-http3-tests", "test-and-lint-protocols", "test", ["http3", "swift"]),
+        ("gateway-stack-lint", "test-and-lint-gateway-stack", "dev", ["gateway-stack"]),
+        ("gateway-stack-tests", "test-and-lint-gateway-stack", "test", ["gateway-stack"]),
         ("server-rio-v2", "build-rustfs-debug-binary-rio-v2", "dev", ["e2e-test-hooks", "rio-v2"]),
     ]
     return [{"id": identity, "job": job, "target": "x86_64-unknown-linux-gnu", "profile": profile,

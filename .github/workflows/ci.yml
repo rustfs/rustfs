@@ -118,7 +118,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=7$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=8$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'gateway_smoke=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -469,7 +469,7 @@ jobs:
       # hold. `cargo check --release` is metadata-only and needs no
       # link-concurrency limit; it is cold because ci-dev holds no release
       # artifacts.
-      - name: Reject short credentials in release builds
+      - name: Reject debug-only features in release builds
         run: python3 scripts/check_connect_release_boundary.py
 
       - name: Check offline enrollment E2E root boundary
@@ -675,6 +675,54 @@ jobs:
             artifacts/workspace
           retention-days: 3
           if-no-files-found: warn
+
+  test-and-lint-gateway-stack:
+    name: Test and Lint (gateway-stack)
+    # The gateway S3 stack (rustfs/backlog#2734) sits behind the rustfs
+    # `gateway-stack` feature, which no other pull-request lane lints or tests.
+    # Unlike the dormant feature lanes above, this one runs for every code
+    # change: each operation slice puts its handler tests and its refusal-matrix
+    # row behind the feature, and a lane that ran only on demand would let them
+    # rot behind a green pull request.
+    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    needs: [ quick-checks, classify-changes ]
+    # Self-hosted for build scale and cache ownership: a workspace-scale Cargo
+    # build that reads the ci-dev cache written on this image.
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      # A feature that does not compile fails here; nothing below is skipped
+      # into a pass.
+      - name: Run clippy with gateway-stack
+        run: cargo clippy --locked -p rustfs --all-targets --features gateway-stack -- -D warnings
+
+      # The gateway stack's own tests: the assembly, the operation table and
+      # its completeness, the shared handler sequence, the stack selection, and
+      # the embedded server driven through the whole middleware stack. The
+      # filter names modules, never operations.
+      - name: Run tests with gateway-stack
+        env:
+          # The same bounded link concurrency as the other feature lanes.
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo nextest run --profile ci --locked -p rustfs --features gateway-stack --no-tests fail \
+            --status-level all --final-status-level all \
+            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | binary(embedded_gateway_stack_test)'
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
@@ -1564,6 +1612,7 @@ jobs:
       - fips-provider
       - test-and-lint-rio-v2
       - test-and-lint-protocols
+      - test-and-lint-gateway-stack
       - build-rustfs-debug-binary
       - uring-integration
       - e2e-tests
@@ -1599,6 +1648,7 @@ jobs:
       - core-contract
       - test-and-lint-rio-v2
       - test-and-lint-protocols
+      - test-and-lint-gateway-stack
       - build-rustfs-debug-binary
       - build-rustfs-debug-binary-rio-v2
       - uring-integration

@@ -978,6 +978,31 @@
       "alert_contract": "scheduled-validation"
     },
     {
+      "workflow": ".github/workflows/gateway-acceptance.yml",
+      "name": "Gateway Acceptance",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "29 3 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 36,
+      "result_owner": "gateway-acceptance.yml",
+      "disposition": "gateway conformance corpus (rustfs profile) and client matrix against the candidate on both S3 stacks",
+      "failure_owner": "watchdog",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/gateway-integration-sync.yml",
       "name": "Gateway Integration Sync",
       "roles": [
