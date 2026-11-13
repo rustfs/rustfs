@@ -182,6 +182,10 @@ pub struct LockEntry {
     #[serde(rename = "type")]
     pub lock_type: &'static str,
     pub owner: String,
+    /// Physical guards sampled for this node-local resource, version, mode and owner cohort.
+    /// Collection is not a cluster-wide atomic snapshot; older responses omit this count.
+    /// Consumers must treat an omitted count as unknown.
+    pub holder_count: u32,
     pub priority: &'static str,
     /// Wall-clock RFC3339 timestamp when the lock was acquired, if representable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,6 +198,7 @@ pub struct LockEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLocksResponse {
+    /// Resource, mode and owner rows before truncation.
     pub total: usize,
     pub truncated: bool,
     pub locks: Vec<LockEntry>,
@@ -243,6 +248,7 @@ struct LockHolderKey {
 struct TopLockState {
     acquired_at: SystemTime,
     ttl_secs: u64,
+    holder_count: u32,
     priority: &'static str,
 }
 
@@ -320,12 +326,14 @@ fn build_top_locks_response(
                     TopLockState {
                         acquired_at: lease.acquired_at,
                         ttl_secs: lease.ttl_secs,
+                        holder_count,
                         priority,
                     }
                 }
                 _ => TopLockState {
                     acquired_at: info.acquired_at,
                     ttl_secs: info.expires_at.duration_since(now).unwrap_or(Duration::ZERO).as_secs(),
+                    holder_count,
                     priority,
                 },
             };
@@ -347,6 +355,7 @@ fn build_top_locks_response(
             version: holder.resource.version.as_ref().map(|version| version.to_string()),
             lock_type: holder.mode.label(),
             owner: holder.owner,
+            holder_count: state.holder_count,
             priority: state.priority,
             since: system_time_to_rfc3339(state.acquired_at),
             elapsed_secs: now.duration_since(state.acquired_at).unwrap_or(Duration::ZERO).as_secs(),
@@ -1584,6 +1593,7 @@ mod tests {
             .find(|entry| entry.object == "shared-object")
             .expect("lease-backed shared owner should be listed once");
         assert_eq!(leased.lock_type, "READ");
+        assert_eq!(leased.holder_count, 2);
         assert_eq!(leased.elapsed_secs, 50);
         assert_eq!(leased.ttl_secs, 20);
 
@@ -1593,6 +1603,7 @@ mod tests {
             .find(|entry| entry.object == "write-object")
             .expect("lease-backed exclusive holder should be listed");
         assert_eq!(exclusive.lock_type, "WRITE");
+        assert_eq!(exclusive.holder_count, 1);
         assert_eq!(exclusive.ttl_secs, 18);
 
         let direct = response
@@ -1601,6 +1612,7 @@ mod tests {
             .find(|entry| entry.object == "direct-object")
             .expect("direct fast lock should remain visible");
         assert_eq!(direct.ttl_secs, 7);
+        assert_eq!(direct.holder_count, 1);
 
         let mixed = response
             .locks
@@ -1608,6 +1620,7 @@ mod tests {
             .find(|entry| entry.object == "mixed-object")
             .expect("mixed direct and leased shared holders should remain visible");
         assert_eq!(mixed.ttl_secs, 9);
+        assert_eq!(mixed.holder_count, 2, "incomplete lease coverage must retain the physical holder count");
 
         let replaced = response
             .locks
@@ -1615,6 +1628,7 @@ mod tests {
             .find(|entry| entry.object == "replaced-object")
             .expect("a replaced lease holder should remain visible");
         assert_eq!(replaced.ttl_secs, 4);
+        assert_eq!(replaced.holder_count, 1);
 
         let remaining_shared = response
             .locks
@@ -1622,6 +1636,7 @@ mod tests {
             .find(|entry| entry.object == "remaining-shared-object")
             .expect("an older surviving shared lease should remain lease-backed");
         assert_eq!(remaining_shared.ttl_secs, 22);
+        assert_eq!(remaining_shared.holder_count, 1);
 
         let opaque = response
             .locks
@@ -1629,6 +1644,7 @@ mod tests {
             .find(|entry| entry.object == "opaque-object")
             .expect("generation-less holder should remain visible");
         assert_eq!(opaque.ttl_secs, 6);
+        assert_eq!(opaque.holder_count, 1);
     }
 
     #[test]
@@ -1663,6 +1679,76 @@ mod tests {
         let entry = response.locks.first().expect("replacement remains visible");
         assert_eq!(entry.ttl_secs, 4);
         assert_eq!(entry.elapsed_secs, 2);
+        assert_eq!(entry.holder_count, 1, "a stale lease identity must not change the physical holder count");
+    }
+
+    #[tokio::test]
+    async fn collect_top_locks_serializes_physical_holder_counts_by_owner() {
+        use rustfs_lock::{FastObjectLockManager, GlobalLockManager};
+
+        let manager = Arc::new(GlobalLockManager::Enabled(Arc::new(FastObjectLockManager::new())));
+        let fast = manager.as_fast_lock_manager().expect("enabled fixture lock manager");
+        let resource = ObjectKey::new("count-bucket", "shared-object");
+        let _first = fast
+            .acquire_read_lock(resource.clone(), "owner-a")
+            .await
+            .expect("first shared grant");
+        let _second = fast
+            .acquire_read_lock(resource.clone(), "owner-a")
+            .await
+            .expect("second shared grant for the same owner");
+        let _other_owner = fast
+            .acquire_read_lock(resource, "owner-b")
+            .await
+            .expect("shared grant for another owner");
+        let _exclusive = fast
+            .acquire_write_lock(ObjectKey::new("count-bucket", "write-object"), "owner-c")
+            .await
+            .expect("exclusive grant");
+
+        let response = collect_top_locks_with_clients(TOP_LOCKS_DEFAULT_LIMIT, manager, Vec::new()).await;
+        assert_eq!(response.total, 3, "total counts owner rows");
+        assert_eq!(response.locks.len(), 3);
+        assert!(!response.truncated);
+        let shared: Vec<_> = response
+            .locks
+            .iter()
+            .filter(|entry| entry.object == "shared-object")
+            .collect();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared.iter().map(|entry| entry.holder_count).sum::<u32>(), 3);
+        assert_eq!(
+            shared
+                .iter()
+                .find(|entry| entry.owner == "owner-a")
+                .expect("owner-a row")
+                .holder_count,
+            2,
+        );
+        assert_eq!(
+            shared
+                .iter()
+                .find(|entry| entry.owner == "owner-b")
+                .expect("owner-b row")
+                .holder_count,
+            1,
+        );
+        let exclusive = response
+            .locks
+            .iter()
+            .find(|entry| entry.object == "write-object")
+            .expect("exclusive row");
+        assert_eq!(exclusive.lock_type, "WRITE");
+        assert_eq!(exclusive.holder_count, 1);
+
+        let value = serde_json::to_value(&response).expect("serialize top locks");
+        assert_eq!(value["total"], 3);
+        let rows = value["locks"].as_array().expect("serialized lock rows");
+        let shared_owner = rows
+            .iter()
+            .find(|row| row["owner"] == "owner-a")
+            .expect("serialized owner-a row");
+        assert_eq!(shared_owner["holder_count"], 2);
     }
 
     #[tokio::test]
