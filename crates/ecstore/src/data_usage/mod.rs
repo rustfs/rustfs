@@ -1472,10 +1472,20 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
         // slow metadata lock while holding the shared admin refresh permit.
         // The common deadline bounds their total added latency; dropping this
         // stream cancels all unfinished reads without spawning detached work.
-        let mut identities = futures::stream::iter(response.usage_snapshot_bucket_observations.keys())
-            .map(|bucket| {
-                let store = &store;
-                async move { (bucket, store.bucket_incarnation_id_from_disk(bucket).await) }
+        // Own the names and store across awaits so this future remains Send
+        // when composed into spawned metrics collectors.
+        let buckets = response
+            .usage_snapshot_bucket_observations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut identities = futures::stream::iter(buckets)
+            .map(move |bucket| {
+                let store = store.clone();
+                async move {
+                    let identity = store.bucket_incarnation_id_from_disk(&bucket).await;
+                    (bucket, identity)
+                }
             })
             .buffer_unordered(ADMIN_USAGE_INCARNATION_CONCURRENCY);
         while tokio::time::Instant::now() < deadline {
@@ -1486,7 +1496,7 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
             if let Ok(incarnation) = identity
                 && !incarnation.is_nil()
             {
-                incarnations.insert(bucket.clone(), incarnation.to_string());
+                incarnations.insert(bucket, incarnation.to_string());
             }
         }
     }

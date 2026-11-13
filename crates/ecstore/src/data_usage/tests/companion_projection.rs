@@ -228,6 +228,11 @@ async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buc
     use crate::config::com::save_config;
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
 
+    // Admin reads also feed spawned metrics collectors across crate boundaries.
+    fn assert_send<T: Send>(future: T) -> T {
+        future
+    }
+
     let (_dirs, store) = isolated_store_over_temp_disks().await;
     init_bucket_metadata_sys(store.clone(), Vec::new()).await;
     let blocked = "usage-blocked-identity";
@@ -270,7 +275,7 @@ async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buc
     .expect("hold the real bucket metadata writer lock");
     let response = tokio::time::timeout(
         ADMIN_USAGE_INCARNATION_TIMEOUT + Duration::from_secs(3),
-        load_admin_data_usage_from_backend_cached(store.clone()),
+        assert_send(load_admin_data_usage_from_backend_cached(store.clone())),
     )
     .await
     .expect("optional projection must return before the blocked metadata lock's long timeout")
