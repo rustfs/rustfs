@@ -321,6 +321,73 @@ pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::
     Ok(())
 }
 
+fn map_service_account_create_error(error: rustfs_iam::error::Error) -> S3Error {
+    match error {
+        rustfs_iam::error::Error::NoSuchUser(_) => s3_error!(InvalidRequest, "target user not exist"),
+        rustfs_iam::error::Error::InvalidArgument
+        | rustfs_iam::error::Error::InvalidAccessKeyLength
+        | rustfs_iam::error::Error::InvalidSecretKeyLength
+        | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(error),
+        rustfs_iam::error::Error::IAMActionNotAllowed => s3_error!(AccessDenied, "access denied"),
+        _ => s3_error!(InternalError, "create service account failed"),
+    }
+}
+
+// The Admin operation owns the local write and site notification together.
+// A disconnected requester can stop waiting without splitting those effects.
+async fn create_and_replicate_service_account<R: Future<Output = S3Result<()>> + Send>(
+    create: impl Future<Output = S3Result<(StoredCredentials, OffsetDateTime, HashMap<String, serde_json::Value>)>> + Send + 'static,
+    replication_policy: Option<String>,
+    replication_expiration: Option<OffsetDateTime>,
+    replicate: impl FnOnce(SRIAMItem) -> R + Send + 'static,
+) -> S3Result<StoredCredentials> {
+    super::supervise_admin_mutation("service account creation", async move {
+        let (new_cred, updated_at, replication_claims) = create.await?;
+        let (replication_session_policy, oidc_service_account_envelope) =
+            encode_service_account_replication_policy(&replication_claims, replication_policy.as_deref())?;
+
+        if let Err(err) = replicate(SRIAMItem {
+            r#type: "service-account".to_string(),
+            svc_acc_change: Some(SRSvcAccChange {
+                create: Some(SRSvcAccCreate {
+                    parent: new_cred.parent_user.clone(),
+                    access_key: new_cred.access_key.clone(),
+                    secret_key: new_cred.secret_key.clone(),
+                    groups: new_cred.groups.clone().unwrap_or_default(),
+                    claims: replication_claims,
+                    session_policy: replication_session_policy,
+                    status: String::new(),
+                    name: new_cred.name.clone().unwrap_or_default(),
+                    description: new_cred.description.clone().unwrap_or_default(),
+                    expiration: replication_expiration,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                oidc_service_account_envelope,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                access_key = %new_cred.access_key,
+                action = "create",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin service account state"
+            );
+        }
+        Ok(new_cred)
+    })
+    .await
+}
+
 pub struct AddServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for AddServiceAccount {
@@ -431,80 +498,39 @@ impl Operation for AddServiceAccount {
             ..Default::default()
         };
 
-        let replication_groups = target_groups.clone().unwrap_or_default();
-        let replication_name = opts.name.clone().unwrap_or_default();
-        let replication_description = opts.description.clone().unwrap_or_default();
+        let target_user = target_user.to_owned();
+        let response_secret = cred.secret_key.clone();
         let replication_expiration = opts.expiration;
-
-        let create_result = if self_scoped {
-            iam_store
-                .new_service_account_from_caller(target_user, target_groups, opts, &cred)
-                .await
-        } else {
-            iam_store
-                .new_service_account_for_user(target_user, opts, &cred, &conditions, owner)
-                .await
+        let create = async move {
+            let create_result = if self_scoped {
+                iam_store
+                    .new_service_account_from_caller(&target_user, target_groups, opts, &cred)
+                    .await
+            } else {
+                iam_store
+                    .new_service_account_for_user(&target_user, opts, &cred, &conditions, owner)
+                    .await
+            };
+            create_result.map_err(|e| {
+                debug!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                    event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                    target_user = %target_user,
+                    result = "create_failed",
+                    error = ?e,
+                    "admin service account state"
+                );
+                map_service_account_create_error(e)
+            })
         };
-        let (new_cred, updated_at, replication_claims) = create_result.map_err(|e| {
-            debug!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
-                target_user = %target_user,
-                result = "create_failed",
-                error = ?e,
-                "admin service account state"
-            );
-            match e {
-                rustfs_iam::error::Error::NoSuchUser(_) => s3_error!(InvalidRequest, "target user not exist"),
-                rustfs_iam::error::Error::InvalidArgument
-                | rustfs_iam::error::Error::InvalidAccessKeyLength
-                | rustfs_iam::error::Error::InvalidSecretKeyLength
-                | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
-                rustfs_iam::error::Error::IAMActionNotAllowed => s3_error!(AccessDenied, "access denied"),
-                err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
-            }
-        })?;
-        let (replication_session_policy, oidc_service_account_envelope) =
-            encode_service_account_replication_policy(&replication_claims, replication_policy.as_deref())?;
-
-        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-            r#type: "service-account".to_string(),
-            svc_acc_change: Some(SRSvcAccChange {
-                create: Some(SRSvcAccCreate {
-                    parent: target_user.to_owned(),
-                    access_key: new_cred.access_key.clone(),
-                    secret_key: new_cred.secret_key.clone(),
-                    groups: replication_groups,
-                    claims: replication_claims,
-                    session_policy: replication_session_policy,
-                    status: String::new(),
-                    name: replication_name,
-                    description: replication_description,
-                    expiration: replication_expiration,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                }),
-                oidc_service_account_envelope,
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            }),
-            updated_at: Some(updated_at),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
-        .await
-        {
-            warn!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
-                access_key = %new_cred.access_key,
-                action = "create",
-                result = "site_replication_hook_failed",
-                error = ?err,
-                "admin service account state"
-            );
-        }
+        let new_cred = create_and_replicate_service_account(
+            create,
+            replication_policy,
+            replication_expiration,
+            site_replication_iam_change_hook,
+        )
+        .await?;
 
         let resp = AddServiceAccountResp {
             credentials: Credentials {
@@ -516,7 +542,7 @@ impl Operation for AddServiceAccount {
         };
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &response_secret, body)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
@@ -1826,22 +1852,58 @@ mod tests {
         assert_eq!(err.message(), Some("service account 'missing' does not exist"));
     }
 
+    #[tokio::test]
+    async fn delegated_service_account_replication_survives_request_cancellation() {
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (event_tx, event_rx) = oneshot::channel();
+        let updated_at = OffsetDateTime::now_utc();
+        let create = async move {
+            started_tx.send(()).expect("signal creation");
+            release_rx.await.expect("release write");
+            let credentials = StoredCredentials {
+                access_key: "backup-key".to_owned(),
+                parent_user: "backup-user".to_owned(),
+                ..Default::default()
+            };
+            Ok((credentials, updated_at, HashMap::new()))
+        };
+        let waiter = tokio::spawn(create_and_replicate_service_account(create, None, None, |item| async move {
+            event_tx.send(item).expect("capture site replication event");
+            Ok(())
+        }));
+        let deadline = Duration::from_secs(5);
+        timeout(deadline, started_rx)
+            .await
+            .expect("creation started")
+            .expect("start signal");
+        waiter.abort();
+        assert!(waiter.await.expect_err("request cancelled").is_cancelled());
+        release_tx.send(()).expect("write still admitted");
+        let item = timeout(deadline, event_rx)
+            .await
+            .expect("replication completed")
+            .expect("replication event");
+        assert_eq!(item.updated_at, Some(updated_at));
+        let created = item.svc_acc_change.and_then(|change| change.create).expect("create event");
+        assert_eq!(created.access_key, "backup-key");
+        assert_eq!(created.parent, "backup-user");
+    }
+
     #[test]
     fn add_service_account_maps_iam_create_errors_to_s3_errors() {
-        let src = include_str!("service_account.rs");
-        let create_start = src
-            .find("impl Operation for AddServiceAccount")
-            .expect("AddServiceAccount operation should exist");
-        let create_block = &src[create_start..];
-        let create_end = create_block
-            .find("if let Err(err) = site_replication_iam_change_hook")
-            .expect("site replication hook marker should exist");
-        let create_block = &create_block[..create_end];
+        use rustfs_iam::error::Error;
 
-        assert!(
-            create_block.contains("AccessKeyAlreadyExists") && create_block.contains("iam_error_to_s3_error(e)"),
-            "duplicate access keys must map to client S3 errors"
-        );
+        for (error, expected) in [
+            (Error::AccessKeyAlreadyExists, S3ErrorCode::InvalidArgument),
+            (Error::NoSuchUser("missing".into()), S3ErrorCode::InvalidRequest),
+            (Error::Io(std::io::Error::other("storage unavailable")), S3ErrorCode::InternalError),
+        ] {
+            assert_eq!(map_service_account_create_error(error).code(), &expected);
+        }
     }
 
     #[test]
