@@ -6122,6 +6122,8 @@ impl LocalIoBackend for StdBackend {
                         let parent_was_presynced = unmark_presynced_tmp_data_dir(parent);
                         parent_exists |= parent_was_presynced;
                         let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                        parent_exists |= file_name.contains(".integrity.")
+                            || (file_name.starts_with(".part.") && file_name.contains(".proof."));
                         mark_dir_presynced = sync_parent_dir
                             && (file_name == "part.1"
                                 || (parent_was_presynced
@@ -15295,52 +15297,57 @@ impl DiskAPI for LocalDisk {
                 let mut created_transaction_parent = false;
                 if let Some((integrity, source, destination, expected_len)) = integrity_prep {
                     let presynced_proof = take_presynced_tmp_file(&source);
-                    let verify_and_sync = (|| -> std::io::Result<bool> {
-                        #[cfg(unix)]
-                        let mut file = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
-                            use rustix::fs::{Mode, OFlags, openat};
-                            match openat(
-                                src_p_fd,
-                                src_name,
-                                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                                Mode::empty(),
-                            ) {
-                                Ok(fd) => std::fs::File::from(fd),
-                                Err(rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR) => return Ok(false),
-                                Err(err) => return Err(std::io::Error::from(err)),
-                            }
-                        } else {
-                            let stat = std::fs::symlink_metadata(&source)?;
-                            if !stat.is_file() || stat.len() != expected_len {
-                                return Ok(false);
-                            }
-                            os::open_file_for_sync_std(&source)?
-                        };
-                        #[cfg(not(unix))]
-                        let mut file = {
-                            let stat = std::fs::symlink_metadata(&source)?;
-                            if !stat.is_file() || stat.len() != expected_len {
-                                return Ok(false);
-                            }
-                            os::open_file_for_sync_std(&source)?
-                        };
-                        #[cfg(unix)]
-                        if src_parent_fd.is_some() {
-                            let stat = file.metadata()?;
-                            if !stat.is_file() || stat.len() != expected_len {
-                                return Ok(false);
-                            }
-                        }
-                        let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
-                        std::io::Read::read_exact(&mut file, &mut header)?;
-                        if header != integrity.index_header() {
-                            return Ok(false);
-                        }
-                        if durability.syncs_data_shards() && !presynced_proof {
-                            file.sync_all()?;
-                        }
+                    let verify_and_sync = if presynced_proof {
                         Ok(true)
-                    })();
+                    } else {
+                        (|| -> std::io::Result<bool> {
+                            #[cfg(unix)]
+                            let mut file =
+                                if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
+                                    use rustix::fs::{Mode, OFlags, openat};
+                                    match openat(
+                                        src_p_fd,
+                                        src_name,
+                                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                                        Mode::empty(),
+                                    ) {
+                                        Ok(fd) => std::fs::File::from(fd),
+                                        Err(rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR) => return Ok(false),
+                                        Err(err) => return Err(std::io::Error::from(err)),
+                                    }
+                                } else {
+                                    let stat = std::fs::symlink_metadata(&source)?;
+                                    if !stat.is_file() || stat.len() != expected_len {
+                                        return Ok(false);
+                                    }
+                                    os::open_file_for_sync_std(&source)?
+                                };
+                            #[cfg(not(unix))]
+                            let mut file = {
+                                let stat = std::fs::symlink_metadata(&source)?;
+                                if !stat.is_file() || stat.len() != expected_len {
+                                    return Ok(false);
+                                }
+                                os::open_file_for_sync_std(&source)?
+                            };
+                            #[cfg(unix)]
+                            if src_parent_fd.is_some() {
+                                let stat = file.metadata()?;
+                                if !stat.is_file() || stat.len() != expected_len {
+                                    return Ok(false);
+                                }
+                            }
+                            let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                            std::io::Read::read_exact(&mut file, &mut header)?;
+                            if header != integrity.index_header() {
+                                return Ok(false);
+                            }
+                            if durability.syncs_data_shards() {
+                                file.sync_all()?;
+                            }
+                            Ok(true)
+                        })()
+                    };
                     match verify_and_sync {
                         Ok(true) => {}
                         Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
