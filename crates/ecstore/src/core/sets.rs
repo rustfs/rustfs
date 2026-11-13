@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use crate::disk::error_reduce::count_errs;
+#[cfg(any(test, feature = "test-util"))]
+use crate::disk::new_disk;
 use crate::error::{Error, Result, is_all_volume_not_found, is_err_object_not_found, is_err_strict_volume_not_found};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
@@ -28,7 +30,6 @@ use crate::{
         DiskAPI, DiskOption, DiskStore,
         error::DiskError,
         format::{DistributionAlgoVersion, FormatV3},
-        new_disk,
     },
     error::StorageError,
     layout::endpoints::{Endpoints, PoolEndpoints},
@@ -64,6 +65,38 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+type TestSetLockers = HashMap<usize, Vec<Arc<dyn rustfs_lock::LockClient>>>;
+
+#[cfg(test)]
+static TEST_SET_LOCKERS: std::sync::LazyLock<std::sync::Mutex<TestSetLockers>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Keep a fixture's real locker domain scoped to its owning instance.
+#[cfg(test)]
+pub(crate) struct ScopedSetLockers(Arc<InstanceContext>);
+
+#[cfg(test)]
+impl ScopedSetLockers {
+    pub(crate) fn install(ctx: Arc<InstanceContext>, lockers: Vec<Arc<dyn rustfs_lock::LockClient>>) -> Self {
+        let key = Arc::as_ptr(&ctx) as usize;
+        let mut domains = TEST_SET_LOCKERS.lock().expect("test set lockers mutex");
+        assert!(!domains.contains_key(&key), "the instance already owns a test locker domain");
+        domains.insert(key, lockers);
+        Self(ctx)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedSetLockers {
+    fn drop(&mut self) {
+        TEST_SET_LOCKERS
+            .lock()
+            .expect("test set lockers mutex")
+            .remove(&(Arc::as_ptr(&self.0) as usize));
+    }
+}
 
 fn is_idempotent_delete_prefix_error(err: &Error) -> bool {
     is_err_object_not_found(err) || is_err_strict_volume_not_found(err)
@@ -265,6 +298,14 @@ impl Sets {
                     set_drive.push(None);
                 }
             }
+
+            #[cfg(test)]
+            let pool_lockers = TEST_SET_LOCKERS
+                .lock()
+                .expect("test set lockers mutex")
+                .get(&(Arc::as_ptr(&instance_ctx) as usize))
+                .cloned()
+                .unwrap_or_else(|| pool_lockers.clone());
 
             let set_disks = SetDisks::new_with_instance_ctx(
                 runtime_sources::local_node_name().await,
@@ -1065,6 +1106,7 @@ impl Sets {
         F: FnMut() -> bool + Send,
     {
         let (disks, init_errs) = init_storage_disks_with_errors(
+            &self.ctx,
             &self.endpoints.endpoints,
             &DiskOption {
                 cleanup: false,
@@ -1270,6 +1312,7 @@ async fn _close_storage_disks(disks: &[Option<DiskStore>]) {
 }
 
 async fn init_storage_disks_with_errors(
+    instance: &InstanceContext,
     endpoints: &Endpoints,
     opts: &DiskOption,
 ) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -1278,7 +1321,7 @@ async fn init_storage_disks_with_errors(
     // let errs = Arc::new(RwLock::new(vec![None; endpoints.as_ref().len()]));
     let mut futures = Vec::with_capacity(endpoints.as_ref().len());
     for endpoint in endpoints.as_ref().iter() {
-        futures.push(new_disk(endpoint, opts));
+        futures.push(crate::disk::new_disk_for_instance(instance, endpoint, opts));
 
         // let ep = endpoint.clone();
         // let opt = opts.clone();

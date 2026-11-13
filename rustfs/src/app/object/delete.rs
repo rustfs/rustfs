@@ -14,10 +14,18 @@
 
 //! DeleteObject / DeleteObjects path.
 
+use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
 use super::*;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
-use s3s::dto::ObjectIdentifier;
-use std::collections::HashSet;
+use crate::app::storage_api::s3::dto::ObjectIdentifier;
+use crate::app::storage_api::s3::dto::{
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
+
+const EVENT_DELETE_OBJECTS_STORAGE_RESULT: &str = "delete_objects_storage_result";
 
 async fn authorize_recursive_delete<T>(
     req: &mut S3Request<T>,
@@ -81,6 +89,19 @@ async fn authorize_recursive_delete<T>(
     result
 }
 
+// XML body keys bypass s3s's URL-path normalization. Match its private slash
+// normalizer without URL-decoding or resolving dot segments in client keys.
+fn normalize_delete_object_key(key: &str) -> Cow<'_, str> {
+    if !key.starts_with('/') {
+        return Cow::Borrowed(key);
+    }
+    let mut normalized = key.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/");
+    if key.ends_with('/') {
+        normalized.push('/');
+    }
+    Cow::Owned(normalized)
+}
+
 fn successful_delete_audit_objects(
     delete: &s3s::dto::Delete,
     successful_results: impl IntoIterator<Item = bool>,
@@ -90,7 +111,9 @@ fn successful_delete_audit_objects(
         .iter()
         .zip(successful_results)
         .filter(|(_, successful)| *successful)
-        .map(|(requested, _)| AuditObjectVersion::new(requested.key.clone(), requested.version_id.clone()))
+        .map(|(requested, _)| {
+            AuditObjectVersion::new(normalize_delete_object_key(&requested.key).into_owned(), requested.version_id.clone())
+        })
         .collect()
 }
 
@@ -505,9 +528,8 @@ fn reduce_delete_objects_result<'a>(
     error: Option<&EcstoreError>,
     synthetic_version_id: bool,
 ) -> Result<&'a StorageDeletedObject, s3s::dto::Error> {
-    match error {
+    match delete_objects_reported_storage_error(object, error) {
         None => Ok(deleted),
-        Some(error) if object.delete_condition.is_none() && is_delete_objects_not_found(error) => Ok(deleted),
         Some(error) => {
             let api_error = ApiError::from(error.clone());
             Err(s3s::dto::Error {
@@ -518,6 +540,48 @@ fn reduce_delete_objects_result<'a>(
             })
         }
     }
+}
+
+fn delete_objects_reported_storage_error<'a>(
+    object: &ObjectToDelete,
+    error: Option<&'a EcstoreError>,
+) -> Option<&'a EcstoreError> {
+    error.filter(|error| object.delete_condition.is_some() || !is_delete_objects_not_found(error))
+}
+
+fn delete_objects_storage_error_counts(
+    objects: &[ObjectToDelete],
+    errors: &[Option<EcstoreError>],
+) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for (object, error) in objects.iter().zip(errors) {
+        let Some(error) = delete_objects_reported_storage_error(object, error.as_ref()) else {
+            continue;
+        };
+        // Classify the typed cause before S3 mapping collapses distinct failures.
+        // Stages are recorded at their source, never inferred from this variant.
+        let kind = match error {
+            StorageError::NamespaceLockQuorumUnavailable { .. } => "namespace_lock_quorum",
+            StorageError::Lock(_) => "lock",
+            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+            StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _) => "write_quorum",
+            StorageError::PreconditionFailed | StorageError::ConditionalDeleteConflict => "condition",
+            StorageError::DeleteRecoveryWorkLimit => "recovery_work_limit",
+            StorageError::DeleteRecoveryLegacyAmbiguous => "recovery_legacy_ambiguous",
+            StorageError::Timeout => "timeout",
+            StorageError::RemoteClientUnavailable(_) => "remote_client_unavailable",
+            StorageError::DiskNotFound | StorageError::FaultyDisk | StorageError::FaultyRemoteDisk => "disk_unavailable",
+            StorageError::DiskOngoingReq => "disk_ongoing_request",
+            StorageError::SlowDown => "slow_down",
+            StorageError::Io(source) if source.kind() == std::io::ErrorKind::TimedOut => "io_timeout",
+            error if is_err_bucket_not_found(error) => "bucket_not_found",
+            error if is_delete_objects_not_found(error) => "not_found",
+            StorageError::Io(_) => "io",
+            _ => "other",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts
 }
 
 impl DefaultObjectUsecase {
@@ -590,7 +654,10 @@ impl DefaultObjectUsecase {
         // Per-key denials are audited once per denied action, in aggregate, after the loop.
         let mut bulk_denials = crate::storage::access::BulkDenialAudit::start(&mut req)?;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
-            if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
+            // Authorization and every storage side effect must address the same
+            // normalized object; retain the request key only for response entries.
+            let key = normalize_delete_object_key(&obj_id.key);
+            if let Err(err) = validate_object_key(&key, "DeleteObjects") {
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some(err.code().as_str().to_string()),
                     key: Some(obj_id.key.clone()),
@@ -623,7 +690,7 @@ impl DefaultObjectUsecase {
             {
                 let req_info = req_info_mut(&mut req)?;
                 req_info.bucket = Some(bucket.clone());
-                req_info.object = Some(obj_id.key.clone());
+                req_info.object = Some(key.to_string());
                 req_info.version_id = version_id.clone();
             }
 
@@ -670,7 +737,7 @@ impl DefaultObjectUsecase {
                 }
             }
 
-            if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {
+            if let Err(err) = validate_table_catalog_object_mutation(&bucket, &key).await {
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("InvalidRequest".to_string()),
                     key: Some(obj_id.key.clone()),
@@ -680,9 +747,9 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            let synthetic_version_id = delete_condition.is_none() && version_id.is_none() && is_dir_object(&obj_id.key);
+            let synthetic_version_id = delete_condition.is_none() && version_id.is_none() && is_dir_object(&key);
             let object = ObjectToDelete {
-                object_name: obj_id.key.clone(),
+                object_name: key.into_owned(),
                 version_id: version_uuid,
                 delete_condition,
                 synthetic_version_id,
@@ -850,9 +917,39 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
         apply_bucket_generation_guard(&req, &bucket, &mut storage_delete_opts)?;
+        let storage_started = std::time::Instant::now();
         let (dobjs, errs, accounting) = store
             .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
             .await;
+        let storage_elapsed_ms = storage_started.elapsed().as_millis();
+        let storage_error_counts = delete_objects_storage_error_counts(&object_to_delete, &errs);
+        let failed_object_count = storage_error_counts.values().sum::<usize>();
+        if failed_object_count > 0 {
+            warn!(
+                event = EVENT_DELETE_OBJECTS_STORAGE_RESULT,
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                result = "failed",
+                request_id = %request_context.request_id,
+                attempted_object_count = object_to_delete.len(),
+                failed_object_count,
+                error_counts = ?storage_error_counts,
+                elapsed_ms = storage_elapsed_ms,
+                "Batch delete storage returned object failures"
+            );
+        } else {
+            debug!(
+                event = EVENT_DELETE_OBJECTS_STORAGE_RESULT,
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                result = "ok",
+                request_id = %request_context.request_id,
+                attempted_object_count = object_to_delete.len(),
+                failed_object_count,
+                elapsed_ms = storage_elapsed_ms,
+                "Batch delete storage completed"
+            );
+        }
 
         #[cfg(test)]
         super::super::storage_api::object_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
@@ -910,15 +1007,16 @@ impl DefaultObjectUsecase {
         let deleted = (!delete.quiet.unwrap_or_default()).then(|| {
             delete_results
                 .iter()
-                .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
-                .map(|(result, object)| DeletedObject {
+                .enumerate()
+                .filter_map(|(idx, result)| result.delete_object.as_ref().map(|object| (idx, result, object)))
+                .map(|(idx, result, object)| DeletedObject {
                     delete_marker: { if object.delete_marker { Some(true) } else { None } },
                     delete_marker_version_id: delete_marker_response_version_id(
                         object.delete_marker_version_id,
                         object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
                         result.synthetic_version_id,
                     ),
-                    key: Some(object.object_name.clone()),
+                    key: Some(delete.objects[idx].key.clone()),
                     version_id: delete_entry_response_version_id(
                         object.version_id,
                         object.delete_marker,
@@ -936,7 +1034,12 @@ impl DefaultObjectUsecase {
 
         let errors = delete_results
             .iter()
-            .filter_map(|v| v.error.clone())
+            .enumerate()
+            .filter_map(|(idx, result)| {
+                let mut error = result.error.clone()?;
+                error.key = Some(delete.objects[idx].key.clone());
+                Some(error)
+            })
             .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
             deleted,
@@ -1571,12 +1674,14 @@ mod tests {
     }
 
     use super::*;
+    use crate::app::storage_api::s3::dto::{ETag, GetObjectInput, HeadObjectInput};
     use http::{HeaderMap, HeaderValue, Method};
-    use s3s::dto::{
-        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-        ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications,
-        ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationRule, PersistedReplicationStatus, PersistedSourceSelectionCriteria,
     };
+    use s3s::dto::{Delete, ObjectIdentifier};
     use std::sync::Arc;
 
     #[test]
@@ -1985,12 +2090,10 @@ mod tests {
                             .version_id(requested_version)
                             .build()
                             .expect("HEAD request");
-                        let get_error = usecase
-                            .execute_get_object(build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
                             .await
                             .expect_err("marker GET");
-                        let head_error = usecase
-                            .execute_head_object(build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
                             .await
                             .expect_err("marker HEAD");
                         for (method, error) in [("GET", get_error), ("HEAD", head_error)] {
@@ -2037,8 +2140,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical GET request");
-                    let response = usecase
-                        .execute_get_object(build_request(get, Method::GET))
+                    let response = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
@@ -2054,8 +2156,7 @@ mod tests {
                         .version_id(Some(original_id.clone()))
                         .build()
                         .expect("historical HEAD request");
-                    let response = usecase
-                        .execute_head_object(build_request(head, Method::HEAD))
+                    let response = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
                         .await
                         .expect("historical HEAD");
                     assert_eq!(response.output.content_length, Some(i64::try_from(payload.len()).unwrap()));
@@ -2075,12 +2176,10 @@ mod tests {
                             .version_id(version)
                             .build()
                             .expect("missing HEAD request");
-                        let get_error = usecase
-                            .execute_get_object(build_request(get, Method::GET))
+                        let get_error = crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET))
                             .await
                             .expect_err("missing GET");
-                        let head_error = usecase
-                            .execute_head_object(build_request(head, Method::HEAD))
+                        let head_error = crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD))
                             .await
                             .expect_err("missing HEAD");
                         for error in [get_error, head_error] {
@@ -2175,7 +2274,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let get_err = Box::pin(usecase.execute_get_object(build_request(get, Method::GET)))
+                    let get_err = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
                         .await
                         .expect_err("GET of a marker remains forbidden");
                     assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2185,7 +2284,7 @@ mod tests {
                         .version_id(Some(marker_id.clone()))
                         .build()
                         .unwrap();
-                    let head_err = Box::pin(usecase.execute_head_object(build_request(head, Method::HEAD)))
+                    let head_err = Box::pin(crate::app::test_seams::head_object(&usecase, build_request(head, Method::HEAD)))
                         .await
                         .expect_err("HEAD of a marker remains forbidden");
                     assert_eq!(head_err.code(), &S3ErrorCode::MethodNotAllowed);
@@ -2261,7 +2360,7 @@ mod tests {
                         .version_id(Some(marker_id))
                         .build()
                         .unwrap();
-                    let missing = Box::pin(usecase.execute_get_object(build_request(removed, Method::GET)))
+                    let missing = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(removed, Method::GET)))
                         .await
                         .expect_err("the marker version must actually be gone");
                     assert_eq!(
@@ -2274,7 +2373,7 @@ mod tests {
                         .key(key.to_string())
                         .build()
                         .unwrap();
-                    let response = Box::pin(usecase.execute_get_object(build_request(get, Method::GET)))
+                    let response = Box::pin(crate::app::test_seams::get_object(&usecase, build_request(get, Method::GET)))
                         .await
                         .expect("GET restores the historical payload");
                     let mut body = response.output.body.expect("GET body");
@@ -2819,10 +2918,56 @@ mod tests {
     }
 
     #[test]
+    fn delete_objects_key_normalization_matches_s3s_path_keys() {
+        use s3s::path::{
+            parse_path_style_with_validation_and_normalization, parse_virtual_hosted_style_with_validation_and_normalization,
+        };
+        use s3s::validation::AwsNameValidation;
+
+        for key in [
+            "plain",
+            "/a/b",
+            "//a/b",
+            "/dir///sub//file",
+            "/dir///",
+            "/",
+            "///",
+            "dir//file",
+            "/literal%2F+名",
+            "/dir/../file",
+            "/dir/./file",
+            "/dir\\file",
+            "/a\0b",
+        ] {
+            let normalized = normalize_delete_object_key(key);
+            let path = parse_path_style_with_validation_and_normalization(
+                &format!("/test-bucket/{key}"),
+                &AwsNameValidation::new(),
+                true,
+            )
+            .expect("path-style key should parse before storage validation");
+            let virtual_host = parse_virtual_hosted_style_with_validation_and_normalization(
+                Some("test-bucket"),
+                &format!("/{key}"),
+                &AwsNameValidation::new(),
+                true,
+            )
+            .expect("virtual-hosted key should parse before storage validation");
+            assert_eq!(Some(normalized.as_ref()), path.get_object_key(), "path-style mismatch for {key:?}");
+            assert_eq!(
+                Some(normalized.as_ref()),
+                virtual_host.get_object_key(),
+                "virtual-hosted mismatch for {key:?}"
+            );
+        }
+        assert_eq!(normalize_delete_object_key(""), "");
+    }
+
+    #[test]
     fn delete_objects_audit_details_include_only_successful_request_entries() {
         let requested = vec![
             ObjectIdentifier {
-                key: "first-key".to_string(),
+                key: "/first-key".to_string(),
                 version_id: None,
                 ..Default::default()
             },
@@ -2832,7 +2977,7 @@ mod tests {
                 ..Default::default()
             },
             ObjectIdentifier {
-                key: "versioned-key".to_string(),
+                key: "//versioned-key".to_string(),
                 version_id: Some("requested-version".to_string()),
                 ..Default::default()
             },
@@ -3011,6 +3156,67 @@ mod tests {
             .expect_err("a failed existence condition is not an idempotent successful delete");
         assert_eq!(error.key.as_deref(), Some("missing-key"));
         assert_eq!(error.code.as_deref(), Some("NoSuchKey"));
+    }
+
+    #[test]
+    fn delete_objects_storage_diagnostics_preserve_mixed_result_semantics() {
+        let mut objects = (0..7)
+            .map(|index| ObjectToDelete {
+                object_name: format!("key-{index}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        objects[2].delete_condition = Some(DeleteObjectCondition::Exists);
+        let errors = vec![
+            None,
+            Some(StorageError::FileNotFound),
+            Some(StorageError::FileNotFound),
+            Some(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_objects_commit",
+                bucket: "bucket".to_owned(),
+                object: "key-3".to_owned(),
+                required: 1,
+                achieved: 0,
+            }),
+            Some(StorageError::ErasureWriteQuorum),
+            Some(StorageError::Timeout),
+            Some(StorageError::PreconditionFailed),
+        ];
+        assert_eq!(
+            delete_objects_storage_error_counts(&objects, &errors),
+            BTreeMap::from([
+                ("condition", 1),
+                ("namespace_lock_quorum", 1),
+                ("not_found", 1),
+                ("timeout", 1),
+                ("write_quorum", 1),
+            ])
+        );
+        let deleted = StorageDeletedObject::default();
+        let results = objects
+            .iter()
+            .zip(&errors)
+            .map(|(object, error)| reduce_delete_objects_result(object, &deleted, error.as_ref(), false))
+            .collect::<Vec<_>>();
+        assert!(results[0].is_ok(), "a successful storage result remains successful");
+        assert!(results[1].is_ok(), "ordinary missing objects remain idempotent success");
+        assert_eq!(
+            results[2]
+                .as_ref()
+                .expect_err("conditional missing object must fail")
+                .code
+                .as_deref(),
+            Some("NoSuchKey")
+        );
+        assert_eq!(
+            results[3]
+                .as_ref()
+                .expect_err("lost namespace fence must fail")
+                .code
+                .as_deref(),
+            Some("ServiceUnavailable")
+        );
+        assert!(results[4..].iter().all(Result::is_err));
     }
 
     #[test]
@@ -3680,31 +3886,31 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_tracks_downstream_delete_marker_targets() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn.clone(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
-                source_selection_criteria: Some(SourceSelectionCriteria {
-                    replica_modifications: Some(ReplicaModifications {
-                        status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                source_selection_criteria: Some(PersistedSourceSelectionCriteria {
+                    replica_modifications: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     sse_kms_encrypted_objects: None,
                 }),
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -3727,26 +3933,26 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_skips_replica_delete_without_replica_modifications() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let config = ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn,
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -3766,26 +3972,26 @@ mod tests {
     #[test]
     fn delete_replication_state_from_config_requires_delete_switch_for_marker_version_purges() {
         let arn = "arn:aws:s3:::target-bucket".to_string();
-        let mut config = ReplicationConfiguration {
+        let mut config = PersistedReplicationConfiguration {
             role: arn.clone(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
                 delete_replication: None,
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: arn.clone(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
                 source_selection_criteria: None,
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
         let obj_info = ObjectInfo {
@@ -3802,8 +4008,8 @@ mod tests {
             "delete-marker version purge must not use DeleteMarkerReplication"
         );
 
-        config.rules[0].delete_replication = Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        config.rules[0].delete_replication = Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         });
         let state = delete_replication_state_from_config(&config, &obj_info, version_id, false)
             .expect("delete-marker version purge should honor DeleteReplication");
@@ -3823,11 +4029,11 @@ mod tests {
         chain_rule.id = Some("chain".to_string());
         chain_rule.priority = Some(1);
         chain_rule.destination.bucket = chain_arn.clone();
-        let site_only = ReplicationConfiguration {
+        let site_only = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![site_rule.clone()],
         };
-        let site_and_chain = ReplicationConfiguration {
+        let site_and_chain = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![site_rule, chain_rule],
         };
@@ -3848,7 +4054,7 @@ mod tests {
         let mut shaped_operator_rule =
             crate::site_replication::build_site_replication_rule(&shaped_operator_arn, 1, "site-repl-target-1");
         shaped_operator_rule.priority = Some(1);
-        let shaped_operator_only = ReplicationConfiguration {
+        let shaped_operator_only = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![shaped_operator_rule],
         };

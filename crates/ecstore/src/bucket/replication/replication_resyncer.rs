@@ -66,9 +66,9 @@ use super::replication_target_boundary::{
     VersionIdentityCapability, is_replication_target_offline_error, replication_action_for_target_head,
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
     replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
-    replication_put_object_options, replication_source_etag_is_comparable, replication_target_head_is_newer_null_version,
-    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
-    version_identity_drifted,
+    replication_put_object_options_for_target, replication_source_etag_is_comparable,
+    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
+    ssec_passthrough_gate, version_identity_capability_from_put, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -85,6 +85,8 @@ use http_body_util::StreamBody;
 use metrics::counter;
 #[cfg(test)]
 use rmp_serde;
+#[cfg(test)]
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_TAGGING_DIRECTIVE,
@@ -92,8 +94,6 @@ use rustfs_utils::http::{
     insert_str, replication_target_versions,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
-#[cfg(test)]
-use s3s::dto::ReplicationConfiguration;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::pin::Pin;
@@ -4813,7 +4813,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.size = size;
         rinfo.replication_action = replication_action;
 
-        let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
+        let (put_opts, is_multipart) = match replication_put_object_options_for_target(&tgt_client, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
                 // Unsupported source metadata (e.g. managed SSE) is a fail-closed
@@ -5046,7 +5046,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         // The target client has no metadata-only operation. Reuse the existing
         // object transport so metadata changes carry tags and object-lock state
         // atomically with the source version.
-        let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
+        let (put_opts, is_multipart) = match replication_put_object_options_for_target(&tgt_client, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
                 fail_replicate_all_put_options(&mut rinfo, &tgt_client, &bucket, object_info, &e, start_time);
@@ -6577,15 +6577,49 @@ mod tests {
         assert_eq!(persisted.targets_map["arn:same"].resync_status, ResyncStatusType::ResyncCompleted);
     }
 
-    use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
+    use super::super::replication_target_boundary::{BucketTarget, BucketTargets, replication_put_object_options};
     use super::*;
-    use s3s::dto::{
-        BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ExcludedPrefix, ReplicationRule,
-        ReplicationRuleStatus, VersioningConfiguration,
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
+    use rustfs_gateway_types::persistence::{
+        PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
     };
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    /// Only a site-replication peer is told the source object's KMS key
+    /// name; an operator-configured target gets the `aws:kms` intent alone.
+    #[test]
+    fn replica_write_names_the_kms_key_for_site_replication_peers_only() {
+        use rustfs_utils::http::{AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
+
+        let object_info = ObjectInfo {
+            user_defined: HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "finance-key".to_string()),
+            ])
+            .into(),
+            ..Default::default()
+        };
+
+        let mut operator_target = test_target_client("http://127.0.0.1:1".to_string());
+        let (options, _) =
+            replication_put_object_options_for_target(&operator_target, &object_info).expect("put options must build");
+        assert_eq!(options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION), Some(&"aws:kms".to_string()));
+        assert!(!options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID));
+
+        Arc::get_mut(&mut operator_target)
+            .expect("test target is uniquely owned")
+            .site_peer_deployment_id = "peer-deployment".to_string();
+        let site_peer = operator_target;
+        let (options, _) = replication_put_object_options_for_target(&site_peer, &object_info).expect("put options must build");
+        assert_eq!(options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION), Some(&"aws:kms".to_string()));
+        assert_eq!(
+            options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID),
+            Some(&"finance-key".to_string())
+        );
+    }
 
     fn test_target_client(endpoint: String) -> Arc<TargetClient> {
         let config = aws_sdk_s3::Config::builder()
@@ -6605,6 +6639,7 @@ mod tests {
             disable_proxy: false,
             arn: format!("arn:rustfs:replication:us-east-1:target:{}", Uuid::new_v4()),
             reset_id: String::new(),
+            site_peer_deployment_id: String::new(),
             secure: false,
             health_check_duration: std::time::Duration::from_secs(5),
             replicate_sync: false,
@@ -8693,7 +8728,7 @@ mod tests {
             ..Default::default()
         };
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: role.to_string(),
                 rules: vec![],
             }),
@@ -8719,7 +8754,7 @@ mod tests {
         ReplicationVersioningStore::install_prefix_state_test_config(
             &bucket,
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
         );
@@ -8752,22 +8787,20 @@ mod tests {
         ReplicationVersioningStore::install_prefix_state_test_config(
             &bucket,
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                excluded_prefixes: Some(vec![ExcludedPrefix {
-                    prefix: Some("archive/".to_string()),
-                }]),
+                status: Some("Enabled".to_owned()),
+                excluded_prefixes: Some(vec![Some("archive/".to_string())]),
                 ..Default::default()
             },
         );
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
@@ -8777,7 +8810,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
             Some(BucketTargets {
@@ -8813,14 +8846,14 @@ mod tests {
         let admitted_arn = "arn:rustfs:replication:us-east-1:target:admitted";
         let current_role = "arn:rustfs:replication:us-east-1:target:current";
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: current_role.to_string(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::DISABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: current_role.to_string(),
                         ..Default::default()
                     },
@@ -8830,7 +8863,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
             Some(BucketTargets {
@@ -8878,12 +8911,12 @@ mod tests {
     #[tokio::test]
     async fn heal_rejects_semantically_invalid_replication_config() {
         let rcfg = ReplicationConfig::new(
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
                         ..Default::default()
                     },
@@ -8893,7 +8926,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static("Enabld"),
+                    status: "Enabld".to_owned(),
                 }],
             }),
             Some(BucketTargets::default()),

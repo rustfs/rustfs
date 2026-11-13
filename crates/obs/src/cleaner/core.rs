@@ -149,6 +149,7 @@ impl LogCleaner {
 
         let LogScanResult {
             mut logs,
+            recent_logs,
             mut compressed_archives,
         } = scan_log_directory(
             &self.log_dir,
@@ -161,8 +162,9 @@ impl LogCleaner {
             self.dry_run,
         )?;
 
+        logs.sort_by_key(|f| f.modified);
+        let mut to_delete = Vec::new();
         if !logs.is_empty() {
-            logs.sort_by_key(|f| f.modified);
             let total_size: u64 = logs.iter().map(|f| f.size).sum();
 
             info!(
@@ -178,16 +180,35 @@ impl LogCleaner {
 
             // Select the oldest files first, then additionally trim any files
             // that still violate configured size constraints.
-            let to_delete = self.select_files_to_process(&logs, total_size);
-            if !to_delete.is_empty() {
-                let (deleted, freed) = if self.parallel_compress && self.compress_old_files {
-                    self.parallel_stealing_compress(&to_delete)?
-                } else {
-                    self.serial_compress_and_delete(&to_delete)?
-                };
-                total_deleted += deleted;
-                total_freed += freed;
-            }
+            to_delete = self.select_files_to_process(&logs, total_size);
+        }
+
+        // `min_file_age_seconds` keeps freshly rolled files readable for a
+        // while, but those files fill the disk like any other. Once the rolled
+        // files that would remain exceed the byte budget, the budget wins:
+        // the oldest of them go, fresh or not, and only as many as it takes.
+        let over_budget = self.select_files_over_budget(&logs, &to_delete, recent_logs);
+        if !over_budget.is_empty() {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "byte_budget_overrides_min_file_age",
+                log_files = over_budget.len(),
+                max_total_size_bytes = self.max_total_size_bytes,
+                "log cleaner state changed"
+            );
+            to_delete.extend(over_budget);
+        }
+
+        if !to_delete.is_empty() {
+            let (deleted, freed) = if self.parallel_compress && self.compress_old_files {
+                self.parallel_stealing_compress(&to_delete)?
+            } else {
+                self.serial_compress_and_delete(&to_delete)?
+            };
+            total_deleted += deleted;
+            total_freed += freed;
         }
 
         if !compressed_archives.is_empty() {
@@ -215,6 +236,44 @@ impl LogCleaner {
         }
 
         Ok((total_deleted, total_freed))
+    }
+
+    /// Byte-budget trim that also counts the rolled files still inside
+    /// `min_file_age_seconds`.
+    ///
+    /// `aged` is sorted oldest first and `selected` is what the regular
+    /// selection already took from it. When the files that would remain,
+    /// aged and recent together, exceed `max_total_size_bytes`, the oldest of
+    /// them are returned until the rest fits. `keep_files` and the per-file
+    /// limit are not applied to recent files: only the bytes matter here.
+    pub(super) fn select_files_over_budget(
+        &self,
+        aged: &[FileInfo],
+        selected: &[FileInfo],
+        mut recent: Vec<FileInfo>,
+    ) -> Vec<FileInfo> {
+        if self.max_total_size_bytes == 0 || recent.is_empty() {
+            return Vec::new();
+        }
+        recent.sort_by_key(|file| file.modified);
+        let selected: std::collections::HashSet<&std::path::Path> = selected.iter().map(|file| file.path.as_path()).collect();
+        // Aged files are older than every recent one, so chaining keeps the
+        // oldest-first order.
+        let remaining: Vec<&FileInfo> = aged
+            .iter()
+            .filter(|file| !selected.contains(file.path.as_path()))
+            .chain(recent.iter())
+            .collect();
+        let mut occupied = remaining.iter().fold(0u64, |total, file| total.saturating_add(file.size));
+        let mut over_budget = Vec::new();
+        for file in remaining {
+            if occupied <= self.max_total_size_bytes {
+                break;
+            }
+            occupied = occupied.saturating_sub(file.size);
+            over_budget.push(file.clone());
+        }
+        over_budget
     }
 
     /// Choose regular log files that should be compressed and/or deleted.

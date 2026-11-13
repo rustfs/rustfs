@@ -1,10 +1,10 @@
-# Preview Artifact Acceptance
+# Candidate Artifact Acceptance
 
-Read after Phase 3 succeeds. Complete every check below before the parent skill's manual confirmation gate. These checks cover the downloaded artifact, embedded Console, and latest rc client.
+Read after Phase 3 succeeds. Complete every check below before the parent skill's manual confirmation gate. These checks cover the downloaded artifact, embedded Console, and the rc release frozen in the candidate inputs.
 
 ## Phase 4 — Run the artifact locally, verify the console
 
-Use a unique task-owned scratch directory. Select the versioned archive matching the host OS, architecture, and runtime, download its checksum file, and verify the archive before extraction. Do not substitute a different build when a matching artifact is unavailable; report that acceptance gap. The shell example below assumes the verified executable is at `RUSTFS_BINARY` (`rustfs.exe` on Windows), `SCRATCH` is the task directory, and `S3_PORT` and `CONSOLE_PORT` are distinct available ports. Use equivalent native commands when the shell differs.
+Use a unique task-owned scratch directory. Select the versioned archive matching the acceptance host, and verify it against the sealed manifest before extraction. Before desktop completion, use the Linux acceptance environment rather than rebuilding for the local desktop. Do not substitute a different build when a matching artifact is unavailable; report that acceptance gap. The shell example below assumes the verified executable is at `RUSTFS_BINARY` (`rustfs.exe` on Windows), `SCRATCH` is the task directory, and `S3_PORT` and `CONSOLE_PORT` are distinct available ports. Use equivalent native commands when the shell differs.
 
 Bind both listeners to loopback. Choose task-only credentials, set loopback proxy exclusions for the server/client processes, and record the server PID. A port probe does not reserve a port; retry startup with fresh ports on a bind conflict rather than connecting to an existing service.
 
@@ -24,16 +24,16 @@ PREVIEW_SERVER_PID=$!
 
 Checks (all must pass):
 
-- `"$RUSTFS_BINARY" --version` reports the preview tag name and the short SHA of `PREVIEW_HASH`. Reporting `<target>` without the `-preview.N` suffix means the build did not embed the tag — treat as FAIL and investigate before proceeding.
+- `"$RUSTFS_BINARY" --version` reports the exact final `<target>` and full `CANDIDATE_SHA`. A preview suffix, another version or another source is a failure.
 - Wait with a bounded readiness deadline while checking the recorded server process remains alive; `curl --noproxy '*' -fsS "$S3_ENDPOINT/health/ready"` must return ready from this process's listener.
 - Startup log shows the embedded console being served (this was the regression that `fix(release): require embedded console assets` guards).
 - Open `CONSOLE_ENDPOINT` in the browser and log in with the task credentials. The dashboard must render without JS console errors; create a bucket, upload a file, download it back (byte-identical), and delete the object and bucket. Keep the server running for Phase 5.
 
-## Phase 5 — Validate with the latest rc client
+## Phase 5 — Validate with the pinned rc client
 
 `rc` is the RustFS CLI client from <https://github.com/rustfs/cli>.
 
-- Resolve the latest release with `gh api repos/rustfs/cli/releases/latest --jq .tag_name`; verify the local client's version or download and verify a host-compatible client into the task directory. Set `RC_BIN` to that executable and record its version/digest. Avoid changing the user's installed client for this check.
+- Read the CLI release and asset digests from `inputs.json`; verify the local client's version or download a host-compatible asset from that exact release into the task directory. If the host is a desktop, resolve its asset within the same pinned CLI release and record the digest; do not independently follow `latest`. Set `RC_BIN` to that executable and record its version/digest. Avoid changing the user's installed client for this check.
 - Inspect the client's current help for an isolated configuration option and use it when supported. Otherwise choose a unique `PREVIEW_ALIAS` and confirm it is absent before creating it; never overwrite an existing alias. Use task-owned bucket/user names and input/output files. The names below are safe only inside the newly started isolated server.
 - Point the client at `S3_ENDPOINT` with loopback proxy exclusions and run the command matrix, recording PASS/FAIL per command:
 
@@ -60,3 +60,9 @@ cmp <local-file> "$SCRATCH/out"
 ```
 
 - Any FAIL blocks acceptance. On success or failure, stop only the recorded task process and remove only task-created aliases/data after retaining the needed failure evidence. Do not erase an existing client configuration or unrelated server data.
+
+## Field acceptance and desktop completion
+
+Before accepting the Linux manifest, record Scanner/Heal, multi-pool, memory, major features, high-concurrency 503, performance and previous-version integrity/upgrade results in backlog. Preserve the release-specific agreed limits and baseline; a PASS label without artifact identities or test results does not satisfy acceptance.
+
+Dispatch `release-complete.yml` only after that report passes, using the exact Linux manifest digest and backlog URL. Require native macOS/Windows checks, package extraction, image startup/scans, chart tests and complete certification to pass. Complete any desktop Console/client checks applicable to the release against these same archives. Record the completion run and final manifest SHA-256 before entering the parent confirmation gate. Partial Linux acceptance does not authorize final publication.

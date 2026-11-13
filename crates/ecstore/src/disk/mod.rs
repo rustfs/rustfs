@@ -223,8 +223,21 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
+impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
-pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn DiskFileWriter>;
+
+pub(crate) fn as_lazy_local_file_writer_mut(writer: &mut dyn DiskFileWriter) -> Option<&mut local::LazyLocalFileWriter> {
+    let any: &mut dyn std::any::Any = writer;
+    if any.is::<local::LazyLocalFileWriter>() {
+        return any.downcast_mut::<local::LazyLocalFileWriter>();
+    }
+    let slow = any.downcast_mut::<disk_store::SlowDiskWriter>()?;
+    let inner_any: &mut dyn std::any::Any = slow.inner_mut();
+    inner_any.downcast_mut::<local::LazyLocalFileWriter>()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotLeaseToken(Uuid);
@@ -729,6 +742,13 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_location(),
             Disk::Remote(remote_disk) => remote_disk.get_disk_location(),
+        }
+    }
+
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.bucket_creation_witness(volume).await,
+            Disk::Remote(_) => Ok(None),
         }
     }
 
@@ -1547,13 +1567,36 @@ impl Disk {
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
-    new_disk_with_health_tracker(ep, opt, None).await
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_disk_for_instance(
+    _instance: &crate::runtime::instance::InstanceContext,
+    ep: &Endpoint,
+    opt: &DiskOption,
+) -> Result<DiskStore> {
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        Some(_instance),
+    )
+    .await
 }
 
 pub(crate) async fn new_disk_with_health_tracker(
     ep: &Endpoint,
     opt: &DiskOption,
     reconnect: Option<disk_store::ReconnectDiskHealthState>,
+    #[cfg(feature = "internode-transport")] instance: Option<&crate::runtime::instance::InstanceContext>,
 ) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
@@ -1563,8 +1606,15 @@ pub(crate) async fn new_disk_with_health_tracker(
             reconnect,
         )))))
     } else {
-        let data_transport = build_internode_data_transport_from_env();
-        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
+        #[cfg(feature = "internode-transport")]
+        let remote_disk = match instance.and_then(|ctx| ctx.internode_data_transport()) {
+            Some(transport) => RemoteDisk::new(ep, opt, Arc::clone(transport))
+                .await?
+                .with_instance_transport(),
+            None => RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?,
+        };
+        #[cfg(not(feature = "internode-transport"))]
+        let remote_disk = RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
@@ -1598,6 +1648,11 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // NSScanner
 
     // Volume operations.
+    /// Unknown or remote backends cannot attest process-local publication history.
+    async fn bucket_creation_witness(&self, _volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        Ok(None)
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
@@ -2453,7 +2508,7 @@ impl DeleteRecoveryJournal {
             }
             let id = request.version_id.unwrap_or_default();
             let Some(original) = originals.get(&id) else {
-                return false;
+                return !id.is_nil() && !locals.contains_key(&id);
             };
             match locals.get(&id) {
                 Some(local) => local == original,
@@ -2503,7 +2558,10 @@ impl DeleteRecoveryJournal {
             };
             match (local, remote) {
                 (Some(local), Some(remote)) => local == remote,
-                (None, None) => self.original_digest.is_none() && authority.original_digest.is_none(),
+                (None, None) => {
+                    (!(request.deleted && request.mark_deleted) && request.version_id.is_some_and(|id| !id.is_nil()))
+                        || (self.original_digest.is_none() && authority.original_digest.is_none())
+                }
                 _ => false,
             }
         })
@@ -2570,7 +2628,13 @@ pub struct BoundedDeleteRecoveryDiscovery {
     pub complete: bool,
 }
 
-pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+/// Entries one bounded discovery call may charge on one drive. Object-scoped
+/// discovery charges each transaction-shaped (UUID) child of the key's
+/// directory once and every name that cannot be delete evidence at
+/// 1/`PLAIN_CHILDREN_PER_BUDGET_ENTRY`, so this admits a missing-key delete of a
+/// folder prefix with this many UUID-named children per drive. The request
+/// budget (`DeleteRecoveryWorkBudget`) still bounds the total across keys.
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 262_144;
 pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3981,6 +4045,46 @@ mod delete_recovery_adoption_tests {
         };
         assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
         assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let missing = Uuid::new_v4();
+        journal.requests.push(FileInfo {
+            version_id: Some(missing),
+            ..Default::default()
+        });
+        journal.original_digest = Some([3; 32]);
+        assert!(
+            journal.matches_prepared_authority(&journal),
+            "an explicit UUID absent from both prepared sources remains a no-op with original metadata"
+        );
+        assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
+        assert!(
+            journal.matches_adoption_source(std::slice::from_ref(&source)),
+            "a missing non-null version in the batch remains a no-op"
+        );
+        let mut unexpected = source.clone();
+        unexpected.version_id = Some(missing);
+        let mut foreign_preparation = journal.clone();
+        foreign_preparation.original_versions.push(unexpected.clone());
+        assert!(
+            !journal.matches_prepared_authority(&foreign_preparation)
+                && !foreign_preparation.matches_prepared_authority(&journal),
+            "absence from only one prepared source cannot establish a generation"
+        );
+        assert!(
+            !journal.matches_adoption_source(&[source.clone(), unexpected]),
+            "a version absent from the authority cannot be deleted locally"
+        );
+        for version_id in [None, Some(Uuid::nil())] {
+            journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_prepared_authority(&journal),
+                "a missing null version with original metadata cannot establish its generation"
+            );
+            assert!(
+                !journal.matches_adoption_source(std::slice::from_ref(&source)),
+                "a missing null version cannot establish its generation"
+            );
+        }
+        journal.requests.pop();
         let mut foreign = source.clone();
         foreign.metadata_digest = [2; 32];
         assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
@@ -3996,6 +4100,25 @@ mod delete_recovery_adoption_tests {
         assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
         journal.requests.clear();
         assert!(!journal.matches_adoption_source(&journal.original_versions));
+
+        let mut marker = journal.clone();
+        marker.requests = vec![FileInfo {
+            version_id: Some(id),
+            deleted: true,
+            mark_deleted: true,
+            ..Default::default()
+        }];
+        marker.original_versions.clear();
+        marker.original_digest = Some([3; 32]);
+        assert!(
+            !marker.matches_prepared_authority(&marker),
+            "a marker with original metadata requires a source generation"
+        );
+        marker.original_digest = None;
+        assert!(
+            marker.matches_prepared_authority(&marker),
+            "marker preparation without original metadata retains the existing allowance"
+        );
     }
 }
 

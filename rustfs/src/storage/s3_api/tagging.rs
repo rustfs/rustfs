@@ -23,18 +23,31 @@ fn invalid_tag_error(message: &str) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidTag, message.to_string())
 }
 
+/// The storage validators read the persisted tag shape.
+fn persisted_tags(tag_set: &[Tag]) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
+    tag_set
+        .iter()
+        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
+            key: tag.key.clone(),
+            value: tag.value.clone(),
+        })
+        .collect()
+}
+
 pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
     if tag_set.len() > 10 {
         return Err(invalid_tag_error("Cannot have more than 10 tags per object"));
     }
-    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(tag_set).map_err(invalid_tag_error)
+    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(&persisted_tags(tag_set))
+        .map_err(invalid_tag_error)
 }
 
 pub(crate) fn validate_bucket_tag_set(tag_set: &[Tag]) -> S3Result<()> {
     if tag_set.len() > crate::storage::storage_api::ecstore_bucket::metadata::MAX_BUCKET_TAGS {
         return Err(invalid_tag_error("Cannot have more than 50 tags per bucket"));
     }
-    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(tag_set).map_err(invalid_tag_error)
+    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(&persisted_tags(tag_set))
+        .map_err(invalid_tag_error)
 }
 
 fn validate_tag_component_encoding(component: &str) -> S3Result<()> {

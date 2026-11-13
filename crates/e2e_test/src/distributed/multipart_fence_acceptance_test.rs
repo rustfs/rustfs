@@ -1285,7 +1285,9 @@ async fn list_parts_disk_loss_after_metadata_read(
     let error = result.expect_err("one missing directory and three unavailable participants cannot prove an empty upload");
     let response = error.raw_response().expect("ListParts must return an S3 service response");
     assert_eq!(response.status().as_u16(), 503);
-    assert_eq!(error.as_service_error().and_then(|err| err.meta().code()), Some("SlowDownRead"));
+    // Since #9149, SlowDownRead is reserved for GET/HEAD object reads; a
+    // ListParts read-quorum failure is reported as ServiceUnavailable.
+    assert_eq!(error.as_service_error().and_then(|err| err.meta().code()), Some("ServiceUnavailable"));
     assert!(response.headers().get("x-rustfs-error-cause").is_none());
     assert!(response.headers().get("retry-after").is_none());
     assert!(

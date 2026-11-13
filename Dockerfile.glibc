@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM ubuntu:26.04 AS build
+ARG BINARY_SOURCE=download
+
+FROM ubuntu:26.04 AS download
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -79,6 +81,14 @@ RUN set -eux; \
 
 COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
 RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" gnu "$RC_RELEASE" /build/rc
+
+# Candidate packaging supplies the accepted executables from verified archives.
+# The default download stage remains available for local image builds.
+FROM scratch AS supplied
+ARG TARGETARCH
+COPY .release-inputs/${TARGETARCH}/ /build/
+
+FROM ${BINARY_SOURCE} AS build
 
 FROM ubuntu:26.04
 

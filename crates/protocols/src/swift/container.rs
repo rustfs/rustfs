@@ -25,7 +25,7 @@ use super::types::Container;
 use super::{SwiftError, SwiftResult};
 use super::{get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, update_swift_bucket_tagging};
 use rustfs_credentials::Credentials;
-use s3s::dto::{Tag, Tagging};
+use rustfs_gateway_types::cors_tagging::{PersistedTag as Tag, PersistedTagging as Tagging};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
 

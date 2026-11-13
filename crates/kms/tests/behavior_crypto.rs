@@ -33,7 +33,7 @@
 
 mod common;
 
-use common::{BackendCase, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload};
+use common::{BackendCase, TestKms, assert_context_mismatch, ctx, flip_middle_bit, for_each_backend, payload, schedule_deletion};
 use rustfs_kms::{
     DecryptRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KmsError, ObjectEncryptionContext, is_data_key_envelope,
 };
@@ -412,6 +412,7 @@ async fn a_data_key_is_not_transferable_between_master_keys() {
 
     // Deleting wrapper-a makes its blobs undecryptable while wrapper-b's keep
     // working — the blobs are genuinely bound to distinct material.
+    schedule_deletion(&manager, "wrapper-a").await;
     manager
         .delete_key(rustfs_kms::DeleteKeyRequest {
             key_id: "wrapper-a".to_string(),

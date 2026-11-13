@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_iam::error::Error as IamError;
-use s3s::{S3Error, S3ErrorCode};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 pub(crate) fn iam_error_to_s3_error(err: IamError) -> S3Error {
     let code = match &err {

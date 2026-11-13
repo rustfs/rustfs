@@ -41,10 +41,10 @@ use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
-use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
+use crate::telemetry::local::{build_json_log_layer, open_rolling_appender, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
-use crate::telemetry::rolling::{RollingAppender, Rotation};
+use crate::telemetry::rolling::Rotation;
 // Import helper functions from local.rs (sibling module)
 use crate::TelemetryError;
 use metrics::counter;
@@ -58,7 +58,7 @@ use opentelemetry_sdk::{
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
-use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
+use rustfs_config::observability::DEFAULT_OBS_LOG_MATCH_MODE;
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
@@ -102,6 +102,16 @@ const OBJECT_LOCK_DURATION_HISTOGRAM_METRICS: &[&str] = &[
 const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
+const INTERNODE_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_system_network_internode_operation_duration_ms",
+    "rustfs_system_network_internode_operation_server_duration_ms",
+];
+// Internode instruments record milliseconds, including sub-millisecond control RPCs.
+const INTERNODE_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0, 250.0,
+    500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
 ];
 
 const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -244,17 +254,12 @@ pub(super) fn init_observability_http(
                 "daily" => Rotation::Daily,
                 _ => Rotation::Daily,
             };
-            let max_single_file_size = config
-                .log_max_single_file_size_bytes
-                .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
-
-            let file_appender =
-                RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            let (file_appender, roll_signal) = open_rolling_appender(config, log_directory, log_filename, rotation, match_mode)?;
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
-            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files, roll_signal);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
 
@@ -521,6 +526,8 @@ fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
         Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
     } else if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) {
         Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
+    } else if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS)
     } else {
         None
     }
@@ -1138,6 +1145,9 @@ mod tests {
         for name in OBJECT_LOCK_DURATION_HISTOGRAM_METRICS {
             assert_eq!(duration_histogram_buckets(name), Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS));
         }
+        for name in INTERNODE_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS));
+        }
         for name in [
             "rustfs_io_put_object_request_duration_seconds",
             "rustfs_io_get_object_response_size_bytes",
@@ -1169,6 +1179,8 @@ mod tests {
         for (name, observations) in [
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[0], [0.002, 0.004, 0.012]),
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[0], [0.04, 3.2, 31000.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[1], [0.02, 1.2, 1300.0]),
         ] {
             let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
             for seconds in observations {
@@ -1186,6 +1198,8 @@ mod tests {
             let expected = match metric.name() {
                 "rustfs_object_lock_diag_acquire_duration_seconds" => [(0.002, 1), (0.004, 1), (0.015, 1)],
                 "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
+                "rustfs_system_network_internode_operation_duration_ms" => [(0.05, 1), (4.0, 1), (60000.0, 1)],
+                "rustfs_system_network_internode_operation_server_duration_ms" => [(0.025, 1), (1.5, 1), (2500.0, 1)],
                 _ => continue,
             };
             let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
@@ -1201,7 +1215,7 @@ mod tests {
             assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
             checked += 1;
         }
-        assert_eq!(checked, 2, "both acquisition and hold histograms were exported");
+        assert_eq!(checked, 4, "lock and internode duration histograms were exported");
         provider.shutdown().expect("stop lock histogram test provider");
     }
 

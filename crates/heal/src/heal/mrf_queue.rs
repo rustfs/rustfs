@@ -2199,7 +2199,7 @@ async fn replay_into(
                 // runtime dispatches it after publishing the successor, avoiding
                 // a duplicate task in the startup-replay and steady-state paths.
                 if let Ok(Some(anchor)) = manager.durable_mrf_repair_anchor(&intent).await {
-                    durable_replay_anchors.push(anchor.clone());
+                    durable_replay_anchors.push(anchor);
                 }
                 let restored = intent_digest(&intent).and_then(|digest| take_lifecycle_record(&mut lifecycle, digest));
                 partial_writes.push((intent, restored));

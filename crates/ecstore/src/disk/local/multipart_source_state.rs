@@ -296,9 +296,10 @@ pub(super) fn put_active_multipart_source_head(source: impl AsRef<Path>, raw: By
 
 fn stamp_matches_active_disk(source: &Path, expected_head_stamp: FileStamp) -> bool {
     FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp)
-        && !source.join(STATE).exists()
-        && !source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
-        && !source.join(".mpu-completions").exists()
+        && !(cfg!(test)
+            && (source.join(STATE).exists()
+                || source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
+                || source.join(".mpu-completions").exists()))
 }
 
 pub(super) fn get_active_multipart_source_head(source: &Path) -> Option<(Bytes, FileInfo)> {
@@ -375,7 +376,11 @@ pub(super) fn finish_active_multipart_part_transaction(
     ACTIVE_MULTIPART_SOURCE_HEADS.remove_if_mut(source, |entry| !entry.unsettled_parts.remove(&part_number));
 }
 
-pub(super) fn get_active_multipart_source_part(source: &Path, part_number: usize) -> Option<rustfs_filemeta::ObjectPartInfo> {
+pub(super) fn get_active_multipart_source_part_with_head(
+    source: &Path,
+    part_number: usize,
+    head_already_verified: bool,
+) -> Option<rustfs_filemeta::ObjectPartInfo> {
     let (head_stamp, data_dir, expected_stamp, part) = ACTIVE_MULTIPART_SOURCE_HEADS
         .with_get(source, |entry| {
             if !entry.unsettled_parts.is_empty() {
@@ -386,7 +391,7 @@ pub(super) fn get_active_multipart_source_part(source: &Path, part_number: usize
             Some((entry.head_stamp, data_dir, *expected_stamp, part.clone()))
         })
         .flatten()?;
-    if !stamp_matches_active_disk(source, head_stamp) {
+    if !head_already_verified && !stamp_matches_active_disk(source, head_stamp) {
         ACTIVE_MULTIPART_SOURCE_HEADS.remove(source);
         return None;
     }
@@ -610,15 +615,35 @@ impl SourceStore {
         terminal: Option<&Path>,
         sync_source_before: bool,
     ) -> std::io::Result<()> {
+        Self::persist_state_with_guard_std(source, base, root, raw, terminal, sync_source_before, None)
+    }
+    fn persist_state_with_guard_std(
+        source: &Path,
+        base: &Path,
+        root: &os::PublicationRoot,
+        raw: &[u8],
+        terminal: Option<&Path>,
+        sync_source_before: bool,
+        directory_guard: Option<&os::RenameCommitGuard>,
+    ) -> std::io::Result<()> {
         invalidate_active_multipart_source_head(source);
-        #[cfg(unix)]
-        let mut pinned = os::pin_multipart_source_directory(source, base, root)?;
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let _pinned = os::pin_multipart_source_directory(source, base, root)?;
         if sync_source_before {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
+                let mut pinned = os::pin_multipart_source_directory(source, base, root)?;
                 let opened = std::fs::File::from(pinned.pop().ok_or_else(|| IoError::other("empty source directory guard"))?);
+                os::fsync_directory_handle_std(source, Some(&opened))?;
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let opened = std::fs::File::from(
+                    _pinned
+                        .last()
+                        .ok_or_else(|| IoError::other("empty source directory guard"))?
+                        .try_clone()?,
+                );
                 os::fsync_directory_handle_std(source, Some(&opened))?;
             }
             #[cfg(not(unix))]
@@ -627,7 +652,7 @@ impl SourceStore {
         if let Some(path) = terminal {
             os::replace_multipart_source_metadata(path, raw, base, root)?;
         }
-        os::replace_multipart_source_metadata(&source.join(STATE), raw, base, root)
+        os::replace_multipart_source_metadata_with_guard(&source.join(STATE), raw, base, root, directory_guard)
     }
     async fn write_owned_backup_and_persist(&self, owner: Uuid, target: bool, bytes: &[u8], state: &SourceState) -> Result<()> {
         if owner.is_nil() {
@@ -724,17 +749,44 @@ impl SourceStore {
         bytes: &[u8],
         sync_source_root: bool,
     ) -> std::io::Result<()> {
+        Self::write_owned_backup_inner_std(source, base, root, owner, target, bytes, sync_source_root, false, true, false)
+    }
+    #[expect(clippy::too_many_arguments)]
+    fn write_owned_backup_inner_std(
+        source: &Path,
+        base: &Path,
+        root: &os::PublicationRoot,
+        owner: Uuid,
+        target: bool,
+        bytes: &[u8],
+        sync_source_root: bool,
+        fresh_owner: bool,
+        sync_parents: bool,
+        source_already_pinned: bool,
+    ) -> std::io::Result<()> {
+        invalidate_active_multipart_source_head(source);
         let path = if target {
             target_backup_path(source, owner)
         } else {
             original_path(source, owner)
         };
-        let _pin = os::pin_multipart_source_directory(source, base, root)?;
+        #[cfg(not(target_os = "linux"))]
+        let _pin = if source_already_pinned {
+            None
+        } else {
+            Some(os::pin_multipart_source_directory(source, base, root)?)
+        };
+        #[cfg(target_os = "linux")]
+        let _ = source_already_pinned;
         let parent = path
             .parent()
             .ok_or_else(|| std::io::Error::other("source backup has no parent"))?;
-        let _parents = os::mkdir_all_below_existing_base_std(parent, base, root)?;
-        let existed = if target {
+        os::existing_base_directory_suffix(source, base)?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut parents = os::mkdir_all_below_existing_base_std(parent, source, root)?;
+        let existed = if fresh_owner {
+            false
+        } else if target {
             match os::observe_multipart_source_metadata(&path, base, root, bytes.len() as u64) {
                 Ok((length, sha)) if length == bytes.len() as u64 && sha == raw_sha(bytes) => true,
                 Ok(_) => {
@@ -752,12 +804,37 @@ impl SourceStore {
             false
         };
         if !existed {
-            os::replace_multipart_source_metadata(&path, bytes, base, root)?;
+            #[cfg(target_os = "linux")]
+            let leaf_fd = parents.pop();
+            #[cfg(all(unix, not(target_os = "linux")))]
+            let leaf_fd = None;
+            os::replace_multipart_source_metadata_with_leaf_fd(
+                &path,
+                bytes,
+                base,
+                root,
+                #[cfg(unix)]
+                leaf_fd,
+            )?;
+            #[cfg(all(unix, not(target_os = "linux")))]
+            let _ = parents.pop();
         }
-        os::sync_multipart_owned_record_parents_options(source, parent, existed, sync_source_root, base, root)
+        if sync_parents {
+            os::sync_multipart_owned_record_parents_options(
+                source,
+                parent,
+                existed,
+                sync_source_root,
+                base,
+                root,
+                Some(parents),
+            )?;
+        }
+        Ok(())
     }
     pub async fn replace_head(&self, bytes: &[u8]) -> Result<()> {
-        self.multipart_index
+        let index_pin = self
+            .multipart_index
             .record_head(&format!("{}/xl.meta", self.path), bytes)
             .await?;
         invalidate_active_multipart_source_head(&self.source);
@@ -766,6 +843,7 @@ impl SourceStore {
         let root = self.publication_root.clone();
         let bytes = bytes.to_vec();
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
+            let _index_pin = index_pin;
             os::replace_multipart_source_metadata(&path, &bytes, &base, &root)
         })
         .await
@@ -869,9 +947,12 @@ impl SourceStore {
         let base = self.base.clone();
         let root = self.publication_root.clone();
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
+            #[cfg(not(target_os = "linux"))]
             let _pin = os::pin_multipart_source_directory(&source, &base, &root)?;
             let parent = path.parent().ok_or_else(|| IoError::other("certificate has no parent"))?;
-            let _parents = os::mkdir_all_below_existing_base_std(parent, &base, &root)?;
+            os::existing_base_directory_suffix(&source, &base)?;
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut parents = os::mkdir_all_below_existing_base_std(parent, &source, &root)?;
             let existed = if let Some(previous) = read_optional(&path, &base, &root).map_err(IoError::other)? {
                 if previous.as_ref() != raw.as_slice() {
                     return Err(IoError::new(std::io::ErrorKind::AlreadyExists, "immutable recovery certificate changed"));
@@ -881,9 +962,22 @@ impl SourceStore {
                 false
             };
             if !existed {
-                os::replace_multipart_source_metadata(&path, &raw, &base, &root)?;
+                #[cfg(target_os = "linux")]
+                let leaf_fd = parents.pop();
+                #[cfg(all(unix, not(target_os = "linux")))]
+                let leaf_fd = None;
+                os::replace_multipart_source_metadata_with_leaf_fd(
+                    &path,
+                    &raw,
+                    &base,
+                    &root,
+                    #[cfg(unix)]
+                    leaf_fd,
+                )?;
+                #[cfg(all(unix, not(target_os = "linux")))]
+                let _ = parents.pop();
             }
-            os::sync_multipart_owned_record_parents(&source, parent, existed, &base, &root)
+            os::sync_multipart_owned_record_parents_options(&source, parent, existed, true, &base, &root, Some(parents))
         })
         .await?;
         Ok(digest)
@@ -1847,8 +1941,14 @@ impl LocalDisk {
             os::run_blocking_namespace_operation_with_sync(staging.lease.clone(), true, move || {
                 SourceStore::write_owned_backup_std(&source_dir, &base_dir, &pub_root, owner, false, &original_bytes, false)?;
                 SourceStore::persist_state_std(&source_dir, &base_dir, &pub_root, &state_raw, terminal.as_deref(), false)?;
-                let _parent = os::mkdir_all_below_existing_base_std(&directory, &base_dir, &pub_root)?;
-                os::replace_multipart_source_metadata(&directory.join(RETIREMENT_ANCHOR), &anchor_bytes, &base_dir, &pub_root)?;
+                let staging_base = directory.parent().filter(|p| p.starts_with(&base_dir)).unwrap_or(&base_dir);
+                os::replace_multipart_source_metadata_creating_parent(
+                    &directory.join(RETIREMENT_ANCHOR),
+                    &anchor_bytes,
+                    staging_base,
+                    &base_dir,
+                    &pub_root,
+                )?;
                 #[cfg(target_os = "linux")]
                 if can_mark_presynced {
                     super::mark_presynced_tmp_data_dir(directory);
@@ -2024,22 +2124,77 @@ impl NativeMultipartPublication {
             }
             let setup_res: std::io::Result<()> = (|| {
                 if let Some((original_bytes, directory, anchor_bytes)) = deferred_initial {
-                    SourceStore::write_owned_backup_std(source, base, root, backup_owner, false, &original_bytes, false)?;
+                    SourceStore::write_owned_backup_inner_std(
+                        source,
+                        base,
+                        root,
+                        backup_owner,
+                        false,
+                        &original_bytes,
+                        false,
+                        true,
+                        old_metadata.is_none(),
+                        true,
+                    )?;
                     if let Some(previous) = old_metadata {
-                        SourceStore::write_owned_backup_std(source, base, root, backup_owner, true, previous, false)?;
+                        SourceStore::write_owned_backup_inner_std(
+                            source,
+                            base,
+                            root,
+                            backup_owner,
+                            true,
+                            previous,
+                            false,
+                            true,
+                            true,
+                            true,
+                        )?;
                     }
-                    SourceStore::persist_state_std(source, base, root, &next_state_raw, terminal.as_deref(), false)?;
-                    let _parent = os::mkdir_all_below_existing_base_std(&directory, base, root)?;
-                    os::replace_multipart_source_metadata(&directory.join(RETIREMENT_ANCHOR), &anchor_bytes, base, root)?;
+                    SourceStore::persist_state_with_guard_std(
+                        source,
+                        base,
+                        root,
+                        &next_state_raw,
+                        terminal.as_deref(),
+                        false,
+                        Some(directory_guard),
+                    )?;
+                    let staging_base = directory.parent().filter(|p| p.starts_with(base)).unwrap_or(base);
+                    os::replace_multipart_source_metadata_creating_parent(
+                        &directory.join(RETIREMENT_ANCHOR),
+                        &anchor_bytes,
+                        staging_base,
+                        base,
+                        root,
+                    )?;
                     #[cfg(target_os = "linux")]
                     if can_mark_presynced {
                         super::mark_presynced_tmp_data_dir(directory);
                     }
                 } else {
                     if let Some(previous) = old_metadata {
-                        SourceStore::write_owned_backup_std(source, base, root, backup_owner, true, previous, false)?;
+                        SourceStore::write_owned_backup_inner_std(
+                            source,
+                            base,
+                            root,
+                            backup_owner,
+                            true,
+                            previous,
+                            false,
+                            false,
+                            true,
+                            true,
+                        )?;
                     }
-                    SourceStore::persist_state_std(source, base, root, &next_state_raw, terminal.as_deref(), false)?;
+                    SourceStore::persist_state_with_guard_std(
+                        source,
+                        base,
+                        root,
+                        &next_state_raw,
+                        terminal.as_deref(),
+                        false,
+                        Some(directory_guard),
+                    )?;
                 }
                 Ok(())
             })();
@@ -2138,8 +2293,14 @@ impl NativeMultipartPublication {
                     SourceStore::write_owned_backup_std(&source, &base, &root, backup_owner, true, previous, false)?;
                 }
                 SourceStore::persist_state_std(&source, &base, &root, &next_state_raw, terminal.as_deref(), false)?;
-                let _parent = os::mkdir_all_below_existing_base_std(&directory, &base, &root)?;
-                os::replace_multipart_source_metadata(&directory.join(RETIREMENT_ANCHOR), &anchor_bytes, &base, &root)?;
+                let staging_base = directory.parent().filter(|p| p.starts_with(&base)).unwrap_or(&base);
+                os::replace_multipart_source_metadata_creating_parent(
+                    &directory.join(RETIREMENT_ANCHOR),
+                    &anchor_bytes,
+                    staging_base,
+                    &base,
+                    &root,
+                )?;
                 #[cfg(target_os = "linux")]
                 if can_mark_presynced {
                     super::mark_presynced_tmp_data_dir(directory);
@@ -2269,6 +2430,7 @@ impl NativeMultipartPublication {
         target_already_synced: bool,
         fused_in_place: bool,
         staging_cleanup: Option<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>,
+        directory_guard: Option<&os::RenameCommitGuard>,
     ) -> Result<MultipartPublicationResult> {
         let mut state = self.state.lock().clone();
         let expected_state_raw = encode(&state)?;
@@ -2354,7 +2516,15 @@ impl NativeMultipartPublication {
                     })?;
                 }
             }
-            SourceStore::persist_state_std(source, base, root, &next_state_raw, terminal.as_deref(), !fused_in_place)?;
+            SourceStore::persist_state_with_guard_std(
+                source,
+                base,
+                root,
+                &next_state_raw,
+                terminal.as_deref(),
+                !fused_in_place,
+                directory_guard,
+            )?;
             if let Some((io_path, cleaned)) = staging_cleanup {
                 match std::fs::remove_dir(&io_path) {
                     Ok(()) => cleaned.store(true, std::sync::atomic::Ordering::Release),
@@ -2387,7 +2557,7 @@ impl NativeMultipartPublication {
     ) -> Result<MultipartPublicationResult> {
         let this = Arc::clone(self);
         os::run_blocking_namespace_operation_with_sync(target_lease, true, move || {
-            this.finish_on_thread(target_already_synced, false, staging_cleanup)
+            this.finish_on_thread(target_already_synced, false, staging_cleanup, None)
                 .map_err(IoError::other)
         })
         .await

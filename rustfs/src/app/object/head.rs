@@ -17,6 +17,12 @@
 use super::veeam_sosapi;
 use super::*;
 use crate::app::storage_api::object_usecase::access::replication_proxy_allowed;
+use crate::app::storage_api::s3::dto::{
+    ChecksumType, ContentType, ETag, HeadObjectInput, HeadObjectOutput, SSECustomerAlgorithm, ServerSideEncryption, StorageClass,
+    Timestamp,
+};
+use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
@@ -753,6 +759,7 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::Range;
     use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,

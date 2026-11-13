@@ -84,12 +84,13 @@ use rand::RngExt as _;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{
     decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
 };
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -13115,7 +13116,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
     bucket: &str,
     version: &rustfs_filemeta::FileInfo,
-    lifecycle_config: Option<&BucketLifecycleConfiguration>,
+    lifecycle_config: Option<&PersistedLifecycleConfiguration>,
     object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
@@ -17046,9 +17047,9 @@ impl ECStore {
         generation: OffsetDateTime,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -17220,9 +17221,9 @@ impl ECStore {
         mut deferred_entry: DeferredDecommissionEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -17329,9 +17330,9 @@ impl ECStore {
         generation: OffsetDateTime,
         set: Arc<SetDisks>,
         bi: DecomBucketInfo,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
@@ -18016,9 +18017,9 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         attempts: &mut usize,
@@ -18202,9 +18203,9 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
-        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         entry_attempt: usize,
         scanner_backlog_handoff_attempt: usize,
@@ -19490,7 +19491,7 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
     ) -> Result<()> {
         let expected_bucket_incarnation_id = if is_meta_bucketname(&bucket) {
             None
@@ -20944,12 +20945,12 @@ impl ECStore {
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut proof = None::<DecommissionDurableIlmReceipt>;
         let mut nonterminal_receipt_found = false;
-        for pool_idx in 0..self.pools.len() {
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
             if pool_idx == source_pool_idx {
                 continue;
             }
             let data = match read_config_limited_preserve_empty(
-                self.pools[pool_idx].clone(),
+                pool.clone(),
                 &receipt_path,
                 DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
             )
@@ -28412,7 +28413,7 @@ mod tests {
             for wrapped in [
                 err.clone(),
                 data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "b", "o", err.clone()),
-                with_decommission_entry_context("migrate_object", "b", "o", err.clone()),
+                with_decommission_entry_context("migrate_object", "b", "o", err),
             ] {
                 assert_eq!(
                     classify_decommission_capacity_failure(&wrapped),
@@ -40280,7 +40281,7 @@ mod pools_tests {
             )
             .expect("finalize records the completion");
 
-            let mut adopted = meta.clone();
+            let mut adopted = meta;
             let plan = decommission_capacity_intent_adoption_plan(&adopted, 0, generation)
                 .expect("plan adoption")
                 .expect("the interrupted completion should be planned");

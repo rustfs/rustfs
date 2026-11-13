@@ -17,7 +17,7 @@ use super::metadata::unreadable_config_refusal;
 use super::{metadata_sys::get_bucket_metadata_sys, versioning::VersioningApi};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
-use s3s::dto::VersioningConfiguration;
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 use tracing::{error, warn};
 
 pub struct BucketVersioningSys {}
@@ -163,7 +163,7 @@ mod tests {
 
     fn enabled() -> VersioningConfiguration {
         VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         }
     }

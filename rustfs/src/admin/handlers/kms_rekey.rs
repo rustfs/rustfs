@@ -18,37 +18,39 @@
 //! walks and rewrites object metadata across buckets, so no per-key role
 //! template confers it.
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_object_store_handle};
-use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
+use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::kms_rekey::{self, RekeyStartError};
 use crate::server::ADMIN_PREFIX;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, KmsAction};
+use rustfs_s3_types::Body;
 use serde::Deserialize;
 
 fn kms_rekey_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::RekeyAction)]
 }
 
-async fn authorize_kms_rekey_request(req: &S3Request<Body>) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_kms_rekey_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
     }
-    authorize_admin_request(req, kms_rekey_actions()).await?;
+    authorize_admin_envelope(req.envelope(), kms_rekey_actions()).await?;
     Ok(())
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
+fn json_response(status: StatusCode, body: Vec<u8>) -> AdminResponse {
     let mut headers = HeaderMap::new();
     headers.insert(s3::header::CONTENT_TYPE, "application/json".parse().expect("static content type"));
-    S3Response::with_headers((status, Body::from(body)), headers)
+    AdminResponse::with_headers(status, Body::from(body), headers)
 }
 
-fn snapshot_response(status: StatusCode, snapshot: &kms_rekey::RekeyJobSnapshot) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn snapshot_response(status: StatusCode, snapshot: &kms_rekey::RekeyJobSnapshot) -> S3Result<AdminResponse> {
     let body = serde_json::to_vec(snapshot)
         .map_err(|e| s3::error(S3ErrorCode::InternalError, format!("failed to serialize rekey status: {e}")))?;
     Ok(json_response(status, body))
@@ -71,12 +73,12 @@ pub struct StartKmsRekeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for StartKmsRekeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_kms_rekey_request(&req).await?;
 
         let mut req = req;
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("failed to read request body: {e}")))?;
@@ -130,7 +132,7 @@ pub struct KmsRekeyStatusHandler;
 
 #[async_trait::async_trait]
 impl Operation for KmsRekeyStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_kms_rekey_request(&req).await?;
 
         match kms_rekey::status() {
@@ -150,7 +152,7 @@ pub struct CancelKmsRekeyHandler;
 
 #[async_trait::async_trait]
 impl Operation for CancelKmsRekeyHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_kms_rekey_request(&req).await?;
 
         match kms_rekey::cancel() {

@@ -15,6 +15,13 @@
 //! PutObject write path: body admission, eager commit, zero-copy tuning.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    CacheControl, ContentDisposition, ContentEncoding, ContentLanguage, ContentType, ObjectLockLegalHoldStatus, ObjectLockMode,
+    PutObjectInput, PutObjectOutput, SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId, ServerSideEncryption, StorageClass,
+    StreamingBlob, TaggingHeader, Timestamp, WebsiteRedirectLocation,
+};
+use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError, s3_error};
 use futures::FutureExt;
 
 use crate::app::trailer_adapter::trailer_source;
@@ -2378,6 +2385,7 @@ fn passthrough_compressed_actual_size(user_defined: &HashMap<String, String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
 
@@ -2614,9 +2622,9 @@ mod tests {
         let internal = fail_put_object(PutObjectCompletion::Internal(None), error());
         assert_eq!(internal.code(), &S3ErrorCode::ServiceUnavailable);
     }
-    use s3s::dto::{
-        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -2755,11 +2763,11 @@ mod tests {
         .unwrap();
 
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                rule: Some(ObjectLockRule {
-                    default_retention: Some(DefaultRetention {
-                        mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -2862,9 +2870,7 @@ mod tests {
             .expect("metadata GET input must build");
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
         let metadata_get = tokio::spawn(async move {
-            metadata_usecase
-                .execute_get_object(build_request(metadata_input, Method::GET))
-                .await
+            crate::app::test_seams::get_object(&metadata_usecase, build_request(metadata_input, Method::GET)).await
         });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
@@ -2893,7 +2899,10 @@ mod tests {
             .build()
             .expect("GET input must build");
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get = tokio::spawn(async move { get_usecase.execute_get_object(build_request(get_input, Method::GET)).await });
+        let get =
+            tokio::spawn(
+                async move { crate::app::test_seams::get_object(&get_usecase, build_request(get_input, Method::GET)).await },
+            );
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -3318,8 +3327,8 @@ mod tests {
             let config = ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                        sse_algorithm: ServerSideEncryption::from_static(algorithm),
-                        kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                        sse_algorithm: algorithm.to_owned(),
+                        kms_master_key_id: kms_key_id.map(|id| id.to_string()),
                     }),
                     blocked_encryption_types: None,
                     bucket_key_enabled: None,
@@ -4328,7 +4337,7 @@ mod tests {
         let config = ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(algorithm),
+                    sse_algorithm: algorithm.to_owned(),
                     kms_master_key_id: kms_key_id.map(|id| id.to_string()),
                 }),
                 blocked_encryption_types: None,
@@ -4413,7 +4422,7 @@ mod tests {
                 .expect("SSE-C HEAD input must build");
             let mut head_request = build_request(head_input, Method::HEAD);
             head_request.headers = read_headers.clone();
-            let head = Box::pin(usecase.execute_head_object(head_request))
+            let head = Box::pin(crate::app::test_seams::head_object(&usecase, head_request))
                 .await
                 .expect("matching SSE-C key must authorize HEAD");
             assert_eq!(head.output.server_side_encryption, None);
@@ -4430,7 +4439,7 @@ mod tests {
                 .expect("SSE-C GET input must build");
             let mut get_request = build_request(get_input, Method::GET);
             get_request.headers = read_headers;
-            let get = Box::pin(usecase.execute_get_object(get_request))
+            let get = Box::pin(crate::app::test_seams::get_object(&usecase, get_request))
                 .await
                 .expect("matching SSE-C key must authorize GET");
             assert_eq!(get.output.server_side_encryption, None);

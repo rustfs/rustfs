@@ -1,0 +1,444 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# s3-tests reference parity lane (rustfs/backlog#2773).
+#
+# Runs the ceph/s3-tests implemented list (scripts/s3-tests/implemented_tests.txt)
+# against every target in .config/reference-parity-targets.toml and fails on
+# any per-node-id difference between a candidate and the reference:
+#
+#   - reference: the release pinned in .config/reference-binary.toml, downloaded
+#     and sha256-verified by .github/actions/reference-binary;
+#   - candidate targets: the debug binary built from this checkout exactly as
+#     ci.yml's build-rustfs-debug-binary job builds it for S3 Implemented Tests.
+#
+# Every target runs the same harness (scripts/s3-tests/run.sh from this
+# checkout), test list and server configuration on its own hosted runner. A
+# target's failures get one rerun against a fresh server; a case that passes it
+# is flaky, not a difference. scripts/s3-tests/reference_parity.py judges the
+# result and honours .config/reference-parity-tolerated.txt, whose entries must
+# each match a real difference.
+#
+# The `differential` job adds the 73-operation dual-stack differential
+# (crates/e2e_test/src/dual_stack_differential, rustfs/backlog#2740) against the
+# same pinned reference: side A is the released binary (RUSTFS_E2E_REFERENCE_BINARY,
+# started without RUSTFS_S3_STACK), side B is the candidate built above on its
+# legacy stack. It reuses the candidate build artifact, never builds the candidate
+# twice, and prints reference_side, version_a and version_b from the report the test
+# wrote; it fails when side A was not the reference or both sides report the same
+# version. Every (op, field, a, b) difference goes to the job summary. Report-only
+# until the first result has been reviewed.
+#
+# Report-only: not part of the Test and Lint aggregate. Scheduled failures are
+# owned by the scheduled-validation watchdog (.github/scheduled-validations.json).
+
+name: Reference Parity
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/reference-parity.yml"
+      - ".github/actions/reference-binary/**"
+      - ".config/reference-binary.toml"
+      - ".config/reference-parity-targets.toml"
+      - ".config/reference-parity-tolerated.txt"
+      - "scripts/s3-tests/reference_parity.py"
+      - "scripts/junit_diff.py"
+      - "crates/e2e_test/src/dual_stack_differential/**"
+  schedule:
+    - cron: "37 1 * * *"
+  workflow_dispatch:
+
+# Matches ci.yml: these variables are hashed into the rust-cache key, so the
+# candidate build reads the same ci-dev cache as build-rustfs-debug-binary.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan parity targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate target list
+        id: targets
+        run: |
+          set -euo pipefail
+          targets="$(python3 scripts/s3-tests/reference_parity.py targets --config .config/reference-parity-targets.toml)"
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+          echo "Parity targets: ${targets}"
+
+  build-candidate:
+    name: Build candidate binary
+    # Critical-path CPU and cache ownership: the same debug build as ci.yml's
+    # build-rustfs-debug-binary, reading the ci-dev cache written on sm-standard-4.
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Build debug binary
+        run: python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
+
+      - name: Upload candidate binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-parity-candidate-binary
+          overwrite: true
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
+          if-no-files-found: error
+          retention-days: 1
+
+  s3tests:
+    name: s3-tests (${{ matrix.target.name }})
+    needs: [ plan, build-candidate ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    env:
+      TARGET_NAME: ${{ matrix.target.name }}
+      TARGET_KIND: ${{ matrix.target.binary }}
+      # Above this many first-run failures the target is systemically broken;
+      # a rerun would only repeat it, so the first run is judged as is.
+      RERUN_CAP: "50"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch pinned reference binary
+        id: reference
+        if: matrix.target.binary == 'reference'
+        uses: ./.github/actions/reference-binary
+
+      - name: Download candidate binary
+        if: matrix.target.binary == 'candidate'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: reference-parity-candidate-binary
+          path: target/debug
+
+      - name: Select target binary
+        env:
+          REFERENCE_PATH: ${{ steps.reference.outputs.path }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_KIND" in
+            reference) binary="$REFERENCE_PATH" ;;
+            candidate) chmod +x target/debug/rustfs; binary="$PWD/target/debug/rustfs" ;;
+            *) echo "unknown target binary kind: $TARGET_KIND" >&2; exit 1 ;;
+          esac
+          test -x "$binary"
+          echo "TARGET_BINARY=$binary" >> "$GITHUB_ENV"
+          mkdir -p "parity/$TARGET_NAME"
+          {
+            echo "target=$TARGET_NAME"
+            echo "binary=$TARGET_KIND"
+            echo "sha256=$(sha256sum "$binary" | cut -d' ' -f1)"
+            echo "version=$("$binary" --version | tr '\n' ' ')"
+          } | tee "parity/$TARGET_NAME/target.txt"
+
+      - name: Apply target environment
+        env:
+          TARGET_JSON: ${{ toJSON(matrix.target) }}
+        run: |
+          set -euo pipefail
+          python3 scripts/s3-tests/reference_parity.py export-env --target-json "$TARGET_JSON" \
+            | tee -a "$GITHUB_ENV" "parity/$TARGET_NAME/target-env.txt"
+
+      - name: Run implemented s3-tests
+        run: |
+          set -uo pipefail
+          report="parity/$TARGET_NAME"
+          harness="artifacts/s3tests-single"
+
+          # Same invocation as ci.yml's S3 Implemented Tests, with a fresh data
+          # root and port per run. $1 optionally replaces the test list.
+          run_suite() {
+            local list="$1" label="$2" root port
+            root="${RUNNER_TEMP}/rustfs-s3tests-${label}"
+            rm -rf "$harness" "$root"
+            mkdir -p "$root"
+            port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+            env DEPLOY_MODE=binary \
+              RUSTFS_BINARY="$TARGET_BINARY" \
+              TEST_MODE=single \
+              MAXFAIL=0 \
+              XDIST=4 \
+              S3_PORT="$port" \
+              DATA_ROOT="$root" \
+              S3TESTS_CONF="$harness/s3tests.conf" \
+              ${list:+IMPLEMENTED_TESTS_FILE="$list"} \
+              ./scripts/s3-tests/run.sh
+          }
+
+          # A run is usable only if it produced a JUnit report; test failures
+          # are data for the comparison, a missing report is a lane failure.
+          keep() {
+            local prefix="$1"
+            for file in pytest.log compat-report.md; do
+              if [[ -f "$harness/$file" ]]; then cp "$harness/$file" "$report/${prefix}${file}"; fi
+            done
+            if [[ -f "$harness/rustfs-single/rustfs.log" ]]; then cp "$harness/rustfs-single/rustfs.log" "$report/${prefix}rustfs.log"; fi
+            test -s "$harness/junit.xml" || { echo "::error::$TARGET_NAME produced no JUnit report (${prefix:-first} run)"; return 1; }
+            cp "$harness/junit.xml" "$report/${prefix}junit.xml"
+          }
+
+          run_suite "" first
+          echo "first_run_exit=$?" >> "$report/target.txt"
+          keep "" || exit 1
+          cp "$harness/selected-nodeids.txt" "$report/selected-nodeids.txt" || exit 1
+
+          failures="$(python3 scripts/s3-tests/reference_parity.py failed --report "$report")" || exit 1
+          count="$(printf '%s' "$failures" | grep -c . || true)"
+          echo "first_run_failures=$count" >> "$report/target.txt"
+          if (( count == 0 )); then
+            exit 0
+          fi
+          if (( count > RERUN_CAP )); then
+            echo "::warning::$TARGET_NAME has $count failures (cap $RERUN_CAP); judging the first run without a rerun"
+            echo "rerun=skipped-over-cap" >> "$report/target.txt"
+            exit 0
+          fi
+          printf '%s\n' "$failures" > "$RUNNER_TEMP/rerun-tests.txt"
+          run_suite "$RUNNER_TEMP/rerun-tests.txt" rerun
+          echo "rerun_exit=$?" >> "$report/target.txt"
+          keep rerun- || exit 1
+
+      - name: Upload target report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-parity-report-${{ matrix.target.name }}
+          overwrite: true
+          path: parity/${{ matrix.target.name }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  differential:
+    name: Dual-stack differential (reference vs candidate)
+    needs: [ build-candidate ]
+    # Compiles the e2e_test harness against the ci-dev cache like the other
+    # sm-standard-4 jobs; the candidate server itself is the downloaded artifact.
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NO_PROXY: 127.0.0.1,localhost,::1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Fetch pinned reference binary
+        id: reference
+        uses: ./.github/actions/reference-binary
+
+      - name: Download candidate binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: reference-parity-candidate-binary
+          path: target/debug
+
+      - name: Run dual-stack differential
+        id: differential
+        continue-on-error: true
+        env:
+          REFERENCE_PATH: ${{ steps.reference.outputs.path }}
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-differential-logs
+        run: |
+          set -euo pipefail
+          export no_proxy="$NO_PROXY"
+          chmod +x target/debug/rustfs
+          test -x "$REFERENCE_PATH"
+          mkdir -p "$RUSTFS_E2E_LOG_DIR"
+          # Side A: the released binary. Side B: the candidate on its legacy stack.
+          export RUSTFS_E2E_REFERENCE_BINARY="$REFERENCE_PATH"
+          test_name='dual_stack_differential::tests::both_stacks_answer_every_operation_identically'
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+            cargo test --locked -p e2e_test --lib "$test_name" -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/differential-test.log"
+
+      - name: Summarize report and verify the reference side
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, json, os, sys
+
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          reports = sorted(glob.glob("target/dual-stack/self-comparison-*.json"))
+          lines = ["## Dual-stack differential: reference vs candidate", ""]
+          failures = []
+          if len(reports) != 1:
+              failures.append(f"expected exactly one self-comparison report, found {len(reports)}: {reports}")
+          else:
+              report = json.load(open(reports[0]))
+              side = report.get("reference_side")
+              version_a = report.get("version_a")
+              version_b = report.get("version_b")
+              lines += [
+                  f"- report: `{reports[0]}`",
+                  f"- reference_side: `{side}`",
+                  f"- version_a: `{(version_a or '').splitlines()[0] if version_a else version_a}`",
+                  f"- version_b: `{(version_b or '').splitlines()[0] if version_b else version_b}`",
+                  f"- stack_a: `{report.get('stack_a')}`, stack_b: `{report.get('stack_b')}`",
+                  f"- compared_ops: {report.get('compared_ops')}, compared_cases: {report.get('compared_cases')}",
+                  "",
+              ]
+              print(f"reference_side={side}\nversion_a={version_a}\nversion_b={version_b}")
+              lines += ["```", "version_a:", version_a or "", "", "version_b:", version_b or "", "```", ""]
+              if side != "a":
+                  failures.append(f"reference_side is {side!r}, expected 'a'")
+              if not version_a or not version_b:
+                  failures.append("version_a or version_b is missing")
+              elif version_a == version_b:
+                  failures.append("version_a equals version_b: the reference was replaced by the candidate")
+              diffs = report.get("differences") or []
+              lines.append(f"### Differences: {len(diffs)}")
+              by_op = {}
+              for d in diffs:
+                  by_op.setdefault(d["op"], []).append(d)
+              for op in sorted(by_op):
+                  lines += ["", f"#### {op}", "", "| case | field | a (reference) | b (candidate) |", "| --- | --- | --- | --- |"]
+                  for d in by_op[op]:
+                      cell = lambda v: "`" + str(v).replace("|", "\\|").replace("`", "'") + "`"
+                      lines.append(f"| {d['case']} | {d['field']} | {cell(d['a'])} | {cell(d['b'])} |")
+          if failures:
+              lines += ["", "### Observation check failed", ""] + [f"- {f}" for f in failures]
+          open(summary, "a").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          for f in failures:
+              print(f"::error::{f}")
+          sys.exit(1 if failures else 0)
+          PY
+
+      - name: Upload differential reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-differential-report
+          overwrite: true
+          path: |
+            target/dual-stack/*.json
+            ${{ runner.temp }}/differential-test.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail when the differential found differences
+        if: steps.differential.outcome == 'failure'
+        run: |
+          echo "::error::the dual-stack differential failed; see the job summary for every (op, field, a, b)"
+          exit 1
+
+  compare:
+    name: Compare targets
+    needs: [ plan, s3tests ]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download target reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: reference-parity-report-*
+          path: parity-download
+
+      - name: Compare per node id
+        env:
+          TARGETS: ${{ needs.plan.outputs.targets }}
+          S3TESTS_RESULT: ${{ needs.s3tests.result }}
+        run: |
+          set -uo pipefail
+          mkdir -p parity
+          for dir in parity-download/reference-parity-report-*; do
+            if [[ -d "$dir" ]]; then mv "$dir" "parity/${dir#parity-download/reference-parity-report-}"; fi
+          done
+          python3 scripts/s3-tests/reference_parity.py compare \
+            --targets-json "$TARGETS" \
+            --reports parity \
+            --tolerated .config/reference-parity-tolerated.txt \
+            --markdown "$GITHUB_STEP_SUMMARY" \
+            --json parity/diff.json > parity/diff.md
+          status=$?
+          cat parity/diff.md
+          if [[ "$S3TESTS_RESULT" != "success" ]]; then
+            echo "::error::s3-tests target jobs finished with '$S3TESTS_RESULT'"
+            status=1
+          fi
+          exit "$status"
+
+      - name: Upload parity diff
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-parity-diff
+          overwrite: true
+          path: |
+            parity/diff.md
+            parity/diff.json
+          if-no-files-found: warn
+          retention-days: 14

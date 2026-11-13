@@ -27,12 +27,16 @@ pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_back
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
 
-pub(crate) use s3s::dto::{
-    BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
-    ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
-};
 #[cfg(test)]
-pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
+pub(crate) use rustfs_gateway_types::persistence::PersistedLifecycleRule as EcstoreLifecycleRule;
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedLifecycleConfiguration as EcstoreBucketLifecycleConfiguration,
+    PersistedLifecycleFilter as EcstoreLifecycleRuleFilter,
+};
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as EcstoreObjectLockConfiguration,
+    PersistedVersioningConfiguration as EcstoreVersioningConfiguration,
+};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -239,9 +243,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
-        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
-        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus,
+        EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 
@@ -249,7 +253,10 @@ pub(crate) mod owner {
 pub struct ScannerReplicationConfig(EcstoreReplicationConfig);
 
 impl ScannerReplicationConfig {
-    pub(crate) fn new(config: Option<s3s::dto::ReplicationConfiguration>, remotes: Option<EcstoreBucketTargets>) -> Self {
+    pub(crate) fn new(
+        config: Option<rustfs_gateway_types::persistence::PersistedReplicationConfiguration>,
+        remotes: Option<EcstoreBucketTargets>,
+    ) -> Self {
         Self(EcstoreReplicationConfig::new(config, remotes))
     }
 

@@ -13,19 +13,20 @@
 // limitations under the License.
 
 use super::*;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 
 pub struct RestLoadCredentialsHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestLoadCredentialsHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        ensure_table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
+        let metadata_backend = table_catalog_backend_from_envelope(req.envelope())?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let issuer = IamTableCredentialIssuer::from_request(&req)?;
         let response = load_credentials_response(

@@ -24,12 +24,12 @@ use std::{collections::HashMap, sync::Arc};
 use time::{Duration, OffsetDateTime, macros::format_description};
 use tracing::{error, info, warn};
 
-use rustfs_utils::http::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header};
-use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
-use s3s::header::{
+use crate::constants::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
     X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION,
 };
+use rustfs_gateway_types::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, ReplicationStatus};
+use rustfs_utils::http::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header};
 //use crate::disk::{BufferReader, Reader};
 use crate::checksum::ChecksumMode;
 use crate::utils::base64_encode;
@@ -61,7 +61,7 @@ impl Default for AdvancedPutOptions {
         Self {
             source_version_id: "".to_string(),
             source_etag: "".to_string(),
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: ReplicationStatus::PENDING,
             source_mtime: OffsetDateTime::now_utc(),
             replication_request: false,
             retention_timestamp: OffsetDateTime::now_utc(),
@@ -83,7 +83,7 @@ pub struct PutObjectOptions {
     pub content_language: String,
     pub cache_control: String,
     pub expires: OffsetDateTime,
-    pub mode: ObjectLockRetentionMode,
+    pub mode: ObjectLockMode,
     pub retain_until_date: OffsetDateTime,
     //pub server_side_encryption: encrypt::ServerSide,
     pub num_threads: u64,
@@ -113,7 +113,7 @@ impl Default for PutObjectOptions {
             content_language: "".to_string(),
             cache_control: "".to_string(),
             expires: OffsetDateTime::UNIX_EPOCH,
-            mode: ObjectLockRetentionMode::from_static(""),
+            mode: ObjectLockMode::custom(""),
             retain_until_date: OffsetDateTime::UNIX_EPOCH,
             //server_side_encryption: encrypt.ServerSide::default(),
             num_threads: 0,
@@ -124,7 +124,7 @@ impl Default for PutObjectOptions {
             // any non-empty status, and CompleteMultipartUpload rejects requests
             // that carry object-lock headers, breaking multipart transitions
             // (rustfs/rustfs#4811). Only send the header when a status is set.
-            legalhold: ObjectLockLegalHoldStatus::from_static(""),
+            legalhold: ObjectLockLegalHoldStatus::custom(""),
             send_content_md5: false,
             disable_content_sha256: false,
             disable_multipart: false,
@@ -461,5 +461,25 @@ impl TransitionClient {
 
         upload_info.size = total_uploaded_size;
         Ok(upload_info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PutObjectOptions;
+    use crate::constants::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_REPLICATION_STATUS};
+
+    // An unset object lock or replication value is empty text, and empty text
+    // sends no header.
+    #[test]
+    fn default_options_send_no_object_lock_or_replication_headers() {
+        let mut opts = PutObjectOptions::default();
+        assert_eq!(opts.mode.as_str(), "");
+        assert_eq!(opts.legalhold.as_str(), "");
+        opts.internal.replication_status = rustfs_gateway_types::dto::ReplicationStatus::custom("");
+        let header = opts.header();
+        for name in [X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_REPLICATION_STATUS] {
+            assert!(header.get(&name).is_none(), "{name} must not be sent: {header:?}");
+        }
     }
 }

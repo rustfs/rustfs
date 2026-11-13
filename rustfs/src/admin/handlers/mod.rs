@@ -88,37 +88,75 @@ pub mod user_policy_binding;
 /// body; `encode_compatible_admin_payload` decides that from the path, so every
 /// handler must go through here rather than serializing directly, or a
 /// MinIO client gets plaintext where it expects ciphertext.
-pub(crate) fn admin_json_response<T: serde::Serialize>(
+pub(crate) fn owned_admin_json_response<T: serde::Serialize>(
     path: &str,
     secret_key: &str,
     status: http::StatusCode,
     payload: &T,
-) -> s3s::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+) -> rustfs_s3_types::S3Result<crate::admin::operation::AdminResponse> {
+    let body = serde_json::to_vec(payload).map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::InternalError, format!("serialize error: {e}"))
+    })?;
     let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
 
     let mut header = hyper::HeaderMap::new();
-    header.insert(s3s::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
-    Ok(s3s::S3Response::with_headers((status, s3s::Body::from(body)), header))
+    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(crate::admin::operation::AdminResponse::with_headers(
+        status,
+        rustfs_s3_types::Body::from(body),
+        header,
+    ))
 }
 
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,
-    mutation: impl std::future::Future<Output = s3s::S3Result<T>> + Send + 'static,
-) -> s3s::S3Result<T>
+    mutation: impl std::future::Future<Output = rustfs_s3_types::S3Result<T>> + Send + 'static,
+) -> rustfs_s3_types::S3Result<T>
 where
     T: Send + 'static,
 {
     tokio::spawn(mutation).await.map_err(|err| {
         let outcome = if err.is_cancelled() { "cancelled" } else { "panicked" };
-        s3s::s3_error!(InternalError, "{} task {}", operation, outcome)
+        rustfs_s3_types::s3_error!(InternalError, "{} task {}", operation, outcome)
     })?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_admin_json_response_encrypts_only_on_the_compat_prefix() {
+        let payload = serde_json::json!({"users": ["alice", "bob"]});
+        let plain = serde_json::to_vec(&payload).expect("payload serializes");
+
+        let (status, headers, mut body) =
+            owned_admin_json_response("/rustfs/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("serializes")
+                .into_parts();
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(body.store_all_limited(4096).await.expect("body reads").as_ref(), plain.as_slice());
+
+        let (status, headers, mut body) =
+            owned_admin_json_response("/minio/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("serializes compat payload")
+                .into_parts();
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let encrypted = body.store_all_limited(4096).await.expect("compat body reads");
+        assert_ne!(encrypted.as_ref(), plain.as_slice());
+        let decrypted = rustfs_crypto::decrypt_stream_io(b"secret", &encrypted).expect("compat payload decrypts");
+        assert_eq!(decrypted, plain);
+    }
 
     #[test]
     fn test_handler_struct_creation() {

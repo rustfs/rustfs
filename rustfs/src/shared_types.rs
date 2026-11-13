@@ -27,6 +27,10 @@ use rustfs_notify::NotifyObjectInfo;
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);
 
+/// Set only by the listener stack; proxy assertions do not establish it.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTlsTransport(pub(crate) bool);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DependencyReadiness {
     pub storage_ready: bool,

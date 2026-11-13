@@ -26,7 +26,13 @@ permissions:
 jobs:
   alert-on-incomplete-run:
     name: Alert on incomplete scheduled run
-    if: github.repository == 'rustfs/rustfs'
+    # The registry still owns responsibility and cadence selection. Successful
+    # and PR runs can never produce an incomplete scheduled-run alert.
+    if: >-
+      github.repository == 'rustfs/rustfs' &&
+      github.event.workflow_run.conclusion != 'success' &&
+      (github.event.workflow_run.event == 'schedule' ||
+       github.event.workflow_run.event == 'workflow_run')
     # Stay on GitHub-hosted runners: this monitor must keep running when the
     # self-hosted sm-standard-* pool is down, which is exactly when the
     # scheduled validations it watches stall.

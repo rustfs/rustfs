@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::route_table::{RouteTable, canonicalize_admin_path, is_admin_v4_fallback_path, route_key_canonical};
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
@@ -27,6 +28,7 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -38,8 +40,8 @@ use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_u
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
-    is_sts_query_request, is_table_catalog_path,
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path, is_sts_query_request,
+    is_table_catalog_path,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -54,7 +56,6 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
-use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
@@ -62,6 +63,8 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -1942,19 +1945,19 @@ fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest>
     })
 }
 
-fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> Vec<String> {
+fn collect_resettable_replication_target_arns(config: &PersistedReplicationConfiguration) -> Vec<String> {
     let mut arns = Vec::new();
     let mut seen = HashSet::new();
 
     for rule in &config.rules {
-        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+        if rule.status == Status::DISABLED.as_str() {
             continue;
         }
 
-        let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|status| {
-            status.status
-                == s3s::dto::ExistingObjectReplicationStatus::from_static(s3s::dto::ExistingObjectReplicationStatus::ENABLED)
-        });
+        let existing_object_enabled = rule
+            .existing_object_replication
+            .as_ref()
+            .is_some_and(|status| status.status == Status::ENABLED.as_str());
         if !existing_object_enabled {
             continue;
         }
@@ -1977,7 +1980,7 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
     arns
 }
 
-fn resolve_replication_reset_target_arn(config: &s3s::dto::ReplicationConfiguration, requested_arn: &str) -> S3Result<String> {
+fn resolve_replication_reset_target_arn(config: &PersistedReplicationConfiguration, requested_arn: &str) -> S3Result<String> {
     let resettable_arns = collect_resettable_replication_target_arns(config);
 
     if requested_arn.is_empty() {
@@ -2169,7 +2172,7 @@ fn is_object_lock_not_enabled_error(err: &S3ClientError) -> bool {
 
 fn validate_replication_check_config_targets(
     targets: &BucketTargets,
-    config: &s3s::dto::ReplicationConfiguration,
+    config: &PersistedReplicationConfiguration,
 ) -> S3Result<()> {
     let configured_arns = targets
         .targets
@@ -2190,7 +2193,7 @@ fn validate_replication_check_config_targets(
     }
 
     for rule in &config.rules {
-        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+        if rule.status == Status::DISABLED.as_str() {
             continue;
         }
 
@@ -2207,7 +2210,7 @@ fn validate_replication_check_config_targets(
     Ok(())
 }
 
-fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
+fn filter_replication_check_targets(targets: BucketTargets, config: &PersistedReplicationConfiguration) -> Vec<BucketTarget> {
     let referenced_arns = config
         .filter_all_replication_target_arns()
         .into_iter()
@@ -3370,15 +3373,13 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
 }
 
 pub struct S3Router<T> {
-    router: Router<T>,
+    table: RouteTable<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
     /// This server's request-path context slot (backlog#1052 S2). Injected
     /// into every request's extensions at dispatch so the static admin
     /// operations can resolve their server's store.
     server_ctx: Option<Arc<ServerContextSlot>>,
-    #[cfg(test)]
-    registered_routes: Vec<String>,
 }
 
 fn is_public_health_path(path: &str) -> bool {
@@ -3432,26 +3433,8 @@ fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
         && query_value_exact(uri, "token").is_some_and(|token| !token.is_empty())
 }
 
-fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if is_admin_path(path)
-        && let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX)
-    {
-        return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
-    }
-
-    std::borrow::Cow::Borrowed(path)
-}
-
-fn is_admin_v4_fallback_path(path: &str) -> bool {
-    path.strip_prefix(ADMIN_PREFIX)
-        .or_else(|| path.strip_prefix(MINIO_ADMIN_PREFIX))
-        .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
-}
-
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
-        let router = Router::new();
-
         let console_router = if console_enabled {
             Some(make_console_server().into_service::<Body>())
         } else {
@@ -3459,12 +3442,10 @@ impl<T: Operation> S3Router<T> {
         };
 
         Self {
-            router,
+            table: RouteTable::new(),
             console_enabled,
             console_router,
             server_ctx: None,
-            #[cfg(test)]
-            registered_routes: Vec::new(),
         }
     }
 
@@ -3475,45 +3456,26 @@ impl<T: Operation> S3Router<T> {
     }
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
-        let path = Self::make_route_str(method, path);
-        #[cfg(test)]
-        let registered_path = path.clone();
-
-        // warn!("set uri {}", &path);
-
-        self.router.insert(path, operation).map_err(std::io::Error::other)?;
-
-        #[cfg(test)]
-        self.registered_routes.push(registered_path);
-
-        Ok(())
-    }
-
-    fn make_route_str(method: Method, path: &str) -> String {
-        format!("{}|{}", method.as_str(), path)
+        self.table.insert(method, path, operation)
     }
 }
 
 #[cfg(test)]
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
-        let route = Self::make_route_str(method, path);
-        self.router.at(&route).is_ok()
+        self.table.contains_route(method, path)
     }
 
     pub(crate) fn contains_compatible_route(&self, method: Method, path: &str) -> bool {
-        let canonical_path = canonicalize_admin_path(path);
-        let route = Self::make_route_str(method, canonical_path.as_ref());
-        self.router.at(&route).is_ok()
+        self.table.contains_compatible_route(method, path)
     }
 
-    #[cfg(test)]
     pub(crate) fn registered_routes(&self) -> &[String] {
-        &self.registered_routes
+        self.table.registered_routes()
     }
 }
 
-impl<T: Operation> Default for S3Router<T> {
+impl<T> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
     }
@@ -3522,7 +3484,7 @@ impl<T: Operation> Default for S3Router<T> {
 #[async_trait::async_trait]
 impl<T> S3Route for S3Router<T>
 where
-    T: Operation,
+    T: OwnedOperation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, extensions: &mut Extensions) -> bool {
         if parse_replication_extension_request(method, uri).is_some() || parse_misc_extension_request(method, uri).is_some() {
@@ -3645,14 +3607,15 @@ where
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
         }
 
-        let canonical_path = canonicalize_admin_path(req.uri.path());
-        let uri = format!("{}|{}", req.method, canonical_path.as_ref());
+        let key = route_key_canonical(&req.method, req.uri.path());
 
-        if let Ok(mat) = self.router.at(&uri) {
+        if let Ok(mat) = self.table.at(&key) {
             let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            let response = resp.map_output(|x| x.1);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+            let request = AdminRequest::new(envelope, req.input.into());
+            let (status, headers, body) = op.call(request, mat.params).await?.into_parts();
+            let mut response = S3Response::with_headers(body.into(), headers);
+            response.status = Some(status);
 
             return Ok(response);
         }
@@ -3667,18 +3630,14 @@ where
     }
 }
 
-#[async_trait::async_trait]
-pub trait Operation: Send + Sync + 'static {
-    // fn method() -> Method;
-    // fn uri() -> &'static str;
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>>;
-}
-
-pub struct AdminOperation(pub &'static dyn Operation);
+/// Registers one owned admin operation with the legacy router. The router
+/// converts the request and response at its edge, so the operation never sees
+/// an s3s type.
+pub struct AdminOperation(pub(crate) &'static dyn OwnedOperation);
 
 #[async_trait::async_trait]
-impl Operation for AdminOperation {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+impl OwnedOperation for AdminOperation {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
         self.0.call(req, params).await
     }
 }
@@ -3754,10 +3713,18 @@ mod tests {
     }
 
     use super::*;
+    use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
+    use crate::auth::constant_time_eq;
+    use bytes::Bytes;
     use http::HeaderMap;
     use http::Method;
     use http::Uri;
+    use rustfs_gateway_types::persistence::{
+        PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
+    };
+    use rustfs_s3_types::{Body as OwnedBody, S3Error as OwnedS3Error, S3ErrorCode as OwnedS3ErrorCode};
     use s3s::S3Request;
+    use std::io;
     use std::net::{IpAddr, SocketAddr};
     use time::macros::datetime;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3826,10 +3793,68 @@ mod tests {
     struct StatusOperation(StatusCode);
 
     #[async_trait::async_trait]
-    impl Operation for StatusOperation {
-        async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-            Ok(S3Response::new((self.0, Body::empty())))
+    impl OwnedOperation for StatusOperation {
+        async fn call(&self, _req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            Ok(AdminResponse::new(self.0, OwnedBody::empty()))
         }
+    }
+
+    struct IdentityOperation;
+
+    #[async_trait::async_trait]
+    impl OwnedOperation for IdentityOperation {
+        async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            let credentials = req
+                .credentials()
+                .ok_or_else(|| OwnedS3Error::with_message(OwnedS3ErrorCode::AccessDenied, "owned admin identity is required"))?;
+            let identity_matches = credentials.access_key() == "AKIAOWNED"
+                && credentials.secret_key_matches("owned-secret")
+                && credentials
+                    .session_token()
+                    .is_some_and(|token| constant_time_eq(token, "owned-session"));
+            if !identity_matches {
+                return Err(OwnedS3Error::with_message(
+                    OwnedS3ErrorCode::AccessDenied,
+                    "owned admin identity is invalid",
+                ));
+            }
+            if req.method() != Method::GET
+                || req.uri().path() != "/__owned_admin/identity"
+                || req.headers().get("x-owned-probe").and_then(|value| value.to_str().ok()) != Some("present")
+                || req.region() != Some("us-east-2")
+                || req.service() != Some("s3")
+                || params.get("kind") != Some("identity")
+            {
+                return Err(OwnedS3Error::with_message(
+                    OwnedS3ErrorCode::InvalidRequest,
+                    "owned admin request facts changed at the router edge",
+                ));
+            }
+            Ok(AdminResponse::new(StatusCode::NO_CONTENT, OwnedBody::empty()))
+        }
+    }
+
+    struct EchoOperation;
+
+    #[async_trait::async_trait]
+    impl OwnedOperation for EchoOperation {
+        async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            let mut headers = HeaderMap::new();
+            headers.append("x-owned-repeat", HeaderValue::from_static("first"));
+            headers.append("x-owned-repeat", HeaderValue::from_static("second"));
+            Ok(AdminResponse::with_headers(StatusCode::IM_A_TEAPOT, req.into_body(), headers))
+        }
+    }
+
+    static IDENTITY_OPERATION: IdentityOperation = IdentityOperation;
+    static ECHO_OPERATION: EchoOperation = EchoOperation;
+
+    fn owned_router(path: &str, operation: &'static dyn OwnedOperation) -> S3Router<AdminOperation> {
+        let mut router = S3Router::new(false);
+        router
+            .insert(Method::GET, path, AdminOperation(operation))
+            .expect("owned test route should register");
+        router
     }
 
     fn router_request(method: Method, uri: &'static str) -> S3Request<Body> {
@@ -3844,6 +3869,86 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_rejects_missing_identity_and_preserves_supplied_identity() {
+        let router = owned_router("/__owned_admin/{kind}", &IDENTITY_OPERATION);
+
+        let error = router
+            .call(router_request(Method::GET, "/__owned_admin/identity"))
+            .await
+            .expect_err("missing credentials must stay denied");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+
+        let mut request = router_request(Method::GET, "/__owned_admin/identity");
+        request.headers.insert("x-owned-probe", HeaderValue::from_static("present"));
+        request
+            .headers
+            .insert("x-amz-security-token", HeaderValue::from_static("owned-session"));
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: "AKIAOWNED".to_owned(),
+            secret_key: "owned-secret".into(),
+        });
+        request.region = Some("us-east-2".parse().expect("valid region"));
+        request.service = Some("s3".to_owned());
+
+        let response = router
+            .call(request)
+            .await
+            .expect("supplied identity must reach the owned operation");
+        assert_eq!(response.status, Some(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_preserves_status_repeated_headers_raw_body_and_size_hint() {
+        let router = owned_router("/__owned_admin/echo", &ECHO_OPERATION);
+        let raw = Bytes::from_static(&[0x00, 0x7f, 0x80, 0xff]);
+        let mut request = router_request(Method::GET, "/__owned_admin/echo");
+        request.input = Body::from(raw.clone());
+
+        let response = router
+            .call(request)
+            .await
+            .expect("owned response should cross the router edge");
+
+        assert_eq!(response.status, Some(StatusCode::IM_A_TEAPOT));
+        assert_eq!(http_body::Body::size_hint(&response.output).exact(), Some(raw.len() as u64));
+        let repeated = response
+            .headers
+            .get_all("x-owned-repeat")
+            .iter()
+            .map(|value| value.to_str().expect("static header"))
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, ["first", "second"]);
+        assert_eq!(
+            http_body_util::BodyExt::collect(response.output)
+                .await
+                .expect("raw body should read")
+                .to_bytes(),
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_preserves_body_errors() {
+        let router = owned_router("/__owned_admin/echo", &ECHO_OPERATION);
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"before-error")),
+            Err(io::Error::other("owned body sentinel")),
+        ]);
+        let mut request = router_request(Method::GET, "/__owned_admin/echo");
+        request.input = OwnedBody::from_stream(stream).into();
+
+        let response = router
+            .call(request)
+            .await
+            .expect("owned response should cross the router edge");
+        let error = http_body_util::BodyExt::collect(response.output)
+            .await
+            .expect_err("the body error must remain observable");
+
+        assert!(error.to_string().contains("owned body sentinel"), "{error}");
     }
 
     #[test]
@@ -4101,26 +4206,24 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_uses_single_existing_object_target_by_default() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:a".to_string(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                        s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                    ),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-a".to_string()),
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -4130,46 +4233,42 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_requires_arn_for_multiple_targets() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![
-                s3s::dto::ReplicationRule {
+                PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: s3s::dto::Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:replication:a".to_string(),
                         ..Default::default()
                     },
-                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                        ),
+                    existing_object_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     filter: None,
                     id: Some("rule-a".to_string()),
                     prefix: Some(String::new()),
                     priority: None,
                     source_selection_criteria: None,
-                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 },
-                s3s::dto::ReplicationRule {
+                PersistedReplicationRule {
                     delete_marker_replication: None,
                     delete_replication: None,
-                    destination: s3s::dto::Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: "arn:replication:b".to_string(),
                         ..Default::default()
                     },
-                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                        status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                            s3s::dto::ExistingObjectReplicationStatus::ENABLED,
-                        ),
+                    existing_object_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     filter: None,
                     id: Some("rule-b".to_string()),
                     prefix: Some(String::new()),
                     priority: None,
                     source_selection_criteria: None,
-                    status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 },
             ],
         };
@@ -4181,26 +4280,24 @@ mod tests {
 
     #[test]
     fn resolve_replication_reset_target_arn_rejects_target_without_existing_object_replication() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:a".to_string(),
                     ..Default::default()
                 },
-                existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
-                    status: s3s::dto::ExistingObjectReplicationStatus::from_static(
-                        s3s::dto::ExistingObjectReplicationStatus::DISABLED,
-                    ),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::DISABLED.to_string(),
                 }),
                 filter: None,
                 id: Some("rule-a".to_string()),
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -4724,7 +4821,7 @@ mod tests {
 
     #[test]
     fn build_replication_check_response_rejects_empty_target_list_at_runtime_boundary() {
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
             rules: vec![],
         };
@@ -4872,12 +4969,12 @@ mod tests {
                 },
             ],
         };
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:b".to_string(),
                     ..Default::default()
                 },
@@ -4887,7 +4984,7 @@ mod tests {
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 
@@ -4906,12 +5003,12 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let config = s3s::dto::ReplicationConfiguration {
+        let config = PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![s3s::dto::ReplicationRule {
+            rules: vec![PersistedReplicationRule {
                 delete_marker_replication: None,
                 delete_replication: None,
-                destination: s3s::dto::Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:replication:missing".to_string(),
                     ..Default::default()
                 },
@@ -4921,7 +5018,7 @@ mod tests {
                 prefix: Some(String::new()),
                 priority: None,
                 source_selection_criteria: None,
-                status: s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         };
 

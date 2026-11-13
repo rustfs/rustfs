@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::{RequestCredentials, RequestEnvelope};
 use crate::auth::get_condition_values;
-use crate::server::RemoteAddr;
 use http::HeaderMap;
-use http::Uri;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
-use s3s::{Body, S3Request, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -236,43 +235,25 @@ pub async fn validate_admin_request_with_kms_key(
     .await
 }
 
-/// Unified authentication request handler for both UI and CLI
-///
-/// This function provides a single entry point for authentication,
-/// ensuring consistent behavior between UI and CLI authentication flows.
-///
-/// # Arguments
-/// * `headers` - HTTP request headers
-/// * `uri` - Request URI
-/// * `credentials` - User credentials from request (Credentials)
-///
-/// # Returns
-/// * `Ok((Credentials, bool))` - Authentication successful, returns user credentials and is_owner flag
-/// * `Err(S3Error)` - Authentication failed with error details
-///
-/// # Example
-/// ```ignore
-/// let (cred, is_owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
-/// ```
-pub async fn authenticate_request(
-    headers: &HeaderMap,
-    uri: &Uri,
-    credentials: &s3s::auth::Credentials,
-) -> S3Result<(Credentials, bool)> {
-    use crate::auth::{check_key_valid, get_session_token};
+/// Authenticate the caller of an owned admin request from the facts its
+/// envelope carries: the presented access key and the session token the edge
+/// decoded.
+pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCredentials) -> S3Result<(Credentials, bool)> {
+    authenticate_request_facts(credentials.access_key(), credentials.session_token().unwrap_or_default()).await
+}
 
-    // Extract session token from request
-    let session_token = get_session_token(uri, headers).unwrap_or_default();
+async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
+    use crate::auth::check_key_valid;
 
     // Log authentication attempt for debugging
     debug!(
         "authenticate_request: processing authentication - access_key={}, has_session_token={}",
-        credentials.access_key,
+        access_key,
         !session_token.is_empty()
     );
 
     // Validate credentials using the core authentication function
-    let result = check_key_valid(session_token, &credentials.access_key).await;
+    let result = check_key_valid(session_token, access_key).await;
 
     match &result {
         Ok((cred, is_owner)) => {
@@ -282,44 +263,27 @@ pub async fn authenticate_request(
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "authenticate_request: authentication failed - access_key={}, error={}",
-                credentials.access_key,
-                e
-            );
+            tracing::warn!("authenticate_request: authentication failed - access_key={}, error={}", access_key, e);
         }
     }
 
-    result
+    result.map_err(Into::into)
 }
 
-/// The policy client address comes only from verified middleware context.
-/// Keep the original socket peer in request extensions for auditing.
-pub(crate) fn policy_source_addr(extensions: &http::Extensions) -> Option<std::net::SocketAddr> {
-    let peer = extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|peer| peer.map(|addr| addr.0));
-    extensions
-        .get::<rustfs_trusted_proxies::ClientInfo>()
-        .map(|client| std::net::SocketAddr::new(client.real_ip, peer.map_or(0, |addr| addr.port())))
-        .or(peer)
-}
-
-/// Full admin gate over an `S3Request`: extract the request credentials,
-/// authenticate them ([`authenticate_request`]), then authorize the caller for
-/// `actions` ([`validate_admin_request`], allowing on the first permitted
-/// action). Returns the authenticated credentials for handlers that need the
-/// caller identity. `deny_only` stays `false`: every caller performs a full
-/// allow check.
-pub async fn authorize_admin_request(req: &S3Request<Body>, actions: Vec<Action>) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+/// Full admin gate over RustFS-owned request facts: authenticate the
+/// presented credentials, then authorize the caller for `actions`
+/// ([`validate_admin_request`], allowing on the first permitted action).
+/// Returns the authenticated credentials for handlers that need the caller
+/// identity. `deny_only` stays `false`: every caller performs a full allow
+/// check.
+pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action>) -> S3Result<Credentials> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
 
-    let (cred, owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
-
-    let remote_addr = policy_source_addr(&req.extensions);
-    validate_admin_request(&req.headers, &cred, owner, false, actions, remote_addr).await?;
+    let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
+    // Policy conditions see the verified proxy client, never the raw peer.
+    validate_admin_request(req.headers(), &cred, owner, false, actions, req.policy_source_addr()).await?;
 
     Ok(cred)
 }
@@ -337,6 +301,7 @@ mod tests {
     //! empty in-memory cache so `is_owner=true` returns allow (owner short-circuit)
     //! and every non-owner principal resolves to deny.
     use super::*;
+    use http::Uri;
     use rustfs_iam::cache::Cache;
     use rustfs_iam::manager::IamCache;
     use rustfs_iam::store::{GroupInfo, MappedPolicy, UserType};
@@ -554,7 +519,7 @@ mod tests {
         let err = res.expect_err("gate should reject the request");
         assert_eq!(
             err.code(),
-            &s3s::S3ErrorCode::AccessDenied,
+            &rustfs_s3_types::S3ErrorCode::AccessDenied,
             "admin gate rejection must map to the AccessDenied S3 error code"
         );
     }
@@ -563,8 +528,10 @@ mod tests {
     #[serial_test::serial]
     fn admin_and_sts_handlers_use_verified_client_ip_and_bucket_scope() {
         crate::app::gating_test_env::run_large_stack_test("admin-client-conditions", || async {
-            use crate::admin::router::Operation;
+            use crate::admin::operation::Operation;
+            use crate::admin::operation::test_support::TestRequest;
             use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::shared_types::RemoteAddr;
             use rustfs_iam::store::object::ObjectStore;
             use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
             use std::sync::Arc;
@@ -634,61 +601,54 @@ mod tests {
                 ..Default::default()
             }));
             publish_test_app_context(context);
-            let request = |key: &str, client_ip: Option<&str>| {
-                let mut extensions = http::Extensions::new();
-                extensions.insert(Some(RemoteAddr("10.1.2.3:4567".parse().unwrap())));
+            let request = |key: &str, client_ip: Option<&str>, method: http::Method, uri: &str, body: &str| {
+                let mut builder = TestRequest::new(method, uri)
+                    .extension(Some(RemoteAddr("10.1.2.3:4567".parse().unwrap())))
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .header("x-real-ip", "10.1.2.3")
+                    .credentials(key, "test-user-secret", None)
+                    .body(body.to_owned());
                 if let Some(ip) = client_ip {
-                    extensions.insert(rustfs_trusted_proxies::ClientInfo::direct(format!("{ip}:7890").parse().unwrap()));
+                    builder =
+                        builder.extension(rustfs_trusted_proxies::ClientInfo::direct(format!("{ip}:7890").parse().unwrap()));
                 }
-                let mut headers = HeaderMap::new();
-                headers.insert("x-forwarded-for", "10.1.2.3".parse().unwrap());
-                headers.insert("x-real-ip", "10.1.2.3".parse().unwrap());
-                S3Request {
-                    input: Body::from(String::new()),
-                    method: http::Method::GET,
-                    uri: "/".parse().unwrap(),
-                    headers,
-                    extensions,
-                    credentials: Some(s3s::auth::Credentials {
-                        access_key: key.to_owned(),
-                        secret_key: s3s::auth::SecretKey::from("test-user-secret".to_owned()),
-                    }),
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                }
+                builder.build()
             };
             for (client, allowed) in [(Some("203.0.113.17"), false), (Some("10.8.7.6"), true), (None, true)] {
-                let req = request("proxy-admin", client);
-                assert_eq!(policy_source_addr(&req.extensions).unwrap().port(), 4567);
-                let result = authorize_admin_request(&req, vec![admin_action()]).await;
+                let req = request("proxy-admin", client, http::Method::GET, "/", "");
+                assert_eq!(req.policy_source_addr().unwrap().port(), 4567);
+                let result = authorize_admin_envelope(req.envelope(), vec![admin_action()]).await;
                 if allowed {
                     result.expect("verified private client is allowed");
                 } else {
-                    assert_eq!(result.unwrap_err().code(), &s3s::S3ErrorCode::AccessDenied);
+                    assert_eq!(result.unwrap_err().code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
                 }
-                let mut req = request("proxy-admin", client);
-                req.method = http::Method::POST;
-                req.input = Body::from("Action=AssumeRole&Version=invalid-version".to_owned());
+                let req = request(
+                    "proxy-admin",
+                    client,
+                    http::Method::POST,
+                    "/",
+                    "Action=AssumeRole&Version=invalid-version",
+                );
                 let error = crate::admin::handlers::sts::AssumeRoleHandle {}
                     .call(req, matchit::Params::new())
                     .await
                     .unwrap_err();
                 if allowed {
-                    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
                     assert_eq!(
                         error.message(),
                         Some("not support version"),
                         "only an authorized caller reaches version validation"
                     );
                 } else {
-                    assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
                 }
                 let response = crate::admin::handlers::is_admin::IsAdminHandler {}
-                    .call(request("proxy-admin", client), matchit::Params::new())
+                    .call(request("proxy-admin", client, http::Method::GET, "/", ""), matchit::Params::new())
                     .await
                     .unwrap();
-                let mut body = response.output.1;
+                let (_status, _headers, mut body) = response.into_parts();
                 let json: serde_json::Value = serde_json::from_slice(&body.store_all_limited(4096).await.unwrap()).unwrap();
                 assert_eq!(json["is_admin"], allowed);
             }
@@ -697,17 +657,16 @@ mod tests {
             for (bucket, allowed) in [("usage-allowed", true), ("usage-secret", false)] {
                 let path = format!("/usage/{bucket}");
                 let matched = routes.at(&path).unwrap();
-                let mut req = request("scoped-usage", None);
-                req.uri = format!("{path}?unexpected=1").parse().unwrap();
+                let req = request("scoped-usage", None, http::Method::GET, &format!("{path}?unexpected=1"), "");
                 let error = crate::admin::handlers::usage_prefix::BucketPrefixUsageHandler {}
                     .call(req, matched.params)
                     .await
                     .unwrap_err();
                 if allowed {
-                    assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
                     assert_eq!(error.message(), Some("unknown query parameter: unexpected"));
                 } else {
-                    assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
                 }
             }
             if let Some(previous) = previous {
@@ -763,23 +722,23 @@ mod tests {
     /// authentication or IAM is consulted, with the exact error the folded
     /// per-handler wrappers produced (rustfs/backlog#1829).
     #[tokio::test]
-    async fn authorize_admin_request_without_credentials_is_rejected() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: http::Method::GET,
-            uri: Uri::from_static("/rustfs/admin/v3/list-jobs"),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+    async fn authorize_admin_envelope_without_credentials_is_rejected() {
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: Uri::from_static("/rustfs/admin/v3/usage/bucket"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
 
-        let err = authorize_admin_request(&req, vec![admin_action()])
+        let err = authorize_admin_envelope(&envelope, vec![admin_action()])
             .await
-            .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+            .expect_err("an envelope without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
     }
 

@@ -802,7 +802,6 @@ impl ECStore {
             let set = set.clone();
             let rx = rx.clone();
             let bucket = bucket.clone();
-            let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
                 let list_rx = rx.clone();
@@ -1043,8 +1042,9 @@ mod tests {
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
-    use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionExpiration,
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleRule,
+        PersistedNoncurrentVersionExpiration,
     };
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
@@ -1088,12 +1088,12 @@ mod tests {
         }
     }
 
-    fn expired_delete_marker_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn expired_delete_marker_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -2125,11 +2125,11 @@ mod tests {
         ))
         .await
         .expect("seed the expired source version");
-        let lifecycle = BucketLifecycleConfiguration {
+        let lifecycle = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -2567,7 +2567,7 @@ mod tests {
                         versioned,
                         version_id,
                         transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
-                            restore_request: s3s::dto::RestoreRequest {
+                            restore_request: rustfs_lifecycle::RestoreRequest {
                                 days: Some(1),
                                 ..Default::default()
                             },
@@ -2647,7 +2647,7 @@ mod tests {
         async fn run_entry_with(
             &self,
             entry: MetaCacheEntry,
-            lifecycle_config: Option<BucketLifecycleConfiguration>,
+            lifecycle_config: Option<PersistedLifecycleConfiguration>,
         ) -> RebalanceEntryOutcome {
             Box::pin(Arc::clone(&self.store).rebalance_entry(
                 RebalanceEntryTarget {
@@ -2983,17 +2983,17 @@ mod tests {
     }
 
     /// A rule that expires every noncurrent version at once.
-    fn noncurrent_expire_all_lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    fn noncurrent_expire_all_lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("noncurrent-expire-all".to_string()),
-                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(0),
                     newer_noncurrent_versions: None,
                 }),

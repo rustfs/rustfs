@@ -41,12 +41,12 @@ use super::super::{
     ObjectKey, ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime,
     Ordering, Pin, PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
-    SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
-    build_get_object_info, build_inline_bitrot_readers_from_refs_with_frame_size, build_inline_bitrot_readers_with_frame_size,
-    can_try_inline_data_shards_direct, check_object_lock_delete, check_object_lock_for_deletion_with_state,
-    check_object_lock_retention_update, classify_get_codec_streaming_object_class, classify_put_write_path,
-    classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID,
+    SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
+    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers_from_refs_with_frame_size,
+    build_inline_bitrot_readers_with_frame_size, can_try_inline_data_shards_direct, check_object_lock_delete,
+    check_object_lock_for_deletion_with_state, check_object_lock_retention_update, classify_get_codec_streaming_object_class,
+    classify_put_write_path, classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
     create_bitrot_writer_with_orig_volume, debug, delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error,
     explicit_delete_removed_marker, finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan,
     get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
@@ -68,6 +68,92 @@ use super::super::{
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::delete_recovery::DeleteRecoveryContext;
+
+const EVENT_SET_DISK_DELETE_OBJECTS_STAGE: &str = "set_disk_delete_objects_stage";
+const DELETE_OBJECTS_STAGE_SLOW_MS: u128 = 1_000;
+
+/// Counts use the stage's actual inputs, not failures inherited from an earlier stage.
+struct DeleteObjectsStageSummary {
+    stage: &'static str,
+    started: Instant,
+    attempted_object_count: usize,
+    attempted_group_count: usize,
+    fence_lost: bool,
+    failed_object_count: usize,
+    failed_group_count: usize,
+    disk_error_counts: std::collections::BTreeMap<u32, usize>,
+}
+
+impl DeleteObjectsStageSummary {
+    fn new(stage: &'static str, attempted_object_count: usize, attempted_group_count: usize) -> Self {
+        Self {
+            stage,
+            started: Instant::now(),
+            attempted_object_count,
+            attempted_group_count,
+            fence_lost: false,
+            failed_object_count: 0,
+            failed_group_count: 0,
+            disk_error_counts: Default::default(),
+        }
+    }
+
+    fn record_disk_failure(&mut self, error: &DiskError, object_count: usize) {
+        self.failed_object_count += object_count;
+        self.failed_group_count += 1;
+        // Wire codes preserve typed disk causes without exposing error messages or paths.
+        *self.disk_error_counts.entry(error.to_u32()).or_default() += 1;
+    }
+
+    fn log(self, pool_index: usize, set_index: usize, disk_index: Option<usize>) {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let state = if self.fence_lost { "fence_lost" } else { "completed" };
+        let result = if self.fence_lost || self.failed_object_count > 0 {
+            "failed"
+        } else {
+            "ok"
+        };
+        if self.fence_lost || self.failed_object_count > 0 || elapsed_ms >= DELETE_OBJECTS_STAGE_SLOW_MS {
+            warn!(
+                event = EVENT_SET_DISK_DELETE_OBJECTS_STAGE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state,
+                result,
+                stage = self.stage,
+                pool_index,
+                set_index,
+                disk_index,
+                attempted_object_count = self.attempted_object_count,
+                attempted_group_count = self.attempted_group_count,
+                failed_object_count = self.failed_object_count,
+                failed_group_count = self.failed_group_count,
+                disk_error_counts = ?self.disk_error_counts,
+                elapsed_ms,
+                "Batch delete stage completed"
+            );
+        } else {
+            debug!(
+                event = EVENT_SET_DISK_DELETE_OBJECTS_STAGE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state,
+                result,
+                stage = self.stage,
+                pool_index,
+                set_index,
+                disk_index,
+                attempted_object_count = self.attempted_object_count,
+                attempted_group_count = self.attempted_group_count,
+                failed_object_count = self.failed_object_count,
+                failed_group_count = self.failed_group_count,
+                disk_error_counts = ?self.disk_error_counts,
+                elapsed_ms,
+                "Batch delete stage completed"
+            );
+        }
+    }
+}
 
 #[derive(Default)]
 struct DeleteCommitContext<'a> {
@@ -2361,6 +2447,8 @@ fn is_restore_control_metadata(key: &str) -> bool {
             .is_some_and(|remainder| remainder.is_empty())
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_WORKER_LOCK)
             .is_some_and(|remainder| remainder.is_empty())
+        || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_COPYBACK)
+            .is_some_and(|remainder| remainder.is_empty())
 }
 
 fn restore_metadata_update_preserves_protected_metadata(
@@ -4324,7 +4412,13 @@ impl SetDisks {
             // state.
             merge_replication_metadata_lww(&mut user_defined, &HashMap::new(), opts);
         }
-        if expected_restore_operation_id.is_some() {
+        // Pending copy-back keeps its recovery identity until finalization.
+        if expected_restore_operation_id.is_some()
+            && !user_defined
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_WORKER_LOCK);
         }
@@ -4743,19 +4837,29 @@ impl SetDisks {
                     inline_proof.to_owned(),
                 );
             }
+            if opts.restore_copyback {
+                insert_str(
+                    &mut user_defined,
+                    SUFFIX_RESTORE_COPYBACK,
+                    rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1.to_string(),
+                );
+            }
             fi.metadata = user_defined;
-            let put_tier_free_version_id =
-                if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
-                    // Current disks publish the same cleanup owner alongside a
-                    // replaced null version. Keep the intent outside metadata:
-                    // older disks persist unknown metadata keys, which splits
-                    // the replacement's read-quorum identity during an upgrade.
-                    let free_version_id = Uuid::new_v4();
-                    fi.overwrite_tier_free_version_id = Some(free_version_id);
-                    Some(free_version_id)
-                } else {
-                    None
-                };
+            let put_tier_free_version_id = if fi.version_id.is_none_or(|id| id.is_nil())
+                && !opts.data_movement
+                && expected_restore_operation_id.is_none()
+                && !opts.restore_copyback
+            {
+                // Current disks publish the same cleanup owner alongside a
+                // replaced null version. Keep the intent outside metadata:
+                // older disks persist unknown metadata keys, which splits
+                // the replacement's read-quorum identity during an upgrade.
+                let free_version_id = Uuid::new_v4();
+                fi.overwrite_tier_free_version_id = Some(free_version_id);
+                Some(free_version_id)
+            } else {
+                None
+            };
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -9997,6 +10101,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dist_erasure = self.ctx.is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
+        let mut raw_lock_summary = DeleteObjectsStageSummary::new("raw_acquire", objects.len(), unique_lock_count);
         if opts.no_lock {
             locked_objects = unique_objects;
         } else if dist_erasure {
@@ -10036,7 +10141,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         for (i, lock_name) in lock_names.iter().enumerate() {
             if let Some(err) = failed_map.get(&(bucket.to_string(), lock_name.to_string())) {
                 del_errs[i] = Some(Error::other(err.to_string()));
+                raw_lock_summary.failed_object_count += 1;
             }
+        }
+        if !opts.no_lock {
+            raw_lock_summary.failed_group_count = failed_map.len();
+            raw_lock_summary.log(self.pool_index, self.set_index, None);
         }
 
         let outer_namespace_lock_fence = opts.namespace_lock_fence.clone();
@@ -10045,12 +10155,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            // Bulk delete is the only multi-key transaction-lock holder; one
-            // batched lock round replaces one quorum round-trip per key and is
-            // deadlock-free by construction (a single `lock_batch` RPC per lock
-            // client, global (shard, key) order at each server). Per-key
-            // failures keep the set layer's per-key error reporting.
+            // Batch unresolved keys per peer under one total acquisition budget.
+            // Confirmed cleanup precedes retries; each key keeps its own quorum
+            // and failure result at the set layer.
             let key_names: Vec<&str> = keys.iter().map(|key| key.as_str()).collect();
+            let mut transaction_summary = DeleteObjectsStageSummary::new(
+                "transaction_acquire",
+                lock_names
+                    .iter()
+                    .filter(|name| locked_objects.contains(name.as_ref()))
+                    .count(),
+                key_names.len(),
+            );
             let acquired = self
                 .acquire_delete_transaction_locks_batch(bucket, &key_names, super::super::get_lock_acquire_timeout())
                 .await;
@@ -10061,14 +10177,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         transaction_guards.insert(key, guard);
                     }
                     Err(error) => {
+                        transaction_summary.failed_group_count += 1;
                         for (index, lock_name) in lock_names.iter().enumerate() {
                             if lock_name.as_ref() == key {
                                 del_errs[index] = Some(error.clone());
+                                transaction_summary.failed_object_count += 1;
                             }
                         }
                     }
                 }
             }
+            transaction_summary.log(self.pool_index, self.set_index, None);
         }
         let transaction_guards = Arc::new(transaction_guards);
         let current_generations = opts.conditional_delete_generations.as_deref();
@@ -10526,11 +10645,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .as_ref()
             .is_some_and(NamespaceLockFence::is_lock_lost)
         {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "fence_before_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             if dist_erasure {
                 self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
             }
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
                         mode: "delete_objects_commit",
                         bucket: bucket.to_string(),
@@ -10540,6 +10666,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
             return (del_objects, del_errs, accounting);
         }
 
@@ -10606,8 +10733,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // let mut errors = Vec::with_capacity(disks.len());
 
-        for disk in disks.iter() {
+        for (disk_index, disk) in disks.iter().enumerate() {
             let disk_namespace_owner = namespace_owner.clone();
+            let group_inputs = &vers;
             let vers = vers.clone();
             let namespace_lock_fence = opts.namespace_lock_fence.clone();
             let lock_lost_during_commit = Arc::clone(&lock_lost_during_commit);
@@ -10616,7 +10744,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     lock_lost_during_commit.store(true, std::sync::atomic::Ordering::Release);
                     return (0..vers.len()).map(|_| Some(DiskError::DiskOngoingReq)).collect();
                 }
-                if let Some(disk) = disk {
+                let mut prepare_summary = DeleteObjectsStageSummary::new(
+                    "prepare",
+                    group_inputs.iter().map(|group| group.versions.len()).sum(),
+                    group_inputs.len(),
+                );
+                let errors = if let Some(disk) = disk {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
@@ -10684,14 +10817,28 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         errs.push(Some(DiskError::DiskNotFound));
                     }
                     errs
+                };
+                for (error, group) in errors.iter().zip(group_inputs) {
+                    if let Some(error) = error {
+                        prepare_summary.record_disk_failure(error, group.versions.len());
+                    }
                 }
+                prepare_summary.log(self.pool_index, self.set_index, Some(disk_index));
+                errors
             });
         }
 
         let results = join_all(futures).await;
         if transaction_guards.values().any(|guard| guard.is_lock_lost()) {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "transaction_fence_after_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     accounting[index] = None;
                     del_errs[index] = Some(StorageError::NamespaceLockQuorumUnavailable {
                         mode: "delete_transaction",
@@ -10702,6 +10849,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
             if dist_erasure {
                 self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
             }
@@ -10768,8 +10916,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         if lock_lost_during_commit.load(std::sync::atomic::Ordering::Acquire) {
+            let mut fence_summary = DeleteObjectsStageSummary::new(
+                "fence_during_prepare",
+                del_errs.iter().filter(|error| error.is_none()).count(),
+                0,
+            );
+            fence_summary.fence_lost = true;
             for (index, object) in objects.iter().enumerate() {
                 if del_errs[index].is_none() {
+                    fence_summary.failed_object_count += 1;
                     del_errs[index] = Some(Error::NamespaceLockQuorumUnavailable {
                         mode: "delete_objects_commit",
                         bucket: bucket.to_string(),
@@ -10779,6 +10934,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
+            fence_summary.log(self.pool_index, self.set_index, None);
         }
 
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
@@ -10797,6 +10953,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Mark all attempted groups before starting publication. A lost
             // response can hide a persisted decision and must never roll back.
             let groups = groups.collect::<Vec<_>>();
+            let mut receipt_summary = DeleteObjectsStageSummary::new(
+                "receipt",
+                groups.iter().map(|index| vers[*index].versions.len()).sum(),
+                groups.len(),
+            );
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
             // Journal publish fans out per object per drive; keep enough
             // publications in flight to feed the drives' durable-mutation
@@ -10844,11 +11005,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             for (index, result) in publications {
                 let group = &vers[index];
                 if let Err(error) = result {
+                    receipt_summary.record_disk_failure(&error, group.versions.len());
                     for version in &group.versions {
                         del_errs[version.idx] = Some(to_object_err(error.clone().into(), vec![bucket, &group.name]));
                     }
                 }
             }
+            receipt_summary.log(self.pool_index, self.set_index, None);
         }
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
@@ -11934,7 +12097,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
         }
-
+        if fi
+            .metadata
+            .get(metadata_keys::RESTORE)
+            .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+            .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
+            return Ok(());
+        }
         /*if fi.xlv1 {
             if let Err(err) = self.heal_object(bucket, object, "", &HealOpts {no_lock: true, ..Default::default()}) {
                 return err.expect("err");
@@ -12441,7 +12611,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let actual_fi = actual.fi();
 
         let oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let mut restore_cleanup_info = oi.clone();
         let restore_result: Result<()> = async {
+            crate::services::notification_sys::require_restore_copyback_fleet_capability().await?;
             // The tier reader releases its own lease at EOF, before PUT or
             // CompleteMultipartUpload necessarily reaches metadata quorum. Keep a
             // second exact-generation lease for the whole restore so the final
@@ -12520,6 +12692,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     .put_object(bucket, object, &mut p_reader, &ropts)
                     .await
                     .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+                restore_cleanup_info = restored_info.clone();
                 let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
                 send_event(EventArgs {
                     event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -12639,6 +12812,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
                     user_defined: restore_commit_metadata,
                     no_lock: false,
+                    restore_copyback: true,
                     decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
                     // The composite ETag would otherwise be recomputed from the
                     // parts as they were written back, which for an encrypted or
@@ -12663,6 +12837,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     return Err(err);
                 }
             };
+            restore_cleanup_info = restored_info.clone();
             let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
             send_event(EventArgs {
                 event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -12676,7 +12851,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         .await;
         if let Err(primary_error) = restore_result {
-            if let Err(cleanup_error) = self_.update_restore_metadata(bucket, object, &oi, opts).await {
+            if let Err(cleanup_error) = self_
+                .update_restore_metadata(bucket, object, &restore_cleanup_info, opts)
+                .await
+            {
                 warn!(
                     event = EVENT_LIFECYCLE_RESTORE_CLEANUP,
                     component = LOG_COMPONENT_ECSTORE,
@@ -13704,8 +13882,8 @@ mod replication_quota_safety_tests {
         let suspended_opts = ObjectOptions {
             version_suspended: true,
             delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
-                s3s::dto::VersioningConfiguration {
-                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                    status: Some("Suspended".to_owned()),
                     ..Default::default()
                 },
                 None,
@@ -14338,11 +14516,11 @@ mod replication_lww_tests {
 
     fn default_retention_snapshot(mode: &'static str) -> Arc<ObjectLockConfigSnapshot> {
         Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
-            config: s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(mode)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some(mode.to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -14359,10 +14537,7 @@ mod replication_lww_tests {
     /// timestamp the write passes and LWW judges it.
     #[tokio::test]
     async fn inbound_without_retention_timestamp_stays_rejected_under_bucket_default_retention() {
-        for mode in [
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
-            s3s::dto::ObjectLockRetentionMode::GOVERNANCE,
-        ] {
+        for mode in ["COMPLIANCE", "GOVERNANCE"] {
             let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
             let bucket = "lww-locked-default-retention";
             let object = "object";
@@ -16515,8 +16690,8 @@ mod metadata_mutation_generation_tests {
 
     #[tokio::test]
     async fn restore_metadata_copy_preserves_tags_expiry_and_version_order() {
+        use rustfs_lifecycle::RestoreRequest;
         use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-        use s3s::dto::RestoreRequest;
         use time::format_description::well_known::Rfc3339;
 
         let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
@@ -16793,7 +16968,7 @@ mod transition_commit_failure_tests {
     use crate::services::tier::tier::TierConfigMgr;
     use http::HeaderMap;
     use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
-    use s3s::dto::RestoreRequest;
+    use rustfs_lifecycle::RestoreRequest;
     use tokio::io::AsyncReadExt;
 
     pub(super) fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
@@ -19372,7 +19547,7 @@ mod transition_upload_integrity_tests {
         for disk in disk_stores {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
-        let mut source = PutObjReader::from_vec(b"restore source body".repeat(1024));
+        let mut source = PutObjReader::from_vec(b"restore source body".repeat(64 * 1024));
         set_disks
             .put_object(bucket, object, &mut source, &ObjectOptions::default())
             .await
@@ -19389,7 +19564,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("pending restore metadata should be installed");
 
-        let mut restored_reader = PutObjReader::from_vec(b"restored body".repeat(1024));
+        let mut restored_reader = PutObjReader::from_vec(b"restored body".repeat(64 * 1024));
         set_disks
             .put_object(
                 bucket,
@@ -19397,18 +19572,19 @@ mod transition_upload_integrity_tests {
                 &mut restored_reader,
                 &ObjectOptions {
                     user_defined: restore_metadata(operation_id, true),
+                    restore_copyback: true,
                     ..Default::default()
                 },
             )
             .await
-            .expect("matching restore commit should consume its operation id")
+            .expect("matching restore copy-back should retain its pending operation id")
     }
 
     fn restore_finalize_options(operation_id: Uuid) -> ObjectOptions {
         ObjectOptions {
             user_defined: restore_operation_id_metadata(operation_id),
             transition: TransitionOptions {
-                restore_request: s3s::dto::RestoreRequest {
+                restore_request: rustfs_lifecycle::RestoreRequest {
                     days: Some(1),
                     ..Default::default()
                 },
@@ -19418,17 +19594,87 @@ mod transition_upload_integrity_tests {
         }
     }
 
-    async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_cleanup_reclaims_committed_copyback_data_dir() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-copyback-data-dir-bucket";
+        let object = "object.bin";
+        let operation_id = Uuid::new_v4();
+        let restored = write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await;
+        let data_dir = restored
+            .data_dir
+            .expect("committed copy-back must have a local data directory");
+        for temp_dir in &temp_dirs {
+            assert!(
+                temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "committed copy-back must retain its local data directory before cleanup"
+            );
+        }
+
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &restored,
+                &ObjectOptions {
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching restore cleanup should remove the failed copy-back");
+
+        for temp_dir in &temp_dirs {
+            assert!(
+                !temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "failed copy-back cleanup must reclaim its committed local data directory"
+            );
+        }
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleaned object metadata should remain readable");
+        assert!(!cleaned.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE));
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                cleaned.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+            )
+            .is_none(),
+            "failed copy-back cleanup must remove the local routing marker"
+        );
+    }
+
+    async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, operation_id: Uuid) {
         let current = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("pending restore metadata should remain readable");
-        assert!(
-            restore_operation_id_from_metadata(current.user_defined.as_ref())
-                .expect("operation id metadata should parse")
-                .is_none(),
-            "successful restore commit must have consumed the operation id"
+        assert_eq!(
+            restore_operation_id_from_metadata(current.user_defined.as_ref()).expect("operation id metadata should parse"),
+            Some(operation_id),
+            "unfinished restore copy-back must retain its exact operation id"
         );
+        let operation_id = operation_id.to_string();
+        for (suffix, expected) in [
+            (rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID, operation_id.as_str()),
+            (
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+                rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1,
+            ),
+        ] {
+            for prefix in [
+                rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+                rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            ] {
+                assert_eq!(
+                    current.user_defined.get(&format!("{prefix}{suffix}")).map(String::as_str),
+                    Some(expected),
+                    "unfinished restore copy-back must retain each recovery marker alias"
+                );
+            }
+        }
         assert!(
             rustfs_filemeta::parse_restore_obj_status(
                 current
@@ -19486,7 +19732,7 @@ mod transition_upload_integrity_tests {
                 if error.kind() == std::io::ErrorKind::Other
                     && error.to_string() == "restore finalization lock lost before metadata update"
         ));
-        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
+        assert_committed_restore_remains_pending(&set_disks, bucket, object, operation_id).await;
     }
 
     #[tokio::test]
@@ -19523,7 +19769,7 @@ mod transition_upload_integrity_tests {
                 ..
             }
         ));
-        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
+        assert_committed_restore_remains_pending(&set_disks, bucket, object, operation_id).await;
     }
 
     async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {
@@ -20073,7 +20319,7 @@ mod transition_upload_integrity_tests {
             no_lock: true,
             part_number: Some(1),
             transition: TransitionOptions {
-                restore_request: s3s::dto::RestoreRequest {
+                restore_request: rustfs_lifecycle::RestoreRequest {
                     days: Some(1),
                     ..Default::default()
                 },
@@ -24750,29 +24996,20 @@ mod put_object_tmp_cleanup_tests {
             (
                 "compliance",
                 HashMap::from([
-                    (
-                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                        s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                    ),
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                     (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until.clone()),
                 ]),
             ),
             (
                 "governance",
                 HashMap::from([
-                    (
-                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                        s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
-                    ),
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
                     (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
                 ]),
             ),
             (
                 "legal-hold",
-                HashMap::from([(
-                    metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
-                    s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
-                )]),
+                HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
             ),
         ];
 
@@ -24973,13 +25210,11 @@ mod put_object_tmp_cleanup_tests {
             .expect("versioned PUT should return a version ID")
             .to_string();
         let default_compliance = ObjectLockConfigState::Configured {
-            config: s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
-                        )),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -25301,10 +25536,7 @@ mod put_object_tmp_cleanup_tests {
                 &ObjectOptions {
                     version_id: Some(destination_version.clone()),
                     versioned: true,
-                    eval_metadata: Some(HashMap::from([(
-                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
-                        s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
-                    )])),
+                    eval_metadata: Some(HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())])),
                     ..Default::default()
                 },
             )
@@ -26337,7 +26569,7 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn delete_objects_derives_per_object_versioning_from_the_request_snapshot() {
-        use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-versioning-snapshot-bucket";
@@ -26349,10 +26581,8 @@ mod delete_objects_lock_gating_tests {
         put_plain_object(&set_disks, bucket, "archive/unversioned-object").await;
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                excluded_prefixes: Some(vec![ExcludedPrefix {
-                    prefix: Some("archive/".to_string()),
-                }]),
+                status: Some("Enabled".to_owned()),
+                excluded_prefixes: Some(vec![Some("archive/".to_string())]),
                 ..Default::default()
             },
             None,
@@ -26398,11 +26628,13 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn batch_version_delete_uses_tags_read_under_the_delete_lock() {
-        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
-            ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter,
+            PersistedReplicationRule, PersistedReplicationStatus, PersistedReplicationTag,
         };
+        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-delete-locked-tags";
@@ -26438,23 +26670,23 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
                     existing_object_replication: None,
-                    filter: Some(ReplicationRuleFilter {
-                        tag: Some(Tag {
+                    filter: Some(PersistedReplicationFilter {
+                        tag: Some(PersistedReplicationTag {
                             key: Some("generation".to_string()),
                             value: Some("locked".to_string()),
                         }),
@@ -26464,7 +26696,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -26502,9 +26734,11 @@ mod delete_objects_lock_gating_tests {
     #[tokio::test]
     #[serial]
     async fn lifecycle_delete_all_history_records_exact_replication_purge() {
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
-            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+            PersistedReplicationStatus,
         };
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -26546,17 +26780,17 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
@@ -26566,7 +26800,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -26608,10 +26842,11 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn synthetic_directory_delete_uses_decoded_prefix_and_marker_switch() {
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
-            DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleFilter,
-            ReplicationRuleStatus, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
+        use rustfs_gateway_types::persistence::{
+            PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+            PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus,
         };
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -26625,24 +26860,24 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
-                    delete_marker_replication: Some(DeleteMarkerReplication {
-                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                rules: vec![PersistedReplicationRule {
+                    delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                        status: Some(Status::ENABLED.to_string()),
                     }),
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::DISABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::DISABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
                     existing_object_replication: None,
-                    filter: Some(ReplicationRuleFilter {
+                    filter: Some(PersistedReplicationFilter {
                         prefix: Some("photos/".to_string()),
                         ..Default::default()
                     }),
@@ -26650,7 +26885,7 @@ mod delete_objects_lock_gating_tests {
                     prefix: None,
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -26782,10 +27017,7 @@ mod delete_objects_lock_gating_tests {
         // stat and the #4297 rejection.
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 30);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until
@@ -28415,9 +28647,10 @@ mod batch_delete_marker_tests {
 
     #[tokio::test]
     async fn batch_delete_explicit_marker_does_not_wait_for_pending_replication() {
-        use s3s::dto::{
-            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
-            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::{
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+            PersistedReplicationStatus, PersistedVersioningConfiguration,
         };
 
         let (_dirs, store) = isolated_store_over_temp_disks().await;
@@ -28425,18 +28658,18 @@ mod batch_delete_marker_tests {
         let (data_versions, markers) = marker_history(&store, bucket).await;
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
-            VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            PersistedVersioningConfiguration {
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
-            Some(ReplicationConfiguration {
+            Some(PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
+                rules: vec![PersistedReplicationRule {
                     delete_marker_replication: None,
-                    delete_replication: Some(DeleteReplication {
-                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    delete_replication: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: arn.to_string(),
                         ..Default::default()
                     },
@@ -28446,7 +28679,7 @@ mod batch_delete_marker_tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             }),
         ));
@@ -29066,3 +29299,24 @@ mod delete_recovery_inventory_tests {
 
 #[cfg(all(test, feature = "test-util"))]
 mod data_movement_prefix_cleanup_tests;
+
+#[cfg(test)]
+mod delete_objects_stage_summary_tests {
+    use super::*;
+
+    #[test]
+    fn batch_delete_diagnostics_count_groups_and_versions_separately() {
+        let mut summary = DeleteObjectsStageSummary::new("receipt", 6, 3);
+        summary.record_disk_failure(&DiskError::ErasureWriteQuorum, 3);
+        summary.record_disk_failure(&DiskError::ErasureWriteQuorum, 2);
+
+        assert_eq!(summary.attempted_object_count, 6);
+        assert_eq!(summary.attempted_group_count, 3);
+        assert_eq!(summary.failed_object_count, 5);
+        assert_eq!(summary.failed_group_count, 2);
+        assert_eq!(
+            summary.disk_error_counts,
+            std::collections::BTreeMap::from([(DiskError::ErasureWriteQuorum.to_u32(), 2)])
+        );
+    }
+}

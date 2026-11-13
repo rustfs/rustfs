@@ -26,6 +26,7 @@ members = [
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
+    "crates/gateway-adapter", # RustFS implementations of the gateway extension traits
     "crates/heal", # Erasure set and object healing
     "crates/heal-contracts", # Heal request/response channel contracts
     "crates/iam", # Identity and Access Management
@@ -48,7 +49,7 @@ members = [
     "crates/replication", # Replication contracts and wire formats
     "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-client", # S3 client for engine-side consumption of remote S3 endpoints (tiering, transition targets)
-    "crates/s3-types", # S3 event type definitions
+    "crates/s3-types", # S3 event and error type definitions
     "crates/s3-ops", # S3 operation definitions and mapping
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
@@ -93,6 +94,7 @@ redundant_clone = "warn"
 [workspace.dependencies]
 # RustFS Internal Crates
 rustfs = { path = "./rustfs", version = "1.0.5" }
+rustfs-gateway-adapter = { path = "crates/gateway-adapter", version = "1.0.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.5" }
 rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.5" }
@@ -143,13 +145,26 @@ rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.5" }
 rustfs-utils = { path = "crates/utils", version = "1.0.5" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 
+# The gateway's S3 types: the DTOs and persisted bucket-configuration codecs the
+# engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
+# gateway in this workspace; no crate may enable a `compat-s3s*` feature except
+# the s3s-facing edge of the rustfs binary.
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.40.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.2.0", default-features = false }
+# The gateway framework itself, consumed for its extension traits by the ring-2
+# adapter. `default-features = false` keeps the `server` feature, and with it the
+# server crate, out of the build.
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", version = "0.62.0", default-features = false }
+# Test-only: builds the `EffectiveHost` a host-resolution test queries with.
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "7915d06950f88611d883f6ab3d95efc90c65dec0", default-features = false }
+
 # Async Runtime and Networking
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
 async-compression = { version = "0.4.52" }
 async-trait = "0.1.92"
-async-nats = { version = "0.51.0", default-features = false }
+async-nats = { version = "0.52.0", default-features = false }
 axum = "0.8.9"
 futures = "0.3.34"
 futures-core = "0.3.34"
@@ -196,7 +211,7 @@ bytesize = "2.7.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
-prost = "0.14.4"
+prost = "0.14.5"
 quick-xml = "0.42.0"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -225,7 +240,7 @@ p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "=0.10.0-rc.18" }
 rustls = { default-features = false, version = "0.23.46" }
 rustls-native-certs = "0.8"
-rustls-pki-types = "1.15.1"
+rustls-pki-types = "1.16.0"
 x509-parser = "0.18.1"
 sha1 = "0.11.0"
 sha2 = "0.11.1"
@@ -236,7 +251,7 @@ proptest = "1"
 # Time and Date
 chrono = { version = "0.4.45" }
 humantime = "2.4.0"
-jiff = { version = "0.2.39" }
+jiff = { version = "0.2.43" }
 time = { version = "0.3.55" }
 
 # Database
@@ -246,22 +261,22 @@ tokio-postgres-rustls = "0.14.0"
 
 # Utilities and Tools
 anyhow = "1.0.104"
-arc-swap = "1.9.3"
+arc-swap = "1.9.5"
 rustfs-tokio-tar = { version = "0.7.1" }
 # Candidate Snowball parser versions exercised by rustfs-zip compatibility fixtures.
-tar-codec = "0.0.15"
-tar-framing = "0.0.15"
+tar-codec = "0.0.16"
+tar-framing = "0.0.16"
 atoi = "3.1.1"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.13.0" }
+aws-config = { version = "1.13.2" }
 aws-credential-types = { version = "1.3.1" }
-aws-sdk-kms = { default-features = false, version = "1.129.0" }
-aws-sdk-s3 = { default-features = false, version = "1.157.0" }
-aws-sdk-sts = { default-features = false, version = "1.124.0" }
+aws-sdk-kms = { default-features = false, version = "1.131.0" }
+aws-sdk-s3 = { default-features = false, version = "1.159.0" }
+aws-sdk-sts = { default-features = false, version = "1.126.0" }
 aws-smithy-async = { version = "1.3.1" }
 aws-smithy-http-client = { default-features = false, version = "1.5.2" }
-aws-smithy-runtime-api = { version = "1.19.2" }
-aws-smithy-types = { version = "1.9.1" }
+aws-smithy-runtime-api = { version = "1.21.0" }
+aws-smithy-types = { version = "1.9.4" }
 base64-simd = "0.8.0"
 brotli = "9.1.1"
 clap = { version = "4.6.7" }
@@ -277,10 +292,10 @@ derive_builder = "0.20.2"
 ed25519-dalek = "3.0.0"
 enumset = "1.1.15"
 faster-hex = "1.0.0"
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 glob = "0.3.4"
-google-cloud-storage = "1.21.0"
-google-cloud-auth = "1.18.0"
+google-cloud-storage = "1.22.0"
+google-cloud-auth = "1.19.0"
 hashbrown = { version = "0.17.1" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
@@ -304,7 +319,7 @@ moka = { version = "0.12.16" }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.13.0"
-object = { version = "=0.40.0", default-features = false }
+object = { version = "=0.41.0", default-features = false }
 parking_lot = "0.13.0"
 same-file = "1.0.6"
 path-absolutize = "4.0.1"
@@ -325,19 +340,24 @@ rumqttc = { package = "rumqttc-next", version = "0.34.0" }
 redis = { version = "1.8.1" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.6" }
-rust-embed = { version = "8.13.0" }
+rust-embed = { version = "8.14.0" }
 rustc-hash = { version = "2.1.3" }
 s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
 s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
+# The same s3s pin under the name the legacy edge of the gateway migration uses
+# (crates/s3-types, feature `compat-s3s`). Keep `rev` identical to `s3s` above.
+# DELETE BY T4.2 (rustfs/backlog#2784).
+legacy-s3s = { package = "s3s", git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.4"
-smallvec = { version = "1.16.4" }
+smallvec = { version = "1.16.5" }
 compact_str = "0.10.0"
 snap = "1.1.2"
-starshard = { version = "2.4.0" }
+starshard = { version = "2.4.1" }
 strum = { version = "0.28.0" }
-sysinfo = "0.40.1"
+sync_wrapper = "1.0.2"
+sysinfo = "0.40.3"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.4.1"
@@ -351,7 +371,7 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.29.0" }
+uuid = { version = "1.29.2" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
@@ -359,13 +379,13 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.3.0"
-zstd = "0.14.3"
+zip = "9.5.1"
+zstd = "0.14.4"
 
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
-dial9 = { version = "0.5.7", default-features = false }
+dial9 = { version = "0.5.8", default-features = false }
 opentelemetry = { version = "0.33.1" }
 opentelemetry-appender-tracing = { version = "0.33.1" }
 opentelemetry-otlp = { version = "0.33.1" }
@@ -377,19 +397,19 @@ pyroscope = { version = "2.1.5" }
 
 # FTP and SFTP
 libunftp = { version = "0.24.0" }
-unftp-core = "0.1.0"
+unftp-core = "0.1.1"
 suppaftp = { version = "12.2.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 russh = { version = "0.65.1" }
 russh-sftp = "3.0.1"
 
 # WebDAV
-dav-server = "0.11.0"
+dav-server = "0.12.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.7.3" }
+rustfs-mimalloc = { version = "0.7.4" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.30.3", default-features = false }
+hotpath = { version = "0.31.2", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 

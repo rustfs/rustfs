@@ -1,0 +1,1 @@
+<BucketLoggingStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LoggingEnabled><TargetBucket>interop-logs</TargetBucket><TargetPrefix>interop/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>

@@ -5,7 +5,7 @@
 
 ## Billing facts
 
-This repository is public. For a public repository, GitHub's standard hosted runners (`ubuntu-latest`, `windows-latest`, `macos-latest`) cost nothing and have no minute cap, whatever plan the organisation is on. GitHub bills only two things: larger hosted runners, which have custom labels and are not used here, and standard runners in private repositories.
+This repository is public. For a public repository, GitHub's standard hosted runners (`ubuntu-latest`, `windows-latest`, `macos-latest`) cost nothing and have no minute cap, whatever plan the organisation is on. GitHub bills only two things: larger hosted runners, including the `macos-latest-xlarge` release lane used here, and standard runners in private repositories.
 
 Every other label in this repository is capacity RustFS pays for. ARC pods and lab machines accrue cost while the machine exists. A Ubicloud label is metered for the minutes a job holds its VM:
 
@@ -13,6 +13,7 @@ Every other label in this repository is capacity RustFS pays for. ARC pods and l
 |---|---|---|---|
 | `ubuntu-latest` | nobody | GitHub-hosted, Ubuntu 24.04, 4 vCPU, 16 GB RAM, about 14 GB of free disk. Ships a C toolchain, `docker`, `gh`, `curl`, `wget`, `jq`, Python. Can `mount` tmpfs and loop devices; io_uring works | the default for every job |
 | `windows-latest`, `macos-latest` | nobody | GitHub-hosted standard runners | Windows and macOS targets |
+| `macos-latest-xlarge` | RustFS | GitHub-hosted larger Apple Silicon runner | macOS release builds, deferred until Linux acceptance for candidates |
 | `sm-standard-2` | RustFS | ARC pod, Ubuntu 24.04, minimal image: no `gh`, no C toolchain; Docker only on the `dind-` label | only a job that a hosted runner cannot run (see the placement rule) |
 | `sm-standard-4` | RustFS | ARC pod, Ubuntu 24.04, 14 CPUs and 28 GB (the label is not the core count), large disk | workspace-scale Cargo builds |
 | `ubicloud-standard-16-arm` | RustFS | Ubicloud VM, alias of `ubicloud-standard-16-arm-ubuntu-2404`: Ubuntu 24.04 arm64, 16 vCPU, 48 GB, 300 GB disk. Reached through the `build.yml` matrix, so `actionlint.yaml` does not list it | native aarch64 release builds (`linux-aarch64-musl`, `linux-aarch64-gnu`) |
@@ -32,7 +33,7 @@ A job runs on `ubuntu-latest` unless it has one of these reasons, and the reason
 
 Jobs that do only the following have no reason to be self-hosted: shell or Python scripts, `cargo fmt`, `cargo deny`, typos, actionlint, API calls (`gh`, dependency review, issue and stale bots, CLA checks), downloading an artifact and running a prebuilt binary, or a `cargo build -p rustfs` with its own cache key. `e2e-distributed.yml` and `e2e-upgrade.yml` build the server and the `e2e_test` harness on `ubuntu-latest` inside their budgets, so "it compiles something" alone is not a reason.
 
-The functional chain's `prepare` and `complete-chain` jobs, the performance runner availability check, and runner hygiene use `ubuntu-latest`: they inspect APIs or artifacts, not the lab hosts. The actual functional and performance suites remain on their lab runners. Functional-chain health collection uses `ubuntu-latest` so a lab outage cannot also stop its independent monitor. Docker image packaging also uses `ubuntu-latest` for both musl and glibc variants; it downloads release binaries rather than compiling the workspace, and still sets up QEMU and Buildx explicitly.
+The functional chain's `prepare` and `complete-chain` jobs, the performance runner availability check, and runner hygiene use `ubuntu-latest`: they inspect APIs or artifacts, not the lab hosts. The actual functional and performance suites remain on their lab runners. Functional-chain health collection uses `ubuntu-latest` so a lab outage cannot also stop its independent monitor. Docker image packaging also uses `ubuntu-latest` for both musl and glibc variants; it wraps verified candidate binaries rather than compiling the workspace, and still sets up QEMU and Buildx explicitly.
 
 Moving these jobs off AKS reduces capacity demand, not necessarily the Azure bill immediately. VM costs fall only when nodes scale down or smaller capacity replaces them.
 
@@ -43,6 +44,7 @@ A hosted runner is also the only choice for a few things the pods cannot do: `mo
 `Swatinem/rust-cache` builds its key from the OS, architecture, toolchain and lockfile. It does not include the runner label or image, so a cache written on an `sm-standard-4` pod and one written on `ubuntu-latest` would overwrite each other under the same `shared-key`.
 
 - Every `shared-key` has exactly one writer. `cache-warm.yml` owns `ci-dev`, `ci-feat-rio`, `ci-feat-proto` and `ci-uring`; every other `./.github/actions/setup` call states `cache-save-if` explicitly, and `scripts/security/check_cache_save_if.sh` fails the build when one does not.
+- The `ci-dev` key ends in a digest of `warm-ci-dev`'s build commands. Changing what that job warms therefore needs a new key, or readers keep restoring the old artifacts: `scripts/ci_gate.py --check-workflow` prints the key the commands require and fails until the writer and every reader in `ci.yml` and `reference-parity.yml` name it.
 - All readers of a key run on the same image as its writer. Keys that live on hosted runners say so in their name (`ci-uring` is warmed on `ubuntu-latest`; `ci-e2e-distributed-hosted`, `e2e-upgrade-server-hosted`, `e2e-upgrade-tests-hosted`).
 - Moving a job between pools therefore means renaming its key. The new key is empty until a run from `main` (a scheduled run, or a manual dispatch of that workflow from `main`) saves it; until then that lane does a cold build. The `build.yml` aarch64 release legs append `-ubicloud-arm` for this reason. `cache-warm.yml` does not write those keys.
 - `CARGO_BUILD_JOBS` and every other `CARGO*`, `CC*`, `CFLAGS*`, `CXX*`, `CMAKE*` and `RUST*` variable is hashed into the key. `ci.yml` sets `CARGO_BUILD_JOBS` at step level for that reason; promoting it to job level rotates the key for every lane that shares it.
@@ -52,7 +54,7 @@ A hosted runner is also the only choice for a few things the pods cannot do: `mo
 These are the patterns that have cost real money here without validating anything more:
 
 - An `if: always()` summary or alert job on a self-hosted label inside a `workflow_run`-triggered workflow. The upstream workflow completes many times a day, the real jobs skip, and the summary still starts a pod each time. Gate it on the upstream job having run, and keep it on `ubuntu-latest`.
-- Per-push workflows on `main`. A merge triggers the full `ci.yml` matrix, `cache-warm.yml` and the `build.yml` development build; with tens of merges a day that is as much self-hosted time as all pull requests together. Anything that does not verify the merged tree itself belongs on a schedule or behind a `paths` filter.
+- Per-push workflows on `main`. A merge triggers cache warming and a `ci.yml` run, which validates the merged tree in full unless a merge-queue run already validated that tree; `build.yml` development builds are scheduled or manual; with tens of merges a day that is as much self-hosted time as all pull requests together. Anything that does not verify the merged tree itself belongs on a schedule or behind a `paths` filter.
 - `apt-get install` of tools the hosted image already ships. It is only needed on the minimal pod images.
 - A throttled `CARGO_BUILD_JOBS` on a 14-CPU pod. The limit exists for link-storm reasons documented in `ci.yml`; measure before raising it, and measure before lowering it further.
 - Tiny jobs on ARC pods. Each one pays roughly a minute of pod start-up before its first step; a compile-free job that takes ten seconds costs more to schedule than to run.
@@ -66,7 +68,7 @@ gh api "repos/rustfs/rustfs/actions/runs/<run_id>/jobs?per_page=100" \
   --jq '.jobs[] | "\(.conclusion)\t\(.labels | join(","))\t\(.started_at)\t\(.completed_at)\t\(.name)"'
 ```
 
-Only rows whose label starts with `sm-`, `dind-`, `ubicloud-`, `smoke-` or `pf-` cost anything. At the October 2026 review, a full pull-request run of `ci.yml` spent about 150 self-hosted minutes, a third of it in jobs that never compiled; treat that as the scale of what a placement mistake costs, not as a current figure.
+Rows using `macos-latest-xlarge` or a label starting with `sm-`, `dind-`, `ubicloud-`, `smoke-` or `pf-` use paid capacity. At the October 2026 review, a full pull-request run of `ci.yml` spent about 150 self-hosted minutes, a third of it in jobs that never compiled; treat that as the scale of what a placement mistake costs, not as a current figure.
 
 ## Checklist for a new or moved job
 
@@ -76,3 +78,9 @@ Only rows whose label starts with `sm-`, `dind-`, `ubicloud-`, `smoke-` or `pf-`
 - A self-hosted `runs-on` carries a comment naming its reason from the placement rule.
 - Every `./.github/actions/setup` call states `cache-save-if`, and a key read from one pool is not written from the other.
 - Moving a job does not change its check name, so the `main` ruleset and `docs/testing/ci-gates.md` stay as they are; renaming it does, and then that document's change checklist applies.
+
+## Release stages
+
+The [candidate release pipeline](../../docs/operations/release-pipeline.md) builds Linux first and defers paid desktop capacity until acceptance. Daily development builds also select Linux; use manual platform selection for desktop development artifacts. All six platforms remain required before publication. The pipeline records and promotes the exact tested bytes. Builder workflows have no public-release credentials. Keep periodic development builds, PR verification and field-test chains separate when their contracts differ; do not re-enable disabled workflows as part of a source-file migration.
+
+Larger runners remain billed for public repositories; see [GitHub runner billing](https://docs.github.com/en/actions/concepts/runners/larger-runners#billing). Actual spending comes from organization billing, not runner labels or an estimated build duration.

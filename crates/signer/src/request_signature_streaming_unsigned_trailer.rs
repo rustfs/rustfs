@@ -15,14 +15,12 @@
 use http::{HeaderValue, request};
 use time::{OffsetDateTime, macros::format_description};
 
-use s3s::Body;
-
-pub fn streaming_unsigned_v4(
-    mut req: request::Request<Body>,
+pub fn streaming_unsigned_v4<B>(
+    mut req: request::Request<B>,
     session_token: &str,
     _data_len: i64,
     req_time: OffsetDateTime,
-) -> request::Request<Body> {
+) -> request::Request<B> {
     let headers = req.headers_mut();
 
     let chunked_value = HeaderValue::from_static("aws-chunked");
@@ -48,7 +46,7 @@ pub fn streaming_unsigned_v4(
 mod tests {
     use super::streaming_unsigned_v4;
     use http::request;
-    use s3s::Body;
+    use rustfs_s3_types::Body;
     use time::OffsetDateTime;
 
     #[test]

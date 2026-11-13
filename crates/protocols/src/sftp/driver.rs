@@ -27,7 +27,7 @@ use super::attrs;
 use super::constants::limits::S3_COPY_OBJECT_MAX_SIZE;
 use super::errors::{SftpError, auth_err, auth_err_unreachable, is_no_such_upload_error, ok_status, s3_error_to_sftp};
 use super::lifecycle::SessionDiag;
-use super::paths::{parse_s3_path, sanitise_control_bytes};
+use super::paths::{copy_source_value, parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
 use crate::common::client::s3::StorageBackend;
@@ -35,8 +35,9 @@ use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
 use rustfs_credentials::Credentials;
+use rustfs_gateway_types::dto::{AbortMultipartUploadInput, CopyObjectInput, ListObjectsV2Input};
+use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
 use rustfs_utils::MaskedAccessKey;
-use s3s::dto::{AbortMultipartUploadInput, CopyObjectInput, CopySource, ListObjectsV2Input};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
@@ -325,7 +326,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
     pub(super) async fn authorize_list_objects(&self, input: &ListObjectsV2Input) -> Result<(), SftpError> {
         let auth_fut = self.storage.authorize_list_objects(&self.session_context, input);
-        self.await_authorization(&S3Action::ListBucket, &input.bucket, input.prefix.as_deref(), auth_fut)
+        self.await_authorization(&S3Action::ListBucket, input.bucket.as_str(), input.prefix.as_deref(), auth_fut)
             .await
     }
 
@@ -936,16 +937,10 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // Multipart UploadPartCopy above that.
         if content_length <= S3_COPY_OBJECT_MAX_SIZE {
             self.authorize(&S3Action::CopyObject, &dst_bucket, Some(&dst_object)).await?;
-            let input = CopyObjectInput::builder()
-                .copy_source(CopySource::Bucket {
-                    bucket: src_bucket.clone().into(),
-                    key: src_object.clone().into(),
-                    version_id: None,
-                })
-                .bucket(dst_bucket.clone())
-                .key(dst_object.clone())
-                .build()
-                .map_err(|e| s3_error_to_sftp("build_copy_object", e))?;
+            let input = CopyObjectInput::builder(copy_source_value(&src_bucket, &src_object))
+                .bucket(BucketName::new(dst_bucket.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
+                .key(ObjectKey::new(dst_object.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
+                .build();
             self.run_backend("copy_object", self.storage.copy_object(input, self.credentials()))
                 .await?;
         } else {
@@ -1116,29 +1111,11 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                         peer = %peer,
                         "aborting orphaned multipart upload on session drop"
                     );
-                    // Build AbortMultipartUploadInput inside the spawned
-                    // task so the builder Result is handled in async
-                    // context. The builder only fails on missing required
-                    // fields. bucket, key, and upload_id are all set, so
-                    // log and return on any unexpected failure.
-                    let input = match AbortMultipartUploadInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.clone())
-                        .upload_id(upload_id.clone())
-                        .build()
-                    {
-                        Ok(input) => input,
-                        Err(e) => {
-                            tracing::error!(
-                                bucket = %bucket,
-                                key = %key,
-                                upload_id = %upload_id,
-                                err = %e,
-                                "failed to build AbortMultipartUploadInput on session drop"
-                            );
-                            return;
-                        }
-                    };
+                    let input = AbortMultipartUploadInput::builder()
+                        .bucket(BucketName::new(bucket.clone()).expect("validated bucket name"))
+                        .key(ObjectKey::new(key.clone()).expect("validated object key"))
+                        .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
+                        .build();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(backend_op_timeout_secs),
                         storage.abort_multipart_upload(input, &credentials),
@@ -1275,7 +1252,7 @@ mod tests {
             ..Default::default()
         };
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 1234, attrs.clone()))
+            .allocate_handle(file_handle("bucket", "k", 1234, attrs.clone()))
             .expect("allocate");
         let out = driver.fstat(4, handle_id).await.expect("fstat on File must succeed");
         assert_eq!(out.attrs.size, Some(1234));
@@ -1289,7 +1266,7 @@ mod tests {
         let phase = WritePhase::Buffering {
             part_buffer: vec![0u8; 4096],
         };
-        let handle_id = driver.allocate_handle(write_handle("b", "k", phase)).expect("allocate");
+        let handle_id = driver.allocate_handle(write_handle("bucket", "k", phase)).expect("allocate");
         let out = driver.fstat(5, handle_id).await.expect("fstat on Write must succeed");
         assert_eq!(
             out.attrs.size,
@@ -1303,7 +1280,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 0, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
         let status = driver
             .fsetstat(6, handle_id, FileAttributes::default())
@@ -1420,7 +1397,7 @@ mod tests {
             "list_objects_v2 transient failure".into(),
         ));
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_err(), "list_objects_v2 error must propagate as Err");
     }
 
@@ -1429,7 +1406,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_list_objects_v2_ok_empty();
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_ok(), "empty listing must return Ok");
     }
 
@@ -1438,7 +1415,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_readonly_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 0, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
         let result = driver.fsetstat(10, handle_id, FileAttributes::default()).await;
         match result {
@@ -1455,7 +1432,7 @@ mod tests {
     async fn authorize_maps_iam_unavailable_to_failure() {
         let backend = Arc::new(DummyBackend::new());
         let driver = build_driver(backend, TEST_PART_SIZE);
-        let result = with_test_iam_unavailable(driver.authorize(&S3Action::PutObject, "b", Some("k"))).await;
+        let result = with_test_iam_unavailable(driver.authorize(&S3Action::PutObject, "bucket", Some("k"))).await;
         let err = result.expect_err("IAM unavailable must surface as Err");
         assert!(
             matches!(err.0, StatusCode::Failure),
@@ -1470,7 +1447,7 @@ mod tests {
     async fn authorize_maps_access_denied_to_permission_denied() {
         let backend = Arc::new(DummyBackend::new());
         let driver = build_driver(backend, TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| false, driver.authorize(&S3Action::PutObject, "b", Some("k"))).await;
+        let result = with_test_auth_override(|_, _, _| false, driver.authorize(&S3Action::PutObject, "bucket", Some("k"))).await;
         let err = result.expect_err("Deny must surface as Err");
         assert!(matches!(err.0, StatusCode::PermissionDenied), "AccessDenied must map to PermissionDenied");
     }

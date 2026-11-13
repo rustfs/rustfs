@@ -254,11 +254,15 @@ impl DefaultAdminUsecase {
     /// absent from `buckets_usage` — absent already means "unknown" on the
     /// wire, distinct from a present zero — and the snapshot is marked
     /// non-converged so clients can tell it is not the whole namespace. A
-    /// snapshot that is structurally incomplete, or that measured nothing the
-    /// namespace still contains, carries no usable information and is dropped
-    /// exactly as before.
-    fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
-        if !info.is_complete_bucket_usage_snapshot() && !info.is_valid_partial_snapshot() {
+    /// snapshot that is structurally incomplete (`snapshot_measured` is false),
+    /// or that measured nothing the namespace still contains, carries no usable
+    /// information and is dropped exactly as before.
+    fn narrow_data_usage_snapshot_to_measured_buckets(
+        info: &mut DataUsageInfo,
+        snapshot_measured: bool,
+        buckets: impl IntoIterator<Item = String>,
+    ) {
+        if !snapshot_measured {
             *info = DataUsageInfo::default();
             return;
         }
@@ -275,11 +279,29 @@ impl DefaultAdminUsecase {
 
         let covers_namespace = current_buckets.len() == info.buckets_usage.len();
         info.buckets_count = info.buckets_usage.len() as u64;
-        if !covers_namespace {
-            // Some bucket in the namespace was never measured, so the totals
-            // below are a floor rather than the converged truth.
+        if !covers_namespace || !info.is_complete_bucket_usage_snapshot() {
+            // Some bucket in the namespace was never measured, or holds
+            // mutations no scan has reconciled yet, so the totals below are
+            // not the converged truth.
             info.usage_snapshot_converged = Some(false);
         }
+    }
+
+    /// Overlay single-process counts on a persisted snapshot and narrow it
+    /// for display.
+    ///
+    /// Whether the snapshot measured anything is decided before the overlay.
+    /// The overlay clears `usage_snapshot_complete` when it holds counts it
+    /// cannot reconcile with the snapshot, such as writes into a bucket that
+    /// has no verified baseline. That makes the totals unconverged, not the
+    /// scanned buckets unusable; treating it as structural incompleteness
+    /// blanked usage for every bucket for as long as one such bucket kept
+    /// receiving writes, because each write restarts its scanner fence.
+    async fn present_data_usage_snapshot(mut info: DataUsageInfo, buckets: impl IntoIterator<Item = String>) -> DataUsageInfo {
+        let snapshot_measured = info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot();
+        apply_bucket_usage_memory_overlay(&mut info).await;
+        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, snapshot_measured, buckets);
+        info
     }
 
     async fn rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<Option<RebalanceMeta>> {
@@ -323,8 +345,7 @@ impl DefaultAdminUsecase {
     /// This path never triggers a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let mut info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
-        apply_bucket_usage_memory_overlay(&mut info).await;
+        let info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
         let buckets = store
             .list_bucket(&BucketOptions {
                 cached: true,
@@ -333,11 +354,7 @@ impl DefaultAdminUsecase {
             })
             .await
             .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
-        // Serve what the scan measured; buckets it never reached stay absent
-        // (absent means unknown on the wire, unlike a present zero) and the
-        // snapshot is flagged non-converged. See rustfs#5806 for why blanking
-        // the whole document instead was worse than the rule it enforced.
-        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, buckets.into_iter().map(|bucket| bucket.name));
+        let mut info = Self::present_data_usage_snapshot(info, buckets.into_iter().map(|bucket| bucket.name)).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -876,6 +893,12 @@ mod tests {
         });
     }
 
+    /// Narrow a snapshot no overlay has touched, judging it as persisted.
+    fn narrow_persisted_snapshot(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
+        let snapshot_measured = info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot();
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(info, snapshot_measured, buckets);
+    }
+
     /// rustfs#5806: a bucket the last scan never reached must not blank the
     /// usage the scan *did* measure — that turned every bucket creation into a
     /// deployment-wide usage blackout until the next cycle.
@@ -897,10 +920,7 @@ mod tests {
         // A brand-new bucket the scan never saw: keep bucket-a, omit bucket-new,
         // and say so via the convergence flag.
         let mut info = measured("bucket-a");
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
-            &mut info,
-            ["bucket-a".to_string(), "bucket-new".to_string(), ".rustfs.sys".to_string()],
-        );
+        narrow_persisted_snapshot(&mut info, ["bucket-a".to_string(), "bucket-new".to_string(), ".rustfs.sys".to_string()]);
         assert!(info.buckets_usage.contains_key("bucket-a"), "measured usage must survive");
         assert!(!info.buckets_usage.contains_key("bucket-new"), "unmeasured bucket stays absent");
         assert_eq!(info.usage_snapshot_converged, Some(false));
@@ -909,22 +929,19 @@ mod tests {
 
         // Full coverage leaves the snapshot untouched.
         let mut info = measured("bucket-a");
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
-            &mut info,
-            ["bucket-a".to_string(), ".rustfs.sys".to_string()],
-        );
+        narrow_persisted_snapshot(&mut info, ["bucket-a".to_string(), ".rustfs.sys".to_string()]);
         assert_eq!(info.usage_snapshot_converged, None, "a covering snapshot is not downgraded");
         assert_eq!(info.buckets_count, 1);
 
         // A bucket deleted since the scan must not linger in the response.
         let mut info = measured("bucket-gone");
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-live".to_string()]);
+        narrow_persisted_snapshot(&mut info, ["bucket-live".to_string()]);
         assert_eq!(info, DataUsageInfo::default(), "nothing measured is still in the namespace");
 
         // Structurally incomplete snapshots carry no usable information.
         let mut info = measured("bucket-a");
         info.usage_snapshot_complete = false;
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        narrow_persisted_snapshot(&mut info, ["bucket-a".to_string()]);
         assert_eq!(info, DataUsageInfo::default());
 
         // A structurally valid partial admin view can still carry useful
@@ -945,7 +962,7 @@ mod tests {
             tombstone: false,
             segment_invalidation_proof: None,
         }];
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        narrow_persisted_snapshot(&mut info, ["bucket-a".to_string()]);
         assert_eq!(info.usage_snapshot_converged, Some(false));
         assert_eq!(info.buckets_count, 1);
         assert_eq!(info.objects_total_count, 7);
@@ -957,9 +974,61 @@ mod tests {
             buckets_count: 0,
             ..Default::default()
         };
-        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, [".rustfs.sys".to_string()]);
+        narrow_persisted_snapshot(&mut info, [".rustfs.sys".to_string()]);
         assert_eq!(info.usage_snapshot_converged, None);
         assert_eq!(info.buckets_count, 0);
+    }
+
+    /// A write into a bucket without a verified baseline leaves process-local
+    /// counts the overlay cannot reconcile, so it clears
+    /// `usage_snapshot_complete`. That must flag the response non-converged,
+    /// not erase every bucket the persisted scan measured: under continuous
+    /// writes the scanner fence never clears and the blackout never ends.
+    #[tokio::test]
+    async fn unverified_bucket_writes_do_not_blank_measured_usage() {
+        let measured_bucket = "admin-usage-measured";
+        let unverified_bucket = "admin-usage-unverified";
+        let mut persisted = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+            usage_snapshot_complete: true,
+            buckets_count: 1,
+            ..Default::default()
+        };
+        persisted.buckets_usage.insert(
+            measured_bucket.to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                objects_count: 4_000,
+                versions_count: 4_000,
+                size: 8_192_000,
+                ..Default::default()
+            },
+        );
+        persisted.bucket_sizes.insert(measured_bucket.to_string(), 8_192_000);
+        persisted.calculate_totals();
+        assert!(persisted.is_complete_bucket_usage_snapshot());
+
+        crate::app::storage_api::test::data_usage::record_bucket_object_write_memory(unverified_bucket, None, 1_024).await;
+
+        let info = DefaultAdminUsecase::present_data_usage_snapshot(
+            persisted,
+            [measured_bucket.to_string(), unverified_bucket.to_string()],
+        )
+        .await;
+
+        assert_eq!(
+            info.buckets_usage
+                .get(measured_bucket)
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((4_000, 8_192_000)),
+            "usage the scanner measured must survive an unrelated unverified bucket"
+        );
+        assert!(
+            !info.buckets_usage.contains_key(unverified_bucket),
+            "a bucket without a verified baseline stays absent (unknown)"
+        );
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert!(!info.is_complete_bucket_usage_snapshot());
+        assert_eq!(info.objects_total_count, 4_000);
     }
 
     #[tokio::test]

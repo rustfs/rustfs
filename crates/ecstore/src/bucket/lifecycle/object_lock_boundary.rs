@@ -22,7 +22,7 @@ pub(crate) fn is_object_locked_by_metadata(user_defined: &HashMap<String, String
 }
 
 pub(crate) fn check_object_lock_for_deletion_with_config(
-    config: Option<&s3s::dto::ObjectLockConfiguration>,
+    config: Option<&rustfs_gateway_types::persistence::PersistedObjectLockConfiguration>,
     obj_info: &ObjectInfo,
     bypass_governance: bool,
 ) -> crate::error::Result<Option<ObjectLockBlockReason>> {

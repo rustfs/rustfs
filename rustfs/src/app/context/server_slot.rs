@@ -34,6 +34,8 @@ use std::sync::{Arc, OnceLock};
 pub struct ServerContextSlot {
     app_context: OnceLock<Arc<AppContext>>,
     bootstrap_target: Option<BootstrapLocalTarget>,
+    #[cfg(feature = "internode-transport")]
+    peer_control: std::sync::Weak<crate::app::storage_api::context::InstalledControlService>,
     heal_topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
 }
 
@@ -52,6 +54,8 @@ impl ServerContextSlot {
         Arc::new(Self {
             app_context: OnceLock::new(),
             bootstrap_target: None,
+            #[cfg(feature = "internode-transport")]
+            peer_control: std::sync::Weak::new(),
             heal_topology_fingerprint: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
@@ -62,6 +66,23 @@ impl ServerContextSlot {
             bootstrap_target: Some(BootstrapLocalTarget::new(ctx)),
             ..Self::default()
         })
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn with_peer_control(
+        ctx: Arc<InstanceContext>,
+        control: Option<&Arc<crate::app::storage_api::context::InstalledControlService>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            bootstrap_target: Some(BootstrapLocalTarget::new(ctx)),
+            peer_control: control.map(Arc::downgrade).unwrap_or_default(),
+            ..Self::default()
+        })
+    }
+
+    #[cfg(feature = "internode-transport")]
+    pub(crate) fn peer_control(&self) -> Option<Arc<crate::app::storage_api::context::InstalledControlService>> {
+        self.peer_control.upgrade()
     }
 
     /// Install this server's application context (once). Returns `false` if

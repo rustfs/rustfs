@@ -16,7 +16,6 @@ use crate::target::REDACTED_SECRET;
 use hashbrown::HashMap;
 use hyper::HeaderMap;
 use regex::Regex;
-use s3s::{S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -93,11 +92,6 @@ impl std::fmt::Display for Host {
     }
 }
 
-/// Extract request parameters from S3Request, mainly header information.
-pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
-    extract_params_header(&req.headers)
-}
-
 /// Extract request parameters from hyper::HeaderMap, mainly header information.
 /// This function is useful when you have a raw HTTP request and need to extract parameters.
 #[deprecated(since = "0.1.0", note = "Use extract_params_header instead")]
@@ -122,11 +116,6 @@ pub fn extract_params_header(head: &HeaderMap) -> HashMap<String, String> {
         }
     }
     params
-}
-
-/// Extract response elements from S3Response, mainly header information.
-pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String> {
-    extract_params_header(&resp.headers)
 }
 
 /// Get host from header information.

@@ -36,11 +36,14 @@ their issue closes.
 | `check_migration_gate_count.sh` | ci-gate | Migration-critical test gate with committed count floor (`.config/migration-gate-floor.txt`) | ci.yml Test and Lint; `docs/testing/README.md` |
 | `check_no_planning_docs.sh` | ci-gate | Blocks committed planning-type documents | ci.yml Quick Checks; `make pre-commit` |
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
-| `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
+| `check_s3s_footprint.sh` | ci-gate | Lower-only s3s surface ratchet: a pull request (`--base <sha>`, from Quick Checks) may not rise above its base revision; the baseline is a ceiling everywhere (a drop passes and prints the line to lower) ahead of the gateway migration (reads `.config/s3s-footprint-baseline.txt`; `s3_error_lines` leaves out lines whose file imports the macro from `rustfs-s3-types`, rule in the script header); `--mode allowlist` fails on any Rust file referencing s3s outside `.config/s3s-edge-allowlist.txt`, `--dry-run` lists them | ci.yml Quick Checks; `make pre-commit`; `make script-tests` (`--self-test`) |
+| `check_test_retirements.py` | ci-gate | Every test a migration slice retires (`.config/test-retirements/<slice>.txt`, rustfs/backlog#2765) has five fields, is listed once, and names a replacement that exists (a test function, a differential step or an e2e function) | ci.yml Quick Checks; `make pre-commit`; `make script-tests` (`--self-test`) |
+| `check_test_count_ratchet.sh` | ci-gate | Per-crate test-count floor and `#[ignore]` ceiling against `.config/test-count-baseline.txt`; no crate may fall below its tests row or rise above its ignored row (extra tests and new crates pass with a note) | ci.yml Quick Checks; `make pre-commit` |
+| `guard_source_set.sh` | ci-gate (library) | Sourced helpers for text guards that must survive a mechanical file split (rustfs/backlog#2765): `guard_source_set` resolves a required file plus the split directory (a missing required file fails), `module_relative_rg` rewrites a `super::` rule for each file's module depth | Sourced by `check_architecture_migration_rules.sh` and `check_logging_guardrails.sh`; contract tests `test_guard_source_set.sh`; end-to-end split probe `test_split_guard_rules.sh` (both `make script-tests`) |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
-| `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
+| `helm_chart_version.sh` | dev-tool | Normalizes chart/app versions for installation references | rustfs-release-version-bump skill |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
 
 ## Test & e2e runners
@@ -54,9 +57,17 @@ their issue closes.
 | `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
 | `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
 | `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
+| `junit_diff.py` | dev-tool | Case-by-case pass/fail/skip diff of two JUnit XML reports (reference vs candidate stack); exit 1 on any difference or stale `--allow` entry, 2 on unreadable input | `python3 scripts/junit_diff.py a.xml b.xml`; backlog T3.1 |
+| `test_junit_diff.py` | ci-gate | Contract tests and fixtures (`scripts/tests/junit_diff/`) for `junit_diff.py` | `make script-tests` |
+| `dual_stack.py` | ci-gate | Proves which S3 stack a leg's servers ran from their own `server_starting` line (`stack`) | `python3 scripts/dual_stack.py stack --help`; backlog T3.1 |
+| `test_dual_stack.py` | ci-gate | Contract tests for `dual_stack.py` | `make script-tests` |
+| `s3-tests/reference_parity.py` | ci-gate | Plans the reference parity targets, lists a run's failures for the single rerun, and compares every candidate's s3-tests JUnit against the pinned reference per node id with a tolerated-difference file | `.github/workflows/reference-parity.yml`; backlog T3.2 |
+| `s3-tests/test_reference_parity.py` | ci-gate | Contract tests for `reference_parity.py` | `make script-tests` |
+| `test_reference_binary.py` | ci-gate | Contract tests for `.github/actions/reference-binary/reference_binary.py` (pin resolution and verified unpacking) | `make script-tests` |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
+| `gen_bucket_config_goldens.sh` | dev-tool | One-shot generator for the 13-family persisted bucket-config XML byte goldens; refuses to overwrite without `--force` and records the generating commit | `crates/ecstore/tests/fixtures/bucket-config-goldens/README.md`; `crates/ecstore/tests/bucket_config_goldens.rs` |
 | `run.sh` | dev-tool | Local rustfs startup wrapper | `make e2e-server`; Justfile |
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
@@ -160,8 +171,9 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
+| `codemods/` | dev-tool | Scripted, idempotent source migrations for the gateway migration (rustfs/backlog#2734); `s3_error_to_s3_types.py` moves s3s error-type paths onto `rustfs-s3-types` per crate closure and refuses the s3s edge allowlist; `split_bucket_usecase.py` splits `rustfs/src/app/bucket_usecase.rs` into one file per configuration family (preparatory refactor P2, rustfs/backlog#2765) and stops on any item its tables do not assign | `make script-tests` (`--self-test`); usage in each script's docstring |
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
-| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml |
+| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml; manual-main-packages.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |
 | `security/` | ci-gate | Workflow-pin enforcement and release supply-chain asset generation | audit.yml; build.yml |
 | `table-catalog/` | dev-tool | S3-Tables / pyiceberg validation suite | `docs/architecture/s3-tables-support-matrix.md` |

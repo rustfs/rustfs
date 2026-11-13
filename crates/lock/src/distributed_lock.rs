@@ -14,7 +14,7 @@
 
 use crate::{
     ObjectKey,
-    client::{LockCleanupOutcome, LockClient},
+    client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient},
     error::{LockError, Result},
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 use uuid::Uuid;
 
 const EVENT_DISTRIBUTED_LOCK_CLEANUP: &str = "distributed_lock_cleanup";
@@ -66,6 +66,121 @@ enum LockAcquireFailureKind {
     NonRetryable,
     RetryableContention,
     UnrecoverableQuorum,
+}
+
+#[derive(PartialEq, Eq)]
+struct BatchLockPeerDiagnostics {
+    peer_index: usize,
+    granted_keys: usize,
+    retryable_no_grant_keys: usize,
+    terminal_no_grant_keys: usize,
+    ambiguous_keys: usize,
+    failed_response_keys: usize,
+    missing_response_keys: usize,
+    call_failed_keys: usize,
+    extra_responses: usize,
+    call_error_kind: Option<&'static str>,
+    elapsed_ms: u128,
+}
+
+impl std::fmt::Debug for BatchLockPeerDiagnostics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchLockPeerDiagnostics")
+            .field("peer_index", &self.peer_index)
+            .field("granted_keys", &self.granted_keys)
+            .field("retryable_no_grant_keys", &self.retryable_no_grant_keys)
+            .field("terminal_no_grant_keys", &self.terminal_no_grant_keys)
+            .field("ambiguous_keys", &self.ambiguous_keys)
+            .field("failed_response_keys", &self.failed_response_keys)
+            .field("missing_response_keys", &self.missing_response_keys)
+            .field("call_failed_keys", &self.call_failed_keys)
+            .field("extra_responses", &self.extra_responses)
+            .field("call_error_kind", &self.call_error_kind)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish()
+    }
+}
+
+impl BatchLockPeerDiagnostics {
+    fn from_outcomes(peer_index: usize, key_count: usize, outcomes: &[BatchAcquireOutcome], elapsed: Duration) -> Self {
+        let mut diagnostics = Self {
+            peer_index,
+            granted_keys: 0,
+            retryable_no_grant_keys: 0,
+            terminal_no_grant_keys: 0,
+            ambiguous_keys: 0,
+            failed_response_keys: 0,
+            missing_response_keys: key_count.saturating_sub(outcomes.len()),
+            call_failed_keys: 0,
+            extra_responses: outcomes.len().saturating_sub(key_count),
+            call_error_kind: None,
+            elapsed_ms: elapsed.as_millis(),
+        };
+        for outcome in outcomes.iter().take(key_count) {
+            match outcome {
+                BatchAcquireOutcome::Granted { .. } => diagnostics.granted_keys += 1,
+                BatchAcquireOutcome::RetryableNoGrant { .. } => diagnostics.retryable_no_grant_keys += 1,
+                BatchAcquireOutcome::TerminalNoGrant { .. } => diagnostics.terminal_no_grant_keys += 1,
+                BatchAcquireOutcome::Ambiguous { .. } => diagnostics.ambiguous_keys += 1,
+            }
+        }
+        diagnostics.failed_response_keys =
+            diagnostics.retryable_no_grant_keys + diagnostics.terminal_no_grant_keys + diagnostics.ambiguous_keys;
+        diagnostics
+    }
+
+    #[cfg(test)]
+    fn from_response(peer_index: usize, key_count: usize, response: &Result<Vec<LockResponse>>, elapsed: Duration) -> Self {
+        let mut diagnostics = Self {
+            peer_index,
+            granted_keys: 0,
+            retryable_no_grant_keys: 0,
+            terminal_no_grant_keys: 0,
+            ambiguous_keys: 0,
+            failed_response_keys: 0,
+            missing_response_keys: 0,
+            call_failed_keys: 0,
+            extra_responses: 0,
+            call_error_kind: None,
+            elapsed_ms: elapsed.as_millis(),
+        };
+        match response {
+            Ok(responses) => {
+                for response in responses.iter().take(key_count) {
+                    if response.success {
+                        diagnostics.granted_keys += 1;
+                    } else {
+                        // Legacy response errors have already lost their source;
+                        // a failed response is not proof of contention or an RPC timeout.
+                        diagnostics.failed_response_keys += 1;
+                    }
+                }
+                diagnostics.missing_response_keys = key_count.saturating_sub(responses.len());
+                diagnostics.extra_responses = responses.len().saturating_sub(key_count);
+            }
+            Err(error) => {
+                diagnostics.call_failed_keys = key_count;
+                diagnostics.call_error_kind = Some(match error {
+                    LockError::Timeout { .. } => "timeout",
+                    LockError::ResourceNotFound { .. } => "resource_not_found",
+                    LockError::PermissionDenied { .. } => "permission_denied",
+                    LockError::Network { .. } => "network",
+                    LockError::Internal { .. } => "internal",
+                    LockError::AlreadyLocked { .. } => "already_locked",
+                    LockError::InvalidHandle { .. } => "invalid_handle",
+                    LockError::Configuration { .. } => "configuration",
+                    LockError::Serialization { .. } => "serialization",
+                    LockError::Deserialization { .. } => "deserialization",
+                    LockError::InsufficientNodes { .. } => "insufficient_nodes",
+                    LockError::QuorumNotReached { .. } => "quorum_not_reached",
+                    LockError::QueueFull { .. } => "queue_full",
+                    LockError::NotOwner { .. } => "not_owner",
+                });
+            }
+        }
+        diagnostics
+    }
 }
 
 /// Generate a new aggregate lock ID for multiple client locks
@@ -272,6 +387,34 @@ impl Drop for LockAcquireRound {
                 self.clients.clone(),
                 self.fallback_lock_id.clone(),
                 "distributed_lock_cancelled_acquisition_cleanup",
+            );
+        }
+    }
+}
+
+/// Keep completed grants and every unconsumed batch reply owned across cancellation.
+struct LockBatchAcquireRound {
+    pending: JoinSet<LockBatchAcquireTaskResult>,
+    grants: Vec<Vec<HeldLockEntry>>,
+    clients: Arc<[Arc<dyn LockClient>]>,
+    span: tracing::Span,
+}
+
+enum BatchRetryCleanupResult {
+    Key { key: usize, confirmed: bool },
+    Peer { key: usize, peer: usize, confirmed: bool },
+}
+
+impl Drop for LockBatchAcquireRound {
+    fn drop(&mut self) {
+        let _span = self.span.enter();
+        let entries = self.grants.iter().flatten().map(HeldLockEntry::release_entry).collect();
+        DistributedLock::spawn_release_cleanup(entries, "distributed_lock_cancelled_batch_acquisition");
+        if !self.pending.is_empty() {
+            DistributedLock::spawn_pending_batch_cleanup(
+                std::mem::take(&mut self.pending),
+                self.clients.clone(),
+                "distributed_lock_cancelled_batch_acquisition_cleanup",
             );
         }
     }
@@ -545,6 +688,33 @@ pub struct DistributedLock {
 }
 
 type LockAcquireTaskResult = (usize, Result<LockResponse>);
+struct LockBatchAcquireTaskResult {
+    peer_index: usize,
+    key_indices: Vec<usize>,
+    requests: Arc<[LockRequest]>,
+    outcomes: Vec<BatchAcquireOutcome>,
+    started: Instant,
+    elapsed: Duration,
+}
+
+fn normalized_batch_outcome(request: &LockRequest, outcome: Option<BatchAcquireOutcome>) -> BatchAcquireOutcome {
+    match outcome {
+        Some(BatchAcquireOutcome::Granted {
+            lock_info: Some(ref info),
+            ..
+        }) if info.id != request.lock_id || info.resource != request.resource || info.lock_type != request.lock_type => {
+            BatchAcquireOutcome::Ambiguous {
+                error: LockError::internal("Batch peer returned mismatched grant metadata"),
+                cleanup_owned_by_client: false,
+            }
+        }
+        Some(outcome) => outcome,
+        None => BatchAcquireOutcome::Ambiguous {
+            error: LockError::internal("Batch peer omitted an acquisition outcome"),
+            cleanup_owned_by_client: false,
+        },
+    }
+}
 
 struct LockAcquireQuorumResult {
     response: LockResponse,
@@ -739,21 +909,14 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
-    /// Acquire exclusive locks for many independent resources in one batched
-    /// round: one [`LockClient::acquire_locks_batch`] RPC per client instead of
-    /// one quorum round-trip per key. Returns one guard or error per resource.
+    /// Acquire independent exclusive locks with one sub-batch per peer and round.
+    /// A successful key starts its heartbeat immediately. Only completed, explicitly
+    /// retryable attempts whose grants have been cleaned may enter another round.
+    /// The acquisition, rollback wait and backoff share one absolute deadline.
     ///
-    /// Bulk operations (S3 `DeleteObjects`) are the only multi-key write-lock
-    /// holders, and their keys are independent. Per-key outcomes are
-    /// deadlock-free without any serial fallback: the wire call is a single
-    /// round per client and every lock server orders concurrent batches by the
-    /// same global (shard, key) order, so no acquirer can hold one key while
-    /// waiting for another. A key that fails to reach quorum releases its
-    /// partial grants (awaited) before its error is returned.
-    ///
-    /// Guards keep the same TTL heartbeat and lock-lost semantics as
-    /// [`Self::acquire_guard`]. Contention is waited out server-side up to
-    /// `timeout` (each request carries it), matching the single-key path.
+    /// Cancellation or expiry transfers pending replies and exact-ID cleanup to
+    /// independent owners. Exhausted cleanup retries still rely on backend leases;
+    /// uncertain replies never establish that another attempt is safe on that peer.
     pub async fn acquire_guard_batch(
         &self,
         resources: &[ObjectKey],
@@ -761,6 +924,8 @@ impl DistributedLock {
         timeout: Duration,
         ttl: Duration,
     ) -> Vec<Result<DistributedLockGuard>> {
+        let entered = Instant::now();
+        let deadline = entered.checked_add(timeout).unwrap_or(entered);
         if resources.is_empty() {
             return Vec::new();
         }
@@ -772,97 +937,381 @@ impl DistributedLock {
         }
 
         let required_quorum = self.required_quorum(LockType::Exclusive);
-        let attempt_started = Instant::now();
-        let requests: Vec<LockRequest> = resources
-            .iter()
-            .map(|resource| {
-                LockRequest::new(resource.clone(), LockType::Exclusive, owner)
-                    .with_acquire_timeout(timeout)
-                    .with_ttl(ttl)
-            })
-            .collect();
-
-        // One batched round per client; a client-level failure is a per-key
-        // failure for every key that still needed that client's vote.
-        let rounds = join_all(self.clients.iter().map(|client| {
-            let requests = requests.clone();
-            async move { client.acquire_locks_batch(&requests).await }
-        }))
-        .await;
-
-        let mut results: Vec<Result<DistributedLockGuard>> = Vec::with_capacity(resources.len());
-        let mut orphaned_entries: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
-        for (key_idx, resource) in resources.iter().enumerate() {
-            let mut entries: Vec<HeldLockEntry> = Vec::new();
-            let mut failure: Option<String> = None;
-            for (client_idx, client) in self.clients.iter().enumerate() {
-                match &rounds[client_idx] {
-                    Ok(responses) => match responses.get(key_idx) {
-                        Some(response) if response.success => {
-                            let lock_id = response
-                                .lock_info
-                                .as_ref()
-                                .map(|info| info.id.clone())
-                                .unwrap_or_else(|| LockId::new_unique(resource));
-                            entries.push(HeldLockEntry {
-                                lock_id,
-                                client: client.clone(),
-                                valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
-                            });
+        let mut results: Vec<Option<Result<DistributedLockGuard>>> = (0..resources.len()).map(|_| None).collect();
+        let mut eligible = vec![vec![true; self.clients.len()]; resources.len()];
+        let mut achieved = vec![0; resources.len()];
+        let mut cleanup_pending = vec![false; resources.len()];
+        let mut peer_cleanup_pending = vec![vec![false; self.clients.len()]; resources.len()];
+        let cleanup_capacity = resources.len().saturating_mul(self.clients.len().saturating_add(1));
+        let (cleanup_completed, mut cleanup_results) = tokio::sync::mpsc::channel(cleanup_capacity);
+        let mut next_cleanup = None;
+        let mut attempt = 0usize;
+        while results.iter().any(Option::is_none) && Instant::now() < deadline {
+            while let Some(completed) = next_cleanup.take().or_else(|| cleanup_results.try_recv().ok()) {
+                match completed {
+                    BatchRetryCleanupResult::Key { key, confirmed } => {
+                        cleanup_pending[key] = false;
+                        if !confirmed && results[key].is_none() {
+                            results[key] = Some(Err(LockError::QuorumNotReached {
+                                required: required_quorum,
+                                achieved: achieved[key],
+                            }));
                         }
-                        Some(response) => {
-                            failure.get_or_insert_with(|| {
-                                response
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "distributed lock acquisition failed".to_string())
-                            });
-                        }
-                        None => {
-                            failure.get_or_insert_with(|| "client returned incomplete batch lock response".to_string());
-                        }
-                    },
-                    Err(err) => {
-                        failure.get_or_insert_with(|| err.to_string());
+                    }
+                    BatchRetryCleanupResult::Peer { key, peer, confirmed } => {
+                        peer_cleanup_pending[key][peer] = false;
+                        eligible[key][peer] = confirmed;
                     }
                 }
             }
-
-            if entries.len() >= required_quorum {
-                let heartbeat = LockHeartbeatConfig {
-                    ttl,
-                    interval: derive_refresh_interval(entries.len(), ttl, None),
-                    refresh_quorum: required_quorum,
-                    owner: owner.to_string(),
-                    resource: resource.clone(),
-                };
-                results.push(Ok(DistributedLockGuard::new(
-                    LockId::new_unique(resource),
-                    entries,
-                    LockType::Exclusive,
-                    heartbeat,
-                )));
-            } else {
-                let achieved = entries.len();
-                orphaned_entries.extend(entries.iter().map(HeldLockEntry::release_entry));
-                if let Some(error) = failure {
-                    tracing::debug!(resource = %resource, owner, required_quorum, achieved, "batch lock acquire failed: {error}");
+            for (key, result) in results.iter_mut().enumerate() {
+                if result.is_none()
+                    && !cleanup_pending[key]
+                    && !peer_cleanup_pending[key].iter().any(|&pending| pending)
+                    && eligible[key].iter().filter(|&&value| value).count() < required_quorum
+                {
+                    *result = Some(Err(LockError::QuorumNotReached {
+                        required: required_quorum,
+                        achieved: achieved[key],
+                    }));
                 }
-                results.push(Err(LockError::QuorumNotReached {
-                    required: required_quorum,
-                    achieved,
-                }));
+            }
+            if results.iter().all(Option::is_some) {
+                break;
+            }
+            if !results.iter().enumerate().any(|(key, result)| {
+                result.is_none()
+                    && !cleanup_pending[key]
+                    && eligible[key].iter().filter(|&&value| value).count() >= required_quorum
+            }) {
+                // Per-key cleanup tasks own their grants independently. Waiting
+                // here is necessary only when no other key can start a round.
+                match tokio::time::timeout_at(deadline, cleanup_results.recv()).await {
+                    Ok(Some(completed)) => {
+                        next_cleanup = Some(completed);
+                        continue;
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            let round_started = Instant::now();
+            let wait = self.peer_acquire_timeout(deadline.saturating_duration_since(round_started));
+            let round_deadline = round_started.checked_add(wait).unwrap_or(round_started).min(deadline);
+            let requests: Vec<_> = resources
+                .iter()
+                .enumerate()
+                .map(|(key, resource)| {
+                    (results[key].is_none() && !cleanup_pending[key]).then(|| {
+                        LockRequest::new(resource.clone(), LockType::Exclusive, owner)
+                            .with_acquire_timeout(wait)
+                            .with_ttl(ttl)
+                    })
+                })
+                .collect();
+            let mut round = LockBatchAcquireRound {
+                pending: JoinSet::new(),
+                grants: vec![Vec::new(); resources.len()],
+                clients: self.clients.clone(),
+                span: tracing::Span::current(),
+            };
+            for (peer_index, client) in self.clients.iter().enumerate() {
+                let key_indices: Vec<_> = (0..resources.len())
+                    .filter(|&key| results[key].is_none() && !cleanup_pending[key] && eligible[key][peer_index])
+                    .collect();
+                if key_indices.is_empty() {
+                    continue;
+                }
+                let requests: Arc<[LockRequest]> = key_indices.iter().filter_map(|&key| requests[key].clone()).collect();
+                let client = client.clone();
+                round.pending.spawn(
+                    async move {
+                        // The local deadline is fixed before scheduling or is_local().
+                        // Remote clients need the total deadline for queue/RPC headroom.
+                        let local = client.is_local().await;
+                        let peer_deadline = if local { round_deadline } else { deadline };
+                        let outcomes = if Instant::now() >= peer_deadline {
+                            requests
+                                .iter()
+                                .map(|request| BatchAcquireOutcome::RetryableNoGrant {
+                                    error: LockError::timeout(request.resource.to_string(), request.acquire_timeout),
+                                })
+                                .collect()
+                        } else {
+                            client.acquire_locks_batch_until(&requests, peer_deadline).await
+                        };
+                        LockBatchAcquireTaskResult {
+                            peer_index,
+                            key_indices,
+                            requests,
+                            outcomes,
+                            started: round_started,
+                            elapsed: round_started.elapsed(),
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+
+            let mut pending_by_key: Vec<Vec<bool>> = eligible
+                .iter()
+                .enumerate()
+                .map(|(key, peers)| {
+                    peers
+                        .iter()
+                        .map(|&enabled| enabled && results[key].is_none() && !cleanup_pending[key])
+                        .collect()
+                })
+                .collect();
+            let mut excluded_pending = false;
+            let mut peer_outcomes = Vec::with_capacity(self.clients.len());
+            let mut rollback_grants = 0usize;
+            // A peer batch can contain both successful and unresolved keys. Keep
+            // consuming its entire output until every key is settled or D_total.
+            while !round.pending.is_empty() && results.iter().any(Option::is_none) {
+                let joined = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    joined = round.pending.join_next() => joined,
+                };
+                let Some(joined) = joined else { break };
+                let reply = match joined {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        warn!(
+                            event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "batch_task_failed",
+                            failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                            "Namespace batch lock peer task failed"
+                        );
+                        // A panicked implementation cannot prove no-grant. Do not
+                        // retry this round's requests with an unknown outcome.
+                        for (key, peers) in eligible.iter_mut().enumerate() {
+                            if results[key].is_none() {
+                                peers.fill(false);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                peer_outcomes.push(BatchLockPeerDiagnostics::from_outcomes(
+                    reply.peer_index,
+                    reply.requests.len(),
+                    &reply.outcomes,
+                    reply.elapsed,
+                ));
+                let client = self.clients[reply.peer_index].clone();
+                let valid_until = reply.started.checked_add(ttl).unwrap_or(reply.started);
+                let mut outcomes = reply.outcomes.into_iter();
+                let mut redundant = Vec::new();
+                let mut uncertain = Vec::new();
+                for (&key, request) in reply.key_indices.iter().zip(reply.requests.iter()) {
+                    pending_by_key[key][reply.peer_index] = false;
+                    let outcome = normalized_batch_outcome(request, outcomes.next());
+                    match outcome {
+                        BatchAcquireOutcome::Granted { .. } => {
+                            let entry = HeldLockEntry {
+                                lock_id: request.lock_id.clone(),
+                                client: client.clone(),
+                                valid_until,
+                            };
+                            if results[key].is_some() {
+                                redundant.push(entry.release_entry());
+                            } else {
+                                round.grants[key].push(entry);
+                            }
+                        }
+                        BatchAcquireOutcome::RetryableNoGrant { .. } => {}
+                        BatchAcquireOutcome::TerminalNoGrant { .. } => eligible[key][reply.peer_index] = false,
+                        BatchAcquireOutcome::Ambiguous {
+                            cleanup_owned_by_client, ..
+                        } => {
+                            eligible[key][reply.peer_index] = false;
+                            if !cleanup_owned_by_client {
+                                uncertain.push((request.lock_id.clone(), client.clone()));
+                            }
+                        }
+                    }
+                }
+                // Transfer cleanup synchronously before the next cancellation point.
+                rollback_grants += redundant.len();
+                Self::spawn_release_cleanup(redundant, "distributed_lock_batch_redundant_grants");
+                Self::spawn_uncertain_batch_cleanup(uncertain, "distributed_lock_batch_ambiguous");
+
+                let now = Instant::now();
+                for (key, resource) in resources.iter().enumerate() {
+                    if results[key].is_some() || cleanup_pending[key] {
+                        continue;
+                    }
+                    achieved[key] = round.grants[key].iter().filter(|entry| now < entry.valid_until).count();
+                    if now < deadline && achieved[key] >= required_quorum {
+                        let (entries, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut round.grants[key])
+                            .into_iter()
+                            .partition(|entry| now < entry.valid_until);
+                        rollback_grants += expired.len();
+                        Self::spawn_release_cleanup(
+                            expired.iter().map(HeldLockEntry::release_entry).collect(),
+                            "distributed_lock_batch_expired_grants",
+                        );
+                        let heartbeat = LockHeartbeatConfig {
+                            ttl,
+                            interval: derive_refresh_interval(entries.len(), ttl, None),
+                            refresh_quorum: required_quorum,
+                            owner: owner.to_owned(),
+                            resource: resource.clone(),
+                        };
+                        results[key] = Some(Ok(DistributedLockGuard::new(
+                            LockId::new_unique(resource),
+                            entries,
+                            LockType::Exclusive,
+                            heartbeat,
+                        )));
+                    }
+                }
+                // Completed eligible peers can form a new quorum after rollback,
+                // even when a silent peer could complete the current quorum.
+                // Keep waiting only for keys without enough completed peers.
+                let can_retry_without_pending = results.iter().enumerate().all(|(key, result)| {
+                    if result.is_some() || cleanup_pending[key] {
+                        return true;
+                    }
+                    let pending_votes = pending_by_key[key].iter().filter(|&&value| value).count();
+                    pending_votes == 0
+                        || eligible[key]
+                            .iter()
+                            .zip(&pending_by_key[key])
+                            .filter(|(eligible, pending)| **eligible && !**pending)
+                            .count()
+                            >= required_quorum
+                });
+                if can_retry_without_pending && !round.pending.is_empty() {
+                    for (key, peers) in eligible.iter_mut().enumerate() {
+                        if results[key].is_none() {
+                            for (peer, enabled) in peers.iter_mut().enumerate() {
+                                if pending_by_key[key][peer] {
+                                    *enabled = false;
+                                    peer_cleanup_pending[key][peer] = true;
+                                }
+                            }
+                        }
+                    }
+                    excluded_pending = true;
+                    break;
+                }
+            }
+
+            for (key, grants) in round.grants.iter_mut().enumerate() {
+                if results[key].is_none() && !cleanup_pending[key] {
+                    achieved[key] = grants.iter().filter(|entry| Instant::now() < entry.valid_until).count();
+                }
+                if grants.is_empty() {
+                    continue;
+                }
+                rollback_grants += grants.len();
+                cleanup_pending[key] = true;
+                let entries = std::mem::take(grants);
+                let completed = cleanup_completed.clone();
+                // Spawn before the next await so cancellation cannot abandon
+                // these exact-ID grants. Other keys consume their own results.
+                Self::spawn_cleanup(
+                    async move {
+                        let confirmed = Self::release_batch_for_retry(entries).await;
+                        let _ = completed.send(BatchRetryCleanupResult::Key { key, confirmed }).await;
+                    },
+                    "distributed_lock_batch_quorum_rollback",
+                );
+            }
+            // Dropping the round detaches all late replies before rollback awaits.
+            // A selected peer is retried only when the old wave fully completed.
+            let round_completed = round.pending.is_empty() || excluded_pending;
+            if excluded_pending {
+                Self::spawn_retry_peer_cleanup(
+                    std::mem::take(&mut round.pending),
+                    self.clients.clone(),
+                    cleanup_completed.clone(),
+                );
+            }
+            drop(round);
+            for (key, result) in results.iter_mut().enumerate() {
+                if result.is_none()
+                    && ((!cleanup_pending[key]
+                        && (!round_completed
+                            || (!peer_cleanup_pending[key].iter().any(|&pending| pending)
+                                && eligible[key].iter().filter(|&&value| value).count() < required_quorum)))
+                        || Instant::now() >= deadline)
+                {
+                    *result = Some(Err(LockError::QuorumNotReached {
+                        required: required_quorum,
+                        achieved: achieved[key],
+                    }));
+                }
+            }
+            let mut keys_by_achieved_votes = vec![0; self.clients.len() + 1];
+            for &votes in &achieved {
+                keys_by_achieved_votes[votes] += 1;
+            }
+            let failed_keys = results.iter().filter(|result| matches!(result, Some(Err(_)))).count();
+            let successful_keys = results.iter().filter(|result| matches!(result, Some(Ok(_)))).count();
+            peer_outcomes.sort_unstable_by_key(|outcome| outcome.peer_index);
+            if failed_keys > 0 {
+                warn!(
+                    event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "batch_quorum_failed",
+                    round = attempt,
+                    key_count = resources.len(),
+                    peer_count = self.clients.len(),
+                    required_quorum,
+                    successful_keys,
+                    failed_keys,
+                    ?keys_by_achieved_votes,
+                    ?peer_outcomes,
+                    rollback_grants,
+                    acquire_ms = round_started.elapsed().as_millis(),
+                    "Namespace batch lock acquisition did not reach quorum for all keys"
+                );
+            } else {
+                debug!(
+                    event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "batch_round_completed",
+                    round = attempt,
+                    key_count = resources.len(),
+                    peer_count = self.clients.len(),
+                    required_quorum,
+                    successful_keys,
+                    retrying_keys = resources.len() - successful_keys,
+                    ?keys_by_achieved_votes,
+                    ?peer_outcomes,
+                    rollback_grants,
+                    acquire_ms = round_started.elapsed().as_millis(),
+                    "Namespace batch lock acquisition round completed"
+                );
+            }
+            if results.iter().any(Option::is_none) && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng()).min(remaining / 2);
+                if backoff.is_zero() {
+                    break;
+                }
+                tokio::time::sleep_until(Instant::now().checked_add(backoff).unwrap_or(deadline).min(deadline)).await;
             }
         }
-
-        // One bounded synchronous pass so the caller cannot race these
-        // unlocks on an immediate retry; anything a slow peer still holds
-        // keeps retrying in the background instead of parking the request
-        // on the deferred unlock schedule.
-        if !orphaned_entries.is_empty() {
-            Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
-        }
         results
+            .into_iter()
+            .map(|result| match result {
+                Some(Ok(guard)) if !guard.is_lock_lost() => Ok(guard),
+                Some(Ok(_)) | None => Err(LockError::QuorumNotReached {
+                    required: required_quorum,
+                    achieved: 0,
+                }),
+                Some(Err(error)) => Err(error),
+            })
+            .collect()
     }
 
     fn spawn_lock_requests_until(
@@ -966,16 +1415,131 @@ impl DistributedLock {
         Self::release_entries_deferred(pending, context).await;
     }
 
-    /// Release entries with one synchronous pass, then continue the retry
-    /// schedule in the background.
-    ///
-    /// The batch-acquire rollback path runs on the request: it must not park
-    /// the caller on the deferred unlock schedule when a peer is unreachable,
-    /// while still confirming the healthy quorum is free before returning.
-    async fn release_entries_bounded(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
-        let pending = Self::release_pending_once(entries, 1, context).await;
+    /// Retain rollback ownership independently of the foreground deadline. Keys
+    /// with an unconfirmed grant are not retried; their remaining cleanup continues.
+    async fn release_batch_for_retry(mut entries: Vec<HeldLockEntry>) -> bool {
+        for attempt in 1..=UNLOCK_RETRY_ATTEMPTS {
+            entries = join_all(entries.into_iter().map(|entry| async move {
+                match entry.client.cleanup_grant(&entry.lock_id).await {
+                    Ok(LockCleanupOutcome::Released | LockCleanupOutcome::AlreadyAbsent) => None,
+                    Ok(LockCleanupOutcome::Unconfirmed) | Err(_) => Some(entry),
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+            if entries.is_empty() {
+                return true;
+            }
+            if attempt < UNLOCK_RETRY_ATTEMPTS {
+                let multiplier = u32::try_from(attempt).unwrap_or(u32::MAX);
+                tokio::time::sleep(UNLOCK_RETRY_BACKOFF.saturating_mul(multiplier)).await;
+            }
+        }
+        Self::spawn_cleanup(
+            Self::release_entries_deferred(
+                entries.into_iter().map(|entry| entry.release_entry()).collect(),
+                "distributed_lock_batch_quorum_rollback",
+            ),
+            "distributed_lock_batch_quorum_rollback",
+        );
+        false
+    }
+
+    fn spawn_uncertain_batch_cleanup(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        if !entries.is_empty() {
+            Self::spawn_cleanup(Self::release_uncertain_batch(entries, context), context);
+        }
+    }
+
+    /// A peer skipped by the foreground round becomes usable again only after
+    /// its old request completes and any exact-ID grant is confirmed cleaned.
+    fn spawn_retry_peer_cleanup(
+        mut pending: JoinSet<LockBatchAcquireTaskResult>,
+        clients: Arc<[Arc<dyn LockClient>]>,
+        completed: tokio::sync::mpsc::Sender<BatchRetryCleanupResult>,
+    ) {
+        Self::spawn_cleanup(
+            async move {
+                let mut cleanups = JoinSet::new();
+                while let Some(joined) = pending.join_next().await {
+                    let Ok(reply) = joined else { continue };
+                    let peer = reply.peer_index;
+                    let Some(client) = clients.get(peer) else { continue };
+                    let mut outcomes = reply.outcomes.into_iter();
+                    for (&key, request) in reply.key_indices.iter().zip(reply.requests.iter()) {
+                        let outcome = normalized_batch_outcome(request, outcomes.next());
+                        let client = client.clone();
+                        let entry = HeldLockEntry {
+                            lock_id: request.lock_id.clone(),
+                            client: client.clone(),
+                            valid_until: reply.started,
+                        };
+                        let completed = completed.clone();
+                        // Each task owns its grant before the drain next awaits.
+                        cleanups.spawn(
+                            async move {
+                                let confirmed = match outcome {
+                                    BatchAcquireOutcome::Granted { .. } => Self::release_batch_for_retry(vec![entry]).await,
+                                    BatchAcquireOutcome::RetryableNoGrant { .. } => true,
+                                    BatchAcquireOutcome::TerminalNoGrant { .. } => false,
+                                    BatchAcquireOutcome::Ambiguous {
+                                        cleanup_owned_by_client, ..
+                                    } => {
+                                        if !cleanup_owned_by_client {
+                                            Self::spawn_uncertain_batch_cleanup(
+                                                vec![(entry.lock_id, client)],
+                                                "distributed_lock_batch_retry_late_ambiguous",
+                                            );
+                                        }
+                                        false
+                                    }
+                                };
+                                let _ = completed.send(BatchRetryCleanupResult::Peer { key, peer, confirmed }).await;
+                            }
+                            .in_current_span(),
+                        );
+                    }
+                }
+                while cleanups.join_next().await.is_some() {}
+            },
+            "distributed_lock_batch_retry_late_cleanup",
+        );
+    }
+
+    /// Ambiguous acquisitions can still grant after an absence reply. Only an
+    /// exact-ID release acknowledgement ends this conservative cleanup schedule.
+    async fn release_uncertain_batch(mut pending: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        let delays = [Duration::ZERO, UNLOCK_RETRY_BACKOFF, UNLOCK_RETRY_BACKOFF * 2]
+            .into_iter()
+            .chain(DEFERRED_UNLOCK_BACKOFF);
+        for delay in delays {
+            if pending.is_empty() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+            pending = join_all(pending.into_iter().map(|(lock_id, client)| async move {
+                match client.release(&lock_id).await {
+                    Ok(true) => None,
+                    Ok(false) | Err(_) => Some((lock_id, client)),
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        }
         if !pending.is_empty() {
-            Self::spawn_release_cleanup(pending, context);
+            warn!(
+                event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                component = LOG_COMPONENT_LOCK,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                state = "uncertain",
+                context,
+                remaining = pending.len(),
+                "Ambiguous batch grant cleanup remains unconfirmed after bounded retries"
+            );
         }
     }
 
@@ -1066,6 +1630,7 @@ impl DistributedLock {
     }
 
     fn spawn_cleanup(cleanup: impl std::future::Future<Output = ()> + Send + 'static, context: &'static str) {
+        let cleanup = cleanup.in_current_span();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let join_handle = handle.spawn(cleanup);
             drop(join_handle);
@@ -1085,6 +1650,96 @@ impl DistributedLock {
             ),
         });
         drop(join_handle);
+    }
+
+    fn spawn_pending_batch_cleanup(
+        mut pending: JoinSet<LockBatchAcquireTaskResult>,
+        clients: Arc<[Arc<dyn LockClient>]>,
+        context: &'static str,
+    ) {
+        Self::spawn_cleanup(
+            async move {
+                let mut releases = JoinSet::new();
+                while let Some(joined) = pending.join_next().await {
+                    match joined {
+                        Ok(reply) => {
+                            let peer_outcome = BatchLockPeerDiagnostics::from_outcomes(
+                                reply.peer_index,
+                                reply.requests.len(),
+                                &reply.outcomes,
+                                reply.elapsed,
+                            );
+                            debug!(
+                                event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                                component = LOG_COMPONENT_LOCK,
+                                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                                state = "batch_reply_completed",
+                                context,
+                                ?peer_outcome,
+                                "Unconsumed batch lock reply retained for cleanup"
+                            );
+                            let Some(client) = clients.get(reply.peer_index) else { continue };
+                            let mut outcomes = reply.outcomes.into_iter();
+                            let mut confirmed = Vec::new();
+                            let mut uncertain = Vec::new();
+                            for request in reply.requests.iter() {
+                                match normalized_batch_outcome(request, outcomes.next()) {
+                                    BatchAcquireOutcome::Granted { .. } => {
+                                        confirmed.push((request.lock_id.clone(), client.clone()))
+                                    }
+                                    BatchAcquireOutcome::Ambiguous {
+                                        cleanup_owned_by_client: false,
+                                        ..
+                                    } => {
+                                        uncertain.push((request.lock_id.clone(), client.clone()));
+                                    }
+                                    BatchAcquireOutcome::RetryableNoGrant { .. }
+                                    | BatchAcquireOutcome::TerminalNoGrant { .. }
+                                    | BatchAcquireOutcome::Ambiguous {
+                                        cleanup_owned_by_client: true,
+                                        ..
+                                    } => {}
+                                }
+                            }
+                            // Keep cleanup concurrent across peers without blocking the
+                            // drain on one release or one deferred uncertainty schedule.
+                            releases.spawn(
+                                async move {
+                                    tokio::join!(
+                                        Self::release_entries(confirmed, context),
+                                        Self::release_uncertain_batch(uncertain, context)
+                                    );
+                                }
+                                .in_current_span(),
+                            );
+                        }
+                        Err(error) => warn!(
+                            event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "task_failed",
+                            context,
+                            failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                            "Pending batch lock acquisition task failed"
+                        ),
+                    }
+                }
+                while let Some(result) = releases.join_next().await {
+                    if let Err(error) = result {
+                        warn!(
+                            event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "task_failed",
+                            context,
+                            failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                            "Pending batch grant release cleanup task failed"
+                        );
+                    }
+                }
+            },
+            context,
+        );
     }
 
     fn spawn_pending_cleanup(
@@ -1652,11 +2307,17 @@ fn record_lock_held_release(lock_type: LockType) {
 }
 
 #[cfg(test)]
+mod batch_acquire_tests;
+
+#[cfg(test)]
+mod batch_retry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
-        DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LOCK_ACQUIRE_SPARE_HEDGES,
-        LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF,
-        is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        BatchLockPeerDiagnostics, DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
+        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS,
+        UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{
         GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
@@ -4025,6 +4686,71 @@ mod tests {
         drop(delayed_a_active);
 
         drop(guard);
+    }
+
+    #[test]
+    fn batch_peer_diagnostics_preserves_response_failure_and_missing_counts() {
+        let success = LockResponse {
+            success: true,
+            lock_info: None,
+            error: None,
+            wait_time: Duration::ZERO,
+            position_in_queue: None,
+        };
+        let responses = Ok(vec![
+            success.clone(),
+            LockResponse::failure("Remote lock RPC timed out", Duration::ZERO),
+            success,
+        ]);
+        assert_eq!(
+            BatchLockPeerDiagnostics::from_response(2, 4, &responses, Duration::from_millis(17)),
+            BatchLockPeerDiagnostics {
+                peer_index: 2,
+                granted_keys: 2,
+                retryable_no_grant_keys: 0,
+                terminal_no_grant_keys: 0,
+                ambiguous_keys: 0,
+                failed_response_keys: 1,
+                missing_response_keys: 1,
+                call_failed_keys: 0,
+                extra_responses: 0,
+                call_error_kind: None,
+                elapsed_ms: 17,
+            },
+            "failed legacy responses and missing entries must remain distinct without guessing their cause"
+        );
+        let extra = BatchLockPeerDiagnostics::from_response(0, 1, &responses, Duration::ZERO);
+        assert_eq!(extra.granted_keys, 1, "out-of-range responses cannot add valid grant votes");
+        assert_eq!(extra.failed_response_keys, 0);
+        assert_eq!(extra.missing_response_keys, 0);
+        assert_eq!(extra.extra_responses, 2, "extra peer entries must remain visible");
+    }
+
+    #[test]
+    fn batch_peer_diagnostics_counts_all_keys_for_a_typed_call_failure() {
+        for (error, expected_kind) in [
+            (LockError::timeout("peer", Duration::from_secs(3)), "timeout"),
+            (LockError::internal("Remote lock RPC timed out"), "internal"),
+            (LockError::permission_denied("request rejected"), "permission_denied"),
+        ] {
+            assert_eq!(
+                BatchLockPeerDiagnostics::from_response(1, 1000, &Err(error), Duration::from_secs(3)),
+                BatchLockPeerDiagnostics {
+                    peer_index: 1,
+                    granted_keys: 0,
+                    retryable_no_grant_keys: 0,
+                    terminal_no_grant_keys: 0,
+                    ambiguous_keys: 0,
+                    failed_response_keys: 0,
+                    missing_response_keys: 0,
+                    call_failed_keys: 1000,
+                    extra_responses: 0,
+                    call_error_kind: Some(expected_kind),
+                    elapsed_ms: 3000,
+                },
+                "one failed peer call affects every requested key, and only its typed variant identifies the cause"
+            );
+        }
     }
 
     /// Per-object scripted client: grants only the named objects and records

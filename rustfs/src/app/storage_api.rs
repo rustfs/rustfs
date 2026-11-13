@@ -46,26 +46,45 @@ pub(crate) mod diagnostic {
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
     #[cfg(test)]
-    pub(crate) use s3s::auth::SimpleAuth;
+    pub(crate) use rustfs_gateway_types::dto::Status;
+    #[cfg(test)]
+    pub(crate) use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
+    };
+    pub(crate) use s3s::S3Response;
+    pub(crate) use s3s::StdError;
+    #[cfg(test)]
+    pub(crate) use s3s::access::S3Access;
+    #[cfg(test)]
+    pub(crate) use s3s::auth::{Credentials, SimpleAuth};
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
+    pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, GetObjectInput,
-        HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output, ReplicationConfiguration, ReplicationRule,
-        ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, Tag, VersioningConfiguration,
+        BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, Tag, Tagging,
     };
     #[cfg(test)]
+    pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{GetObjectOutput, HeadObjectOutput, PutObjectInput, PutObjectOutput};
+    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
+    pub(crate) use s3s::header;
+    pub(crate) use s3s::region;
+    pub(crate) use s3s::s3_error;
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
+    pub(crate) use s3s::stream;
     #[cfg(test)]
     pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, S3, S3Response};
+    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
@@ -319,15 +338,18 @@ pub(crate) mod access {
 }
 
 pub(crate) mod bucket {
+    use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
+        RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
+    };
     use std::sync::Arc;
 
     pub(crate) trait ObjectLockConfigExt {
         fn enabled(&self) -> bool;
     }
 
-    impl ObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+    impl ObjectLockConfigExt for rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
         fn enabled(&self) -> bool {
-            <s3s::dto::ObjectLockConfiguration as crate::storage::storage_api::ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
+            <rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as crate::storage::storage_api::ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
         }
     }
 
@@ -336,32 +358,463 @@ pub(crate) mod bucket {
         fn suspended(&self) -> bool;
     }
 
-    impl VersioningConfigExt for s3s::dto::VersioningConfiguration {
+    impl VersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
         fn enabled(&self) -> bool {
-            <s3s::dto::VersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::enabled(
+            <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::enabled(
                 self,
             )
         }
 
         fn suspended(&self) -> bool {
-            <s3s::dto::VersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::suspended(self)
+            <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::suspended(self)
         }
     }
 
     pub(crate) async fn predict_lifecycle_expiration(
-        lifecycle: &s3s::dto::BucketLifecycleConfiguration,
+        lifecycle: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration,
         obj: &lifecycle::lifecycle::ObjectOpts,
     ) -> lifecycle::lifecycle::Event {
         crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
     }
 
+    // Remove this conversion when RestoreObject receives Gateway inputs.
+    pub(crate) fn restore_request_from_wire(request: s3s::dto::RestoreRequest) -> RestoreRequest {
+        use rustfs_gateway_types::dto;
+
+        RestoreRequest {
+            days: request.days,
+            description: request.description,
+            glacier_job_parameters: request.glacier_job_parameters.map(|parameters| dto::GlacierJobParameters {
+                tier: dto::Tier::custom(parameters.tier.as_str().to_owned()),
+            }),
+            output_location: request.output_location.map(|output| RestoreOutputLocation {
+                s3: output.s3.map(|location| RestoreS3Location {
+                    access_control_list: location.access_control_list.map(|grants| {
+                        grants
+                            .into_iter()
+                            .map(|grant| dto::Grant {
+                                grantee: grant.grantee.map(|grantee| dto::Grantee {
+                                    display_name: grantee.display_name,
+                                    email_address: grantee.email_address,
+                                    id: grantee.id,
+                                    r#type: Some(dto::Type::custom(grantee.type_.as_str().to_owned())),
+                                    uri: grantee.uri,
+                                }),
+                                permission: grant
+                                    .permission
+                                    .map(|value| dto::Permission::custom(value.as_str().to_owned())),
+                            })
+                            .collect()
+                    }),
+                    bucket_name: location.bucket_name,
+                    canned_acl: location
+                        .canned_acl
+                        .map(|value| dto::CannedAcl::custom(value.as_str().to_owned())),
+                    encryption: location.encryption.map(|encryption| dto::Encryption {
+                        encryption_type: dto::EncryptionType::custom(encryption.encryption_type.as_str().to_owned()),
+                        kms_context: encryption.kms_context,
+                        kms_key_id: encryption.kms_key_id,
+                    }),
+                    prefix: location.prefix,
+                    storage_class: location
+                        .storage_class
+                        .map(|value| dto::StorageClass::custom(value.as_str().to_owned())),
+                    tagging: location.tagging.map(|tagging| RestoreTagging {
+                        tag_set: tagging
+                            .tag_set
+                            .into_iter()
+                            .map(|tag| RestoreTag {
+                                key: tag.key,
+                                value: tag.value,
+                            })
+                            .collect(),
+                    }),
+                    user_metadata: location.user_metadata.map(|metadata| {
+                        metadata
+                            .into_iter()
+                            .map(|entry| dto::MetadataEntry {
+                                name: entry.name,
+                                value: entry.value,
+                            })
+                            .collect()
+                    }),
+                }),
+            }),
+            select_parameters: request.select_parameters.map(|parameters| dto::SelectParameters {
+                expression: parameters.expression,
+                expression_type: dto::ExpressionType::custom(parameters.expression_type.as_str().to_owned()),
+                input_serialization: dto::InputSerialization {
+                    csv: parameters.input_serialization.csv.map(|csv| dto::CsvInput {
+                        allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter,
+                        comments: csv.comments,
+                        field_delimiter: csv.field_delimiter,
+                        file_header_info: csv
+                            .file_header_info
+                            .map(|value| dto::FileHeaderInfo::custom(value.as_str().to_owned())),
+                        quote_character: csv.quote_character,
+                        quote_escape_character: csv.quote_escape_character,
+                        record_delimiter: csv.record_delimiter,
+                    }),
+                    compression_type: parameters
+                        .input_serialization
+                        .compression_type
+                        .map(|value| dto::CompressionType::custom(value.as_str().to_owned())),
+                    json: parameters.input_serialization.json.map(|json| dto::JsonInput {
+                        r#type: json.type_.map(|value| dto::Type::custom(value.as_str().to_owned())),
+                    }),
+                    parquet: parameters.input_serialization.parquet.map(|_| dto::ParquetInput {}),
+                },
+                output_serialization: dto::OutputSerialization {
+                    csv: parameters.output_serialization.csv.map(|csv| dto::CsvOutput {
+                        field_delimiter: csv.field_delimiter,
+                        quote_character: csv.quote_character,
+                        quote_escape_character: csv.quote_escape_character,
+                        quote_fields: csv
+                            .quote_fields
+                            .map(|value| dto::QuoteFields::custom(value.as_str().to_owned())),
+                        record_delimiter: csv.record_delimiter,
+                    }),
+                    json: parameters.output_serialization.json.map(|json| dto::JsonOutput {
+                        record_delimiter: json.record_delimiter,
+                    }),
+                },
+            }),
+            tier: request.tier.map(|value| dto::Tier::custom(value.as_str().to_owned())),
+            type_: request.type_.map(|value| value.as_str().to_owned()),
+        }
+    }
+
     pub(crate) fn validate_restore_request(
-        request: &s3s::dto::RestoreRequest,
+        request: &RestoreRequest,
         api: Arc<crate::storage::storage_api::ECStore>,
     ) -> std::io::Result<()> {
-        <s3s::dto::RestoreRequest as crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps>::validate(
+        <RestoreRequest as crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::RestoreRequestOps>::validate(
             request, api,
         )
+    }
+
+    #[cfg(test)]
+    mod restore_conversion_tests {
+        use super::restore_request_from_wire;
+        use rustfs_gateway_types::dto;
+        use s3s::dto as legacy;
+
+        #[test]
+        fn restore_request_conversion_preserves_legacy_output_values() {
+            let request = legacy::RestoreRequest {
+                type_: Some(legacy::RestoreRequestType::from_static("SELECT")),
+                select_parameters: Some(legacy::SelectParameters {
+                    expression: "SELECT _1 FROM S3Object".to_owned(),
+                    expression_type: legacy::ExpressionType::from("future/expression".to_owned()),
+                    input_serialization: legacy::InputSerialization {
+                        csv: Some(legacy::CSVInput {
+                            allow_quoted_record_delimiter: Some(true),
+                            comments: Some("comment".to_owned()),
+                            field_delimiter: Some("|".to_owned()),
+                            file_header_info: Some(legacy::FileHeaderInfo::from("future/header".to_owned())),
+                            quote_character: Some("'".to_owned()),
+                            quote_escape_character: Some("\\".to_owned()),
+                            record_delimiter: Some("\r\n".to_owned()),
+                        }),
+                        compression_type: Some(legacy::CompressionType::from("future/compression".to_owned())),
+                        parquet: Some(legacy::ParquetInput {}),
+                        ..Default::default()
+                    },
+                    output_serialization: legacy::OutputSerialization {
+                        csv: Some(legacy::CSVOutput {
+                            field_delimiter: Some(";".to_owned()),
+                            quote_character: Some("\"".to_owned()),
+                            quote_escape_character: Some("\\".to_owned()),
+                            quote_fields: Some(legacy::QuoteFields::from("future/quote-fields".to_owned())),
+                            record_delimiter: Some("\n".to_owned()),
+                        }),
+                        ..Default::default()
+                    },
+                }),
+                output_location: Some(legacy::OutputLocation {
+                    s3: Some(legacy::S3Location {
+                        access_control_list: Some(vec![legacy::Grant {
+                            grantee: Some(legacy::Grantee {
+                                display_name: Some("Display Name".to_owned()),
+                                email_address: Some("user@example.com".to_owned()),
+                                id: Some("grantee-id".to_owned()),
+                                type_: legacy::Type::from("future/grantee".to_owned()),
+                                uri: Some("urn:example:grantee".to_owned()),
+                            }),
+                            permission: Some(legacy::Permission::from("future/permission".to_owned())),
+                        }]),
+                        bucket_name: "a/b".to_owned(),
+                        canned_acl: Some(legacy::ObjectCannedACL::from("future/canned-acl".to_owned())),
+                        encryption: Some(legacy::Encryption {
+                            encryption_type: legacy::ServerSideEncryption::from("future/encryption".to_owned()),
+                            kms_context: Some("kms-context".to_owned()),
+                            kms_key_id: Some("kms-key-id".to_owned()),
+                        }),
+                        prefix: String::new(),
+                        storage_class: Some(legacy::StorageClass::from("future/storage-class".to_owned())),
+                        tagging: Some(legacy::Tagging {
+                            tag_set: vec![
+                                legacy::Tag { key: None, value: None },
+                                legacy::Tag {
+                                    key: None,
+                                    value: Some("value".to_owned()),
+                                },
+                                legacy::Tag {
+                                    key: Some(String::new()),
+                                    value: None,
+                                },
+                                legacy::Tag {
+                                    key: Some("key".to_owned()),
+                                    value: Some(String::new()),
+                                },
+                                legacy::Tag {
+                                    key: Some("key".to_owned()),
+                                    value: Some(String::new()),
+                                },
+                            ],
+                        }),
+                        user_metadata: Some(vec![
+                            legacy::MetadataEntry {
+                                name: None,
+                                value: Some("value".to_owned()),
+                            },
+                            legacy::MetadataEntry {
+                                name: Some(String::new()),
+                                value: None,
+                            },
+                        ]),
+                    }),
+                }),
+                ..Default::default()
+            };
+
+            let converted = restore_request_from_wire(request);
+            assert_eq!(converted.type_.as_deref(), Some("SELECT"));
+
+            let select = converted.select_parameters.expect("select parameters should be preserved");
+            assert_eq!(select.expression, "SELECT _1 FROM S3Object");
+            assert_eq!(select.expression_type.as_str(), "future/expression");
+            let csv_input = select.input_serialization.csv.expect("CSV input should be preserved");
+            assert_eq!(
+                (
+                    csv_input.allow_quoted_record_delimiter,
+                    csv_input.comments.as_deref(),
+                    csv_input.field_delimiter.as_deref(),
+                    csv_input.file_header_info.as_ref().map(|value| value.as_str()),
+                    csv_input.quote_character.as_deref(),
+                    csv_input.quote_escape_character.as_deref(),
+                    csv_input.record_delimiter.as_deref(),
+                ),
+                (
+                    Some(true),
+                    Some("comment"),
+                    Some("|"),
+                    Some("future/header"),
+                    Some("'"),
+                    Some("\\"),
+                    Some("\r\n")
+                )
+            );
+            assert_eq!(
+                select
+                    .input_serialization
+                    .compression_type
+                    .as_ref()
+                    .map(|value| value.as_str()),
+                Some("future/compression")
+            );
+            assert!(select.input_serialization.parquet.is_some());
+
+            let csv_output = select.output_serialization.csv.expect("CSV output should be preserved");
+            assert_eq!(
+                (
+                    csv_output.field_delimiter.as_deref(),
+                    csv_output.quote_character.as_deref(),
+                    csv_output.quote_escape_character.as_deref(),
+                    csv_output.quote_fields.as_ref().map(|value| value.as_str()),
+                    csv_output.record_delimiter.as_deref(),
+                ),
+                (Some(";"), Some("\""), Some("\\"), Some("future/quote-fields"), Some("\n"))
+            );
+
+            let s3 = converted
+                .output_location
+                .and_then(|output| output.s3)
+                .expect("S3 output location should be preserved");
+            assert_eq!((s3.bucket_name.as_str(), s3.prefix.as_str()), ("a/b", ""));
+            let grants = s3.access_control_list.expect("ACL grants should be preserved");
+            assert_eq!(grants.len(), 1);
+            let grant = &grants[0];
+            assert_eq!(grant.permission.as_ref().map(|value| value.as_str()), Some("future/permission"));
+            let grantee = grant.grantee.as_ref().expect("grantee should be preserved");
+            assert_eq!(
+                (
+                    grantee.display_name.as_deref(),
+                    grantee.email_address.as_deref(),
+                    grantee.id.as_deref(),
+                    grantee.r#type.as_ref().map(|value| value.as_str()),
+                    grantee.uri.as_deref(),
+                ),
+                (
+                    Some("Display Name"),
+                    Some("user@example.com"),
+                    Some("grantee-id"),
+                    Some("future/grantee"),
+                    Some("urn:example:grantee"),
+                )
+            );
+            assert_eq!(s3.canned_acl.as_ref().map(|value| value.as_str()), Some("future/canned-acl"));
+            let encryption = s3.encryption.expect("encryption should be preserved");
+            assert_eq!(
+                (
+                    encryption.encryption_type.as_str(),
+                    encryption.kms_context.as_deref(),
+                    encryption.kms_key_id.as_deref(),
+                ),
+                ("future/encryption", Some("kms-context"), Some("kms-key-id"))
+            );
+            assert_eq!(s3.storage_class.as_ref().map(|value| value.as_str()), Some("future/storage-class"));
+            assert_eq!(
+                s3.tagging.map(|tagging| tagging
+                    .tag_set
+                    .into_iter()
+                    .map(|tag| (tag.key, tag.value))
+                    .collect::<Vec<_>>()),
+                Some(vec![
+                    (None, None),
+                    (None, Some("value".to_owned())),
+                    (Some(String::new()), None),
+                    (Some("key".to_owned()), Some(String::new())),
+                    (Some("key".to_owned()), Some(String::new())),
+                ])
+            );
+            assert_eq!(
+                s3.user_metadata
+                    .map(|entries| entries.into_iter().map(|entry| (entry.name, entry.value)).collect::<Vec<_>>()),
+                Some(vec![(None, Some("value".to_owned())), (Some(String::new()), None)])
+            );
+        }
+
+        #[test]
+        fn restore_request_conversion_preserves_presence_and_raw_enums() {
+            for (raw, days) in [
+                (None, None),
+                (Some(""), Some(i32::MIN)),
+                (Some("future/Value"), Some(i32::MAX)),
+                (Some("\0"), Some(-1)),
+            ] {
+                let request = legacy::RestoreRequest {
+                    days,
+                    description: raw.map(|_| String::new()),
+                    type_: raw.map(|value| legacy::RestoreRequestType::from(value.to_owned())),
+                    tier: raw.map(|value| legacy::Tier::from(value.to_owned())),
+                    glacier_job_parameters: raw.map(|value| legacy::GlacierJobParameters {
+                        tier: legacy::Tier::from(value.to_owned()),
+                    }),
+                    select_parameters: raw.map(|value| legacy::SelectParameters {
+                        expression: value.to_owned(),
+                        expression_type: legacy::ExpressionType::from(value.to_owned()),
+                        input_serialization: legacy::InputSerialization {
+                            compression_type: Some(legacy::CompressionType::from(value.to_owned())),
+                            json: Some(legacy::JSONInput {
+                                type_: Some(legacy::JSONType::from(value.to_owned())),
+                            }),
+                            ..Default::default()
+                        },
+                        output_serialization: legacy::OutputSerialization {
+                            json: Some(legacy::JSONOutput {
+                                record_delimiter: Some(String::new()),
+                            }),
+                            ..Default::default()
+                        },
+                    }),
+                    output_location: raw.map(|_| legacy::OutputLocation { s3: None }),
+                };
+
+                let converted = restore_request_from_wire(request);
+                assert_eq!(
+                    (
+                        converted.days,
+                        converted.description,
+                        converted.type_,
+                        converted.tier,
+                        converted.glacier_job_parameters.map(|parameters| parameters.tier),
+                        converted.select_parameters.map(|parameters| (
+                            parameters.expression,
+                            parameters.expression_type,
+                            parameters.input_serialization.compression_type,
+                            parameters.input_serialization.json.map(|json| json.r#type),
+                            parameters.output_serialization.json.map(|json| json.record_delimiter),
+                        )),
+                        converted.output_location.map(|output| output.s3.is_none()),
+                    ),
+                    (
+                        days,
+                        raw.map(|_| String::new()),
+                        raw.map(str::to_owned),
+                        raw.map(dto::Tier::custom),
+                        raw.map(dto::Tier::custom),
+                        raw.map(|value| (
+                            value.to_owned(),
+                            dto::ExpressionType::custom(value),
+                            Some(dto::CompressionType::custom(value)),
+                            Some(Some(dto::Type::custom(value))),
+                            Some(Some(String::new())),
+                        )),
+                        raw.map(|_| true),
+                    )
+                );
+            }
+        }
+
+        #[test]
+        fn restore_request_conversion_distinguishes_absent_and_empty_containers() {
+            let outputs = [
+                None,
+                Some(legacy::OutputLocation { s3: None }),
+                Some(legacy::OutputLocation {
+                    s3: Some(legacy::S3Location::default()),
+                }),
+                Some(legacy::OutputLocation {
+                    s3: Some(legacy::S3Location {
+                        access_control_list: Some(Vec::new()),
+                        user_metadata: Some(Vec::new()),
+                        tagging: Some(legacy::Tagging { tag_set: Vec::new() }),
+                        ..Default::default()
+                    }),
+                }),
+            ];
+
+            let converted = outputs
+                .into_iter()
+                .map(|output_location| {
+                    restore_request_from_wire(legacy::RestoreRequest {
+                        output_location,
+                        ..Default::default()
+                    })
+                    .output_location
+                    .map(|output| {
+                        output.s3.map(|location| {
+                            (
+                                location.access_control_list.map(|grants| grants.len()),
+                                location.user_metadata.map(|entries| entries.len()),
+                                location.tagging.map(|tagging| tagging.tag_set.len()),
+                            )
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                converted,
+                vec![
+                    None,
+                    Some(None),
+                    Some(Some((None, None, None))),
+                    Some(Some((Some(0), Some(0), Some(0))))
+                ]
+            );
+        }
     }
 
     pub(crate) mod lifecycle {
@@ -430,14 +883,14 @@ pub(crate) mod bucket {
             }
 
             pub(crate) async fn validate_transition_tier(
-                lc: &s3s::dto::BucketLifecycleConfiguration,
+                lc: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration,
             ) -> Result<(), std::io::Error> {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::validate_transition_tier(lc).await
             }
 
             pub(crate) async fn validate_lifecycle_config(
-                lc: &s3s::dto::BucketLifecycleConfiguration,
-                lock_config: &s3s::dto::ObjectLockConfiguration,
+                lc: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration,
+                lock_config: &rustfs_gateway_types::persistence::PersistedObjectLockConfiguration,
             ) -> Result<(), std::io::Error> {
                 use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle as _;
 
@@ -496,11 +949,12 @@ pub(crate) mod bucket {
     pub(crate) mod metadata_sys {
         use std::sync::Arc;
 
-        use rustfs_policy::policy::BucketPolicy;
-        use s3s::dto::{
-            BucketLifecycleConfiguration, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-            PublicAccessBlockConfiguration, ServerSideEncryptionConfiguration, Tagging,
+        use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
+        use rustfs_gateway_types::persistence::{
+            PersistedBucketEncryptionConfiguration, PersistedLifecycleConfiguration, PersistedNotificationConfiguration,
+            PersistedObjectLockConfiguration, PersistedPublicAccessBlockConfiguration,
         };
+        use rustfs_policy::policy::BucketPolicy;
         use time::OffsetDateTime;
         use tokio::sync::RwLock;
 
@@ -554,7 +1008,7 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_cors_config(
             bucket: &str,
-        ) -> Result<(CORSConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedCorsConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_cors_config(bucket).await
         }
 
@@ -564,49 +1018,53 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_lifecycle_config(
             bucket: &str,
-        ) -> Result<(BucketLifecycleConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_lifecycle_config(bucket).await
         }
 
         pub(crate) async fn get_notification_config(
             bucket: &str,
-        ) -> Result<Option<NotificationConfiguration>, crate::storage::storage_api::StorageError> {
+        ) -> Result<Option<PersistedNotificationConfiguration>, crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_notification_config(bucket).await
         }
 
         pub(crate) async fn get_object_lock_config(
             bucket: &str,
-        ) -> Result<(ObjectLockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedObjectLockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
         }
 
         pub(crate) async fn get_public_access_block_config(
             bucket: &str,
-        ) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedPublicAccessBlockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError>
+        {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_public_access_block_config(bucket).await
         }
 
         pub(crate) async fn get_replication_config(
             bucket: &str,
-        ) -> Result<(s3s::dto::ReplicationConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<
+            (rustfs_gateway_types::persistence::PersistedReplicationConfiguration, OffsetDateTime),
+            crate::storage::storage_api::StorageError,
+        > {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_replication_config(bucket).await
         }
 
         pub(crate) async fn get_sse_config(
             bucket: &str,
-        ) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedBucketEncryptionConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_sse_config(bucket).await
         }
 
         pub(crate) async fn get_tagging_config(
             bucket: &str,
-        ) -> Result<(Tagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedTagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_s3_tagging_config(bucket).await
         }
 
         pub(crate) async fn update_s3_tagging_config(
             bucket: &str,
-            tagging: Option<Tagging>,
+            tagging: Option<PersistedTagging>,
             expected_incarnation_id: Option<uuid::Uuid>,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::update_s3_tagging_config(
@@ -961,7 +1419,7 @@ pub(crate) mod bucket {
         }
 
         pub(crate) fn delete_replication_state_from_config(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
             obj_info: &crate::storage::storage_api::StorageObjectInfo,
             version_id: Option<Uuid>,
             replica: bool,
@@ -995,12 +1453,12 @@ pub(crate) mod bucket {
         /// `site_peer_deployment_ids` is skipped; with site replication
         /// disabled the set is empty and every rule forwards.
         pub(crate) fn replica_delete_fanout_state_from_config(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
             obj_info: &crate::storage::storage_api::StorageObjectInfo,
             version_id: Option<Uuid>,
             site_peer_deployment_ids: &HashSet<String>,
         ) -> Option<replication_contracts::ReplicationState> {
-            let is_site_peer_rule = |rule: &s3s::dto::ReplicationRule| {
+            let is_site_peer_rule = |rule: &rustfs_gateway_types::persistence::PersistedReplicationRule| {
                 replication_contracts::site_replication_rule_deployment_id(rule)
                     .is_some_and(|deployment_id| site_peer_deployment_ids.contains(deployment_id))
             };
@@ -1015,14 +1473,18 @@ pub(crate) mod bucket {
 
         /// Whether `config` has a rule with the derived site-replication shape,
         /// so the replica-delete fan-out needs the current peer set.
-        pub(crate) fn has_site_replication_shaped_rule(config: &s3s::dto::ReplicationConfiguration) -> bool {
+        pub(crate) fn has_site_replication_shaped_rule(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> bool {
             config
                 .rules
                 .iter()
                 .any(|rule| replication_contracts::site_replication_rule_deployment_id(rule).is_some())
         }
 
-        pub(crate) fn replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> HashSet<String> {
+        pub(crate) fn replication_target_arns(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> HashSet<String> {
             replication_contracts::replication_target_arns(config)
         }
 
@@ -1059,17 +1521,19 @@ pub(crate) mod bucket {
 
         pub(crate) fn validate_replication_config_target_arns<'a>(
             configured_arns: impl Iterator<Item = &'a str>,
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Result<(), ReplicationTargetValidationError> {
             replication_contracts::validate_replication_config_target_arns(configured_arns, config)
         }
 
-        pub(crate) fn unsupported_replication_config_field(config: &s3s::dto::ReplicationConfiguration) -> Option<&'static str> {
+        pub(crate) fn unsupported_replication_config_field(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> Option<&'static str> {
             replication_contracts::unsupported_replication_config_field(config)
         }
 
         pub(crate) fn invalid_replication_config_status_field(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Option<&'static str> {
             replication_contracts::invalid_replication_config_status_field(config)
         }
@@ -1077,7 +1541,7 @@ pub(crate) mod bucket {
         pub(crate) type ReplicationConfigStructureError = replication_contracts::ReplicationConfigStructureError;
 
         pub(crate) fn validate_replication_config_structure(
-            config: &s3s::dto::ReplicationConfiguration,
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> Result<(), ReplicationConfigStructureError> {
             replication_contracts::validate_replication_config_structure(config)
         }
@@ -1085,7 +1549,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod tagging {
         pub(crate) fn decode_tags(tags: &str) -> Vec<s3s::dto::Tag> {
-            crate::storage::storage_api::ecstore_bucket::tagging::decode_tags(tags)
+            crate::storage::storage_api::decode_tags(tags)
         }
     }
 
@@ -1097,9 +1561,7 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod utils {
-        pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-            crate::storage::storage_api::ecstore_bucket::utils::serialize(val)
-        }
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::{BucketConfigXml, serialize};
     }
 
     pub(crate) mod versioning_sys {
@@ -1375,11 +1837,36 @@ pub(crate) mod select_object {
     };
 }
 
+/// The storage items the owned/legacy authorization parity tests drive.
+#[cfg(test)]
+pub(crate) mod owned_parity {
+    pub(crate) use crate::storage::storage_api::owned_parity_consumer::{
+        DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
+        ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+    };
+}
+
 pub(crate) mod context {
     #[cfg(test)]
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
+    pub(crate) use super::helper::OperationHelper;
     pub(crate) use super::runtime;
+    pub(crate) use crate::storage::storage_api::access_consumer::{
+        AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+    };
+    pub(crate) use crate::storage::storage_api::access_consumer::{
+        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+        PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization, TableDataPlaneListAccess,
+        TableDataPlanePublicationGuards,
+    };
+    pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use crate::storage::storage_api::rpc_consumer::InstalledControlService;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};

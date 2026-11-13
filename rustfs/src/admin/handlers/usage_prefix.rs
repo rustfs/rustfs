@@ -19,15 +19,15 @@
 //! usage caches, with a one-level sub-prefix breakdown — the data console
 //! buckets view MinIO serves from `loadPrefixUsageFromBackend`.
 
-use crate::admin::auth::{authenticate_request, policy_source_addr, validate_admin_request_with_bucket};
+use crate::admin::auth::{authenticate_envelope_credentials, validate_admin_request_with_bucket};
 use crate::admin::handlers::system::data_usage_info_gate_actions;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use hyper::Method;
 use matchit::Params;
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MAX_ENTRIES: usize = 1000;
@@ -68,26 +68,26 @@ fn parse_usage_prefix_query(query: Option<&str>) -> S3Result<(String, usize)> {
 
 #[async_trait::async_trait]
 impl Operation for BucketPrefixUsageHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials.as_ref() else {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(input_cred) = req.credentials() else {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "get cred failed"));
         };
-        let (cred, owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
+        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
         let bucket = params.get("bucket").unwrap_or_default().to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket path parameter is required"));
         }
         validate_admin_request_with_bucket(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
             data_usage_info_gate_actions(),
-            policy_source_addr(&req.extensions),
+            req.policy_source_addr(),
             &bucket,
         )
         .await?;
-        let (prefix, max_entries) = parse_usage_prefix_query(req.uri.query())?;
+        let (prefix, max_entries) = parse_usage_prefix_query(req.uri().query())?;
 
         // Authorization is bucket-scoped by the same any-of gate as the
         // datausageinfo route; the bucket name itself is validated by the
@@ -101,15 +101,16 @@ impl Operation for BucketPrefixUsageHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BucketPrefixUsageHandler, DEFAULT_MAX_ENTRIES, MAX_ENTRIES_LIMIT, parse_usage_prefix_query};
-    use crate::admin::router::Operation;
-    use s3s::S3Error;
+    use crate::admin::operation::{AdminRequest, Operation};
+    use crate::app::{RequestEnvelope, RequestHead};
+    use rustfs_s3_types::{Body, S3Error};
 
     fn query(raw: &str) -> Result<(String, usize), S3Error> {
         parse_usage_prefix_query(Some(raw))
@@ -121,23 +122,24 @@ mod tests {
     /// message-preserving pre-check is needed here.
     #[tokio::test]
     async fn prefix_usage_handler_keeps_its_missing_credentials_message() {
-        let req = s3s::S3Request {
-            input: s3s::Body::from(String::new()),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/rustfs/admin/v3/usage/bucket"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let envelope = RequestEnvelope::from_parts(
+            RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/rustfs/admin/v3/usage/bucket"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let req = AdminRequest::new(envelope, Body::empty());
 
-        let err = BucketPrefixUsageHandler {}
-            .call(req, matchit::Params::new())
-            .await
-            .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let err = match (BucketPrefixUsageHandler {}).call(req, matchit::Params::new()).await {
+            Ok(_) => panic!("a request without credentials must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
     }
 

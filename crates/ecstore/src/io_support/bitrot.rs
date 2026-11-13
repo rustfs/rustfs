@@ -974,7 +974,7 @@ pub async fn create_bitrot_writer_with_orig_volume(
         let file = disk.create_file(origvolume, volume, path, length).await?;
         #[cfg(feature = "hotpath")]
         let file = instrument_raw_shard_writer(file, disk.is_local());
-        CustomWriter::new_tokio_writer(file)
+        CustomWriter::from_file_writer(file)
     } else {
         return Err(DiskError::DiskNotFound);
     };

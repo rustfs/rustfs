@@ -16,13 +16,13 @@
 
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
+use rustfs_lifecycle::RestoreRequest;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
 use rustfs_scanner::{
     ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
     scanner::init_data_scanner,
 };
-use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
     collections::HashMap,

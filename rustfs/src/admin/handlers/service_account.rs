@@ -15,15 +15,18 @@
 use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
 use crate::admin::handlers::site_replication::{encode_service_account_replication_policy, site_replication_iam_change_hook};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use crate::{
-    admin::router::{AdminOperation, Operation, S3Router},
+    admin::router::{AdminOperation, S3Router},
     auth::check_key_valid,
 };
 use http::HeaderMap;
+use http::header::CONTENT_LENGTH;
+use http::header::CONTENT_TYPE;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -39,9 +42,8 @@ use rustfs_madmin::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy};
-use s3s::S3ErrorCode::InvalidRequest;
-use s3s::header::CONTENT_LENGTH;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_s3_types::{Body, S3ErrorCode::InvalidRequest};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -333,19 +335,20 @@ pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::
 pub struct AddServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for AddServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(req_cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(req_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &req_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), req_cred.access_key()).await?;
 
-        if !constant_time_eq(&cred.secret_key, req_cred.secret_key.expose()) {
+        if !req_cred.secret_key_matches(&cred.secret_key) {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "access denied"));
         }
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
 
         let mut create_req: AddServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
@@ -394,8 +397,7 @@ impl Operation for AddServiceAccount {
         };
 
         create_req.expiration = bounded_service_account_expiration(&cred, create_req.expiration);
-        let mut conditions =
-            get_condition_values(&req.headers, &cred, None, None, crate::admin::auth::policy_source_addr(&req.extensions));
+        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         set_service_account_duration_condition(&mut conditions, create_req.expiration, OffsetDateTime::now_utc());
 
         // This family deliberately calls `is_allowed` directly instead of going
@@ -539,12 +541,12 @@ impl Operation for AddServiceAccount {
         };
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
@@ -593,9 +595,9 @@ async fn build_info_service_account_resp<T: IamStore>(
 pub struct UpdateServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for UpdateServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -610,12 +612,13 @@ impl Operation for UpdateServiceAccount {
 
         let access_key = query.access_key;
 
-        let Some(input_cred) = req.credentials else {
+        let input = req.take_body();
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -626,7 +629,7 @@ impl Operation for UpdateServiceAccount {
         //     s3_error!(InternalError, "get service account failed")
         // })?;
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body = read_compatible_admin_body(input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
 
         let mut update_req: UpdateServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
@@ -640,8 +643,7 @@ impl Operation for UpdateServiceAccount {
         if update_req.new_expiration.is_some() {
             update_req.new_expiration = bounded_service_account_expiration(&cred, update_req.new_expiration);
         }
-        let mut conditions =
-            get_condition_values(&req.headers, &cred, None, None, crate::admin::auth::policy_source_addr(&req.extensions));
+        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         set_service_account_duration_condition(
             &mut conditions,
             update_req
@@ -716,16 +718,16 @@ impl Operation for UpdateServiceAccount {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers((StatusCode::NO_CONTENT, Body::empty()), header))
+        Ok(AdminResponse::with_headers(StatusCode::NO_CONTENT, Body::empty(), header))
     }
 }
 
 pub struct InfoServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for InfoServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -744,12 +746,12 @@ impl Operation for InfoServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let (svc_account, session_policy) = iam_store
             .get_service_account(&access_key)
@@ -762,13 +764,7 @@ impl Operation for InfoServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    crate::admin::auth::policy_source_addr(&req.extensions),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -783,21 +779,21 @@ impl Operation for InfoServiceAccount {
         let resp = build_info_service_account_resp(&iam_store, &svc_account, session_policy).await?;
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 pub struct TemporaryAccountInfo {}
 #[async_trait::async_trait]
 impl Operation for TemporaryAccountInfo {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -810,12 +806,12 @@ impl Operation for TemporaryAccountInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -827,13 +823,7 @@ impl Operation for TemporaryAccountInfo {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListTemporaryAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    crate::admin::auth::policy_source_addr(&req.extensions),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -851,21 +841,21 @@ impl Operation for TemporaryAccountInfo {
 
         let resp: TemporaryAccountInfoResp = build_info_service_account_resp(&iam_store, &temp_account, session_policy).await?;
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 pub struct InfoAccessKey {}
 #[async_trait::async_trait]
 impl Operation for InfoAccessKey {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -874,12 +864,12 @@ impl Operation for InfoAccessKey {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let access_key = if query.access_key.is_empty() {
             cred.access_key.clone()
@@ -893,8 +883,7 @@ impl Operation for InfoAccessKey {
 
         let target_cred = iam_store.get_user(&access_key).await.map(|identity| identity.credentials);
 
-        let conditions =
-            get_condition_values(&req.headers, &cred, None, None, crate::admin::auth::policy_source_addr(&req.extensions));
+        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         let claims = cred.claims_or_empty();
 
         if !iam_store
@@ -944,12 +933,12 @@ impl Operation for InfoAccessKey {
         let resp = access_key_identity::resolve_info_access_key_resp(&iam_store, access_key, target_cred).await?;
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
@@ -961,9 +950,9 @@ pub struct ListServiceAccountQuery {
 pub struct ListServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for ListServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: ListServiceAccountQuery = from_bytes(query.as_bytes())
                     .map_err(|_e| s3_error!(InvalidArgument, "invalid service account query parameters"))?;
                 input
@@ -972,12 +961,12 @@ impl Operation for ListServiceAccount {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key())
                 .await
                 .map_err(|e| {
                     debug!(
@@ -1018,13 +1007,7 @@ impl Operation for ListServiceAccount {
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(
-                        &req.headers,
-                        &cred,
-                        None,
-                        None,
-                        crate::admin::auth::policy_source_addr(&req.extensions),
-                    ),
+                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                     is_owner: owner,
                     object: "",
                     claims: cred.claims_or_empty(),
@@ -1064,18 +1047,18 @@ impl Operation for ListServiceAccount {
                 access_key: sa.access_key,
                 name: sa.name,
                 description: sa.description,
-                expiration: expiration_for_admin_path(req.uri.path(), sa.expiration),
+                expiration: expiration_for_admin_path(req.uri().path(), sa.expiration),
             })
             .collect();
 
         let data = serde_json::to_vec(&ListServiceAccountsResp { accounts })
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
-        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1128,19 +1111,19 @@ fn parse_list_access_keys_query(query: Option<&str>) -> ListAccessKeysQuery {
 pub struct ListAccessKeysBulk {}
 #[async_trait::async_trait]
 impl Operation for ListAccessKeysBulk {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = { parse_list_access_keys_query(req.uri.query()) };
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query = { parse_list_access_keys_query(req.uri().query()) };
 
         if query.all && !query.users.is_empty() {
             return Err(s3_error!(InvalidRequest, "either specify users or all, not both"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -1162,13 +1145,7 @@ impl Operation for ListAccessKeysBulk {
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::ListUsersAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(
-                        &req.headers,
-                        &cred,
-                        None,
-                        None,
-                        crate::admin::auth::policy_source_addr(&req.extensions),
-                    ),
+                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                     is_owner: owner,
                     object: "",
                     claims: cred.claims_or_empty(),
@@ -1185,13 +1162,7 @@ impl Operation for ListAccessKeysBulk {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    crate::admin::auth::policy_source_addr(&req.extensions),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1255,7 +1226,7 @@ impl Operation for ListAccessKeysBulk {
                     .map(|sts| {
                         access_key_identity::list_entry_from_credentials(
                             &sts,
-                            expiration_for_admin_path(req.uri.path(), sts.expiration),
+                            expiration_for_admin_path(req.uri().path(), sts.expiration),
                         )
                     })
                     .collect();
@@ -1284,7 +1255,7 @@ impl Operation for ListAccessKeysBulk {
                     .map(|svc| {
                         access_key_identity::list_entry_from_credentials(
                             &svc,
-                            expiration_for_admin_path(req.uri.path(), svc.expiration),
+                            expiration_for_admin_path(req.uri().path(), svc.expiration),
                         )
                     })
                     .collect();
@@ -1299,25 +1270,25 @@ impl Operation for ListAccessKeysBulk {
 
         let data = serde_json::to_vec(&access_key_map)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal access keys err {e}")))?;
-        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 pub struct DeleteServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for DeleteServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key())
                 .await
                 .map_err(|e| {
                     debug!(
@@ -1332,7 +1303,7 @@ impl Operation for DeleteServiceAccount {
                 })?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery = from_bytes(query.as_bytes())
                     .map_err(|_e| s3_error!(InvalidArgument, "invalid access key query parameters"))?;
                 input
@@ -1366,13 +1337,7 @@ impl Operation for DeleteServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    crate::admin::auth::policy_source_addr(&req.extensions),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1446,8 +1411,9 @@ impl Operation for DeleteServiceAccount {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
-        Ok(S3Response::with_headers(
-            (delete_service_account_success_status(req.uri.path()), Body::empty()),
+        Ok(AdminResponse::with_headers(
+            delete_service_account_success_status(req.uri().path()),
+            Body::empty(),
             header,
         ))
     }
@@ -1508,26 +1474,18 @@ mod tests {
             publish_test_app_context(context);
             for caller in ["keystone:forged", disabled_key.as_str()] {
                 for operation in ["update-service-account", "info-service-account"] {
-                    let req = S3Request {
-                        input: Body::from(vec![0u8; 64]),
-                        method: if operation == "update-service-account" {
-                            http::Method::POST
-                        } else {
-                            http::Method::GET
-                        },
-                        uri: format!("/minio/admin/v3/{operation}?accessKey=missing-target")
-                            .parse()
-                            .unwrap(),
-                        headers: HeaderMap::new(),
-                        extensions: http::Extensions::new(),
-                        credentials: Some(s3s::auth::Credentials {
-                            access_key: caller.to_owned(),
-                            secret_key: s3s::auth::SecretKey::from("disabled-user-secret"),
-                        }),
-                        region: None,
-                        service: None,
-                        trailing_headers: None,
+                    let method = if operation == "update-service-account" {
+                        http::Method::POST
+                    } else {
+                        http::Method::GET
                     };
+                    let req = crate::admin::operation::test_support::TestRequest::new(
+                        method,
+                        format!("/minio/admin/v3/{operation}?accessKey=missing-target").as_str(),
+                    )
+                    .credentials(caller, "disabled-user-secret", None)
+                    .body(vec![0u8; 64])
+                    .build();
                     let result = if operation == "update-service-account" {
                         UpdateServiceAccount {}.call(req, Params::new()).await
                     } else {
@@ -1537,7 +1495,7 @@ mod tests {
                         result
                             .expect_err("invalid identity precedes KDF and missing target lookup")
                             .code(),
-                        &s3s::S3ErrorCode::InvalidAccessKeyId,
+                        &S3ErrorCode::InvalidAccessKeyId,
                         "{caller}: {operation}"
                     );
                 }
