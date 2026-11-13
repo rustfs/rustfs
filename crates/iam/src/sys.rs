@@ -1552,7 +1552,11 @@ impl<T: Store> IamSys<T> {
     }
 
     /// Issue a credential for a different local user. Both actions must allow the
-    /// authenticated caller and the same resolved target.
+    /// authenticated caller and the same resolved target. Once admitted, the
+    /// write continues if the caller stops waiting.
+    ///
+    /// Returns an error if the caller lacks either grant, the target is missing
+    /// or ineligible, the caller has been revoked, or the key cannot be saved.
     pub async fn new_service_account_for_user(
         &self,
         target: &str,

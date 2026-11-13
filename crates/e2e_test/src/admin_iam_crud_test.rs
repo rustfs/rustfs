@@ -348,8 +348,6 @@ async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestRe
     Ok(())
 }
 
-/// Full user -> policy -> service-account lifecycle, proving each management
-/// call takes effect on the data plane, not just that the endpoint answers 200.
 #[tokio::test]
 async fn test_delegated_service_account_creation_through_console_sessions() -> TestResult {
     init_logging();
@@ -464,6 +462,8 @@ async fn test_delegated_service_account_creation_through_console_sessions() -> T
     Ok(())
 }
 
+/// Full user -> policy -> service-account lifecycle, proving each management
+/// call takes effect on the data plane, not just that the endpoint answers 200.
 #[tokio::test]
 async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
     init_logging();
