@@ -538,6 +538,12 @@ impl AuthorizationRequest for RequestEnvelope {
     fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
         self.requested_copy_source()
     }
+    fn install_requested_copy_source(&mut self, source: RequestedCopySource) {
+        self.requested_copy_source = Some(source);
+    }
+    fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard) {
+        self.copy_source_bucket_generation = Some(guard);
+    }
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
     }

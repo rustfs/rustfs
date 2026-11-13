@@ -681,16 +681,22 @@ pub(crate) fn odm_read_generation<R: AuthorizationRequest + ?Sized>(req: &R, buc
     }
 }
 
-async fn load_copy_source_bucket_generation(fs: &FS, bucket: &str) -> S3Result<CopySourceBucketGenerationGuard> {
-    let store = fs
-        .server_ctx()
-        .object_store()
-        .ok_or_else(|| s3_error!(InternalError, "object store is not initialized"))?;
-    let incarnation_id = store.bucket_incarnation_id(bucket).await.map_err(ApiError::from)?;
-    Ok(CopySourceBucketGenerationGuard {
-        bucket: bucket.to_string(),
-        incarnation_id,
-    })
+/// The legacy decoder's copy source as owned parts; `None` for an access-point or Outposts ARN.
+fn legacy_copy_source(source: &CopySource) -> Option<(String, String, Option<String>)> {
+    match source {
+        CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => None,
+        CopySource::Bucket { bucket, key, version_id } => {
+            Some((bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string())))
+        }
+    }
+}
+
+fn copy_source_object<'a>(
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Option<&'a str>,
+) -> access_owned::object_commit::CopySourceObject<'a> {
+    access_owned::object_commit::CopySourceObject { bucket, key, version_id }
 }
 
 pub(crate) fn apply_bucket_generation_guard<R: AuthorizationRequest + ?Sized>(
@@ -1046,6 +1052,8 @@ pub(crate) trait AuthorizationRequest {
     fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags>;
     fn requested_copy_source(&self) -> Option<&RequestedCopySource>;
+    fn install_requested_copy_source(&mut self, source: RequestedCopySource);
+    fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard);
     /// The headers that describe what the request stores: a POST upload's form
     /// fields when present, otherwise the request headers.
     fn policy_headers(&self) -> &HeaderMap;
@@ -1140,6 +1148,12 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
         self.extensions.get::<RequestedCopySource>()
+    }
+    fn install_requested_copy_source(&mut self, source: RequestedCopySource) {
+        self.extensions.insert(source);
+    }
+    fn install_copy_source_bucket_generation(&mut self, guard: CopySourceBucketGenerationGuard) {
+        self.extensions.insert(guard);
     }
     fn policy_headers(&self) -> &HeaderMap {
         self.extensions
@@ -3080,31 +3094,11 @@ impl S3Access for FS {
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket { bucket, key, version_id } => {
-                (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-            }
+        let Some((src_bucket, src_key, version_id)) = legacy_copy_source(&req.input.copy_source) else {
+            return access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), None).await;
         };
-        let source = match version_id.as_deref() {
-            Some(version) => format!("{src_bucket}/{src_key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
-            None => format!("{src_bucket}/{src_key}"),
-        };
-        req.extensions.insert(RequestedCopySource(source));
-        let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
-
-        {
-            let req_info = ext_req_info_mut(&mut req.extensions)?;
-            req_info.bucket = Some(src_bucket.clone());
-            req_info.object = Some(src_key.clone());
-            req_info.version_id = version_id.clone();
-
-            // GHSA-3ppv: a versioned copy source must authorize against
-            // s3:GetObjectVersion, not s3:GetObject.
-            authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
-        }
-        req.extensions.insert(source_bucket_generation?);
+        let source = copy_source_object(&src_bucket, &src_key, version_id.as_deref());
+        access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), Some(source)).await?;
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
 
@@ -4246,31 +4240,11 @@ impl S3Access for FS {
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let (src_bucket, src_key, version_id) = match &req.input.copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket { bucket, key, version_id } => {
-                (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
-            }
-        };
-        let source = match version_id.as_deref() {
-            Some(version) => format!("{src_bucket}/{src_key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
-            None => format!("{src_bucket}/{src_key}"),
-        };
-        req.extensions.insert(RequestedCopySource(source));
-        let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
-
-        {
-            let req_info = ext_req_info_mut(&mut req.extensions)?;
-            req_info.bucket = Some(src_bucket.clone());
-            req_info.object = Some(src_key.clone());
-            req_info.version_id = version_id.clone();
-
-            // GHSA-3ppv: a versioned copy source must authorize against
-            // s3:GetObjectVersion, not s3:GetObject.
-            authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
-        }
-        req.extensions.insert(source_bucket_generation?);
+        let source = legacy_copy_source(&req.input.copy_source);
+        let source = source
+            .as_ref()
+            .map(|(bucket, key, version_id)| copy_source_object(bucket, key, version_id.as_deref()));
+        access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), source).await?;
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
@@ -4699,7 +4673,7 @@ mod tests {
         assert_eq!(unavailable.code(), &S3ErrorCode::InternalError);
     }
 
-    struct UnreadyIam;
+    pub(super) struct UnreadyIam;
 
     impl IamInterface for UnreadyIam {
         fn handle(&self) -> Arc<IamSys<ObjectStore>> {
@@ -4711,7 +4685,7 @@ mod tests {
         }
     }
 
-    struct TestKms;
+    pub(super) struct TestKms;
 
     impl KmsInterface for TestKms {
         fn handle(&self) -> Arc<KmsServiceManager> {
@@ -4719,7 +4693,7 @@ mod tests {
         }
     }
 
-    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
+    pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
             method,
@@ -4733,7 +4707,7 @@ mod tests {
         }
     }
 
-    fn ensure_req_info<T>(req: &mut S3Request<T>) {
+    pub(super) fn ensure_req_info<T>(req: &mut S3Request<T>) {
         req.extensions.insert(ReqInfo::default());
     }
 
