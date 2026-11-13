@@ -69,6 +69,11 @@ use std::sync::OnceLock;
 use time::OffsetDateTime;
 use url::Url;
 
+/// The authorization shapes one migration batch owns; a child module so they reach the guard
+/// state this module keeps private.
+#[path = "access_owned/mod.rs"]
+pub(crate) mod access_owned;
+
 fn iam_authorization_error(err: IamError) -> ApiError {
     match err {
         IamError::IAMActionNotAllowed => ApiError::access_denied(),
