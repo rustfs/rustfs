@@ -16,70 +16,7 @@ use crate::disk::error::{Error, Result};
 use crate::disk::{DiskInfo, error::DiskError};
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
-use std::collections::HashSet;
 use uuid::Uuid;
-
-const LEGACY_FORMAT_BASE_MAX_BYTES: usize = 16 * 1024;
-const LEGACY_FORMAT_MAX_BYTES_PER_DISK: usize = 64;
-
-pub(crate) fn legacy_format_max_bytes(disk_count: usize) -> crate::error::Result<usize> {
-    disk_count
-        .checked_mul(LEGACY_FORMAT_MAX_BYTES_PER_DISK)
-        .and_then(|size| size.checked_add(LEGACY_FORMAT_BASE_MAX_BYTES))
-        .ok_or_else(|| crate::error::Error::other("legacy format size limit overflow"))
-}
-
-fn check_format_erasure_value(format: &FormatV3) -> crate::error::Result<()> {
-    if format.version != FormatMetaVersion::V1 {
-        return Err(crate::error::Error::other("invalid FormatMetaVersion"));
-    }
-
-    if !matches!(format.format, FormatBackend::Erasure | FormatBackend::ErasureSingle) {
-        return Err(crate::error::Error::other("invalid FormatBackend"));
-    }
-
-    if format.id.is_nil() || format.id == Uuid::max() {
-        return Err(crate::error::Error::other("invalid deployment ID"));
-    }
-
-    if format.erasure.version != FormatErasureVersion::V3 {
-        return Err(crate::error::Error::other("invalid FormatErasureVersion"));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_format_erasure_layout(format: &FormatV3) -> crate::error::Result<usize> {
-    check_format_erasure_value(format)?;
-
-    let set_drive_count = format
-        .erasure
-        .sets
-        .first()
-        .map(Vec::len)
-        .filter(|count| *count > 0)
-        .ok_or_else(|| crate::error::Error::other("erasure.sets must contain at least one drive"))?;
-    if format.erasure.sets.iter().any(|set| set.len() != set_drive_count) {
-        return Err(crate::error::Error::other("erasure.sets must be rectangular"));
-    }
-    let drive_count = format
-        .erasure
-        .sets
-        .len()
-        .checked_mul(set_drive_count)
-        .ok_or_else(|| crate::error::Error::other("erasure set drive count overflow"))?;
-    let mut disk_ids = HashSet::with_capacity(drive_count);
-
-    for disk_id in format.erasure.sets.iter().flatten() {
-        if disk_id.is_nil() || *disk_id == Uuid::max() {
-            return Err(crate::error::Error::other("erasure.sets contains an invalid disk UUID"));
-        }
-        if !disk_ids.insert(*disk_id) {
-            return Err(crate::error::Error::other("erasure.sets contains a duplicate disk UUID"));
-        }
-    }
-
-    Ok(set_drive_count)
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum FormatMetaVersion {

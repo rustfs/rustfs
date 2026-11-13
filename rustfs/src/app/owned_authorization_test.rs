@@ -1172,9 +1172,19 @@ fn peer(req: &mut S3Request<()>, addr: [u8; 4]) {
         .insert(Some(crate::shared_types::RemoteAddr(std::net::SocketAddr::from((addr, 40000)))));
 }
 
-#[tokio::test]
-#[serial]
-async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
+const PRIVATE: &str = "parity-private";
+const PUBLIC: &str = "parity-public";
+
+/// What the decision parity tests share: two buckets on an isolated store, `PUBLIC` with a bucket
+/// policy for anonymous callers, an IAM user whose policy covers `PRIVATE`, the owner, and a
+/// request slot bound to that store. The first element keeps the store's directories alive.
+async fn decision_world() -> (
+    impl Sized,
+    Arc<crate::app::storage_api::test::ECStore>,
+    Arc<ServerContextSlot>,
+    rustfs_credentials::Credentials,
+    rustfs_credentials::Credentials,
+) {
     use rustfs_iam::store::{Store as _, UserType};
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::Policy;
@@ -1190,9 +1200,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         }
     }
 
-    const PRIVATE: &str = "parity-private";
-    const PUBLIC: &str = "parity-public";
-    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let (temp_dir, disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     for bucket in [PRIVATE, PUBLIC] {
         store
             .make_bucket(bucket, &MakeBucketOptions::default())
@@ -1215,7 +1223,8 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/stage/*"),
             "Condition":{"Bool":{"s3:ObjectCreationOperation":"false"}}},
         {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{PUBLIC}/post/*"),
-            "Condition":{"StringEquals":{"s3:RequestObjectTag/class":"public"}}}
+            "Condition":{"StringEquals":{"s3:RequestObjectTag/class":"public"}}},
+        {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutBucketCors","Resource":format!("arn:aws:s3:::{PUBLIC}")}
     ]});
     store
         .update_bucket_metadata_config(
@@ -1251,7 +1260,8 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             format!(
                 r#"{{"Version":"2012-10-17","Statement":[
                     {{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{PRIVATE}/*"}},
-                    {{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::{PRIVATE}/iam-denied"}}
+                    {{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::{PRIVATE}/iam-denied"}},
+                    {{"Effect":"Allow","Action":"s3:PutBucketTagging","Resource":"arn:aws:s3:::{PRIVATE}"}}
                 ]}}"#
             )
             .as_bytes(),
@@ -1272,6 +1282,13 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
     let context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
     let slot = ServerContextSlot::new();
     assert!(slot.install(context), "install request context");
+    ((temp_dir, disk_paths), store, slot, user, owner)
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
+    let (_store_dirs, _store, slot, user, owner) = decision_world().await;
 
     let cases = [
         DecisionCase {
@@ -1593,4 +1610,135 @@ fn post_form(req: &mut S3Request<()>, form_tagging: &'static str, header_tagging
     form.insert("x-amz-tagging", HeaderValue::from_static(form_tagging));
     req.extensions.insert(PostObjectRequestMarker);
     req.extensions.insert(PostObjectPolicyHeaders(form));
+}
+
+/// What a bucket-configuration mutation answered, compared across the two request forms.
+#[derive(Debug, PartialEq)]
+enum MutationOutcome {
+    /// Allowed, with the incarnation snapshot the use case reads back.
+    Allowed(Option<uuid::Uuid>),
+    Denied,
+    /// Refused with another code after the decision, such as a snapshot failure.
+    Failed(String),
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_snapshot() {
+    use crate::app::storage_api::owned_parity::{authorize_bucket_config_mutation, bucket_config_mutation_incarnation};
+
+    const MISSING: &str = "parity-missing";
+    let (_store_dirs, store, slot, user, owner) = decision_world().await;
+    let private = Some(store.bucket_incarnation_id(PRIVATE).await.expect("private incarnation"));
+    let public = Some(store.bucket_incarnation_id(PUBLIC).await.expect("public incarnation"));
+    let failed = |code: &str| MutationOutcome::Failed(code.to_owned());
+    let cases = [
+        (
+            "IAM policy allows the user",
+            PRIVATE,
+            Principal::User,
+            S3Action::PutBucketTaggingAction,
+            MutationOutcome::Allowed(private),
+        ),
+        (
+            "bucket policy allows anonymous",
+            PUBLIC,
+            Principal::Anonymous,
+            S3Action::PutBucketCorsAction,
+            MutationOutcome::Allowed(public),
+        ),
+        (
+            "owner",
+            PRIVATE,
+            Principal::Owner,
+            S3Action::PutBucketVersioningAction,
+            MutationOutcome::Allowed(private),
+        ),
+        (
+            "user policy names another bucket",
+            PUBLIC,
+            Principal::User,
+            S3Action::PutBucketTaggingAction,
+            MutationOutcome::Denied,
+        ),
+        (
+            "user without a policy for the action",
+            PRIVATE,
+            Principal::User,
+            S3Action::PutBucketCorsAction,
+            MutationOutcome::Denied,
+        ),
+        (
+            "anonymous on a private bucket",
+            PRIVATE,
+            Principal::Anonymous,
+            S3Action::PutBucketTaggingAction,
+            MutationOutcome::Denied,
+        ),
+        (
+            "anonymous on a missing bucket",
+            MISSING,
+            Principal::Anonymous,
+            S3Action::PutBucketCorsAction,
+            MutationOutcome::Denied,
+        ),
+        (
+            "owner on a missing bucket",
+            MISSING,
+            Principal::Owner,
+            S3Action::PutBucketVersioningAction,
+            failed("NoSuchBucket"),
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (name, bucket, principal, action, expected) in cases {
+        let mut legacy = build_request((), Method::PUT);
+        legacy.uri = format!("/{bucket}").parse().expect("case uri");
+        legacy.extensions.insert(Arc::clone(&slot));
+        let (cred, is_owner) = match principal {
+            Principal::Anonymous => (None, false),
+            Principal::User => (Some(user.clone()), false),
+            Principal::Owner => (Some(owner.clone()), true),
+        };
+        legacy.extensions.insert(ReqInfo {
+            cred,
+            is_owner,
+            ..Default::default()
+        });
+        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let action = Action::S3Action(action);
+
+        let legacy_result = authorize_bucket_config_mutation(&slot, &mut legacy, bucket, action).await;
+        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action).await;
+        let outcome = |result: Result<(), S3ErrorCode>, snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| match result {
+            Ok(()) => MutationOutcome::Allowed(snapshot.ok().flatten()),
+            Err(S3ErrorCode::AccessDenied) => MutationOutcome::Denied,
+            Err(code) => MutationOutcome::Failed(code.as_str().to_owned()),
+        };
+        let legacy_outcome = outcome(
+            legacy_result.map_err(|err| err.code().clone()),
+            bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone()),
+        );
+        let owned_outcome = outcome(
+            owned_result.map_err(|err| err.code().clone()),
+            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()),
+        );
+        // A refused request hands no snapshot on: the use case's reader refuses to run without one.
+        let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| {
+            matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(S3ErrorCode::InternalError)
+        };
+        let both_refused_without_snapshot =
+            refused_without_snapshot(bucket_config_mutation_incarnation(&legacy, bucket).map_err(|err| err.code().clone()))
+                && refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()));
+        let bucket_recorded = [legacy.extensions.get::<ReqInfo>(), owned.req_info()]
+            .iter()
+            .all(|info| info.and_then(|info| info.bucket.as_deref()) == Some(bucket));
+        if legacy_outcome != expected || owned_outcome != expected || !both_refused_without_snapshot || !bucket_recorded {
+            mismatches.push(format!(
+                "{name}: expected {expected:?}, legacy {legacy_outcome:?}, owned {owned_outcome:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "bucket config mutation mismatches:\n{}", mismatches.join("\n"));
 }

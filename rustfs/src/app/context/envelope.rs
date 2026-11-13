@@ -507,6 +507,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot> {
         self.bucket_config_mutation.as_ref()
     }
+    fn install_bucket_config_mutation(&mut self, snapshot: BucketConfigMutationSnapshot) {
+        self.bucket_config_mutation = Some(snapshot);
+    }
     #[cfg(test)]
     fn test_extensions(&self) -> &Extensions {
         &self.residual_extensions

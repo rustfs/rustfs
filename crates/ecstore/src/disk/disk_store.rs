@@ -1951,11 +1951,6 @@ impl LocalDiskWrapper {
     }
 
     #[cfg(test)]
-    pub(crate) fn health_monitor_cancelled_for_test(&self) -> bool {
-        self.cancel_token.is_cancelled()
-    }
-
-    #[cfg(test)]
     pub(crate) fn override_operation_timeout_for_test(&self, timeout: Duration) -> ScopedDiskOperationTimeout {
         assert!(!timeout.is_zero(), "fault injection needs a positive timeout");
         // The metrics epoch follows this drive across clones and reconnects.
