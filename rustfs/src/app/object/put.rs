@@ -15,6 +15,13 @@
 //! PutObject write path: body admission, eager commit, zero-copy tuning.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    CacheControl, ContentDisposition, ContentEncoding, ContentLanguage, ContentType, ObjectLockLegalHoldStatus, ObjectLockMode,
+    PutObjectInput, PutObjectOutput, SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId, ServerSideEncryption, StorageClass,
+    StreamingBlob, TaggingHeader, Timestamp, WebsiteRedirectLocation,
+};
+use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError, s3_error};
 use futures::FutureExt;
 
 use crate::app::trailer_adapter::trailer_source;
@@ -2236,6 +2243,7 @@ fn passthrough_compressed_actual_size(user_defined: &HashMap<String, String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
 

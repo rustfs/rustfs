@@ -85,6 +85,11 @@ test-seams-check: ## Check tests outside an operation's owner call its use-case 
 	@echo "🧪 Checking cross-owner test seams..."
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py
 
+.PHONY: test-retirements-check
+test-retirements-check: ## Check every test retired by a migration slice names a replacement that exists
+	@echo "🧪 Checking test retirement tables..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py
+
 .PHONY: fips-wording-check
 fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
 	@echo "📣 Checking cryptographic capability wording guard..."

@@ -115,15 +115,7 @@ use rustfs_utils::http::{
     headers::{AMZ_CHECKSUM_TYPE, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
-use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, ChecksumAlgorithm, ChecksumType, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOutput, CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, ETag, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
-    ServerSideEncryption, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
-};
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
-use s3s::stream::ByteStream;
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -289,6 +281,7 @@ fn multipart_upload_api_error(err: StorageError) -> S3Error {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::app::storage_api::s3::dto::{CompleteMultipartUploadInput, CreateMultipartUploadInput, ServerSideEncryption};
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {

@@ -4242,7 +4242,7 @@ mod tests {
                 "compatible aliases for {suffix} should match"
             );
 
-            let mut source_without_marker = source.clone();
+            let mut source_without_marker = source;
             rustfs_utils::http::remove_str(Arc::make_mut(&mut source_without_marker.user_defined), suffix);
             let mut target_with_generated_marker = source_without_marker.clone();
             rustfs_utils::http::insert_str(

@@ -69,7 +69,7 @@ pub mod error;
 pub mod identity;
 pub mod middleware;
 
-pub use auth::KeystoneAuthProvider;
+pub use auth::{KeystoneAuthProvider, ValidatedKeystoneToken};
 pub use client::KeystoneClient;
 pub use config::{KeystoneConfig, RoleMapping};
 pub use error::{KeystoneError, Result};

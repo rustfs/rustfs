@@ -4223,9 +4223,10 @@ mod tests {
                         o_hdr.ec_m = o_m;
                         o_hdr.ec_n = o_n;
 
+                        let actual = FileMeta::headers_match_strict(&s_hdr, &o_hdr);
                         let expected = {
-                            let mut s_cmp = s_hdr.clone();
-                            let mut o_cmp = o_hdr.clone();
+                            let mut s_cmp = s_hdr;
+                            let mut o_cmp = o_hdr;
                             if s_cmp.has_ec() != o_cmp.has_ec() {
                                 s_cmp.ec_m = 0;
                                 s_cmp.ec_n = 0;
@@ -4234,11 +4235,7 @@ mod tests {
                             }
                             s_cmp == o_cmp
                         };
-                        assert_eq!(
-                            FileMeta::headers_match_strict(&s_hdr, &o_hdr),
-                            expected,
-                            "mismatch for s=({s_m},{s_n}) vs o=({o_m},{o_n})"
-                        );
+                        assert_eq!(actual, expected, "mismatch for s=({s_m},{s_n}) vs o=({o_m},{o_n})");
                     }
                 }
             }
