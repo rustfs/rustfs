@@ -136,6 +136,22 @@ impl SourceSet {
         self.files.iter().map(|file| file.text.matches(needle).count()).sum()
     }
 
+    /// [`SourceSet::count`] with all whitespace removed from both the text and `needle`, so a
+    /// call matches however rustfmt wraps its arguments.
+    pub(crate) fn count_ignoring_whitespace(&self, needle: &str) -> usize {
+        let needle: String = needle.split_whitespace().collect();
+        self.files
+            .iter()
+            .map(|file| {
+                file.text
+                    .split_whitespace()
+                    .collect::<String>()
+                    .matches(needle.as_str())
+                    .count()
+            })
+            .sum()
+    }
+
     /// The text of the one `async fn name` method of the set: from its definition line, which
     /// must be indented by exactly four spaces (a method of a top-level `impl`), through the first
     /// following line that is exactly `    }`. A neighbouring method of any visibility, a test

@@ -236,10 +236,6 @@ pub(crate) mod server {
         #[cfg(feature = "gateway-stack")]
         pub(crate) mod access {
             /// The per-batch authorization shapes, one module per migration batch.
-            #[expect(
-                unused_imports,
-                reason = "the batches' gateway edges use it; the first of them removes this"
-            )]
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
                 AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,

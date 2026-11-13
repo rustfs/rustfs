@@ -1309,7 +1309,7 @@ fn tonic_rpc_metric_operation(path: &str) -> &'static str {
         Some("ReadMultiple") => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
         Some("ReadVersion") => INTERNODE_OPERATION_GRPC_READ_VERSION,
         Some("BatchReadVersion") => INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
-        Some("WriteAll") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        Some("WriteAll" | "WriteFormatControl") => INTERNODE_OPERATION_GRPC_WRITE_ALL,
         Some("CompareAndUpdateFile") => INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
         Some("Lock") => INTERNODE_OPERATION_GRPC_LOCK,
         Some("UnLock") => INTERNODE_OPERATION_GRPC_UNLOCK,
@@ -3193,6 +3193,10 @@ mod tests {
         );
         assert_eq!(
             tonic_rpc_metric_operation("/node_service.NodeService/WriteAll"),
+            INTERNODE_OPERATION_GRPC_WRITE_ALL
+        );
+        assert_eq!(
+            tonic_rpc_metric_operation("/node_service.NodeService/WriteFormatControl"),
             INTERNODE_OPERATION_GRPC_WRITE_ALL
         );
         assert_eq!(

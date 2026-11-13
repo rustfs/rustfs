@@ -345,6 +345,7 @@ const DISK_OPERATION_NAMES: &[&str] = &[
     "read_parts",
     "read_multiple",
     "write_all",
+    "write_format_control",
     "compare_and_update_file",
     "read_all",
 ];
@@ -1951,11 +1952,6 @@ impl LocalDiskWrapper {
     #[cfg(test)]
     pub fn health_check_enabled_for_test(&self) -> bool {
         self.health_check
-    }
-
-    #[cfg(test)]
-    pub(crate) fn health_monitor_cancelled_for_test(&self) -> bool {
-        self.cancel_token.is_cancelled()
     }
 
     #[cfg(test)]
@@ -3666,6 +3662,16 @@ impl DiskAPI for LocalDiskWrapper {
                 TimeoutHealthAction::MarkFailure
             },
             DiskMetricMutation::Write,
+        )
+        .await
+    }
+
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        self.track_disk_health_mutation(
+            "write_format_control",
+            DiskMetricMutation::Write,
+            || async { self.disk.write_format_control(path, data).await },
+            get_max_timeout_duration(),
         )
         .await
     }

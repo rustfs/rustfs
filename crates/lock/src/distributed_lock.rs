@@ -56,6 +56,8 @@ const DEFERRED_UNLOCK_BACKOFF: [Duration; 5] = [
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 // Bound a peer's contention wait without discarding slow responses to that wait.
 const LOCK_PEER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+// A retrying writer must keep its queue position through longer reader holds.
+const LOCK_PEER_WRITER_RETRY_TIMEOUT: Duration = LOCK_PEER_ACQUIRE_TIMEOUT.saturating_mul(2);
 const LOCK_ACQUIRE_SPARE_HEDGES: usize = 1;
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
 const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
@@ -996,7 +998,7 @@ impl DistributedLock {
             }
             attempt = attempt.saturating_add(1);
             let round_started = Instant::now();
-            let wait = self.peer_acquire_timeout(deadline.saturating_duration_since(round_started));
+            let wait = self.peer_acquire_timeout(deadline.saturating_duration_since(round_started), LOCK_PEER_ACQUIRE_TIMEOUT);
             let round_deadline = round_started.checked_add(wait).unwrap_or(round_started).min(deadline);
             let requests: Vec<_> = resources
                 .iter()
@@ -1371,11 +1373,11 @@ impl DistributedLock {
         Duration::from_nanos(rng.random_range(lower_nanos..=upper_nanos))
     }
 
-    fn peer_acquire_timeout(&self, remaining: Duration) -> Duration {
+    fn peer_acquire_timeout(&self, remaining: Duration, peer_wait_limit: Duration) -> Duration {
         if self.clients.len() <= 1 {
             remaining
         } else {
-            remaining.min(LOCK_PEER_ACQUIRE_TIMEOUT)
+            remaining.min(peer_wait_limit)
         }
     }
 
@@ -1836,7 +1838,14 @@ impl DistributedLock {
 
             let remaining = request.acquire_timeout - elapsed;
             let mut attempt_request = request.clone();
-            attempt_request.acquire_timeout = self.peer_acquire_timeout(remaining);
+            // Only retryable contention reaches another round. Give later writer
+            // attempts enough queue time to outlast readers that entered the gap.
+            let peer_wait_limit = if request.lock_type == LockType::Exclusive && attempt > 1 {
+                LOCK_PEER_WRITER_RETRY_TIMEOUT
+            } else {
+                LOCK_PEER_ACQUIRE_TIMEOUT
+            };
+            attempt_request.acquire_timeout = self.peer_acquire_timeout(remaining, peer_wait_limit);
             attempt_request.lock_id = LockId::new_unique(&request.resource);
 
             // A peer may grant promptly but deliver its response after its local
@@ -2316,8 +2325,9 @@ mod batch_retry_tests;
 mod tests {
     use super::{
         BatchLockPeerDiagnostics, DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
-        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS,
-        UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LOCK_PEER_WRITER_RETRY_TIMEOUT, LockAcquireFailureKind,
+        LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure,
+        should_warn_lock_failure,
     };
     use crate::{
         GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
@@ -3292,11 +3302,11 @@ mod tests {
 
     #[derive(Debug)]
     struct TimeoutRecordingClient {
-        seen_timeouts: Arc<Mutex<Vec<Duration>>>,
+        seen_timeouts: Arc<Mutex<Vec<(LockId, tokio::time::Instant, Duration)>>>,
     }
 
     impl TimeoutRecordingClient {
-        fn new(seen_timeouts: Arc<Mutex<Vec<Duration>>>) -> Self {
+        fn new(seen_timeouts: Arc<Mutex<Vec<(LockId, tokio::time::Instant, Duration)>>>) -> Self {
             Self { seen_timeouts }
         }
 
@@ -3308,7 +3318,11 @@ mod tests {
     #[async_trait::async_trait]
     impl LockClient for TimeoutRecordingClient {
         async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
-            self.seen_timeouts.lock().unwrap().push(request.acquire_timeout);
+            self.seen_timeouts.lock().expect("record peer contention waits").push((
+                request.lock_id.clone(),
+                tokio::time::Instant::now(),
+                request.acquire_timeout,
+            ));
             Ok(LockResponse::failure("Lock acquisition timeout", Duration::ZERO))
         }
 
@@ -4026,25 +4040,45 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn acquire_guard_bounds_peer_contention_wait() {
-        let seen_timeouts = Arc::new(Mutex::new(Vec::new()));
-        let clients: Vec<Arc<dyn LockClient>> = (0..4)
-            .map(|_| TimeoutRecordingClient::new(seen_timeouts.clone()).into_client())
-            .collect();
-        let lock = DistributedLock::new("test".to_string(), clients, 3);
-        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_millis(1500));
+        for lock_type in [LockType::Exclusive, LockType::Shared] {
+            let seen_timeouts = Arc::new(Mutex::new(Vec::new()));
+            let clients: Vec<Arc<dyn LockClient>> = (0..4)
+                .map(|_| TimeoutRecordingClient::new(seen_timeouts.clone()).into_client())
+                .collect();
+            let lock = DistributedLock::new("test".to_string(), clients, 3);
+            let request = LockRequest::new(ObjectKey::new("bucket", "object"), lock_type, "owner")
+                .with_acquire_timeout(Duration::from_secs(5));
+            let started = tokio::time::Instant::now();
 
-        let result = lock.acquire_guard(&request).await;
+            let result = lock.acquire_guard(&request).await;
 
-        assert_matches!(result, Ok(None));
-        let seen_timeouts = seen_timeouts.lock().unwrap();
-        assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
-        assert!(
-            seen_timeouts.iter().all(|timeout| *timeout <= LOCK_PEER_ACQUIRE_TIMEOUT),
-            "peer contention waits should be bounded by {LOCK_PEER_ACQUIRE_TIMEOUT:?}, saw {seen_timeouts:?}"
-        );
+            assert_matches!(result, Ok(None));
+            assert_eq!(started.elapsed(), request.acquire_timeout, "contention must respect the caller deadline");
+            let seen_timeouts = seen_timeouts.lock().expect("observed peer contention waits");
+            assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
+            let first_round_id = &seen_timeouts[0].0;
+            for (id, dispatched, timeout) in seen_timeouts.iter() {
+                let limit = if lock_type == LockType::Exclusive && id != first_round_id {
+                    LOCK_PEER_WRITER_RETRY_TIMEOUT
+                } else {
+                    LOCK_PEER_ACQUIRE_TIMEOUT
+                };
+                assert!(*timeout <= limit, "{lock_type:?} peer wait must respect its round limit");
+                let remaining = request.acquire_timeout.saturating_sub(dispatched.duration_since(started));
+                assert!(*timeout <= remaining, "a peer wait must fit the caller's remaining budget");
+            }
+            assert_eq!(seen_timeouts[0].2, LOCK_PEER_ACQUIRE_TIMEOUT, "the first probe must retain its limit");
+            if lock_type == LockType::Exclusive {
+                assert!(
+                    seen_timeouts
+                        .iter()
+                        .any(|(_, _, timeout)| *timeout == LOCK_PEER_WRITER_RETRY_TIMEOUT),
+                    "a contended writer must receive the longer retry wait"
+                );
+            }
+        }
     }
 
     async fn wait_for_acquisition_cleanup(clients: &[Arc<SequencedClient>]) {

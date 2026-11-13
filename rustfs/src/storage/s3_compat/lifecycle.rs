@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Converts only the lifecycle family between the legacy S3 edge and its persistence shape.
+//! Converts only the lifecycle family between the legacy S3 edge and its persistence shape. Answers
+//! cross the gateway seam instead (`app::bucket_usecase::lifecycle`); the reverse direction is
+//! compiled only as the oracle of the legacy answer-parity test and goes with the forward one.
 //! Dates keep their original precision and offset until an XML or cache encoder runs.
 
 use rustfs_gateway_types::persistence::{
@@ -33,6 +35,7 @@ fn date_from_s3s(value: Option<dto::Timestamp>) -> std::io::Result<Option<String
         .transpose()
 }
 
+#[cfg(test)]
 fn date_to_s3s(value: Option<String>) -> std::io::Result<Option<dto::Timestamp>> {
     value
         .map(|value| {
@@ -52,6 +55,7 @@ pub(crate) fn lifecycle_configuration_from_s3s(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn lifecycle_configuration_to_s3s(
     value: PersistedLifecycleConfiguration,
 ) -> std::io::Result<dto::BucketLifecycleConfiguration> {
@@ -131,6 +135,7 @@ fn rule_from_s3s(value: dto::LifecycleRule) -> std::io::Result<PersistedLifecycl
     })
 }
 
+#[cfg(test)]
 fn rule_to_s3s(value: PersistedLifecycleRule) -> std::io::Result<dto::LifecycleRule> {
     Ok(dto::LifecycleRule {
         abort_incomplete_multipart_upload: value
@@ -204,9 +209,70 @@ fn tag_from_s3s(value: dto::Tag) -> PersistedLifecycleTag {
         value: value.value,
     }
 }
+#[cfg(test)]
 fn tag_to_s3s(value: PersistedLifecycleTag) -> dto::Tag {
     dto::Tag {
         key: value.key,
         value: value.value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lifecycle_configuration_to_s3s;
+    use crate::app::dto_values::stored_config;
+    use crate::storage::storage_api::ecstore_bucket::utils::BucketConfigXml;
+    use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_bucket_lifecycle_configuration::output_to_s3s;
+    use rustfs_gateway_types::dto as gateway_dto;
+    use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, parse_lifecycle_dto};
+    use s3s::{dto, xml};
+
+    /// Every member the legacy answer carries, the MinIO ones and dates with an offset included.
+    const STORED: &[u8] = b"<LifecycleConfiguration><Rule><DelMarkerExpiration><Days>7</Days></DelMarkerExpiration>\
+<Expiration><Days>30</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration><Filter><And><Prefix>logs/\
+</Prefix><Tag><Key>tier</Key><Value>cold</Value></Tag><ObjectSizeGreaterThan>1</ObjectSizeGreaterThan></And></Filter>\
+<ID>members</ID><NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays><NewerNoncurrentVersions>2\
+</NewerNoncurrentVersions></NoncurrentVersionExpiration><NoncurrentVersionTransition><NoncurrentDays>3</NoncurrentDays>\
+<StorageClass>WARM</StorageClass></NoncurrentVersionTransition><Status>Enabled</Status><Transition><Days>10</Days>\
+<StorageClass>WARM</StorageClass></Transition></Rule><Rule><AbortIncompleteMultipartUpload><DaysAfterInitiation>3\
+</DaysAfterInitiation></AbortIncompleteMultipartUpload><Expiration><Date>2099-01-01T00:00:00Z</Date></Expiration><ID>dated\
+</ID><Prefix>archive/</Prefix><Status>Disabled</Status><Transition><Date>2098-06-01T08:00:00+08:00</Date><StorageClass>WARM\
+</StorageClass></Transition></Rule></LifecycleConfiguration>";
+
+    fn s3s_bytes(value: &dto::GetBucketLifecycleConfigurationOutput) -> String {
+        let mut buf = Vec::new();
+        xml::Serialize::serialize(value, &mut xml::Serializer::new(&mut buf)).expect("the s3s encoder writes the answer");
+        String::from_utf8(buf).expect("the s3s encoder writes UTF-8")
+    }
+
+    /// The legacy stack answers a stored configuration through the gateway seam with the bytes it
+    /// answered through this module's reverse direction.
+    #[test]
+    fn the_legacy_answer_through_the_seam_is_the_answer_of_the_reverse_direction() {
+        let stored = PersistedLifecycleConfiguration::decode_config_xml(STORED).expect("the fixture is a stored document");
+        let before = dto::GetBucketLifecycleConfigurationOutput {
+            rules: Some(
+                lifecycle_configuration_to_s3s(stored.clone())
+                    .expect("reverse direction")
+                    .rules,
+            ),
+            ..Default::default()
+        };
+        let answer = gateway_dto::GetBucketLifecycleConfigurationOutput {
+            rules: stored_config(&stored, parse_lifecycle_dto).expect("gateway answer").rules,
+            ..Default::default()
+        };
+
+        let after = s3s_bytes(&output_to_s3s(answer).expect("seam"));
+
+        assert_eq!(after, s3s_bytes(&before));
+        for member in [
+            "<DelMarkerExpiration>",
+            "<ExpiredObjectAllVersions>",
+            "<Transition>",
+            "<Date>2098-06-01T",
+        ] {
+            assert!(after.contains(member), "{member} is missing from {after}");
+        }
     }
 }

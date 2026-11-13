@@ -16,8 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    GetBucketLocationInput, GetBucketLocationOutput,
+    BucketLocationConstraint, DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput,
 };
 use crate::app::storage_api::s3::region::Region;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
@@ -36,19 +35,29 @@ fn location_constraint_is_served(location: &str, server_region: &str, additional
 /// second account that could trigger `BucketAlreadyExists`. That leaves the AWS
 /// account-owner semantics: the default region returns the legacy idempotent
 /// `200 OK`, any other region returns `BucketAlreadyOwnedByYou`.
-fn create_bucket_exists_response(region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
+fn create_bucket_exists_response(region: &str) -> rustfs_s3_types::S3Result<gateway_dto::CreateBucketOutput> {
     if region == RUSTFS_REGION {
-        return Ok(S3Response::new(CreateBucketOutput::default()));
+        return Ok(gateway_dto::CreateBucketOutput::default());
     }
 
-    Err(S3Error::with_message(
-        S3ErrorCode::BucketAlreadyOwnedByYou,
-        "The requested bucket already exists.",
+    Err(rustfs_s3_types::s3_error!(
+        BucketAlreadyOwnedByYou,
+        "The requested bucket already exists."
     ))
 }
 
+/// The `LocationConstraint` of a CreateBucket body, as written; an empty one is none.
+pub(crate) fn requested_location_constraint(input: &gateway_dto::CreateBucketInput) -> Option<&str> {
+    input
+        .create_bucket_configuration
+        .as_ref()
+        .and_then(|config| config.location_constraint.as_ref())
+        .map(|location| location.as_str())
+        .filter(|location| !location.is_empty())
+}
+
 impl DefaultBucketUsecase {
-    fn create_bucket_exists_result(&self) -> S3Result<S3Response<CreateBucketOutput>> {
+    fn create_bucket_exists_result(&self) -> rustfs_s3_types::S3Result<gateway_dto::CreateBucketOutput> {
         let region = self
             .global_region()
             .map(|region| region.to_string())
@@ -56,21 +65,27 @@ impl DefaultBucketUsecase {
         create_bucket_exists_response(&region)
     }
 
+    /// Creates `input.bucket`, for either edge, on a fresh admitted task. The access phase has
+    /// authorized it; an existing bucket is answered without entering the mutation queue.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidLocationConstraint` for a constraint this server does not serve;
+    /// `BucketAlreadyOwnedByYou` for an existing bucket outside the default region;
+    /// `InternalError` when the access phase installed no `ReqInfo` or the store is not
+    /// initialized; otherwise the admission refusal or the storage error of the creation.
     #[instrument(
         level = "debug",
-        skip(self, req),
+        skip(self, envelope, input),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
-    pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+    pub async fn execute_create_bucket(
+        &self,
+        envelope: RequestEnvelope,
+        input: gateway_dto::CreateBucketInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::CreateBucketOutput> {
         rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
-        if let Some(location) = req
-            .input
-            .create_bucket_configuration
-            .as_ref()
-            .and_then(|config| config.location_constraint.as_ref())
-            .map(BucketLocationConstraint::as_str)
-            .filter(|location| !location.is_empty())
-        {
+        if let Some(location) = requested_location_constraint(&input) {
             let location = if location == "EU" { "eu-west-1" } else { location };
             let region = self.global_region();
             if !location_constraint_is_served(
@@ -78,53 +93,50 @@ impl DefaultBucketUsecase {
                 region.as_ref().map_or(RUSTFS_REGION, Region::as_str),
                 &self.additional_regions(),
             ) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidLocationConstraint,
-                    "The specified location constraint does not match this server's region.",
+                return Err(rustfs_s3_types::s3_error!(
+                    InvalidLocationConstraint,
+                    "The specified location constraint does not match this server's region."
                 ));
             }
         }
 
         // An existing bucket needs no mutation. Answer before the mutation queue and the
         // bucket's exclusive locks, which wait for every in-flight object write.
-        if req_info_ref(&req).is_ok()
+        if envelope.req_info().is_some()
             && let Some(store) = self.object_store()
             && store
-                .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+                .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
                 .await
                 .is_ok()
         {
-            let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
+            let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::BucketCreated, S3Operation::CreateBucket);
             let result = self.create_bucket_exists_result();
-            let _ = helper.complete(&result);
+            let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
             return result;
         }
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
-            usecase.execute_create_bucket_inner(req, mutation_permit).await
+            Ok(usecase.execute_create_bucket_inner(envelope, input, mutation_permit).await)
         })
-        .await
+        .await?
     }
 
     async fn execute_create_bucket_inner(
         &self,
-        req: S3Request<CreateBucketInput>,
+        envelope: RequestEnvelope,
+        input: gateway_dto::CreateBucketInput,
         mutation_permit: OwnedSemaphorePermit,
-    ) -> S3Result<S3Response<CreateBucketOutput>> {
-        let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        if req_info_ref(&req).is_err() {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
+    ) -> rustfs_s3_types::S3Result<gateway_dto::CreateBucketOutput> {
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::BucketCreated, S3Operation::CreateBucket);
+        let request_context = envelope.request_context().cloned();
+        if envelope.req_info().is_none() {
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Missing request info"));
         }
-        let CreateBucketInput {
-            bucket,
-            object_lock_enabled_for_bucket,
-            ..
-        } = req.input;
-        let lock_enabled = object_lock_enabled_for_bucket.is_some_and(|v| v);
+        let bucket = input.bucket.as_str().to_owned();
+        let lock_enabled = input.object_lock_enabled_for_bucket.is_some_and(|v| v);
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         // Keep the local namespace mutation and its peer hook ordered across
@@ -176,16 +188,15 @@ impl DefaultBucketUsecase {
             }
             Err(StorageError::BucketExists(_)) => {
                 let result = self.create_bucket_exists_result();
-                let _ = helper.complete(&result);
+                let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
                 return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
         }
 
-        let output = CreateBucketOutput::default();
         counter!("rustfs_create_bucket_total").increment(1);
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
+        let result = Ok(gateway_dto::CreateBucketOutput::default());
+        let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
         rustfs_scanner::record_dirty_usage_bucket_from_producer(
             &bucket,
             rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
@@ -330,7 +341,6 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, s3_op_total};
-    use crate::app::storage_api::s3::dto;
     use http::Method;
 
     #[test]
@@ -350,34 +360,58 @@ mod tests {
         assert!(!location_constraint_is_served("us-west", "us-east-1", &additional));
     }
 
+    /// A CreateBucket input for `bucket` with an optional `LocationConstraint`.
+    fn create_input(bucket: &str, location: Option<&str>) -> gateway_dto::CreateBucketInput {
+        gateway_dto::CreateBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new(bucket).expect("valid bucket name"),
+            create_bucket_configuration: location.map(|location| gateway_dto::CreateBucketConfiguration {
+                location_constraint: Some(gateway_dto::LocationConstraint::custom(location.to_owned())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The envelope of a request whose access phase installed `req_info`, or none.
+    fn envelope(req_info: Option<ReqInfo>) -> RequestEnvelope {
+        let req = match req_info {
+            Some(req_info) => build_request_with_req_info((), Method::PUT, req_info),
+            None => build_request((), Method::PUT),
+        };
+        RequestEnvelope::from_s3s(&req)
+    }
+
     #[test]
     fn create_bucket_exists_response_returns_ok_in_default_region() {
-        let response = create_bucket_exists_response(RUSTFS_REGION).expect("recreate in us-east-1 should succeed");
-        assert_eq!(response.output.location, None);
+        let output = create_bucket_exists_response(RUSTFS_REGION).expect("recreate in us-east-1 should succeed");
+        assert_eq!(output.location, None);
     }
 
     #[test]
     fn create_bucket_exists_response_returns_owned_by_you_outside_default_region() {
         let err = create_bucket_exists_response("eu-west-1").expect_err("recreate outside us-east-1 should report ownership");
-        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::BucketAlreadyOwnedByYou);
+    }
+
+    #[test]
+    fn an_empty_or_absent_location_constraint_is_none() {
+        assert_eq!(requested_location_constraint(&create_input("b-location", None)), None);
+        assert_eq!(requested_location_constraint(&create_input("b-location", Some(""))), None);
+        assert_eq!(
+            requested_location_constraint(&create_input("b-location", Some("eu-west-1"))),
+            Some("eu-west-1")
+        );
     }
 
     #[tokio::test]
     async fn execute_create_bucket_returns_internal_error_when_store_uninitialized() {
-        let input = CreateBucketInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
-        let mut call = Box::pin(usecase.execute_create_bucket(req));
+        let mut call = Box::pin(usecase.execute_create_bucket(envelope(None), create_input("test-bucket", None)));
         let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
             .await
             .expect_err("an uninitialized store must fail");
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(
             request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
             Some("s3:CreateBucket")
@@ -408,25 +442,14 @@ mod tests {
             for (requester_is_owner, location, expected_error) in [
                 (true, None, None),
                 (false, None, None),
-                (true, Some("ap-south-1"), Some(S3ErrorCode::InvalidLocationConstraint)),
+                (true, Some("ap-south-1"), Some(rustfs_s3_types::S3ErrorCode::InvalidLocationConstraint)),
             ] {
-                let input = CreateBucketInput {
-                    bucket: bucket.clone(),
-                    create_bucket_configuration: location.map(|location| dto::CreateBucketConfiguration {
-                        location_constraint: Some(BucketLocationConstraint::from(location.to_string())),
-                        ..Default::default()
-                    }),
+                let req_info = ReqInfo {
+                    is_owner: requester_is_owner,
                     ..Default::default()
                 };
-                let req = build_request_with_req_info(
-                    input,
-                    Method::PUT,
-                    ReqInfo {
-                        is_owner: requester_is_owner,
-                        ..Default::default()
-                    },
-                );
-                let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+                let call = usecase.execute_create_bucket(envelope(Some(req_info)), create_input(&bucket, location));
+                let result = tokio::time::timeout(Duration::from_secs(2), call)
                     .await
                     .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock");
                 match expected_error {
@@ -437,18 +460,12 @@ mod tests {
                 }
             }
 
-            let req = build_request(
-                CreateBucketInput {
-                    bucket,
-                    ..Default::default()
-                },
-                Method::PUT,
-            );
-            let err = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+            let call = usecase.execute_create_bucket(envelope(None), create_input(&bucket, None));
+            let err = tokio::time::timeout(Duration::from_secs(2), call)
                 .await
                 .expect("missing request info must fail before storage mutation")
                 .expect_err("an existing bucket must not bypass request-info validation");
-            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
         });
     }
 
@@ -459,17 +476,15 @@ mod tests {
             let context = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let bucket = format!("create-missing-{}", uuid::Uuid::new_v4().simple());
-            let input = CreateBucketInput::builder().bucket(bucket.clone()).build().unwrap();
-            let req = build_request_with_req_info(
-                input,
-                Method::PUT,
-                ReqInfo {
-                    is_owner: true,
-                    ..Default::default()
-                },
-            );
+            let req_info = ReqInfo {
+                is_owner: true,
+                ..Default::default()
+            };
             let usecase = DefaultBucketUsecase::with_context(Some(context));
-            usecase.execute_create_bucket(req).await.expect("create a missing bucket");
+            usecase
+                .execute_create_bucket(envelope(Some(req_info)), create_input(&bucket, None))
+                .await
+                .expect("create a missing bucket");
             let info = store
                 .get_bucket_info(&bucket, &BucketOptions::default())
                 .await
