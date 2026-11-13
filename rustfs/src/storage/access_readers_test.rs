@@ -422,8 +422,18 @@ fn resource_free_conditions_read_the_same_client_through_both_forms() {
         ),
     ] {
         let envelope = RequestEnvelope::from_s3s(&req);
-        let legacy_conditions = resource_free_condition_values(&req, &cred);
-        assert_eq!(legacy_conditions, resource_free_condition_values(&envelope, &cred), "{name}");
+        // The clock values are read at each call; every request-derived value must match.
+        let without_clock = |mut conditions: HashMap<String, Vec<String>>| {
+            conditions.remove("CurrentTime");
+            conditions.remove("EpochTime");
+            conditions
+        };
+        let legacy_conditions = without_clock(resource_free_condition_values(&req, &cred));
+        assert_eq!(
+            legacy_conditions,
+            without_clock(resource_free_condition_values(&envelope, &cred)),
+            "{name}"
+        );
         assert_eq!(source_ip(&legacy_conditions), expected, "{name}");
     }
 }
