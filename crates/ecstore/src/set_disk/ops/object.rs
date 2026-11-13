@@ -16251,11 +16251,20 @@ mod metadata_mutation_generation_tests {
             for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
                 assert!(!keys.contains(key), "a status write-back must not persist {key}");
             }
-            let added: HashSet<_> = keys.difference(before).collect();
-            assert!(
-                added.iter().all(|key| status.contains_key(*key)),
-                "a status write-back adds only the status keys: {added:?}"
-            );
+            // The write-back adds exactly the status keys `main` writes.
+            let added: HashSet<&str> = keys.difference(before).map(String::as_str).collect();
+            let expected: HashSet<&str> = status
+                .keys()
+                .map(String::as_str)
+                .chain([
+                    "X-Amz-Replication-Status",
+                    "x-rustfs-internal-replication-status",
+                    "x-minio-internal-replication-status",
+                    "x-rustfs-internal-data-moved",
+                    "x-minio-internal-data-moved",
+                ])
+                .collect();
+            assert_eq!(added, expected);
         }
     }
 
