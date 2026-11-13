@@ -2393,7 +2393,7 @@ mod tests {
     #[test]
     fn collected_put_body_joins_frames_only_when_they_match_the_size() {
         let collector: super::PutBodyCacheCollector =
-            Arc::new(Mutex::new(vec![Bytes::from_static(b"hell"), Bytes::from_static(b"o")]));
+            Arc::new(Mutex::new(vec![Bytes::from_static(b"he"), Bytes::from_static(b"llo")]));
         assert_eq!(super::collected_put_body(&collector, 5).as_deref(), Some(&b"hello"[..]));
         let collector: super::PutBodyCacheCollector = Arc::new(Mutex::new(vec![Bytes::from_static(b"hello")]));
         assert!(super::collected_put_body(&collector, 4).is_none(), "a size mismatch must not fill");
