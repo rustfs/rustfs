@@ -41,7 +41,7 @@ use rustfs_madmin::{
     ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy};
+use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy, SVC_TARGET_USER};
 use rustfs_s3_types::{Body, S3ErrorCode::InvalidRequest};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
@@ -139,19 +139,8 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
     caller_parent == target_parent_user
 }
 
-/// GHSA-5354: whether a caller resolving to `owner` may create a service account
-/// parented to `target_user`, given the caller's own key (`req_user`) and its
-/// effective parent (`req_parent_user`, which equals `req_user` for a top-level
-/// user or the parent for a derived credential).
-///
-/// The `CreateServiceAccountAdminAction` permission gates *whether* a caller may
-/// create service accounts, not *for whom*. A non-owner is therefore confined to
-/// its own non-root scope; only an owner may target another user — including the root
-/// credential, whose existence check is deliberately lenient. Without this a
-/// caller holding only that action could pass `target_user = <root access key>`
-/// and mint a root-parented service account that authenticates as owner via
-/// `prepare_service_account_auth`, a full-takeover privilege escalation. Mirrors
-/// `imported_service_account_parent_allowed` on the ImportIam path (GHSA-566f).
+/// Scope available with the base create permission. Creating for another local
+/// user requires separate authorization in IAM, even when the caller is owner.
 fn add_service_account_parent_within_scope(
     root_access_key: &str,
     target_user: &str,
@@ -376,20 +365,13 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
         }
 
-        let mut target_user = if let Some(u) = create_req.target_user {
-            u
-        } else {
-            cred.access_key.clone()
-        };
-
-        let req_user = cred.access_key.clone();
-        let mut req_parent_user = cred.access_key.clone();
-        let req_groups = cred.groups.clone();
-        let mut req_is_derived_cred = false;
-
-        if cred.is_service_account() || cred.is_temp() {
-            req_parent_user = cred.parent_user.clone();
-            req_is_derived_cred = true;
+        let requested_user = create_req.target_user.as_deref().unwrap_or(&cred.access_key);
+        let derived = cred.is_service_account() || cred.is_temp();
+        let caller_parent = if derived { &cred.parent_user } else { &cred.access_key };
+        let self_scoped = requested_user == cred.access_key || requested_user == caller_parent;
+        let target_user = if self_scoped { caller_parent.as_str() } else { requested_user };
+        if target_user.is_empty() {
+            return Err(s3_error!(AccessDenied, "service account requires a parent"));
         }
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
@@ -400,48 +382,45 @@ impl Operation for AddServiceAccount {
         let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         set_service_account_duration_condition(&mut conditions, create_req.expiration, OffsetDateTime::now_utc());
 
-        // This family deliberately calls `is_allowed` directly instead of going
-        // through `validate_admin_request`, and must keep doing so
-        // (backlog#1886). The shared helper returns as soon as *any* candidate
-        // action is allowed — an OR. The checks here are an AND: each one must
-        // pass, and a later stage additionally needs `owner` for the GHSA-5354
-        // parent-scope guard and drives `deny_only` dynamically. Replacing these
-        // with the shared gate would widen authorization.
-        if !iam_store
-            .is_allowed(&Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
-                bucket: "",
-                conditions: &conditions,
-                is_owner: owner,
-                object: "",
-                claims: cred.claims_or_empty(),
-                deny_only: false, // Always require explicit Allow permission
-            })
-            .await
-        {
-            return Err(s3_error!(AccessDenied, "access denied"));
-        }
-
-        if target_user != cred.access_key {
-            let has_user = iam_store.get_user(&target_user).await;
-            if has_user.is_none() && target_user != sys_cred.access_key {
+        // The policy and the write must see the same resolved parent, including
+        // when a derived credential names itself. OPA receives this map too.
+        conditions.retain(|key, _| !key.eq_ignore_ascii_case(SVC_TARGET_USER));
+        conditions.insert(SVC_TARGET_USER.to_owned(), vec![target_user.to_owned()]);
+        if self_scoped {
+            if !iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
+                    bucket: "",
+                    conditions: &conditions,
+                    is_owner: owner,
+                    object: "",
+                    claims: cred.claims_or_empty(),
+                    deny_only: false,
+                })
+                .await
+            {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
+            if !add_service_account_parent_within_scope(
+                &sys_cred.access_key,
+                requested_user,
+                &cred.access_key,
+                caller_parent,
+                owner,
+            ) {
+                return Err(s3_error!(AccessDenied, "service account parent is outside requester scope"));
+            }
+            if requested_user != cred.access_key
+                && requested_user != sys_cred.access_key
+                && iam_store.get_user(requested_user).await.is_none()
+            {
                 return Err(s3_error!(InvalidRequest, "target user not exist"));
             }
         }
 
-        let is_svc_acc = target_user == req_user || target_user == req_parent_user;
-        // GHSA-5354: confine a non-owner caller to its own scope so it cannot mint
-        // a root-parented (owner) service account. Evaluated on the original
-        // `target_user` the caller submitted, before the derived-credential rewrite
-        // to `req_parent_user` below, so the guard is bound to the parent actually
-        // requested and to the effective parent after that rewrite.
-        if !add_service_account_parent_within_scope(&sys_cred.access_key, &target_user, &req_user, &req_parent_user, owner) {
-            return Err(s3_error!(AccessDenied, "service account parent is outside requester scope"));
-        }
-
-        let mut target_groups = None;
+        let target_groups = if self_scoped { cred.groups.clone() } else { None };
         let opts = NewServiceAccountOpts {
             access_key: create_req.access_key,
             secret_key: create_req.secret_key,
@@ -452,25 +431,20 @@ impl Operation for AddServiceAccount {
             ..Default::default()
         };
 
-        if is_svc_acc {
-            if req_is_derived_cred {
-                if req_parent_user.is_empty() {
-                    return Err(s3_error!(AccessDenied, "only derived cred can create service account"));
-                }
-                target_user = req_parent_user;
-            }
-
-            target_groups = req_groups;
-        }
-
         let replication_groups = target_groups.clone().unwrap_or_default();
         let replication_name = opts.name.clone().unwrap_or_default();
         let replication_description = opts.description.clone().unwrap_or_default();
         let replication_expiration = opts.expiration;
 
-        let create_result = iam_store
-            .new_service_account_from_caller(&target_user, target_groups, opts, &cred)
-            .await;
+        let create_result = if self_scoped {
+            iam_store
+                .new_service_account_from_caller(target_user, target_groups, opts, &cred)
+                .await
+        } else {
+            iam_store
+                .new_service_account_for_user(target_user, opts, &cred, &conditions, owner)
+                .await
+        };
         let (new_cred, updated_at, replication_claims) = create_result.map_err(|e| {
             debug!(
                 component = LOG_COMPONENT_ADMIN,
@@ -482,6 +456,7 @@ impl Operation for AddServiceAccount {
                 "admin service account state"
             );
             match e {
+                rustfs_iam::error::Error::NoSuchUser(_) => s3_error!(InvalidRequest, "target user not exist"),
                 rustfs_iam::error::Error::InvalidArgument
                 | rustfs_iam::error::Error::InvalidAccessKeyLength
                 | rustfs_iam::error::Error::InvalidSecretKeyLength
@@ -497,7 +472,7 @@ impl Operation for AddServiceAccount {
             r#type: "service-account".to_string(),
             svc_acc_change: Some(SRSvcAccChange {
                 create: Some(SRSvcAccCreate {
-                    parent: target_user.clone(),
+                    parent: target_user.to_owned(),
                     access_key: new_cred.access_key.clone(),
                     secret_key: new_cred.secret_key.clone(),
                     groups: replication_groups,
