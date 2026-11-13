@@ -44,6 +44,13 @@
 # well inside the 120-minute budget and buys deterministic infra. The
 # docker-capable self-hosted `dind-sm-standard-2` label was the alternative but
 # has fewer cores and reintroduces fleet-state risk for no reliability gain.
+#
+# Stack dimension (rustfs/backlog#2774, T3.3): one image, run with RUSTFS_S3_STACK=legacy and
+# =gateway. `compare` (scripts/mint_stack_diff.py) holds the gate that every case legacy passes
+# passes on gateway with no new failure. The gateway leg and `compare` are report-only until
+# T2.10. A gateway server that refuses to start stops its leg at "Wait for RustFS ready", before
+# mint runs; the summary says `skipped: gateway stack refuses startup: <why>`. The stack is read
+# from the server's own start-up line (scripts/dual_stack.py stack).
 
 name: mint
 
@@ -108,14 +115,8 @@ defaults:
     shell: bash
 
 jobs:
-  mint:
-    # GitHub-hosted: reliably provides a running Docker daemon + buildx +
-    # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
-    # label was abandoned (no docker.sock on the pod its only run landed on).
-    # sm-standard-2 has no docker.sock either (weekly runs failed at "Enable
-    # buildx" from 2026-09-27 to 2026-11-08), so keep this job on ubuntu-latest.
-    # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
-    # run) is added by the ci-8 composite action; do not implement it here.
+  image:
+    name: Build the RustFS image once
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -134,6 +135,48 @@ jobs:
             --cache-to "type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE}" \
             -t rustfs-ci \
             -f Dockerfile.source .
+          docker save rustfs-ci --output "${RUNNER_TEMP}/rustfs-ci.tar"
+
+      - name: Upload the image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mint-image
+          path: ${{ runner.temp }}/rustfs-ci.tar
+          retention-days: 1
+
+  mint:
+    name: mint (${{ matrix.stack }}${{ matrix.stack == 'gateway' && ', report-only until T2.10' || '' }})
+    needs: [image]
+    # Report-only until T2.10: the gateway stack cannot serve the suites yet.
+    continue-on-error: ${{ matrix.stack == 'gateway' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [legacy, gateway]
+    env:
+      STACK: ${{ matrix.stack }}
+    # GitHub-hosted: reliably provides a running Docker daemon + buildx +
+    # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
+    # label was abandoned (no docker.sock on the pod its only run landed on).
+    # sm-standard-2 has no docker.sock either (weekly runs failed at "Enable
+    # buildx" from 2026-09-27 to 2026-11-08), so keep this job on ubuntu-latest.
+    # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
+    # run) is added by the ci-8 composite action; do not implement it here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download the image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mint-image
+          path: ${{ runner.temp }}
+
+      - name: Load the image
+        run: docker load --input "${RUNNER_TEMP}/rustfs-ci.tar"
 
       - name: Start RustFS
         run: |
@@ -151,6 +194,8 @@ jobs:
             -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
             -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
             -e RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
+            -e RUSTFS_S3_STACK="${STACK}" \
+            -e RUST_LOG=rustfs=info \
             -v /tmp/rustfs-mint:/data \
             rustfs-ci
 
@@ -246,16 +291,50 @@ jobs:
           mkdir -p artifacts/rustfs-mint
           docker logs rustfs-mint > artifacts/rustfs-mint/rustfs.log 2>&1 || true
 
+      - name: Prove which stack the server selected
+        if: always()
+        run: python3 scripts/dual_stack.py stack --expect "${STACK}" --out artifacts/stack.json artifacts/rustfs-mint
+
       - name: Upload artifacts
         if: always() && env.ACT != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mint
+          name: mint-${{ matrix.stack }}
           path: artifacts/**
+
+  compare:
+    name: Compare stacks (report-only until T2.10)
+    needs: [mint]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download both legs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mint-{legacy,gateway}
+          path: legs
+
+      # A leg that never uploaded leaves no directory: create both so that the
+      # comparison reports "no result" for it instead of failing to find it.
+      - name: Compare the stacks
+        run: |
+          # The shell runs with -e; the exit status is reported after the summary is written.
+          set +e -u -o pipefail
+          mkdir -p legs/mint-legacy legs/mint-gateway
+          python3 scripts/mint_stack_diff.py legs/mint-legacy legs/mint-gateway | tee report.txt
+          status="${PIPESTATUS[0]}"
+          { echo '## Mint: gateway versus legacy'; echo; echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   alert-on-failure:
     name: Alert on scheduled failure
-    needs: [mint]
+    needs: [image, mint]
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.

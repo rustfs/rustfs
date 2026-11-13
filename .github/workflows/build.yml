@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nightly development artifacts and reusable immutable-candidate builds.
+# Scheduled development artifacts and reusable immutable-candidate builds.
+# The daily cron builds Linux. Sunday 16:17 UTC builds macOS and Windows.
 # Public release writes live exclusively in release-publish.yml. Candidate callers
 # select Linux or desktop and pin release inputs before any matrix starts.
 
@@ -30,7 +31,8 @@ on:
         required: true
         type: string
   schedule:
-    - cron: "13 1 * * *" # Nightly 01:13 UTC
+    - cron: "13 1 * * *" # Daily Linux, 01:13 UTC
+    - cron: "17 16 * * 0" # Weekly macOS and Windows, Sunday 16:17 UTC
   workflow_dispatch:
     inputs:
       publish:
@@ -219,16 +221,33 @@ jobs:
         env:
           # via env, not interpolation: a dispatch input is free-form text and
           # would otherwise be pasted into the script for bash to evaluate.
-          # Daily development builds cover Linux. Desktop remains available on
-          # manual dispatch and is required after candidate field acceptance.
+          # A direct schedule has no platforms input. Choose its subset from
+          # github.event.schedule, which is fixed when that cron fires, so a
+          # queued job cannot switch subsets because the runner clock moved.
+          # Callers that pass platforms keep that list, including a scheduled
+          # caller: inputs.platforms is set even though event_name stays schedule.
           RAW_PLATFORMS: ${{ inputs.platforms || 'linux' }}
+          HAS_PLATFORM_INPUT: ${{ inputs.platforms && 'true' || 'false' }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
 
-          selected="$RAW_PLATFORMS"
-          selected="$(echo "${selected}" | tr -d '[:space:]')"
-          if [[ -z "${selected}" ]]; then
-            selected="all"
+          if [[ "${EVENT_NAME}" == "schedule" && "${HAS_PLATFORM_INPUT}" != "true" ]]; then
+            if [[ "${EVENT_SCHEDULE}" == "13 1 * * *" ]]; then
+              selected="linux"
+            elif [[ "${EVENT_SCHEDULE}" == "17 16 * * 0" ]]; then
+              selected="desktop"
+            else
+              echo "Unrecognized schedule cron: ${EVENT_SCHEDULE}" >&2
+              exit 1
+            fi
+          else
+            selected="${RAW_PLATFORMS}"
+            selected="$(echo "${selected}" | tr -d '[:space:]')"
+            if [[ -z "${selected}" ]]; then
+              selected="all"
+            fi
           fi
 
           # linux-aarch64-* need a real aarch64 host (placement rule: hardware)

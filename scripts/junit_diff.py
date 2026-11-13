@@ -18,8 +18,13 @@ Cases are aligned on classname + name and reduced to pass / fail / skip. A case
 present in only one report is reported as `missing` on the other side. A
 `<flakyFailure>` case that finally passed is a pass and is listed separately.
 
+A side that is missing, empty or holds no test case produced no result: that is
+exit 2 with `no result for <label>`, never an empty comparison that reads as
+"No differences".
+
 Exit codes: 0 no unallowed differences and no stale allow-list entry; 1 at least
-one difference or stale allow-list entry; 2 unreadable or malformed input.
+one difference or stale allow-list entry; 2 no result for a side, or unreadable or
+malformed input.
 """
 
 import argparse
@@ -35,6 +40,10 @@ class InputError(Exception):
     """Input that cannot be trusted as a report; maps to exit code 2."""
 
 
+class NoResult(InputError):
+    """A report that is missing, empty or holds no test case: the side ran nothing observable."""
+
+
 def case_id(classname, name):
     return f"{classname}::{name}" if classname else name
 
@@ -44,10 +53,12 @@ def parse_report(path):
     try:
         with open(path, "rb") as handle:
             data = handle.read()
+    except FileNotFoundError as exc:
+        raise NoResult(f"{path}: cannot read: file is missing") from exc
     except OSError as exc:
         raise InputError(f"{path}: cannot read: {exc.strerror or exc}") from exc
     if not data.strip():
-        raise InputError(f"{path}: file is empty")
+        raise NoResult(f"{path}: file is empty")
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
@@ -73,8 +84,16 @@ def parse_report(path):
         if state == PASS and tags & _RETRY_TAGS:
             flaky.append(cid)
     if not states:
-        raise InputError(f"{path}: report contains no test cases")
+        raise NoResult(f"{path}: report contains no test cases")
     return states, sorted(flaky)
+
+
+def load_report(path, label):
+    """parse_report, naming the side whose report is absent."""
+    try:
+        return parse_report(path)
+    except NoResult as exc:
+        raise InputError(f"no result for {label}: {exc}") from exc
 
 
 def read_allow(path):
@@ -140,8 +159,8 @@ def main(argv=None):
         print("error: --label-a and --label-b must differ", file=sys.stderr)
         return 2
     try:
-        states_a, flaky_a = parse_report(args.a)
-        states_b, flaky_b = parse_report(args.b)
+        states_a, flaky_a = load_report(args.a, args.label_a)
+        states_b, flaky_b = load_report(args.b, args.label_b)
         allow = read_allow(args.allow) if args.allow else set()
         diffs, stale = compare(states_a, states_b, allow)
         counts_a, counts_b = counts(states_a), counts(states_b)

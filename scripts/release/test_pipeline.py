@@ -393,11 +393,69 @@ class PromotionTests(unittest.TestCase):
 
 
 class WorkflowContractTests(unittest.TestCase):
-    def test_nightly_avoids_desktop_and_manual_builds_keep_platform_selection(self):
+    def test_schedule_cron_selects_linux_or_desktop_without_dropping_manual_platforms(self):
         value = workflow("build.yml")
-        selection = value["jobs"]["prepare-platform-matrix"]["steps"][-1]
-        self.assertEqual(selection["env"]["RAW_PLATFORMS"], "${{ inputs.platforms || 'linux' }}")
+        self.assertEqual([item["cron"] for item in value["on"]["schedule"]], ["13 1 * * *", "17 16 * * 0"])
+        self.assertNotIn("push", value["on"])
+        self.assertNotIn("pull_request", value["on"])
         self.assertEqual(value["on"]["workflow_dispatch"]["inputs"]["platforms"]["default"], "all")
+        selection = value["jobs"]["prepare-platform-matrix"]["steps"][-1]
+        env = selection["env"]
+        self.assertEqual(env["RAW_PLATFORMS"], "${{ inputs.platforms || 'linux' }}")
+        self.assertEqual(env["HAS_PLATFORM_INPUT"], "${{ inputs.platforms && 'true' || 'false' }}")
+        self.assertEqual(env["EVENT_NAME"], "${{ github.event_name }}")
+        self.assertEqual(env["EVENT_SCHEDULE"], "${{ github.event.schedule }}")
+        linux = [
+            ("linux-x86_64-musl", "sm-standard-4"),
+            ("linux-aarch64-musl", "ubicloud-standard-16-arm"),
+            ("linux-x86_64-gnu", "sm-standard-4"),
+            ("linux-aarch64-gnu", "ubicloud-standard-16-arm"),
+        ]
+        desktop = [("macos-aarch64", "macos-latest-xlarge"), ("windows-x86_64", "windows-latest")]
+
+        def select(event, raw, schedule="", has_input="false"):
+            with tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "github-output"
+                environment = {**os.environ, "EVENT_NAME": event, "EVENT_SCHEDULE": schedule,
+                               "RAW_PLATFORMS": raw, "HAS_PLATFORM_INPUT": has_input, "GITHUB_OUTPUT": str(output)}
+                result = subprocess.run(["bash", "-c", selection["run"]], env=environment, capture_output=True, text=True)
+                parsed = {}
+                if output.exists():
+                    for line in output.read_text().splitlines():
+                        key, item = line.split("=", 1)
+                        parsed[key] = item
+                return result, parsed
+
+        def rows(parsed):
+            return [(item["target_id"], item["os"]) for item in json.loads(parsed["matrix"])["include"]]
+
+        daily, daily_out = select("schedule", "all", "13 1 * * *")
+        self.assertEqual(daily.returncode, 0, daily.stderr)
+        self.assertEqual(rows(daily_out), linux)
+        self.assertEqual(daily_out["selected"], ",".join(item[0] for item in linux))
+        weekly, weekly_out = select("schedule", "linux", "17 16 * * 0")
+        self.assertEqual(weekly.returncode, 0, weekly.stderr)
+        self.assertEqual(rows(weekly_out), desktop)
+        self.assertEqual(weekly_out["selected"], ",".join(item[0] for item in desktop))
+        for schedule in ("", "13 1 * * 1", "0 16 * * 7", "13 1 extra stuff"):
+            rejected, _ = select("schedule", "all", schedule)
+            self.assertNotEqual(rejected.returncode, 0, schedule)
+            self.assertIn("Unrecognized schedule cron", rejected.stderr)
+        caller, caller_out = select("schedule", "linux", "17 16 * * 0", has_input="true")
+        self.assertEqual(caller.returncode, 0, caller.stderr)
+        self.assertEqual(rows(caller_out), linux)
+        dispatched, dispatched_out = select("workflow_dispatch", "all", has_input="true")
+        self.assertEqual(dispatched.returncode, 0, dispatched.stderr)
+        self.assertEqual(dispatched_out["selected"], "all")
+        self.assertEqual(rows(dispatched_out), linux + desktop)
+        custom, custom_out = select("workflow_dispatch", "linux-x86_64-musl,macos-aarch64", has_input="true")
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.assertEqual(custom_out["selected"], "linux-x86_64-musl,macos-aarch64")
+        self.assertEqual(rows(custom_out), [("linux-x86_64-musl", "sm-standard-4"), ("macos-aarch64", "macos-latest-xlarge")])
+        for event, raw, expected in (("workflow_call", "linux", linux), ("workflow_call", "desktop", desktop)):
+            called, called_out = select(event, raw, has_input="true")
+            self.assertEqual(called.returncode, 0, called.stderr)
+            self.assertEqual(rows(called_out), expected)
 
     def test_main_push_cannot_cancel_the_scheduled_oidc_gate(self):
         value = workflow("oidc-keycloak.yml")

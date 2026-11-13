@@ -33,22 +33,22 @@
 # cache-save-if to anything but 'false' for it; every lane in ci.yml reads.
 # scripts/security/check_cache_save_if.sh keeps the declarations explicit.
 #
-# The builds are supersets of what the reading lanes compile, because a reader
-# restores only what the writer saved. Feature resolution matters here: a lane
-# built with e2e-test-hooks resolves dependency features differently, which
-# changes -Cmetadata, so the plain build does not cover it. See
-# rustfs/backlog#1600.
+# A reader restores only what the writer saved, and Cargo reuses a dependency
+# only when it resolves the same features for it. Every package selection and
+# feature set resolves differently and changes -Cmetadata, so each job builds
+# its readers' own invocations, not a superset (rustfs/backlog#1600).
+#
+# Rust-cache never replaces an entry restored from an exact key match: the key
+# hashes the lockfile, toolchain and compiler environment, not the commit. A
+# job whose restore was an exact hit therefore skips its builds; they could
+# only produce what is already stored.
 
 name: Cache Warm
 
 on:
   schedule:
-    # Every six hours; the 22:41 UTC run lands before ci.yml's nightly 00:11
-    # UTC matrix. A reader restores the newest entry under its key and
-    # rebuilds whatever its own diff changed, so a cache up to six hours old
-    # costs a PR the handful of crates merged since. Warming after every merge
-    # (fourteen completed runs a day, about two sm-standard-4 hours each)
-    # spent far more than that to avoid it.
+    # Writes a key that no push created, such as one for a new stable
+    # toolchain; with every key present the jobs stop after the restore.
     - cron: "41 4,10,16,22 * * *"
   push:
     branches: [ main ]
@@ -96,8 +96,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Readers: workspace-clippy, workspace-lint-and-build, workspace-tests (workspace and ILM), build-rustfs-debug-binary,
-  # e2e-tests, e2e-full.
+  # Readers: workspace-clippy, workspace-lint-and-build, build-rustfs-debug-binary,
+  # connect-feature-boundaries (nightly) and reference-parity.yml.
   warm-ci-dev:
     name: Warm ci-dev
     runs-on: sm-standard-4
@@ -111,10 +111,13 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust environment
+        id: setup
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-dev
+          # Digest of the build steps below; scripts/ci_gate.py --check-workflow
+          # names the new key when they change, and every reader must follow.
+          cache-shared-key: ci-dev-ea7eec74fe14
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 
@@ -130,7 +133,7 @@ jobs:
       # 50% and 25% respectively; if linking dominates instead, the answer is
       # mold/lld plus split-debuginfo, which is exactly the part sccache cannot
       # touch. Off by default — this doubles the ci-dev build.
-      - name: Build ci-dev superset (with --timings)
+      - name: Build the workspace with --timings
         if: inputs.emit_timings
         env:
           CARGO_BUILD_JOBS: "2"
@@ -145,18 +148,18 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # --all-targets covers the test binaries nextest builds, including
-      # e2e_test, which the workspace run excludes. The second build adds
-      # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
-      # and that no lint lane enables.
-      - name: Build ci-dev superset
+      # The workspace and E2E test archives of workspace-lint-and-build and
+      # build-rustfs-debug-binary, then that job's hooks server.
+      - name: Build ci-dev reader selections
+        if: steps.setup.outputs.cache-hit != 'true'
         env:
-          # Same limit ci.yml puts on its nextest step: this builds the same
-          # ~100 workspace test binaries, and three concurrent links saturate the
-          # self-hosted runner's overlay I/O and can wedge Cargo (#5394).
+          # Same limit ci.yml puts on its archive steps: three concurrent test
+          # binary links saturate the self-hosted runner's overlay I/O and can
+          # wedge Cargo (#5394).
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo build --workspace --all-targets
+          python3 scripts/ci_test_artifact.py cargo warm --configuration workspace
+          python3 scripts/ci_test_artifact.py cargo warm --configuration e2e
           cargo build -p rustfs --bins --features e2e-test-hooks
 
       # ci.yml runs Clippy on every pull request. Clippy's check-mode artifacts
@@ -165,8 +168,9 @@ jobs:
       # touches. A lint failure on main must not stop the warm-up: the cache is
       # still saved (cache-on-failure), and the failure belongs to ci.yml.
       - name: Warm Clippy check artifacts
+        if: steps.setup.outputs.cache-hit != 'true'
         run: |
-          if ! cargo clippy --all-targets -- -D warnings; then
+          if ! python3 scripts/ci_test_artifact.py cargo lint --configuration workspace; then
             echo "::warning::cargo clippy reports findings on this commit; check artifacts are still cached"
           fi
 
@@ -213,6 +217,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust environment
+        id: setup
         uses: ./.github/actions/setup
         with:
           rust-version: stable
@@ -221,6 +226,7 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-rio superset
+        if: steps.setup.outputs.cache-hit != 'true'
         env:
           # --all-targets links the same test binaries as the reader lane.
           CARGO_BUILD_JOBS: "2"
@@ -244,6 +250,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust environment
+        id: setup
         uses: ./.github/actions/setup
         with:
           rust-version: stable
@@ -252,6 +259,7 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-proto superset
+        if: steps.setup.outputs.cache-hit != 'true'
         env:
           # Avoid an unbounded burst of concurrent test-binary links (#5394).
           CARGO_BUILD_JOBS: "2"
@@ -274,6 +282,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust environment
+        id: setup
         uses: ./.github/actions/setup
         with:
           rust-version: stable
@@ -282,7 +291,9 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Install build dependencies
+        if: steps.setup.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Build ci-uring superset
+        if: steps.setup.outputs.cache-hit != 'true'
         run: cargo build -p rustfs-ecstore --all-targets

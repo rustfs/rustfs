@@ -38,9 +38,9 @@ mod route_registration_test;
 
 use handlers::{
     account, audit, batch_job, bucket_meta, bucket_recovery, cluster_snapshot, config_admin, diagnostics,
-    durability as durability_handler, extensions, gateway_key_inventory, heal, health, idp_compat, ilm_transition,
-    inspect_archive, integrity, kms, mfa, module_switch, object_data_cache, object_zip_download, oidc, on_demand_migration,
-    plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
+    durability as durability_handler, etag as etag_handler, extensions, gateway_key_inventory, heal, health, idp_compat,
+    ilm_transition, inspect_archive, integrity, kms, mfa, module_switch, object_data_cache, object_zip_download, oidc,
+    on_demand_migration, plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
     replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, usage_prefix,
     user,
 };
@@ -83,6 +83,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
 
     quota_handler::register_quota_route(r)?;
     durability_handler::register_durability_route(r)?;
+    etag_handler::register_etag_route(r)?;
     bucket_recovery::register_bucket_recovery_route(r)?;
     on_demand_migration::register_on_demand_migration_route(r)?;
     bucket_meta::register_bucket_meta_route(r)?;
@@ -100,6 +101,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     plugins_instances::register_plugin_instance_route(r)?;
 
     replication_handler::register_replication_route(r)?;
+    handlers::s3_extension::register_s3_extension_routes(r)?;
     batch_job::register_batch_job_route(r)?;
     integrity::register_integrity_routes(r)?;
     site_replication::register_site_replication_route(r)?;

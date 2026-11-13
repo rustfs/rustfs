@@ -248,6 +248,10 @@ pub struct InstanceContext {
     /// Write-once like the process global it replaces: startup sets it exactly
     /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
     region: OnceLock<Region>,
+    /// Further regions this instance accepts as a bucket `LocationConstraint`
+    /// besides [`Self::region`] - the tail of a comma-separated `RUSTFS_REGION`.
+    /// Write-once like `region`.
+    additional_regions: OnceLock<Vec<Region>>,
     /// This instance's deployment id (Phase 5 Slice 5, backlog#939).
     ///
     /// Write-once identity, mirrored by `ECStore::id` (both come from the same
@@ -305,6 +309,9 @@ pub struct InstanceContext {
     /// reads share one registry. Replaces the three `GLOBAL_LOCAL_DISK_*`
     /// statics: the path→disk map, the disk-id→endpoint map, and the
     /// pool/set/drive layout.
+    // Registration writers serialize preparation and publication independently
+    // of the short-lived inventory locks used by RPC readers.
+    local_disk_registration: Mutex<()>,
     local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
@@ -463,6 +470,7 @@ impl InstanceContext {
             internode_data_transport: OnceLock::new(),
             lock_manager,
             region: OnceLock::new(),
+            additional_regions: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
             multipart_proof_topology: OnceLock::new(),
@@ -473,6 +481,7 @@ impl InstanceContext {
             bucket_monitor: OnceLock::new(),
             replication_stats: OnceCell::new(),
             replication_pool: OnceCell::new(),
+            local_disk_registration: Mutex::new(()),
             local_disk_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
@@ -881,6 +890,22 @@ impl InstanceContext {
         self.region.get().cloned()
     }
 
+    /// Set the further regions this instance accepts as a bucket
+    /// `LocationConstraint` besides its own [`Self::region`].
+    ///
+    /// Write-once: panics on a second write, like [`Self::set_region`].
+    pub fn set_additional_regions(&self, regions: Vec<Region>) {
+        self.additional_regions
+            .set(regions)
+            .expect("instance additional regions should be initialized once during startup");
+    }
+
+    /// The further regions this instance accepts as a bucket
+    /// `LocationConstraint`; empty unless startup set some.
+    pub fn additional_regions(&self) -> Vec<Region> {
+        self.additional_regions.get().cloned().unwrap_or_default()
+    }
+
     /// Set this instance's deployment id.
     ///
     /// Write-once: panics on a second write, preserving the startup fail-fast
@@ -936,11 +961,12 @@ impl InstanceContext {
         Ok(stored.1.clone())
     }
 
+    pub(crate) fn bound_multipart_proof_verification_context(&self) -> Option<ProofVerificationContext> {
+        self.multipart_proof_topology.get().map(|(_, authority)| authority.clone())
+    }
+
     pub(crate) fn multipart_proof_verification_context(&self) -> ProofVerificationContext {
-        self.multipart_proof_topology
-            .get()
-            .map(|(_, authority)| authority.clone())
-            .unwrap_or_default()
+        self.bound_multipart_proof_verification_context().unwrap_or_default()
     }
 
     /// This instance's tier configuration manager, materializing it on first
@@ -1007,6 +1033,10 @@ impl InstanceContext {
     }
 
     /// Handle to this instance's local path→disk map.
+    pub(crate) fn local_disk_registration_lock(&self) -> &Mutex<()> {
+        &self.local_disk_registration
+    }
+
     pub(crate) fn local_disk_map(&self) -> Arc<RwLock<HashMap<String, Option<DiskStore>>>> {
         self.local_disk_map.clone()
     }
@@ -1668,6 +1698,23 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_region(region("us-east-1"));
         ctx.set_region(region("eu-west-1"));
+    }
+
+    // Additional regions default to none and are write-once like the region.
+    #[tokio::test]
+    async fn additional_regions_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.additional_regions().is_empty());
+        ctx.set_additional_regions(vec![region("ap-southeast-2"), region("us-west-2")]);
+        assert_eq!(ctx.additional_regions(), vec![region("ap-southeast-2"), region("us-west-2")]);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_additional_regions_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_additional_regions(vec![region("us-west-2")]);
+        ctx.set_additional_regions(vec![region("eu-west-1")]);
     }
 
     // A fresh context has no deployment id until set; set-then-get round-trips.

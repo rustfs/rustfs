@@ -15,6 +15,19 @@
 //! Bucket create, delete, head and location use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    BucketLocationConstraint, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
+    GetBucketLocationInput, GetBucketLocationOutput,
+};
+use crate::app::storage_api::s3::region::Region;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+
+/// Whether `CreateBucket` may record `location`: the server's own region, or
+/// one of the further regions listed after it in `RUSTFS_REGION`. `location`
+/// has already had the `EU` alias resolved.
+fn location_constraint_is_served(location: &str, server_region: &str, additional_regions: &[Region]) -> bool {
+    location == server_region || additional_regions.iter().any(|region| region.as_str() == location)
+}
 
 /// Answer a `CreateBucket` for a bucket that already exists.
 ///
@@ -60,7 +73,11 @@ impl DefaultBucketUsecase {
         {
             let location = if location == "EU" { "eu-west-1" } else { location };
             let region = self.global_region();
-            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+            if !location_constraint_is_served(
+                location,
+                region.as_ref().map_or(RUSTFS_REGION, Region::as_str),
+                &self.additional_regions(),
+            ) {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidLocationConstraint,
                     "The specified location constraint does not match this server's region.",
@@ -262,21 +279,27 @@ impl DefaultBucketUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        record_s3_op(S3Operation::HeadBucket);
-        let input = req.input;
-
+    /// Answers whether `input.bucket` exists, for either edge. The access phase has authorized it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized; otherwise the storage error of the
+    /// lookup, `NoSuchBucket` among them.
+    #[instrument(level = "debug", skip(self, input))]
+    pub async fn execute_head_bucket(
+        &self,
+        input: gateway_dto::HeadBucketInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::HeadBucketOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        Ok(S3Response::new(HeadBucketOutput::default()))
+        Ok(gateway_dto::HeadBucketOutput::default())
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -307,7 +330,25 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, s3_op_total};
+    use crate::app::storage_api::s3::dto;
     use http::Method;
+
+    #[test]
+    fn location_constraint_is_served_accepts_server_and_additional_regions() {
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &[]));
+        assert!(!location_constraint_is_served("us-west-2", "us-east-1", &[]));
+
+        let additional: Vec<Region> = ["ap-southeast-2", "us-west-2"]
+            .into_iter()
+            .map(|region| region.parse().expect("region"))
+            .collect();
+        assert!(location_constraint_is_served("ap-southeast-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-west-2", "us-east-1", &additional));
+        assert!(location_constraint_is_served("us-east-1", "us-east-1", &additional));
+        assert!(!location_constraint_is_served("eu-west-1", "us-east-1", &additional));
+        // whole region names only, never a prefix
+        assert!(!location_constraint_is_served("us-west", "us-east-1", &additional));
+    }
 
     #[test]
     fn create_bucket_exists_response_returns_ok_in_default_region() {
@@ -371,7 +412,7 @@ mod tests {
             ] {
                 let input = CreateBucketInput {
                     bucket: bucket.clone(),
-                    create_bucket_configuration: location.map(|location| s3s_crate::dto::CreateBucketConfiguration {
+                    create_bucket_configuration: location.map(|location| dto::CreateBucketConfiguration {
                         location_constraint: Some(BucketLocationConstraint::from(location.to_string())),
                         ..Default::default()
                     }),
@@ -461,15 +502,17 @@ mod tests {
 
     #[tokio::test]
     async fn execute_head_bucket_returns_internal_error_when_store_uninitialized() {
-        let input = HeadBucketInput::builder().bucket("test-bucket".to_string()).build().unwrap();
-
-        let req = build_request(input, Method::HEAD);
+        let input = gateway_dto::HeadBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
         let before = s3_op_total(S3Operation::HeadBucket);
 
-        let err = usecase.execute_head_bucket(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(s3_op_total(S3Operation::HeadBucket), before + 1);
+        let err = usecase.execute_head_bucket(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+        // Each edge counts the operation once, before it calls the use case.
+        assert_eq!(s3_op_total(S3Operation::HeadBucket), before);
     }
 
     #[tokio::test]

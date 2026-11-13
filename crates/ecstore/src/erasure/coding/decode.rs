@@ -22,6 +22,7 @@ use crate::diagnostics::get::{
 use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::{Error, is_terminal_read_error};
 use crate::disk::error_reduce::reduce_errs;
+use crate::erasure::codec::shard_buf::ShardBuf;
 use crate::erasure::codec::workspace::ShardBufferPool;
 use crate::erasure::coding::{BitrotReader, Erasure};
 use crate::io_support::bitrot::DeferredReaderStripeHandle;
@@ -42,9 +43,9 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, warn};
 
-type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<ShardBuf, Error>, bool)> + Send + 'a>>;
 type OwnedShardReadFuture<'a, R> =
-    Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<ShardBuf, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
 pub(crate) type DeferredReaderReopener<R> = Arc<dyn Fn(usize) -> Option<BitrotReader<R>> + Send + Sync>;
 #[derive(Debug, Default)]
 pub(crate) struct DecodeOutcome {
@@ -330,20 +331,26 @@ async fn read_shard_result<R>(
     index: usize,
     read_cost: ShardReadCost,
     reader: &mut BitrotReader<R>,
-    recycled_buf: Option<Vec<u8>>,
+    recycled_buf: Option<ShardBuf>,
     shard_size: usize,
     data_shards: usize,
     read_timeout: Duration,
     metrics_path: Option<&'static str>,
-) -> (Result<Vec<u8>, Error>, bool)
+) -> (Result<ShardBuf, Error>, bool)
 where
     R: crate::erasure::coding::ShardSource,
 {
     let role = shard_role(index, data_shards);
     // Capacity, not length: `read_appending` writes every byte it returns, so
     // the buffer never needs zeroing first (rustfs/backlog#1159).
-    let mut buf = recycled_buf.unwrap_or_else(|| Vec::with_capacity(shard_size));
+    let mut buf = recycled_buf.unwrap_or_else(|| ShardBuf::with_capacity(shard_size));
     buf.clear();
+    if metrics_path.is_some() {
+        // Where the shard buffer lives, with the requested capacity as the
+        // recorded value so the summary shows it next to the arena block size.
+        let home = if buf.is_arena() { "shard_buf_arena" } else { "shard_buf_heap" };
+        rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", home, shard_size as f64);
+    }
     let read_start = metrics_path.map(|_| Instant::now());
     let read_result = if read_timeout.is_zero() {
         reader.read_appending(&mut buf, shard_size).await
@@ -416,7 +423,7 @@ fn read_shard<'a, R>(
     index: usize,
     read_cost: ShardReadCost,
     reader: &'a mut Option<BitrotReader<R>>,
-    recycled_buf: Option<Vec<u8>>,
+    recycled_buf: Option<ShardBuf>,
     shard_size: usize,
     data_shards: usize,
     read_timeout: Duration,
@@ -466,7 +473,7 @@ fn read_shard_owned<'a, R>(
     index: usize,
     read_cost: ShardReadCost,
     reader: Option<BitrotReader<R>>,
-    recycled_buf: Option<Vec<u8>>,
+    recycled_buf: Option<ShardBuf>,
     shard_size: usize,
     data_shards: usize,
     read_timeout: Duration,
@@ -867,14 +874,14 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn record_shard_read_result(
-    shards: &mut [Option<Vec<u8>>],
+    shards: &mut [Option<ShardBuf>],
     errs: &mut [Option<Error>],
     retire_readers: &mut ShardIndexes,
     success: &mut usize,
     successful_costs: &mut ShardReadCostCounts,
     i: usize,
     read_cost: ShardReadCost,
-    result: Result<Vec<u8>, Error>,
+    result: Result<ShardBuf, Error>,
     should_retire: bool,
 ) -> bool {
     match result {
@@ -932,7 +939,7 @@ fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
 /// layout from opening every remaining shard at once.  As a read completes the
 /// caller invokes this again, which refills one slot after a failure or a
 /// successful-but-insufficient parity result.
-fn demand_bound_parity_admission_limit(shards: &[Option<Vec<u8>>], active: &[bool], data_shards: usize) -> usize {
+fn demand_bound_parity_admission_limit(shards: &[Option<ShardBuf>], active: &[bool], data_shards: usize) -> usize {
     let missing_data = shards.iter().take(data_shards).filter(|shard| shard.is_none()).count();
     if missing_data == 0 {
         return 0;
@@ -2044,7 +2051,7 @@ where
         }
     }
 
-    pub fn recycle_shards(&mut self, shards: &mut [Option<Vec<u8>>]) {
+    pub fn recycle_shards(&mut self, shards: &mut [Option<ShardBuf>]) {
         for (i, reader) in self.readers.iter().enumerate() {
             if reader.is_some()
                 && let Some(buf) = shards.get_mut(i).and_then(Option::take)
@@ -2098,7 +2105,7 @@ where
 }
 
 /// Get the total length of data blocks
-fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
+fn get_data_block_len(shards: &[Option<ShardBuf>], data_blocks: usize) -> usize {
     let mut size = 0;
     for shard in shards.iter().take(data_blocks).flatten() {
         size += shard.len();
@@ -2124,7 +2131,7 @@ where
 /// Write data blocks from encoded blocks to target, supporting offset and length
 async fn write_data_blocks<W>(
     writer: &mut W,
-    en_blocks: &[Option<Vec<u8>>],
+    en_blocks: &mut [Option<ShardBuf>],
     data_blocks: usize,
     mut offset: usize,
     length: usize,
@@ -2181,8 +2188,10 @@ where
     let mut total_written = 0;
     let mut write_left = length;
 
-    for block_op in &en_blocks[..data_blocks] {
-        let Some(block) = block_op else {
+    let emitter_offered = crate::erasure::codec::shard_emit::shard_emitter_offered();
+    let mut emitted_any = false;
+    for block_op in en_blocks[..data_blocks].iter_mut() {
+        let Some(block) = block_op.as_ref() else {
             let reason = GetObjectFailureReason::ShortRead;
             error!(
                 data_blocks,
@@ -2201,11 +2210,44 @@ where
             continue;
         }
 
-        let block_slice = &block[offset..];
+        let block_len = block.len();
+        let start = offset;
         offset = 0;
 
-        let write_len = write_left.min(block_slice.len());
+        let write_len = write_left.min(block_len - start);
         let write_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
+        // Zero-copy emit: a consumer that can send straight out of registered
+        // arena memory takes the whole shard; the bytes still go out in order.
+        // The three counters (zero duration, one per decision) show in the
+        // stage summary how many shards an emitter saw, how many lived in the
+        // arena and how many it took.
+        if emitter_offered && write_stage_start.is_some() {
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_offered", 0.0);
+            if block.is_arena() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_arena", 0.0);
+            }
+        }
+        if emitter_offered
+            && block.is_arena()
+            && crate::erasure::codec::shard_emit::emit_shard(block_op, start..start + write_len).await?
+        {
+            if write_stage_start.is_some() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_taken", 0.0);
+            }
+            if let Some(write_stage_start) = write_stage_start {
+                rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+            }
+            emitted_any = true;
+            total_written += write_len;
+            write_left -= write_len;
+            if write_left == 0 {
+                crate::erasure::codec::shard_emit::flush_shards().await?;
+                return Ok(total_written);
+            }
+            continue;
+        }
+        let block = block_op.as_ref().expect("the shard was not taken");
+        let block_slice = &block[start..];
         if let Err(e) = writer.write_all(&block_slice[..write_len]).await {
             if let Some(write_stage_start) = write_stage_start {
                 rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
@@ -2243,6 +2285,9 @@ where
         write_left -= write_len;
 
         if write_left == 0 {
+            if emitted_any {
+                crate::erasure::codec::shard_emit::flush_shards().await?;
+            }
             return Ok(total_written);
         }
     }
@@ -2411,7 +2456,7 @@ impl Erasure {
     async fn emit_decoded_stripe<W>(
         &self,
         writer: &mut W,
-        shards: &mut [Option<Vec<u8>>],
+        shards: &mut [Option<ShardBuf>],
         errs: &[Option<Error>],
         block_offset: usize,
         block_length: usize,
@@ -3264,10 +3309,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_writes_range_across_blocks() {
-        let blocks = vec![Some(vec![1, 2, 3, 4]), Some(vec![5, 6, 7]), Some(vec![8, 9])];
+        let mut blocks = vec![
+            Some(ShardBuf::from(vec![1, 2, 3, 4])),
+            Some(ShardBuf::from(vec![5, 6, 7])),
+            Some(ShardBuf::from(vec![8, 9])),
+        ];
         let mut out = Vec::new();
 
-        let written = write_data_blocks(&mut out, &blocks, 3, 2, 5).await.unwrap();
+        let written = write_data_blocks(&mut out, &mut blocks, 3, 2, 5).await.unwrap();
 
         assert_eq!(written, 5);
         assert_eq!(out, vec![3, 4, 5, 6, 7]);
@@ -3275,10 +3324,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_short_data_after_offset() {
-        let blocks = vec![Some(vec![1, 2, 3, 4]), Some(vec![5, 6, 7])];
+        let mut blocks = vec![Some(ShardBuf::from(vec![1, 2, 3, 4])), Some(ShardBuf::from(vec![5, 6, 7]))];
         let mut out = Vec::new();
 
-        let err = write_data_blocks(&mut out, &blocks, 2, 3, 5).await.unwrap_err();
+        let err = write_data_blocks(&mut out, &mut blocks, 2, 3, 5).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert!(out.is_empty());
@@ -3286,10 +3335,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_invalid_data_block_count() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let mut blocks = vec![Some(ShardBuf::from(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
-        let err = write_data_blocks(&mut out, &blocks, 2, 0, 1).await.unwrap_err();
+        let err = write_data_blocks(&mut out, &mut blocks, 2, 0, 1).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(out.is_empty());
@@ -3297,10 +3346,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_offset_length_overflow() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let mut blocks = vec![Some(ShardBuf::from(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
-        let err = write_data_blocks(&mut out, &blocks, 1, usize::MAX, 1).await.unwrap_err();
+        let err = write_data_blocks(&mut out, &mut blocks, 1, usize::MAX, 1).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(out.is_empty());
@@ -3308,10 +3357,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_rejects_missing_data_shard_even_when_total_bytes_are_available() {
-        let blocks = vec![None, Some(vec![1, 2, 3, 4])];
+        let mut blocks = vec![None, Some(ShardBuf::from(vec![1, 2, 3, 4]))];
         let mut out = Vec::new();
 
-        let err = write_data_blocks(&mut out, &blocks, 2, 0, 1).await.unwrap_err();
+        let err = write_data_blocks(&mut out, &mut blocks, 2, 0, 1).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
         assert!(out.is_empty());
@@ -3319,10 +3368,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_data_blocks_propagates_writer_emit_failure() {
-        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let mut blocks = vec![Some(ShardBuf::from(vec![1, 2, 3, 4]))];
         let mut writer = FailingEmitWriter;
 
-        let err = write_data_blocks(&mut writer, &blocks, 1, 0, 4)
+        let err = write_data_blocks(&mut writer, &mut blocks, 1, 0, 4)
             .await
             .expect_err("writer failure must fail the decoded emit path");
 
@@ -5468,7 +5517,11 @@ mod tests {
             erasure
                 .decode_data_with_reconstruction_verification(&mut shards)
                 .expect("recover the stripe after peer loss");
-            let actual: Vec<u8> = shards[..DATA_SHARDS].iter().flatten().flatten().copied().collect();
+            let actual: Vec<u8> = shards[..DATA_SHARDS]
+                .iter()
+                .flatten()
+                .flat_map(|shard| shard.iter().copied())
+                .collect();
             assert_eq!(actual, data[stripe * BLOCK_SIZE..(stripe + 1) * BLOCK_SIZE]);
         }
         assert_eq!(

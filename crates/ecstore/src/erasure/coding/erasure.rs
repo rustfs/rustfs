@@ -18,6 +18,7 @@
 
 use crate::disk::background_memory::{BackgroundBuffer, Reservation};
 use crate::disk::{BackgroundMemoryBudget, current_resource_unit};
+use crate::erasure::codec::shard_buf::ShardBytes;
 use bytes::{Bytes, BytesMut};
 use reed_solomon_simd;
 use rustfs_erasure_codec::galois_8::ReedSolomon;
@@ -299,8 +300,14 @@ impl LegacyReedSolomonEncoder {
         Ok(())
     }
 
-    fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    fn reconstruct_data<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+        // Every data shard present: nothing to rebuild. The conversions
+        // below would copy each shard out of its arena block and hand back
+        // heap buffers, which also defeats the zero-copy emit.
+        if shards.iter().take(self.data_shards).all(Option::is_some) {
             return Ok(());
         }
 
@@ -358,7 +365,7 @@ impl LegacyReedSolomonEncoder {
             if shard_opt.is_none() && i < self.data_shards {
                 for (restored_index, restored_data) in result.restored_original_iter() {
                     if restored_index == i {
-                        *shard_opt = Some(restored_data.to_vec());
+                        *shard_opt = Some(S::from(restored_data.to_vec()));
                         break;
                     }
                 }
@@ -380,7 +387,7 @@ impl LegacyReedSolomonEncoder {
         Ok(())
     }
 
-    fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    fn reconstruct<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         self.reconstruct_data(shards)?;
         self.encode_parity(shards)
     }
@@ -420,7 +427,7 @@ impl LegacyReedSolomonEncoder {
         Ok(true)
     }
 
-    fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    fn encode_parity<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
     }
 }
@@ -478,21 +485,35 @@ impl ReedSolomonEncoder {
     }
 
     /// Reconstruct missing data shards.
-    pub fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    pub fn reconstruct_data<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+        // Every data shard present: nothing to rebuild. The conversions
+        // below would copy each shard out of its arena block and hand back
+        // heap buffers, which also defeats the zero-copy emit.
+        if shards.iter().take(self.data_shards).all(Option::is_some) {
             return Ok(());
         }
 
         if let Some(ref rs) = self.encoder {
-            rs.reconstruct_data(shards)
-                .map_err(|e| io::Error::other(format!("Reed-Solomon reconstruct failed: {e:?}")))
+            // The codec works on plain vectors: a move for vectors, a copy out
+            // of arena blocks (reconstruction is the rare path).
+            let mut owned: Vec<Option<Vec<u8>>> = shards.iter_mut().map(|slot| slot.take().map(S::into_vec)).collect();
+            let result = rs
+                .reconstruct_data(owned.as_mut_slice())
+                .map_err(|e| io::Error::other(format!("Reed-Solomon reconstruct failed: {e:?}")));
+            for (slot, shard) in shards.iter_mut().zip(owned) {
+                *slot = shard.map(S::from);
+            }
+            result
         } else {
             Ok(())
         }
     }
 
     /// Reconstruct missing data shards and regenerate parity shards.
-    pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    pub fn reconstruct<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         self.reconstruct_data(shards)?;
         self.encode_parity(shards)
     }
@@ -520,7 +541,7 @@ impl ReedSolomonEncoder {
         }
     }
 
-    fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    fn encode_parity<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
     }
 }
@@ -582,7 +603,12 @@ fn cached_legacy_reed_solomon_in(
     Ok(Arc::new(LegacyReedSolomonEncoder::new(data_shards, parity_shards)?))
 }
 
-fn encode_parity_shards<F>(shards: &mut [Option<Vec<u8>>], data_shards: usize, parity_shards: usize, encode: F) -> io::Result<()>
+fn encode_parity_shards<S: ShardBytes, F>(
+    shards: &mut [Option<S>],
+    data_shards: usize,
+    parity_shards: usize,
+    encode: F,
+) -> io::Result<()>
 where
     F: FnOnce(SmallVec<[&mut [u8]; 16]>) -> io::Result<()>,
 {
@@ -597,12 +623,12 @@ where
 
     let shard_len = shards
         .iter()
-        .find_map(|s| s.as_ref().map(Vec::len))
+        .find_map(|s| s.as_ref().map(ShardBytes::len))
         .ok_or_else(|| io::Error::other("No valid shards found for parity encoding"))?;
 
     for shard in shards.iter_mut().skip(data_shards) {
         if shard.is_none() {
-            *shard = Some(vec![0; shard_len]);
+            *shard = Some(S::from(vec![0; shard_len]));
         }
     }
 
@@ -640,8 +666,8 @@ where
     encode(shard_refs)
 }
 
-fn recover_empty_payload_data_shards(
-    shards: &mut [Option<Vec<u8>>],
+fn recover_empty_payload_data_shards<S: ShardBytes>(
+    shards: &mut [Option<S>],
     data_shards: usize,
     parity_shards: usize,
 ) -> io::Result<bool> {
@@ -667,7 +693,7 @@ fn recover_empty_payload_data_shards(
 
     for shard in shards.iter_mut().take(data_shards) {
         if shard.is_none() {
-            *shard = Some(Vec::new());
+            *shard = Some(S::from(Vec::new()));
         }
     }
     Ok(true)
@@ -978,7 +1004,7 @@ impl Erasure {
     /// # Returns
     /// Ok if reconstruction succeeds, error otherwise.
     #[hotpath::measure(impl_type = "Erasure")]
-    pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    pub fn decode_data<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         if self.parity_shards > 0 {
             if self.uses_legacy {
                 if let Some(encoder) = self.legacy_encoder.as_ref() {
@@ -998,7 +1024,7 @@ impl Erasure {
 
     /// Decode and reconstruct missing data shards, then regenerate parity shards.
     #[hotpath::measure(impl_type = "Erasure")]
-    pub fn decode_data_and_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    pub fn decode_data_and_parity<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         if self.parity_shards > 0 {
             if self.uses_legacy {
                 if let Some(encoder) = self.legacy_encoder.as_ref() {
@@ -1016,20 +1042,20 @@ impl Erasure {
         Ok(())
     }
 
-    pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    pub(crate) fn decode_data_with_reconstruction_verification<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         self.decode_data_with_reconstruction_verification_policy(shards, false)
     }
 
-    pub(crate) fn decode_data_with_reconstruction_verification_for_lockstep(
+    pub(crate) fn decode_data_with_reconstruction_verification_for_lockstep<S: ShardBytes>(
         &self,
-        shards: &mut [Option<Vec<u8>>],
+        shards: &mut [Option<S>],
     ) -> io::Result<()> {
         self.decode_data_with_reconstruction_verification_policy(shards, true)
     }
 
-    fn decode_data_with_reconstruction_verification_policy(
+    fn decode_data_with_reconstruction_verification_policy<S: ShardBytes>(
         &self,
-        shards: &mut [Option<Vec<u8>>],
+        shards: &mut [Option<S>],
         require_surplus_source: bool,
     ) -> io::Result<()> {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
@@ -1045,7 +1071,7 @@ impl Erasure {
                 .iter()
                 .enumerate()
                 .skip(self.data_shards)
-                .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
+                .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.as_slice().to_vec())))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1063,7 +1089,7 @@ impl Erasure {
                     "missing rebuilt parity shard after read verification",
                 ));
             };
-            if rebuilt != &source {
+            if rebuilt.as_slice() != source.as_slice() {
                 warn!(
                     shard_index = index,
                     data_shards = self.data_shards,
@@ -1077,7 +1103,7 @@ impl Erasure {
         Ok(())
     }
 
-    pub(crate) fn verify_data_and_parity(&self, shards: &[Option<Vec<u8>>]) -> io::Result<bool> {
+    pub(crate) fn verify_data_and_parity<S: ShardBytes>(&self, shards: &[Option<S>]) -> io::Result<bool> {
         let expected_shards = self.total_shard_count();
         if shards.len() != expected_shards {
             return Err(io::Error::other(format!(
@@ -1094,7 +1120,8 @@ impl Erasure {
         let mut shard_len = None;
         for (index, shard) in shards.iter().enumerate() {
             let shard = shard
-                .as_deref()
+                .as_ref()
+                .map(ShardBytes::as_slice)
                 .ok_or_else(|| io::Error::other(format!("missing shard {index} for data/parity verification")))?;
             if let Some(expected_len) = shard_len {
                 if shard.len() != expected_len {
@@ -1868,7 +1895,7 @@ mod tests {
         .expect_err("mismatched non-empty shards must be rejected");
         assert!(err.to_string().contains("inconsistent shard length"));
 
-        let mut no_present_empty_payload = vec![None, None, None];
+        let mut no_present_empty_payload: Vec<Option<Vec<u8>>> = vec![None, None, None];
         assert!(
             !recover_empty_payload_data_shards(&mut no_present_empty_payload, 2, 1)
                 .expect("all-missing empty payload marker should not be synthesized")

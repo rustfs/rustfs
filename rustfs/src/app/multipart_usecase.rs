@@ -21,6 +21,7 @@ use super::storage_api::multipart_usecase::access::{
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
+    etag::bucket_uses_xxh3_etag,
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
@@ -47,7 +48,9 @@ use super::storage_api::multipart_usecase::error::{
 use super::storage_api::multipart_usecase::helper::{OperationHelper, run_owned_mutation};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::io::{
+    EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
+};
 use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
@@ -109,21 +112,13 @@ use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, insert_header};
 use rustfs_utils::http::{
-    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
+    SUFFIX_ETAG_ALGORITHM, SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
     SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header, get_source_scheme,
     headers::{AMZ_CHECKSUM_TYPE, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
-use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, ChecksumAlgorithm, ChecksumType, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOutput, CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, ETag, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
-    ServerSideEncryption, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
-};
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
-use s3s::stream::ByteStream;
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -172,6 +167,18 @@ fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback:
 #[cfg(test)]
 fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
     parts.iter().map(|part| part.number).collect()
+}
+
+/// ETag value pinned by CreateMultipartUpload for a bucket with XXH3 ETags.
+const ETAG_ALGORITHM_XXH3: &str = "xxh3";
+
+/// The ETag algorithm pinned for this multipart upload at its creation;
+/// uploads without the pin (MD5 buckets, older uploads) keep MD5.
+fn multipart_etag_algorithm(metadata: &HashMap<String, String>) -> EtagAlgorithm {
+    match get_consistent_str(metadata, SUFFIX_ETAG_ALGORITHM) {
+        Some(value) if value.eq_ignore_ascii_case(ETAG_ALGORITHM_XXH3) => EtagAlgorithm::Xxh3,
+        _ => EtagAlgorithm::Md5,
+    }
 }
 
 fn multipart_max_total_object_size(metadata: &HashMap<String, String>) -> S3Result<Option<u64>> {
@@ -289,6 +296,7 @@ fn multipart_upload_api_error(err: StorageError) -> S3Error {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::app::storage_api::s3::dto::{CompleteMultipartUploadInput, CreateMultipartUploadInput, ServerSideEncryption};
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
@@ -546,6 +554,24 @@ mod tests {
                 .expect_err("uploads created before the fix must not publish reserved keys");
             assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
         }
+    }
+
+    #[test]
+    fn multipart_etag_algorithm_reads_the_pinned_value() {
+        let mut metadata = HashMap::new();
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Md5);
+
+        insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Xxh3);
+        assert_eq!(
+            metadata.get("x-minio-internal-etag-algorithm").map(String::as_str),
+            Some("xxh3"),
+            "the pin is written under both internal prefixes"
+        );
+
+        // Conflicting copies fail closed to MD5.
+        metadata.insert("x-minio-internal-etag-algorithm".to_string(), "md5".to_string());
+        assert_eq!(multipart_etag_algorithm(&metadata), EtagAlgorithm::Md5);
     }
 
     #[test]

@@ -37,15 +37,12 @@ use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::auth::{ACCOUNT_OFF, UserIdentity};
 
+use crate::keystone::KEYSTONE_PRINCIPAL_PREFIX;
 use crate::root::{RootSource, is_usable_secret};
 
 /// The opaque issuer recorded in the [`rustfs_gateway::SessionBinding`] of every RustFS STS
 /// credential.
 pub const STS_SESSION_ISSUER: &str = "rustfs-sts";
-
-/// Access keys with this prefix belong to Keystone token authentication, which never verifies an
-/// AWS signature.
-const KEYSTONE_ACCESS_KEY_PREFIX: &str = "keystone:";
 
 /// The narrow slice of IAM that a credential lookup needs.
 ///
@@ -73,23 +70,27 @@ impl<T: Store> IamKeyLookup for IamSys<T> {
 
 /// A [`CredentialProvider`] over RustFS IAM and the live root credentials.
 ///
-/// Built only by [`crate::IamAdapters::new`], so it always reads the same [`RootSource`] as the
-/// policy source it was assembled with.
+/// A deployment that also installs the policy source builds both through
+/// [`crate::IamAdapters::new`], so the two read the same [`RootSource`]; one that installs no
+/// policy source builds this half alone with [`IamCredentials::new`].
 pub struct IamCredentials {
     iam: Arc<dyn IamKeyLookup>,
     root: Arc<dyn RootSource>,
 }
 
 impl IamCredentials {
-    pub(crate) fn new(iam: Arc<dyn IamKeyLookup>, root: Arc<dyn RootSource>) -> Self {
+    /// The provider over `iam`, with `root` read on every lookup.
+    #[must_use]
+    pub fn new(iam: Arc<dyn IamKeyLookup>, root: Arc<dyn RootSource>) -> Self {
         Self { iam, root }
     }
 
     async fn resolve(&self, access_key: &str) -> Result<CredentialLookup, ProviderError> {
         // Deliberate change from the legacy s3s path (`rustfs/src/auth.rs` `get_secret_key`),
         // which answered a `keystone:` key with an empty secret. Keystone authenticates by token,
-        // so there is no AWS secret to verify a signature against: the key is unknown here.
-        if access_key.starts_with(KEYSTONE_ACCESS_KEY_PREFIX) {
+        // so there is no AWS secret to verify a signature against: the key is unknown here, and
+        // that is decided before the root key and before IAM.
+        if access_key.starts_with(KEYSTONE_PRINCIPAL_PREFIX) {
             return Ok(CredentialLookup::NotFound);
         }
 
@@ -294,6 +295,21 @@ mod tests {
         let result = lookup(iam.clone(), "keystone:project-user").await;
         assert!(is_not_found(&result));
         assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Negative — a `keystone:` key resolves to no secret even when it spells the root access
+    /// key, and even while the root credentials are not initialized: the prefix is decided before
+    /// the root key and before IAM, so the answer is a plain `NotFound`.
+    #[tokio::test]
+    async fn credentials_keystone_prefix_is_not_found_even_when_it_spells_the_root_key() {
+        let root =
+            RootCredentials::new("keystone:rootlike", "root-secret-key", "sts-signing-key").expect("valid root credentials");
+        let iam = fake(true, || found(user("on"), true));
+        let with_that_root = IamCredentials::new(iam.clone(), Arc::new(RootCell::new(Some(root))));
+        assert!(is_not_found(&with_that_root.lookup("keystone:rootlike").await));
+
+        let without_root = IamCredentials::new(iam, Arc::new(RootCell::new(None)));
+        assert!(is_not_found(&without_root.lookup("keystone:rootlike").await));
     }
 
     /// Negative — a switched-off or otherwise invalid user resolves, but disabled, and the same

@@ -1597,6 +1597,9 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_LICENSE")]
     pub license: Option<String>,
 
+    /// Server region; a comma-separated list adds further regions that
+    /// `CreateBucket` accepts as a `LocationConstraint` (the first entry stays
+    /// the server's own region).
     #[arg(long, env = "RUSTFS_REGION")]
     pub region: Option<String>,
 

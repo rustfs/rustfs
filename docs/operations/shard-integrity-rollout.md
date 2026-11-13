@@ -65,6 +65,10 @@ queue does not imply that these persistent obligations have been cleared.
 
 After a qualified all-healthy Deep check, the attempt is `Completed` with an `Unknown` object outcome; it is counted in `unverified_tasks`, not `successful_tasks` or `failed_tasks`. This cumulative attempt count is distinct from the current `held_unverified_legacy` responsibility count. The scheduler reports `verification_unavailable`, and the durable obligation remains subject to the existing explicit recheck or audited operator disposition. Execution completion never supplies a missing integrity receipt.
 
+This also applies when the same Deep attempt has just reconstructed missing legacy shards: successful storage commits and a complete, aligned, all-healthy report for the selected version permit an unverified completion without another Deep pass. Storage failures, incomplete commits, lost locks, invalid receipts and protected-object verification failures do not qualify. `total_unverified_objects_repaired` and `total_unverified_bytes_repaired` record physical repair attempts separately from verified outcomes; bytes are logical object sizes, not disk or network traffic, and repeated repairs of the same object are separate attempts. An already-healthy check adds no physical repair count.
+
+Attempt completion, an in-memory hold and a durable hold are separate steps. The hold survives restart after its companion checkpoint commits. A crash before that commit, a lost completion notice or an unavailable publication result can conservatively replay the earlier active responsibility and repeat Deep. Preserve the prior checkpoint and responsibility until a committed publication or exact readback confirms the transition; no retry or execution completion supplies independent verification.
+
 Partial-write MRF replay uses Deep verification so a protected object's repair
 can discharge its obligation after verifying the payload. This adds full-object
 read work to those background attempts, including healthy replay targets.

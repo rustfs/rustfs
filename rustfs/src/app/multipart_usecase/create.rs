@@ -15,6 +15,10 @@
 //! CreateMultipartUpload.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    ChecksumAlgorithm, ChecksumType, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn create_multipart_upload_metadata(
     input_metadata: Option<HashMap<String, String>>,
@@ -129,6 +133,9 @@ impl DefaultMultipartUsecase {
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
+        }
+        if bucket_uses_xxh3_etag(&bucket) {
+            insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
         }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some()

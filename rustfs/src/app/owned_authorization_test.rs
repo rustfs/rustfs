@@ -1536,9 +1536,19 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
         });
         (case.facts)(&mut legacy);
         let mut owned = RequestEnvelope::from_s3s(&legacy);
+        // The object shape both edges' access hooks call: it must reach the same decision.
+        let mut owned_shape = RequestEnvelope::from_s3s(&legacy);
         let action = Action::S3Action(case.action);
         let legacy_result = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action).await;
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
+        let shape_result = crate::app::storage_api::owned_parity::authorize_object_request(
+            &mut owned_shape,
+            case.bucket,
+            case.object,
+            None,
+            action,
+        )
+        .await;
         let legacy_ok = match &legacy_result {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &S3ErrorCode::AccessDenied,
@@ -1547,9 +1557,13 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied,
         };
-        if !legacy_ok || !owned_ok {
+        let shape_ok = match &shape_result {
+            Ok(()) => case.allowed,
+            Err(err) => !case.allowed && err.code() == &S3ErrorCode::AccessDenied,
+        };
+        if !legacy_ok || !owned_ok || !shape_ok {
             mismatches.push(format!(
-                "{} (expected allowed={}): legacy {legacy_result:?}, owned {owned_result:?}",
+                "{} (expected allowed={}): legacy {legacy_result:?}, owned {owned_result:?}, object shape {shape_result:?}",
                 case.name, case.allowed
             ));
         }

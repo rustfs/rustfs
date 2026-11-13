@@ -9,7 +9,7 @@ repository.workspace = true
 description = "RustFS internal adapter for zstd 0.13 consumers using the fixed codec"
 
 [dependencies]
-zstd_fixed = { package = "zstd", version = "=0.14.3", default-features = false }
+zstd_fixed = { package = "zstd", version = "=0.14.4", default-features = false }
 
 [features]
 default = ["legacy", "arrays", "zdict_builder"]
@@ -29,7 +29,7 @@ zdict_builder = ["zstd_fixed/zdict_builder"]
 zstdmt = ["zstd_fixed/zstdmt"]
 
 [dev-dependencies]
-zstd-safe = { version = "8.2.0", features = ["seekable"] }
+zstd-safe = { version = "8.3.0", features = ["seekable"] }
 toml = "1.2.1"
 semver = "1.0.28"
 apache-avro.workspace = true

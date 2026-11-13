@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use super::*;
+use crate::app::storage_api::s3::S3ErrorCode;
+use crate::app::storage_api::s3::dto::{CopySource, UploadPartCopyInput};
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::{ObjectIO, ObjectOperations};
 

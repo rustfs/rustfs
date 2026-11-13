@@ -412,6 +412,10 @@ impl RegionInterface for ECStore {
     fn get(&self) -> Option<s3s::region::Region> {
         self.region().map(Into::into)
     }
+
+    fn additional(&self) -> Vec<s3s::region::Region> {
+        self.additional_regions().into_iter().map(Into::into).collect()
+    }
 }
 
 /// Ambient region adapter for callers without an explicit application context.

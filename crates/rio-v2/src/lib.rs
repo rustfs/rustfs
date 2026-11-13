@@ -23,6 +23,7 @@ pub use compress_reader::{CompressReader, DecompressReader};
 pub use encrypt_reader::{DecryptReader, EncryptReader, derive_part_key};
 pub use rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE;
 pub use rustfs_rio::DynReader;
+pub use rustfs_rio::EtagAlgorithm;
 pub use rustfs_rio::EtagReader;
 pub use rustfs_rio::EtagResolvable;
 pub use rustfs_rio::HardLimitReader;

@@ -41,7 +41,8 @@ const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
-const GATEWAY_STACK_NOT_ASSEMBLED: &str = "gateway stack is not assembled yet (rustfs/backlog#2734 T2.5)";
+#[cfg(not(feature = "gateway-stack"))]
+const GATEWAY_STACK_NOT_BUILT: &str = "RUSTFS_S3_STACK=gateway needs a binary built with the `gateway-stack` feature, which no release build enables (rustfs/backlog#2734)";
 
 pub(crate) struct StartupListenContext {
     pub(crate) readiness: Arc<GlobalReadiness>,
@@ -82,21 +83,14 @@ pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
 ) -> Result<StartupListenContext> {
-    match config.s3_stack {
-        S3Stack::Legacy => {}
-        // REPLACED BY T2.5
-        // Refuse before any listener or storage exists; never fall back to legacy.
-        S3Stack::Gateway => return Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_ASSEMBLED)),
-    }
+    refuse_unbuilt_stack(config.s3_stack)?;
     crate::server::init_console_prefix()?;
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region_str) = &config.region {
-        region_str
-            .parse::<s3s::region::Region>()
-            .map(|region| startup_runtime_sources::publish_region(instance_ctx, region))
-            .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
+        let (region, additional_regions) = parse_region_list(region_str)?;
+        startup_runtime_sources::publish_region(instance_ctx, region, additional_regions);
     }
 
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
@@ -124,6 +118,7 @@ pub(crate) async fn init_startup_listen_context(
         ip = %server_addr.ip(),
         port = %server_port,
         version = %crate::version::get_version(),
+        s3_stack = ?config.s3_stack,
         "Starting RustFS server"
     );
 
@@ -136,6 +131,18 @@ pub(crate) async fn init_startup_listen_context(
         server_addr,
         server_address,
     })
+}
+
+/// Refuses a selected S3 stack this binary cannot serve, before any listener or storage exists.
+/// The selection is never replaced by another stack.
+fn refuse_unbuilt_stack(stack: S3Stack) -> Result<()> {
+    match stack {
+        S3Stack::Legacy => Ok(()),
+        #[cfg(feature = "gateway-stack")]
+        S3Stack::Gateway => Ok(()),
+        #[cfg(not(feature = "gateway-stack"))]
+        S3Stack::Gateway => Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_BUILT)),
+    }
 }
 
 pub(crate) async fn prepare_embedded_startup_config(
@@ -167,6 +174,10 @@ pub(crate) async fn prepare_embedded_startup_config(
     config.secret_key = secret_key.clone();
     config.region = Some(region.clone());
     config.console_enable = false;
+    // The stack is selected for the whole process, so an embedded server reads the same variable
+    // the binary does.
+    config.s3_stack = S3Stack::from_env()?;
+    refuse_unbuilt_stack(config.s3_stack)?;
 
     Ok(EmbeddedStartupConfig {
         config,
@@ -229,13 +240,12 @@ pub(crate) async fn init_embedded_startup_listen_context(
         .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
 
     if let Some(region_str) = &config.region {
-        let region = region_str
-            .parse::<s3s::region::Region>()
-            .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
+        let (region, additional_regions) = parse_region_list(region_str)?;
         // The instance context is per-server, so region publication cannot
         // panic on a second embedded server; the process still has one region
         // for legacy ambient readers.
         instance_ctx.set_region(region.into());
+        instance_ctx.set_additional_regions(additional_regions.into_iter().map(Into::into).collect());
     }
 
     startup_runtime_sources::publish_server_port(server_addr.port());
@@ -379,6 +389,24 @@ fn validate_console_listener_address(config: &Config, s3_addr: SocketAddr) -> Re
     Ok(())
 }
 
+/// Parse `RUSTFS_REGION` / `--region`: one region, or a comma-separated list
+/// whose first entry is the server's own region and whose rest are further
+/// regions `CreateBucket` accepts as a `LocationConstraint`. Whitespace around
+/// entries is ignored; an empty or invalid entry is an error, as an invalid
+/// single region always was.
+fn parse_region_list(region_str: &str) -> Result<(s3s::region::Region, Vec<s3s::region::Region>)> {
+    let mut regions = region_str.split(',').map(|entry| {
+        entry
+            .trim()
+            .parse::<s3s::region::Region>()
+            .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))
+    });
+    let region = regions
+        .next()
+        .ok_or_else(|| Error::other(format!("invalid region '{region_str}'")))??;
+    Ok((region, regions.collect::<Result<_>>()?))
+}
+
 fn listener_addresses_overlap(left: SocketAddr, right: SocketAddr) -> bool {
     left.port() == right.port() && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
 }
@@ -387,13 +415,31 @@ fn listener_addresses_overlap(left: SocketAddr, right: SocketAddr) -> bool {
 mod tests {
     use super::{
         DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, find_embedded_available_port,
-        init_startup_listen_context, listener_addresses_overlap, prepare_embedded_startup_config, s3_http_server_config,
-        validate_console_listener_address,
+        init_startup_listen_context, listener_addresses_overlap, parse_region_list, prepare_embedded_startup_config,
+        s3_http_server_config, validate_console_listener_address,
     };
     use crate::config::Config;
     use crate::storage_api::startup::runtime_sources::InstanceContext;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
+
+    #[test]
+    fn parse_region_list_takes_first_entry_as_server_region() {
+        let (region, additional) = parse_region_list("us-east-1").expect("single region");
+        assert_eq!(region.as_str(), "us-east-1");
+        assert!(additional.is_empty());
+
+        let (region, additional) = parse_region_list("ap-southeast-2, us-west-2").expect("region list");
+        assert_eq!(region.as_str(), "ap-southeast-2");
+        assert_eq!(additional.iter().map(|region| region.as_str()).collect::<Vec<_>>(), ["us-west-2"]);
+    }
+
+    #[test]
+    fn parse_region_list_rejects_empty_and_invalid_entries() {
+        for value in ["", "us-east-1,", "us-east-1,,us-west-2", "us-east-1,US_WEST"] {
+            assert!(parse_region_list(value).is_err(), "{value:?} must be rejected");
+        }
+    }
 
     #[test]
     fn s3_http_server_config_disables_console_without_changing_address() {
@@ -517,6 +563,26 @@ mod tests {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9002),
         ));
+    }
+
+    #[cfg(not(feature = "gateway-stack"))]
+    #[test]
+    fn a_binary_without_the_gateway_stack_refuses_to_select_it() {
+        let err = super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect_err("the gateway stack is not built");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("gateway-stack"), "{err}");
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    #[test]
+    fn a_binary_with_the_gateway_stack_accepts_its_selection() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect("the gateway stack is built");
+    }
+
+    #[test]
+    fn the_legacy_stack_is_always_selectable() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Legacy).expect("legacy is the default stack");
     }
 
     #[tokio::test]
