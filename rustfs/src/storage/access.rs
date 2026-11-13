@@ -3338,10 +3338,8 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketLifecycleAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketLifecycleAction)).await
     }
 
     /// Checks whether the GetBucketLocation request has accesses to the resources.
@@ -3415,10 +3413,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_replication(&self, req: &mut S3Request<GetBucketReplicationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetReplicationConfigurationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetReplicationConfigurationAction)).await
     }
 
     /// Checks whether the GetBucketRequestPayment request has accesses to the resources.
@@ -3526,10 +3522,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_lock_configuration(&self, req: &mut S3Request<GetObjectLockConfigurationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketObjectLockConfigurationAction)).await
     }
 
     /// Checks whether the GetObjectRetention request has accesses to the resources.

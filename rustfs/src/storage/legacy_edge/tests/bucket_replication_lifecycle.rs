@@ -133,3 +133,31 @@ async fn test_put_object_lock_configuration_returns_internal_error_when_store_un
         .unwrap_err();
     assert_eq!(err.code(), &S3ErrorCode::InternalError);
 }
+
+/// The legacy stack answers a stored Object Lock configuration through the gateway seam with what
+/// `persisted_to_s3s` answered. The document holds no timestamp, so equal values encode to equal
+/// bytes.
+#[test]
+fn object_lock_answer_through_the_seam_is_the_answer_of_the_reverse_direction() {
+    use crate::app::dto_values::stored_config;
+    use crate::storage::persisted_to_s3s;
+    use crate::storage::storage_api::ecstore_bucket::utils::deserialize;
+    use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_object_lock_configuration::output_to_s3s;
+    use rustfs_gateway_types::persistence::{PersistedObjectLockConfiguration, parse_object_lock_dto};
+
+    for stored in [
+        &b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"[..],
+        &b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE\
+</Mode><Years>1</Years></DefaultRetention></Rule></ObjectLockConfiguration>"[..],
+    ] {
+        let stored: PersistedObjectLockConfiguration = deserialize(stored).expect("stored document");
+        let before: ObjectLockConfiguration = persisted_to_s3s(&stored).expect("reverse direction");
+        let answer = rustfs_gateway_types::dto::GetObjectLockConfigurationOutput {
+            object_lock_configuration: Some(stored_config(&stored, parse_object_lock_dto).expect("gateway answer")),
+        };
+
+        let after = output_to_s3s(answer).expect("seam").object_lock_configuration;
+
+        assert_eq!(after, Some(before));
+    }
+}
