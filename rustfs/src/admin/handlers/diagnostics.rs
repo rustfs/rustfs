@@ -183,8 +183,8 @@ pub struct LockEntry {
     pub lock_type: &'static str,
     pub owner: String,
     /// Physical guards sampled for this node-local resource, version, mode and owner cohort.
-    /// Collection is not a cluster-wide atomic snapshot; older responses omit this count.
-    /// Consumers must treat an omitted count as unknown.
+    /// Each node samples its cohorts independently.
+    /// Consumers must treat a missing count from older responses as unknown.
     pub holder_count: u32,
     pub priority: &'static str,
     /// Wall-clock RFC3339 timestamp when the lock was acquired, if representable.
