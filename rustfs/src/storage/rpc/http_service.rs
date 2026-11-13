@@ -74,7 +74,7 @@ const MIGRATING_META_BUCKET: &str = ".minio.sys";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
-#[cfg(feature = "nixl")]
+#[cfg(all(feature = "nixl", target_os = "linux"))]
 use crate::storage::storage_api::rpc_consumer::nixl_read::{READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH};
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
@@ -564,9 +564,9 @@ async fn handle_internode_rpc(
                 None => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
             },
             (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
-            #[cfg(feature = "nixl")]
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
             (Method::GET, READ_FILE_NIXL_PATH) => super::nixl_read::handle_read_file_nixl(req).await,
-            #[cfg(feature = "nixl")]
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
             (Method::PUT, WRITE_FILE_NIXL_PATH) => super::nixl_read::handle_write_file_nixl(req).await,
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
@@ -636,9 +636,9 @@ fn emit_internode_rpc_telemetry(started_at: Instant, status: StatusCode) {
 fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
-        #[cfg(feature = "nixl")]
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
         READ_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
-        #[cfg(feature = "nixl")]
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
         WRITE_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),

@@ -19,6 +19,9 @@
 //! The reply carries [`RDMA_REPLY_HEADER`] and
 //! [`RDMA_BYTES_TRANSFERRED_HEADER`] exactly like the cuObject transport, so a
 //! client treats both the same.
+//!
+//! NIXL/UCX exists only on Linux; on other targets this crate is empty.
+#![cfg(target_os = "linux")]
 
 use bytes::Bytes;
 use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, ThreadSync, XferDescList, XferOp, XferStatus};

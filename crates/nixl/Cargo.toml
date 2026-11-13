@@ -14,7 +14,9 @@ documentation = "https://docs.rs/rustfs-nixl/latest/rustfs_nixl/"
 [lints]
 workspace = true
 
-[dependencies]
+# NIXL/UCX only exists on Linux; elsewhere the crate is empty, so a workspace
+# build or test on macOS neither builds nor links nixl-sys.
+[target.'cfg(target_os = "linux")'.dependencies]
 base64-simd = { workspace = true }
 bytes = { workspace = true }
 memmap2 = { workspace = true }

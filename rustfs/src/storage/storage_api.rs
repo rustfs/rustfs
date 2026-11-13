@@ -327,7 +327,7 @@ pub(crate) mod rpc_consumer {
     }
 
     /// Server side of internode NIXL chunk reads (`nixl` feature).
-    #[cfg(feature = "nixl")]
+    #[cfg(all(feature = "nixl", target_os = "linux"))]
     pub(crate) mod nixl_read {
         pub(crate) use super::super::check_and_record_signed_rpc_nonce;
         pub(crate) use super::super::ecstore_disk::DiskAPI;

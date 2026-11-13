@@ -15,7 +15,7 @@
 #[cfg(feature = "internode-transport")]
 pub mod external_transport;
 pub mod http_service;
-#[cfg(feature = "nixl")]
+#[cfg(all(feature = "nixl", target_os = "linux"))]
 pub mod nixl_read;
 pub mod node_service;
 
@@ -38,7 +38,7 @@ use serde::Serialize;
 /// passed the string-level containment check, but a symlink inside the volume
 /// could still point elsewhere. The check reads the opened descriptor's real
 /// path, so nothing can change between the check and the use.
-#[cfg(feature = "nixl")]
+#[cfg(all(feature = "nixl", target_os = "linux"))]
 pub(crate) fn open_shard_contained(path: &std::path::Path, key: &str) -> std::io::Result<std::fs::File> {
     let file = std::fs::File::open(path)?;
     #[cfg(target_os = "linux")]
