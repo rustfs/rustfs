@@ -15472,10 +15472,12 @@ impl DiskAPI for LocalDisk {
                 Err(err) => return Ok(Err(err)),
             }
 
-            if let Some(admission) = admission
-                && let Err(err) = admission.validate()
-            {
-                return Ok(Err(to_file_error(err).into()));
+            if let Some(admission) = admission {
+                match admission.validate_part_settlement(&transaction_path) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(false)),
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                }
             }
             if action == PartTransactionAction::Rollback {
                 if let Err(err) = std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []) {
