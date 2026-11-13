@@ -16,9 +16,8 @@
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::access::requested_bucket_force_delete;
-use crate::app::storage_api::s3::dto::{BucketLocationConstraint, GetBucketLocationInput, GetBucketLocationOutput};
+use crate::app::storage_api::s3::S3Error;
 use crate::app::storage_api::s3::region::Region;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 /// Whether `CreateBucket` may record `location`: the server's own region, or
 /// one of the further regions listed after it in `RUSTFS_REGION`. `location`
@@ -323,27 +322,32 @@ impl DefaultBucketUsecase {
         Ok(gateway_dto::HeadBucketOutput::default())
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    /// Answers the region `input.bucket` is in, for either edge: none for the default region,
+    /// as AWS answers for `us-east-1`. The access phase has authorized it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized; otherwise the storage error of the
+    /// lookup, `NoSuchBucket` among them.
+    #[instrument(level = "debug", skip(self, input))]
     pub async fn execute_get_bucket_location(
         &self,
-        req: S3Request<GetBucketLocationInput>,
-    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        let input = req.input;
-
+        input: gateway_dto::GetBucketLocationInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketLocationOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
         let location_constraint = self
             .global_region()
             .filter(|region| region.as_str() != RUSTFS_REGION)
-            .map(|region| BucketLocationConstraint::from(region.to_string()));
-        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
+            .map(|region| gateway_dto::LocationConstraint::custom(region.to_string()));
+        Ok(gateway_dto::GetBucketLocationOutput { location_constraint })
     }
 }
 
@@ -540,15 +544,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_location_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketLocationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
+        let input = gateway_dto::GetBucketLocationInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_location(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_location(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 }

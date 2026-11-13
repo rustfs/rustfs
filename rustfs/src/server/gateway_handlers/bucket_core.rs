@@ -32,6 +32,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::HeadBucket>(),
     row::<dto::CreateBucket>(),
     row::<dto::DeleteBucket>(),
+    row::<dto::GetBucketLocation>(),
 ];
 
 impl Served for dto::ListBuckets {
@@ -94,6 +95,22 @@ impl Served for dto::DeleteBucket {
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_delete_bucket(envelope, request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketLocation {
+    const METRIC: S3Operation = S3Operation::GetBucketLocation;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketLocationAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_location(request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

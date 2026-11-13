@@ -34,6 +34,7 @@ use crate::storage::{
 };
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{create_bucket, delete_bucket, head_bucket};
+use rustfs_gateway_types::compat::s3s_5761ddfe::get_bucket_location;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -164,7 +165,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
         record_s3_op(S3Operation::GetBucketLocation);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_get_bucket_location(req).await
+        through_gateway_seam(
+            req,
+            get_bucket_location::input_from_s3s,
+            |output| Ok(get_bucket_location::output_to_s3s(output)),
+            |_, input| usecase.execute_get_bucket_location(input),
+        )
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_request_payment_edge(

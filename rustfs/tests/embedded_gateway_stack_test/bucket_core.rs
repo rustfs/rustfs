@@ -46,6 +46,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: delete_bucket,
     },
+    MatrixRow {
+        operation: "GetBucketLocation",
+        metric: S3Operation::GetBucketLocation,
+        has_error_body: true,
+        call: get_bucket_location,
+    },
 ];
 
 fn list_buckets<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -54,6 +60,10 @@ fn list_buckets<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outco
 
 fn head_bucket<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.head_bucket().bucket(bucket).send().await) })
+}
+
+fn get_bucket_location<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_location().bucket(bucket).send().await) })
 }
 
 /// Re-creating the existing matrix bucket: the default region answers it `200`.
@@ -225,6 +235,34 @@ fn the_gateway_stack_deletes_buckets_as_before() {
 #[test]
 fn the_legacy_stack_deletes_buckets_as_before() {
     with_stack(LEGACY, delete_bucket_answers_as_before);
+}
+
+/// A bucket in the default region has an empty location constraint, under an ordinary name and
+/// under one the AWS grammar reserves; a missing bucket is `NoSuchBucket`.
+async fn get_bucket_location_answers_as_before(server: RustFSServer) {
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    for bucket in ["located", "located-s3alias"] {
+        super::create_bucket_in_the_store(bucket).await;
+        let located = root.get_bucket_location().bucket(bucket).send().await.expect(bucket);
+        // The default region is written as an empty `LocationConstraint` element, which the SDK
+        // reads as an empty constraint.
+        assert_eq!(located.location_constraint().map(|constraint| constraint.as_str()), Some(""), "{bucket}");
+    }
+
+    let missing = root.get_bucket_location().bucket("not-located").send().await;
+    let refusal = outcome(missing).expect_err("a missing bucket is refused");
+    assert_eq!((refusal.code.as_deref(), refusal.status), (Some("NoSuchBucket"), Some(404)));
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_locates_buckets_as_before() {
+    with_stack(GATEWAY, get_bucket_location_answers_as_before);
+}
+
+#[test]
+fn the_legacy_stack_locates_buckets_as_before() {
+    with_stack(LEGACY, get_bucket_location_answers_as_before);
 }
 
 async fn force_delete_header_order(server: RustFSServer) {
