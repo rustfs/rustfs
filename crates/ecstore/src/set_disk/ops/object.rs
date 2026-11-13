@@ -15896,6 +15896,125 @@ mod metadata_mutation_generation_tests {
         assert!(metadata.contains_key(&format!("x-minio-internal-{suffix}")));
     }
 
+    const EC_BLOCK_SIZE_PROJECTION_KEYS: [&str; 2] = ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"];
+
+    /// Metadata keys of the latest version as persisted on every disk.
+    async fn stored_metadata_keys(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<HashSet<String>> {
+        let mut stored = Vec::with_capacity(disks.len());
+        for disk in disks {
+            let bytes = disk
+                .read_all(bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("persisted metadata");
+            let fi = FileMeta::load(&bytes)
+                .expect("decode xl.meta")
+                .into_fileinfo(bucket, object, "", false, false, false)
+                .expect("latest version");
+            stored.push(fi.metadata.into_keys().collect());
+        }
+        stored
+    }
+
+    #[tokio::test]
+    async fn default_layout_metadata_copy_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-copy";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                user_defined: HashMap::from([("x-amz-meta-color".to_string(), "red".to_string())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+
+        let opts = ObjectOptions::default();
+        let mut source = set.get_object_info(bucket, object, &opts).await.expect("read metadata");
+        assert_eq!(source.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+        source.metadata_only = true;
+        Arc::make_mut(&mut source.user_defined).insert("x-amz-meta-color".to_string(), "blue".to_string());
+        set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .await
+            .expect("metadata-replacing copy");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for keys in &after {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a default-layout copy must not persist {key}");
+            }
+        }
+        assert_eq!(after, before, "a metadata-replacing copy keeps the stored key set");
+        let copied = set
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("read copied metadata");
+        assert_eq!(copied.user_defined.get("x-amz-meta-color").map(String::as_str), Some("blue"));
+        assert_eq!(copied.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+    }
+
+    #[tokio::test]
+    async fn default_layout_replication_status_writeback_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-writeback";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+        let snapshot = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read metadata")
+            .replication_generation_snapshot();
+        let status = replication_metadata(None, None, "arn:test=COMPLETED;");
+        set.put_object_metadata(
+            bucket,
+            object,
+            &ObjectOptions {
+                eval_metadata: Some(status.clone()),
+                replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                    expected_generation: snapshot,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("replication status write-back");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for (keys, before) in after.iter().zip(&before) {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a status write-back must not persist {key}");
+            }
+            let added: HashSet<_> = keys.difference(before).collect();
+            assert!(
+                added.iter().all(|key| status.contains_key(*key)),
+                "a status write-back adds only the status keys: {added:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn replication_status_writeback_cas_accepts_suspended_null_version_snapshot() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;

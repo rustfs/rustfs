@@ -1657,6 +1657,12 @@ pub struct ObjectInfo {
     pub multipart_completion_replayed: bool,
     /// Previous current version's size observed during `rename_data` commit.
     pub backfilled_old_current_size: Option<crate::disk::OldCurrentSize>,
+    /// Persisted EC block size of a local version, projected from its erasure
+    /// layout for response headers. It is deliberately not part of
+    /// `user_defined`: every writer that turns `user_defined` back into stored
+    /// metadata would otherwise persist it. Read it through
+    /// [`ObjectInfo::effective_ec_block_size`].
+    pub ec_block_size: Option<usize>,
 }
 
 impl Default for ObjectInfo {
@@ -1700,6 +1706,7 @@ impl Default for ObjectInfo {
             checksum: None,
             multipart_completion_replayed: false,
             backfilled_old_current_size: None,
+            ec_block_size: None,
         }
     }
 }
@@ -1744,6 +1751,7 @@ impl Clone for ObjectInfo {
             checksum: self.checksum.clone(),
             multipart_completion_replayed: self.multipart_completion_replayed,
             backfilled_old_current_size: self.backfilled_old_current_size,
+            ec_block_size: self.ec_block_size,
             expires: self.expires,
         }
     }
@@ -1753,12 +1761,7 @@ impl ObjectInfo {
     /// Return the persisted EC block size exposed by the response-side
     /// projection.  Callers must not infer this value from request metadata.
     pub fn effective_ec_block_size(&self) -> Option<usize> {
-        rustfs_utils::http::metadata_compat::get_consistent_str(
-            &self.user_defined,
-            crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX,
-        )
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+        self.ec_block_size
     }
 
     pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
@@ -2184,13 +2187,7 @@ impl ObjectInfo {
         // FileInfo for the reader, but never expose the internal marker as
         // ordinary S3 metadata.
         rustfs_utils::http::metadata_compat::remove_str(&mut metadata, crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX);
-        if !fi.deleted && !is_remote && fi.erasure.block_size > 0 {
-            rustfs_utils::http::metadata_compat::insert_str(
-                &mut metadata,
-                crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX,
-                fi.erasure.block_size.to_string(),
-            );
-        }
+        let ec_block_size = (!fi.deleted && !is_remote && fi.erasure.block_size > 0).then_some(fi.erasure.block_size);
 
         let storage_class = Some(
             storageclass::effective_class(
@@ -2250,6 +2247,7 @@ impl ObjectInfo {
             version_purge_status_internal,
             version_purge_status,
             replication_decision,
+            ec_block_size,
             ..Default::default()
         }
     }
@@ -3173,12 +3171,12 @@ mod tests {
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
 
         assert_eq!(info.effective_ec_block_size(), Some(64 * 1024));
-        assert_eq!(
-            info.user_defined
-                .get(crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_KEY)
-                .map(String::as_str),
-            Some("65536")
-        );
+        for key in ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"] {
+            assert!(
+                !info.user_defined.contains_key(key),
+                "the projection must not enter metadata that writers persist: {key}"
+            );
+        }
 
         fi.erasure.block_size = 131_072;
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
@@ -3206,9 +3204,10 @@ mod tests {
         let owned = ObjectInfo::from_owned_file_info(fi, "bucket", "object", false);
 
         assert_eq!(owned.effective_ec_block_size(), Some(64 * 1024));
+        assert_eq!(borrowed.effective_ec_block_size(), Some(64 * 1024));
         assert_eq!(owned.user_defined, borrowed.user_defined);
         for key in ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"] {
-            assert_eq!(owned.user_defined.get(key).map(String::as_str), Some("65536"));
+            assert!(!owned.user_defined.contains_key(key), "{key}");
         }
     }
 
