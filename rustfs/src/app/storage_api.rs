@@ -1690,11 +1690,12 @@ pub(crate) mod timeout_wrapper {
 pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
-            parse_list_object_versions_params, parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
+            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
+        pub(crate) use crate::storage::storage_api::s3_api_consumer::common::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
     }
 
     pub(crate) mod multipart {
@@ -1852,7 +1853,8 @@ pub(crate) mod owned_parity {
         DenialAuditor, DenialRateLimiter, DenialScope, FS, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker,
         ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
         RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG, TableDataPlanePublicationGuards,
-        authorization_denial_entry, authorization_denial_entry_for_view, authorize_request, parity_test_support,
+        authorization_denial_entry, authorization_denial_entry_for_view, authorize_object_request, authorize_request,
+        parity_test_support,
     };
 }
 

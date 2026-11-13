@@ -56,6 +56,13 @@ required-features = ["swift"]
 name = "swift_object_integration_test"
 required-features = ["swift"]
 
+# Starts an embedded server on the gateway stack, which only a build with the
+# feature can select.
+[[test]]
+name = "embedded_gateway_stack_test"
+path = "tests/embedded_gateway_stack_test/main.rs"
+required-features = ["gateway-stack"]
+
 [features]
 internode-transport = ["rustfs-ecstore/internode-transport", "rustfs-rio/internode-transport"]
 default = ["ftps", "webdav", "gcs"]
@@ -70,12 +77,19 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
-e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
+# The debug-only E2E binary also carries the gateway S3 stack, so the gateway smoke
+# lane runs the same artifact as the legacy one with RUSTFS_S3_STACK as its only change.
+e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks", "gateway-stack"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# The rustfs-gateway S3 stack, selected at startup with RUSTFS_S3_STACK=gateway
+# (rustfs/backlog#2734). Under construction: off by default and never enabled in a
+# release build; the stack refuses to compile without debug assertions, and
+# `scripts/check_connect_release_boundary.py` keeps every release-reachable feature from enabling it.
+gateway-stack = ["dep:rustfs-gateway", "dep:rustfs-gateway-adapter", "dep:rustfs-gateway-stream"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
@@ -256,6 +270,9 @@ rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
+rustfs-gateway = { workspace = true, optional = true }
+rustfs-gateway-adapter = { workspace = true, optional = true }
+rustfs-gateway-stream = { workspace = true, optional = true }
 rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }

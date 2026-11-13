@@ -492,11 +492,29 @@ impl HealManager {
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
                         publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events, &result);
+                        // Single-object MRF attempts retain one storage result.
+                        // Use the original result even if the report was size
+                        // limited, without certifying independent integrity.
+                        let unverified_repair_bytes = if completed_status == HealTaskStatus::Completed
+                            && matches!(&result, Err(Error::LegacyMrfUnverified { .. }))
+                        {
+                            task.result_items
+                                .read()
+                                .await
+                                .iter()
+                                .find(|(_, item)| item.drives_healed().is_some_and(|healed| healed > 0))
+                                .map(|(_, item)| u64::try_from(item.object_size).unwrap_or(u64::MAX))
+                        } else {
+                            None
+                        };
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
                             HealTaskStatus::Completed if matches!(&result, Err(Error::LegacyMrfUnverified { .. })) => {
                                 stats.update_unverified_task_completion();
+                                if let Some(bytes) = unverified_repair_bytes {
+                                    stats.add_unverified_repair(bytes);
+                                }
                             }
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
