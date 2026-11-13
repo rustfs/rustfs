@@ -30,8 +30,6 @@ use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
-use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
-use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
@@ -925,8 +923,8 @@ fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&
 
     // Skip empty object lock values
     if value.is_empty()
-        && (key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_MODE.as_str())
-            || key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()))
+        && (key.eq_ignore_ascii_case(AMZ_OBJECT_LOCK_MODE_LOWER)
+            || key.eq_ignore_ascii_case(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER))
     {
         return true;
     }
@@ -2572,6 +2570,21 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+    }
+
+    /// An empty Object Lock mode or retain-until date is never handed back as
+    /// user metadata, whatever its casing; an empty user value is.
+    #[test]
+    fn empty_object_lock_values_are_not_user_metadata() {
+        for key in [
+            "x-amz-object-lock-mode",
+            "X-Amz-Object-Lock-Mode",
+            "x-amz-object-lock-retain-until-date",
+            "X-AMZ-OBJECT-LOCK-RETAIN-UNTIL-DATE",
+        ] {
+            assert!(should_skip_object_metadata_key(key, "", &[]), "{key:?} must be skipped");
+        }
+        assert!(!should_skip_object_metadata_key("object-lock-mode", "", &[]));
     }
 
     /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
