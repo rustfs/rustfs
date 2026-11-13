@@ -142,6 +142,20 @@ impl DefaultMultipartUsecase {
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
+        // cuObject S3-over-RDMA UploadPart: an empty HTTP body plus
+        // `x-amz-rdma-token` means the part bytes are read from the client's
+        // registered buffer (see `object::cuobject::rdma_put_body`).
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(&req.headers) {
+            Some(token) if content_length.unwrap_or(0) == 0 => {
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(&bucket, &key, &token, true)?;
+                let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
+                (Some(body), Some(total), Some(total))
+            }
+            _ => (body, content_length, None),
+        };
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let rdma_put: Option<i64> = None;
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
         if let Some(size) = size {
             reject_oversize_single_upload(size)?;
@@ -419,7 +433,20 @@ impl DefaultMultipartUsecase {
 
         // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
         // server-computed part checksum as a raw response header (#1261).
-        let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut upload_part_extra_checksum_headers =
+            crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let _ = rdma_put;
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        if let Some(moved) = rdma_put {
+            upload_part_extra_checksum_headers.push((crate::app::object::cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
+            upload_part_extra_checksum_headers
+                .push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+        }
 
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
