@@ -31,8 +31,7 @@ use crate::admin::handlers::replication::cluster_replication_stats;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::replication_metrics_wire::{MetricsV2Wire, MetricsWire};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_envelope, current_boot_time, current_bucket_monitor_handle, current_object_store_handle,
-    current_replication_pool_handle,
+    AppContext, app_context_from_envelope, current_boot_time, current_bucket_monitor_handle, current_replication_pool_handle,
 };
 use crate::admin::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use crate::admin::storage_api::bucket::metadata_sys;
@@ -40,7 +39,6 @@ use crate::admin::storage_api::bucket::replication::{self, BucketReplicationResy
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::utils::{owned_json_response, query_value_exact};
 use crate::error::ApiError;
@@ -137,7 +135,7 @@ impl Operation for ReplicationExtension {
             .get("bucket")
             .ok_or_else(|| s3_error!(InternalError, "replication extension route has no bucket"))?;
         super::authorize(&mut req, Some(bucket), replication_extension_policy_action(route)).await?;
-        ensure_replication_bucket_exists(bucket).await?;
+        super::ensure_bucket_exists(bucket).await?;
 
         match route {
             ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
@@ -250,19 +248,6 @@ struct ReplicationResetStatusTarget {
     object: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-}
-
-async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
-    let Some(store) = current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
-    };
-
-    store
-        .get_bucket_info(bucket, &BucketOptions::default())
-        .await
-        .map_err(ApiError::from)?;
-
-    Ok(())
 }
 
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {

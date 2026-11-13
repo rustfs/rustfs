@@ -16,6 +16,7 @@ use super::*;
 use crate::admin::operation::test_support::TestRequest;
 use crate::admin::runtime_sources::ServerContextSlot;
 use crate::admin::storage_api::access::ReqInfo;
+use crate::admin::storage_api::contract::bucket::BucketOperations as _;
 use http::Method;
 use std::sync::Arc;
 
@@ -259,10 +260,13 @@ fn listen_notification_streams_close_after_identity_policy_or_bucket_revocation(
             } else {
                 S3Action::ListenNotificationAction
             });
-            let mut authorization =
-                ListenNotificationAuthorization::capture(request.build(), bucket_scoped.then_some(bucket.as_str()), action)
-                    .await
-                    .expect("admit subscription");
+            let mut authorization = ListenNotificationAuthorization::capture(
+                request.build().into_envelope(),
+                bucket_scoped.then_some(bucket.as_str()),
+                action,
+            )
+            .await
+            .expect("admit subscription");
             assert!(authorization.still_allowed().await, "initial listener {case}");
             // Fill a real stream's output channel, then revoke while its next
             // send is waiting. A consumer pause cannot defer reauthorization.
@@ -323,7 +327,7 @@ async fn build_listen_notification_response_sets_event_stream_headers() {
         .expect("uri should parse");
 
     let authorization = ListenNotificationAuthorization {
-        request: TestRequest::new(Method::GET, uri.clone()).build(),
+        envelope: TestRequest::new(Method::GET, uri.clone()).build().into_envelope(),
         action: Action::S3Action(S3Action::ListenBucketNotificationAction),
         bucket_incarnation: None,
         keystone_credentials: None,

@@ -72,9 +72,9 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 pub const ADMIN_OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads";
-const LOG_COMPONENT_ADMIN: &str = "admin";
+pub(crate) const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_OBJECT_LAMBDA: &str = "object_lambda";
-const EVENT_ADMIN_ROUTER_STATE: &str = "admin_router_state";
+pub(crate) const EVENT_ADMIN_ROUTER_STATE: &str = "admin_router_state";
 
 #[derive(Debug, Clone)]
 struct ObjectLambdaWebhookConfig {

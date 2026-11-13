@@ -35,7 +35,7 @@ use std::time::Duration;
 const SECRET: &str = "s3-extension-secret";
 
 /// Every request shape the extension routes claim, with `{b}` standing for the bucket.
-const ROUTES: [(Method, &str); 8] = [
+const ROUTES: [(Method, &str); 10] = [
     (Method::PUT, "/{b}?replication-reset"),
     (Method::GET, "/{b}?replication-reset-status"),
     (Method::GET, "/{b}?replication-metrics=2"),
@@ -44,6 +44,8 @@ const ROUTES: [(Method, &str); 8] = [
     (Method::GET, "/?events=s3:ObjectCreated:*"),
     (Method::GET, "/{b}?events=s3:ObjectCreated:*"),
     (Method::GET, "/{b}/?events=s3:ObjectCreated:*"),
+    (Method::GET, "/{b}?events"),
+    (Method::GET, "/?events="),
 ];
 
 fn router() -> S3Router<AdminOperation> {
@@ -88,8 +90,40 @@ fn error_code(result: S3Result<S3Response<Body>>, context: &str) -> S3ErrorCode 
 /// The callers the tests present, created in the process IAM under unique names.
 struct Callers {
     no_policy: String,
-    reader: String,
     full: String,
+    /// One caller per action, each allowed exactly that action.
+    single: [(Action, String); 5],
+}
+
+/// The action each extension route authorizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    ResetReplication,
+    GetReplication,
+    PutReplication,
+    Listen,
+    ListenBucket,
+}
+
+impl Action {
+    fn policy_action(self) -> &'static str {
+        match self {
+            Action::ResetReplication => "s3:ResetBucketReplicationState",
+            Action::GetReplication => "s3:GetReplicationConfiguration",
+            Action::PutReplication => "s3:PutReplicationConfiguration",
+            Action::Listen => "s3:ListenNotification",
+            Action::ListenBucket => "s3:ListenBucketNotification",
+        }
+    }
+
+    /// The resource the single-action caller is allowed it on: the bucket where the
+    /// action is bucket-scoped, every resource for the service-level listen action.
+    fn resource(self, bucket: &str) -> String {
+        match self {
+            Action::Listen => "arn:aws:s3:::*".to_owned(),
+            _ => format!("arn:aws:s3:::{bucket}"),
+        }
+    }
 }
 
 /// Creates the three callers in the ambient context's IAM, which every global
@@ -114,27 +148,35 @@ async fn install_identities() -> (Callers, String) {
         .expect("IAM format");
     let iam = ambient.iam().handle();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let bucket = format!("ext-routes-{suffix}");
+    let all = [
+        Action::ResetReplication,
+        Action::GetReplication,
+        Action::PutReplication,
+        Action::Listen,
+        Action::ListenBucket,
+    ];
     let callers = Callers {
         no_policy: format!("ext-no-policy-{suffix}"),
-        reader: format!("ext-reader-{suffix}"),
         full: format!("ext-full-{suffix}"),
+        single: all.map(|action| (action, format!("ext-{action:?}-{suffix}").to_lowercase())),
     };
-    for (user, actions) in [
-        (&callers.no_policy, None),
-        (&callers.reader, Some(vec!["s3:GetReplicationConfiguration"])),
-        (
-            &callers.full,
-            Some(vec![
-                "s3:GetReplicationConfiguration",
-                "s3:PutReplicationConfiguration",
-                "s3:ResetBucketReplicationState",
-                "s3:ListenNotification",
-                "s3:ListenBucketNotification",
-            ]),
-        ),
-    ] {
+    let mut grants =
+        vec![(callers.no_policy.clone(), vec![]), (
+        callers.full.clone(),
+        all.iter()
+            .map(|action| serde_json::json!({"Effect":"Allow","Action":action.policy_action(),"Resource":"arn:aws:s3:::*"}))
+            .collect(),
+    )];
+    for (action, user) in &callers.single {
+        grants.push((
+            user.clone(),
+            vec![serde_json::json!({"Effect":"Allow","Action":action.policy_action(),"Resource":action.resource(&bucket)})],
+        ));
+    }
+    for (user, statements) in grants {
         iam.create_user(
-            user,
+            &user,
             &AddOrUpdateUserReq {
                 secret_key: SECRET.into(),
                 policy: None,
@@ -143,21 +185,19 @@ async fn install_identities() -> (Callers, String) {
         )
         .await
         .expect("create user");
-        if let Some(actions) = actions {
-            let policy = serde_json::json!({"Version":"2012-10-17","Statement":[
-                {"Effect":"Allow","Action":actions,"Resource":"arn:aws:s3:::*"}]});
+        if !statements.is_empty() {
+            let policy = serde_json::json!({"Version":"2012-10-17","Statement":statements});
             iam.set_policy(
-                user,
+                &user,
                 Policy::parse_config(&serde_json::to_vec(&policy).expect("policy JSON")).expect("policy"),
             )
             .await
             .expect("set policy");
-            iam.policy_db_set(user, UserType::Reg, false, user)
+            iam.policy_db_set(&user, UserType::Reg, false, &user)
                 .await
                 .expect("attach policy");
         }
     }
-    let bucket = format!("ext-routes-{suffix}");
     crate::admin::storage_api::contract::bucket::BucketOperations::make_bucket(
         ambient.object_store().as_ref(),
         &bucket,
@@ -232,30 +272,65 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             };
             assert_eq!(code, expected, "no-policy {method} {uri}");
         }
-        assert_eq!(S3ErrorCode::AccessDenied.status_code(), Some(StatusCode::FORBIDDEN));
 
-        // The reader holds only s3:GetReplicationConfiguration: the metrics routes
-        // reach the handler, every other route is refused on its own action.
-        for (method, template, expected) in [
-            (Method::PUT, "/{b}?replication-reset", S3ErrorCode::AccessDenied),
-            (Method::GET, "/{b}?replication-check", S3ErrorCode::AccessDenied),
-            (Method::GET, "/?events=s3:ObjectCreated:*", S3ErrorCode::InternalError),
-            (Method::GET, "/{b}?events=s3:ObjectCreated:*", S3ErrorCode::AccessDenied),
-            (Method::GET, "/{b}?replication-reset-status", S3ErrorCode::AccessDenied),
+        // Each single-action caller is served exactly on the routes that authorize its
+        // action and refused on every other route. Served is the handler's first answer
+        // for a bucket without replication configuration; refused is AccessDenied, or the
+        // pinned InternalError on the bucketless listen route.
+        for (method, template, action, served) in [
+            (
+                Method::PUT,
+                "/{b}?replication-reset",
+                Action::ResetReplication,
+                Some(S3ErrorCode::ReplicationConfigurationNotFoundError),
+            ),
+            (
+                Method::GET,
+                "/{b}?replication-reset-status",
+                Action::ResetReplication,
+                Some(S3ErrorCode::ReplicationConfigurationNotFoundError),
+            ),
             (
                 Method::GET,
                 "/{b}?replication-metrics=2",
-                S3ErrorCode::ReplicationConfigurationNotFoundError,
+                Action::GetReplication,
+                Some(S3ErrorCode::ReplicationConfigurationNotFoundError),
             ),
             (
                 Method::GET,
                 "/{b}?replication-metrics",
-                S3ErrorCode::ReplicationConfigurationNotFoundError,
+                Action::GetReplication,
+                Some(S3ErrorCode::ReplicationConfigurationNotFoundError),
             ),
+            (
+                Method::GET,
+                "/{b}?replication-check",
+                Action::PutReplication,
+                Some(S3ErrorCode::InvalidRequest),
+            ),
+            (Method::GET, "/?events=s3:ObjectCreated:*", Action::Listen, None),
+            (Method::GET, "/{b}?events=s3:ObjectCreated:*", Action::ListenBucket, None),
         ] {
             let uri = uri_for(template, &bucket);
-            let result = send(&router, request(method.clone(), &uri, Some(&callers.reader))).await;
-            assert_eq!(error_code(result, &format!("reader {method} {uri}")), expected, "reader {method} {uri}");
+            for (caller_action, caller) in &callers.single {
+                let context = format!("{caller_action:?} caller, {method} {uri}");
+                let result = send(&router, request(method.clone(), &uri, Some(caller))).await;
+                match (*caller_action == action, served.clone()) {
+                    (true, Some(code)) => assert_eq!(error_code(result, &context), code, "{context}"),
+                    (true, None) => {
+                        let response = result.unwrap_or_else(|error| panic!("{context}: expected the stream, got {error:?}"));
+                        assert_eq!(response.status, Some(StatusCode::OK), "{context}");
+                    }
+                    (false, _) => {
+                        let refused = if template.starts_with("/?") {
+                            S3ErrorCode::InternalError
+                        } else {
+                            S3ErrorCode::AccessDenied
+                        };
+                        assert_eq!(error_code(result, &context), refused, "{context}");
+                    }
+                }
+            }
         }
 
         // The fully permitted caller reaches each handler's first decision.
@@ -280,6 +355,8 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             (Method::GET, "/missing-{b}?replication-metrics", S3ErrorCode::NoSuchBucket),
             (Method::GET, "/missing-{b}?events=s3:ObjectCreated:*", S3ErrorCode::NoSuchBucket),
             (Method::GET, "/{b}?events=not-an-event", S3ErrorCode::InvalidArgument),
+            (Method::GET, "/{b}?events", S3ErrorCode::InvalidArgument),
+            (Method::GET, "/?events=", S3ErrorCode::InvalidArgument),
         ] {
             let uri = uri_for(template, &bucket);
             let result = send(&router, request(method.clone(), &uri, Some(&callers.full))).await;

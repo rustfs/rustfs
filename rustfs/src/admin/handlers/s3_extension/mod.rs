@@ -34,10 +34,12 @@ mod replication;
 use crate::admin::auth::authenticate_envelope_credentials;
 use crate::admin::operation::AdminRequest;
 use crate::admin::route_table;
-use crate::admin::router::{AdminOperation, S3Router};
-use crate::admin::runtime_sources::current_region;
+use crate::admin::router::{AdminOperation, EVENT_ADMIN_ROUTER_STATE, LOG_COMPONENT_ADMIN, S3Router};
+use crate::admin::runtime_sources::{current_object_store_handle, current_region};
 use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::utils::query_value_exact;
+use crate::error::ApiError;
 use crate::license::license_check;
 use http::{Method, Uri};
 use listen::ListenNotification;
@@ -47,6 +49,7 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use tracing::error;
 
 const LISTEN_SUB_RESOURCE: &str = "events";
+const LOG_SUBSYSTEM_S3_EXTENSION: &str = "s3_extension";
 
 /// The admin route-table key of an extension request: `METHOD|?<sub-resource>/<bucket>`,
 /// with an empty bucket for the service-level listen route; `None` when the
@@ -113,9 +116,9 @@ async fn authorize(req: &mut AdminRequest, bucket: Option<&str>, action: Action)
         std::io::ErrorKind::PermissionDenied => S3Error::with_message(S3ErrorCode::AccessDenied, format!("{er}")),
         _ => {
             error!(
-                event = "admin_router_state",
-                component = "admin",
-                subsystem = "s3_extension",
+                event = EVENT_ADMIN_ROUTER_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_S3_EXTENSION,
                 result = "license_check_failed",
                 error = %er,
                 "admin router state"
@@ -124,6 +127,18 @@ async fn authorize(req: &mut AdminRequest, bucket: Option<&str>, action: Action)
         }
     })?;
     authorize_owned_request(req.envelope_mut(), action, None).await
+}
+
+/// Refuses a request on a bucket that does not exist, with the error the store reports.
+async fn ensure_bucket_exists(bucket: &str) -> S3Result<()> {
+    let Some(store) = current_object_store_handle() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+    };
+    store
+        .get_bucket_info(bucket, &BucketOptions::default())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,6 +170,8 @@ mod tests {
             (Method::GET, "/?events=s3:ObjectRemoved:*", "GET|?events/"),
             (Method::GET, "/demo-bucket?events=s3:ObjectCreated:*", "GET|?events/demo-bucket"),
             (Method::GET, "/demo-bucket/?events=s3:ObjectCreated:*", "GET|?events/demo-bucket"),
+            (Method::GET, "/demo-bucket?events", "GET|?events/demo-bucket"),
+            (Method::GET, "/?events=", "GET|?events/"),
         ] {
             assert_eq!(key(method.clone(), uri).as_deref(), Some(expected), "{method} {uri}");
         }

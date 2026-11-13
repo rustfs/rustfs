@@ -27,13 +27,12 @@
 mod tests;
 
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-use crate::admin::runtime_sources::{
-    app_context_from_envelope, current_notification_system, current_object_store_handle, object_store_from_envelope,
-};
+use crate::admin::router::{EVENT_ADMIN_ROUTER_STATE, LOG_COMPONENT_ADMIN};
+use crate::admin::runtime_sources::{app_context_from_envelope, current_notification_system, object_store_from_envelope};
 use crate::admin::storage_api::access::{authorize_owned_request, spawn_traced};
-use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::runtime::PeerRestClient;
 use crate::admin::utils::{query_value_exact, query_values_exact};
+use crate::app::RequestEnvelope;
 use crate::auth::get_session_token;
 use crate::error::ApiError;
 use bytes::Bytes;
@@ -48,9 +47,7 @@ use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
-const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_LIVE_EVENTS: &str = "live_events";
-const EVENT_ADMIN_ROUTER_STATE: &str = "admin_router_state";
 
 /// The listen route; the bucket parameter is absent on the service-level route.
 pub(super) struct ListenNotification;
@@ -67,16 +64,10 @@ impl Operation for ListenNotification {
         super::authorize(&mut req, bucket, action).await?;
         validate_listen_notification_query(req.uri())?;
         if let Some(bucket) = bucket {
-            let Some(store) = current_object_store_handle() else {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
-            };
-            store
-                .get_bucket_info(bucket, &BucketOptions::default())
-                .await
-                .map_err(ApiError::from)?;
+            super::ensure_bucket_exists(bucket).await?;
         }
         let uri = req.uri().clone();
-        let authorization = ListenNotificationAuthorization::capture(req, bucket, action).await?;
+        let authorization = ListenNotificationAuthorization::capture(req.into_envelope(), bucket, action).await?;
         build_listen_notification_response(&uri, bucket, authorization)
     }
 }
@@ -260,7 +251,7 @@ const LISTEN_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // No Debug implementation: the admitted request retains its signing credentials.
 struct ListenNotificationAuthorization {
-    request: AdminRequest,
+    envelope: RequestEnvelope,
     action: Action,
     bucket_incarnation: Option<(String, uuid::Uuid)>,
     keystone_credentials: Option<rustfs_credentials::Credentials>,
@@ -268,9 +259,9 @@ struct ListenNotificationAuthorization {
 }
 
 impl ListenNotificationAuthorization {
-    async fn capture(request: AdminRequest, bucket: Option<&str>, action: Action) -> S3Result<Self> {
+    async fn capture(envelope: RequestEnvelope, bucket: Option<&str>, action: Action) -> S3Result<Self> {
         let bucket_incarnation = if let Some(bucket) = bucket {
-            let store = object_store_from_envelope(request.envelope())
+            let store = object_store_from_envelope(&envelope)
                 .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Object store is unavailable"))?;
             Some((
                 bucket.to_string(),
@@ -280,7 +271,7 @@ impl ListenNotificationAuthorization {
             None
         };
         Ok(Self {
-            request,
+            envelope,
             action,
             bucket_incarnation,
             keystone_credentials: rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten(),
@@ -299,11 +290,11 @@ impl ListenNotificationAuthorization {
                 let provider =
                     crate::auth_keystone::get_keystone_auth().ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
                 let token = self
-                    .request
+                    .envelope
                     .headers()
                     .get("x-auth-token")
                     .and_then(|v| v.to_str().ok())
-                    .or_else(|| self.request.headers().get("x-storage-token").and_then(|v| v.to_str().ok()))
+                    .or_else(|| self.envelope.headers().get("x-storage-token").and_then(|v| v.to_str().ok()))
                     .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
                 let current = provider
                     .revalidate_subscription_token(token)
@@ -315,8 +306,7 @@ impl ListenNotificationAuthorization {
                 self.keystone_credentials = Some(current);
             }
             if let Some((bucket, expected)) = &self.bucket_incarnation {
-                let store =
-                    object_store_from_envelope(self.request.envelope()).ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+                let store = object_store_from_envelope(&self.envelope).ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
                 let actual = store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?;
                 if actual != *expected {
                     return Err(S3Error::new(S3ErrorCode::AccessDenied));
@@ -332,13 +322,13 @@ impl ListenNotificationAuthorization {
         {
             return Err(S3Error::new(S3ErrorCode::AccessDenied));
         }
-        let context = app_context_from_envelope(self.request.envelope());
-        if context.is_none() && self.request.envelope().server_context().is_some() {
+        let context = app_context_from_envelope(&self.envelope);
+        if context.is_none() && self.envelope.server_context().is_some() {
             return Err(S3Error::new(S3ErrorCode::AccessDenied));
         }
         let keystone = self.keystone_credentials.clone();
         let access_key = self
-            .request
+            .envelope
             .credentials()
             .map(|credentials| credentials.access_key().to_owned())
             .or_else(|| keystone.as_ref().map(|credentials| credentials.access_key.clone()))
@@ -346,26 +336,26 @@ impl ListenNotificationAuthorization {
         rustfs_keystone::KEYSTONE_CREDENTIALS
             .scope(keystone, async {
                 let (cred, is_owner) = crate::auth::check_key_valid_with_context(
-                    get_session_token(self.request.uri(), self.request.headers()).unwrap_or_default(),
+                    get_session_token(self.envelope.uri(), self.envelope.headers()).unwrap_or_default(),
                     &access_key,
                     context.as_deref(),
                 )
                 .await?;
                 if self.keystone_credentials.is_none()
                     && !self
-                        .request
+                        .envelope
                         .credentials()
                         .is_some_and(|credentials| credentials.secret_key_matches(&cred.secret_key))
                 {
                     return Err(S3Error::new(S3ErrorCode::AccessDenied));
                 }
                 let info = self
-                    .request
+                    .envelope
                     .req_info_mut()
                     .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
                 info.cred = Some(cred);
                 info.is_owner = is_owner;
-                authorize_owned_request(self.request.envelope_mut(), self.action, None).await
+                authorize_owned_request(&mut self.envelope, self.action, None).await
             })
             .await
     }
