@@ -2179,6 +2179,7 @@ impl LockReleaseStatus {
         }
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TierMutationPeerState {
@@ -3795,6 +3796,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "BackgroundHealStatus"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn mrf_lifecycle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MrfLifecycleRequest>,
+        ) -> std::result::Result<tonic::Response<super::MrfLifecycleResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/MrfLifecycle");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "MrfLifecycle"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn replacement_recovery_status(
             &mut self,
             request: impl tonic::IntoRequest<super::ReplacementRecoveryStatusRequest>,
@@ -4408,6 +4424,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::BackgroundHealStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::BackgroundHealStatusResponse>, tonic::Status>;
+        async fn mrf_lifecycle(
+            &self,
+            request: tonic::Request<super::MrfLifecycleRequest>,
+        ) -> std::result::Result<tonic::Response<super::MrfLifecycleResponse>, tonic::Status>;
         async fn replacement_recovery_status(
             &self,
             request: tonic::Request<super::ReplacementRecoveryStatusRequest>,
@@ -7285,6 +7305,34 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/MrfLifecycle" => {
+                    #[allow(non_camel_case_types)]
+                    struct MrfLifecycleSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::MrfLifecycleRequest> for MrfLifecycleSvc<T> {
+                        type Response = super::MrfLifecycleResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::MrfLifecycleRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::mrf_lifecycle(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = MrfLifecycleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/ReplacementRecoveryStatus" => {
                     #[allow(non_camel_case_types)]
                     struct ReplacementRecoveryStatusSvc<T: NodeService>(pub Arc<T>);
@@ -8526,4 +8574,28 @@ pub mod tier_mutation_control_service_server {
     impl<T> tonic::server::NamedService for TierMutationControlServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MrfLifecycleRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(string, tag = "2")]
+    pub topology_fingerprint: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub command: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub challenge: ::prost::bytes::Bytes,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MrfLifecycleResponse {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub result: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
 }

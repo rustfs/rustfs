@@ -126,7 +126,7 @@ tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 rustfs-s3-types.workspace = true
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
-rustfs-ecstore = { workspace = true, features = ["test-util", "internode-transport"] }
+rustfs-ecstore = { workspace = true, features = ["test-util"] }
 
 [lib]
 doctest = false

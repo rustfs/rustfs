@@ -1561,18 +1561,6 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     new_disk_with_health_tracker(ep, opt, None).await
 }
 
-pub(crate) async fn new_disk_for_instance(
-    instance: &crate::runtime::instance::InstanceContext,
-    ep: &Endpoint,
-    opt: &DiskOption,
-) -> Result<DiskStore> {
-    let disk = new_disk_with_health_tracker(ep, opt, None).await?;
-    if let Disk::Local(wrapper) = disk.as_ref() {
-        wrapper.get_disk().usage_watch_binding.bind(&instance.usage_watches);
-    }
-    Ok(disk)
-}
-
 pub(crate) async fn new_disk_with_health_tracker(
     ep: &Endpoint,
     opt: &DiskOption,

@@ -6030,6 +6030,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mrf_cluster_routes_require_signature_and_handler_authentication() {
+        let mut router = S3Router::new(false);
+        crate::admin::handlers::heal::register_heal_route(&mut router).expect("production heal routes register");
+
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            for (method, suffix) in [
+                (Method::GET, ""),
+                (Method::GET, "/responsibilities"),
+                (Method::GET, "/responsibilities/node/00000000-0000-4000-8000-000000000001"),
+                (Method::POST, "/responsibilities/actions"),
+            ] {
+                let path = format!("{prefix}/v4/heal/mrf/cluster{suffix}");
+                assert!(router.contains_compatible_route(method.clone(), &path));
+                let mut req = router_request(method, "/");
+                req.uri = path.parse().expect("MRF cluster route parses");
+                let error = router
+                    .check_access(&mut req)
+                    .await
+                    .expect_err("MRF cluster route must require a signature");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+
+                let error = router
+                    .call(req)
+                    .await
+                    .expect_err("MRF cluster route must dispatch to an authenticated handler");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(error.to_string().contains("authentication required"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn check_access_rejects_anonymous_replication_extension_request() {
         let router: S3Router<AdminOperation> = S3Router::new(false);
         let mut req = S3Request {

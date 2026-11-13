@@ -640,7 +640,12 @@ pub mod rio {
 }
 
 pub mod rpc {
-    #[cfg(all(feature = "test-util", feature = "internode-transport"))]
+    #[cfg(feature = "test-util")]
+    pub use crate::cluster::rpc::internode_data_transport::{
+        InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
+        ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    };
+    #[cfg(feature = "test-util")]
     pub mod test_util {
         /// Build a remote disk using a controlled transport and no health monitor.
         ///
@@ -648,7 +653,7 @@ pub mod rpc {
         /// Returns the normal remote-disk construction error for the supplied endpoint.
         pub async fn remote_disk_with_transport(
             endpoint: &crate::layout::endpoint::Endpoint,
-            transport: std::sync::Arc<dyn super::InternodeDataTransport>,
+            transport: std::sync::Arc<dyn crate::cluster::rpc::internode_data_transport::InternodeDataTransport>,
         ) -> crate::disk::error::Result<crate::disk::DiskStore> {
             let options = crate::disk::DiskOption {
                 cleanup: false,
