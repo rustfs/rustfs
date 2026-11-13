@@ -673,8 +673,9 @@ pub(crate) mod ecstore_rpc {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
         RpcReplayCacheAdmissionError, ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers,
-        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_put_file_capability,
-        verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
+        verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability, verify_tonic_boot_epoch_response,
+        verify_tonic_rpc_response_proof,
     };
 }
 

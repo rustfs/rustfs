@@ -3351,8 +3351,7 @@ mod tests {
         assert_eq!(workers.available_permits(), 0);
         let overflow = super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline)
             .await
-            .err()
-            .expect("a ninth request cannot enlarge the bounded queue");
+            .expect_err("a ninth request cannot enlarge the bounded queue");
         assert_eq!(overflow.code(), tonic::Code::ResourceExhausted);
         drop(active);
         let resumed = futures_util::future::join_all(queued).await;
@@ -3366,7 +3365,7 @@ mod tests {
         let mut expired = Box::pin(super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline));
         assert!(futures::poll!(expired.as_mut()).is_pending());
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        let error = expired.await.err().expect("admission shares the original operation deadline");
+        let error = expired.await.expect_err("admission shares the original operation deadline");
         assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
         assert_eq!(admission.available_permits(), 8, "timed-out waiters release admission");
         drop(held);
