@@ -730,10 +730,13 @@ impl S3 for FS {
     }
 }
 
-/// Every mutating S3 operation that has no bucket notification event reaches the audit
-/// stream only through `audit_only_operation`; a new such operation, or a dropped
-/// wrapper, must fail here rather than silently go unaudited. The wrappers are looked
-/// up in this file and in `legacy_edge/`, where a split of this file moves them.
+/// Every mutating S3 operation that has no bucket notification event is audited at exactly one
+/// place: either its legacy edge wraps it (`audit_only_operation(req, S3Operation::X, …)` in this
+/// file or in `legacy_edge/`), or, once it is migrated, its use case under `src/app/` opens the
+/// owned audit (`audit_only_operation(envelope, S3Operation::X, …)` on `RequestEnvelope`, or
+/// `OperationHelper::audit_only_from_view(&envelope.audit_view(), S3Operation::X)`), so both
+/// stacks write the same record. Neither place leaves the operation unaudited; both would audit
+/// it twice. The calls are matched as text with whitespace ignored.
 #[cfg(test)]
 mod audit_coverage_tests {
     use crate::guard_sources::SourceSet;
@@ -746,8 +749,19 @@ mod audit_coverage_tests {
             .any(|prefix| name.starts_with(prefix))
     }
 
+    /// The legacy wrappers and the owned audit calls of `op`, in that order.
+    fn audit_sites(legacy_edge: &SourceSet, use_cases: &SourceSet, op: S3Operation) -> (usize, usize) {
+        let legacy = legacy_edge.count_ignoring_whitespace(&format!("audit_only_operation(req, S3Operation::{op:?},"));
+        // The helper's last argument is followed by `)`, or by `,` when rustfmt lays it out vertically.
+        let helper = format!("OperationHelper::audit_only_from_view(&envelope.audit_view(), S3Operation::{op:?}");
+        let owned = use_cases.count_ignoring_whitespace(&format!("audit_only_operation(envelope, S3Operation::{op:?},"))
+            + use_cases.count_ignoring_whitespace(&format!("{helper})"))
+            + use_cases.count_ignoring_whitespace(&format!("{helper},)"));
+        (legacy, owned)
+    }
+
     #[test]
-    fn mutating_operations_without_a_notification_event_are_wrapped_for_audit() {
+    fn mutating_operations_without_a_notification_event_are_audited_once() {
         let mut expected: Vec<S3Operation> = S3Operation::ALL
             .into_iter()
             .filter(|op| !is_read_only(*op) && op.to_event_name().is_none())
@@ -756,15 +770,70 @@ mod audit_coverage_tests {
         expected.push(S3Operation::AbortMultipartUpload);
         assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
 
-        let source = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
+        let legacy_edge = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
+        let use_cases = SourceSet::production("src/app/mod.rs", "src/app");
         for op in expected {
-            let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
-            assert!(
-                source.contains(&wrapper),
-                "{} is not run through audit_only_operation in {}",
+            let (legacy, owned) = audit_sites(&legacy_edge, &use_cases, op);
+            assert_eq!(
+                legacy + owned,
+                1,
+                "{} must be audited at exactly one place; legacy edge wrappers: {legacy} in {}, owned use-case calls: {owned} in {}",
                 op.as_str(),
-                source.describe()
+                legacy_edge.describe(),
+                use_cases.describe()
             );
+        }
+    }
+
+    /// A package root holding one legacy edge file and one use-case file.
+    fn fixture(edge: &str, use_case: &str) -> (tempfile::TempDir, SourceSet, SourceSet) {
+        let root = tempfile::tempdir().expect("fixture root");
+        for (path, text) in [
+            ("src/storage/ecfs.rs", edge),
+            ("src/app/mod.rs", ""),
+            ("src/app/upload_part.rs", use_case),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture dir");
+            std::fs::write(path, text).expect("fixture file");
+        }
+        let edge = SourceSet::production_under(root.path(), "src/storage/ecfs.rs", "src/storage/legacy_edge");
+        let use_cases = SourceSet::production_under(root.path(), "src/app/mod.rs", "src/app");
+        (root, edge, use_cases)
+    }
+
+    const LEGACY: &str = "audit_only_operation(req, S3Operation::UploadPart, |req| usecase.run(req)).await";
+    const OWNED_HELPER: &str =
+        "let helper = OperationHelper::audit_only_from_view(\n    &envelope.audit_view(),\n    S3Operation::UploadPart,\n);";
+    const OWNED_WRAPPER: &str =
+        "RequestEnvelope::audit_only_operation(\n    envelope,\n    S3Operation::UploadPart,\n    StatusCode::OK,\n    run,\n)";
+
+    #[test]
+    fn the_guard_accepts_exactly_one_audit_place() {
+        for (edge, use_case) in [(LEGACY, ""), ("", OWNED_HELPER), ("", OWNED_WRAPPER)] {
+            let (_root, edge, use_cases) = fixture(edge, use_case);
+            let (legacy, owned) = audit_sites(&edge, &use_cases, S3Operation::UploadPart);
+            assert_eq!(legacy + owned, 1, "legacy {legacy}, owned {owned}");
+        }
+    }
+
+    #[test]
+    fn the_guard_refuses_an_operation_audited_nowhere_or_twice() {
+        let wrapper_in_test_only = format!("#[cfg(test)]\nfn t() {{\n    {OWNED_HELPER}\n}}\n");
+        for (edge, use_case) in [
+            ("", ""),
+            (LEGACY, OWNED_HELPER),
+            (LEGACY, OWNED_WRAPPER),
+            ("", wrapper_in_test_only.as_str()),
+            ("audit_only_operation(req, S3Operation::UploadPartCopy, run)", ""),
+            (
+                "",
+                "OperationHelper::audit_only_from_view(&envelope.audit_view(), S3Operation::UploadPartCopy)",
+            ),
+        ] {
+            let (_root, edge, use_cases) = fixture(edge, use_case);
+            let (legacy, owned) = audit_sites(&edge, &use_cases, S3Operation::UploadPart);
+            assert_ne!(legacy + owned, 1, "legacy {legacy}, owned {owned}");
         }
     }
 }
