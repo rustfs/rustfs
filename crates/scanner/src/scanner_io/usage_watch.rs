@@ -5,7 +5,7 @@
 //! These witnesses do not acknowledge dirty work or certify a published root.
 use super::*;
 use crate::scanner::{LOCAL_SCANNER_ACTIVITY_NODE, ScannerActivitySnapshot, probe_scanner_activity};
-use rustfs_ecstore::api::runtime::{ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest};
+use crate::storage_api::scanner_io::{ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

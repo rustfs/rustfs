@@ -5311,7 +5311,7 @@ fn clear_coordinator_bucket_scan_probe() {
 #[test]
 fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
     let server_epoch = Uuid::from_u128(7);
-    let capabilities = rustfs_storage_api::NsScannerCapabilities {
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
         server_epoch,
         supports_durable_progress: false,
         supports_complete_observation: false,

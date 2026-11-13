@@ -67,8 +67,6 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
 };
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::object_opts_from_object_info as ecstore_object_opts_from_object_info;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
     BucketMetadataMutationGuard as EcstoreBucketMetadataMutationGuard,
@@ -162,8 +160,6 @@ pub(crate) use rustfs_ecstore::api::rpc::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::api::runtime::ScannerUsageWatchRequest as EcstoreUsageWatchRequest;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
 pub(crate) use rustfs_ecstore::api::runtime::{
@@ -423,12 +419,17 @@ pub(crate) mod scan {
         EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
         EcstoreScannerPublicationLeaseGrant,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
 }
 
 pub(crate) mod scanner_io {
-    pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions, NsScannerCapabilities};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    pub(crate) use rustfs_ecstore::api::runtime::{
+        ScannerUsageWatchKnown, ScannerUsageWatchObservation, ScannerUsageWatchRequest,
+    };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::{
         bucket::{

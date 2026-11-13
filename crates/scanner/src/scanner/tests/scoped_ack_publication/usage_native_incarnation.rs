@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::scanner_io::{acknowledge_scoped_dirty_usage, scanner_activity_epoch};
-use crate::storage_api::ecstore_scanner_ack_fence;
-use crate::storage_api::scan::{DeleteBucketOptions, MakeBucketOptions};
+use crate::storage_api::owner::ObjectOperations as _;
+use crate::storage_api::scan::{DeleteBucketOptions, MakeBucketOptions, ecstore_scanner_ack_fence};
 use rustfs_data_usage::{DATA_USAGE_BUCKET_OBSERVATION_VERSION, DataUsageBucketObservation, DataUsageBucketObservationSource};
 
 #[tokio::test]

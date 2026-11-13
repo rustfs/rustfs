@@ -7,11 +7,15 @@
 
 A watch proves that one bucket's counted namespace stayed unchanged within the same producer session. It does not acknowledge dirty work, prove durable object contents, replace quorum, or authorize root publication. Bucket incarnation, the complete producer owner set, and the topology and movement identity are separate required inputs.
 
+The consumer binds the proof to the owning ECStore's full endpoint layout and the expected remote grid-host set. Missing or substituted owners, a different instance with the same pool/set coordinates, and endpoint changes reject reuse before and after the watch query.
+
 The registry linearizes watch installation, mutation begin, mutation end, and observation under one short synchronous lock. Every admitted user-bucket mutation is tracked even when no watch exists yet. Installing a watch during an earlier mutation therefore returns an active count. Both begin and the physical tail's end advance the installed revision; logical cancellation cannot expose an idle interval while detached work is still changing storage.
 
 An unchanged interval requires matching owner, process session, watch token, bucket incarnation, revision, coverage version, and coverage epoch, with no active mutation at either endpoint. Missing, expired, malformed, or unsupported evidence is Unknown. Unknown never becomes revision zero or an empty clean set.
 
 Watch renewal keeps the original starting revision. A caller may extend its conservative local monotonic deadline after a successful renewal, but it must not replace the original proof with the renewed revision. A persisted checkpoint stores identity and revision, not a usable `Instant`; after restart, the old producer token must be checked again against the complete current owner set.
+
+One keeper belongs to each leader-local cohort, with weak store and cohort references. It revisits retained watches every sixty seconds, with four concurrent queries and a five-second total limit per keepalive query. At the 256-watch limit one pass is bounded by 380 seconds, below the ten-minute producer lease. Retained checkpoints and finished sources awaiting root publication and ACK keep their original proof alive. A subsequent cycle may restart a cancelled keeper for the same instance, but cannot reset the original token, revision, or expired deadline.
 
 ## Consumer and persistence order
 
@@ -44,7 +48,7 @@ Raw streaming writes directly into a live user volume do not yet carry an indepe
 
 Recovery operations whose user bucket cannot be derived from a hashed internal scope use an untracked owner. While it is active, every watch is Unknown. Resource overflow also revokes existing tokens and keeps Unknown until untracked work drains. Revision or coverage exhaustion never wraps, and replay invalidates tokens without copying durable dirty generations into watch revisions. ACK does not mutate the watch registry.
 
-The receiver admits at most eight requests, including at most four active operations. Admitted bursts may wait for a worker within the same five-second deadline used for storage validation; overload beyond that bounded queue is rejected. Sender-side watch requests share a per-peer limit across admission, keepalive and root verification, so those paths do not independently exceed the receiver's four active slots.
+The receiver admits at most eight requests, including at most four active operations. Admitted bursts may wait for a worker within the same five-second deadline used for storage validation; overload beyond that bounded queue is rejected. Sender-side watch requests share a per-peer limit across admission, keepalive and root verification, so those paths do not independently exceed the receiver's four active slots. PeerRestClient clones share this limit; a local admission timeout does not mark the peer offline.
 
 Registry entry and name-byte limits, RPC batch and byte limits, lease duration, and receiver concurrency are enforced by the owning implementations. Proof encoding is bounded before use; a cluster that cannot provide a complete bounded proof retains the strict global mutation check. None of these fallbacks permits dropping pending work or treating an incomplete companion as a canonical usage value.
 

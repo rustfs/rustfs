@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::scanner_io::{acknowledge_scoped_dirty_usage, scanner_activity_epoch};
-use crate::storage_api::{EcstoreUsageWatchRequest, ecstore_scanner_ack_fence};
+use crate::storage_api::scan::ecstore_scanner_ack_fence;
+use crate::storage_api::scanner_io::ScannerUsageWatchRequest as EcstoreUsageWatchRequest;
 
 async fn scoped_ack_after_real_post_walk_mutations() -> serde_json::Value {
     let (directory, store) = candidate_store().await;

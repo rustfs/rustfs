@@ -1547,7 +1547,7 @@ fn current_cache_snapshot_rejects_current_bucket_cache_with_detached_entry() {
 #[test]
 fn namespace_scanner_worker_selection_keeps_coordinator_fallback_disks() {
     let server_epoch = uuid::Uuid::new_v4();
-    let capabilities = rustfs_storage_api::NsScannerCapabilities {
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
         server_epoch,
         supports_durable_progress: false,
         supports_complete_observation: false,
@@ -1904,7 +1904,7 @@ async fn usage_quantum_real_remote_wire_and_entry_fallback_preserve_parent_limit
     assert!(wire.max_duration <= cycle.remaining_config().max_duration);
     assert!(wire.max_objects <= cycle.remaining_config().max_objects);
     assert!(wire.max_directories <= cycle.remaining_config().max_directories);
-    let capabilities = rustfs_storage_api::NsScannerCapabilities {
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
         server_epoch: uuid::Uuid::new_v4(),
         supports_durable_progress: true,
         supports_complete_observation: true,

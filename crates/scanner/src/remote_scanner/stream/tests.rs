@@ -390,7 +390,7 @@ fn request_round_trip_preserves_scan_inputs_without_cache_data() {
 
 #[test]
 fn remote_request_binds_a_complete_watch_and_rejects_malformed_proofs() {
-    use rustfs_ecstore::api::runtime::ScannerUsageWatchKnown;
+    use crate::storage_api::scanner_io::ScannerUsageWatchKnown;
     let owner = Uuid::from_u128(1);
     let incarnation = Uuid::from_u128(7);
     let proof = crate::scanner_io::ScannerUsageWatchProof {

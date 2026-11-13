@@ -61,7 +61,7 @@ use crate::ScannerObjectInfo as ObjectInfo;
 use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::NamespaceLocking as _;
-use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
+use crate::storage_api::scanner_io::{BucketInfo, BucketOptions, NsScannerCapabilities};
 use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
@@ -1479,12 +1479,12 @@ fn should_publish_completed_snapshot(completed_count: usize, total_count: usize,
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NamespaceScannerWorkerMode {
     Coordinator,
-    RemoteV4(rustfs_storage_api::NsScannerCapabilities),
+    RemoteV4(NsScannerCapabilities),
 }
 
 fn namespace_scanner_workers<T>(
     coordinator_disks: Vec<T>,
-    remote_disks: Vec<(T, rustfs_storage_api::NsScannerCapabilities)>,
+    remote_disks: Vec<(T, NsScannerCapabilities)>,
     budget: &ScannerCycleBudgetConfig,
 ) -> Vec<(T, NamespaceScannerWorkerMode)> {
     let mut workers = Vec::with_capacity(coordinator_disks.len() + remote_disks.len());
