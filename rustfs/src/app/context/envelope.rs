@@ -480,6 +480,37 @@ impl AuthorizationRequest for RequestEnvelope {
     fn req_info_mut(&mut self) -> Option<&mut ReqInfo> {
         self.req_info_mut()
     }
+    fn request_context(&self) -> Option<&RequestContext> {
+        self.request_context.as_ref()
+    }
+    fn bucket_generation(&self) -> Option<&BucketGenerationGuard> {
+        self.bucket_generation.as_ref()
+    }
+    fn install_bucket_generation(&mut self, guard: BucketGenerationGuard) {
+        self.bucket_generation = Some(guard);
+    }
+    fn pending_delete_bucket_generation(&self) -> Option<&PendingDeleteBucketGenerationGuard> {
+        self.pending_delete_bucket_generation.as_ref()
+    }
+    fn install_pending_delete_bucket_generation(&mut self, guard: PendingDeleteBucketGenerationGuard) {
+        self.pending_delete_bucket_generation = Some(guard);
+    }
+    fn copy_source_bucket_generation(&self) -> Option<&CopySourceBucketGenerationGuard> {
+        self.copy_source_bucket_generation.as_ref()
+    }
+    fn odm_read_generation(&self) -> Option<&OdmReadGenerationGuard> {
+        self.odm_read_generation.as_ref()
+    }
+    fn install_odm_read_generation(&mut self, guard: OdmReadGenerationGuard) {
+        self.odm_read_generation = Some(guard);
+    }
+    fn bucket_config_mutation(&self) -> Option<&BucketConfigMutationSnapshot> {
+        self.bucket_config_mutation.as_ref()
+    }
+    #[cfg(test)]
+    fn test_extensions(&self) -> &Extensions {
+        &self.residual_extensions
+    }
     fn internal_object_authorization(&self) -> bool {
         false
     }
