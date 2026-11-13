@@ -17,8 +17,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def lookup(repository: str, tree: str, branch: str, token: str, opener=None) -> dict | None:
-    if not (token and SHA.fullmatch(tree) and re.fullmatch(r"[\w.-]+/[\w.-]+", repository)
-            and re.fullmatch(r"[\w.-]+(/[\w.-]+)*", branch) and ".." not in branch):
+    # The branch is only compared as a queue-branch prefix; the repository is part of the URL.
+    if not (token and SHA.fullmatch(tree) and re.fullmatch(r"[\w.-]+/[\w.-]+", repository)):
         return None
     request = urllib.request.Request(
         f"https://api.github.com/repos/{repository}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100",
@@ -51,14 +51,13 @@ def proves(run, repository: str, branch: str, tree: str) -> bool:
 
 def main() -> int:
     """Print the proof for GITHUB_SHA on GITHUB_REF as JSON, or null; never fail the step."""
-    ref = os.environ.get("GITHUB_REF", "")
     try:
         tree = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{os.environ.get('GITHUB_SHA', '')}^{{tree}}"],
                               capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         tree = ""
     print(json.dumps(lookup(os.environ.get("GITHUB_REPOSITORY", ""), tree,
-                            ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else "", os.environ.get("GITHUB_TOKEN", ""))))
+                            os.environ.get("GITHUB_REF", "").removeprefix("refs/heads/"), os.environ.get("GITHUB_TOKEN", ""))))
     return 0
 
 

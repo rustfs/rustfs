@@ -34,7 +34,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "6"
+PLAN_CONTRACT = "7"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -474,9 +474,9 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
     effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
     effective_connect = mode == "full" if shadow else connect
     effective_full = mode == "full" if shadow else full
-    proven = event == "push" and mode == "full" and isinstance(proof, dict) and proof.get("tree") == tree
+    proven = event == "push" and isinstance(proof, dict) and proof.get("tree") == tree
     if proven:
-        mode = "proven"
+        mode, effective_connect, effective_full = "proven", False, False
         reasons.append(f"merge_group run {proof['url']} already validated tree {tree}")
     jobs = expected_results(mode, event, ref, effective_connect, action)
     plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
@@ -522,6 +522,7 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
     proof = plan.get("proven_by")
     if (proof is not None or plan.get("mode") == "proven") and not (
             isinstance(proof, dict) and plan.get("mode") == "proven" and proof.get("tree") == plan["tree"]
+            and not plan["connect"] and not plan["full_validation"]
             and type(proof.get("run_id")) is int and proof["run_id"] > 0
             and re.fullmatch(rf"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/{proof['run_id']}", str(proof.get("url")))):
         raise ValueError("a proven push requires the merge-group run that validated its tree")

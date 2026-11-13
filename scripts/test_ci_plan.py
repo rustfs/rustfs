@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression cases for trusted planning and fail-closed aggregation."""
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -187,6 +188,8 @@ class PlannerTests(unittest.TestCase):
         proof = {'run_id': 7, 'url': 'https://github.com/rustfs/rustfs/actions/runs/7', 'tree': tree}
         plan = self.repo.plan(head, event='push', proof=proof)
         self.assertEqual((plan['mode'], plan['proven_by']), ('proven', proof))
+        # This run validates nothing itself, so the retained plan must not claim a full or Connect validation.
+        self.assertEqual((plan['full_validation'], plan['connect']), (False, False))
         self.assertEqual({job for job, state in plan['jobs'].items() if state == 'success'}, set(gate.ALWAYS_JOBS))
         self.assertTrue(all(proof['url'] in plan['not_applicable'][job] for job in gate.CODE_JOBS))
         self.assertEqual(gate.validate_plan(plan, 'push', 'refs/heads/main', head, tree), plan['jobs'])
@@ -479,7 +482,7 @@ class GateTests(unittest.TestCase):
     def plan(self, event='pull_request', mode='full', connect=True):
         jobs = gate.expected_results(mode, event, 'refs/heads/main', connect)
         return {'schema_version': 1, 'event': event, 'ref': 'refs/heads/main', 'head': 'a' * 40, 'tree': 'b' * 40,
-                'base': 'c' * 40, 'action': '', 'mode': mode, 'connect': connect, 'full_validation': mode == 'full', 'packages': ['rustfs'] if mode != 'docs' else [],
+                'base': 'c' * 40, 'action': '', 'mode': mode, 'connect': connect and mode != 'proven', 'full_validation': mode == 'full', 'packages': ['rustfs'] if mode != 'docs' else [],
                 'policy': {'revision': 'c' * 40, 'rollout': 'enforced'}, 'jobs': jobs, 'configurations': gate.configurations(jobs),
                 'reasons': ['fixture'], 'not_applicable': {job: 'fixture' for job, state in jobs.items() if state == 'skipped'},
                 'proven_by': {'run_id': 7, 'url': 'https://github.com/rustfs/rustfs/actions/runs/7', 'tree': 'b' * 40} if mode == 'proven' else None}
@@ -527,13 +530,28 @@ class GateTests(unittest.TestCase):
         bad = [dict(proven, proven_by=None), dict(proven, proven_by=dict(proof, tree='c' * 40)),
                dict(proven, proven_by=dict(proof, run_id='7')), dict(proven, proven_by=dict(proof, run_id=0)),
                dict(proven, proven_by=dict(proof, url='https://example.invalid/7')), dict(proven, proven_by={}),
-               dict(full, proven_by=proof)]
+               dict(full, proven_by=proof), dict(proven, connect=True), dict(proven, full_validation=True)]
         for plan in bad:
-            with self.subTest(plan=plan['proven_by']), self.assertRaises(ValueError):
+            with self.subTest(plan=plan['proven_by'], connect=plan['connect'], full=plan['full_validation']), self.assertRaises(ValueError):
                 gate.validate_plan(plan, 'push', plan['ref'])
         for event in ('pull_request', 'merge_group', 'schedule', 'workflow_dispatch'):
             with self.subTest(event=event), self.assertRaises(ValueError):
                 gate.expected_results('proven', event, 'refs/heads/main')
+
+    def test_the_aggregate_names_the_proving_run_only_for_a_proven_plan(self):
+        for mode in ('proven', 'full'):
+            plan = self.plan('push', mode)
+            with tempfile.TemporaryDirectory() as directory, self.subTest(mode=mode):
+                summary = Path(directory) / 'summary.md'
+                environment = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': plan['ref'], 'GITHUB_STEP_SUMMARY': str(summary),
+                               'CI_NEEDS': json.dumps(self.needs(plan))}
+                with patch.dict(os.environ, environment, clear=True), patch.object(sys, 'argv', ['ci_gate.py', 'verify']), \
+                        patch('sys.stdout', new_callable=io.StringIO) as output:
+                    self.assertEqual(gate.main(), False)
+                note = ('Validation jobs were skipped as proven: merge_group run https://github.com/rustfs/rustfs/actions/runs/7 '
+                        f"passed tree {'b' * 40}.")
+                self.assertEqual(note in output.getvalue(), mode == 'proven')
+                self.assertEqual(summary.read_text() if summary.exists() else '', note + '\n' if mode == 'proven' else '')
 
     def test_the_queue_run_that_proves_a_push_validates_everything_that_push_would(self):
         queued = {job for job, result in gate.expected_results('full', 'merge_group', 'refs/heads/main').items() if result == 'success'}
