@@ -1057,8 +1057,7 @@ where
                     tokio::select! {
                       result = &mut scan => result,
                       _ = source_token.cancelled() => {
-                          let grace = crate::scanner::SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT;
-                          let deadline = budget_clone.drain_deadline(grace).unwrap_or_else(|| tokio::time::Instant::now() + grace);
+                          let deadline = budget_clone.shutdown_deadline();
                           tokio::time::timeout_at(deadline, &mut scan).await
                               .unwrap_or_else(|_| Err(StorageError::other("scanner source turn exceeded its bounded drain")))
                       }

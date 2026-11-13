@@ -239,6 +239,9 @@ async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
             ..Default::default()
         },
     );
+    // This path includes physical bucket and source-cache commits. Use the
+    // production drain window instead of the accelerated unit-test timer.
+    budget.use_production_drain_grace_for_tests();
     let budget_stopped = budget.token();
     let (updates, mut receiver) = mpsc::channel(1);
     let (scan, first_deadline) = tokio::time::timeout(Duration::from_secs(60), async {
@@ -255,14 +258,20 @@ async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
         let first_deadline = budget
             .drain_deadline(Duration::from_secs(30))
             .expect("first budget drain deadline");
+        assert_eq!(budget.shutdown_deadline(), first_deadline);
         transport.release_complete.cancel();
         (scan.await.expect("accept the authenticated late Complete"), first_deadline)
     })
     .await
     .expect("the actual pipeline must finish within the fixture deadline");
-    assert_eq!(scan.status, ScannerCycleStatus::Complete);
+    assert_eq!(scan.status, ScannerCycleStatus::Complete, "the actual remote drain result: {scan:#?}");
     assert!(!owner.is_cancelled());
     assert_eq!(budget.drain_deadline(Duration::from_secs(30)), Some(first_deadline));
+    assert_eq!(budget.shutdown_deadline(), first_deadline);
+    assert!(
+        tokio::time::Instant::now() <= first_deadline,
+        "the physical aggregate must finish within the original drain"
+    );
     let candidate = receiver
         .recv()
         .await

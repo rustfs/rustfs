@@ -1611,7 +1611,7 @@ impl ScannerIOCache for SetDisks {
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner bucket cache lock was lost before checkpoint save"));
                                 }
-                                if ctx_clone.is_cancelled() {
+                                if owner_ctx_clone.is_cancelled() {
                                     scan_ctx.cancel();
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner leader fence changed before checkpoint save"));
@@ -1625,7 +1625,7 @@ impl ScannerIOCache for SetDisks {
                                     store_clone_clone.clone(),
                                     fence_store,
                                     ScannerCheckpointPersistContext {
-                                        ctx: &ctx_clone,
+                                        ctx: &owner_ctx_clone,
                                         expected_publication_epoch: expected_publication_epoch_clone,
                                         cycle: want_cycle,
                                         leader_epoch,
@@ -1637,7 +1637,7 @@ impl ScannerIOCache for SetDisks {
                                 .await
                                 {
                                     ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
-                                        if cache_guard.is_lock_lost() || ctx_clone.is_cancelled() {
+                                        if cache_guard.is_lock_lost() || owner_ctx_clone.is_cancelled() {
                                             scan_ctx.cancel();
                                             await_scanner_disk_shutdown(scan.as_mut()).await;
                                             break Err(Error::other("scanner bucket cache fence changed after checkpoint save"));

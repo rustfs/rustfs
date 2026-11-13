@@ -27,6 +27,9 @@ async fn run(
             ..Default::default()
         },
     );
+    // These cycles persist real bucket checkpoints and source caches. Keep
+    // the production drain window after the object budget stops walking.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
@@ -82,12 +85,21 @@ async fn durable_watch_start_survives_three_cycles_and_unrelated_bucket_writes()
         put(&store, BUCKET, &format!("prefix-{index:02}/object"), 16).await;
     }
     let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
-    let (_, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
-    assert!(first.has_scan_position());
+    let (first_result, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
+    assert!(
+        first.has_scan_position(),
+        "the first cycle must persist a position: status={:?}, snapshot_complete={}",
+        first_result.status,
+        first.info.snapshot_complete
+    );
     let first_watch = first.info.scan_usage_watch.clone().expect("real storage watch in checkpoint");
     let first_plan = first.info.scan_progress.expect("durable starting plan").started_plan;
     for cycle in 2..=3 {
-        put(&store, "z-unrelated", &format!("change-{cycle}"), 32).await;
+        // This bucket fits one turn; only the target bucket needs a resumed
+        // sweep. Every overwrite still advances the real producer revision.
+        let before_write = store.scanner_namespace_mutation_generation();
+        put(&store, "z-unrelated", "changing-object", 32).await;
+        assert!(store.scanner_namespace_mutation_generation() > before_write);
         let (_, _, continued) = run(&store, cohort.clone(), cycle, Some(2)).await;
         assert!(!continued.info.snapshot_complete, "the long bucket must really span three cycles");
         let progress = continued.info.scan_progress.expect("continued plan");
@@ -100,7 +112,12 @@ async fn durable_watch_start_survives_three_cycles_and_unrelated_bucket_writes()
         assert!(first_watch.verify_with_store(store.as_ref()).await);
     }
     let (result, usage, completed) = run(&store, cohort, 4, None).await;
-    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(
+        result.status,
+        ScannerCycleStatus::Complete,
+        "the fourth cycle must certify the continued watch: target_complete={}",
+        completed.info.snapshot_complete
+    );
     assert!(completed.info.snapshot_complete);
     assert!(completed.completed_bucket_observation().is_none());
     let root = completed.checked_flatten_complete_scope(BUCKET).expect("full bucket");
@@ -140,8 +157,13 @@ async fn changed_watch_during_resume_preserves_an_observation_then_requires_a_fr
         put(&store, BUCKET, &format!("prefix-{index:02}/object"), 16).await;
     }
     let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
-    let (_, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
-    assert!(first.has_scan_position());
+    let (first_result, _, first) = run(&store, cohort.clone(), 1, Some(2)).await;
+    assert!(
+        first.has_scan_position(),
+        "the first cycle must persist a position: status={:?}, snapshot_complete={}",
+        first_result.status,
+        first.info.snapshot_complete
+    );
     let scanned = first
         .checked_flatten(&format!("{BUCKET}/prefix-00"))
         .expect("the changed range was actually scanned before the checkpoint");

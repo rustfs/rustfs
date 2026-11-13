@@ -1762,9 +1762,7 @@ where
 {
     tokio::pin!(read);
     loop {
-        let drain = negotiated
-            .then(|| budget.drain_deadline(crate::scanner::SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT))
-            .flatten();
+        let drain = (negotiated && budget.budget_elapsed()).then(|| budget.shutdown_deadline());
         let base = semantic_deadline.min(rpc_deadline);
         let deadline = drain.map_or(base, |drain| drain.min(base));
         tokio::select! {

@@ -1248,30 +1248,6 @@ impl DataUsageCache {
         }
     }
 
-    /// Identifies how far durable resume state has advanced. Discovery alone
-    /// does not change it; only committed raw pages or coverage frontier do.
-    pub(crate) fn durable_scan_position(&self) -> (Option<String>, Option<String>, u64) {
-        let raw_entries = self
-            .info
-            .scan_raw_enumeration_page_index
-            .iter()
-            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
-            .map(|index| match index.status() {
-                RawEnumerationPageOwnerStatus::Unsupported => 0,
-                RawEnumerationPageOwnerStatus::Building { indexed_entries, .. }
-                | RawEnumerationPageOwnerStatus::Ready { indexed_entries, .. } => indexed_entries,
-            })
-            .fold(0, u64::saturating_add);
-        (
-            self.info.scan_resume_after.clone(),
-            self.info
-                .scan_coverage_receipt
-                .as_ref()
-                .map(|receipt| receipt.through.clone()),
-            raw_entries,
-        )
-    }
-
     pub(crate) fn has_scan_position(&self) -> bool {
         self.info.scan_resume_after.is_some()
             || self.info.scan_checkpoint.is_some()

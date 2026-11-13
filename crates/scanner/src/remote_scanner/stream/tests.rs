@@ -518,8 +518,8 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
     );
     let first = ScannerIODisk::nsscanner_disk(
         disk.clone(),
-        ctx,
-        budget,
+        budget.token(),
+        budget.clone(),
         disks.clone(),
         cache,
         None,
@@ -531,6 +531,9 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
     )
     .await
     .expect("first bounded walk");
+    assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
+    assert_eq!(budget.progress().0, 1, "the real object budget must stop the first walk");
+    assert!(!ctx.is_cancelled(), "a work-budget stop must preserve the owner");
     let ScannerDiskScanOutcome::Partial(partial) = first else {
         panic!("bounded walk must require resume")
     };
@@ -543,7 +546,7 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
     let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
     let outcome = ScannerIODisk::nsscanner_disk(
         disk,
-        ctx,
+        budget.token(),
         budget,
         disks,
         cache,
@@ -556,6 +559,7 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
     )
     .await
     .expect("real bucket scan");
+    assert!(!ctx.is_cancelled(), "the resumed walk retains its owner");
     assert!(matches!(outcome, ScannerDiskScanOutcome::Complete(_)), "fixture must reach healthy EOF");
     let (complete, terminal) =
         classify_remote_usage_watch_outcome(&store, outcome, Some(&proof), plan, Some(plan), resumed_sweep).await;

@@ -13,6 +13,28 @@ async fn usage_drain_lease_and_epoch_loss_reject_real_root_without_restarting_de
     for loss in ["lease", "epoch"] {
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
         let (directory, store) = setup_scanner_cycle_store_with_pool_count(false, 2).await;
+        if loss == "epoch" {
+            // Rebalance admission queries the production notification system,
+            // which a local disk fixture otherwise never starts. It must see
+            // the actual disk capacity before the drain clock starts.
+            crate::storage_api::scan::new_global_notification_sys(
+                store
+                    .instance_endpoints()
+                    .expect("the real fixture publishes its local endpoints"),
+            )
+            .await
+            .expect("initialize the real local capacity collector");
+            let storage_info = crate::storage_api::scan::StorageAdminApi::storage_info(store.as_ref()).await;
+            for pool in 0..store.pools.len() {
+                assert!(
+                    storage_info
+                        .disks
+                        .iter()
+                        .any(|disk| disk.pool_index == pool as i32 && disk.total_space > 0),
+                    "the real collector must report physical capacity for pool {pool}"
+                );
+            }
+        }
         store
             .make_bucket(PROOF_BUCKET, &crate::storage_api::scan::MakeBucketOptions::default())
             .await

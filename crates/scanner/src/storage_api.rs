@@ -408,7 +408,7 @@ pub(crate) mod scan {
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
     };
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO, StorageAdminApi};
     pub use super::storage_contracts::{
         SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
@@ -421,6 +421,8 @@ pub(crate) mod scan {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence as ecstore_scanner_ack_fence;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::new_global_notification_sys;
 }
 
 pub(crate) mod scanner_io {

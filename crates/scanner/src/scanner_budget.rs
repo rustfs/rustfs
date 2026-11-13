@@ -87,6 +87,8 @@ pub struct ScannerCycleBudget {
     durable_turn_progress: AtomicBool,
     #[cfg(test)]
     source_turn_admissions: std::sync::Mutex<Vec<usize>>,
+    #[cfg(test)]
+    production_drain_grace: AtomicBool,
     token: CancellationToken,
     stop: Arc<OnceLock<ScannerCycleBudgetStop>>,
     started_at: Instant,
@@ -168,6 +170,8 @@ impl ScannerCycleBudget {
             durable_turn_progress: AtomicBool::new(false),
             #[cfg(test)]
             source_turn_admissions: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            production_drain_grace: AtomicBool::new(false),
             token,
             stop,
             started_at,
@@ -292,6 +296,33 @@ impl ScannerCycleBudget {
         let own = self.stop.get().map(|stop| stop.at + grace);
         let parent = self.parent.as_ref().and_then(|parent| parent.drain_deadline(grace));
         minimum_limit(own, parent)
+    }
+
+    /// A budget stop retains its original deadline across every drain phase.
+    /// Without a budget stop, the caller starts grace when observing cancellation.
+    pub(crate) fn shutdown_deadline(&self) -> Instant {
+        let grace = self.shutdown_grace();
+        self.drain_deadline(grace).unwrap_or_else(|| Instant::now() + grace)
+    }
+
+    fn shutdown_grace(&self) -> Duration {
+        #[cfg(test)]
+        {
+            if self.production_drain_grace.load(Ordering::Acquire) {
+                return crate::scanner::SCANNER_PRODUCTION_SHUTDOWN_GRACE;
+            }
+            if let Some(parent) = &self.parent {
+                return parent.shutdown_grace();
+            }
+        }
+        crate::scanner::SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT
+    }
+
+    /// Select before dispatch when the fixture performs real storage commits.
+    /// Child budgets inherit this choice; accelerated timeout tests keep 50 ms.
+    #[cfg(test)]
+    pub(crate) fn use_production_drain_grace_for_tests(&self) {
+        self.production_drain_grace.store(true, Ordering::Release);
     }
 
     /// External cancellation is not a budget stop. The cycle owner handles it
@@ -626,6 +657,46 @@ mod tests {
         assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
         assert_eq!(budget.drain_deadline(grace), Some(stopped_at + grace));
         assert!(!ctx.is_cancelled(), "budget drain retains the cycle owner");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_storage_drain_grace_is_inherited_without_restarting_the_deadline() {
+        let cycle = ScannerCycleBudget::new(
+            &CancellationToken::new(),
+            ScannerCycleBudgetConfig {
+                bucket_quantum: Some(ScannerBucketQuantum {
+                    max_objects: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        cycle.use_production_drain_grace_for_tests();
+        let (source, _) = cycle.for_source(&cycle.token());
+        let (bucket, _) = source.for_bucket(&source.token());
+        let stopped_at = Instant::now();
+        bucket.record_object_scanned();
+        let deadline = stopped_at + crate::scanner::SCANNER_PRODUCTION_SHUTDOWN_GRACE;
+        assert_eq!(source.shutdown_deadline(), deadline);
+        assert_eq!(bucket.shutdown_deadline(), deadline);
+        assert!(!cycle.budget_elapsed());
+        tokio::time::advance(Duration::from_millis(51)).await;
+        cycle.cancel_for_runtime();
+        assert_eq!(source.shutdown_deadline(), deadline);
+        assert_eq!(bucket.shutdown_deadline(), deadline);
+
+        let accelerated = ScannerCycleBudget::new(
+            &CancellationToken::new(),
+            ScannerCycleBudgetConfig {
+                max_objects: Some(1),
+                ..Default::default()
+            },
+        );
+        let accelerated_stop = Instant::now();
+        accelerated.record_object_scanned();
+        assert_eq!(accelerated.shutdown_deadline(), accelerated_stop + Duration::from_millis(50));
+        tokio::time::advance(Duration::from_millis(51)).await;
+        assert!(accelerated.shutdown_deadline() < Instant::now());
     }
 
     #[tokio::test(start_paused = true)]

@@ -218,11 +218,10 @@ pub(super) async fn admit_scanner_usage_watch(
     if current
         .as_ref()
         .is_some_and(|live| live.deadline <= Instant::now() || live.start.bucket_incarnation != incarnation)
+        && let Some(expired) = current.take()
     {
-        if let Some(expired) = current.take() {
-            expired.start.revoke_local(store);
-            let _ = tokio::time::timeout(WATCH_QUERY_TIMEOUT, expired.start.release_with_store(store)).await;
-        }
+        expired.start.revoke_local(store);
+        let _ = tokio::time::timeout(WATCH_QUERY_TIMEOUT, expired.start.release_with_store(store)).await;
     }
     let previous = current
         .as_ref()
@@ -506,8 +505,7 @@ fn owner_routes(
 }
 
 fn accept_watch_observations(
-    bucket: &str,
-    incarnation: Uuid,
+    request: &ScannerUsageWatchRequest,
     routes: &BTreeMap<Uuid, Option<String>>,
     observations: BTreeMap<Uuid, Vec<ScannerUsageWatchObservation>>,
     previous: Option<&ScannerUsageWatchProof>,
@@ -515,9 +513,11 @@ fn accept_watch_observations(
     started: Instant,
     now: Instant,
 ) -> Option<LiveUsageWatch> {
-    if routes.is_empty() || observations.len() != routes.len() {
+    if request.release || routes.is_empty() || observations.len() != routes.len() {
         return None;
     }
+    let bucket = request.bucket.as_str();
+    let incarnation = request.bucket_incarnation;
     if let Some(previous) = previous
         && (!previous.is_well_formed()
             || previous.bucket != bucket
@@ -609,8 +609,9 @@ async fn query_watch(
         .iter()
         .filter_map(|(owner, host)| host.as_ref().map(|host| (host.clone(), *owner, vec![request_for(owner)])))
         .collect::<Vec<_>>();
+    let local_request = request_for(&store.id);
     let started = Instant::now();
-    let local = store.scanner_usage_watch(&[request_for(&store.id)]).await;
+    let local = store.scanner_usage_watch(std::slice::from_ref(&local_request)).await;
     let remote = if distributed {
         notifications.as_ref()?.scanner_usage_watches(remote_requests).await.ok()?
     } else {
@@ -631,7 +632,7 @@ async fn query_watch(
     {
         return None;
     }
-    accept_watch_observations(bucket, incarnation, &routes, observations, previous, structure, started, Instant::now())
+    accept_watch_observations(&local_request, &routes, observations, previous, structure, started, Instant::now())
 }
 
 /// Legacy activity/notification accessors may still resolve process globals.

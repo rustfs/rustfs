@@ -50,6 +50,9 @@ async fn run_cohort_cycle(
     cycle: u64,
     budget: Arc<ScannerCycleBudget>,
 ) -> (ScannerCycleResult, Option<DataUsageInfo>) {
+    // These fixtures persist real bucket and source caches; keep timeout-only
+    // tests on their independent accelerated budgets.
+    budget.use_production_drain_grace_for_tests();
     let ctx = CancellationToken::new();
     let root_before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -161,13 +164,24 @@ async fn service_cohort_production_dispatch_services_waiters_across_sources() {
         "ongoing dirty/new bootstrap must not displace the original cohort"
     );
 
-    // Admission fairness is not completed coverage: prior budgeted prefixes
-    // were observed under changing plans. A clean tail must not certify them.
+    // Admission fairness is not completed coverage: the changed hot bucket
+    // produces a complete observation while its primary remains uncertified.
     let ctx = CancellationToken::new();
     let (result, usage) =
         run_cohort_cycle(&store, cohort, 5, ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default())).await;
     assert_eq!(result.status, ScannerCycleStatus::Incomplete);
-    assert!(usage.is_none(), "neither source has a complete mixed-plan baseline to publish");
+    let usage = usage.expect("mixed EOF emits an observation for the completed hot bucket");
+    assert!(usage.usage_snapshot_observational);
+    assert!(!usage.usage_snapshot_complete);
+    assert_eq!(usage.usage_snapshot_converged, Some(false));
+    assert!(!usage.buckets_usage.contains_key(&hot), "an observation is not a canonical primary");
+    let observed = usage
+        .usage_snapshot_bucket_observations
+        .get(&hot)
+        .expect("all-source hot observation");
+    assert_eq!(observed.usage.objects_count, 2);
+    assert_eq!(observed.usage.size, 12);
+    assert!(observed.usage.usage_certification.is_none());
     for set in store.all_set_disks() {
         let mut cache = DataUsageCache::default();
         cache
@@ -175,7 +189,9 @@ async fn service_cohort_production_dispatch_services_waiters_across_sources() {
             .await
             .expect("retained hot prefix");
         assert!(!cache.info.snapshot_complete);
-        assert!(cache.info.scan_progress.is_some());
+        assert!(cache.info.scan_progress.is_some(), "mixed EOF retains fresh-sweep responsibility");
+        assert!(!cache.has_scan_position(), "mixed EOF retires the traversal cursor");
+        assert!(cache.completed_bucket_observation().is_some());
         assert!(cache.info.scan_plan_digest.is_none(), "mixed coverage must remain non-authoritative");
     }
     clear_dirty_usage_buckets_for_tests();
@@ -538,7 +554,9 @@ async fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets() {
     let ledger = load_set_cache(&store).await.info.scan_bucket_service.expect("saved order");
     assert!(ledger.buckets["a-flat"].service_quanta >= 3, "{ledger:?}");
     assert_eq!(ledger.buckets["z-cold-one"].service_quanta, 1, "{ledger:?}");
-    assert_eq!(ledger.buckets["z-cold-two"].service_quanta, 1, "{ledger:?}");
+    // The source has the same two-object share: the second cold object's
+    // EOF needs a second turn after the first cold object consumed one slot.
+    assert_eq!(ledger.buckets["z-cold-two"].service_quanta, 2, "{ledger:?}");
     assert!(
         ledger.buckets["a-flat"].waiting_since > ledger.buckets["z-cold-two"].waiting_since,
         "the wide bucket must finish behind the buckets it yielded to: {ledger:?}"

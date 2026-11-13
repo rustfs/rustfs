@@ -383,12 +383,26 @@ fn usage_repeated_carried_and_mixed_rounds_preserve_value_provenance() {
         observed.info.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(cycle * 10));
         observed.record_completed_bucket_observation();
         assert_eq!(observed.completed_bucket_observation().unwrap().completed_at, observed_at);
+        assert!(observed.info.scan_plan_digest.is_none(), "a bucket checkpoint is not a source root");
+        let mut observed_root = observed_source(second, 2);
+        observed_root.info.next_cycle = cycle;
+        observed_root.info.scan_bucket_observations = crate::scanner_io::io_cache::source_turn_bucket_observations(
+            &observed,
+            None,
+            second,
+            identity().publication_epoch,
+            identity().tier_registry_generation,
+            Some(&observed_root.info.scan_bucket_incarnations),
+        );
         let mut current = caches[0].clone();
         current.info.leader_epoch = 3;
         let (aggregate, _) =
-            observational_data_usage_info(&[current, observed.clone()], &sources, &buckets, &[], TEST_PLAN_DIGEST, cycle, 3)
+            observational_data_usage_info(&[current, observed_root], &sources, &buckets, &[], TEST_PLAN_DIGEST, cycle, 3)
                 .expect("complete mixed observation from both sources");
-        let observation = &aggregate.usage_snapshot_bucket_observations["bucket"];
+        let observation = aggregate
+            .usage_snapshot_bucket_observations
+            .get("bucket")
+            .expect("validated source roots should retain the mixed observation");
         assert_eq!(observation.completed_at, observed_at);
         assert!(observation.usage.usage_certification.is_none());
         observed_times.push(

@@ -45,6 +45,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
+#[cfg(unix)]
+mod checkpoint_owner;
 mod cold_bucket_service;
 mod collector_lifecycle;
 mod cycle_collector_diagnostics;
@@ -571,6 +573,7 @@ pub(crate) async fn setup_local_scanner_store(pool_count: usize, drives_per_set:
 
     let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
+    instance_ctx.set_endpoints(endpoint_pools.clone());
     init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
         .await
         .expect("multi-pool local disks should initialize");
@@ -583,6 +586,19 @@ pub(crate) async fn setup_local_scanner_store(pool_count: usize, drives_per_set:
     .await
     .expect("multi-pool ECStore should initialize");
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+    assert_eq!(
+        store
+            .instance_endpoints()
+            .expect("scanner fixture must publish its instance endpoints")
+            .0
+            .len(),
+        pool_count
+    );
+    let owner = store
+        .scanner_usage_watch_store_handle()
+        .await
+        .expect("scanner fixture must expose its live metadata owner");
+    assert!(Arc::ptr_eq(&owner, &store), "scanner watch metadata owner must be this fixture");
 
     (temp_dir, store)
 }
@@ -4106,12 +4122,11 @@ fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
             expected,
         );
     }
-    // Owner cancellation stays incomplete even after full coverage. A walk
-    // budget alone does not invalidate the completed data.
-    for (cancelled, expected) in [
-        (false, ScannerCycleStatus::Superseded),
-        (true, ScannerCycleStatus::Incomplete),
-    ] {
+    // A bucket dirty change retains pending responsibility without superseding
+    // a complete root when the activity guardrail is unchanged. Owner
+    // cancellation still rejects that root even after full coverage.
+    // Pending propagation and ACK retention are verified by separate tests.
+    for (cancelled, expected) in [(false, ScannerCycleStatus::Complete), (true, ScannerCycleStatus::Incomplete)] {
         assert_eq!(
             classify_nsscanner_cycle(
                 true,

@@ -52,17 +52,28 @@ fn responses(proof: &ScannerUsageWatchProof) -> BTreeMap<Uuid, Vec<ScannerUsageW
         .collect()
 }
 
+fn renewal_request(proof: &ScannerUsageWatchProof) -> ScannerUsageWatchRequest {
+    let local = proof.peers.get(&Uuid::from_u128(1)).expect("fixture local owner");
+    ScannerUsageWatchRequest {
+        bucket: proof.bucket.clone(),
+        bucket_incarnation: proof.bucket_incarnation,
+        watch_id: Some(local.watch_id),
+        session_id: Some(local.session_id),
+        release: false,
+    }
+}
+
 #[test]
 fn renewals_keep_the_original_revision_and_charge_the_full_round_trip() {
     let (proof, routes) = fixture();
+    let mut request = renewal_request(&proof);
     let now = Instant::now();
     let mut replies = responses(&proof);
     for entries in replies.values_mut() {
         entries[0].known.as_mut().unwrap().lease_remaining_ms = 50_000;
     }
     let renewed = accept_watch_observations(
-        "bucket",
-        proof.bucket_incarnation,
+        &request,
         &routes,
         replies,
         Some(&proof),
@@ -84,8 +95,7 @@ fn renewals_keep_the_original_revision_and_charge_the_full_round_trip() {
         .lease_remaining_ms = 2_250;
     assert!(
         accept_watch_observations(
-            "bucket",
-            proof.bucket_incarnation,
+            &request,
             &routes,
             replies,
             Some(&proof),
@@ -96,11 +106,17 @@ fn renewals_keep_the_original_revision_and_charge_the_full_round_trip() {
         .is_none(),
         "a lease exhausted by RTT and safety margin is Unknown"
     );
+    request.release = true;
+    assert!(
+        accept_watch_observations(&request, &routes, responses(&proof), Some(&proof), proof.structure, now, now).is_none(),
+        "resource retirement cannot establish a clean observation"
+    );
 }
 
 #[test]
 fn every_owner_and_stable_start_field_is_required_for_renewal() {
     let (proof, routes) = fixture();
+    let request = renewal_request(&proof);
     let now = Instant::now();
     for field in 0..10 {
         let mut replies = responses(&proof);
@@ -121,17 +137,7 @@ fn every_owner_and_stable_start_field_is_required_for_renewal() {
             _ => unreachable!(),
         }
         assert!(
-            accept_watch_observations(
-                "bucket",
-                proof.bucket_incarnation,
-                &routes,
-                replies,
-                Some(&proof),
-                proof.structure,
-                now,
-                now,
-            )
-            .is_none(),
+            accept_watch_observations(&request, &routes, replies, Some(&proof), proof.structure, now, now).is_none(),
             "changed or missing field {field} must retain strict coverage"
         );
     }
@@ -140,17 +146,7 @@ fn every_owner_and_stable_start_field_is_required_for_renewal() {
     let mut replies = responses(&proof);
     replies.remove(&Uuid::from_u128(2));
     assert!(
-        accept_watch_observations(
-            "bucket",
-            proof.bucket_incarnation,
-            &fewer,
-            replies,
-            Some(&proof),
-            proof.structure,
-            now,
-            now,
-        )
-        .is_none(),
+        accept_watch_observations(&request, &fewer, replies, Some(&proof), proof.structure, now, now).is_none(),
         "matching response count cannot hide a removed expected owner"
     );
 }
