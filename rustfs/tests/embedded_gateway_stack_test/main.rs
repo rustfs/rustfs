@@ -352,6 +352,7 @@ fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
 async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer) {
     create_bucket_in_the_store(MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
+    create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
     create_user_without_a_policy(NO_POLICY_USER).await;
     let endpoint = server.endpoint();
     let root = s3_client(&endpoint, server.access_key(), server.secret_key());

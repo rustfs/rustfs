@@ -3254,15 +3254,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        #[cfg(test)]
-        wait_for_object_generation_test_hook(&bucket).await;
-        let key = req.input.key.clone();
-        let version_id = req.input.version_id.clone();
-        let guard = authorize_delete_object(req, &bucket, &key, version_id.as_deref(), bucket_generation).await?;
-        req.install_pending_delete_bucket_generation(guard);
-        Ok(())
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_delete_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
@@ -7673,7 +7666,7 @@ mod tests {
         assert_eq!(opts.expected_bucket_incarnation_id, Some(captured_incarnation_id));
 
         let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context))
-            .execute_delete_object(req)
+            .execute_delete_object_from_s3s(req)
             .await
             .expect_err("the old authorization must not delete from the recreated bucket");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
