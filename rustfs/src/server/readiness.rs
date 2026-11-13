@@ -1914,6 +1914,51 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial]
+    async fn cluster_health_report_uncached_waiter_shares_failure_before_starting_a_fresh_round() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let started_at = tokio::time::Instant::now();
+                let mut leader = Box::pin(request());
+                assert!(futures::poll!(leader.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let mut waiter = Box::pin(request());
+                assert!(futures::poll!(waiter.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let (first, shared) = tokio::join!(leader, waiter);
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(shared, first);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(started_at.elapsed(), Duration::from_millis(20));
+
+                let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                let recovered =
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { ready.clone() }).await;
+                assert_eq!(recovered, ready, "a later request must not inherit the completed failed round");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
     async fn cluster_health_report_waiter_timeout_does_not_poison_the_cache() {
         reset_cluster_health_report_caches().await;
         async_with_vars(
