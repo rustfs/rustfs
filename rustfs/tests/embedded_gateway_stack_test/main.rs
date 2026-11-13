@@ -324,11 +324,6 @@ fn the_refusal_matrix_holds_on_the_legacy_stack() {
 /// Names RustFS creates and the AWS bucket grammar refuses. An IP-shaped name such as `256.1.1.1`
 /// is also outside the AWS grammar, but RustFS's own create rule refuses it, so no store holds one.
 const RUSTFS_ONLY_NAMES: [&str; 5] = ["a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3", "xn--abc"];
-/// HeadBucket statuses the legacy stack answers on `main` for names no store holds.
-const HEAD_UPPER: u16 = 400;
-const HEAD_DOTTED_QUAD: u16 = 404;
-const HEAD_TOO_SHORT: u16 = 400;
-const HEAD_TOO_LONG: u16 = 400;
 
 /// A listing names every bucket the store holds, as it is stored, with its date and the owner.
 async fn the_listing_names_every_stored_bucket(server: RustFSServer) {
@@ -367,8 +362,9 @@ fn the_legacy_stack_lists_every_stored_bucket() {
 
 /// HeadBucket on the legacy stack answers every name as before the use case moved onto the
 /// gateway's types: a stored name the AWS grammar refuses is found, a missing one is not, and a
-/// name the edge refuses is refused there. Never a server fault. The statuses were measured on
-/// `main` before this change.
+/// name the edge refuses is refused there, never with a server fault. Every status was measured
+/// on `main` before the move. The SDK sends nothing for a `--x-s3` name: it treats it as a
+/// directory bucket and refuses it on the client.
 #[test]
 fn the_legacy_stack_heads_every_bucket_name_as_before() {
     with_stack(LEGACY, |server| async move {
@@ -377,13 +373,18 @@ fn the_legacy_stack_heads_every_bucket_name_as_before() {
         }
         let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
         let too_long = "a".repeat(64);
-        let expected = RUSTFS_ONLY_NAMES.iter().map(|name| (*name, 200)).chain([
-            ("missing-bucket", 404),
-            ("UPPER", HEAD_UPPER),
-            ("256.1.1.1", HEAD_DOTTED_QUAD),
-            ("ab", HEAD_TOO_SHORT),
-            (too_long.as_str(), HEAD_TOO_LONG),
-        ]);
+        let expected = [
+            ("a-s3alias", Some(200)),
+            ("sthree-x", Some(200)),
+            ("x--ol-s3", Some(200)),
+            ("x--x-s3", None),
+            ("xn--abc", Some(400)),
+            ("missing-bucket", Some(404)),
+            ("UPPER", Some(400)),
+            ("256.1.1.1", Some(404)),
+            ("ab", Some(400)),
+            (too_long.as_str(), Some(400)),
+        ];
 
         let mut answered = Vec::new();
         let mut wanted = Vec::new();
@@ -393,7 +394,7 @@ fn the_legacy_stack_heads_every_bucket_name_as_before() {
                 Err(error) => refusal(&error).1,
             };
             answered.push((name.to_owned(), observed));
-            wanted.push((name.to_owned(), Some(status)));
+            wanted.push((name.to_owned(), status));
         }
         assert_eq!(answered, wanted);
         server.shutdown().await;
