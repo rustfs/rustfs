@@ -77,7 +77,8 @@ mod ecstore_metrics {
 
 mod ecstore_notification {
     pub(crate) use crate::storage::storage_api::ecstore_notification::{
-        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys,
+        acquire_cross_pool_fence_fleet_proof,
     };
 }
 
@@ -953,9 +954,8 @@ pub(crate) mod data_usage {
 }
 
 pub(crate) mod access {
-    pub(crate) use crate::storage::storage_api::access_consumer::{
-        ReqInfo, authorize_internal_object_request, authorize_request,
-    };
+    pub(crate) use crate::app::{authorize_owned_internal_object_request, authorize_owned_request};
+    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
     pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 
@@ -982,6 +982,8 @@ pub(crate) mod bucket {
 }
 
 pub(crate) mod cluster {
+    pub(crate) type NotificationPeerErr = super::ecstore_notification::NotificationPeerErr;
+
     pub(crate) use super::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,

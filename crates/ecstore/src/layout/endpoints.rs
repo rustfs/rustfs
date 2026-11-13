@@ -391,7 +391,7 @@ impl PoolEndpointList {
                             e.get_mut().extend(host_ip_set.iter());
                         }
                         Entry::Vacant(e) => {
-                            e.insert(host_ip_set.clone());
+                            e.insert(host_ip_set);
                         }
                     }
                 }
@@ -2149,6 +2149,15 @@ mod test {
         }
     }
 
+    /// Runs endpoint parsing cases whose local paths do not exist. Unix leaves
+    /// missing paths out of the physical-disk independence check, but Windows
+    /// resolves them to their volume, so paths such as `/d1` and `/d2` count as
+    /// one shared device there. These cases cover parsing, not disk
+    /// independence, which has its own tests below.
+    async fn with_disk_independence_check_bypassed<F: std::future::Future<Output = ()>>(cases: F) {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true"))], cases).await;
+    }
+
     #[test]
     fn endpoint_parse_errors_do_not_echo_url_credentials() {
         let err = Endpoints::try_from(["http://:topsecret@server/path"].as_slice()).unwrap_err();
@@ -2157,8 +2166,13 @@ mod test {
         assert!(!err.to_string().contains("topsecret"));
     }
 
+    #[serial]
     #[tokio::test]
     async fn explicit_local_endpoint_host_selects_only_exact_host_and_server_port() {
+        with_disk_independence_check_bypassed(explicit_local_endpoint_host_selects_only_exact_host_and_server_port_cases()).await;
+    }
+
+    async fn explicit_local_endpoint_host_selects_only_exact_host_and_server_port_cases() {
         let args = vec![
             "http://rustfs-0.rustfs-headless.ns.svc.cluster.local./data0",
             "http://rustfs-0.rustfs-headless.ns.svc.cluster.local.:9443/data1",
@@ -2921,8 +2935,13 @@ mod test {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_create_pool_endpoints() {
+        with_disk_independence_check_bypassed(test_create_pool_endpoints_cases()).await;
+    }
+
+    async fn test_create_pool_endpoints_cases() {
         #[derive(Default)]
         struct TestCase<'a> {
             num: usize,
@@ -3541,8 +3560,13 @@ mod test {
         (urls, local_flags)
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_create_server_endpoints() {
+        with_disk_independence_check_bypassed(test_create_server_endpoints_cases()).await;
+    }
+
+    async fn test_create_server_endpoints_cases() {
         let test_cases = [
             // Invalid input.
             ("", vec![], false),

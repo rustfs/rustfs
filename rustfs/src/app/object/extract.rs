@@ -19,6 +19,10 @@ use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecis
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
+use crate::app::storage_api::s3::dto::{
+    ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectOutput, ServerSideEncryption, Timestamp, TimestampFormat,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use crate::app::trailer_adapter::trailer_source;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
@@ -2773,6 +2777,8 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::StdError;
+    use crate::app::storage_api::s3::dto::{ObjectLockRetentionMode, StreamingBlob};
     use http::{HeaderMap, HeaderName, HeaderValue};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};

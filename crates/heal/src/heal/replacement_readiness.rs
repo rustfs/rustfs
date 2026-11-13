@@ -348,10 +348,7 @@ mod tests {
             let enabled = std::env::var(ENABLE_ENV)
                 .ok()
                 .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-            if !enabled {
-                return Ok(false);
-            }
-            Ok(true)
+            Ok(enabled)
         }
 
         fn run_current_test_in_mount_namespace() -> Result<(), Box<dyn Error + Send + Sync>> {

@@ -225,6 +225,50 @@ impl ReplicationTargetStore {
     }
 }
 
+/// Name the source object's KMS key on a replica write to a site-replication
+/// peer, so the peer seals the replica under its key of the same name.
+///
+/// Sites share bucket default-encryption key names and key-scoped IAM
+/// policies verbatim and are required to hold every key under the same name.
+/// With only the `aws:kms` intent the peer falls back to its bucket or site
+/// default, and an object written under an explicitly named key ends up
+/// sealed under a different key on each site: a caller scoped to the named
+/// key can then read the object on one site and not on the other. Only the
+/// name travels; the envelope and the encryption context stay on the source.
+///
+/// Must not be applied to an operator-configured target, whose KMS has no
+/// reason to hold a key of that name.
+fn name_source_kms_key_for_site_peer(options: &mut PutObjectOptions, object_info: &ObjectInfo) {
+    if !matches!(
+        classify_replication_source_encryption(&object_info.user_defined),
+        ReplicationSourceEncryption::SseKms
+    ) {
+        return;
+    }
+    if let Some(key_id) = metadata_value(&object_info.user_defined, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)
+        .map(str::trim)
+        .filter(|key_id| !key_id.is_empty())
+    {
+        options
+            .user_metadata
+            .insert(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), key_id.to_string());
+    }
+}
+
+/// Put options for replicating `object_info` to `target`: the transport
+/// options every target gets, plus the source KMS key name when the target is
+/// a site-replication peer.
+pub(crate) fn replication_put_object_options_for_target(
+    target: &TargetClient,
+    object_info: &ObjectInfo,
+) -> Result<(PutObjectOptions, bool)> {
+    let (mut options, is_multipart) = replication_put_object_options(&target.storage_class, object_info)?;
+    if target.is_site_replication_peer() {
+        name_source_kms_key_for_site_peer(&mut options, object_info);
+    }
+    Ok((options, is_multipart))
+}
+
 pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
     use base64_simd::STANDARD as BASE64_STANDARD;
     use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
@@ -281,8 +325,9 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
 
     // Managed SSE replicates as plaintext (the replication reader decrypts via
     // the object-encryption resolver) and re-encrypts on the target with the
-    // target's own KMS. Send only the encryption intent — never the source
-    // key id, whose meaning is local to the source site's KMS.
+    // target's own KMS. Send only the encryption intent: a key id means
+    // nothing to an arbitrary target's KMS. Site-replication peers are the
+    // exception and get the key name from `name_source_kms_key_for_site_peer`.
     if matches!(source_encryption, ReplicationSourceEncryption::SseS3) {
         meta.insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string());
     } else if matches!(source_encryption, ReplicationSourceEncryption::SseKms) {
@@ -1588,6 +1633,80 @@ mod tests {
                 .any(|value| value.contains("sealed-envelope") || value.contains("source-key-1")),
             "source KMS identifiers and envelopes must never leave the source site"
         );
+    }
+
+    #[test]
+    fn site_peer_replica_write_names_the_source_kms_key_only() {
+        use rustfs_utils::http::object_encryption_keys::{
+            INTERNAL_ENCRYPTION_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
+        };
+
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "finance-key".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "sealed-envelope".to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), "ctx".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let (mut options, _) = replication_put_object_options("", &object_info).expect("managed SSE-KMS must build put options");
+        name_source_kms_key_for_site_peer(&mut options, &object_info);
+
+        assert_eq!(options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION), Some(&"aws:kms".to_string()));
+        assert_eq!(
+            options.user_metadata.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID),
+            Some(&"finance-key".to_string())
+        );
+        // The name is all that travels: no envelope, no encryption context.
+        assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
+        assert!(
+            !options
+                .user_metadata
+                .contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+        );
+        assert!(!options.user_metadata.values().any(|value| value.contains("sealed-envelope")));
+    }
+
+    #[test]
+    fn site_peer_replica_write_names_no_key_for_other_encryption() {
+        use rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_ID_HEADER;
+
+        for (label, user_defined) in [
+            ("plaintext", HashMap::from([("x-user-meta".to_string(), "value".to_string())])),
+            (
+                // SSE-S3 wraps its data key under the site default key; that
+                // key is internal and is not a name the peer was asked to use.
+                "sse-s3",
+                HashMap::from([
+                    (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string()),
+                    (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "site-default".to_string()),
+                ]),
+            ),
+            (
+                "sse-kms without a recorded key id",
+                HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string())]),
+            ),
+            (
+                "sse-kms with a blank key id",
+                HashMap::from([
+                    (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                    (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "  ".to_string()),
+                ]),
+            ),
+        ] {
+            let object_info = ObjectInfo {
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            };
+            let (mut options, _) = replication_put_object_options("", &object_info).expect("put options must build");
+            name_source_kms_key_for_site_peer(&mut options, &object_info);
+            assert!(
+                !options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID),
+                "{label}: no key id may be sent"
+            );
+        }
     }
 
     #[test]

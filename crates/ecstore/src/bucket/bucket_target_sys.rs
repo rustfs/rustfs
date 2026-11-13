@@ -1189,6 +1189,7 @@ impl BucketTargetSys {
             disable_proxy: target.disable_proxy,
             arn: target.arn.clone(),
             reset_id: target.reset_id.clone(),
+            site_peer_deployment_id: target.deployment_id.trim().to_string(),
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
@@ -2011,6 +2012,9 @@ pub struct TargetClient {
     pub disable_proxy: bool,
     pub arn: String,
     pub reset_id: String,
+    /// Deployment id of the site-replication peer this target was derived
+    /// for; empty for an operator-configured bucket-replication target.
+    pub site_peer_deployment_id: String,
     pub secure: bool,
     pub health_check_duration: Duration,
     pub replicate_sync: bool,
@@ -2019,6 +2023,13 @@ pub struct TargetClient {
 }
 
 impl TargetClient {
+    /// Whether the target is a site-replication peer. Peers share bucket
+    /// configuration and IAM, and are required to hold KMS keys under the
+    /// same names; an operator-configured target promises neither.
+    pub fn is_site_replication_peer(&self) -> bool {
+        !self.site_peer_deployment_id.is_empty()
+    }
+
     fn credentials_expired_at(&self, now: jiff::Timestamp) -> bool {
         self.credentials
             .as_ref()
@@ -3050,6 +3061,7 @@ mod tests {
                 disable_proxy: false,
                 arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
                 reset_id: String::new(),
+                site_peer_deployment_id: String::new(),
                 secure: true,
                 health_check_duration: Duration::from_secs(5),
                 replicate_sync: false,
@@ -3593,6 +3605,7 @@ mod tests {
                 disable_proxy: false,
                 arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
                 reset_id: String::new(),
+                site_peer_deployment_id: String::new(),
                 secure: true,
                 health_check_duration: Duration::from_secs(5),
                 replicate_sync: false,
@@ -3906,6 +3919,7 @@ mod tests {
             disable_proxy: false,
             arn: arn.to_string(),
             reset_id: String::new(),
+            site_peer_deployment_id: String::new(),
             secure: true,
             health_check_duration: Duration::from_secs(5),
             replicate_sync: false,

@@ -137,7 +137,7 @@ filter = '(package(rustfs) & test(/^(admin::handlers::replication::target_repair
 setup = 'ecstore-base-stack'
 
 [[profile.default.scripts]]
-filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::complete::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
 setup = 'ecstore-base-stack'
 
 # These handler/store fixtures and the relocated-pool GET compose deep storage
@@ -455,7 +455,7 @@ filter = '(package(rustfs) & test(/^(admin::handlers::replication::target_repair
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
-filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::complete::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|app::object::internal_put::tests::internal_multipart_roundtrip_completes_and_abort_leaves_nothing|app::object::restore::tests::execute_restore_object_maps_failures_to_typed_s3_errors|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
 setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
@@ -946,6 +946,10 @@ path = "junit.xml"
 # parallel-safe — the same property e2e-smoke relies on. The exceptions are the
 # 4-disk reliability / degraded-read fault-injection tests, multi-node heal
 # clusters, and the fixed-port Vault tests, all serialized below.
+# `dual_stack_differential::reference::` holds hermetic unit tests of how the
+# differential picks side A (shell-script stand-ins, no server, no reference
+# binary). They already run on every pull request in e2e-smoke, so e2e-full
+# excludes them to keep its selection digest unchanged.
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
@@ -956,6 +960,7 @@ default-filter = """
     & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|interop_test|real_source_test)::/)
     & !test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)
+    & !test(/^dual_stack_differential::reference::/)
 """
 fail-fast = false
 

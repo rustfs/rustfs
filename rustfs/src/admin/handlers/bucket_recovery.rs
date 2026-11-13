@@ -61,10 +61,11 @@ pub fn register_bucket_recovery_route(router: &mut S3Router<AdminOperation>) -> 
 impl Operation for RecoverOrphanedBucketHandler {
     async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RecoverOrphanedBucketAction)]).await?;
-        let secret_key = req
+        let credentials = req
             .credentials()
-            .map(|credentials| Zeroizing::new(credentials.secret_key().to_owned()))
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "authentication required"))?;
+        // Checked before the recovery runs, so a refusal leaves the bucket untouched.
+        let response_secret = compat_response_secret(req.uri().path(), credentials.secret_key())?;
         let bucket = params
             .get("bucket")
             .filter(|bucket| !bucket.is_empty())
@@ -123,21 +124,65 @@ impl Operation for RecoverOrphanedBucketHandler {
             "orphaned bucket metadata recovery completed"
         );
 
-        super::owned_admin_json_response(
-            req.uri().path(),
-            &secret_key,
-            StatusCode::OK,
-            &RecoverOrphanedBucketResponse {
-                bucket: bucket.to_owned(),
-                retired_incarnation_id: request.expected_incarnation_id,
-            },
-        )
+        let response = RecoverOrphanedBucketResponse {
+            bucket: bucket.to_owned(),
+            retired_incarnation_id: request.expected_incarnation_id,
+        };
+        match response_secret {
+            Some(secret_key) => super::owned_admin_json_response(req.uri().path(), &secret_key, StatusCode::OK, &response),
+            None => crate::admin::utils::owned_json_response(StatusCode::OK, &response),
+        }
     }
+}
+
+/// The key the response body is sealed with. Only the MinIO compat prefix
+/// encrypts admin responses, so only that path needs the caller's secret.
+///
+/// # Errors
+///
+/// `AccessDenied` on the compat prefix when the verified credential carries no
+/// secret key.
+fn compat_response_secret(path: &str, secret: Option<&str>) -> S3Result<Option<Zeroizing<String>>> {
+    if !crate::admin::utils::is_compat_admin_request(path) {
+        return Ok(None);
+    }
+    secret
+        .map(|secret| Some(Zeroizing::new(secret.to_owned())))
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::AccessDenied, "the request credential carries no secret key"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNED_PATH: &str = "/rustfs/admin/v3/recover-orphaned-bucket/orphan";
+    const COMPAT_PATH: &str = "/minio/admin/v3/recover-orphaned-bucket/orphan";
+
+    #[test]
+    fn compat_recovery_without_a_secret_key_is_refused_before_it_runs() {
+        let err = compat_response_secret(COMPAT_PATH, None).expect_err("compat response needs a sealing key");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn owned_recovery_without_a_secret_key_proceeds_unsealed() {
+        assert!(
+            compat_response_secret(OWNED_PATH, None)
+                .expect("owned path needs no key")
+                .is_none()
+        );
+        assert!(
+            compat_response_secret(OWNED_PATH, Some("secret"))
+                .expect("owned path")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compat_recovery_with_a_secret_key_seals_with_it() {
+        let secret = compat_response_secret(COMPAT_PATH, Some("secret")).expect("compat path with key");
+        assert_eq!(secret.as_deref().map(String::as_str), Some("secret"));
+    }
 
     #[test]
     fn recovery_request_rejects_missing_or_nil_generation_identity() {

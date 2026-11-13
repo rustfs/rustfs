@@ -14,11 +14,18 @@
 
 //! DeleteObject / DeleteObjects path.
 
+use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
 use super::*;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
-use s3s::dto::ObjectIdentifier;
+use crate::app::storage_api::s3::dto::ObjectIdentifier;
+use crate::app::storage_api::s3::dto::{
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+const EVENT_DELETE_OBJECTS_STORAGE_RESULT: &str = "delete_objects_storage_result";
 
 async fn authorize_recursive_delete<T>(
     req: &mut S3Request<T>,
@@ -521,9 +528,8 @@ fn reduce_delete_objects_result<'a>(
     error: Option<&EcstoreError>,
     synthetic_version_id: bool,
 ) -> Result<&'a StorageDeletedObject, s3s::dto::Error> {
-    match error {
+    match delete_objects_reported_storage_error(object, error) {
         None => Ok(deleted),
-        Some(error) if object.delete_condition.is_none() && is_delete_objects_not_found(error) => Ok(deleted),
         Some(error) => {
             let api_error = ApiError::from(error.clone());
             Err(s3s::dto::Error {
@@ -534,6 +540,48 @@ fn reduce_delete_objects_result<'a>(
             })
         }
     }
+}
+
+fn delete_objects_reported_storage_error<'a>(
+    object: &ObjectToDelete,
+    error: Option<&'a EcstoreError>,
+) -> Option<&'a EcstoreError> {
+    error.filter(|error| object.delete_condition.is_some() || !is_delete_objects_not_found(error))
+}
+
+fn delete_objects_storage_error_counts(
+    objects: &[ObjectToDelete],
+    errors: &[Option<EcstoreError>],
+) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for (object, error) in objects.iter().zip(errors) {
+        let Some(error) = delete_objects_reported_storage_error(object, error.as_ref()) else {
+            continue;
+        };
+        // Classify the typed cause before S3 mapping collapses distinct failures.
+        // Stages are recorded at their source, never inferred from this variant.
+        let kind = match error {
+            StorageError::NamespaceLockQuorumUnavailable { .. } => "namespace_lock_quorum",
+            StorageError::Lock(_) => "lock",
+            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+            StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _) => "write_quorum",
+            StorageError::PreconditionFailed | StorageError::ConditionalDeleteConflict => "condition",
+            StorageError::DeleteRecoveryWorkLimit => "recovery_work_limit",
+            StorageError::DeleteRecoveryLegacyAmbiguous => "recovery_legacy_ambiguous",
+            StorageError::Timeout => "timeout",
+            StorageError::RemoteClientUnavailable(_) => "remote_client_unavailable",
+            StorageError::DiskNotFound | StorageError::FaultyDisk | StorageError::FaultyRemoteDisk => "disk_unavailable",
+            StorageError::DiskOngoingReq => "disk_ongoing_request",
+            StorageError::SlowDown => "slow_down",
+            StorageError::Io(source) if source.kind() == std::io::ErrorKind::TimedOut => "io_timeout",
+            error if is_err_bucket_not_found(error) => "bucket_not_found",
+            error if is_delete_objects_not_found(error) => "not_found",
+            StorageError::Io(_) => "io",
+            _ => "other",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    counts
 }
 
 impl DefaultObjectUsecase {
@@ -869,9 +917,39 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
         apply_bucket_generation_guard(&req, &bucket, &mut storage_delete_opts)?;
+        let storage_started = std::time::Instant::now();
         let (dobjs, errs, accounting) = store
             .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
             .await;
+        let storage_elapsed_ms = storage_started.elapsed().as_millis();
+        let storage_error_counts = delete_objects_storage_error_counts(&object_to_delete, &errs);
+        let failed_object_count = storage_error_counts.values().sum::<usize>();
+        if failed_object_count > 0 {
+            warn!(
+                event = EVENT_DELETE_OBJECTS_STORAGE_RESULT,
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                result = "failed",
+                request_id = %request_context.request_id,
+                attempted_object_count = object_to_delete.len(),
+                failed_object_count,
+                error_counts = ?storage_error_counts,
+                elapsed_ms = storage_elapsed_ms,
+                "Batch delete storage returned object failures"
+            );
+        } else {
+            debug!(
+                event = EVENT_DELETE_OBJECTS_STORAGE_RESULT,
+                component = LOG_COMPONENT_APP,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                result = "ok",
+                request_id = %request_context.request_id,
+                attempted_object_count = object_to_delete.len(),
+                failed_object_count,
+                elapsed_ms = storage_elapsed_ms,
+                "Batch delete storage completed"
+            );
+        }
 
         #[cfg(test)]
         super::super::storage_api::object_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
@@ -1596,6 +1674,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::app::storage_api::s3::dto::{ETag, GetObjectInput, HeadObjectInput};
     use http::{HeaderMap, HeaderValue, Method};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
@@ -3077,6 +3156,67 @@ mod tests {
             .expect_err("a failed existence condition is not an idempotent successful delete");
         assert_eq!(error.key.as_deref(), Some("missing-key"));
         assert_eq!(error.code.as_deref(), Some("NoSuchKey"));
+    }
+
+    #[test]
+    fn delete_objects_storage_diagnostics_preserve_mixed_result_semantics() {
+        let mut objects = (0..7)
+            .map(|index| ObjectToDelete {
+                object_name: format!("key-{index}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        objects[2].delete_condition = Some(DeleteObjectCondition::Exists);
+        let errors = vec![
+            None,
+            Some(StorageError::FileNotFound),
+            Some(StorageError::FileNotFound),
+            Some(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_objects_commit",
+                bucket: "bucket".to_owned(),
+                object: "key-3".to_owned(),
+                required: 1,
+                achieved: 0,
+            }),
+            Some(StorageError::ErasureWriteQuorum),
+            Some(StorageError::Timeout),
+            Some(StorageError::PreconditionFailed),
+        ];
+        assert_eq!(
+            delete_objects_storage_error_counts(&objects, &errors),
+            BTreeMap::from([
+                ("condition", 1),
+                ("namespace_lock_quorum", 1),
+                ("not_found", 1),
+                ("timeout", 1),
+                ("write_quorum", 1),
+            ])
+        );
+        let deleted = StorageDeletedObject::default();
+        let results = objects
+            .iter()
+            .zip(&errors)
+            .map(|(object, error)| reduce_delete_objects_result(object, &deleted, error.as_ref(), false))
+            .collect::<Vec<_>>();
+        assert!(results[0].is_ok(), "a successful storage result remains successful");
+        assert!(results[1].is_ok(), "ordinary missing objects remain idempotent success");
+        assert_eq!(
+            results[2]
+                .as_ref()
+                .expect_err("conditional missing object must fail")
+                .code
+                .as_deref(),
+            Some("NoSuchKey")
+        );
+        assert_eq!(
+            results[3]
+                .as_ref()
+                .expect_err("lost namespace fence must fail")
+                .code
+                .as_deref(),
+            Some("ServiceUnavailable")
+        );
+        assert!(results[4..].iter().all(Result::is_err));
     }
 
     #[test]

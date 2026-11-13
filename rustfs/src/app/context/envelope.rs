@@ -28,16 +28,25 @@
 use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
+use crate::app::storage_api::context::OperationHelper;
 use crate::app::storage_api::context::{
-    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-    OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, RequestContext,
+    AuditRequestView, AuthorizationRequest, DenialAuditor, DenialScope, authorize_request_core,
+};
+use crate::app::storage_api::context::{
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+    ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+    PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
+    RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
     TableDataPlaneListAccess, TableDataPlanePublicationGuards,
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
-use http::{Extensions, HeaderMap, Method, Uri};
+use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
+use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_ops::S3Operation;
 use rustfs_trusted_proxies::ClientInfo;
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -45,42 +54,109 @@ use zeroize::Zeroizing;
 /// The identity a request was authenticated with.
 ///
 /// The secret key and the session token are bearer material: the type has no
-/// `PartialEq`, and its `Debug` output redacts both.
+/// `PartialEq`, and its `Debug` output redacts both. An edge that keeps the
+/// caller's secret (it verified the signature itself) builds the value with
+/// [`Self::without_secret_key`]; the absence is then `None`, never a
+/// substitute string a reader could compare, seal or derive with.
 #[derive(Clone)]
 pub struct RequestCredentials {
     access_key: String,
-    secret_key: Zeroizing<String>,
+    secret_key: Option<Zeroizing<String>>,
     session_token: Option<Zeroizing<String>>,
 }
 
+/// An edge handed over an empty secret key. Absence is expressed with
+/// [`RequestCredentials::without_secret_key`], so an empty secret is refused
+/// rather than read as "absent" or used as a key.
+#[derive(Debug)]
+pub(crate) struct EmptySecretKey;
+
+impl fmt::Display for EmptySecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("handed-over secret key is empty")
+    }
+}
+
+impl std::error::Error for EmptySecretKey {}
+
 impl RequestCredentials {
-    pub(crate) fn new(access_key: String, secret_key: String, session_token: Option<String>) -> Self {
+    /// Credentials whose secret the edge handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`EmptySecretKey`] when `secret_key` is empty.
+    pub(crate) fn new(access_key: String, secret_key: String, session_token: Option<String>) -> Result<Self, EmptySecretKey> {
+        if secret_key.is_empty() {
+            return Err(EmptySecretKey);
+        }
+        Ok(Self {
+            access_key,
+            secret_key: Some(Zeroizing::new(secret_key)),
+            session_token: session_token.map(Zeroizing::new),
+        })
+    }
+
+    /// Credentials whose secret the edge kept.
+    pub(crate) fn without_secret_key(access_key: String, session_token: Option<String>) -> Self {
         Self {
             access_key,
-            secret_key: Zeroizing::new(secret_key),
+            secret_key: None,
             session_token: session_token.map(Zeroizing::new),
         }
+    }
+
+    /// The same identity with `session_token` as its token.
+    #[cfg(test)]
+    pub(crate) fn with_session_token(mut self, session_token: Option<String>) -> Self {
+        self.session_token = session_token.map(Zeroizing::new);
+        self
     }
 
     pub fn access_key(&self) -> &str {
         &self.access_key
     }
 
-    /// Never log this value or compare it with `==`.
-    pub fn secret_key(&self) -> &str {
-        &self.secret_key
+    /// The caller's secret, or `None` when the edge did not hand it over.
+    /// A reader must fail closed on `None`. Never log this value or compare it
+    /// with `==`.
+    pub fn secret_key(&self) -> Option<&str> {
+        self.secret_key.as_deref().map(String::as_str)
     }
 
     pub fn session_token(&self) -> Option<&str> {
         self.session_token.as_deref().map(String::as_str)
     }
+
+    /// The handed-over secret, or [`MissingSecretKey`] when the edge kept it.
+    pub(crate) fn require_secret_key(&self) -> Result<&str, MissingSecretKey> {
+        self.secret_key().ok_or(MissingSecretKey)
+    }
+
+    /// Whether the handed-over secret equals `stored`, compared in constant
+    /// time. An absent secret matches nothing, not even an empty `stored`.
+    pub(crate) fn secret_key_matches(&self, stored: &str) -> bool {
+        self.secret_key()
+            .is_some_and(|secret| crate::auth::constant_time_eq(secret, stored))
+    }
 }
+
+/// A reader needed the caller's secret, but the edge did not hand it over.
+#[derive(Debug)]
+pub(crate) struct MissingSecretKey;
+
+impl fmt::Display for MissingSecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the caller's secret key was not handed over for this request")
+    }
+}
+
+impl std::error::Error for MissingSecretKey {}
 
 impl fmt::Debug for RequestCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestCredentials")
             .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
+            .field("secret_key", &self.secret_key.as_ref().map(|_| "<redacted>"))
             .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -128,6 +204,7 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
     bucket_generation: Option<BucketGenerationGuard>,
@@ -138,6 +215,13 @@ pub struct RequestEnvelope {
     table_publication_guards: Option<TableDataPlanePublicationGuards>,
     table_list_access: Option<TableDataPlaneListAccess>,
     object_tag_conditions: Option<ObjectTagConditions>,
+    multipart_staging_operation: Option<MultipartStagingOperation>,
+    staged_multipart_part_authorization: Option<StagedMultipartPartAuthorization>,
+    requested_object_lock_retention: Option<RequestedObjectLockRetention>,
+    requested_object_lock_retain_until: Option<RequestedObjectLockRetainUntil>,
+    requested_object_legal_hold: Option<RequestedObjectLegalHold>,
+    requested_object_tags: Option<RequestedObjectTags>,
+    requested_copy_source: Option<RequestedCopySource>,
     residual_extensions: Extensions,
 }
 
@@ -167,6 +251,7 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
             pending_delete_bucket_generation: extensions.remove(),
@@ -176,6 +261,13 @@ impl RequestEnvelope {
             table_publication_guards: extensions.remove(),
             table_list_access: extensions.remove(),
             object_tag_conditions: extensions.remove(),
+            multipart_staging_operation: extensions.remove(),
+            staged_multipart_part_authorization: extensions.remove(),
+            requested_object_lock_retention: extensions.remove(),
+            requested_object_lock_retain_until: extensions.remove(),
+            requested_object_legal_hold: extensions.remove(),
+            requested_object_tags: extensions.remove(),
+            requested_copy_source: extensions.remove(),
             residual_extensions: extensions,
         }
     }
@@ -312,12 +404,233 @@ impl RequestEnvelope {
         self.table_publication_guards.as_ref()
     }
 
+    pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.table_publication_guards = Some(guards);
+    }
+
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
         self.table_list_access.as_ref()
     }
 
     pub(crate) fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions.as_ref()
+    }
+
+    pub(crate) fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.object_tag_conditions = Some(conditions);
+    }
+
+    pub(crate) fn multipart_staging_operation(&self) -> Option<&MultipartStagingOperation> {
+        self.multipart_staging_operation.as_ref()
+    }
+
+    pub(crate) fn staged_multipart_part_authorization(&self) -> Option<&StagedMultipartPartAuthorization> {
+        self.staged_multipart_part_authorization.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until.as_ref()
+    }
+
+    pub(crate) fn post_object_policy_headers(&self) -> Option<&PostObjectPolicyHeaders> {
+        self.post_object_policy_headers.as_ref()
+    }
+
+    pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold.as_ref()
+    }
+
+    pub(crate) fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags.as_ref()
+    }
+
+    pub(crate) fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source.as_ref()
+    }
+}
+
+/// The authorization core in `storage` reads requests only through
+/// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
+impl AuthorizationRequest for RequestEnvelope {
+    fn headers(&self) -> &HeaderMap {
+        self.headers()
+    }
+    fn uri(&self) -> &http::Uri {
+        self.uri()
+    }
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        self.remote_addr()
+    }
+    fn client_info(&self) -> Option<&ClientInfo> {
+        self.client_info()
+    }
+    fn server_context(&self) -> Option<&Arc<ServerContextSlot>> {
+        self.server_context()
+    }
+    fn req_info(&self) -> Option<&ReqInfo> {
+        self.req_info()
+    }
+    fn internal_object_authorization(&self) -> bool {
+        false
+    }
+    fn multipart_staging(&self) -> bool {
+        self.multipart_staging_operation().is_some()
+    }
+    fn staged_multipart_part(&self) -> bool {
+        self.staged_multipart_part_authorization().is_some()
+    }
+    fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention()
+    }
+    fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until()
+    }
+    fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold()
+    }
+    fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags()
+    }
+    fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source()
+    }
+    fn policy_headers(&self) -> &HeaderMap {
+        self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
+    }
+    fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
+        self.object_tag_conditions()
+    }
+    fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.install_object_tag_conditions(conditions);
+    }
+    fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards> {
+        self.table_publication_guards()
+    }
+    fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.install_table_publication_guards(guards);
+    }
+    fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str) {
+        auditor.audit_owned(&self.audit_view(), action, reason, DenialScope::Request);
+    }
+}
+
+/// Authorizes an owned request through the same IAM, bucket and table policies as the legacy edge.
+///
+/// Like the legacy `authorize_request`, it first restores the signed `x-amz-meta-*`
+/// query parameters into headers, so policy conditions and duplicate rejection see
+/// the same request shape on both edges.
+///
+/// This is only the policy decision. It does **not** perform the composite checks
+/// the legacy `S3Access` hooks run around their decision, such as the
+/// `s3:BypassGovernanceRetention` authorization for a governance-bypass header or
+/// the copy-source read authorization; a caller that needs them runs them itself.
+///
+/// # Errors
+///
+/// `InvalidArgument` when the signed query repeats a user metadata key;
+/// `AccessDenied` when the decision for `action` depends on a request-body input
+/// the envelope does not carry (see [`require_body_policy_inputs`]) or when the
+/// policies deny the request.
+pub(crate) async fn authorize_owned_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+    location_constraint: Option<String>,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, location_constraint, false)
+        .await
+        .map_err(Into::into)
+}
+
+/// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
+///
+/// It applies the same preparation and has the same limits as [`authorize_owned_request`].
+pub(crate) async fn authorize_owned_internal_object_request(
+    req: &mut RequestEnvelope,
+    action: Action,
+) -> rustfs_s3_types::S3Result<()> {
+    prepare_owned_authorization(req, action)?;
+    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+}
+
+fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(rustfs_s3_types::S3Error::from)?;
+    require_body_policy_inputs(req, action)
+}
+
+/// Fails closed when the decision for `action` depends on a value the request
+/// body supplies but the envelope does not carry it. Policy conditions would
+/// otherwise fall back to client headers, which the stored value need not match
+/// (header `OFF` with body `ON` would pass a legal-hold Deny).
+fn require_body_policy_inputs(req: &RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
+    let missing = match action {
+        Action::S3Action(S3Action::PutObjectLegalHoldAction) => req.requested_object_legal_hold.is_none(),
+        Action::S3Action(S3Action::PutObjectTaggingAction | S3Action::PutObjectVersionTaggingAction) => {
+            req.requested_object_tags.is_none()
+        }
+        Action::S3Action(S3Action::PutObjectRetentionAction) => req.requested_object_lock_retention.is_none(),
+        _ => false,
+    } || (req.post_object.is_some() && req.post_object_policy_headers.is_none())
+        || (req.headers.contains_key(COPY_SOURCE_HEADER) && req.requested_copy_source.is_none());
+    if missing {
+        return Err(rustfs_s3_types::s3_error!(
+            AccessDenied,
+            "request body policy input is missing for this action"
+        ));
+    }
+    Ok(())
+}
+
+const COPY_SOURCE_HEADER: &str = "x-amz-copy-source";
+
+impl RequestEnvelope {
+    /// The request fields an audit entry for this request is built from.
+    pub(crate) fn audit_view(&self) -> AuditRequestView<'_> {
+        AuditRequestView::from_facts(
+            self.headers(),
+            self.uri(),
+            self.req_info(),
+            self.client_info(),
+            self.remote_addr(),
+            self.request_context(),
+        )
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the operation batches of rustfs/backlog#2749 are its first callers (task H2)"
+    )
+)]
+impl RequestEnvelope {
+    /// Runs `handler` on this request and records its outcome as an audit-only
+    /// entry for `op`, the owned form of the legacy edge's `audit_only_operation`.
+    ///
+    /// The entry is started before the request is handed over; a success is
+    /// recorded with `success_status` and no added response headers. An operation
+    /// that adds response headers builds its helper with
+    /// [`OperationHelper::audit_only_from_view`] and calls
+    /// [`OperationHelper::complete_owned`] itself.
+    pub(crate) async fn audit_only_operation<O, F, Fut>(
+        req: Self,
+        op: S3Operation,
+        success_status: StatusCode,
+        handler: F,
+    ) -> rustfs_s3_types::S3Result<O>
+    where
+        F: FnOnce(Self) -> Fut,
+        Fut: Future<Output = rustfs_s3_types::S3Result<O>>,
+    {
+        let helper = OperationHelper::audit_only_from_view(&req.audit_view(), op);
+        let result = handler(req).await;
+        let _helper = helper.complete_owned(&result, success_status, &HeaderMap::new());
+        result
     }
 }
 
@@ -326,12 +639,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authorization_payloads_move_from_extensions_into_named_fields() {
+        let mut extensions = Extensions::new();
+        extensions.insert(MultipartStagingOperation);
+        extensions.insert(StagedMultipartPartAuthorization);
+        let mut retention = RequestedObjectLockRetention(Default::default());
+        retention.0.mode = Some("COMPLIANCE".to_owned().into());
+        extensions.insert(retention);
+        let retain_until = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("valid timestamp");
+        extensions.insert(RequestedObjectLockRetainUntil(retain_until));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope.multipart_staging_operation().is_some(),
+                envelope.staged_multipart_part_authorization().is_some(),
+                envelope
+                    .requested_object_lock_retention()
+                    .and_then(|value| value.0.mode.as_ref().map(|mode| mode.as_str())),
+                envelope.requested_object_lock_retain_until().map(|value| value.0),
+                envelope.residual_extensions().is_empty(),
+                empty.multipart_staging_operation().is_none(),
+                empty.staged_multipart_part_authorization().is_none(),
+                empty.requested_object_lock_retention().is_none(),
+                empty.requested_object_lock_retain_until().is_none(),
+            ),
+            (true, true, Some("COMPLIANCE"), Some(retain_until), true, true, true, true, true),
+        );
+    }
+
+    #[test]
+    fn request_body_policy_payloads_move_from_extensions_into_named_fields() {
+        let mut form_headers = HeaderMap::new();
+        form_headers.insert("x-amz-tagging", http::HeaderValue::from_static("from=form"));
+        let mut legal_hold = RequestedObjectLegalHold(Default::default());
+        legal_hold.0.status = Some("ON".to_owned().into());
+        let mut tags = RequestedObjectTags(Default::default());
+        tags.0.tag_set.push(Default::default());
+        tags.0.tag_set[0].key = Some("body".to_owned());
+        let mut extensions = Extensions::new();
+        extensions.insert(PostObjectPolicyHeaders(form_headers));
+        extensions.insert(legal_hold);
+        extensions.insert(tags);
+        extensions.insert(RequestedCopySource("source-bucket/source-key".to_owned()));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope
+                    .post_object_policy_headers()
+                    .and_then(|headers| headers.0.get("x-amz-tagging"))
+                    .and_then(|value| value.to_str().ok()),
+                envelope
+                    .requested_object_legal_hold()
+                    .and_then(|hold| hold.0.status.as_ref().map(|status| status.as_str())),
+                envelope
+                    .requested_object_tags()
+                    .and_then(|tags| tags.0.tag_set.first())
+                    .and_then(|tag| tag.key.as_deref()),
+                envelope.requested_copy_source().map(|source| source.0.as_str()),
+                envelope.residual_extensions().is_empty(),
+                empty.post_object_policy_headers().is_none(),
+                empty.requested_object_legal_hold().is_none(),
+                empty.requested_object_tags().is_none(),
+                empty.requested_copy_source().is_none(),
+            ),
+            (
+                Some("from=form"),
+                Some("ON"),
+                Some("body"),
+                Some("source-bucket/source-key"),
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+        );
+    }
+
+    #[test]
+    fn an_empty_handed_over_secret_is_refused() {
+        assert!(RequestCredentials::new("AKIAENVELOPE".to_owned(), String::new(), None).is_err());
+    }
+
+    #[test]
+    fn an_absent_secret_matches_no_stored_secret() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), None);
+        assert_eq!(kept.secret_key(), None);
+        assert!(!kept.secret_key_matches(""), "absent must not equal an empty stored secret");
+        assert!(!kept.secret_key_matches("stored-secret"));
+        let handed = RequestCredentials::new("AKIAENVELOPE".to_owned(), "stored-secret".to_owned(), None).expect("secret");
+        assert!(!handed.secret_key_matches(""));
+        assert!(!handed.secret_key_matches("other-secret"));
+        assert!(handed.secret_key_matches("stored-secret"));
+    }
+
+    #[test]
+    fn a_reader_of_an_absent_secret_fails_closed() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), Some("token".to_owned()));
+        assert!(kept.require_secret_key().is_err());
+        let handed = RequestCredentials::new("AKIAENVELOPE".to_owned(), "s".to_owned(), None).expect("secret");
+        assert_eq!(handed.require_secret_key().ok(), Some("s"));
+    }
+
+    #[test]
+    fn kept_secret_debug_prints_neither_secret_nor_token() {
+        let kept = RequestCredentials::without_secret_key("AKIAENVELOPE".to_owned(), Some("envelope-session-token".to_owned()));
+        let debug = format!("{kept:?}");
+        assert!(debug.contains("AKIAENVELOPE"), "{debug}");
+        assert!(!debug.contains("envelope-session-token"), "{debug}");
+    }
+
+    #[test]
     fn request_credentials_debug_redacts_secret_and_session_token() {
         let credentials = RequestCredentials::new(
             "AKIAENVELOPE".to_owned(),
             "envelope-secret-value".to_owned(),
             Some("envelope-session-token".to_owned()),
-        );
+        )
+        .expect("non-empty secret");
 
         let debug = format!("{credentials:?}");
 

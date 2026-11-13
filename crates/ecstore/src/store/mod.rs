@@ -456,6 +456,8 @@ mod rebalance;
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
+#[cfg(feature = "internode-transport")]
+pub use peer::external_rpc_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
@@ -844,6 +846,12 @@ impl ECStore {
     /// Get this store instance's configured region.
     pub fn region(&self) -> Option<rustfs_s3_types::Region> {
         self.ctx.region()
+    }
+
+    /// Get the further regions this store instance accepts as a bucket
+    /// `LocationConstraint` besides [`Self::region`].
+    pub fn additional_regions(&self) -> Vec<rustfs_s3_types::Region> {
+        self.ctx.additional_regions()
     }
 
     /// Get the tier config manager

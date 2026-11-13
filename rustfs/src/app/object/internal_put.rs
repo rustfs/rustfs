@@ -22,6 +22,8 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
+use crate::app::storage_api::s3::dto::StreamingBlob;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
