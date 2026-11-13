@@ -48,6 +48,9 @@ impl TryFrom<&str> for KeyName {
     }
 }
 
+/// Canonical condition-map key for the resolved service-account parent.
+pub const SVC_TARGET_USER: &str = "TargetUser";
+
 impl KeyName {
     pub const COMMON_KEYS: &'static [KeyName] = &[
         // s3
@@ -136,7 +139,11 @@ impl KeyName {
     /// Names (prefix stripped) of the well-known condition keys that request input
     /// must never populate. See [`KeyName::is_server_derived`].
     pub fn server_derived_key_names() -> impl Iterator<Item = &'static str> {
-        Self::COMMON_KEYS.iter().filter(|k| k.is_server_derived()).map(|k| k.name())
+        Self::COMMON_KEYS
+            .iter()
+            .filter(|k| k.is_server_derived())
+            .map(|k| k.name())
+            .chain([SVC_TARGET_USER])
     }
 
     /// Returns the policy variable form of the key, e.g. `${jwt:sub}`.
@@ -328,6 +335,8 @@ pub enum JwtKeyName {
 pub enum SvcKeyName {
     #[strum(serialize = "svc:DurationSeconds")]
     SVCDurationSeconds,
+    #[strum(serialize = "svc:TargetUser")]
+    TargetUser,
 }
 
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
