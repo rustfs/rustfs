@@ -59,6 +59,8 @@ their issue closes.
 | `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
 | `junit_diff.py` | dev-tool | Case-by-case pass/fail/skip diff of two JUnit XML reports (reference vs candidate stack); exit 1 on any difference or stale `--allow` entry, 2 on unreadable input | `python3 scripts/junit_diff.py a.xml b.xml`; backlog T3.1 |
 | `test_junit_diff.py` | ci-gate | Contract tests and fixtures (`scripts/tests/junit_diff/`) for `junit_diff.py` | `make script-tests` |
+| `dual_stack.py` | ci-gate | Proves which S3 stack a leg's servers ran from their own `server_starting` line (`stack`) | `python3 scripts/dual_stack.py stack --help`; backlog T3.1 |
+| `test_dual_stack.py` | ci-gate | Contract tests for `dual_stack.py` | `make script-tests` |
 | `s3-tests/reference_parity.py` | ci-gate | Plans the reference parity targets, lists a run's failures for the single rerun, and compares every candidate's s3-tests JUnit against the pinned reference per node id with a tolerated-difference file | `.github/workflows/reference-parity.yml`; backlog T3.2 |
 | `s3-tests/test_reference_parity.py` | ci-gate | Contract tests for `reference_parity.py` | `make script-tests` |
 | `test_reference_binary.py` | ci-gate | Contract tests for `.github/actions/reference-binary/reference_binary.py` (pin resolution and verified unpacking) | `make script-tests` |

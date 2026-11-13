@@ -124,6 +124,7 @@ pub(crate) async fn init_startup_listen_context(
         ip = %server_addr.ip(),
         port = %server_port,
         version = %crate::version::get_version(),
+        s3_stack = ?config.s3_stack,
         "Starting RustFS server"
     );
 
