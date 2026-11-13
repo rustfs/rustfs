@@ -440,6 +440,25 @@ fn clear_bucket_durability(bucket: &str) {
     crate::disk::local::bucket_durability::set(bucket, None);
 }
 
+/// Publish the bucket's ETag algorithm to the registry the write path consults.
+fn sync_bucket_etag(bucket: &str, bm: &BucketMetadata) {
+    let xxh3 = bm.etag_config().is_some_and(|cfg| cfg.uses_xxh3());
+    crate::bucket::etag::set_bucket_xxh3_etag(bucket, xxh3);
+}
+
+/// Publish every per-bucket override kept outside the metadata cache
+/// (durability tier, ETag algorithm) on each install path.
+fn sync_bucket_overrides(bucket: &str, bm: &BucketMetadata) {
+    sync_bucket_durability(bucket, bm);
+    sync_bucket_etag(bucket, bm);
+}
+
+/// Drop every per-bucket override when the bucket's metadata leaves the cache.
+fn clear_bucket_overrides(bucket: &str) {
+    clear_bucket_durability(bucket);
+    crate::bucket::etag::set_bucket_xxh3_etag(bucket, false);
+}
+
 /// Publish application-owned bytes on every cache install path.
 fn sync_on_demand_migration(bucket: &str, bm: &BucketMetadata) {
     if let Some(hook) = BUCKET_CONFIG_PUBLISH_HOOK.get() {
@@ -1587,6 +1606,16 @@ pub async fn get_durability_config(
     Ok((bm.durability_config(), bm.durability_config_updated_at))
 }
 
+/// The bucket's ETag algorithm config with its update time. `Ok((None, ..))`
+/// means the bucket keeps MD5 ETags.
+pub async fn get_etag_config(bucket: &str) -> Result<(Option<crate::bucket::etag::BucketEtagConfig>, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    let (bm, _) = bucket_meta_sys.get_config(bucket).await?;
+    Ok((bm.etag_config(), bm.etag_config_updated_at))
+}
+
 /// The bucket's on-demand migration config with its update time, or
 /// `Ok(None)` when the bucket has none. Bytes are opaque to the metadata owner.
 pub async fn get_on_demand_migration_config(bucket: &str) -> Result<Option<(Vec<u8>, OffsetDateTime)>> {
@@ -2451,7 +2480,7 @@ impl BucketMetadataSys {
                 self.missing_buckets.insert(bucket.to_string(), ()).await;
                 if removed {
                     BucketTargetSys::get().delete(bucket).await;
-                    clear_bucket_durability(bucket);
+                    clear_bucket_overrides(bucket);
                     clear_on_demand_migration(bucket);
                 }
             }
@@ -2489,7 +2518,7 @@ impl BucketMetadataSys {
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
-                sync_bucket_durability(bucket, &bm);
+                sync_bucket_overrides(bucket, &bm);
                 sync_on_demand_migration(bucket, &bm);
             }
             MetadataLoadMode::Initial => {
@@ -2537,7 +2566,7 @@ impl BucketMetadataSys {
             self.missing_buckets.invalidate(bucket).await;
             if removed {
                 BucketTargetSys::get().delete(bucket).await;
-                clear_bucket_durability(bucket);
+                clear_bucket_overrides(bucket);
                 clear_on_demand_migration(bucket);
             }
             return Ok(());
@@ -2560,7 +2589,7 @@ impl BucketMetadataSys {
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
-        sync_bucket_durability(bucket, &metadata);
+        sync_bucket_overrides(bucket, &metadata);
         sync_on_demand_migration(bucket, &metadata);
         Ok(())
     }
@@ -2590,7 +2619,7 @@ impl BucketMetadataSys {
             self.fabricated_metadata.write().await.remove(&bucket);
             self.missing_buckets.invalidate(&bucket).await;
             sync_bucket_target_sys(&bucket, &bm).await;
-            sync_bucket_durability(&bucket, &bm);
+            sync_bucket_overrides(&bucket, &bm);
             sync_on_demand_migration(&bucket, &bm);
         }
     }
@@ -2614,7 +2643,7 @@ impl BucketMetadataSys {
         super::config_parse_mode::forget_bucket_config_parse_state(bucket);
         if removed {
             BucketTargetSys::get().delete(bucket).await;
-            clear_bucket_durability(bucket);
+            clear_bucket_overrides(bucket);
             clear_on_demand_migration(bucket);
         }
         removed || removed_fabricated
@@ -2957,7 +2986,7 @@ impl BucketMetadataSys {
                 self.fabricated_metadata.write().await.remove(bucket);
                 self.missing_buckets.invalidate(bucket).await;
                 sync_bucket_target_sys(bucket, &bm).await;
-                sync_bucket_durability(bucket, &bm);
+                sync_bucket_overrides(bucket, &bm);
                 sync_on_demand_migration(bucket, &bm);
                 return Ok((bm, true));
             } else {
@@ -3408,7 +3437,7 @@ impl BucketMetadataSys {
         self.fabricated_metadata.write().await.remove(bucket);
         self.missing_buckets.invalidate(bucket).await;
         sync_bucket_target_sys(bucket, &metadata).await;
-        sync_bucket_durability(bucket, &metadata);
+        sync_bucket_overrides(bucket, &metadata);
         sync_on_demand_migration(bucket, &metadata);
         Ok(BucketMetadataAuthority::Authoritative(metadata))
     }
@@ -6684,6 +6713,41 @@ mod tests {
 
         assert!(target_sys.list_bucket_targets(bucket).await.is_err());
         target_sys.delete(bucket).await;
+    }
+
+    /// Installing bucket metadata publishes the bucket's ETag algorithm to the
+    /// write-path registry; metadata without it, an invalid payload or
+    /// clearing the bucket's overrides withdraws XXH3.
+    #[test]
+    fn metadata_sync_publishes_and_clears_etag_algorithm() {
+        use crate::bucket::etag::bucket_uses_xxh3_etag;
+
+        let bucket = "metadata-sync-etag";
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"xxh3"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(bucket_uses_xxh3_etag(bucket));
+
+        sync_bucket_overrides(bucket, &BucketMetadata::new(bucket));
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"md5"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = b"not-json".to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(!bucket_uses_xxh3_etag(bucket));
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.etag_config_json = br#"{"algorithm":"XXH3"}"#.to_vec();
+        sync_bucket_overrides(bucket, &bm);
+        assert!(bucket_uses_xxh3_etag(bucket));
+        clear_bucket_overrides(bucket);
+        assert!(!bucket_uses_xxh3_etag(bucket));
     }
 
     /// HP-5b (rustfs/backlog#938): installing bucket metadata publishes the

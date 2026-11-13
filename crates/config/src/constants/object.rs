@@ -117,6 +117,30 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Comma-separated buckets that hold a content-addressed cache (an LLM KV
+/// cache) and serve PutObject, GetObject and HeadObject without distributed
+/// locks or authoritative bucket-metadata reads. See the ecstore
+/// `bucket::lockless_cache` module for what such a bucket gives up.
+///
+/// Default is empty: every bucket keeps the locked paths.
+pub const ENV_LOCKLESS_CACHE_BUCKETS: &str = "RUSTFS_LOCKLESS_CACHE_BUCKETS";
+
+/// Smallest declared body, in bytes, whose ETag MD5 is computed on a
+/// blocking-pool thread while the body streams into the erasure encoder,
+/// instead of inline on the request's task. The ETag and Content-MD5
+/// checks are unchanged; `0` keeps every MD5 inline.
+///
+/// Each offloaded upload holds one blocking-pool thread until its body ends,
+/// and that pool also serves disk I/O, so size the threshold against the
+/// expected number of concurrent large uploads before enabling it.
+pub const ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: &str = "RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES";
+
+/// Default: disabled; every ETag MD5 is computed inline. Set
+/// `RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES` (for example `8388608`) to opt in.
+pub const DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: u64 = 0;
+
+const _: () = assert!(DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES == 0);
+
 /// Create independent shard commitments for new writes after the fleet is upgraded.
 /// Existing protected objects and multipart uploads retain their protection.
 pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
@@ -297,6 +321,37 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
+
+/// Environment variable for the smallest bitrot frame (hash + shard bytes)
+/// that is verified on a blocking thread instead of inline on the decode task
+/// (`0` disables off-thread verification).
+///
+/// The shard reads of one stripe complete on one task, so with large shards
+/// their hashes were computed one after another on one core: at 4 MiB shards
+/// a 12+4 stripe spent about 10 ms hashing serially. Frames at or above this
+/// size are hashed on the blocking pool so the shards of a stripe verify in
+/// parallel; small frames stay inline because a thread hop would cost more
+/// than the hash.
+pub const ENV_BITROT_VERIFY_OFFLOAD_MIN_BYTES: &str = "RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES";
+/// Default smallest off-thread bitrot frame: 2 MiB (frames of the legacy 1 MiB
+/// block, and 1 MiB shards, stay inline).
+pub const DEFAULT_BITROT_VERIFY_OFFLOAD_MIN_BYTES: usize = 2 * 1024 * 1024;
+
+/// Environment variable for the erasure shard size, in bytes, of newly written
+/// objects (`0`, the default, keeps the historical 1 MiB erasure block).
+///
+/// When set, the erasure block of a new object is `data shards x shard bytes`,
+/// so every shard read and write is exactly this large and aligned: 4 MiB on a
+/// 12+4 layout gives a 48 MiB block, 48x fewer stripes per object than today.
+/// Existing objects keep the block recorded in their `xl.meta`. System
+/// metadata under `.rustfs.sys` always uses the 1 MiB block. The value must be
+/// a multiple of 4 KiB and at most `MAX_ERASURE_SHARD_BYTES`; invalid values
+/// are ignored with a warning.
+pub const ENV_ERASURE_SHARD_BYTES: &str = "RUSTFS_ERASURE_SHARD_BYTES";
+/// Default erasure shard size override (`0` = derive from the 1 MiB block).
+pub const DEFAULT_ERASURE_SHARD_BYTES: usize = 0;
+/// Largest accepted erasure shard size override (64 MiB).
+pub const MAX_ERASURE_SHARD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Environment variable for the per-shard erasure write stall timeout (seconds).
 ///

@@ -2772,7 +2772,12 @@ async fn setup_multipart_part_readers(
         parity_shards,
         BitrotReaderSetupMode::ReadQuorum,
         prefer_data_blocks_first,
-        None,
+        rustfs_io_metrics::get_stage_metrics_enabled().then_some(BitrotReaderStageMetrics {
+            path: GET_OBJECT_PATH_LEGACY_DUPLEX,
+            reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+            file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+            bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+        }),
         Some(BitrotReaderSetupAttribution {
             path: metrics_path,
             object_class: metrics_object_class,
