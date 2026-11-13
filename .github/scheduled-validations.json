@@ -360,14 +360,15 @@
       "cadence": "nightly",
       "timezone": "UTC",
       "schedule": [
-        "13 1 * * *"
+        "13 1 * * *",
+        "17 16 * * 0"
       ],
       "owner": "@overtrue",
       "policy": "active",
       "monitor": "workflow",
       "max_age_hours": 36,
       "result_owner": "build.yml",
-      "disposition": "Builds artifacts only; public release writes belong to release-publish.yml.",
+      "disposition": "Daily cron builds Linux; Sunday 16:17 UTC builds macOS and Windows. Public release writes belong to release-publish.yml.",
       "failure_owner": "workflow",
       "origin": "baseline",
       "alert_contract": "scheduled-validation"
