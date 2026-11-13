@@ -263,8 +263,7 @@ const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
 const EVENT_SOCKET_FALLBACK: &str = "socket_fallback";
 const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
-#[cfg(feature = "gateway-stack")]
-const EVENT_S3_STACK_SELECTED: &str = "s3_stack_selected";
+const EVENT_S3_STACK_ASSEMBLED: &str = "s3_stack_assembled";
 const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
@@ -1570,16 +1569,12 @@ fn select_s3_stack(
         let stack = GatewayStack::assemble(assembly()).map_err(Error::other)?;
         Ok(GatewayEdgeService(stack))
     })?;
-    let stack = match service.selected() {
-        config::S3Stack::Gateway => "gateway",
-        config::S3Stack::Legacy => "legacy",
-    };
     info!(
-        event = EVENT_S3_STACK_SELECTED,
+        event = EVENT_S3_STACK_ASSEMBLED,
         component = LOG_COMPONENT_SERVER,
         subsystem = LOG_SUBSYSTEM_STARTUP,
-        stack,
-        "S3 stack selected"
+        s3_stack_assembled = service.assembled(),
+        "S3 stack assembled"
     );
     Ok(service)
 }
@@ -2576,6 +2571,14 @@ async fn start_http_server_inner(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     ));
+    #[cfg(not(feature = "gateway-stack"))]
+    info!(
+        event = EVENT_S3_STACK_ASSEMBLED,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        s3_stack_assembled = "legacy",
+        "S3 stack assembled"
+    );
     #[cfg(feature = "gateway-stack")]
     let s3_service = select_s3_stack(config, s3_service, || GatewayAssembly {
         server_ctx: Arc::clone(&server_ctx),

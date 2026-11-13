@@ -44,11 +44,12 @@ pub(crate) struct S3StackService<L, G> {
 }
 
 impl<L, G> S3StackService<L, G> {
-    /// The stack this service runs.
-    pub(crate) fn selected(&self) -> S3Stack {
+    /// The stack this service was built with, as the startup line names it: read from the service
+    /// that answers, never from the configuration that asked for it.
+    pub(crate) fn assembled(&self) -> &'static str {
         match self.gateway {
-            Some(_) => S3Stack::Gateway,
-            None => S3Stack::Legacy,
+            Some(_) => "gateway",
+            None => "legacy",
         }
     }
 }
@@ -157,7 +158,7 @@ mod tests {
         })
         .expect("legacy needs no assembly");
 
-        assert_eq!(service.selected(), S3Stack::Legacy);
+        assert_eq!(service.assembled(), "legacy");
     }
 
     #[tokio::test]
@@ -173,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn the_gateway_stack_answers_every_s3_request_whatever_the_operation() {
         let mut service = gateway_stack();
-        assert_eq!(service.selected(), S3Stack::Gateway);
+        assert_eq!(service.assembled(), "gateway");
 
         for (method, target) in [
             (Method::GET, "/"),

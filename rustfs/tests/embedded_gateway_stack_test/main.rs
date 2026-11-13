@@ -261,6 +261,8 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
         ("no policy", s3_client(&endpoint, NO_POLICY_USER, USER_SECRET_KEY), "AccessDenied", false),
     ];
 
+    // A caller served where it must be refused is collected, so one run names every such caller.
+    let mut served = Vec::new();
     for row in matrix() {
         let before = s3_request_counts();
         assert_eq!((row.call)(&root, MATRIX_BUCKET).await, Ok(()), "{} as root", row.operation);
@@ -276,9 +278,13 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
 
         for (caller, client, code, by_authentication) in &refused {
             let before = s3_request_counts();
-            let refusal = (row.call)(client, MATRIX_BUCKET)
-                .await
-                .expect_err(&format!("{} serves the {caller} caller", row.operation));
+            let refusal = match (row.call)(client, MATRIX_BUCKET).await {
+                Ok(()) => {
+                    served.push(format!("{} serves the {caller} caller", row.operation));
+                    continue;
+                }
+                Err(refusal) => refusal,
+            };
             let context = format!("{} as the {caller} caller: {refusal:?}", row.operation);
             assert_eq!(refusal.status, Some(403), "{context}");
             if row.has_error_body {
@@ -300,6 +306,7 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
             }
         }
     }
+    assert!(served.is_empty(), "{served:?}");
 
     server.shutdown().await;
 }
@@ -354,7 +361,8 @@ fn the_legacy_stack_lists_every_stored_bucket() {
 }
 
 /// The PutObject-only upload-size capability is refused on any other operation, before it is
-/// served, by the admission both stacks run.
+/// served, with the same answer on both stacks. The legacy stack refuses it in the admission both
+/// edges share; the gateway refuses the query before its handler runs.
 async fn a_misplaced_capability_query_is_refused(server: RustFSServer) {
     let refused = s3_client(&server.endpoint(), server.access_key(), server.secret_key())
         .list_buckets()
