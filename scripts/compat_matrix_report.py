@@ -19,14 +19,18 @@ Usage:
   compat_matrix_report.py diff --legacy <dir> --gateway <dir>
   compat_matrix_report.py --self-test
 
-<dir> holds what the lane observed: `startup.txt` (`ready`, or why the server did
-not start), `skipped-clients.txt` (`<client>: <reason>` per client that could not
-be installed), `matrix-exit.txt` (the exit code of the gateway's
+<dir> holds what the lane observed: the server record acceptance_lane.py reads,
+`skipped-clients.txt` (`<client>: <reason>` per client that could not be
+installed), `matrix-exit.txt` (the exit code of the gateway's
 ci/compat/run_matrix.sh) and `compat/matrix.json` (its manifest).
 
-`check` is clean only when the server served, the matrix finished, every client
-ran, and no cell is `fail` or `sut-unregistered` (rustfs/backlog#2776). A
-`client-unsupported` cell is the client's gap, never a pass, and is counted.
+`check` is clean only when the server of the requested stack served, the matrix
+finished, every client ran, and no cell is `fail` or `sut-unregistered`
+(rustfs/backlog#2776). A `client-unsupported` cell is the client's gap, never a
+pass, and is counted. The gateway's own scripts/check_compat_matrix.sh at the
+pinned rev is not a substitute: it does not fail a `fail` cell (it only checks
+the cell's known-fail label) or a client that never ran, and it also judges that
+repository's own files (known-fail ratchet from git history, drivers, workflow).
 `diff` lists every (client, scenario) cell whose status differs between stacks
 and gates on the gateway matrix covering the legacy baseline: every cell that
 passes on legacy must pass on gateway. Other differences are information.
@@ -38,24 +42,18 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from acceptance_lane import InputError, read_exit, read_text, served, write_served  # noqa: E402  (sibling script)
 
 STATUSES = ("pass", "fail", "client-unsupported", "sut-unregistered")
 
 
-class InputError(Exception):
-    """A manifest that cannot be trusted; exit code 2."""
-
-
-def read_run(run_dir):
-    """Return (startup, skipped clients, matrix exit or None, {(client, scenario): cell} or None)."""
-    run_dir = Path(run_dir)
-    read = lambda name: (run_dir / name).read_text(encoding="utf-8").strip() if (run_dir / name).is_file() else ""
-    skipped = [line for line in read("skipped-clients.txt").splitlines() if line.strip()]
-    exit_text = read("matrix-exit.txt")
-    if exit_text and not exit_text.isdigit():
-        raise InputError(f"{run_dir}/matrix-exit.txt: not an exit code: {exit_text!r}")
-    manifest = run_dir / "compat/matrix.json"
+def read_cells(run_dir):
+    """Return {(client, scenario): cell} from the run's manifest, or None when it wrote none."""
+    manifest = Path(run_dir) / "compat/matrix.json"
     cells = None
     if manifest.is_file():
         try:
@@ -66,17 +64,18 @@ def read_run(run_dir):
             raise InputError(f"{manifest}: not a client matrix manifest: {error}") from error
         if any(cell.get("status") not in STATUSES for cell in cells.values()):
             raise InputError(f"{manifest}: unknown cell status")
-    return read("startup.txt"), skipped, int(exit_text) if exit_text else None, cells
+    return cells
 
 
-def check(stack, startup, skipped, matrix_exit, cells):
+def check(stack, run_dir):
     """Return (summary lines, problems)."""
-    lines = [f"### Client matrix, `{stack}` stack", ""]
-    if startup != "ready":
-        observed = startup or "no startup record"
-        lines.append(f"- server: {observed if startup.startswith('did not start') else 'did not start: ' + observed}")
-        return lines, [f"{stack}: the server did not serve; no client ran"]
-    lines += ["- server: ready", f"- run_matrix exit: {matrix_exit if matrix_exit is not None else 'not recorded'}"]
+    server, problem = served(run_dir, stack)
+    lines = [f"### Client matrix, `{stack}` stack", "", server]
+    if problem:
+        return lines, [problem + "; no client ran"]
+    skipped = [line for line in read_text(Path(run_dir) / "skipped-clients.txt").splitlines() if line.strip()]
+    matrix_exit, cells = read_exit(Path(run_dir) / "matrix-exit.txt"), read_cells(run_dir)
+    lines.append(f"- run_matrix exit: {matrix_exit if matrix_exit is not None else 'not recorded'}")
     lines += [f"- {line}" if ": skipped: " in line else f"- {line}: skipped" for line in skipped]
     problems = [f"{stack}: client {line.split(':', 1)[0]} did not run" for line in skipped]
     if cells is None or matrix_exit not in (0, 1) or not cells:
@@ -127,9 +126,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "check":
-            lines, problems = check(args.stack, *read_run(args.run_dir))
+            lines, problems = check(args.stack, args.run_dir)
         else:
-            lines, problems = diff(read_run(args.legacy)[3], read_run(args.gateway)[3])
+            lines, problems = diff(read_cells(args.legacy), read_cells(args.gateway))
     except InputError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -141,13 +140,12 @@ def main(argv=None):
 
 class SelfTest(unittest.TestCase):
     def setUp(self):
-        import tempfile
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(temporary.name)
 
-        self.dir = Path(tempfile.mkdtemp())
-
-    def write_run(self, directory, cells, startup="ready", matrix_exit="0", skipped=""):
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "startup.txt").write_text(startup + "\n")
+    def write_run(self, directory, cells, startup="ready", matrix_exit="0", skipped="", observed=None):
+        write_served(directory, "legacy", startup, observed)
         (directory / "skipped-clients.txt").write_text(skipped)
         if matrix_exit is not None:
             (directory / "matrix-exit.txt").write_text(matrix_exit + "\n")
@@ -161,7 +159,7 @@ class SelfTest(unittest.TestCase):
         return directory
 
     def checked(self, **kwargs):
-        return check("legacy", *read_run(self.write_run(self.dir, **kwargs)))
+        return check("legacy", self.write_run(self.dir, **kwargs))
 
     def test_pass_and_client_unsupported_cells_are_clean(self):
         lines, problems = self.checked(cells={("boto3", "a"): "pass", ("restic", "a"): "client-unsupported"})
@@ -184,6 +182,11 @@ class SelfTest(unittest.TestCase):
         self.assertIn("- server: did not start: refused", lines)
         self.assertEqual(problems, ["legacy: the server did not serve; no client ran"])
 
+    def test_a_server_of_the_other_stack_is_red(self):
+        lines, problems = self.checked(cells={("boto3", "a"): "pass"}, observed="gateway")
+        self.assertIn("- server: ready, but the stack was not observed as `legacy` (observed: gateway)", lines)
+        self.assertEqual(problems, ["legacy: the stack that served was not observed; no client ran"])
+
     def test_an_environment_exit_is_red_even_with_a_manifest(self):
         self.assertEqual(self.checked(cells={("boto3", "a"): "pass"}, matrix_exit="3")[1],
                          ["legacy: the matrix did not complete (exit 3)"])
@@ -199,7 +202,7 @@ class SelfTest(unittest.TestCase):
             self.checked(cells={("boto3", "a"): "passed"})
 
     def cells(self, name, statuses):
-        return read_run(self.write_run(self.dir / name, statuses))[3]
+        return read_cells(self.write_run(self.dir / name, statuses))
 
     def test_a_legacy_pass_lost_or_absent_on_gateway_is_red(self):
         legacy = self.cells("l", {("boto3", "a"): "pass", ("boto3", "b"): "pass", ("mc", "a"): "pass"})

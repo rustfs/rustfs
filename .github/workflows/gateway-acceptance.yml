@@ -19,9 +19,10 @@
 #
 #   - the conformance corpus, `--profile rustfs`. That profile describes the
 #     gateway edge, so scripts/check_conformance_rulings.py judges the gateway
-#     stack against .config/conformance-rulings.toml (an unruled failure and a
-#     stale ruling are both red) and publishes the legacy run as a reference that
-#     is never judged: it only has to start and complete;
+#     stack against .config/conformance-rulings.toml (red: an unruled failure, a
+#     ruled case failing differently, a stale ruling, a skip on the server's own
+#     answer) and publishes the legacy run as a reference that is never judged:
+#     it only has to serve, stay up and complete;
 #   - the client matrix, ci/compat/run_matrix.sh --external, judged per stack by
 #     scripts/compat_matrix_report.py (no `fail`, no `sut-unregistered`, every
 #     client ran; a client that could not be installed is reported as skipped).
@@ -30,8 +31,10 @@
 #
 # The suites are checked out at the rustfs/gateway rev Cargo.toml pins, so the
 # suite and the framework under test never drift apart. The verdict of each
-# stack is computed from what the run left on disk (startup record, runner exit
-# code, report), never from the exit status of an earlier step.
+# stack is computed from what the run left on disk (startup record, the stack
+# the server's own log names, runner exit code, liveness after the corpus,
+# report), never from the exit status of an earlier step. Needs
+# scripts/dual_stack.py and the `s3_stack` startup field of rustfs/rustfs#9367.
 #
 # The gateway stack is report-only until T2.10: its job may fail without failing
 # the workflow, and its summary says what it observed (did not start, or how many
@@ -44,10 +47,6 @@
 name: Gateway Acceptance
 
 on:
-  # TEMPORARY: removed before merge; it exists only to run this lane on its own pull request.
-  pull_request:
-    paths:
-      - ".github/workflows/gateway-acceptance.yml"
   schedule:
     - cron: "29 3 * * *"
   workflow_dispatch:
@@ -172,8 +171,9 @@ jobs:
     # GitHub-hosted like the s3-tests targets of reference-parity.yml: the job
     # only runs prebuilt binaries and the pinned clients, none of which needs Docker.
     runs-on: ubuntu-latest
-    # The client matrix alone is 30-90 minutes by design.
-    timeout-minutes: 150
+    # About 3x the 15 minutes the legacy job took in run 43325101234 (client install about
+    # 8, matrix about 3, corpus about 3), so a hung server costs 45 runner minutes, not more.
+    timeout-minutes: 45
     continue-on-error: ${{ matrix.stack == 'gateway' }}
     strategy:
       fail-fast: false
@@ -213,7 +213,9 @@ jobs:
           name: gateway-acceptance-tools
           path: tools
 
-      # Records `ready`, or what the process said when it exited, in lane/startup.txt.
+      # Records `ready`, or what the process said when it exited, in lane/startup.txt. `ready`
+      # also needs the server's own `server_starting` log event to name the requested stack
+      # (its `s3_stack` field comes from rustfs/rustfs#9367; scripts/dual_stack.py reads it).
       - name: Start candidate (${{ matrix.stack }} stack)
         run: |
           set -uo pipefail
@@ -226,6 +228,7 @@ jobs:
             --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
             > lane/rustfs.log 2>&1 &
           pid=$!
+          echo "$pid" > lane/rustfs.pid
           # Liveness first: a ready answer counts only while this process is still running.
           for _ in $(seq 120); do
             if ! kill -0 "$pid" 2>/dev/null; then
@@ -236,8 +239,13 @@ jobs:
               exit 1
             fi
             if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
-              echo ready > lane/startup.txt
-              exit 0
+              if python3 scripts/dual_stack.py stack --expect "$STACK" --out lane/stack.json lane/rustfs.log > /dev/null; then
+                echo ready > lane/startup.txt
+                exit 0
+              fi
+              echo "did not start: stack not observed" > lane/startup.txt
+              cat lane/startup.txt
+              exit 1
             fi
             sleep 1
           done
@@ -252,6 +260,7 @@ jobs:
             --endpoint "$ENDPOINT" --allow-external-fixtures \
             --json lane/report.json > lane/conformance.log 2>&1
           echo "$?" > lane/runner-exit.txt
+          if kill -0 "$(cat lane/rustfs.pid)" 2>/dev/null; then echo alive; else echo exited; fi > lane/alive-after-conformance.txt
           tail -n 20 lane/conformance.log
 
       - name: Set up Python
@@ -343,6 +352,7 @@ jobs:
             lane/*.txt
             lane/*.log
             lane/report.json
+            lane/stack.json
             lane/compat/matrix.json
             lane/compat/probe.jsonl
             lane/compat/sut.log
