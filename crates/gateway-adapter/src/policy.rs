@@ -31,7 +31,8 @@
 //! disabled one, or one whose secret fails the effective-length rule, is
 //! [`DISABLED_PRINCIPAL`]; an identity
 //! whose credential kind disagrees with IAM's record is [`SESSION_MISMATCH`]; a token whose claims
-//! cannot be read is [`PolicyError::malformed`]. None of them is ever an empty snapshot: an empty
+//! cannot be read is [`PolicyError::malformed`]; a principal a host verifier reported is
+//! [`HOST_TOKEN_PRINCIPAL`]. None of them is ever an empty snapshot: an empty
 //! snapshot is what an anonymous caller gets, and answering a fault with it would judge an
 //! authenticated caller as anonymous.
 //!
@@ -45,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rustfs_credentials::Credentials as IamCredential;
-use rustfs_gateway::{BoxFuture, Identity, PolicyError, PolicySnapshot, PolicySource};
+use rustfs_gateway::{BoxFuture, Identity, IdentityOrigin, PolicyError, PolicySnapshot, PolicySource};
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::{
@@ -65,6 +66,10 @@ pub const DISABLED_PRINCIPAL: &str = "disabled-principal";
 /// [`PolicyError`] label: the identity's credential kind (session or long-term) disagrees with
 /// what IAM holds for its access key.
 pub const SESSION_MISMATCH: &str = "session-mismatch";
+/// [`PolicyError`] label: a principal a host verifier reported (`IdentityOrigin::HostToken`). It
+/// is not an access key, so it is never compared with root or looked up in IAM; how such a
+/// principal is authorised is not decided yet, so it is refused.
+pub const HOST_TOKEN_PRINCIPAL: &str = "host-token-principal";
 
 /// The narrow slice of IAM a policy reading needs, on top of [`IamKeyLookup`].
 ///
@@ -178,8 +183,10 @@ impl IamPolicySource {
         let Some(identity) = identity else {
             return Ok(PolicySnapshot::empty());
         };
-        let principal = self.principal(identity).await?;
-        Ok(PolicySnapshot::of(Arc::new(principal)))
+        match identity.origin() {
+            IdentityOrigin::AccessKey => Ok(PolicySnapshot::of(Arc::new(self.principal(identity).await?))),
+            IdentityOrigin::HostToken => Err(PolicyError::because(HOST_TOKEN_PRINCIPAL)),
+        }
     }
 
     async fn principal(&self, identity: &Identity) -> Result<RustfsPrincipal, PolicyError> {
@@ -548,6 +555,33 @@ mod tests {
             let error = refusal(source(iam).snapshot(Some(&long_term(ACCESS_KEY))).await);
             assert_eq!(error, PolicyError::unavailable(), "{:?}", failure());
         }
+    }
+
+    /// Negative — a principal the host verifier reported is refused before root and IAM, although
+    /// the root access key and an IAM user are both spelled exactly like it; the access key of
+    /// that spelling is root to the one source and an IAM user to the other.
+    #[tokio::test]
+    async fn policy_host_token_principal_is_refused_without_lookup() {
+        let keystone = crate::keystone::fixture::host_token_identity("rootlike").await;
+        let spelling = keystone.access_key_id();
+        let iam = fake(true, || found(user()));
+        let root = RootCredentials::new(spelling, ROOT_SECRET, SIGNING_KEY).expect("valid root credentials");
+        let root_spelled_like_it = IamPolicySource::new(iam.clone(), Arc::new(RootCell::new(Some(root))));
+        let user_spelled_like_it = source(iam.clone());
+        for policy_source in [&root_spelled_like_it, &user_spelled_like_it] {
+            let error = refusal(policy_source.snapshot(Some(&keystone)).await);
+            assert_eq!(error, PolicyError::because(HOST_TOKEN_PRINCIPAL));
+        }
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 0, "IAM was asked about a host-reported name");
+
+        let access_key = long_term(spelling);
+        assert!(
+            payload(&principal_of(&root_spelled_like_it, &access_key).await).is_owner(),
+            "the control: root"
+        );
+        let as_user = principal_of(&user_spelled_like_it, &access_key).await;
+        assert!(payload(&as_user).kind() == PrincipalKind::User, "the control: an IAM user");
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 1, "the control: an access key is looked up");
     }
 
     /// Negative — a principal IAM no longer knows is refused as unknown, not as unavailable and
