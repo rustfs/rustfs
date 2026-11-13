@@ -15,6 +15,7 @@
 //! Fixtures and test-only imports shared by the multipart use-case tests.
 
 use super::*;
+use crate::app::storage_api::s3::S3Request;
 pub(super) use crate::app::storage_api::s3::dto::CompletedMultipartUpload;
 pub(super) use crate::app::storage_api::s3::dto::StorageClass;
 pub(super) use http::Extensions;

@@ -15,6 +15,10 @@
 //! Bucket CORS configuration use-case operations.
 
 use super::*;
+use crate::app::storage_api::s3::dto::{
+    DeleteBucketCorsInput, DeleteBucketCorsOutput, GetBucketCorsInput, PutBucketCorsInput, PutBucketCorsOutput,
+};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
@@ -128,6 +132,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::storage_api::s3::dto::CORSConfiguration;
     use http::Method;
 
     #[tokio::test]
