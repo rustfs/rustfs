@@ -398,6 +398,7 @@ struct GetObjectStrategyContext {
 struct GetObjectOutputContext {
     output: GetObjectOutput,
     event_info: Option<ObjectInfo>,
+    effective_ec_block_size: Option<usize>,
     response_content_length: i64,
     optimal_buffer_size: usize,
     extra_checksum_headers: Vec<(&'static str, String)>,
@@ -4006,6 +4007,7 @@ impl DefaultObjectUsecase {
         method: &hyper::Method,
         headers: &HeaderMap,
         event_info: Option<ObjectInfo>,
+        effective_ec_block_size: Option<usize>,
         version_id_for_event: String,
         output: GetObjectOutput,
         extra_checksum_headers: Vec<(&'static str, String)>,
@@ -4023,6 +4025,11 @@ impl DefaultObjectUsecase {
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
         let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -4067,6 +4074,7 @@ impl DefaultObjectUsecase {
     where
         F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<DynReader>>,
     {
+        let effective_ec_block_size = info.effective_ec_block_size();
         let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
@@ -4177,6 +4185,7 @@ impl DefaultObjectUsecase {
         Ok(GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers: checksums.extra,
@@ -4717,6 +4726,7 @@ impl DefaultObjectUsecase {
         let GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers,
@@ -4738,6 +4748,7 @@ impl DefaultObjectUsecase {
             &req.method,
             &req.headers,
             event_info,
+            effective_ec_block_size,
             version_id_for_event,
             output,
             extra_checksum_headers,
@@ -6491,6 +6502,7 @@ mod tests {
             &req.method,
             &req.headers,
             None,
+            Some(262_144),
             String::new(),
             GetObjectOutput::default(),
             Vec::new(),
@@ -6499,6 +6511,7 @@ mod tests {
         .expect("finalize response");
 
         assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+        assert_eq!(response.headers.get(EC_BLOCK_SIZE_RESPONSE_HEADER).unwrap(), "262144");
     }
 
     #[test]

@@ -3932,6 +3932,9 @@ enum SyncMode {
     FileOnly,
 }
 
+// Keep 2 MiB of shard data plus up to 128 32-byte hashes in one file buffer.
+const SHARD_FILE_MAX_BUF_SIZE: usize = 2 * 1024 * 1024 + 4096;
+
 #[allow(
     dead_code,
     reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
@@ -4280,7 +4283,8 @@ async fn read_dir_entry_batch_with_walk_stall(
 }
 
 impl FileCacheReclaimReader {
-    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
@@ -5123,7 +5127,8 @@ impl AsyncWrite for LazyLocalFileWriter {
 
 #[cfg(test)]
 impl FileCacheReclaimWriter {
-    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+    fn new(mut inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_shutdown {
             let _ = set_fd_nocache(&inner);
@@ -14468,12 +14473,38 @@ impl LocalDisk {
     }
 }
 
-/// Batch positioned reads for local EC shard files in a single `spawn_blocking`.
+/// Shard windows at least this large are copy-bound: reading them concurrently
+/// beats one serial blocking pass, while smaller windows stay coalesced to save
+/// blocking-pool round trips.
+#[cfg(unix)]
+const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
+
+/// Positioned reads for local EC shard files, returned in request order.
 ///
-/// Collapses per-shard blocking-pool round-trips that dominate warm GET
-/// fan-out on single-node multi-disk topologies.
+/// Small windows share a single `spawn_blocking`, collapsing per-shard
+/// blocking-pool round-trips that dominate warm GET fan-out on single-node
+/// multi-disk topologies. When every window reaches
+/// `LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES`, each shard gets its own dispatch so
+/// copies and device reads proceed concurrently.
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    if requests.len() < 2
+        || requests
+            .iter()
+            .any(|(_, _, length)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
+    {
+        return batch_shard_pread_blocking(requests).await;
+    }
+    futures::future::join_all(requests.into_iter().map(|request| batch_shard_pread_blocking(vec![request])))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Read every request in turn inside one `spawn_blocking`.
+#[cfg(unix)]
+async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
@@ -14481,7 +14512,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
-        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         // The disabled build expands directly to the original operation.
         macro_rules! diagnostic_stage {
@@ -14549,26 +14580,36 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            if offset == 0 {
-                                use std::io::Read as _;
-                                total = (&file)
-                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
-                                    .read_to_end(&mut buf)
-                                    .map_err(DiskError::from)?;
-                                if total < length {
+                            // Announce the exact window before reading it. Kernel
+                            // readahead otherwise sizes its first request from the
+                            // read size: a small window at offset 0 pulls several
+                            // times its size, and a multi-MiB read is split into
+                            // serial readahead chunks. WILLNEED submits exactly the
+                            // window at once. It is advisory, so an unsupported hint
+                            // must not fail the read.
+                            #[cfg(target_os = "linux")]
+                            if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
+                                let _ = rustix::fs::fadvise(
+                                    &file,
+                                    start,
+                                    std::num::NonZeroU64::new(len),
+                                    rustix::fs::Advice::WillNeed,
+                                );
+                            }
+                            // `with_capacity` reserves exactly `length` bytes, so each
+                            // positioned read fills only the remaining requested span
+                            // without zero-initializing it first.
+                            while total < length {
+                                let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
+                                let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
+                                    Ok(nbytes) => nbytes,
+                                    Err(rustix::io::Errno::INTR) => continue,
+                                    Err(err) => return Err(DiskError::from(std::io::Error::from(err))),
+                                };
+                                if nbytes == 0 {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                            } else {
-                                buf.resize(length, 0);
-                                while total < length {
-                                    let nbytes = file
-                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                                        .map_err(DiskError::from)?;
-                                    if nbytes == 0 {
-                                        return Err(DiskError::FileCorrupt);
-                                    }
-                                    total += nbytes;
-                                }
+                                total += nbytes;
                             }
                             Ok::<_, DiskError>(())
                         }
@@ -15174,6 +15215,14 @@ impl DiskAPI for LocalDisk {
         )
         .map_err(DiskError::from)?;
         fi.validate(ValidationMode::RequireErasure)?;
+        let frame_size = crate::object_api::persisted_ec_read_quantum(
+            &fi.metadata,
+            codec_erasure.block_size,
+            codec_erasure.data_shards,
+            codec_erasure.shard_size(),
+        )
+        .map_err(|_| DiskError::FileCorrupt)?
+        .unwrap_or_else(|| codec_erasure.shard_size());
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -15195,7 +15244,7 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    codec_erasure.shard_size(),
+                    frame_size,
                 )
                 .await
                 .err();
@@ -33839,6 +33888,80 @@ mod test {
         assert!(body.ends_with(b"abcdef"));
     }
 
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_round_trip_checksum_sized_file_buffers() {
+        use sha2::{Digest, Sha256};
+        use std::io::IoSlice;
+
+        let dir = tempfile::tempdir().expect("create wrapper test directory");
+        for checksum_bytes in [32, 64] {
+            let wire_len = 2 * 1024 * 1024 + checksum_bytes;
+            let content: Vec<_> = (0u8..=250).cycle().take(wire_len).collect();
+            let path = dir.path().join(format!("frame-{checksum_bytes}"));
+            let file = File::create(&path).await.expect("create writer file");
+            let mut writer = FileCacheReclaimWriter::new(file, wire_len, true);
+            let mut bufs = Vec::new();
+            for frame in content.chunks(wire_len / (checksum_bytes / 32)) {
+                bufs.push(IoSlice::new(&frame[..32]));
+                bufs.push(IoSlice::new(&frame[32..]));
+            }
+            let accepted = writer.write_vectored(&bufs).await.expect("accept checksum and data slices");
+            assert_eq!(accepted, wire_len, "checksum overhead must fit alongside 2 MiB of data");
+            let tail = b"short final tail!";
+            writer.write_all(tail).await.expect("write after the accepted frame");
+            writer.flush().await.expect("flush pending writes");
+            writer.shutdown().await.expect("finish writes before cache reclaim");
+            writer.inner.sync_all().await.expect("sync the completed test file");
+
+            let file = File::open(&path).await.expect("reopen completed file");
+            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true, 0);
+            let mut actual = vec![0; wire_len];
+            let read = reader
+                .read(&mut actual)
+                .await
+                .expect("read the complete large frame in one request");
+            assert_eq!(read, wire_len, "the file buffer must read checksum overhead alongside 2 MiB of data");
+            assert_eq!(actual, content, "large reads must preserve every accepted byte");
+            assert_eq!(Sha256::digest(&actual), Sha256::digest(&content), "frame digest must survive file I/O");
+            let mut actual_tail = [0; 32];
+            assert_eq!(
+                reader
+                    .read_exact(&mut actual_tail)
+                    .await
+                    .expect_err("short tail must report EOF")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(&actual_tail[..tail.len()], tail, "short read must preserve the available tail");
+            assert_eq!(reader.read(&mut [0; 1]).await.expect("read at EOF"), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_cache_reclaim_writer_propagates_shutdown_error_after_acceptance() {
+        use std::io::IoSlice;
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .expect("open full device");
+        let payload = vec![31; 2 * 1024 * 1024 + 64];
+        let mut writer = FileCacheReclaimWriter::new(file, payload.len(), true);
+        let accepted = writer
+            .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+            .await
+            .expect("Tokio may accept bytes before the blocking write fails");
+        assert_eq!(accepted, payload.len(), "the expanded buffer must accept the complete frame");
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("accepted bytes must not hide a failed blocking write");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!writer.reclaimed, "failed shutdown must not run successful-write cache reclaim");
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_nocache_helpers_accept_tokio_and_std_files() {
@@ -39164,6 +39287,46 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    fn local_batch_reads_large_windows_per_shard_and_coalesces_small_windows() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("dispatch shape directory");
+        let large = LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES;
+        let paths: Vec<_> = (0..2)
+            .map(|index| {
+                let path = dir.path().join(format!("shard-{index}"));
+                std::fs::write(&path, vec![u8::try_from(index).expect("small shard index"); large + 64])
+                    .expect("write dispatch shape shard");
+                path
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("dispatch shape runtime");
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let dispatches = |length: usize| {
+            let recorder = CapturingRecorder::default();
+            let requests = paths.iter().map(|path| (path.clone(), 64, length)).collect();
+            let results = metrics::with_local_recorder(&recorder, || runtime.block_on(batch_shard_pread(requests)));
+            for (index, result) in results.iter().enumerate() {
+                let bytes = result.as_ref().expect("window inside the shard");
+                assert_eq!(bytes.len(), length);
+                assert!(bytes.iter().all(|byte| usize::from(*byte) == index), "results keep request order");
+            }
+            recorder.histogram_values("rustfs_io_get_object_local_batch_shards", &[])
+        };
+        let large_shape = dispatches(large);
+        let small_shape = dispatches(large - 1);
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+
+        assert_eq!(large_shape, vec![1.0, 1.0], "copy-bound windows must not serialize in one worker");
+        assert_eq!(small_shape, vec![2.0], "small windows must share one blocking dispatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_batch_read_metrics_survive_caller_cancellation() {
         use crate::test_metrics::CapturingRecorder;
 
@@ -39275,6 +39438,81 @@ mod test {
         assert!(results[1].as_ref().expect("empty range at EOF").is_empty());
         for result in &results[2..] {
             assert!(matches!(result, Err(DiskError::FileCorrupt)), "invalid range: {result:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_returns_exact_multi_page_windows() {
+        let dir = tempfile::tempdir().expect("multi-page window fixture");
+        let path = dir.path().join("shard");
+        let window = 1024 * 1024 + 32;
+        let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &content).expect("write multi-page shard");
+        let unaligned = 2 * window + 7;
+        // Windows of one and two q frames, at zero and nonzero offsets.
+        let windows = [
+            (0, window),
+            (window, window),
+            (unaligned, content.len() - unaligned),
+            (0, 2 * window),
+            (window - 5, 2 * window),
+        ];
+        let results = batch_shard_pread(
+            windows
+                .iter()
+                .map(|&(offset, length)| (path.clone(), offset, length))
+                .collect(),
+        )
+        .await;
+        for (result, (offset, length)) in results.iter().zip(windows) {
+            let bytes = result.as_ref().expect("window inside the shard");
+            assert_eq!(bytes.len(), length, "window at {offset} must not over-read");
+            assert_eq!(bytes.as_ref(), &content[offset..offset + length], "window at {offset}");
+        }
+    }
+
+    /// A cold batch read must bring in only its window. Without an exact hint,
+    /// kernel readahead sizes the first request from the read size, so a 16 KiB
+    /// window at offset 0 caches several times its pages and a 2 MiB window
+    /// almost twice its pages.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_batch_shard_pread_cold_read_caches_only_its_window() {
+        use rustix::fs::{Advice, fadvise};
+
+        let dir = tempfile::tempdir().expect("cold window fixture");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, vec![5u8; 8 << 20]).expect("write cold window shard");
+        std::fs::File::open(&path)
+            .expect("open shard for sync")
+            .sync_all()
+            .expect("clean pages before eviction");
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let evict = || {
+            let file = std::fs::File::open(&path).expect("open shard for eviction");
+            fadvise(&file, 0, None, Advice::DontNeed).expect("evict shard pages");
+        };
+        evict();
+        assert_eq!(
+            resident_pages(&path),
+            0,
+            "the temporary filesystem must be able to drop page cache, otherwise residency is unobservable"
+        );
+        for length in [16 * 1024 + 32, 2 * 1024 * 1024 + 64] {
+            evict();
+            let results = batch_shard_pread(vec![(path.clone(), 0, length)]).await;
+            assert_eq!(results[0].as_ref().expect("cold window read").len(), length);
+            let window_pages = length.div_ceil(page);
+            let resident = resident_pages(&path);
+            assert!(
+                resident >= window_pages,
+                "the window itself must be resident: {resident} < {window_pages}"
+            );
+            assert!(
+                resident <= window_pages + window_pages / 8 + 4,
+                "a {length}-byte cold read cached {resident} pages for a {window_pages}-page window"
+            );
         }
     }
 

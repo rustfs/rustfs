@@ -15,6 +15,10 @@
 //! CreateMultipartUpload.
 
 use super::*;
+use crate::app::storage_api::multipart_usecase::{
+    DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY, EC_BLOCK_SIZE_HINT_REASON_HEADER,
+    EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
+};
 use crate::app::storage_api::s3::dto::{
     ChecksumAlgorithm, ChecksumType, CreateMultipartUploadInput, CreateMultipartUploadOutput,
 };
@@ -38,6 +42,61 @@ fn create_multipart_upload_metadata(
     }
 
     metadata
+}
+
+fn extract_multipart_ec_block_size_hint(headers: &HeaderMap, metadata: &HashMap<String, String>) -> S3Result<Option<String>> {
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE,
+        rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+    );
+    let strict = enabled && fleet_confirmed;
+    let header_name = http::HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+    let raw_values = headers
+        .get_all(header_name)
+        .iter()
+        .map(|value| {
+            if strict {
+                value.to_str().map(str::to_owned).map_err(|_| {
+                    S3Error::with_message(
+                        S3ErrorCode::InvalidArgument,
+                        "rustfs-ec-block-size-hint must be ASCII decimal digits".to_string(),
+                    )
+                })
+            } else {
+                Ok(String::from_utf8_lossy(value.as_bytes()).into_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if strict && raw_values.len() > 1 {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "duplicate rustfs-ec-block-size-hint metadata is not allowed".to_string(),
+        ));
+    }
+
+    let metadata_values = metadata
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(EC_BLOCK_SIZE_HINT_METADATA_KEY))
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    if strict && metadata_values.len() > 1 {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "duplicate rustfs-ec-block-size-hint metadata is not allowed".to_string(),
+        ));
+    }
+
+    let hint = raw_values.into_iter().next().or_else(|| metadata_values.into_iter().next());
+    if strict && let Some(value) = hint.as_deref() {
+        resolve_ec_block_size_hint(Some(value), true, true, true).map_err(|error| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, format!("invalid rustfs-ec-block-size-hint: {error}"))
+        })?;
+    }
+    Ok(hint)
 }
 
 /// A multipart session advertises disk compression only when the staged-rollout
@@ -131,6 +190,7 @@ impl DefaultMultipartUsecase {
         )?;
 
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
+        let ec_block_size_hint = extract_multipart_ec_block_size_hint(&req.headers, &metadata)?;
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
         }
@@ -223,11 +283,12 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        if should_advertise_session_compression(
+        let session_compression = should_advertise_session_compression(
             is_multipart_disk_compression_enabled(),
             ciphertext_passthrough,
             is_disk_compressible(&req.headers, &key),
-        ) {
+        );
+        if session_compression {
             rustfs_utils::http::insert_str(
                 &mut metadata,
                 rustfs_utils::http::SUFFIX_COMPRESSION,
@@ -241,6 +302,47 @@ impl DefaultMultipartUsecase {
                 .await
                 .map_err(ApiError::from)?;
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        let shard_integrity_rollout =
+            rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+                && rustfs_utils::get_env_bool(
+                    rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                );
+
+        let ec_block_size_hint_resolution = resolve_ec_block_size_hint(
+            ec_block_size_hint.as_deref(),
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE,
+                rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_ENABLE,
+            ),
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+                rustfs_config::DEFAULT_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED,
+            ),
+            !session_compression
+                && effective_sse.is_none()
+                && sse_customer_algorithm.is_none()
+                && effective_kms_key_id.is_none()
+                && !ciphertext_passthrough
+                && !replication_authorized
+                && !opts.data_movement
+                && opts.shard_integrity_write_mode.is_none()
+                && !shard_integrity_rollout,
+        )
+        .map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, format!("invalid rustfs-ec-block-size-hint: {err}"))
+        })?;
+        // A 1 MiB hint selects the historical storage default, so avoid
+        // writing a redundant transient marker on the multipart hot path.
+        if matches!(ec_block_size_hint_resolution.outcome, EcBlockSizeHintOutcome::Applied)
+            && ec_block_size_hint_resolution.effective_block_size != DEFAULT_EC_BLOCK_SIZE
+        {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut opts.user_defined,
+                EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX,
+                ec_block_size_hint_resolution.effective_block_size.to_string(),
+            );
+        }
 
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
@@ -292,6 +394,7 @@ impl DefaultMultipartUsecase {
             upload_id,
             checksum_algo,
             checksum_type,
+            effective_ec_block_size,
         } = store
             .new_multipart_upload(&bucket, &key, &opts)
             .await
@@ -310,7 +413,23 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
 
-        let result = Ok(S3Response::new(output));
+        let mut response = S3Response::new(output);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
+        if let Some(status) = ec_block_size_hint_resolution.outcome.status_header() {
+            response
+                .headers
+                .insert(EC_BLOCK_SIZE_HINT_STATUS_HEADER, HeaderValue::from_static(status));
+        }
+        if let Some(reason) = ec_block_size_hint_resolution.outcome.reason_header() {
+            response
+                .headers
+                .insert(EC_BLOCK_SIZE_HINT_REASON_HEADER, HeaderValue::from_static(reason));
+        }
+        let result = Ok(response);
         let _ = helper.complete(&result);
         result
     }
@@ -320,6 +439,43 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+
+    #[test]
+    #[serial_test::serial(ec_block_size_hint)]
+    fn multipart_ec_block_size_hint_validates_create_upload_metadata() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let header_name = http::HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+                let mut headers = HeaderMap::new();
+                headers.insert(header_name, HeaderValue::from_static("65_536"));
+                let error =
+                    extract_multipart_ec_block_size_hint(&headers, &HashMap::new()).expect_err("malformed create-upload hint");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_ENABLE, Some("false")),
+                (rustfs_config::ENV_EC_BLOCK_SIZE_HINT_FLEET_CONFIRMED, Some("false")),
+            ],
+            || {
+                let header_name = http::HeaderName::from_static("x-amz-meta-rustfs-ec-block-size-hint");
+                let mut headers = HeaderMap::new();
+                headers.insert(header_name, HeaderValue::from_static("not-a-number"));
+                assert_eq!(
+                    extract_multipart_ec_block_size_hint(&headers, &HashMap::new())
+                        .unwrap()
+                        .as_deref(),
+                    Some("not-a-number")
+                );
+            },
+        );
+    }
 
     #[test]
     fn session_compression_is_advertised_only_for_non_passthrough_compressible_uploads() {

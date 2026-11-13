@@ -677,7 +677,11 @@ fn verify_inline_body_from_observations<'a>(
         candidate.uses_legacy_checksum,
     );
     let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, data_shards, candidate.uses_legacy_checksum);
-    if object_size == 0 || read_length == 0 || read_length > shard_size || data_files.len() < data_shards {
+    let frame_size =
+        crate::object_api::persisted_ec_read_quantum(&candidate.metadata, candidate.erasure.block_size, data_shards, shard_size)
+            .map_err(|_| GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY)?
+            .unwrap_or(shard_size);
+    if object_size == 0 || read_length == 0 || frame_size == 0 || read_length > shard_size || data_files.len() < data_shards {
         return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     }
     let shards_needed = object_size.div_ceil(read_length);
@@ -698,20 +702,32 @@ fn verify_inline_body_from_observations<'a>(
     }
 
     let hash_size = checksum_algo.size();
-    let need = hash_size + read_length;
     let mut body = Vec::with_capacity(encoded_capacity);
     for file in data_files.iter().take(shards_needed) {
         let Some(raw) = file.data.as_deref() else {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
         };
-        let Some(block) = raw.get(..need) else {
-            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-        };
-        let (hash, data) = block.split_at(hash_size);
-        if hash_size > 0 && checksum_algo.hash_encode(data).as_ref() != hash {
-            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+        let mut remaining = read_length;
+        let mut cursor = 0usize;
+        while remaining > 0 {
+            let payload_len = remaining.min(frame_size);
+            let Some(frame_need) = hash_size.checked_add(payload_len) else {
+                return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+            };
+            let Some(end) = cursor.checked_add(frame_need) else {
+                return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+            };
+            let Some(block) = raw.get(cursor..end) else {
+                return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+            };
+            let (hash, data) = block.split_at(hash_size);
+            if hash_size > 0 && checksum_algo.hash_encode(data).as_ref() != hash {
+                return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+            }
+            body.extend_from_slice(data);
+            cursor = end;
+            remaining -= payload_len;
         }
-        body.extend_from_slice(data);
         if body.len() >= object_size {
             body.truncate(object_size);
             return Ok(bytes::Bytes::from(body));

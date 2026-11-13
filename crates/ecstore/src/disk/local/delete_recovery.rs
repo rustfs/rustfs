@@ -1661,7 +1661,10 @@ impl LocalDisk {
     ) -> Result<(Vec<DeleteTransactionId>, Option<DiscoverySession>)> {
         let lease = os::acquire_namespace_mutation_lease_with_owner(path, None).await;
         self.validate_delete_discovery_owner(&session)?;
-        os::run_blocking_namespace_operation(lease, move || session.advance(limit))
+        // A discovery page can lstat thousands of entries on a cold tree. The
+        // one-worker foreground lane also serves GET metadata reads, so a page
+        // there stalls every read on this disk until the walk finishes.
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || session.advance(limit))
             .await
             .map_err(|error| to_file_error(error).into())
     }
@@ -4350,6 +4353,38 @@ mod tests {
                 "{shape}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_discovery_runs_while_foreground_metadata_lane_is_busy() {
+        let (_temp, disk, _info, _original) = fixture().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let queue = disk.blocking_queue.clone();
+        let foreground = tokio::spawn(async move {
+            queue
+                .run_cancellable(move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("foreground metadata worker entered");
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            disk.delete_recovery_discover("recovery", None, None, 128),
+        )
+        .await;
+        release_tx.send(()).expect("release foreground metadata worker");
+        foreground
+            .await
+            .expect("foreground metadata job joins")
+            .expect("foreground metadata job succeeds");
+        let page = page
+            .expect("bucket discovery must not wait behind the foreground metadata lane")
+            .expect("bucket discovery succeeds");
+        assert!(page.transactions.is_empty(), "fixture holds no delete transactions");
     }
 
     #[tokio::test]

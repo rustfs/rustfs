@@ -99,6 +99,7 @@ pub(crate) fn legacy_encrypted_range_seek_enabled() -> bool {
 }
 
 mod body_cache_hook;
+pub mod ec_block_layout;
 mod encryption;
 mod hook_slot;
 mod object_mutation_hook;
@@ -122,6 +123,7 @@ pub use body_cache_hook::{
 pub(crate) use body_cache_hook::{
     get_object_body_cache_hook, get_object_body_cache_hook_suppressed, without_get_object_body_cache_hook,
 };
+pub use ec_block_layout::*;
 pub use encryption::{
     EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
     ReadEncryptionMode, ReadEncryptionRequest,

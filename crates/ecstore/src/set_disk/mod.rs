@@ -80,7 +80,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer, create_bitrot_writer_with_orig_volume};
+use crate::io_support::bitrot::{create_bitrot_writer, create_bitrot_writer_with_orig_volume};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
 use crate::object_api::object_api_utils::get_raw_etag;
@@ -6164,6 +6164,7 @@ fn inline_admission_shard_size(erasure: &coding::Erasure, stored_size: i64, actu
     HashReader::SIZE_PRESERVE_LAYER
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers(
     files: &[FileInfo],
@@ -6175,10 +6176,36 @@ async fn build_inline_bitrot_readers(
     checksum_algo: &HashAlgorithm,
     skip_verify_bitrot: bool,
 ) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    build_inline_bitrot_readers_with_frame_size(
+        files,
+        total_shards,
+        bucket,
+        object,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_with_frame_size(
+    files: &[FileInfo],
+    total_shards: usize,
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
     let mut readers = Vec::with_capacity(total_shards);
     for file in files.iter().take(total_shards) {
         let reader = if let Some(data) = &file.data {
-            create_bitrot_reader_from_bytes(
+            crate::io_support::bitrot::create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
                 Some(data.clone()),
                 None,
                 bucket,
@@ -6186,9 +6213,11 @@ async fn build_inline_bitrot_readers(
                 0,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 false,
+                None,
             )
             .await?
         } else {
@@ -6199,6 +6228,7 @@ async fn build_inline_bitrot_readers(
     Ok(readers)
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers_from_refs(
     files: &[&FileInfo],
@@ -6209,10 +6239,34 @@ async fn build_inline_bitrot_readers_from_refs(
     checksum_algo: &HashAlgorithm,
     skip_verify_bitrot: bool,
 ) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    build_inline_bitrot_readers_from_refs_with_frame_size(
+        files,
+        bucket,
+        object,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_from_refs_with_frame_size(
+    files: &[&FileInfo],
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
     let mut readers = Vec::with_capacity(files.len());
     for file in files {
         let reader = if let Some(data) = &file.data {
-            create_bitrot_reader_from_bytes(
+            crate::io_support::bitrot::create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
                 Some(data.clone()),
                 None,
                 bucket,
@@ -6220,9 +6274,11 @@ async fn build_inline_bitrot_readers_from_refs(
                 0,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 false,
+                None,
             )
             .await?
         } else {

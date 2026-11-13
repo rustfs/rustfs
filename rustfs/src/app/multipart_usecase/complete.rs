@@ -15,6 +15,7 @@
 //! CompleteMultipartUpload.
 
 use super::*;
+use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
 use crate::app::storage_api::s3::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ETag, ServerSideEncryption,
 };
@@ -583,6 +584,7 @@ impl DefaultMultipartUsecase {
             version_id: mpu_version,
             ..Default::default()
         };
+        let effective_ec_block_size = obj_info.effective_ec_block_size();
         // Set object info for event notification
         helper = helper.object(obj_info);
         if let Some(version_id) = &mpu_version_for_event {
@@ -591,6 +593,11 @@ impl DefaultMultipartUsecase {
 
         let mut response = S3Response::new(output);
         crate::app::object_usecase::inject_additional_checksum_headers(&mut response.headers, &complete_extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
         if let Some(algorithm) = ssec_algorithm.as_deref() {
             let value = HeaderValue::from_str(algorithm)
                 .map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C algorithm metadata"))?;
