@@ -188,6 +188,13 @@ validate_args() {
     fi
   fi
   if [[ "$TOOL" == "warp" ]]; then
+    case "$WARP_MODE" in
+      mixed|get|put) ;;
+      *)
+        echo "ERROR: --warp-mode must be mixed, get, or put" >&2
+        exit 1
+        ;;
+    esac
     local warp_host
     warp_host="$(normalize_warp_host "$ENDPOINT")"
     if [[ -z "$warp_host" ]]; then

@@ -78,4 +78,17 @@ if [[ "${actual}" != "${expected}" ]]; then
   exit 1
 fi
 
+if "${SCRIPT_DIR}/run_object_batch_bench.sh" \
+  --tool warp \
+  --warp-bin "${FAKE_WARP}" \
+  --warp-mode invalid \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key test \
+  --secret-key test \
+  --sizes 100KiB \
+  --out-dir "${TMP_DIR}/invalid-mode" >/dev/null 2>&1; then
+  echo "invalid warp mode must be rejected" >&2
+  exit 1
+fi
+
 echo "object batch benchmark tests passed"
