@@ -61,11 +61,11 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .build()
         .unwrap();
 
-    let complete_output = Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+    let complete_output = Box::pin(usecase.complete_for_s3s_request(build_request(complete_input, Method::POST)))
         .await
         .expect("Failed to complete multipart upload through usecase");
     assert!(
-        complete_output.output.version_id.is_some(),
+        complete_output.version_id.is_some(),
         "versioned CompleteMultipartUpload should return the created version ID"
     );
 
@@ -140,7 +140,7 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .unwrap();
 
     with_forced_immediate_enqueue_timeout(&backend, || async {
-        Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+        Box::pin(usecase.complete_for_s3s_request(build_request(complete_input, Method::POST)))
             .await
             .expect("Failed to complete multipart upload through usecase");
     })

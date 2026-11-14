@@ -22,12 +22,13 @@
 //! `.minio.sys`) can never carry an override; they stay pinned to `strict`.
 //! See docs/operations/durability-modes.md for the semantics.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Valid per-bucket durability tier names. `legacy-off` is deliberately not
 /// representable per bucket: it exists only for the process-wide legacy
 /// switch (`RUSTFS_DRIVE_SYNC_ENABLE=false`).
 pub const BUCKET_DURABILITY_MODE_STRICT: &str = "strict";
+pub const BUCKET_DURABILITY_MODE_FILE_SYNC: &str = "file-sync";
 pub const BUCKET_DURABILITY_MODE_RELAXED: &str = "relaxed";
 pub const BUCKET_DURABILITY_MODE_NONE: &str = "none";
 
@@ -35,12 +36,67 @@ pub const BUCKET_DURABILITY_MODE_NONE: &str = "none";
 ///
 /// An absent entry, an empty payload, or an empty `mode` string all mean
 /// "no override": the bucket follows the process-wide durability mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BucketDurabilityConfig {
-    /// Requested tier: `strict` | `relaxed` | `none` (case-insensitive,
+    /// Requested tier: `strict` | `file-sync` | `relaxed` | `none` (case-insensitive,
     /// whitespace-tolerant). Empty means "inherit the global mode".
-    #[serde(default)]
     pub mode: String,
+}
+
+#[derive(Serialize)]
+struct BucketDurabilityConfigWireRef<'a> {
+    mode: &'a str,
+    #[serde(skip_serializing_if = "is_false")]
+    file_sync: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Deserialize)]
+struct BucketDurabilityConfigWire {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    file_sync: bool,
+}
+
+impl Serialize for BucketDurabilityConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let file_sync = self.mode.trim().eq_ignore_ascii_case(BUCKET_DURABILITY_MODE_FILE_SYNC);
+        BucketDurabilityConfigWireRef {
+            mode: if file_sync {
+                BUCKET_DURABILITY_MODE_STRICT
+            } else {
+                &self.mode
+            },
+            file_sync,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketDurabilityConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BucketDurabilityConfigWire::deserialize(deserializer)?;
+        let mode = if wire.file_sync {
+            if wire.mode.trim().eq_ignore_ascii_case(BUCKET_DURABILITY_MODE_STRICT) {
+                BUCKET_DURABILITY_MODE_FILE_SYNC.to_string()
+            } else {
+                BUCKET_DURABILITY_MODE_STRICT.to_string()
+            }
+        } else {
+            wire.mode
+        };
+        Ok(Self { mode })
+    }
 }
 
 impl BucketDurabilityConfig {
@@ -52,7 +108,10 @@ impl BucketDurabilityConfig {
     pub fn is_valid_mode(mode: &str) -> bool {
         matches!(
             mode.trim().to_ascii_lowercase().as_str(),
-            BUCKET_DURABILITY_MODE_STRICT | BUCKET_DURABILITY_MODE_RELAXED | BUCKET_DURABILITY_MODE_NONE
+            BUCKET_DURABILITY_MODE_STRICT
+                | BUCKET_DURABILITY_MODE_FILE_SYNC
+                | BUCKET_DURABILITY_MODE_RELAXED
+                | BUCKET_DURABILITY_MODE_NONE
         )
     }
 
@@ -117,6 +176,7 @@ mod tests {
     #[test]
     fn valid_modes_are_recognized() {
         assert!(BucketDurabilityConfig::is_valid_mode("strict"));
+        assert!(BucketDurabilityConfig::is_valid_mode("file-sync"));
         assert!(BucketDurabilityConfig::is_valid_mode("relaxed"));
         assert!(BucketDurabilityConfig::is_valid_mode("none"));
         assert!(BucketDurabilityConfig::is_valid_mode(" RELAXED "));
@@ -130,6 +190,7 @@ mod tests {
     fn normalized_mode_canonicalizes_or_rejects() {
         assert_eq!(BucketDurabilityConfig::new(" Relaxed ").normalized_mode().as_deref(), Some("relaxed"));
         assert_eq!(BucketDurabilityConfig::new("strict").normalized_mode().as_deref(), Some("strict"));
+        assert_eq!(BucketDurabilityConfig::new(" FILE-SYNC ").normalized_mode().as_deref(), Some("file-sync"));
         assert_eq!(BucketDurabilityConfig::default().normalized_mode(), None);
         assert_eq!(BucketDurabilityConfig::new("bogus").normalized_mode(), None);
     }
@@ -141,9 +202,32 @@ mod tests {
         let back: BucketDurabilityConfig = serde_json::from_slice(&json).expect("deserialize");
         assert_eq!(back, cfg);
 
+        let file_sync = BucketDurabilityConfig::new("file-sync");
+        let json = serde_json::to_vec(&file_sync).expect("serialize file-sync");
+        assert_eq!(json, br#"{"mode":"strict","file_sync":true}"#);
+        let back: BucketDurabilityConfig = serde_json::from_slice(&json).expect("deserialize file-sync");
+        assert_eq!(back.normalized_mode().as_deref(), Some("file-sync"));
+
+        let malformed = serde_json::from_slice::<BucketDurabilityConfig>(br#"{"mode":"none","file_sync":true}"#)
+            .expect("deserialize malformed file-sync");
+        assert_eq!(malformed.normalized_mode().as_deref(), Some("strict"));
+
         // Empty object deserializes to the "inherit" default.
         let empty: BucketDurabilityConfig = serde_json::from_slice(b"{}").expect("deserialize empty");
         assert_eq!(empty.normalized_mode(), None);
+    }
+
+    #[test]
+    fn file_sync_encoding_fails_closed_on_legacy_readers() {
+        #[derive(Deserialize)]
+        struct LegacyConfig {
+            #[serde(default)]
+            mode: String,
+        }
+
+        let json = serde_json::to_vec(&BucketDurabilityConfig::new("file-sync")).expect("serialize file-sync");
+        let legacy: LegacyConfig = serde_json::from_slice(&json).expect("legacy reader should ignore the marker");
+        assert_eq!(legacy.mode, "strict", "legacy readers must apply the stronger strict fallback");
     }
 
     #[test]
@@ -157,6 +241,7 @@ mod tests {
     fn new_bucket_default_honors_explicit_tiers() {
         for mode in [
             BUCKET_DURABILITY_MODE_STRICT,
+            BUCKET_DURABILITY_MODE_FILE_SYNC,
             BUCKET_DURABILITY_MODE_RELAXED,
             BUCKET_DURABILITY_MODE_NONE,
         ] {

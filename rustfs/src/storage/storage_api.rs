@@ -125,6 +125,12 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSink = ecstore_object::GetObjectSink;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkSegments = ecstore_object::GetObjectSinkSegments;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkWriter = ecstore_object::GetObjectSinkWriter;
 pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
@@ -325,6 +331,18 @@ pub(crate) mod rpc_consumer {
             find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
             sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
             with_remote_background_io,
+        };
+    }
+
+    /// Server side of internode NIXL chunk reads (`nixl` feature).
+    #[cfg(all(feature = "nixl", target_os = "linux"))]
+    pub(crate) mod nixl_read {
+        pub(crate) use super::super::check_and_record_signed_rpc_nonce;
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
+        pub(crate) use super::super::find_local_disk_by_ref_for_rpc;
+        pub(crate) use rustfs_ecstore::api::disk::Disk;
+        pub(crate) use rustfs_ecstore::api::rpc::nixl::{
+            NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH,
         };
     }
 
@@ -568,8 +586,8 @@ pub(crate) mod ecstore_error {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
     pub(crate) use rustfs_ecstore::api::error::{
-        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_invalid_upload_id,
-        is_err_object_not_found, is_err_version_not_found,
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
+        is_err_version_not_found,
     };
 }
 
@@ -632,6 +650,14 @@ pub(crate) mod ecstore_rio {
     };
 }
 
+/// ECStore surface of the S3-over-RDMA object transport (`cuobject`/`nixl` features).
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) mod ecstore_rdma {
+    pub(crate) use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
+    #[cfg(feature = "nixl")]
+    pub(crate) use rustfs_ecstore::api::rpc::nixl::{NixlRecvBuffer, NixlRecvPool, install_nixl_recv_pool};
+}
+
 #[cfg(feature = "internode-transport")]
 pub(crate) mod ecstore_internode {
     pub use ecstore_rpc::{
@@ -680,6 +706,8 @@ pub(crate) mod ecstore_object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
     };
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectSink, GetObjectSinkSegments, GetObjectSinkWriter};
 }
 
 #[cfg(all(test, feature = "rio-v2"))]
@@ -2366,10 +2394,6 @@ pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
-}
-
-pub(crate) fn is_err_invalid_upload_id(err: &Error) -> bool {
-    ecstore_error::is_err_invalid_upload_id(err)
 }
 
 pub(crate) fn is_err_object_not_found(err: &Error) -> bool {

@@ -1867,7 +1867,7 @@ impl LocalDisk {
         let destination = root.join(transaction.to_string());
         let destination_was_absent = original.is_none();
         let original = original.map(<[u8]>::to_vec);
-        let sync = effective_durability(volume).syncs_commit_metadata();
+        let sync = effective_durability(volume).syncs_recovery_protocol_state();
         #[cfg(test)]
         let record_destination = destination.clone();
         let staging_root = temporary;
@@ -2344,7 +2344,7 @@ impl LocalDisk {
                     Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Err(err) => return Err(to_file_error(err).into()),
                 }
-                if effective_durability(volume).syncs_commit_metadata() {
+                if effective_durability(volume).syncs_recovery_protocol_state() {
                     os::fsync_dir_with_owner(&dir, owner.clone()).await.map_err(to_file_error)?;
                 }
                 if self
@@ -2372,7 +2372,9 @@ impl LocalDisk {
                     Err(err) => return Err(to_file_error(err).into()),
                 }
             }
-            if effective_durability(volume).syncs_commit_metadata() && fs::try_exists(&rollback).await.map_err(to_file_error)? {
+            if effective_durability(volume).syncs_recovery_protocol_state()
+                && fs::try_exists(&rollback).await.map_err(to_file_error)?
+            {
                 os::fsync_dir_with_owner(&rollback, owner.clone())
                     .await
                     .map_err(to_file_error)?;
@@ -2456,7 +2458,7 @@ impl LocalDisk {
                             None,
                         )
                         .await?;
-                        if effective_durability(volume).syncs_commit_metadata() {
+                        if effective_durability(volume).syncs_recovery_protocol_state() {
                             os::fsync_dir_with_owner(&root, owner.clone()).await.map_err(to_file_error)?;
                         }
                     }
@@ -2467,7 +2469,7 @@ impl LocalDisk {
                     os::remove_files_and_fsync_with_owner(
                         &rollback,
                         &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE],
-                        effective_durability(volume).syncs_commit_metadata(),
+                        effective_durability(volume).syncs_recovery_protocol_state(),
                         None,
                         owner.clone(),
                     )
@@ -2500,7 +2502,7 @@ impl LocalDisk {
                                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                                 Err(err) => return Err(to_file_error(err).into()),
                             }
-                            if effective_durability(volume).syncs_commit_metadata() {
+                            if effective_durability(volume).syncs_recovery_protocol_state() {
                                 os::fsync_dir_with_owner(&staged, owner.clone())
                                     .await
                                     .map_err(to_file_error)?;
@@ -2581,7 +2583,7 @@ impl LocalDisk {
                     let lease = os::acquire_namespace_mutation_lease_with_owner(&dir, owner.clone()).await;
                     prune_dirs.push((dir, lease));
                 }
-                let sync = effective_durability(volume).syncs_commit_metadata();
+                let sync = effective_durability(volume).syncs_recovery_protocol_state();
                 let (rollback_buf, root_buf, volume_str, object_str) =
                     (rollback.clone(), root.clone(), volume.to_owned(), object.to_owned());
                 let publication_root = self.publication_root.clone();
@@ -2802,7 +2804,7 @@ impl LocalDisk {
         } else {
             self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?
         };
-        let sync = effective_durability(volume).syncs_commit_metadata();
+        let sync = effective_durability(volume).syncs_recovery_protocol_state();
         let incarnation = opts.delete_recovery_bucket_incarnation;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
         let fi_clone = fi.clone();
@@ -3235,7 +3237,7 @@ impl LocalDisk {
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
         let rollback = root.join(transaction.to_string());
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
-        let sync = effective_durability(volume).syncs_commit_metadata();
+        let sync = effective_durability(volume).syncs_recovery_protocol_state();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
@@ -3478,7 +3480,7 @@ impl LocalDisk {
         let owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((metadata_owner, volume_guard)));
         let rollback = root.join(transaction.to_string());
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
-        let sync = effective_durability(volume).syncs_commit_metadata();
+        let sync = effective_durability(volume).syncs_recovery_protocol_state();
 
         let mut claims: Vec<SnapshotLeaseDeleteClaim> = Vec::with_capacity(journal.data_dirs.len());
         for data_dir in &journal.data_dirs {

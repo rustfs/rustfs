@@ -52,6 +52,8 @@ pub(crate) mod s3 {
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
+    #[cfg(any(test, all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+    pub(crate) use s3s::Body;
     pub(crate) use s3s::S3Response;
     pub(crate) use s3s::StdError;
     #[cfg(test)]
@@ -84,7 +86,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
-    pub(crate) use s3s::{Body, BodySizeLimitExceeded, S3};
+    pub(crate) use s3s::{BodySizeLimitExceeded, S3};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, TrailingHeaders};
 }
 
@@ -1607,7 +1609,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        StorageError, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
@@ -1778,6 +1780,18 @@ pub(crate) mod object_usecase {
         pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
+    /// Process-wide runtime facts the object use case reads (cuObject S3-over-RDMA addressing).
+    /// ECStore surface of the S3-over-RDMA object transport.
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use crate::storage::storage_api::ecstore_rdma as rdma;
+
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) mod runtime {
+        pub(crate) use super::super::runtime::get_global_endpoints_opt;
+        #[cfg(not(feature = "nixl"))]
+        pub(crate) use super::super::runtime::global_rustfs_port;
+    }
+
     pub(crate) mod contract {
         #[cfg(test)]
         pub(crate) mod http {
@@ -1808,6 +1822,10 @@ pub(crate) mod object_usecase {
         remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
         validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
         wrap_response_with_cors,
+    };
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use crate::storage::storage_api::{
+        StorageGetObjectSink, StorageGetObjectSinkSegments, StorageGetObjectSinkWriter,
     };
 }
 
