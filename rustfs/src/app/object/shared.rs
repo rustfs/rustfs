@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::s3::dto::{
     ChecksumAlgorithm, ChecksumType, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
-    ObjectLockRetentionMode, Range, SSEKMSKeyId, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
+    ObjectLockRetentionMode, Range, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
 };
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
@@ -285,7 +285,7 @@ pub(super) fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
 }
 
-pub(super) async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
+pub(crate) async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
     table_catalog::validate_bucket_object_mutation(bucket, key)
         .await
         .map_err(|_| s3_error!(InvalidRequest, "{}", table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE))
@@ -347,10 +347,10 @@ pub(super) fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
 /// them to the returned pair.
 pub(super) fn resolve_bucket_default_sse(
     bucket_sse_config: Option<&ServerSideEncryptionConfiguration>,
-    requested_sse: Option<ServerSideEncryption>,
-    requested_kms_key_id: Option<SSEKMSKeyId>,
+    requested_sse: Option<String>,
+    requested_kms_key_id: Option<String>,
     has_explicit_ssec: bool,
-) -> (Option<ServerSideEncryption>, Option<SSEKMSKeyId>) {
+) -> (Option<String>, Option<String>) {
     let bucket_default = || {
         if has_explicit_ssec {
             return None;
@@ -1503,12 +1503,12 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(
             Some(&config),
-            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            Some(SSEKMSKeyId::from("request-key".to_string())),
+            Some(String::from(ServerSideEncryption::AES256)),
+            Some("request-key".to_string()),
             false,
         );
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
     }
 
@@ -1516,14 +1516,10 @@ mod tests {
     fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
         let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
 
-        let (sse, kms_key_id) = resolve_bucket_default_sse(
-            Some(&config),
-            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-            None,
-            false,
-        );
+        let (sse, kms_key_id) =
+            resolve_bucket_default_sse(Some(&config), Some(String::from(ServerSideEncryption::AES256)), None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
@@ -1533,7 +1529,7 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AWS_KMS));
         assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
     }
 
@@ -1547,7 +1543,7 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
         assert!(kms_key_id.is_none());
     }
 

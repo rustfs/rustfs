@@ -25,8 +25,8 @@
 # Left out of both stacks: `dual_stack_differential::` (servers with an explicit
 # stack), `fake_s3_target::`, the upgrade write-readiness cases and one deadline
 # case (no server), and `distributed_startup_regression_test::` (needs ci.yml's
-# hooks-binary manifest). e2e-full runs without the mc, Vault and iptables
-# tools ci.yml installs: their cases fail on both stacks.
+# hooks-binary manifest). Both e2e-full stacks use ci.yml's pinned mc and
+# Vault binaries and network fault-injection tools.
 
 name: dual-stack-nightly
 
@@ -159,6 +159,54 @@ jobs:
           python3 -m pip install --user --upgrade pip "awscurl==0.44"
           echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
           test -x "$HOME/.local/bin/awscurl"
+
+      - name: Install network fault-injection tools
+        if: matrix.profile == 'e2e-full'
+        run: |
+          sudo apt-get install -y iptables
+          sudo -n iptables --version
+          # The endpoint-blackhole heal scenario needs CAP_NET_ADMIN. Containerised
+          # runners can run iptables but not touch the rule set; the test then logs
+          # a skip instead of failing, so surface that here where it is visible.
+          if ! sudo -n iptables -w 5 -S OUTPUT >/dev/null 2>&1; then
+            echo "::warning::iptables cannot read the OUTPUT chain on this runner (no CAP_NET_ADMIN); the endpoint-blackhole heal scenario will be skipped"
+          fi
+
+      - name: Install mc
+        if: matrix.profile == 'e2e-full'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MC_VERSION: RELEASE.2025-08-13T08-35-41Z
+          MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+          MC_BINARY="mc.linux-amd64.${MC_VERSION}"
+          python3 .github/actions/setup/download_release_asset.py --repository minio/mc --tag "$MC_VERSION" --asset "$MC_BINARY" --output "$RUNNER_TEMP/mc" --sha256 "$MC_SHA256"
+          echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
+          chmod +x "$RUNNER_TEMP/mc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Verify mc
+        if: matrix.profile == 'e2e-full'
+        run: mc --version
+
+      - name: Install Vault
+        if: matrix.profile == 'e2e-full'
+        run: |
+          VAULT_VERSION="1.17.6"
+          VAULT_ARCHIVE="vault_${VAULT_VERSION}_linux_amd64.zip"
+          curl -fsSLo "$RUNNER_TEMP/$VAULT_ARCHIVE" "https://releases.hashicorp.com/vault/${VAULT_VERSION}/${VAULT_ARCHIVE}"
+          echo "0cddc1fbbb88583b5ba5b845f9f8fae47c6fb39a6d48cd543c6ba6fd3ac1a669  $RUNNER_TEMP/$VAULT_ARCHIVE" | sha256sum --check --status
+          unzip -q "$RUNNER_TEMP/$VAULT_ARCHIVE" -d "$RUNNER_TEMP/vault-bin"
+          echo "RUSTFS_TEST_VAULT_BIN=$RUNNER_TEMP/vault-bin/vault" >> "$GITHUB_ENV"
+
+      - name: Verify Vault
+        if: matrix.profile == 'e2e-full'
+        run: |
+          "$RUSTFS_TEST_VAULT_BIN" version
 
       - name: Run the profile on the ${{ matrix.stack }} stack
         env:

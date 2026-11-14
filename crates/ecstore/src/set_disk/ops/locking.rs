@@ -610,6 +610,9 @@ impl SetDisks {
         new_disk.enable_health_check();
 
         if new_disk.is_local() {
+            if let crate::disk::Disk::Local(wrapper) = new_disk.as_ref() {
+                wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
+            }
             let local_disk_map = runtime_sources::local_disk_map_handle();
             let mut global_local_disk_map = local_disk_map.write().await;
             let path = new_disk.endpoint().to_string();

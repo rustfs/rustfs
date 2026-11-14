@@ -15,7 +15,7 @@
 // The gateway S3 stack inside an embedded RustFS server (rustfs/backlog#2734). Requests are signed
 // by the AWS SDK and travel through the whole middleware stack, so what is asserted here is what a
 // client sees. Every served operation has a row in the refusal matrix, kept per migration family in
-// the module named after it, and the matrix runs on both stacks.
+// the module named after it, or an entry in `ANSWERS_EVERY_CALLER_ALIKE`; both run on both stacks.
 
 #![recursion_limit = "256"]
 
@@ -40,9 +40,10 @@ use aws_sdk_s3::{Client, Config};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::{RustFSServer, RustFSServerBuilder, find_available_port, gateway_operations};
+use rustfs_ecstore::api::object::PutObjReader;
 use rustfs_io_metrics::s3_http_metrics::s3_http_metrics_snapshot;
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, ObjectIO};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
@@ -87,6 +88,26 @@ const MATRIX: &[&[MatrixRow]] = &[
 fn matrix() -> impl Iterator<Item = &'static MatrixRow> {
     MATRIX.iter().flat_map(|family| family.iter())
 }
+
+/// A served operation whose answer does not depend on the caller, so it has no refusal rows. It
+/// must refuse every caller it serves alike, never serve data: an operation here cannot dodge the
+/// matrix while answering `2xx`.
+struct AnswersEveryCallerAlike {
+    operation: &'static str,
+    reason: &'static str,
+    metric: S3Operation,
+    /// The code and status every admitted caller gets.
+    answer: (&'static str, u16),
+    call: for<'a> fn(&'a Client, &'a str) -> BoxFuture<'a, Outcome>,
+}
+
+const ANSWERS_EVERY_CALLER_ALIKE: &[AnswersEveryCallerAlike] = &[AnswersEveryCallerAlike {
+    operation: "GetObjectTorrent",
+    reason: "always NoSuchKey: the legacy hook checks nothing and no torrent is ever served",
+    metric: S3Operation::GetObjectTorrent,
+    answer: ("NoSuchKey", 404),
+    call: object_meta::get_object_torrent,
+}];
 
 /// What one call observed: served, or refused.
 pub(crate) type Outcome = Result<(), Refusal>;
@@ -209,6 +230,16 @@ async fn create_bucket_in_the_store(bucket: &str) {
         .expect("create bucket in the store");
 }
 
+async fn put_object_in_the_store(bucket: &str, key: &str) {
+    let mut data = PutObjReader::from_vec(b"payload".to_vec());
+    get_global_app_context()
+        .expect("embedded server context")
+        .object_store()
+        .put_object(bucket, key, &mut data, &Default::default())
+        .await
+        .expect("put object in the store");
+}
+
 async fn bucket_exists_in_the_store(bucket: &str) -> bool {
     get_global_app_context()
         .expect("embedded server context")
@@ -235,19 +266,93 @@ async fn create_user_without_a_policy(access_key: &str) {
         .expect("create user without a policy");
 }
 
+/// Creates `access_key` with the user secret and attaches a policy granting `action` on `bucket`
+/// alone, so a call on any other bucket is a wrong-resource refusal.
+async fn create_user_allowed_on_one_bucket(access_key: &str, action: &str, bucket: &str) {
+    create_user_without_a_policy(access_key).await;
+    let document = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["{action}"],"Resource":["arn:aws:s3:::{bucket}"]}}]}}"#
+    );
+    let policy = rustfs_policy::policy::Policy::parse_config(document.as_bytes()).expect("parse policy");
+    let iam = get_global_app_context().expect("embedded server context").iam().handle();
+    iam.set_policy(access_key, policy).await.expect("store policy");
+    iam.policy_db_set(access_key, rustfs_iam::store::UserType::Reg, false, access_key)
+        .await
+        .expect("attach policy");
+}
+
 #[test]
 fn every_served_operation_has_one_matrix_row_and_every_row_a_served_operation() {
     let rows: Vec<&str> = matrix().map(|row| row.operation).collect();
     let distinct: BTreeSet<&str> = rows.iter().copied().collect();
 
+    let alike: BTreeSet<&str> = ANSWERS_EVERY_CALLER_ALIKE.iter().map(|entry| entry.operation).collect();
+
     assert_eq!(rows.len(), distinct.len(), "an operation has two rows: {rows:?}");
-    assert_eq!(distinct, gateway_operations().into_iter().collect());
+    assert_eq!(alike.len(), ANSWERS_EVERY_CALLER_ALIKE.len(), "an operation is listed twice: {alike:?}");
+    assert!(distinct.is_disjoint(&alike), "{:?}", distinct.intersection(&alike));
+    assert_eq!(&distinct | &alike, gateway_operations().into_iter().collect());
+}
+
+/// Every operation that answers every caller alike gives root, the user without a policy and the
+/// anonymous caller its one non-`2xx` answer, counted once under its label, while authentication
+/// still refuses a wrong secret and an unknown key before any operation is known.
+async fn every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike(server: RustFSServer) {
+    create_bucket_in_the_store(MATRIX_BUCKET).await;
+    create_user_without_a_policy(NO_POLICY_USER).await;
+    let endpoint = server.endpoint();
+    let admitted = [
+        ("root", s3_client(&endpoint, server.access_key(), server.secret_key())),
+        ("no policy", s3_client(&endpoint, NO_POLICY_USER, USER_SECRET_KEY)),
+        ("anonymous", anonymous_client(&endpoint).await),
+    ];
+    let unauthenticated = [
+        ("wrong secret", s3_client(&endpoint, ROOT_ACCESS_KEY, "not-the-root-secret")),
+        ("unknown key", s3_client(&endpoint, "gatewaystackunknown", USER_SECRET_KEY)),
+    ];
+
+    for entry in ANSWERS_EVERY_CALLER_ALIKE {
+        let (code, status) = entry.answer;
+        assert!(!(200..300).contains(&status), "{} ({}) serves", entry.operation, entry.reason);
+        for (caller, client) in &admitted {
+            let before = s3_request_counts();
+            let context = format!("{} as the {caller} caller", entry.operation);
+            let refusal = (entry.call)(client, MATRIX_BUCKET).await.expect_err(&context);
+            assert_eq!((refusal.code.as_deref(), refusal.status), (Some(code), Some(status)), "{context}");
+            let counted = counted_since(&before);
+            let series = [(entry.metric.as_str(), "4xx")];
+            assert!(counted.values().all(|total| *total == 1), "{context} {counted:?}");
+            assert!(
+                counted.keys().map(|(_, label, outcome)| (*label, *outcome)).eq(series),
+                "{context} {counted:?}"
+            );
+        }
+        for (caller, client) in &unauthenticated {
+            let context = format!("{} as the {caller} caller", entry.operation);
+            let refusal = (entry.call)(client, MATRIX_BUCKET).await.expect_err(&context);
+            assert_eq!(refusal.status, Some(403), "{context}");
+        }
+    }
+
+    server.shutdown().await;
+}
+
+#[test]
+fn operations_that_answer_every_caller_alike_do_so_on_the_gateway_stack() {
+    with_stack(GATEWAY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
+}
+
+#[test]
+fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
+    with_stack(LEGACY, every_caller_gets_the_same_refusal_from_an_operation_that_answers_all_alike);
 }
 
 /// Every served operation serves the root caller, counted once under its label, and refuses
 /// each caller it cannot admit with the code the legacy stack answers, counted once.
 async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer) {
     create_bucket_in_the_store(MATRIX_BUCKET).await;
+    create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
+    create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
     create_user_without_a_policy(NO_POLICY_USER).await;
     let endpoint = server.endpoint();
     let root = s3_client(&endpoint, server.access_key(), server.secret_key());
@@ -514,5 +619,102 @@ fn the_legacy_stack_still_serves_writes_and_reads() {
         assert_eq!(refusal(&missing), (Some("NoSuchKey".to_owned()), Some(404)));
 
         server.shutdown().await;
+    });
+}
+
+/// HeadBucket's outcome with `x-amz-expected-bucket-owner` set to `owner`, or without it.
+async fn head_bucket_owned_by(client: &Client, bucket: &str, owner: Option<&str>) -> Result<(), Option<u16>> {
+    let sent = client
+        .head_bucket()
+        .bucket(bucket)
+        .set_expected_bucket_owner(owner.map(str::to_owned))
+        .send()
+        .await;
+    outcome(sent).map_err(|refusal| refusal.status)
+}
+
+/// ListBuckets' outcome with `x-amz-expected-bucket-owner` set to `owner`.
+async fn list_buckets_owned_by(client: &Client, owner: &str) -> Result<(), Option<u16>> {
+    let owner = owner.to_owned();
+    let sent = client
+        .list_buckets()
+        .customize()
+        .mutate_request(move |request| {
+            request.headers_mut().insert("x-amz-expected-bucket-owner", owner.clone());
+        })
+        .send()
+        .await;
+    outcome(sent).map_err(|refusal| refusal.status)
+}
+
+/// `x-amz-expected-bucket-owner` against the owner id the listing reports. `expected` is the
+/// outcome of the same id, another id and none, first on a bucket that exists and then on one that
+/// does not, then on a reserved-shaped bucket, and of the same id on ListBuckets.
+async fn expected_bucket_owner_answers(server: RustFSServer, expected: [Result<(), Option<u16>>; 10]) {
+    const OWNED: &str = "gateway-stack-owned";
+    const MISSING: &str = "gateway-stack-missing";
+    const RESERVED: &str = "sthree-gateway-stack-owned";
+    create_bucket_in_the_store(OWNED).await;
+    create_bucket_in_the_store(RESERVED).await;
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let listing = client.list_buckets().send().await.expect("signed ListBuckets");
+    let reported = listing
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("the listing names its owner")
+        .to_owned();
+    let other = format!("{reported}0");
+
+    let mut answered = Vec::new();
+    for bucket in [OWNED, MISSING, RESERVED] {
+        for owner in [Some(reported.as_str()), Some(other.as_str()), None] {
+            answered.push(head_bucket_owned_by(&client, bucket, owner).await);
+        }
+    }
+    answered.push(list_buckets_owned_by(&client, &reported).await);
+
+    assert_eq!(answered, expected, "same id, other id, absent for each bucket; ListBuckets");
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_serves_only_the_reported_bucket_owner() {
+    with_stack(GATEWAY, |server| {
+        expected_bucket_owner_answers(
+            server,
+            [
+                Ok(()),
+                Err(Some(403)),
+                Ok(()),
+                Err(Some(404)),
+                Err(Some(403)),
+                Err(Some(404)),
+                Ok(()),
+                Err(Some(403)),
+                Ok(()),
+                Err(Some(403)),
+            ],
+        )
+    });
+}
+
+#[test]
+fn the_legacy_stack_answers_expected_bucket_owner_requests() {
+    with_stack(LEGACY, |server| {
+        expected_bucket_owner_answers(
+            server,
+            [
+                Ok(()),
+                Ok(()),
+                Ok(()),
+                Err(Some(404)),
+                Err(Some(404)),
+                Err(Some(404)),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+            ],
+        )
     });
 }

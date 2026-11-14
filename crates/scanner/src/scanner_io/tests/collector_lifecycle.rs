@@ -122,6 +122,8 @@ async fn scan_plan(set: &Arc<SetDisks>, names: &[&str], cycle: u64) -> ScannerBu
     let digest = scanner_bucket_plan_digest(&buckets, [7; 32]);
     let tier_registry_generation = runtime_tier_registry_for_cycle(cycle, 11).await.generation;
     ScannerBucketScanPlan {
+        owner_ctx: CancellationToken::new(),
+        usage_watch_store: None,
         all_buckets: Arc::new(buckets.clone()),
         buckets,
         scope: ScannerBucketScanScope::default(),
@@ -404,6 +406,7 @@ fn bucket_root(name: &str, generation: u64, size: usize) -> DataUsageEntryInfo {
         },
         bucket_incarnation: None,
         tier_registry_generation: Some(generation),
+        value_origin: None,
     }
 }
 
@@ -461,8 +464,8 @@ async fn collector_reports_distinct_duplicate_and_rejected_roots_after_drain() {
             cache.find("bucket-b").expect("retained or recovered root").size,
             if recover_missing { 4 } else { 19 }
         );
-        assert_eq!(should_publish_completed_snapshot(completed.len(), 2, false, false), recover_missing);
-        assert!(!should_publish_completed_snapshot(completed.len(), 2, false, true));
+        assert_eq!(should_publish_completed_snapshot(completed.len(), 2, false), recover_missing);
+        assert!(!should_publish_completed_snapshot(completed.len(), 2, true));
 
         let events = events
             .iter()

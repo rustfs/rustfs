@@ -95,6 +95,8 @@ spec:
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
+          resources:
+            {{- toYaml .Values.initContainer.resources | nindent 12 }}
           volumeMounts:
             {{- if $dataVolumeEnabled }}
             - name: data

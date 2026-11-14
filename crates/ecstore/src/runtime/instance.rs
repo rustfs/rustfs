@@ -99,6 +99,7 @@ pub(crate) struct ScannerPublicationLeaseEntry {
 pub(crate) struct NamespaceCommitGuard {
     ctx: Arc<InstanceContext>,
     counted: bool,
+    _usage_watch: super::usage_watch::UsageWatchMutationGuard,
 }
 
 impl Drop for NamespaceCommitGuard {
@@ -371,6 +372,7 @@ pub struct InstanceContext {
     scanner_publication_state: AtomicU8,
     namespace_commits: AtomicU64,
     namespace_commit_generation: AtomicU64,
+    pub(crate) usage_watches: Arc<super::usage_watch::UsageWatchRegistry>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     delete_recovery_hints: DeleteRecoveryHints,
@@ -496,6 +498,7 @@ impl InstanceContext {
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
+            usage_watches: Arc::new(super::usage_watch::UsageWatchRegistry::default()),
             object_encryption_resolver: OnceLock::new(),
             delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -735,6 +738,15 @@ impl InstanceContext {
     }
 
     pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
+        self.begin_namespace_commit_scoped(None)
+    }
+
+    pub(crate) fn begin_namespace_commit_for_bucket(self: &Arc<Self>, bucket: &str) -> Arc<NamespaceCommitGuard> {
+        self.begin_namespace_commit_scoped(Some(bucket))
+    }
+
+    fn begin_namespace_commit_scoped(self: &Arc<Self>, bucket: Option<&str>) -> Arc<NamespaceCommitGuard> {
+        let usage_watch = self.usage_watches.begin(bucket);
         let counted = self
             .namespace_commits
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
@@ -747,6 +759,7 @@ impl InstanceContext {
         Arc::new(NamespaceCommitGuard {
             ctx: Arc::clone(self),
             counted,
+            _usage_watch: usage_watch,
         })
     }
 

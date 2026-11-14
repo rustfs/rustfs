@@ -683,6 +683,7 @@ pub fn canonical_scanner_activity_v7_response_body(
 }
 
 pub mod scoped_dirty_usage;
+pub mod usage_watch;
 
 /// Binds checkpoint continuity independently of the fresh RPC process ID.
 pub fn canonical_scanner_activity_v8_response_body(

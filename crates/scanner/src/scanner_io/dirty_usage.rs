@@ -1685,12 +1685,11 @@ pub(super) fn dirty_usage_buckets_excluding_failed(
 pub(super) fn should_clear_dirty_usage_snapshot(
     result_ok: bool,
     completed_all_sets: bool,
-    budget_elapsed: bool,
     guardrail_passed: bool,
     dirty_buckets: &DirtyUsageBuckets,
     failed_buckets: &HashSet<String>,
 ) -> Option<DirtyUsageBuckets> {
-    if result_ok && completed_all_sets && !budget_elapsed && guardrail_passed {
+    if result_ok && completed_all_sets && guardrail_passed {
         return Some(dirty_usage_buckets_excluding_failed(dirty_buckets, failed_buckets));
     }
 

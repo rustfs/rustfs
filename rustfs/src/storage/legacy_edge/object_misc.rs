@@ -23,6 +23,7 @@
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
+use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::delete_object;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
@@ -55,12 +56,19 @@ impl FS {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         crate::hp_guard!("S3::delete_object");
+        record_s3_op(S3Operation::DeleteObject);
         let request_id = req
             .extensions
             .get::<crate::storage::request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone());
         let usecase = s3_api::object_usecase_for(self);
-        let result = Box::pin(usecase.execute_delete_object(req)).await;
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let input = req.input;
+        let result = Box::pin(usecase.execute_delete_object_fields(envelope, input.bucket, input.key, input.version_id))
+            .await
+            .and_then(|output| delete_object::output_to_s3s(output).map_err(crate::app::dto_values::seam_error))
+            .map(S3Response::new)
+            .map_err(Into::into);
         if let Err(error) = &result {
             log_object_internal_error("DeleteObject", request_id.as_deref(), error);
         }

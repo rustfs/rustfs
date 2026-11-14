@@ -786,11 +786,48 @@ pub(super) fn empty_namespace_usage_candidate(
 }
 
 impl ValidatedUsageCandidate {
+    pub(super) fn retain_carried_certifications(&mut self, baseline: &DataUsageInfo) {
+        for (bucket, usage) in &mut self.data.buckets_usage {
+            if usage.usage_value_state != Some(rustfs_data_usage::BucketUsageValueState::Carried) {
+                continue;
+            }
+            let Some(previous) = baseline.buckets_usage.get(bucket) else { continue };
+            let mut left = usage.clone();
+            let mut right = previous.clone();
+            left.usage_value_state = None;
+            left.usage_certification = None;
+            right.usage_value_state = None;
+            right.usage_certification = None;
+            if left == right {
+                usage.usage_certification = previous.usage_certification;
+            }
+        }
+    }
+
     pub(super) fn prepare(
         mut self,
         status: ScannerCycleStatus,
         pending_buckets: &ScannerCyclePendingBuckets,
     ) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        let certified_at = SystemTime::now();
+        for (bucket, usage) in &mut self.data.buckets_usage {
+            if usage.usage_value_state == Some(rustfs_data_usage::BucketUsageValueState::Certified) {
+                if status == ScannerCycleStatus::Complete && !pending_buckets.contains(bucket) {
+                    usage.certify(rustfs_data_usage::BucketUsageCertification {
+                        epoch: self.data.scanner_epoch.unwrap_or_default(),
+                        cycle: self.data.scanner_cycle.unwrap_or_default(),
+                        certified_at,
+                    });
+                } else {
+                    usage.mark_observed();
+                }
+            }
+        }
+        if status == ScannerCycleStatus::Complete {
+            self.data
+                .usage_snapshot_bucket_observations
+                .retain(|bucket, _| pending_buckets.contains(bucket));
+        }
         apply_scanner_cycle_publication_marks(&mut self.data, status, pending_buckets);
         let expectation = if status == ScannerCycleStatus::Complete {
             struct DigestWriter(Sha256);
@@ -822,10 +859,9 @@ pub(super) fn completed_data_usage_info(
     scope: &ScannerSnapshotScope<'_>,
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
-    budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
-    completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, budget_elapsed, cancelled)
+    completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, cancelled)
         .map(|candidate| (candidate.data, candidate.last_update))
 }
 
@@ -843,7 +879,6 @@ pub(super) fn completed_usage_candidate(
     scope: &ScannerSnapshotScope<'_>,
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
-    budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<ValidatedUsageCandidate> {
     let candidate: std::result::Result<ValidatedUsageCandidate, CandidateOutcome> = (|| {
@@ -851,7 +886,7 @@ pub(super) fn completed_usage_candidate(
             return Err(CandidateOutcome::InventoryIncomplete);
         }
         let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
-        if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
+        if !should_publish_completed_snapshot(completed_set_count, results.len(), cancelled) {
             return Err(CandidateOutcome::PublishGate);
         }
         let validated = ValidatedScannerSnapshot::validate(results, scope).map_err(|reason| match reason {
@@ -893,6 +928,26 @@ pub(super) fn completed_usage_candidate(
             .map(|(bucket, entry)| {
                 let mut usage = checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?;
                 usage.bucket_incarnation = certified_bucket_incarnation(results, &bucket).map(|id| id.to_string());
+                let origins = results
+                    .iter()
+                    .map(|result| result.info.scan_bucket_value_origins.get(&bucket))
+                    .collect::<Vec<_>>();
+                usage.usage_value_state = if usage.bucket_incarnation.is_some()
+                    && !origins.is_empty()
+                    && origins.iter().all(|origin| {
+                        origin.is_some_and(|origin| {
+                            !origin.carried && origin.epoch == scope.identity.leader_epoch && origin.cycle == scope.identity.cycle
+                        })
+                    }) {
+                    Some(rustfs_data_usage::BucketUsageValueState::Certified)
+                } else if usage.bucket_incarnation.is_some()
+                    && !origins.is_empty()
+                    && origins.iter().all(|origin| origin.is_some_and(|origin| origin.carried))
+                {
+                    Some(rustfs_data_usage::BucketUsageValueState::Carried)
+                } else {
+                    None
+                };
                 Ok((bucket, usage))
             })
             .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
@@ -917,7 +972,7 @@ pub(super) fn completed_usage_candidate(
             })
             .collect::<std::result::Result<Vec<_>, CandidateOutcome>>()?;
         usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
-        let data_usage_info = DataUsageInfo {
+        let mut data_usage_info = DataUsageInfo {
             last_update: Some(merged_last_update),
             scanner_cycle: Some(scope.identity.cycle),
             scanner_epoch: Some(scope.identity.leader_epoch),
@@ -934,6 +989,7 @@ pub(super) fn completed_usage_candidate(
             usage_snapshot_set_states,
             ..Default::default()
         };
+        attach_bucket_observations(&mut data_usage_info, results, scope.sources, all_buckets, tier_registry_names);
         Ok(ValidatedUsageCandidate {
             data: data_usage_info,
             #[cfg(test)]
@@ -1054,6 +1110,122 @@ fn tier_accounting_proof_is_publishable(
     proof.physical_known == known_tier_physical_total
 }
 
+/// Project full-source observations into an additive field. No companion
+/// enters the canonical counters, cold-cache proof, or dirty ACK eligibility.
+fn attach_bucket_observations(
+    data: &mut DataUsageInfo,
+    results: &[DataUsageCache],
+    expected_sources: &HashSet<DataUsageCacheSource>,
+    buckets: &[String],
+    tier_names: &[String],
+) {
+    let mut sources = expected_sources.iter().copied().collect::<Vec<_>>();
+    sources.sort_unstable_by_key(|source| (source.pool_index, source.set_index));
+    for bucket in buckets {
+        let mut merged = DataUsageEntry::default();
+        let mut provenance = Vec::with_capacity(sources.len());
+        let mut incarnation = None;
+        let mut saw_observation = false;
+        let mut valid = !sources.is_empty();
+        for source in &sources {
+            let Some(result) = results.iter().find(|result| result.info.source == Some(*source)) else {
+                valid = false;
+                break;
+            };
+            let Some(state) = data.usage_snapshot_set_states.iter().find(|state| {
+                usize::try_from(state.pool_index).ok() == Some(source.pool_index)
+                    && usize::try_from(state.set_index).ok() == Some(source.set_index)
+            }) else {
+                valid = false;
+                break;
+            };
+            let Some(plan) = state.scan_plan_digest else {
+                valid = false;
+                break;
+            };
+            let contribution = result.info.scan_bucket_observations.get(bucket).filter(|observation| {
+                observation.matches(*source, observation.identity)
+                    && observation.identity.tier_registry_generation == result.info.tier_registry_generation.unwrap_or_default()
+                    && observation.completed_epoch <= result.info.leader_epoch
+                    && observation.completed_cycle <= result.info.next_cycle
+                    && result.info.scan_bucket_incarnations.get(bucket) == Some(&observation.identity.bucket_incarnation)
+            });
+            let (entry, id, epoch, cycle, completed_at, started, requested) = if let Some(observation) = contribution {
+                saw_observation = true;
+                (
+                    observation.entry.clone(),
+                    observation.identity.bucket_incarnation,
+                    observation.completed_epoch,
+                    observation.completed_cycle,
+                    observation.completed_at,
+                    observation.started_plan.0,
+                    observation.requested_plan.0,
+                )
+            } else {
+                let (Some(entry), Some(id), Some(origin)) = (
+                    result.checked_flatten(bucket),
+                    result.info.scan_bucket_incarnations.get(bucket),
+                    result.info.scan_bucket_value_origins.get(bucket),
+                ) else {
+                    valid = false;
+                    break;
+                };
+                if origin.carried && !result.info.snapshot_complete && !result.info.lkg_snapshot_complete {
+                    valid = false;
+                    break;
+                }
+                (entry, *id, origin.epoch, origin.cycle, origin.completed_at, plan, plan)
+            };
+            if id.is_nil()
+                || incarnation.is_some_and(|previous| previous != id)
+                || !tier_accounting_proof_is_publishable(&entry, result.info.tier_registry_generation, tier_names)
+                || !merged.checked_merge(&entry)
+            {
+                valid = false;
+                break;
+            }
+            incarnation = Some(id);
+            let (Ok(pool_index), Ok(set_index)) = (u64::try_from(source.pool_index), u64::try_from(source.set_index)) else {
+                valid = false;
+                break;
+            };
+            provenance.push(rustfs_data_usage::DataUsageBucketObservationSource {
+                pool_index,
+                set_index,
+                bucket_incarnation: id.to_string(),
+                scanner_epoch: epoch,
+                scanner_cycle: cycle,
+                scan_plan_digest: plan,
+                started_plan: started,
+                requested_plan: requested,
+                completed_at,
+            });
+        }
+        if !valid || !saw_observation {
+            continue;
+        }
+        let (Some(mut usage), Some(incarnation), Some(completed_at)) = (
+            checked_bucket_usage_info(merged),
+            incarnation,
+            provenance.iter().map(|source| source.completed_at).min(),
+        ) else {
+            continue;
+        };
+        usage.bucket_incarnation = Some(incarnation.to_string());
+        usage.mark_observed();
+        let observation = rustfs_data_usage::DataUsageBucketObservation {
+            version: rustfs_data_usage::DATA_USAGE_BUCKET_OBSERVATION_VERSION,
+            usage,
+            snapshot_identity: data.snapshot_identity(),
+            completed_at,
+            sources: provenance,
+        };
+        if observation.matches_snapshot(data, &incarnation.to_string()) {
+            data.usage_snapshot_bucket_observations.insert(bucket.clone(), observation);
+        }
+    }
+}
+
 /// Build a non-authoritative view from the set snapshots that completed this
 /// cycle plus compatible per-set last-known-good caches.  The caller must
 /// persist this result only on the observational object; a missing set is
@@ -1078,6 +1250,8 @@ pub(super) fn observational_data_usage_info(
         }
 
         let mut usable = Vec::new();
+        let mut observed_last_update = None;
+        let mut observed_generation = None;
         let mut set_states = Vec::with_capacity(expected_sources.len());
         let mut sources = expected_sources.iter().copied().collect::<Vec<_>>();
         sources.sort_by_key(|source| (source.pool_index, source.set_index));
@@ -1098,6 +1272,30 @@ pub(super) fn observational_data_usage_info(
                             || (epoch == leader_epoch && result.info.lkg_next_cycle.is_some_and(|cycle| cycle <= scanner_cycle))
                     })
             });
+            let observation_source = result.filter(|result| {
+                result.info.next_cycle == scanner_cycle
+                    && result.info.leader_epoch == leader_epoch
+                    && result.info.scan_plan_digest == Some(expected_plan_digest)
+                    && result.info.scan_bucket_observations.iter().any(|(bucket, observation)| {
+                        all_buckets.contains(bucket)
+                            && observation.matches(source, observation.identity)
+                            && result.info.scan_bucket_incarnations.get(bucket) == Some(&observation.identity.bucket_incarnation)
+                            && Some(observation.identity.tier_registry_generation) == result.info.tier_registry_generation
+                            && (observation.completed_epoch, observation.completed_cycle) <= (leader_epoch, scanner_cycle)
+                    })
+            });
+            if let Some(observed) = observation_source {
+                if observed_generation.is_some_and(|generation| Some(generation) != observed.info.tier_registry_generation) {
+                    return Err(CandidateOutcome::TierGeneration);
+                }
+                observed_generation = observed.info.tier_registry_generation;
+                for observation in observed.info.scan_bucket_observations.values() {
+                    observed_last_update = Some(
+                        observed_last_update
+                            .map_or(observation.completed_at, |previous: SystemTime| previous.max(observation.completed_at)),
+                    );
+                }
+            }
             let current_snapshot = current.is_some();
             let selected = current.or(lkg);
             if let Some(selected) = selected {
@@ -1120,6 +1318,15 @@ pub(super) fn observational_data_usage_info(
                         None,
                     )
                 };
+                let (cycle, epoch, digest) = if let Some(observed) = observation_source {
+                    (
+                        Some(observed.info.next_cycle),
+                        Some(observed.info.leader_epoch),
+                        Some(expected_plan_digest.0),
+                    )
+                } else {
+                    (cycle, epoch, digest)
+                };
                 set_states.push(DataUsageSnapshotSetState {
                     pool_index: u64::try_from(source.pool_index).map_err(|_| CandidateOutcome::CountOverflow)?,
                     set_index: u64::try_from(source.set_index).map_err(|_| CandidateOutcome::CountOverflow)?,
@@ -1135,8 +1342,8 @@ pub(super) fn observational_data_usage_info(
                 set_states.push(DataUsageSnapshotSetState {
                     pool_index: u64::try_from(source.pool_index).map_err(|_| CandidateOutcome::CountOverflow)?,
                     set_index: u64::try_from(source.set_index).map_err(|_| CandidateOutcome::CountOverflow)?,
-                    scanner_cycle: None,
-                    scanner_epoch: None,
+                    scanner_cycle: observation_source.map(|result| result.info.next_cycle),
+                    scanner_epoch: observation_source.map(|result| result.info.leader_epoch),
                     scan_plan_digest: Some(expected_plan_digest.0),
                     complete: false,
                     tombstone: false,
@@ -1144,15 +1351,17 @@ pub(super) fn observational_data_usage_info(
                 });
             }
         }
-        if usable.is_empty() {
+        if usable.is_empty() && observed_last_update.is_none() {
             return Err(CandidateOutcome::NoUsableSnapshots);
         }
+        let has_canonical_sources = !usable.is_empty();
         let registry_generation = usable
             .first()
-            .ok_or(CandidateOutcome::NoUsableSnapshots)?
-            .0
-            .info
-            .tier_registry_generation;
+            .map(|(result, _)| result.info.tier_registry_generation)
+            .unwrap_or(observed_generation);
+        if observed_generation.is_some() && registry_generation != observed_generation {
+            return Err(CandidateOutcome::TierGeneration);
+        }
         if usable.iter().any(|(result, _)| match registry_generation {
             Some(generation) => result.info.tier_registry_generation != Some(generation),
             None => result.info.tier_registry_generation.is_some(),
@@ -1162,7 +1371,7 @@ pub(super) fn observational_data_usage_info(
 
         let mut total = DataUsageEntry::default();
         let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
-        let mut merged_last_update = None;
+        let mut merged_last_update = observed_last_update;
         for (result, last_update) in usable {
             if let Some(update) = last_update {
                 merged_last_update = Some(merged_last_update.map_or(update, |current: SystemTime| current.max(update)));
@@ -1186,7 +1395,7 @@ pub(super) fn observational_data_usage_info(
         {
             return Err(CandidateOutcome::TierProof);
         }
-        if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
+        if has_canonical_sources && !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
             return Err(CandidateOutcome::TierProof);
         }
         let merged_last_update = merged_last_update.ok_or(CandidateOutcome::MissingLastUpdate)?;
@@ -1194,31 +1403,34 @@ pub(super) fn observational_data_usage_info(
             .into_iter()
             .map(|(bucket, entry)| Ok((bucket, checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
             .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
-        Ok((
-            DataUsageInfo {
-                last_update: Some(merged_last_update),
-                scanner_cycle: Some(scanner_cycle),
-                scanner_epoch: Some(leader_epoch),
-                objects_total_count: u64::try_from(total.objects).map_err(|_| CandidateOutcome::CountOverflow)?,
-                versions_total_count: u64::try_from(total.versions).map_err(|_| CandidateOutcome::CountOverflow)?,
-                delete_markers_total_count: u64::try_from(total.delete_markers).map_err(|_| CandidateOutcome::CountOverflow)?,
-                objects_total_size: u64::try_from(total.size).map_err(|_| CandidateOutcome::CountOverflow)?,
-                tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
-                unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
-                buckets_count: u64::try_from(buckets_usage.len()).map_err(|_| CandidateOutcome::CountOverflow)?,
-                bucket_sizes: buckets_usage
-                    .iter()
-                    .map(|(bucket, usage)| (bucket.clone(), usage.size))
-                    .collect(),
-                buckets_usage,
-                usage_snapshot_complete: false,
-                usage_snapshot_partial: true,
-                usage_snapshot_converged: Some(false),
-                usage_snapshot_set_states: set_states,
-                ..Default::default()
-            },
-            merged_last_update,
-        ))
+        let mut data = DataUsageInfo {
+            last_update: Some(merged_last_update),
+            scanner_cycle: Some(scanner_cycle),
+            scanner_epoch: Some(leader_epoch),
+            objects_total_count: u64::try_from(total.objects).map_err(|_| CandidateOutcome::CountOverflow)?,
+            versions_total_count: u64::try_from(total.versions).map_err(|_| CandidateOutcome::CountOverflow)?,
+            delete_markers_total_count: u64::try_from(total.delete_markers).map_err(|_| CandidateOutcome::CountOverflow)?,
+            objects_total_size: u64::try_from(total.size).map_err(|_| CandidateOutcome::CountOverflow)?,
+            tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
+            buckets_count: u64::try_from(buckets_usage.len()).map_err(|_| CandidateOutcome::CountOverflow)?,
+            bucket_sizes: buckets_usage
+                .iter()
+                .map(|(bucket, usage)| (bucket.clone(), usage.size))
+                .collect(),
+            buckets_usage,
+            usage_snapshot_complete: false,
+            usage_snapshot_partial: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_observational: true,
+            usage_snapshot_set_states: set_states,
+            ..Default::default()
+        };
+        attach_bucket_observations(&mut data, results, expected_sources, all_buckets, tier_registry_names);
+        if !has_canonical_sources && data.usage_snapshot_bucket_observations.is_empty() {
+            return Err(CandidateOutcome::NoUsableSnapshots);
+        }
+        Ok((data, merged_last_update))
     })();
     global_metrics().record_usage_candidate(
         CandidateKind::Observational,
@@ -1469,6 +1681,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     }
     if persisted.info.scan_coverage_digest == Some(coverage_digest)
         && persisted.info.scan_execution_digest == Some(execution_digest)
+        && persisted.info.scan_bucket_incarnations == cache_snapshot.info.scan_bucket_incarnations
         && matches!(
             current_cache_root_entry_with_generation(
                 &persisted,

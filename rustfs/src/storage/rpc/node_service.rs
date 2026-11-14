@@ -1387,8 +1387,115 @@ impl NodeService {
     }
 }
 
+/// Bound both queued and active watch work. A brief burst may wait for one of
+/// four workers, but cannot create an unbounded semaphore waiter list or gain
+/// a new operation budget after admission.
+async fn acquire_scanner_usage_watch_admission<'a>(
+    admission: &'a tokio::sync::Semaphore,
+    workers: &'a tokio::sync::Semaphore,
+    deadline: tokio::time::Instant,
+) -> Result<(tokio::sync::SemaphorePermit<'a>, tokio::sync::SemaphorePermit<'a>), Status> {
+    let admitted = admission
+        .try_acquire()
+        .map_err(|_| Status::resource_exhausted("usage watch receiver is busy"))?;
+    let worker = tokio::time::timeout_at(deadline, workers.acquire())
+        .await
+        .map_err(|_| Status::deadline_exceeded("usage watch admission timed out"))?
+        .map_err(|_| Status::unavailable("usage watch receiver stopped"))?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Status::deadline_exceeded("usage watch admission timed out"));
+    }
+    Ok((admitted, worker))
+}
+
 #[tonic::async_trait]
 impl scanner_control_service_server::ScannerControlService for NodeService {
+    async fn scanner_usage_watch(
+        &self,
+        request: Request<ScannerUsageWatchRequest>,
+    ) -> Result<Response<ScannerUsageWatchResponse>, Status> {
+        use rustfs_protos::usage_watch::*;
+        static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let canonical =
+            canonical_usage_watch_request(request.get_ref()).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("usage watch authentication failed"))?;
+        let _admission = acquire_scanner_usage_watch_admission(&ADMISSION, &WORKERS, deadline).await?;
+        let request = request.into_inner();
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        if store.id.is_nil() || request.owner_id != store.id.to_string() {
+            return Err(Status::failed_precondition("usage watch storage owner changed"));
+        }
+        let requests = request
+            .entries
+            .iter()
+            .map(|entry| {
+                Ok(crate::storage::storage_api::ecstore_runtime::ScannerUsageWatchRequest {
+                    bucket: entry.bucket.clone(),
+                    bucket_incarnation: Uuid::from_slice(entry.bucket_incarnation.as_ref())
+                        .map_err(|_| Status::invalid_argument("invalid watch bucket incarnation"))?,
+                    watch_id: if entry.watch_id.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            Uuid::from_slice(entry.watch_id.as_ref())
+                                .map_err(|_| Status::invalid_argument("invalid watch token"))?,
+                        )
+                    },
+                    release: entry.release,
+                    session_id: if entry.session_id.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            Uuid::from_slice(entry.session_id.as_ref())
+                                .map_err(|_| Status::invalid_argument("invalid watch session"))?,
+                        )
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let observations = tokio::time::timeout_at(deadline, store.scanner_usage_watch(&requests))
+            .await
+            .map_err(|_| Status::deadline_exceeded("usage watch incarnation validation timed out"))?;
+        let entries = observations
+            .into_iter()
+            .map(|observation| {
+                let mut entry = ScannerUsageWatchResult {
+                    bucket: observation.bucket,
+                    ..Default::default()
+                };
+                if let Some(known) = observation.known {
+                    entry.known = true;
+                    entry.bucket_incarnation = known.bucket_incarnation.as_bytes().to_vec().into();
+                    entry.watch_id = known.watch_id.as_bytes().to_vec().into();
+                    entry.revision = known.revision;
+                    entry.inflight = known.inflight;
+                    entry.coverage_version = known.coverage_version;
+                    entry.coverage_epoch = known.coverage_epoch;
+                    entry.lease_remaining_ms = known.lease_remaining_ms;
+                }
+                entry
+            })
+            .collect();
+        let mut response = ScannerUsageWatchResponse {
+            protocol_version: USAGE_WATCH_PROTOCOL_VERSION,
+            owner_id: store.id.to_string(),
+            session_id: store.scanner_usage_watch_session_id().as_bytes().to_vec().into(),
+            entries,
+            response_proof: Bytes::new(),
+        };
+        let body = canonical_usage_watch_response(&canonical, &response)
+            .map_err(|_| Status::internal("usage watch response is too large"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&body)
+            .map_err(|_| Status::unavailable("usage watch response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
+    }
+
     async fn scanner_scoped_dirty_usage_ack(
         &self,
         request: Request<ScannerScopedDirtyUsageAckRequest>,
@@ -3319,6 +3426,53 @@ impl Node for NodeService {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn usage_watch_receiver_bounds_bursts_without_rejecting_queued_work() {
+        let admission = tokio::sync::Semaphore::new(8);
+        let workers = tokio::sync::Semaphore::new(4);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            active.push(
+                super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline)
+                    .await
+                    .expect("first four watch requests run"),
+            );
+        }
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            let mut waiting = Box::pin(super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline));
+            assert!(
+                futures::poll!(waiting.as_mut()).is_pending(),
+                "a bounded burst waits instead of self-rejecting"
+            );
+            queued.push(waiting);
+        }
+        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(workers.available_permits(), 0);
+        let overflow = super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline)
+            .await
+            .expect_err("a ninth request cannot enlarge the bounded queue");
+        assert_eq!(overflow.code(), tonic::Code::ResourceExhausted);
+        drop(active);
+        let resumed = futures_util::future::join_all(queued).await;
+        assert!(resumed.iter().all(Result::is_ok));
+        assert_eq!(workers.available_permits(), 0);
+        drop(resumed);
+        assert_eq!(admission.available_permits(), 8);
+        assert_eq!(workers.available_permits(), 4);
+
+        let held = workers.acquire_many(4).await.expect("hold all processing slots");
+        let mut expired = Box::pin(super::acquire_scanner_usage_watch_admission(&admission, &workers, deadline));
+        assert!(futures::poll!(expired.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let error = expired.await.expect_err("admission shares the original operation deadline");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(admission.available_permits(), 8, "timed-out waiters release admission");
+        drop(held);
+        assert_eq!(workers.available_permits(), 4);
+    }
+
     use super::{
         CROSS_POOL_FENCE_SUPPORTED_VERSION, CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE,
         KMS_SIGNAL_SUBSYSTEM, MetricType, Node as _, NodeService, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,

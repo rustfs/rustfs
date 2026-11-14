@@ -5,6 +5,7 @@
 {{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
 {{- $generatedVolumes := empty .Values.config.rustfs.volumes }}
 {{- $localEndpointHostAutoInject := empty .Values.secret.existingSecret }}
+{{- $initContainerResources := .Values.initContainer.resources | default dict -}}
 {{- with .Values.localEndpointHost }}
 {{- if and (hasKey . "autoInject") (ne .autoInject nil) }}
 {{- if not (kindIs "bool" .autoInject) }}
@@ -182,6 +183,8 @@ spec:
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
+          resources:
+            {{- toYaml $initContainerResources | nindent 12 }}
           volumeMounts:
             {{- if $dataPvcEnabled }}
             {{- if gt $drivesPerNode 1 }}

@@ -93,15 +93,15 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod list {
-        pub(crate) use super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
+        pub(crate) use super::super::storage_contracts::ListOperations;
     }
 
     pub(crate) mod multipart {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
+        pub(crate) use super::super::storage_contracts::ListPartsInfo;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartInfo, MultipartOperations, PartInfo};
-        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -148,9 +148,11 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::access_owned;
+    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
-        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
+        authorize_object_request, resolve_req_info,
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
@@ -172,12 +174,13 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::authorize_create_bucket;
+    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::{
         AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo,
         RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
         RequestedObjectTags, TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
-        authorize_request, bucket_config_mutation_incarnation, parity_test_support,
+        authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+        authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
@@ -320,8 +323,8 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
             find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
-            sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
-            verify_rpc_signature, with_remote_background_io,
+            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+            verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
         };
     }
 
@@ -382,20 +385,9 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
-
-        pub(crate) mod contract {
-            pub(crate) mod list {
-                pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
-            }
-        }
-
-        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
-
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod common {
@@ -405,18 +397,16 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod multipart {
         pub(crate) use super::super::super::s3_api::multipart::{
-            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+            parse_upload_part_number,
         };
 
         pub(crate) mod contract {
             pub(crate) mod multipart {
-                pub(crate) use super::super::super::super::contract::multipart::{
-                    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
-                };
+                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
 
                 #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};
+                pub(crate) use super::super::super::super::contract::multipart::PartInfo;
             }
         }
 
@@ -595,8 +585,8 @@ pub(crate) mod ecstore_global {
 
 pub(crate) mod ecstore_runtime {
     pub(crate) use rustfs_ecstore::api::runtime::{
-        InstanceContext, boot_time, bootstrap_ctx, bucket_monitor, deployment_id, endpoint_pools, global_lock_client,
-        global_lock_clients, global_tier_config_mgr, region, rustfs_port, setup_is_dist_erasure,
+        InstanceContext, ScannerUsageWatchRequest, boot_time, bootstrap_ctx, bucket_monitor, deployment_id, endpoint_pools,
+        global_lock_client, global_lock_clients, global_tier_config_mgr, region, rustfs_port, setup_is_dist_erasure,
     };
 }
 
@@ -664,17 +654,18 @@ pub(crate) mod ecstore_rpc {
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
         decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
-        sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, sign_tonic_rpc_response_proof,
-        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-        verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
         verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
         RpcReplayCacheAdmissionError, ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers,
-        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_put_file_capability,
-        verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
+        verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability, verify_tonic_boot_epoch_response,
+        verify_tonic_rpc_response_proof,
     };
 }
 
@@ -820,6 +811,7 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
+pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
@@ -2469,17 +2461,28 @@ pub(crate) fn verify_put_file_auth_trailer(
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
 }
 
-pub(crate) fn sign_ns_scanner_capability_with_checkpoint_coverage(
+pub(crate) fn sign_ns_scanner_usage_watch_capability(
+    challenge: uuid::Uuid,
+    server_epoch: uuid::Uuid,
+) -> std::io::Result<Vec<u8>> {
+    ecstore_rpc::sign_ns_scanner_usage_watch_capability(challenge, server_epoch)
+}
+
+pub(crate) fn sign_ns_scanner_capability_with_usage_capabilities(
     challenge: uuid::Uuid,
     server_epoch: uuid::Uuid,
     supports_tier_registry_generation: bool,
     supports_checkpoint_coverage: bool,
+    supports_durable_progress: bool,
+    supports_complete_observation: bool,
 ) -> std::io::Result<Vec<u8>> {
-    ecstore_rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
+    ecstore_rpc::sign_ns_scanner_capability_with_usage_capabilities(
         challenge,
         server_epoch,
         supports_tier_registry_generation,
         supports_checkpoint_coverage,
+        supports_durable_progress,
+        supports_complete_observation,
     )
 }
 

@@ -81,13 +81,12 @@ fn scanner_bucket_inventory_requires_exact_unique_set_union() {
 }
 
 #[test]
-fn should_publish_completed_snapshot_requires_full_clean_cycle() {
-    assert!(should_publish_completed_snapshot(3, 3, false, false));
-    assert!(!should_publish_completed_snapshot(2, 3, false, false));
-    assert!(!should_publish_completed_snapshot(3, 3, true, false));
-    assert!(!should_publish_completed_snapshot(3, 3, false, true));
+fn should_publish_completed_snapshot_requires_full_coverage_and_cycle_owner() {
+    assert!(should_publish_completed_snapshot(3, 3, false));
+    assert!(!should_publish_completed_snapshot(2, 3, false));
+    assert!(!should_publish_completed_snapshot(3, 3, true));
     assert!(
-        should_publish_completed_snapshot(0, 0, false, false),
+        should_publish_completed_snapshot(0, 0, false),
         "a completed empty namespace is an authoritative zero snapshot"
     );
 }
@@ -167,11 +166,10 @@ fn completed_root_cache(bucket: &str, objects: usize, update_secs: u64, source: 
 fn completed_data_usage_info_for_test(
     results: &[DataUsageCache],
     all_buckets: &[String],
-    budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let expected_sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
-    completed_usage_for_scope(results, &expected_sources, all_buckets, &[], true, budget_elapsed, cancelled)
+    completed_usage_for_scope(results, &expected_sources, all_buckets, &[], true, cancelled)
 }
 
 fn completed_usage_for_scope(
@@ -180,7 +178,6 @@ fn completed_usage_for_scope(
     all_buckets: &[String],
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
-    budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let first = results.first()?;
@@ -199,7 +196,6 @@ fn completed_usage_for_scope(
         },
         tier_registry_names,
         bucket_plan_complete,
-        budget_elapsed,
         cancelled,
     )
 }
@@ -208,7 +204,7 @@ fn completed_usage_for_scope(
 fn completed_data_usage_info_rejects_duplicate_bucket_inventory() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let buckets = vec!["bucket".to_string(), "bucket".to_string()];
-    assert!(completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &buckets, false).is_none());
 }
 
 #[test]
@@ -224,9 +220,8 @@ fn completed_data_usage_info_carries_segment_invalidation_proof_to_set_state() {
     let mut set = completed_root_cache("bucket", 2, 10, source);
     set.info.segment_invalidation_proof = Some(proof.clone());
 
-    let (usage, _) =
-        completed_usage_for_scope(&[set], &HashSet::from([source]), &["bucket".to_string()], &[], true, false, false)
-            .expect("complete set should publish root usage");
+    let (usage, _) = completed_usage_for_scope(&[set], &HashSet::from([source]), &["bucket".to_string()], &[], true, false)
+        .expect("complete set should publish root usage");
 
     assert_eq!(usage.usage_snapshot_set_states.len(), 1);
     assert_eq!(usage.usage_snapshot_set_states[0].segment_invalidation_proof, Some(proof));
@@ -244,14 +239,14 @@ fn completed_data_usage_info_rejects_extra_or_detached_bucket_data() {
             ..Default::default()
         },
     );
-    assert!(completed_data_usage_info_for_test(&[set.clone()], &buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set.clone()], &buckets, false).is_none());
     set.cache
         .get_mut(DATA_USAGE_ROOT)
         .expect("set root")
         .children
         .remove(&hash_path("unlisted").key());
     assert!(
-        completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none(),
+        completed_data_usage_info_for_test(&[set], &buckets, false).is_none(),
         "orphaned data must not disappear from authoritative accounting"
     );
 }
@@ -261,7 +256,7 @@ fn completed_data_usage_info_rejects_disconnected_expected_bucket() {
     let buckets = vec!["bucket".to_string()];
     let mut set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     set.cache.get_mut(DATA_USAGE_ROOT).expect("set root").children.clear();
-    assert!(completed_data_usage_info_for_test(&[set], &buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &buckets, false).is_none());
 }
 
 #[test]
@@ -270,10 +265,10 @@ fn completed_data_usage_info_rejects_root_scalar_data_and_unknown_key_format() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let mut scalar_root = set.clone();
     scalar_root.cache.get_mut(DATA_USAGE_ROOT).expect("set root").size = 10;
-    assert!(completed_data_usage_info_for_test(&[scalar_root], &buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[scalar_root], &buckets, false).is_none());
     let mut future_format = set;
     future_format.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT + 1;
-    assert!(completed_data_usage_info_for_test(&[future_format], &buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[future_format], &buckets, false).is_none());
 }
 
 #[test]
@@ -314,15 +309,15 @@ fn completed_data_usage_info_binds_all_results_to_requested_identity() {
             buckets: &buckets,
             identity: expected,
         };
-        assert!(completed_data_usage_info(&results, &scope, &[], true, false, false).is_none());
+        assert!(completed_data_usage_info(&results, &scope, &[], true, false).is_none());
     }
     let scope = ScannerSnapshotScope {
         sources: &sources,
         buckets: &buckets,
         identity,
     };
-    let (usage, _) = completed_data_usage_info(&results, &scope, &[], true, false, false)
-        .expect("the requested complete scope remains publishable");
+    let (usage, _) =
+        completed_data_usage_info(&results, &scope, &[], true, false).expect("the requested complete scope remains publishable");
     assert_eq!(usage.objects_total_count, 2);
     assert!(usage.is_complete_bucket_usage_snapshot());
 }
@@ -351,10 +346,7 @@ fn partial_usage_is_observational_not_authoritative_for_quota() {
     let stalled = lkg_root_cache("bucket", 1, stalled_source);
     let expected = HashSet::from([current_source, stalled_source]);
 
-    assert!(
-        completed_usage_for_scope(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false)
-            .is_none()
-    );
+    assert!(completed_usage_for_scope(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false).is_none());
     let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
         .expect("a completed set should produce an observational view");
     assert!(observed.usage_snapshot_partial);
@@ -518,7 +510,7 @@ fn completed_data_usage_info_publishes_tier_stats_across_sets() {
     });
     second_set.replace("bucket-a", DATA_USAGE_ROOT, tiered);
 
-    let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+    let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false)
         .expect("completed sets should publish a snapshot");
 
     assert_eq!(
@@ -555,7 +547,7 @@ fn completed_data_usage_info_rejects_logical_proof_mismatch() {
         ..Default::default()
     });
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -580,7 +572,7 @@ fn completed_data_usage_info_rejects_logical_total_size_mismatch() {
         ..Default::default()
     });
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -604,7 +596,7 @@ fn completed_data_usage_info_rejects_physical_proof_mismatch() {
         ..Default::default()
     });
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -632,7 +624,7 @@ fn completed_data_usage_info_rejects_unknown_physical_double_accounting() {
         ..Default::default()
     });
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -645,7 +637,7 @@ fn completed_data_usage_info_rejects_unknown_counter_overflow() {
         ..Default::default()
     });
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -653,7 +645,7 @@ fn completed_data_usage_info_accepts_no_tier_standard_empty_map_with_proof() {
     let all_buckets = vec!["bucket-a".to_string()];
     let set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
 
-    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false, false)
+    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false)
         .expect("no-tier STANDARD/RRS usage does not require a tier map");
     assert!(info.tier_stats.is_none());
 }
@@ -687,7 +679,7 @@ fn completed_data_usage_info_accepts_no_tier_unknown_and_standard_shape() {
         ..Default::default()
     });
 
-    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false, false)
+    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false)
         .expect("no-tier STANDARD plus UNKNOWN should remain publishable");
     assert_eq!(
         info.tier_stats.expect("unknown bucket should be retained").tiers[UNKNOWN_TIER].total_size,
@@ -726,9 +718,7 @@ fn completed_data_usage_info_accepts_unknown_only_with_current_registry_generati
     });
 
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
-    assert!(
-        completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_some()
-    );
+    assert!(completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false,).is_some());
 }
 
 #[test]
@@ -764,9 +754,7 @@ fn completed_data_usage_info_rejects_non_registry_tier_in_current_generation() {
     });
 
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
-    assert!(
-        completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_none()
-    );
+    assert!(completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false,).is_none());
 }
 
 #[test]
@@ -784,7 +772,7 @@ fn completed_data_usage_info_rejects_legacy_proof_missing_when_tier_accounted() 
     )]));
     entry.tier_accounting_proof = None;
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -794,7 +782,7 @@ fn completed_data_usage_info_rejects_legacy_proof_missing_for_scalar_usage() {
     let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
     entry.tier_accounting_proof = None;
 
-    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -803,7 +791,7 @@ fn completed_data_usage_info_omits_tier_stats_without_tiered_objects() {
     let set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
 
     let (data_usage_info, _) =
-        completed_data_usage_info_for_test(&[set], &all_buckets, false, false).expect("completed set should publish a snapshot");
+        completed_data_usage_info_for_test(&[set], &all_buckets, false).expect("completed set should publish a snapshot");
 
     assert!(data_usage_info.tier_stats.is_none());
 }
@@ -816,7 +804,7 @@ fn completed_data_usage_info_rejects_legacy_and_new_tier_generations_mixed() {
     current.info.tier_registry_generation = Some(42);
 
     assert!(
-        completed_data_usage_info_for_test(&[legacy, current], &all_buckets, false, false).is_none(),
+        completed_data_usage_info_for_test(&[legacy, current], &all_buckets, false).is_none(),
         "legacy and generation-tagged sets must not publish a mixed snapshot"
     );
 }
@@ -866,13 +854,10 @@ fn completed_data_usage_info_requires_every_set_before_publish() {
     second_set.replace("bucket-a", DATA_USAGE_ROOT, DataUsageEntry::default());
     second_set.replace("bucket-empty", DATA_USAGE_ROOT, DataUsageEntry::default());
 
-    assert!(
-        completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false).is_none()
-    );
-    assert!(completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, true, false).is_none());
-    assert!(completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, false, true).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, true).is_none());
 
-    let (data_usage_info, last_update) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+    let (data_usage_info, last_update) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false)
         .expect("all completed sets should produce a publishable data usage snapshot");
     assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
     assert_eq!(data_usage_info.scanner_cycle, Some(0));
@@ -927,7 +912,7 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
     };
     completed_set.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
 
-    let (data_usage_info, _) = completed_data_usage_info_for_test(&[completed_set], &[], false, false)
+    let (data_usage_info, _) = completed_data_usage_info_for_test(&[completed_set], &[], false)
         .expect("a completed empty namespace should produce an authoritative snapshot");
 
     assert!(data_usage_info.is_complete_bucket_usage_snapshot());
@@ -939,7 +924,7 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
 fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     let all_buckets = vec!["bucket".to_string()];
     let completed_set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
-    let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false, false);
+    let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false);
 
     assert!(completed_usage.is_some());
     // A moved dirty generation shades buckets for the next cycle; only a
@@ -947,7 +932,6 @@ fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     assert_eq!(
         classify_nsscanner_cycle(
             completed_usage.is_some(),
-            false,
             false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
@@ -958,7 +942,6 @@ fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     assert_eq!(
         classify_nsscanner_cycle(
             completed_usage.is_some(),
-            false,
             false,
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
@@ -984,7 +967,7 @@ fn completed_data_usage_info_adds_same_bucket_across_unique_sets() {
         },
     );
 
-    let (data_usage_info, last_update) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+    let (data_usage_info, last_update) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false)
         .expect("unique completed set snapshots should be aggregated");
     let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -1035,7 +1018,7 @@ fn completed_usage_certifies_only_matching_non_nil_bucket_incarnations() {
     let mut b = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
     a.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
     b.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
-    let published = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+    let published = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false)
         .unwrap()
         .0;
     assert_eq!(
@@ -1048,19 +1031,19 @@ fn completed_usage_certifies_only_matching_non_nil_bucket_incarnations() {
     b.info
         .scan_bucket_incarnations
         .insert("bucket".to_string(), uuid::Uuid::from_u128(8));
-    let mismatch = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+    let mismatch = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false)
         .unwrap()
         .0;
     assert_eq!(mismatch.buckets_usage["bucket"].bucket_incarnation, None);
     b.info.scan_bucket_incarnations.remove("bucket");
-    let missing = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+    let missing = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false)
         .unwrap()
         .0;
     assert_eq!(missing.buckets_usage["bucket"].bucket_incarnation, None);
     b.info
         .scan_bucket_incarnations
         .insert("bucket".to_string(), uuid::Uuid::nil());
-    let nil = completed_data_usage_info_for_test(&[a, b], &buckets, false, false).unwrap().0;
+    let nil = completed_data_usage_info_for_test(&[a, b], &buckets, false).unwrap().0;
     assert_eq!(nil.buckets_usage["bucket"].bucket_incarnation, None);
 }
 
@@ -1124,6 +1107,8 @@ fn checked_bucket_usage_info_moves_replication_keys_and_preserves_the_snapshot()
         );
     }
     let expected = BucketUsageInfo {
+        usage_value_state: None,
+        usage_certification: None,
         size: 32768,
         bucket_incarnation: None,
         replication_pending_size_v1: 0,
@@ -1254,7 +1239,7 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
     let second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
 
     let mut results = [first_set, second_set];
-    let (data_usage_info, _) = completed_data_usage_info_for_test(&results, &all_buckets, false, false)
+    let (data_usage_info, _) = completed_data_usage_info_for_test(&results, &all_buckets, false)
         .expect("nested bucket entries should be flattened before aggregation");
     let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -1313,7 +1298,7 @@ fn completed_data_usage_info_rejects_cyclic_bucket_entries() {
         .expect("nested entry")
         .add_child(&crate::hash_path("bucket"));
 
-    assert!(completed_data_usage_info_for_test(&[cache], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[cache], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1323,11 +1308,11 @@ fn completed_data_usage_info_rejects_duplicate_or_incomplete_set_sources() {
     let first_set = completed_root_cache("bucket", 2, 10, source);
     let duplicate_set = completed_root_cache("bucket", 3, 20, source);
 
-    assert!(completed_data_usage_info_for_test(&[first_set.clone(), duplicate_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set.clone(), duplicate_set], &all_buckets, false).is_none());
 
     let mut incomplete_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
     incomplete_set.info.snapshot_complete = false;
-    assert!(completed_data_usage_info_for_test(&[first_set, incomplete_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set, incomplete_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1337,10 +1322,7 @@ fn completed_data_usage_info_requires_exact_topology_sources() {
     let unexpected_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(99, 99));
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(1, 0)]);
 
-    assert!(
-        completed_usage_for_scope(&[first_set, unexpected_set], &expected_sources, &all_buckets, &[], true, false, false)
-            .is_none()
-    );
+    assert!(completed_usage_for_scope(&[first_set, unexpected_set], &expected_sources, &all_buckets, &[], true, false).is_none());
 }
 
 #[test]
@@ -1349,7 +1331,7 @@ fn completed_data_usage_info_rejects_incomplete_bucket_plan() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
 
-    assert!(completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &[], false, false, false).is_none());
+    assert!(completed_usage_for_scope(&[set], &expected_sources, &all_buckets, &[], false, false).is_none());
 }
 
 #[test]
@@ -1359,7 +1341,7 @@ fn completed_data_usage_info_rejects_missing_bucket_from_any_set() {
     complete_set.replace("bucket-b", DATA_USAGE_ROOT, DataUsageEntry::default());
     let missing_bucket_set = completed_root_cache("bucket-a", 3, 20, DataUsageCacheSource::new(1, 0));
 
-    assert!(completed_data_usage_info_for_test(&[complete_set, missing_bucket_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[complete_set, missing_bucket_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1369,7 +1351,7 @@ fn completed_data_usage_info_rejects_mixed_scan_plans() {
     let mut second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
     second_set.info.scan_plan_digest = Some(DataUsageScanPlanDigest([8; 32]));
 
-    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1380,7 +1362,7 @@ fn completed_data_usage_info_rejects_mixed_scanner_cycles() {
     first_set.info.next_cycle = 12;
     second_set.info.next_cycle = 13;
 
-    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1391,7 +1373,7 @@ fn completed_data_usage_info_rejects_mixed_leader_epochs() {
     first_set.info.leader_epoch = 11;
     second_set.info.leader_epoch = 12;
 
-    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1400,7 +1382,7 @@ fn completed_data_usage_info_rejects_counter_overflow() {
     let first_set = completed_root_cache("bucket", usize::MAX, 10, DataUsageCacheSource::new(0, 0));
     let second_set = completed_root_cache("bucket", 1, 20, DataUsageCacheSource::new(1, 0));
 
-    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
+    assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false).is_none());
 }
 
 #[test]
@@ -1566,17 +1548,27 @@ fn current_cache_snapshot_rejects_current_bucket_cache_with_detached_entry() {
 #[test]
 fn namespace_scanner_worker_selection_keeps_coordinator_fallback_disks() {
     let server_epoch = uuid::Uuid::new_v4();
-    let workers = namespace_scanner_workers(vec!["local", "legacy-remote"], vec![("v4", server_epoch)]);
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
+        server_epoch,
+        supports_durable_progress: false,
+        supports_complete_observation: false,
+        supports_usage_watch: false,
+    };
+    let workers = namespace_scanner_workers(
+        vec!["local", "legacy-remote"],
+        vec![("v4", capabilities)],
+        &ScannerCycleBudgetConfig::default(),
+    );
 
     assert_eq!(
         workers,
         vec![
             ("local", NamespaceScannerWorkerMode::Coordinator),
             ("legacy-remote", NamespaceScannerWorkerMode::Coordinator),
-            ("v4", NamespaceScannerWorkerMode::RemoteV4(server_epoch)),
+            ("v4", NamespaceScannerWorkerMode::RemoteV4(capabilities)),
         ]
     );
-    assert!(namespace_scanner_workers::<()>(Vec::new(), Vec::new()).is_empty());
+    assert!(namespace_scanner_workers::<()>(Vec::new(), Vec::new(), &ScannerCycleBudgetConfig::default()).is_empty());
 }
 
 #[test]
@@ -1736,10 +1728,7 @@ fn scoped_scan_complete_root_requires_current_coverage_from_every_set() {
         let mut second = completed_root_cache("bucket", 3, 10, DataUsageCacheSource::new(1, 0));
         first.info.scan_coverage_digest = first_coverage;
         second.info.scan_coverage_digest = second_coverage;
-        assert_eq!(
-            completed_data_usage_info(&[first, second], &scope, &[], true, false, false).is_some(),
-            valid
-        );
+        assert_eq!(completed_data_usage_info(&[first, second], &scope, &[], true, false).is_some(), valid);
     }
 }
 
@@ -1880,3 +1869,105 @@ fn replication_execution_digest_is_canonical_and_tracks_statistics() {
 
 #[path = "usage_candidate_metrics_tests.rs"]
 mod usage_candidate_metrics_tests;
+
+#[path = "usage_observation_tests.rs"]
+mod usage_observation_tests;
+
+#[tokio::test(start_paused = true)]
+async fn usage_quantum_real_remote_wire_and_entry_fallback_preserve_parent_limits() {
+    use crate::scanner_budget::ScannerBucketQuantum;
+    let owner = CancellationToken::new();
+    let cycle = ScannerCycleBudget::new_with_progress_tracking(
+        &owner,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(10)),
+            max_objects: Some(5),
+            max_directories: Some(6),
+            bucket_quantum: Some(ScannerBucketQuantum {
+                max_duration: Some(Duration::from_secs(20)),
+                max_objects: Some(10),
+                max_directories: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    cycle.record_object_scanned();
+    assert!(cycle.try_start_directory());
+    let (source, source_token) = cycle.for_source(&owner);
+    let (bucket, _) = source.for_bucket(&source_token);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let remaining = bucket.remaining_config();
+    let wire = crate::remote_scanner::remote_scanner_budget_wire_round_trip_for_test(remaining);
+    assert_eq!(wire.max_duration, Some(Duration::from_secs(8)));
+    assert_eq!(wire.max_objects, Some(4));
+    assert_eq!(wire.max_directories, Some(5));
+    assert!(wire.max_duration <= cycle.remaining_config().max_duration);
+    assert!(wire.max_objects <= cycle.remaining_config().max_objects);
+    assert!(wire.max_directories <= cycle.remaining_config().max_directories);
+    let capabilities = crate::storage_api::scanner_io::NsScannerCapabilities {
+        server_epoch: uuid::Uuid::new_v4(),
+        supports_durable_progress: true,
+        supports_complete_observation: true,
+        supports_usage_watch: true,
+    };
+    let ordinary = namespace_scanner_workers(vec!["local"], vec![("remote", capabilities)], &remaining);
+    assert_eq!(ordinary[1].1, NamespaceScannerWorkerMode::RemoteV4(capabilities));
+    let mut entry_modes = Vec::new();
+    for (entries, names) in [(Some(7), None), (None, Some(8)), (Some(7), Some(8))] {
+        let cycle = ScannerCycleBudget::new_with_progress_tracking(
+            &owner,
+            ScannerCycleBudgetConfig {
+                max_entries: entries,
+                max_entry_name_bytes: names,
+                bucket_quantum: Some(ScannerBucketQuantum {
+                    max_entries: Some(10),
+                    max_entry_name_bytes: Some(10),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let (source, source_token) = cycle.for_source(&owner);
+        let (bucket, _) = source.for_bucket(&source_token);
+        let workers = namespace_scanner_workers(vec!["local"], vec![("remote", capabilities)], &bucket.remaining_config());
+        assert_eq!(workers[1].1, NamespaceScannerWorkerMode::Coordinator);
+        let walkers = namespace_scanner_walkers(workers, 2, |disk| *disk == "local");
+        assert_eq!(walkers.iter().filter(|walker| walker.disk == "remote").count(), 1);
+        assert!(bucket.try_charge_raw_entry(3, 1));
+        if let Some(limit) = entries {
+            assert_eq!(cycle.remaining_config().max_entries, Some(limit - 1));
+            assert_eq!(bucket.remaining_config().max_entries, Some(limit - 1));
+        }
+        if let Some(limit) = names {
+            assert_eq!(cycle.remaining_config().max_entry_name_bytes, Some(limit - 3));
+            assert_eq!(bucket.remaining_config().max_entry_name_bytes, Some(limit - 3));
+        }
+        entry_modes.push(serde_json::json!({
+            "entries_limit": entries, "name_bytes_limit": names, "mode": "coordinator",
+            "parent_entries_remaining": cycle.remaining_config().max_entries,
+            "parent_name_bytes_remaining": cycle.remaining_config().max_entry_name_bytes,
+        }));
+    }
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "assertion_id": "USAGE-13-A02", "status": "PASS",
+            "evidence": {"encoded_duration_ms": wire.max_duration.map(|duration| duration.as_millis()),
+                "encoded_objects": wire.max_objects, "encoded_directories": wire.max_directories,
+                "entry_budget_fallbacks": entry_modes}
+        })
+    );
+    cycle.token().cancel();
+    source.token().cancel();
+    bucket.token().cancel();
+    owner.cancel();
+    assert!(owner.is_cancelled());
+    println!(
+        "usage_cleanup: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "status": "PASS", "scope": "process-local budget and worker selection",
+            "owner_cancelled": owner.is_cancelled(),
+        })
+    );
+}

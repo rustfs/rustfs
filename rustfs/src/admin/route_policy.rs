@@ -1878,6 +1878,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/account/permissions",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     // The self-service account routes act on the caller, never on a target
     // named in the request, so they gate on possession of the credential (plus,
     // for the mutation, knowledge of the current secret) rather than on an
@@ -2648,6 +2653,11 @@ mod tests {
             DeferredRoutePolicyReason::MultipleActions,
         );
         assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action);
+        assert_deferred(
+            HttpMethod::Post,
+            "/rustfs/admin/v4/account/permissions",
+            DeferredRoutePolicyReason::CredentialOnly,
+        );
         assert_deferred(
             HttpMethod::Post,
             "/rustfs/admin/v3/object-zip-downloads",

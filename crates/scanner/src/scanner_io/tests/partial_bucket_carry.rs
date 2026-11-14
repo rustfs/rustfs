@@ -38,12 +38,15 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
             ..Default::default()
         },
     );
+    // The count stop must drain real bucket-cache commits, not a timed mock.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget,
                 updates,
@@ -56,6 +59,7 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
                 requires_full_scan: options.requires_full_scan,
                 service_cohort: None,
                 resolved_scope_observer: options.resolved_scope_observer,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },

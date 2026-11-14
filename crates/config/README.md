@@ -121,6 +121,11 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` (canonical)
 - `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
 - `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
 - `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
@@ -135,6 +140,12 @@ Scanner cycle budget controls:
 
 - When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
 - An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+
+Scanner bucket quantum controls:
+
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES`, `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES`, and `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` cap one bucket admission. Their persistent keys are `scanner.bucket_quantum_duration`, `scanner.bucket_quantum_objects`, `scanner.bucket_quantum_directories`, `scanner.bucket_quantum_entries`, and `scanner.bucket_quantum_name_bytes`; duration is in whole seconds and the remaining keys are work counts or bytes.
+- All five defaults are `0` for controlled rollout. A positive value enables that dimension; `0` disables that dimension, and all five zero values disable the bucket quantum. Parent cycle limits remain in force. Invalid unsigned integers and durations outside the platform timer range are rejected; environment overrides take precedence but cannot hide invalid persisted values. Admin scanner status reports each effective value and source under `runtime_config.bucket_quantum_*`, using `bucket_quantum_duration_seconds` for duration.
+- Disabled defaults are an initial rollout state, not completion of usage-convergence acceptance. Production defaults require matched-topology A/B measurements and the remote progress/fairness checks in [Scanner runtime controls](../../docs/operations/scanner-runtime-controls.md#bucket-quantum-rollout-and-acceptance). These controls do not certify partial usage or acknowledge pending dirty work.
 
 Scanner recovery retry controls:
 

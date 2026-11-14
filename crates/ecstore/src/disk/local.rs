@@ -77,10 +77,10 @@ use crate::disk::{
     format::FormatV3,
     fs::{
         O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std,
-        remove, remove_all_std, remove_std, rename,
+        remove_all_std, remove_std, rename,
     },
     is_quota_mutation_fence_path, os,
-    os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
+    os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all_ignore_missing_source},
     quota_mutation_fence_path,
 };
 use crate::erasure::coding::{self, bitrot_verify};
@@ -8162,6 +8162,7 @@ pub struct LocalDisk {
     publication_root: os::PublicationRoot,
     publication_history: Option<os::NativePublicationRegistration>,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
+    pub(crate) usage_watch_binding: Arc<super::usage_watch::DiskUsageWatchBinding>,
     multipart_index: Arc<multipart_index::IndexOwner>,
     /// I/O root pinned to the mount instance that was opened while the disk
     /// was initialized. On Linux this is `/proc/self/fd/<dirfd>/.`; resolving
@@ -8727,6 +8728,7 @@ impl LocalDisk {
             publication_root,
             publication_history,
             multipart_proof_authority: OnceLock::new(),
+            usage_watch_binding: Arc::new(super::usage_watch::DiskUsageWatchBinding::default()),
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
             mount_lease: mount_lease.clone(),
@@ -9571,6 +9573,7 @@ impl LocalDisk {
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
             crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
         }
@@ -9780,6 +9783,7 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<Error>> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         let concurrency = delete_version_batch_concurrency(&versions, &opts);
         let mut errors = vec![None; versions.len()];
         let mut pending = stream::iter(
@@ -9812,6 +9816,7 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<DiskError>> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         let payload = super::GuardedDeleteVersionsPayload {
             versions,
             opts,
@@ -9847,6 +9852,8 @@ impl LocalDisk {
         mut fi: FileInfo,
         mutation: DeleteVersionMutation,
     ) -> Result<()> {
+        let mut mutation = mutation;
+        mutation.namespace_owner = self.usage_watch_binding.owner(volume, mutation.namespace_owner.take());
         if volume == RUSTFS_META_BUCKET {
             crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
         }
@@ -10469,7 +10476,12 @@ impl LocalDisk {
             .await
             .err()
         } else {
-            match rename(&delete_path, &trash_path).await {
+            let renamed = if namespace_owner.is_some() {
+                os::rename_with_namespace_owner(delete_path, &trash_path, namespace_owner.clone()).await
+            } else {
+                rename(delete_path, &trash_path).await
+            };
+            match renamed {
                 Ok(()) => None,
                 Err(err)
                     if err.kind() == ErrorKind::NotFound && os::rename_source_is_missing(delete_path, &self.publication_root) =>
@@ -10521,6 +10533,7 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
             crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
         }
@@ -10956,6 +10969,7 @@ impl LocalDisk {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn delete_file(&self, base_path: &Path, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None, None)
             .await
@@ -12257,6 +12271,15 @@ impl LocalDisk {
     // Executes the given SyncMode verbatim: durability policy (tier gating,
     // system-critical pinning) is resolved by callers via effective_durability.
     async fn write_all_internal(&self, file_path: &Path, data: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
+        let relative = file_path
+            .strip_prefix(self.io_root())
+            .or_else(|_| file_path.strip_prefix(&self.root));
+        let bucket = relative
+            .ok()
+            .and_then(|path| path.components().next())
+            .and_then(|component| component.as_os_str().to_str())
+            .unwrap_or("");
+        let usage_owner = self.usage_watch_binding.owner(bucket, None);
         let skip_parent = if skip_parent.as_os_str().is_empty() {
             self.io_root()
         } else {
@@ -12276,6 +12299,7 @@ impl LocalDisk {
 
         let root = self.publication_root.clone();
         let operation = move |is_cancelled: &dyn Fn() -> bool| {
+            let _usage_owner = usage_owner;
             if is_cancelled() {
                 return Err(std::io::Error::other("blocking namespace operation cancelled"));
             }
@@ -15394,7 +15418,15 @@ impl DiskAPI for LocalDisk {
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
         multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), src_volume, src_path)?;
-        let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
+        let usage_owner = self.usage_watch_binding.owner(src_volume, None);
+        let usage_owner = if src_volume == dst_volume {
+            usage_owner
+        } else {
+            self.usage_watch_binding.owner(dst_volume, usage_owner)
+        };
+        let source_owner = self
+            .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
+            .await?;
         let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
         let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
         let (dst_volume_dir, dst_file_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
@@ -15785,7 +15817,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
-        let source_owner = self.multipart_source_owner(volume, path, true, false, None).await?;
+        let usage_owner = self.usage_watch_binding.owner(volume, None);
+        let source_owner = self.multipart_source_owner(volume, path, true, false, usage_owner).await?;
         let admission = self.multipart_source_admission(volume, path, true, false)?;
         let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         let txn_rel_path = crate::disk::part_transaction_path(path);
@@ -15989,7 +16022,15 @@ impl DiskAPI for LocalDisk {
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
         multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), src_volume, src_path)?;
-        let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
+        let usage_owner = self.usage_watch_binding.owner(src_volume, None);
+        let usage_owner = if src_volume == dst_volume {
+            usage_owner
+        } else {
+            self.usage_watch_binding.owner(dst_volume, usage_owner)
+        };
+        let source_owner = self
+            .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
+            .await?;
         multipart_staging::reject_reserved_anchor(dst_path)?;
         let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
         let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
@@ -16429,8 +16470,15 @@ impl DiskAPI for LocalDisk {
         }
 
         if !published_transaction_meta && let Some(parent) = src_file_for_cleanup.parent() {
-            self.delete_file(&src_volume_for_cleanup, &parent.to_path_buf(), false, false)
-                .await?;
+            self.delete_file_with_namespace_owner(
+                &src_volume_for_cleanup,
+                &parent.to_path_buf(),
+                false,
+                false,
+                source_owner,
+                None,
+            )
+            .await?;
         }
 
         Ok(())
@@ -16438,6 +16486,12 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        let usage_owner = self.usage_watch_binding.owner(src_volume, None);
+        let usage_owner = if src_volume == dst_volume {
+            usage_owner
+        } else {
+            self.usage_watch_binding.owner(dst_volume, usage_owner)
+        };
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), src_volume, src_path)?;
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), dst_volume, dst_path)?;
         if src_volume == RUSTFS_META_MULTIPART_BUCKET || dst_volume == RUSTFS_META_MULTIPART_BUCKET {
@@ -16495,14 +16549,21 @@ impl DiskAPI for LocalDisk {
             // destination is the normal case when renaming a directory to a new
             // location, so tolerate NotFound instead of aborting the whole rename
             // (MinIO's RenameFile ignores osIsNotExist here).
-            if let Err(e) = remove(&dst_file_path).await
+            if let Err(e) = os::remove_with_owner(&dst_file_path, usage_owner.clone()).await
                 && e.kind() != ErrorKind::NotFound
             {
                 return Err(to_file_error(e).into());
             }
         }
 
-        rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await?;
+        os::rename_all_with_owner(
+            &src_file_path,
+            &dst_file_path,
+            &dst_volume_dir,
+            &self.publication_root,
+            usage_owner.clone(),
+        )
+        .await?;
 
         // Both ends changed identity: the source path no longer exists and the
         // destination now resolves to a different inode (backlog#1145).
@@ -16515,7 +16576,9 @@ impl DiskAPI for LocalDisk {
         }
 
         if let Some(parent) = src_file_path.parent() {
-            let _ = self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await;
+            let _ = self
+                .delete_file_with_namespace_owner(&src_volume_dir, &parent.to_path_buf(), false, false, usage_owner, None)
+                .await;
         }
 
         Ok(())
@@ -16523,6 +16586,10 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
+        // Normal PUT streams into the internal staging volume and is covered
+        // by rename_data. A raw stream into a live user volume has no retained
+        // physical completion owner, so it revokes the watch capability.
+        self.usage_watch_binding.mark_uncovered_user_stream(volume);
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         multipart_staging::reject_reserved_anchor(path)?;
         multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
@@ -16572,6 +16639,12 @@ impl DiskAPI for LocalDisk {
         {
             return self.retire_format_bootstrap().await;
         }
+        let usage_owner = self.usage_watch_binding.owner(src_volume, None);
+        let usage_owner = if src_volume == dst_volume {
+            usage_owner
+        } else {
+            self.usage_watch_binding.owner(dst_volume, usage_owner)
+        };
         let source = self.io_get_object_path(src_volume, src_path)?;
         let destination = self.io_get_object_path(dst_volume, dst_path)?;
         check_path_length(source.to_string_lossy().as_ref())?;
@@ -16582,9 +16655,11 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
         if durability.syncs_data_shards() {
+            let sync_owner = usage_owner.clone();
             #[cfg(target_os = "linux")]
             let mount_lease = self.mount_lease.clone();
             spawn_blocking_with_disk_io_permit(None, move || {
+                let _usage_owner = sync_owner;
                 #[cfg(target_os = "linux")]
                 let _mount_lease = mount_lease;
                 os::sync_file(&source)
@@ -16595,7 +16670,7 @@ impl DiskAPI for LocalDisk {
         }
         self.rename_file(src_volume, src_path, dst_volume, dst_path).await?;
         if durability.syncs_commit_metadata() {
-            os::fsync_dir(destination.parent().ok_or(DiskError::InvalidPath)?)
+            os::fsync_dir_with_owner(destination.parent().ok_or(DiskError::InvalidPath)?, usage_owner.clone())
                 .await
                 .map_err(to_file_error)?;
         }
@@ -16605,6 +16680,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
+        self.usage_watch_binding.mark_uncovered_user_stream(volume);
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         multipart_staging::reject_reserved_anchor(path)?;
         multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
@@ -16975,6 +17051,7 @@ impl DiskAPI for LocalDisk {
             } else {
                 self.multipart_source_owner(volume, path, true, true, None).await?
             };
+            let owner = self.usage_watch_binding.owner(volume, owner);
             self.move_to_trash_with_namespace_owner(&file_path, false, false, owner)
                 .await?;
 
@@ -17130,6 +17207,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        let status_only = super::usage_watch::status_only_metadata_update(&fi, opts);
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         let object_path = self.get_object_path(volume, path)?;
@@ -17142,13 +17220,18 @@ impl DiskAPI for LocalDisk {
                     condition,
                 )
                 .await?;
-            let owner: Option<Arc<dyn Send + Sync>> = Some(authority.clone());
+            let owner = self.usage_watch_binding.owner(volume, Some(authority.clone()));
             let owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, owner).await);
             return self
                 .reconcile_transition_state_metadata(volume, path, fi.version_id, condition, owner, authority)
                 .await;
         }
         let source_owner = self.multipart_source_owner(volume, path, false, true, None).await?;
+        let source_owner = if status_only {
+            source_owner
+        } else {
+            self.usage_watch_binding.owner(volume, source_owner)
+        };
         let namespace_owner: Option<Arc<dyn Send + Sync>> =
             Some(os::acquire_metadata_mutation_lease(&object_path, source_owner).await);
         if !fi.metadata.is_empty() {
@@ -17536,18 +17619,35 @@ impl DiskAPI for LocalDisk {
         // non-recursive rmdir calls. A file that exists during the scan, or
         // appears before its parent is removed, fails closed with
         // VolumeNotEmpty. Only an explicit force delete removes recursively.
-        let res = if force_delete {
-            fs::remove_dir_all(&p).await
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                remove_empty_directory_tree_under_mount_lease(&self.mount_lease, volume, p.clone()).await
+        let usage_owner = self.usage_watch_binding.owner(volume, None);
+        let physical_path = p.clone();
+        let physical_volume = volume.to_owned();
+        let backend = Arc::clone(&self.io_backend);
+        #[cfg(target_os = "linux")]
+        let mount_lease = Arc::clone(&self.mount_lease);
+        let res = tokio::spawn(async move {
+            let _usage_owner = usage_owner;
+            let _volume_mutation_guard = _volume_mutation_guard;
+            let result = if force_delete {
+                fs::remove_dir_all(&physical_path).await
+            } else {
+                #[cfg(target_os = "linux")]
+                {
+                    remove_empty_directory_tree_under_mount_lease(&mount_lease, &physical_volume, physical_path.clone()).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    remove_empty_directory_tree(&physical_path).await
+                }
+            };
+            if result.is_ok() {
+                backend.invalidate_cached_fds_for_volume(&physical_volume);
+                invalidate_bucket_cache(&physical_path);
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                remove_empty_directory_tree(&p).await
-            }
-        };
+            result
+        })
+        .await
+        .map_err(DiskError::from)?;
 
         if let Err(err) = res {
             let e: DiskError = classify_delete_volume_error(err);
@@ -17726,6 +17826,9 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 
     Ok((disk_info, root_drive))
 }
+
+#[cfg(all(test, not(windows)))]
+mod usage_watch_tests;
 
 #[cfg(test)]
 mod test {
