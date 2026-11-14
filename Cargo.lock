@@ -11029,6 +11029,7 @@ dependencies = [
  "flatbuffers",
  "hotpath",
  "hyper",
+ "hyper-util",
  "prost 0.14.6",
  "rcgen",
  "rmp-serde",

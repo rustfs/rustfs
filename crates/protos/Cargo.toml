@@ -79,6 +79,7 @@ tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aw
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
 hyper = { workspace = true, optional = true, features = ["tracing"] }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 serde = { workspace = true }
