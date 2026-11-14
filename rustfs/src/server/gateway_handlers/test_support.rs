@@ -54,7 +54,19 @@ pub(crate) fn signed_request(
     access_key: &str,
     secret_key: &str,
 ) -> Request<Empty<Bytes>> {
-    let mut headers = HeaderMap::new();
+    signed_request_with_headers(form, method, path, query, access_key, secret_key, HeaderMap::new())
+}
+
+/// Signs the supplied headers along with the request target.
+pub(crate) fn signed_request_with_headers(
+    form: Signed,
+    method: Method,
+    path: &str,
+    query: &str,
+    access_key: &str,
+    secret_key: &str,
+    mut headers: HeaderMap,
+) -> Request<Empty<Bytes>> {
     headers.insert(http::header::HOST, HeaderValue::from_static("localhost"));
     let probe = Request::builder()
         .method(method.clone())

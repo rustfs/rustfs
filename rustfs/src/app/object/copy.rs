@@ -232,7 +232,7 @@ impl DefaultObjectUsecase {
         }
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
         validate_sse_headers_for_write(
-            requested_sse.as_ref(),
+            requested_sse.as_ref().map(|value| value.as_str()),
             requested_kms_key_id.as_ref(),
             ssekms_context.as_ref(),
             sse_customer_algorithm.as_ref(),
@@ -456,7 +456,7 @@ impl DefaultObjectUsecase {
 
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
             bucket_sse_config.as_ref().map(|(config, _)| config),
-            requested_sse,
+            requested_sse.map(|value| value.as_str().to_owned()),
             requested_kms_key_id,
             has_explicit_ssec,
         );
@@ -918,7 +918,7 @@ impl DefaultObjectUsecase {
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
             copy_source_version_id,
-            server_side_encryption: effective_sse,
+            server_side_encryption: effective_sse.map(Into::into),
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -1019,7 +1019,7 @@ mod tests {
             .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
             .map(bucket_default_write_sse);
 
-        assert_eq!(effective_sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(effective_sse.as_deref(), Some(ServerSideEncryption::AES256));
 
         // Valid algorithms map to themselves, byte-identical to the PUT path.
         for (configured, expected) in [

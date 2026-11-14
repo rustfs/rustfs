@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use crate::app::RequestEnvelope;
+use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiErrorDiagnostic;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
@@ -268,10 +268,31 @@ pub(in crate::storage) async fn through_gateway_seam<I, GatewayInput, GatewayOut
 where
     F: Future<Output = rustfs_s3_types::S3Result<GatewayOutput>>,
 {
+    through_gateway_seam_answered(req, input_from_s3s, output_to_s3s, |envelope, input| {
+        let answer = use_case(envelope, input);
+        async move { answer.await.map(Answered::new) }
+    })
+    .await
+}
+
+/// [`through_gateway_seam`] for a use case that answers a status or response headers of its own:
+/// both are written onto the response unchanged.
+pub(in crate::storage) async fn through_gateway_seam_answered<I, GatewayInput, GatewayOutput, O, F>(
+    req: S3Request<I>,
+    input_from_s3s: fn(I) -> Result<GatewayInput, ConversionError>,
+    output_to_s3s: fn(GatewayOutput) -> Result<O, ConversionError>,
+    use_case: impl FnOnce(RequestEnvelope, GatewayInput) -> F,
+) -> S3Result<S3Response<O>>
+where
+    F: Future<Output = rustfs_s3_types::S3Result<Answered<GatewayOutput>>>,
+{
     let envelope = RequestEnvelope::from_s3s(&req);
     let input = input_from_s3s(req.input).map_err(seam_error)?;
-    let output = use_case(envelope, input).await?;
-    output_to_s3s(output).map(S3Response::new).map_err(seam_error)
+    let Answered { output, status, headers } = use_case(envelope, input).await?;
+    let mut response = output_to_s3s(output).map(S3Response::new).map_err(seam_error)?;
+    response.status = status;
+    response.headers = headers;
+    Ok(response)
 }
 
 fn seam_error(error: ConversionError) -> S3Error {
@@ -281,6 +302,8 @@ fn seam_error(error: ConversionError) -> S3Error {
 // The bodies of the methods below, one file per migration batch (rustfs/backlog#2765).
 #[path = "legacy_edge/mod.rs"]
 mod legacy_edge;
+#[cfg(test)]
+pub(crate) use legacy_edge::list_objects_v2_through_legacy_edge;
 
 #[async_trait::async_trait]
 impl S3 for FS {

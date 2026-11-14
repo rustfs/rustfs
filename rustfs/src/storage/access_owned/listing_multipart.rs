@@ -52,6 +52,27 @@ pub(crate) async fn authorize_bucket_listing<R: AuthorizationRequest + ?Sized>(
     Ok(prepare_table_data_plane_list_access(req, bucket, action).await?)
 }
 
+/// The authorization of ListMultipartUploads: the bucket generation captured before the decision,
+/// `ListBucketMultipartUploads` on the bucket, the table snapshot, and the generation handed on
+/// after an allow (a generation that could not be read is raised then, not before the decision).
+///
+/// # Errors
+///
+/// `InternalError` when the access phase installed no `ReqInfo`; otherwise what the policy
+/// decision, the table catalog or the generation read refuses.
+pub(crate) async fn authorize_list_multipart_uploads<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let action = S3Action::ListBucketMultipartUploadsAction;
+    authorize_bucket_request(req, bucket, Action::S3Action(action)).await?;
+    prepare_table_data_plane_list_access(req, bucket, action).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
 /// The authorization of ListObjectsV2: the object listing's, with the bucket generation an
 /// on-demand migration merge binds to captured before the decision and handed on after an allow.
 ///
@@ -119,7 +140,7 @@ fn table_list_cursor_key<R: AuthorizationRequest + ?Sized>(req: &R) -> super::su
 
 /// Snapshots which tables of a table bucket the caller may list, for the listing's use case. A
 /// bucket that is not a table bucket installs nothing.
-pub(crate) async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
+async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     action: S3Action,

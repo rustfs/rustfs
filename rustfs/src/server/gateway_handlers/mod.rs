@@ -45,7 +45,7 @@ mod object_write;
 pub(crate) mod test_support;
 
 use self::error::handler_error;
-use crate::app::RequestEnvelope;
+use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use rustfs_gateway::{Handler, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};
 use rustfs_io_metrics::record_s3_op;
@@ -90,6 +90,21 @@ pub(crate) trait Served: OperationCodec + Sized {
         envelope: RequestEnvelope,
         request: Req<Self>,
     ) -> impl Future<Output = S3Result<Resp<Self>>> + Send;
+}
+
+/// The gateway's answer for a use case's [`Answered`]: its status when it set one, and the headers
+/// its legacy body wrote. The gateway refuses a header it owns or its encoder wrote with a `500`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "HeadObject and GetObject of batch C are its first callers")
+)]
+fn resp<O: Served>(answered: Answered<O::Output>) -> Resp<O> {
+    let Answered { output, status, headers } = answered;
+    match status {
+        Some(status) => Resp::with_status(output, status.as_u16()),
+        None => Resp::new(output),
+    }
+    .with_extra_headers(headers)
 }
 
 impl<O: Served> Handler<O> for GatewayBackend {
@@ -198,5 +213,26 @@ mod tests {
             assert!(response.headers.get(http::header::ETAG).is_none(), "{stored:?}");
             assert_eq!(response.headers.get("x-amz-version-id").map(|value| value.as_bytes()), Some(&b"null"[..]));
         }
+    }
+
+    #[test]
+    fn an_answered_status_and_headers_reach_the_gateway_answer_unchanged_and_absent_ones_add_nothing() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-amz-tagging-count", http::HeaderValue::from_static("2"));
+        headers.append("x-amz-meta-repeated", http::HeaderValue::from_static("one"));
+        headers.append("x-amz-meta-repeated", http::HeaderValue::from_static("two"));
+        let answered = Answered {
+            output: rustfs_gateway::dto::HeadBucketOutput::default(),
+            status: Some(http::StatusCode::PARTIAL_CONTENT),
+            headers: headers.clone(),
+        };
+
+        let (_, status, extra) = resp::<rustfs_gateway::dto::HeadBucket>(answered).into_parts();
+        let (_, default_status, no_extra) =
+            resp::<rustfs_gateway::dto::HeadBucket>(Answered::new(Default::default())).into_parts();
+
+        assert_eq!((status, extra), (206, headers));
+        assert_eq!(default_status, 200);
+        assert!(no_extra.is_empty());
     }
 }

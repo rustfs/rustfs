@@ -14,10 +14,10 @@
 
 //! Stored values as the gateway's answer types hold them, for every use case that answers in them.
 //!
-//! Responsible for: the bucket name, timestamp, owner and stored-configuration conversions a use
-//! case needs to build a gateway output from what the store returned, under the rule in
-//! [`crate::app`]; and [`seam_error`], the one answer for a value the s3s compatibility seam
-//! refused.
+//! Responsible for: the bucket name, object key, timestamp, owner and stored-configuration
+//! conversions a use case needs to build a gateway output from what the store returned, under the
+//! rule in [`crate::app`]; and [`seam_error`], the one answer for a value the s3s compatibility
+//! seam refused.
 //! NOT responsible for: validating names a client sends (the edge that accepted the request did),
 //! or deciding what a use case lists.
 //! Upstream: the use cases in `crate::app`. Downstream: `rustfs_gateway_types`.
@@ -26,7 +26,7 @@ use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, seriali
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
 use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
-use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, Stricter, Timestamp};
+use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, ObjectKey, Stricter, Timestamp};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::fmt::Display;
 use std::sync::{Arc, LazyLock};
@@ -81,6 +81,24 @@ pub(crate) fn seam_error(error: ConversionError) -> S3Error {
     }
 }
 
+/// The object key the store returned, as an answer carries it.
+///
+/// # Errors
+///
+/// `InternalError` for a key the gateway floor refuses (empty, over 1024 bytes, or holding a NUL).
+/// The store's write rule refuses every such key (pinned by `dto_values::tests`), so this is a
+/// store defect, never a key to leave out.
+pub(crate) fn stored_object_key(key: &str) -> S3Result<ObjectKey> {
+    // The floor alone: a request name policy also refuses control characters, which a stored key
+    // can hold.
+    ObjectKey::new(key.to_owned()).map_err(|rejection| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("a stored object key the gateway cannot represent: {rejection}"),
+        )
+    })
+}
+
 /// `at` with its sub-second part.
 pub(crate) fn timestamp(at: OffsetDateTime) -> Timestamp {
     let seconds = at.unix_timestamp();
@@ -104,13 +122,6 @@ pub(crate) fn owner() -> Owner {
 /// inside is kept byte for byte, so the legacy stack's answer does not change. A weak tag whose
 /// inside the gateway's reader refuses or rewrites cannot stay weak (the gateway has no lossless
 /// weak constructor) and is carried as a strong stored tag.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the object reads of batch C and the listings of B2 are its first callers"
-    )
-)]
 pub(crate) fn stored_etag(stored: &str) -> ETag {
     if let Some(rest) = stored.strip_prefix("W/\"") {
         let inside = rest.strip_suffix('"').unwrap_or(rest);
@@ -254,6 +265,50 @@ mod tests {
 
         let input = HeadBucketInput::builder().bucket("sthree-x".into()).build().unwrap();
         assert!(head_bucket::input_from_s3s(input).is_ok(), "a name the floor admits crosses the seam");
+    }
+
+    /// Keys at both length bounds, with every character up to U+02FF in one position, a leading or
+    /// doubled slash and a dot segment: whatever the store's write rule admits, the floor
+    /// represents unchanged.
+    #[test]
+    fn every_key_the_store_can_hold_is_represented_unchanged() {
+        use crate::storage::storage_api::ecstore_bucket::utils::{
+            check_object_name_for_length_and_slash, is_valid_object_prefix,
+        };
+        // The key half of the store's write rule (`check_put_object_args`).
+        let store_holds = |key: &str| {
+            check_object_name_for_length_and_slash("bucket", key).is_ok() && !key.is_empty() && is_valid_object_prefix(key)
+        };
+        let mut keys: Vec<String> = (0..=0x2ff).filter_map(char::from_u32).map(|ch| format!("a{ch}b")).collect();
+        keys.extend(
+            [
+                "a".to_owned(),
+                "a".repeat(1024),
+                "\u{1F600}/x".to_owned(),
+                "dir/".to_owned(),
+                "a/./b".to_owned(),
+                "a\tb\r\n".to_owned(),
+                "&<>\"'".to_owned(),
+            ]
+            .into_iter()
+            .chain(["/lead", "a//b", "a/../b", "a\0b", ""].map(str::to_owned)),
+        );
+
+        let held: Vec<&String> = keys.iter().filter(|key| store_holds(key)).collect();
+
+        assert!(held.len() > 700, "the probe must exercise keys the store keeps: {}", held.len());
+        for key in held {
+            let materialized = stored_object_key(key).unwrap_or_else(|error| panic!("{key:?}: {error:?}"));
+            assert_eq!(materialized.as_str(), key.as_str());
+        }
+    }
+
+    #[test]
+    fn a_key_the_floor_refuses_is_a_server_fault_not_a_gap_in_the_listing() {
+        for key in [String::new(), "a".repeat(1025), "a\0b".to_owned()] {
+            let error = stored_object_key(&key).expect_err(&key);
+            assert_eq!(error.code(), &S3ErrorCode::InternalError, "{key:?}");
+        }
     }
 
     #[test]

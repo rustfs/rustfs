@@ -16,8 +16,8 @@
 
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
-    TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-    has_bypass_governance_header, replication_request_authorized, retained_table_data_plane_publication_guards,
+    apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, has_bypass_governance_header,
+    replication_request_authorized, retained_table_data_plane_publication_guards,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -59,8 +59,8 @@ use super::storage_api::multipart_usecase::options::{
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
-    ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-    parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+    ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+    parse_upload_part_number,
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
@@ -120,7 +120,6 @@ use rustfs_utils::http::{
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -348,7 +347,7 @@ mod tests {
                 let prepare_request = PrepareEncryptionRequest {
                     bucket: "bucket",
                     key: "object",
-                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    server_side_encryption: Some(ServerSideEncryption::AES256.to_owned()),
                     ssekms_key_id: None,
                     ssekms_context: None,
                     sse_customer_algorithm: None,

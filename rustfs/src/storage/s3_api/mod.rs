@@ -17,10 +17,10 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
+use crate::app::bucket_usecase::DefaultBucketUsecase;
 pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
-use crate::app::{
-    bucket_usecase::DefaultBucketUsecase, multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase,
-};
+pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
+use crate::app::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 
 pub(crate) mod bucket;
 pub(crate) mod common;

@@ -306,9 +306,13 @@ import sys
 from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
-marker = '#[instrument(level = "trace", skip(self, req))]\n    pub async fn execute_list_objects_v2('
-if text.count(marker) != 1:
+markers = [
+    f'#[instrument(level = "trace", skip({arguments}))]\n    pub async fn execute_list_objects_v2('
+    for arguments in ("self, req", "self, envelope, input")
+]
+if sum(text.count(marker) for marker in markers) != 1:
     sys.exit(f"split probe: {path} must carry the TRACE attribute directly on execute_list_objects_v2")
+marker = next(marker for marker in markers if marker in text)
 path.write_text(text.replace(marker, marker.replace('"trace"', '"debug"')))
 PY
 checked=$((checked + 1))
