@@ -2022,7 +2022,7 @@ const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy"
 const ENV_RUSTFS_DRIVE_SYNC_ENABLE: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
 const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
 
-/// Durability tier for object data-path writes: `strict` (default) | `relaxed` | `none`.
+/// Durability tier for object data-path writes: `strict` (default) | `file-sync` | `relaxed` | `none`.
 /// See docs/operations/durability-modes.md for the power-loss guarantee matrix.
 const ENV_RUSTFS_DURABILITY_MODE: &str = "RUSTFS_DURABILITY_MODE";
 
@@ -2248,6 +2248,10 @@ pub(crate) enum DurabilityMode {
     /// Every commit point is fsynced: shard/part contents, xl.meta contents,
     /// rollback backups, and the directory entries of commit renames.
     Strict,
+    /// Payload and metadata file contents are fdatasynced, while ordinary
+    /// object commit and newly created ancestor directory entries are left to
+    /// the filesystem. Recovery protocol state retains strict barriers.
+    FileSync,
     /// Object payload bytes (erasure shard files, multipart part files) are
     /// still fdatasynced before the commit rename, but metadata commits
     /// (xl.meta contents, rollback backups, directory entries) are left to
@@ -2267,6 +2271,7 @@ impl DurabilityMode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "strict" => Some(Self::Strict),
+            "file-sync" => Some(Self::FileSync),
             "relaxed" => Some(Self::Relaxed),
             "none" => Some(Self::None),
             _ => None,
@@ -2276,6 +2281,7 @@ impl DurabilityMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
+            Self::FileSync => "file-sync",
             Self::Relaxed => "relaxed",
             Self::None => "none",
             Self::LegacyOff => "legacy-off",
@@ -2285,13 +2291,13 @@ impl DurabilityMode {
     /// Whether object payload bytes (erasure shard files, multipart part
     /// files) must be fdatasynced at commit points.
     fn syncs_data_shards(self) -> bool {
-        matches!(self, Self::Strict | Self::Relaxed)
+        matches!(self, Self::Strict | Self::FileSync | Self::Relaxed)
     }
 
     /// Whether metadata file contents, including xl.meta and rollback
     /// backups, must be fdatasynced before publication.
     fn syncs_metadata_files(self) -> bool {
-        matches!(self, Self::Strict)
+        matches!(self, Self::Strict | Self::FileSync)
     }
 
     /// Whether ordinary commit rename directory entries and newly created
@@ -2311,7 +2317,7 @@ impl DurabilityMode {
     /// namespace publication so a future file-only tier cannot weaken
     /// crash-recovery ordering.
     fn syncs_recovery_protocol_state(self) -> bool {
-        matches!(self, Self::Strict)
+        matches!(self, Self::Strict | Self::FileSync)
     }
 
     fn recovery_sync_mode(self) -> SyncMode {
@@ -2348,7 +2354,7 @@ fn resolve_durability_mode(mode_env: Option<String>, legacy_drive_sync_enabled: 
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
             value = %raw,
-            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|relaxed|none, falling back to the legacy drive-sync switch"
+            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|file-sync|relaxed|none, falling back to the legacy drive-sync switch"
         );
     }
     if legacy_drive_sync_enabled {
@@ -22784,6 +22790,23 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_rename_data_file_sync_new_object_skips_ancestor_fsync() {
+        let bucket = "new-object-bucket-file-sync";
+        let (disk, _dir) = commit_new_object(DurabilityMode::FileSync, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "file-sync must omit the ordinary prefix-directory barrier"
+        );
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "file-sync must omit the ordinary bucket-directory barrier"
+        );
+    }
+
+    #[tokio::test]
     async fn windows_and_unix_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
         // The inline commit path (fi.data present) has the same mkdir gap as the
         // non-inline path: a first PUT under a new prefix must fsync the newly
@@ -24491,6 +24514,7 @@ mod test {
         assert_eq!(resolve_durability_mode(None, false), DurabilityMode::LegacyOff);
         // Explicit mode wins over the legacy switch.
         assert_eq!(resolve_durability_mode(Some("strict".into()), false), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("file-sync".into()), false), DurabilityMode::FileSync);
         assert_eq!(resolve_durability_mode(Some("relaxed".into()), true), DurabilityMode::Relaxed);
         assert_eq!(resolve_durability_mode(Some("none".into()), true), DurabilityMode::None);
         // Case- and whitespace-tolerant.
@@ -24511,6 +24535,15 @@ mod test {
         assert!(DurabilityMode::Strict.syncs_recovery_protocol_state());
         assert_eq!(DurabilityMode::Strict.metadata_sync_mode(), SyncMode::FileAndDir);
         assert_eq!(DurabilityMode::Strict.recovery_sync_mode(), SyncMode::FileAndDir);
+        // FileSync matches MinIO's file-content boundary while preserving
+        // strict recovery-state ordering.
+        assert!(DurabilityMode::FileSync.syncs_data_shards());
+        assert!(DurabilityMode::FileSync.syncs_metadata_files());
+        assert!(!DurabilityMode::FileSync.syncs_commit_directories());
+        assert!(!DurabilityMode::FileSync.fully_syncs_commit_target());
+        assert!(DurabilityMode::FileSync.syncs_recovery_protocol_state());
+        assert_eq!(DurabilityMode::FileSync.metadata_sync_mode(), SyncMode::FileOnly);
+        assert_eq!(DurabilityMode::FileSync.recovery_sync_mode(), SyncMode::FileAndDir);
         // Relaxed keeps payload durability, drops metadata-commit fsyncs.
         assert!(DurabilityMode::Relaxed.syncs_data_shards());
         assert!(!DurabilityMode::Relaxed.syncs_metadata_files());
@@ -24548,6 +24581,11 @@ mod test {
 
     #[test]
     fn test_effective_durability_pins_system_volumes() {
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::FileSync);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::FileSync);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
         {
             let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
             assert_eq!(effective_durability("user-bucket"), DurabilityMode::Relaxed);
@@ -24588,6 +24626,14 @@ mod test {
 
     #[test]
     fn test_effective_durability_bucket_override() {
+        // The file-sync bucket tier can lower ordinary namespace durability
+        // without changing the process-wide strict default.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            let _guard = BucketOverrideGuard::set("hp5b-override-file-sync", DurabilityMode::FileSync);
+            assert_eq!(effective_durability("hp5b-override-file-sync"), DurabilityMode::FileSync);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Strict);
+        }
         // Global strict + per-bucket relaxed: only the named bucket drops.
         {
             let _mode = durability_mode_override::set(DurabilityMode::Strict);
@@ -24744,6 +24790,33 @@ mod test {
         assert!(
             !os::fsync_dir_recorder::was_fsynced(&dst_parent),
             "relaxed mode must skip the metadata-commit dir fsync on user volumes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_file_sync_writes_file_but_skips_dst_parent() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::FileSync);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "file-sync-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("file-sync metadata write should succeed");
+
+        assert_eq!(tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"), b"payload");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "file-sync must omit the ordinary destination-parent barrier"
         );
     }
 
@@ -25130,11 +25203,11 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
-    async fn test_rename_data_writes_old_metadata_backup_for_inline_overwrite() {
+    async fn test_rename_data_file_sync_keeps_recovery_backup_barrier() {
         use std::sync::mpsc;
         use tempfile::tempdir;
 
-        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let _mode = durability_mode_override::set(DurabilityMode::FileSync);
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
@@ -25197,7 +25270,7 @@ mod test {
         assert!(backup_path.exists());
         assert!(
             os::fsync_dir_recorder::was_fsynced(backup_path.parent().expect("backup must have a parent")),
-            "strict inline overwrite must persist the rollback backup directory entry"
+            "file-sync inline overwrite must persist the rollback backup directory entry"
         );
         assert_eq!(
             os::fsync_dir_recorder::was_limited(backup_path.parent().expect("backup must have a parent")),
@@ -25206,12 +25279,12 @@ mod test {
         );
         assert!(
             os::fsync_dir_recorder::was_fsynced(&dst_object_dir),
-            "strict inline overwrite must persist the committed xl.meta directory entry"
+            "file-sync overwrite must retain the recovery backup publication barrier"
         );
         assert_eq!(
             os::fsync_dir_recorder::was_limited(&dst_object_dir),
             cfg!(unix),
-            "only Unix inline commit fsyncs should use the disk file-sync limit"
+            "only Unix recovery backup fsyncs should use the disk file-sync limit"
         );
         // The rollback backup must contain the previous metadata bytes verbatim so
         // that undo_write can restore the prior committed object; guards the inline

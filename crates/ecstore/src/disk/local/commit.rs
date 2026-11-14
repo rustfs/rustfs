@@ -847,16 +847,18 @@ impl LocalDisk {
             let sync_data_shards = no_inline && durability.syncs_data_shards();
             let sync_metadata_files = durability.syncs_metadata_files();
             let sync_commit_directories = durability.syncs_commit_directories();
-            let file_sync_admission = if sync_data_shards || sync_metadata_files || sync_commit_directories {
-                Some(
-                    os::acquire_file_sync_admission(self.file_sync_permits.clone())
-                        .await
-                        .map_err(to_file_error)
-                        .map_err(DiskError::from)?,
-                )
-            } else {
-                None
-            };
+            let sync_recovery_protocol = durability.syncs_recovery_protocol_state();
+            let file_sync_admission =
+                if sync_data_shards || sync_metadata_files || sync_commit_directories || sync_recovery_protocol {
+                    Some(
+                        os::acquire_file_sync_admission(self.file_sync_permits.clone())
+                            .await
+                            .map_err(to_file_error)
+                            .map_err(DiskError::from)?,
+                    )
+                } else {
+                    None
+                };
             let src_parent_owned = src_file_parent.to_path_buf();
             let dst_parent_owned = dst_file_parent.to_path_buf();
             let src_file_path_owned = src_file_path.clone();
@@ -967,7 +969,7 @@ impl LocalDisk {
                         &dst_file_path_owned,
                         &src_file_path_owned,
                         old_metadata,
-                        sync_metadata_files,
+                        sync_recovery_protocol,
                     ) {
                         Ok(path) => path,
                         Err(err) => {
@@ -1106,8 +1108,8 @@ impl LocalDisk {
                         if let Err(err) = backup_path_guard.write_file_for_path_access(
                             &backup_path,
                             dst_buf.as_ref(),
-                            sync_metadata_files,
-                            sync_commit_directories,
+                            sync_recovery_protocol,
+                            sync_recovery_protocol,
                         ) {
                             return Ok(FusedCommitAttempt::RestoreDataSource(guard, to_file_error(err).into()));
                         }
@@ -1126,7 +1128,7 @@ impl LocalDisk {
                         &skip_parent,
                         &publication_root_owned,
                         None,
-                        sync_commit_directories,
+                        sync_recovery_protocol,
                     ) {
                         drop(prepared_metadata_source);
                         cleanup_flat_tmp();
