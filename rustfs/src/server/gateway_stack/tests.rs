@@ -14,6 +14,8 @@
 //! The assembled gateway stack, driven through [`GatewayStack::call`] exactly as `server/http.rs`
 //! drives it. Requests that need object storage are in `rustfs/tests/embedded_gateway_stack_test.rs`.
 
+mod ssec;
+
 use super::*;
 use crate::server::gateway_handlers::rows;
 use crate::server::gateway_handlers::test_support::{CLIENT, PEER, REQUEST_ID, Signed, request_context, signed_request};
