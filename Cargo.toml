@@ -313,6 +313,7 @@ libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"
 memmap2 = "0.9.12"
+nixl-sys = { git = "https://github.com/houseme/nixl", rev = "cc636c83f13d692e85b67e55aed092413d16fb41" }
 lz4 = "1.28.1"
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame"] }
 matchit = "0.9.2"
