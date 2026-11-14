@@ -3348,17 +3348,10 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, complete_multipart_upload_authorize_action()).await?;
+        let key = req.input.key.clone();
         let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
-        authorize_write_etag_condition(req, specific_etag).await?;
-        authorize_replication_only_put_headers(req).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        access_owned::object_commit::authorize_complete_multipart_upload(req, self.server_ctx(), &bucket, &key, specific_etag)
+            .await
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.

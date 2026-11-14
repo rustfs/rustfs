@@ -308,3 +308,45 @@ async fn copy_hooks_source_first_inner() {
         assert_eq!(part_error.code(), &part_expected, "UploadPartCopy: {case}");
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn completion_authorization_requires_write_read_and_replication_permissions() {
+    let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+    let server = ServerContextSlot::new();
+    assert!(server.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+    for (actions, specific_etag, replica, allowed) in [
+        (vec!["s3:PutObject"], false, false, true),
+        (vec![], false, false, false),
+        (vec!["s3:PutObject"], true, false, false),
+        (vec!["s3:PutObject"], false, true, false),
+        (vec!["s3:PutObject", "s3:GetObject"], true, false, true),
+        (vec!["s3:GetObject"], false, false, false),
+    ] {
+        let bucket = source_bucket(&store, &actions).await;
+        let mut request = build_request((), Method::POST);
+        request.extensions.insert(Arc::clone(&server));
+        request.extensions.insert(ReqInfo::default());
+        if replica {
+            request
+                .headers
+                .insert("x-amz-replication-status", http::HeaderValue::from_static("REPLICA"));
+        }
+        let mut envelope = RequestEnvelope::from_s3s(&request);
+        for owned in [false, true] {
+            let result = if owned {
+                super::authorize_complete_multipart_upload(&mut envelope, &server, &bucket, "object", specific_etag).await
+            } else {
+                super::authorize_complete_multipart_upload(&mut request, &server, &bucket, "object", specific_etag).await
+            };
+            if allowed {
+                result.expect("permitted completion");
+            } else {
+                assert_eq!(result.expect_err("completion refused").code(), &S3ErrorCode::AccessDenied);
+            }
+        }
+        assert_eq!(envelope.bucket_generation().is_some(), allowed);
+        assert_eq!(envelope.req_info().unwrap().bucket.as_deref(), Some(bucket.as_str()));
+        assert_eq!(envelope.req_info().unwrap().object.as_deref(), Some("object"));
+    }
+}

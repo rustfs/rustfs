@@ -42,9 +42,7 @@ use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
     record_bucket_object_write_unknown_previous_memory,
 };
-use super::storage_api::multipart_usecase::error::{
-    StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
-};
+use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::multipart_usecase::helper::{OperationHelper, run_owned_mutation};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
@@ -546,12 +544,13 @@ mod tests {
                 .bucket("bucket".to_owned())
                 .key(key.to_owned())
                 .upload_id("upload".to_owned())
+                .multipart_upload(Some(CompletedMultipartUpload::default()))
                 .build()
                 .expect("valid complete request DTO");
-            let error = Box::pin(make_usecase().execute_complete_multipart_upload(build_request(complete, Method::POST)))
+            let error = Box::pin(make_usecase().complete_for_s3s_request(build_request(complete, Method::POST)))
                 .await
                 .expect_err("uploads created before the fix must not publish reserved keys");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         }
     }
 
@@ -710,10 +709,10 @@ mod tests {
                 .expect("complete");
             let complete_req = denied_request(complete, authorizer.clone());
             let error = usecase
-                .execute_complete_multipart_upload(complete_req)
+                .complete_for_s3s_request(complete_req)
                 .await
                 .expect_err("denied completion");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string()); 3]);
             assert!(
                 store
@@ -756,10 +755,10 @@ mod tests {
                 .build()
                 .expect("replay");
             let error = usecase
-                .execute_complete_multipart_upload(denied_request(replay, authorizer.clone()))
+                .complete_for_s3s_request(denied_request(replay, authorizer.clone()))
                 .await
                 .expect_err("replay must authorize before comparing guessed part metadata");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             assert_eq!(authorizer.calls().len(), 4);
         });
     }

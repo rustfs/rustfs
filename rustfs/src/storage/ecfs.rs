@@ -302,6 +302,9 @@ fn seam_error(error: ConversionError) -> S3Error {
 // The bodies of the methods below, one file per migration batch (rustfs/backlog#2765).
 #[path = "legacy_edge/mod.rs"]
 mod legacy_edge;
+
+#[cfg(test)]
+pub(crate) use legacy_edge::complete_multipart_upload_input;
 #[cfg(test)]
 pub(crate) use legacy_edge::list_objects_v2_through_legacy_edge;
 
