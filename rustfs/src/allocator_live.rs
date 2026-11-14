@@ -108,6 +108,8 @@ pub(crate) fn record_snapshot() {
     }
 }
 
+// SAFETY: Tests call GlobalAlloc directly with valid layouts and live
+// pointers; each block below documents allocation ownership and cleanup.
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
