@@ -216,6 +216,153 @@ pub struct PreparedIamAuth {
 }
 
 impl PreparedIamAuth {
+    /// The effective identity decision, including session and federated intersections.
+    /// None means request-dependent conditions can still change it.
+    pub async fn probe_decision(&self, args: &Args<'_>) -> Option<bool> {
+        use rustfs_policy::policy::probe::policy_probe_decision;
+        fn intersection(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+            if left == Some(false) || right == Some(false) {
+                Some(false)
+            } else if left == Some(true) && right == Some(true) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        async fn session_decision(policy: &PreparedSessionPolicy, args: &Args<'_>) -> Option<bool> {
+            match policy {
+                PreparedSessionPolicy::None => Some(true),
+                PreparedSessionPolicy::DenyAll => Some(false),
+                PreparedSessionPolicy::Policy(policy) => {
+                    let mut args = args.clone();
+                    args.is_owner = false;
+                    policy_probe_decision(policy, &args).await
+                }
+            }
+        }
+        match &self.mode {
+            PreparedIamMode::Opa => None,
+            PreparedIamMode::Owner => Some(true),
+            PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => Some(false),
+            PreparedIamMode::Regular { combined_policy } => policy_probe_decision(combined_policy, args).await,
+            PreparedIamMode::Sts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            }
+            | PreparedIamMode::PluginAttemptSts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            } => {
+                let parent = if *is_owner {
+                    Some(true)
+                } else {
+                    policy_probe_decision(combined_policy, args).await
+                };
+                intersection(parent, session_decision(session_policy, args).await)
+            }
+            PreparedIamMode::ServiceAccount {
+                combined_policy,
+                federated_boundary,
+                mode,
+                session_policy,
+                parent_user,
+                is_owner,
+                bypass_parent_policy,
+            } => {
+                let mut parent_args = args.clone();
+                parent_args.account = parent_user;
+                let parent = if *is_owner || *bypass_parent_policy {
+                    Some(true)
+                } else {
+                    policy_probe_decision(combined_policy, &parent_args).await
+                };
+                let boundary = if let Some(policy) = federated_boundary {
+                    let mut args = args.clone();
+                    args.is_owner = false;
+                    policy_probe_decision(policy, &args).await
+                } else {
+                    Some(true)
+                };
+                let combined = intersection(parent, boundary);
+                if matches!(mode, PreparedServicePolicyMode::SessionBound) {
+                    intersection(combined, session_decision(session_policy, args).await)
+                } else {
+                    combined
+                }
+            }
+        }
+    }
+
+    /// Opaque providers decide exact queries through their existing authorization call.
+    pub fn uses_policy_plugin(&self) -> bool {
+        matches!(self.mode, PreparedIamMode::Opa)
+    }
+
+    /// Whether a relevant local policy still needs operation facts. An OPA provider has no
+    /// local document to inspect; exact queries use its normal read-only evaluator instead.
+    pub async fn has_unknown_probe_conditions(&self, args: &Args<'_>) -> bool {
+        !self.uses_policy_plugin() && self.probe_decision(args).await.is_none()
+    }
+
+    /// Entry-point discoverability only; it does not authorize a resource or bypass a boundary.
+    pub async fn action_potential(&self, args: &Args<'_>) -> bool {
+        use rustfs_policy::policy::probe::policy_action_potential;
+        async fn session_potential(session: &PreparedSessionPolicy, args: &Args<'_>) -> bool {
+            match session {
+                PreparedSessionPolicy::None => true,
+                PreparedSessionPolicy::DenyAll => false,
+                PreparedSessionPolicy::Policy(policy) => policy_action_potential(policy, args).await,
+            }
+        }
+        match &self.mode {
+            PreparedIamMode::Owner => true,
+            PreparedIamMode::Opa => true,
+            PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => false,
+            PreparedIamMode::Regular { combined_policy } => policy_action_potential(combined_policy, args).await,
+            PreparedIamMode::Sts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            }
+            | PreparedIamMode::PluginAttemptSts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            } => {
+                (*is_owner || policy_action_potential(combined_policy, args).await)
+                    && session_potential(session_policy, args).await
+            }
+            PreparedIamMode::ServiceAccount {
+                is_owner,
+                bypass_parent_policy,
+                parent_user,
+                combined_policy,
+                federated_boundary,
+                mode,
+                session_policy,
+            } => {
+                let mut parent_args = args.clone();
+                parent_args.account = parent_user;
+                (*is_owner || *bypass_parent_policy || policy_action_potential(combined_policy, &parent_args).await)
+                    && match federated_boundary {
+                        Some(policy) => policy_action_potential(policy, args).await,
+                        None => true,
+                    }
+                    && (!matches!(mode, PreparedServicePolicyMode::SessionBound) || session_potential(session_policy, args).await)
+            }
+        }
+    }
+
+    /// Whether ordinary S3 authorization may try a bucket policy after an implicit IAM denial.
+    pub fn permits_bucket_policy_probe_fallback(&self) -> bool {
+        !matches!(
+            self.mode,
+            PreparedIamMode::TerminalDeny | PreparedIamMode::PluginAttemptSts { .. } | PreparedIamMode::Opa
+        )
+    }
+
     /// Evaluate whether the already-prepared IAM context needs ExistingObjectTag
     /// conditions for the provided request args.
     pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
@@ -2514,6 +2661,137 @@ mod tests {
 
         let resolved = prepared.combined_policy_for_view();
         assert_eq!(resolved.map(|p| p.version.as_str()), Some("2012-10-17"));
+    }
+
+    #[tokio::test]
+    async fn permission_probe_potential_respects_session_and_federated_boundaries() {
+        let write = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#).expect("write policy");
+        let read = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#).expect("read policy");
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "caller",
+            groups: &None,
+            action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            object: "",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        let sts = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Sts {
+                is_owner: false,
+                combined_policy: write.clone(),
+                session_policy: PreparedSessionPolicy::Policy(read.clone()),
+            },
+        };
+        assert!(
+            !sts.action_potential(&args).await,
+            "read-only session cannot advertise a parent write grant"
+        );
+        let service = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::ServiceAccount {
+                is_owner: false,
+                bypass_parent_policy: false,
+                parent_user: "parent".into(),
+                combined_policy: write,
+                federated_boundary: Some(read),
+                mode: PreparedServicePolicyMode::Inherited,
+                session_policy: PreparedSessionPolicy::None,
+            },
+        };
+        assert!(
+            !service.action_potential(&args).await,
+            "federated boundary cannot be omitted from discoverability"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_probe_detects_unknown_conditions_in_session_policy() {
+        let write = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#).expect("write policy");
+        let session = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#).expect("conditional session policy");
+        let prepared = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Sts {
+                is_owner: false,
+                combined_policy: write,
+                session_policy: PreparedSessionPolicy::Policy(session),
+            },
+        };
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "caller",
+            groups: &None,
+            action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            object: "object",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(prepared.has_unknown_probe_conditions(&args).await);
+    }
+
+    #[tokio::test]
+    async fn permission_probe_known_parent_denial_resolves_unknown_session_allow() {
+        let read = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#).expect("read policy");
+        let unknown = Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#).expect("unknown session");
+        let prepared = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Sts {
+                is_owner: false,
+                combined_policy: read,
+                session_policy: PreparedSessionPolicy::Policy(unknown),
+            },
+        };
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "caller",
+            groups: &None,
+            action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            object: "object",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert_eq!(prepared.probe_decision(&args).await, Some(false));
+        assert!(!prepared.has_unknown_probe_conditions(&args).await);
+    }
+
+    #[tokio::test]
+    async fn permission_probe_does_not_disable_opaque_policy_provider_authorization() {
+        let prepared = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Opa,
+        };
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "caller",
+            groups: &None,
+            action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket",
+            object: "object",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(prepared.uses_policy_plugin());
+        assert!(
+            !prepared.has_unknown_probe_conditions(&args).await,
+            "exact provider queries run the existing read-only evaluator"
+        );
+        assert!(prepared.action_potential(&args).await, "unknown targets keep an advisory entry hint");
     }
 
     #[test]

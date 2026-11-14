@@ -35,7 +35,7 @@ use crate::shared_types::RemoteAddr;
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::helper::DenialScope;
 use crate::storage::request_context::RequestContext;
-use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
+use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::ecstore_bucket::lockless_cache::is_lockless_cache_bucket;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
@@ -78,6 +78,12 @@ use url::Url;
 /// state this module keeps private.
 #[path = "access_owned/mod.rs"]
 pub(crate) mod access_owned;
+#[cfg(test)]
+#[path = "access_permission_auth_test.rs"]
+mod permission_auth_test;
+#[cfg(test)]
+#[path = "access_permission_probe_test.rs"]
+mod permission_probe_test;
 #[cfg(test)]
 #[path = "access_readers_test.rs"]
 mod readers_test;
@@ -232,13 +238,29 @@ impl std::fmt::Debug for PostObjectPolicyHeaders {
 #[derive(Clone)]
 pub(crate) struct RequestedCopySource(pub(crate) String);
 
+#[derive(Clone, Copy)]
+pub(crate) enum PermissionProbeRequestFact {
+    CopySource = 1,
+    IfMatch = 2,
+    IfNoneMatch = 4,
+}
+
+impl RequestedCopySource {
+    pub(crate) fn from_object(bucket: &str, key: &str, version_id: Option<&str>) -> Self {
+        Self(match version_id {
+            Some(version) => format!("{bucket}/{key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
+            None => format!("{bucket}/{key}"),
+        })
+    }
+}
+
 /// These operations stage upload state without publishing an object. Keep this
 /// separate from the marker controlling multipart publication fences.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MultipartStagingOperation;
 
 impl MultipartStagingOperation {
-    fn for_operation(operation: &str) -> Option<Self> {
+    pub(crate) fn for_operation(operation: &str) -> Option<Self> {
         matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy").then_some(Self)
     }
 }
@@ -1061,6 +1083,18 @@ fn merge_request_object_tag_conditions(
 /// same policy evaluation without constructing another request type; the
 /// owned `RequestEnvelope` implements it in the app layer.
 pub(crate) trait AuthorizationRequest {
+    fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
+        None
+    }
+    fn permission_probe_request_fact_known(&self, _fact: PermissionProbeRequestFact) -> bool {
+        false
+    }
+    fn permission_probe_auth_type(&self) -> Option<crate::auth::facts::AuthTypeCondition> {
+        None
+    }
+    fn permission_probe(&self) -> bool {
+        false
+    }
     fn headers(&self) -> &HeaderMap;
     fn headers_mut(&mut self) -> &mut HeaderMap;
     fn uri(&self) -> &http::Uri;
@@ -1265,6 +1299,16 @@ fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut target: Au
         target,
         OffsetDateTime::now_utc(),
     )
+    .with_caller_authentication(if req.permission_probe() {
+        req.permission_probe_caller_authentication()
+    } else {
+        None
+    })
+    .with_planned_auth_type(if req.permission_probe() {
+        req.permission_probe_auth_type()
+    } else {
+        None
+    })
 }
 
 /// The root access key a principal is compared against to be the `Account`.
@@ -1322,7 +1366,14 @@ fn authorization_conditions_with_internal<R: AuthorizationRequest + ?Sized>(
     if let Some(RequestedObjectTags(tags)) = req.requested_object_tags() {
         // Standalone tag writes apply the XML body; the x-amz-tagging header is
         // not stored and must not describe the request to the policy engine.
-        conditions.retain(|key, _| key != "RequestObjectTagKeys" && !key.starts_with("RequestObjectTag/"));
+        conditions.retain(|key, _| {
+            if req.permission_probe() {
+                let key = key.to_ascii_lowercase();
+                key != "requestobjecttagkeys" && !key.starts_with("requestobjecttag/")
+            } else {
+                key != "RequestObjectTagKeys" && !key.starts_with("RequestObjectTag/")
+            }
+        });
         let mut keys = Vec::new();
         for (key, value) in tags {
             keys.push(key.clone());
@@ -1353,6 +1404,41 @@ fn authorization_conditions_with_internal<R: AuthorizationRequest + ?Sized>(
         OffsetDateTime::now_utc(),
         &mut conditions,
     );
+    if req.permission_probe() {
+        use rustfs_policy::policy::probe::{
+            PROBE_COPY_SOURCE_KNOWN, PROBE_EXISTING_TAGS_RESOLVED, PROBE_IF_MATCH_KNOWN, PROBE_IF_NONE_MATCH_KNOWN,
+            PROBE_RETENTION_FACTS_KNOWN,
+        };
+        conditions.remove(PROBE_EXISTING_TAGS_RESOLVED);
+        conditions.remove(PROBE_RETENTION_FACTS_KNOWN);
+        for (marker, fact) in [
+            (PROBE_COPY_SOURCE_KNOWN, PermissionProbeRequestFact::CopySource),
+            (PROBE_IF_MATCH_KNOWN, PermissionProbeRequestFact::IfMatch),
+            (PROBE_IF_NONE_MATCH_KNOWN, PermissionProbeRequestFact::IfNoneMatch),
+        ] {
+            conditions.remove(marker);
+            if req.permission_probe_request_fact_known(fact) {
+                conditions.insert(marker.to_owned(), vec!["true".to_owned()]);
+            }
+        }
+        if req.requested_copy_source().is_none() {
+            conditions.remove("x-amz-copy-source");
+        }
+        for name in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+            if !req.headers().contains_key(&name) {
+                conditions.remove(name.as_str());
+            }
+        }
+        if req.requested_object_tags().is_none() {
+            conditions.retain(|key, _| {
+                let key = key.to_ascii_lowercase();
+                key != "requestobjecttagkeys" && !key.starts_with("requestobjecttag/")
+            });
+        }
+        if req.requested_retention().is_some() {
+            conditions.insert(PROBE_RETENTION_FACTS_KNOWN.to_owned(), vec!["true".to_owned()]);
+        }
+    }
     Ok(conditions)
 }
 
@@ -1741,6 +1827,27 @@ pub(crate) struct ListBucketsIamAuthorization {
 }
 
 impl ListBucketsIamAuthorization {
+    async fn probe_conditions_known(&self, bucket: &str, action: S3Action) -> bool {
+        let conditions = if bucket.is_empty() {
+            &self.base_conditions
+        } else {
+            &self.bucket_conditions
+        };
+        !self
+            .prepared
+            .has_unknown_probe_conditions(&Args {
+                account: &self.account,
+                groups: &self.groups,
+                claims: &self.claims,
+                is_owner: self.is_owner,
+                action: Action::S3Action(action),
+                bucket,
+                object: "",
+                conditions,
+                deny_only: false,
+            })
+            .await
+    }
     pub(crate) async fn is_allowed(&self, bucket: &str, action: S3Action) -> bool {
         let conditions = if bucket.is_empty() {
             &self.base_conditions
@@ -1763,6 +1870,37 @@ impl ListBucketsIamAuthorization {
                 },
             )
             .await
+    }
+}
+
+/// The same IAM-only discovery contract as ListBuckets, including its per-bucket fallback.
+/// Bucket policies may authorize a known bucket but do not make its name discoverable.
+pub(crate) async fn query_list_buckets_permission<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<()> {
+    let authorization = prepare_list_buckets_iam_authorization(req).await?;
+    let all_known = authorization
+        .probe_conditions_known("", S3Action::ListAllMyBucketsAction)
+        .await;
+    if all_known && authorization.is_allowed("", S3Action::ListAllMyBucketsAction).await {
+        return Ok(());
+    }
+    let mut unknown = !all_known;
+    let store = request_object_store(req)?;
+    let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+    for bucket in buckets {
+        for action in [S3Action::ListBucketAction, S3Action::GetBucketLocationAction] {
+            if authorization.probe_conditions_known(&bucket.name, action).await {
+                if authorization.is_allowed(&bucket.name, action).await {
+                    return Ok(());
+                }
+            } else {
+                unknown = true;
+            }
+        }
+    }
+    if unknown {
+        Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into())
+    } else {
+        Err(rustfs_s3_types::s3_error!(AccessDenied, "Access Denied").into())
     }
 }
 
@@ -2063,6 +2201,59 @@ pub(crate) async fn authorize_request<R: AuthorizationRequest + ?Sized>(req: &mu
     authorize_request_core(req, action, None, internal_object_authorization).await
 }
 
+/// Discoverability hint for an action with an unknown exact target. This does not authorize
+/// an object, and the normal exact-object gate must still run before the operation.
+pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &R, action: Action) -> S3Result<bool> {
+    use rustfs_policy::policy::probe::{bucket_policy_action_potential, bucket_policy_blocks_action_potential};
+    let info = req.req_info().ok_or_else(missing_req_info_error)?;
+    let cred = info
+        .cred
+        .as_ref()
+        .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
+    let bucket = info.bucket.as_deref().unwrap_or_default();
+    let root = root_access_key();
+    let principal = AuthzPrincipal::new(cred, &root).with_owner(info.is_owner);
+    let facts = request_authz_facts(
+        req,
+        AuthzTarget {
+            action,
+            bucket,
+            object: "",
+            version_id: None,
+            location_constraint: None,
+        },
+    );
+    let conditions = authorization_conditions(req, &principal, &facts)?;
+    let args = build_args(&principal, &facts, &conditions);
+    let iam = request_iam_store(req)?;
+    let prepared = iam.prepare_auth(&args).await;
+    let iam_potential = prepared.action_potential(&args).await;
+    if bucket.is_empty() {
+        return Ok(iam_potential);
+    }
+    let store = request_object_store(req)?;
+    let policy = match store.get_bucket_policy(bucket).await {
+        Ok((policy, _)) => policy,
+        Err(error) if error == StorageError::ConfigNotFound || is_err_bucket_not_found(&error) => return Ok(iam_potential),
+        Err(_) => return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query is unavailable").into()),
+    };
+    let bucket_args = BucketPolicyArgs {
+        bucket,
+        action,
+        is_owner: info.is_owner,
+        account: &cred.access_key,
+        groups: &cred.groups,
+        conditions: &conditions,
+        object: "",
+    };
+    if !owner_can_bypass_policy_deny(info.is_owner, &action) && bucket_policy_blocks_action_potential(&policy, &bucket_args).await
+    {
+        return Ok(false);
+    }
+    Ok(iam_potential
+        || (prepared.permits_bucket_policy_probe_fallback() && bucket_policy_action_potential(&policy, &bucket_args).await))
+}
+
 /// Authorizes `action` on `bucket` for either edge: the whole access hook of an operation that
 /// names one bucket and asks one action, such as HeadBucket.
 ///
@@ -2272,6 +2463,78 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         .await?;
         let bucket_name = bucket.as_str();
 
+        let probe_bucket_policy = if req.permission_probe() && !bucket.is_empty() {
+            match store.get_bucket_policy(&bucket).await {
+                Ok((policy, _)) => Some(policy),
+                Err(error) if error == StorageError::ConfigNotFound || is_err_bucket_not_found(&error) => None,
+                Err(_) => return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query is unavailable").into()),
+            }
+        } else {
+            None
+        };
+        if req.permission_probe() {
+            use rustfs_policy::policy::probe::{PROBE_EXISTING_TAGS_RESOLVED, bucket_policy_probe_decision};
+            if needs_tag {
+                conditions.insert(PROBE_EXISTING_TAGS_RESOLVED.to_owned(), vec!["true".to_owned()]);
+            }
+            let args = build_args(&principal, &facts, &conditions);
+            let bucket_args = BucketPolicyArgs {
+                bucket: bucket.as_str(),
+                action,
+                is_owner,
+                account: &cred.access_key,
+                groups: &cred.groups,
+                conditions: &conditions,
+                object: object.as_str(),
+            };
+            let guard = if owner_can_bypass_policy_deny(is_owner, &action) {
+                Some(true)
+            } else if let Some(policy) = &probe_bucket_policy {
+                bucket_policy_probe_decision(
+                    policy,
+                    &BucketPolicyArgs {
+                        is_owner: true,
+                        ..bucket_args.clone()
+                    },
+                )
+                .await
+            } else {
+                Some(true)
+            };
+            if guard.is_none() {
+                return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
+            }
+            if guard != Some(false) && prepared.has_unknown_probe_conditions(&args).await {
+                let fallback = if let Some(policy) = &probe_bucket_policy {
+                    bucket_policy_probe_decision(policy, &bucket_args).await
+                } else {
+                    Some(is_owner)
+                };
+                let deletion_deny_known = if matches!(
+                    action,
+                    Action::S3Action(
+                        S3Action::DeleteObjectAction
+                            | S3Action::DeleteObjectVersionAction
+                            | S3Action::ForceDeleteBucketAction
+                            | S3Action::ForceDeleteObjectAction
+                            | S3Action::ListBucketVersionsAction
+                            | S3Action::BypassGovernanceRetentionAction
+                            | S3Action::ReplicateDeleteAction
+                    )
+                ) && prepared.combined_policy_for_view().is_some()
+                {
+                    let mut deny_args = args.clone();
+                    deny_args.deny_only = true;
+                    prepared.probe_decision(&deny_args).await == Some(true)
+                } else {
+                    true
+                };
+                if !prepared.permits_bucket_policy_probe_fallback() || fallback != Some(true) || !deletion_deny_known {
+                    return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
+                }
+            }
+        }
+
         // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
         // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
@@ -2299,8 +2562,32 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
             return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
         }
 
+        let probe_evaluation_conditions = if req.permission_probe() {
+            use rustfs_policy::policy::probe::{
+                PROBE_COPY_SOURCE_KNOWN, PROBE_EXISTING_TAGS_RESOLVED, PROBE_IF_MATCH_KNOWN, PROBE_IF_NONE_MATCH_KNOWN,
+                PROBE_RETENTION_FACTS_KNOWN,
+            };
+            let mut values = conditions.clone();
+            let original_values = base_conditions(&principal, &facts);
+            for marker in [
+                PROBE_EXISTING_TAGS_RESOLVED,
+                PROBE_RETENTION_FACTS_KNOWN,
+                PROBE_COPY_SOURCE_KNOWN,
+                PROBE_IF_MATCH_KNOWN,
+                PROBE_IF_NONE_MATCH_KNOWN,
+            ] {
+                values.remove(marker);
+                if let Some(value) = original_values.get(marker) {
+                    values.insert(marker.to_owned(), value.clone());
+                }
+            }
+            Some(values)
+        } else {
+            None
+        };
+        let evaluation_conditions = probe_evaluation_conditions.as_ref().unwrap_or(&conditions);
         let iam_allowed = {
-            let mut final_args = build_args(&principal, &facts, &conditions);
+            let mut final_args = build_args(&principal, &facts, evaluation_conditions);
             let allowed = iam_store
                 .try_eval_prepared(&prepared, &final_args)
                 .await
@@ -2336,8 +2623,19 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
 
         if iam_allowed {
             if !internal_object_authorization {
-                authorize_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions)
-                    .await?;
+                authorize_table_data_plane_if_needed(
+                    req,
+                    action,
+                    bucket.as_str(),
+                    object.as_str(),
+                    cred,
+                    is_owner,
+                    TablePermissionConditions {
+                        evaluation: evaluation_conditions,
+                        probe: Some(&conditions),
+                    },
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -2345,6 +2643,29 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         if action == Action::S3Action(S3Action::ListAllMyBucketsAction) {
             denial.log("iam_implicit_deny", action);
             return Err(ApiError::access_denied().into());
+        }
+
+        if req.permission_probe()
+            && let Some(policy) = &probe_bucket_policy
+        {
+            use rustfs_policy::policy::probe::bucket_policy_probe_decision;
+            if bucket_policy_probe_decision(
+                policy,
+                &BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action,
+                    is_owner,
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                },
+            )
+            .await
+            .is_none()
+            {
+                return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
+            }
         }
 
         let policy_allowed_fallback = PolicySys::try_is_allowed_for_store(
@@ -2355,7 +2676,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                 is_owner,
                 account: &cred.access_key,
                 groups: &cred.groups,
-                conditions: &conditions,
+                conditions: evaluation_conditions,
                 object: object.as_str(),
             },
         )
@@ -2364,8 +2685,19 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
 
         if policy_allowed_fallback {
             if !internal_object_authorization {
-                authorize_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions)
-                    .await?;
+                authorize_table_data_plane_if_needed(
+                    req,
+                    action,
+                    bucket.as_str(),
+                    object.as_str(),
+                    cred,
+                    is_owner,
+                    TablePermissionConditions {
+                        evaluation: evaluation_conditions,
+                        probe: Some(&conditions),
+                    },
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -2616,7 +2948,7 @@ fn table_data_plane_content_mutation(action: Action) -> bool {
 }
 
 fn table_data_plane_publication_fence_required<R: AuthorizationRequest + ?Sized>(req: &R, action: Action) -> bool {
-    !req.staged_multipart_part() && table_data_plane_content_mutation(action)
+    !req.permission_probe() && !req.staged_multipart_part() && table_data_plane_content_mutation(action)
 }
 
 fn table_catalog_backend_for_data_plane<R: AuthorizationRequest + ?Sized>(
@@ -2767,7 +3099,7 @@ async fn table_data_plane_resource_for_request<R: AuthorizationRequest + ?Sized>
     let store = table_catalog_store_for_data_plane(req)?;
     let resource = if catalog_metadata {
         crate::table_catalog::table_metadata_data_plane_resource_for_object(&store, bucket, object).await
-    } else if publication_held {
+    } else if publication_held || req.permission_probe() {
         store
             .resolve_table_data_plane_resource_for_authorization(bucket, object)
             .await
@@ -2810,6 +3142,12 @@ async fn table_data_plane_resource_for_authorization<R: AuthorizationRequest + ?
     table_data_plane_resource_for_request(req, bucket, object, table_bucket_enabled).await
 }
 
+/// Probe analysis retains trusted known-fact markers; real IAM and OPA evaluation use clean facts.
+struct TablePermissionConditions<'a> {
+    evaluation: &'a HashMap<String, Vec<String>>,
+    probe: Option<&'a HashMap<String, Vec<String>>>,
+}
+
 async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     action: Action,
@@ -2817,7 +3155,7 @@ async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     object: &str,
     cred: &rustfs_credentials::Credentials,
     is_owner: bool,
-    conditions: &HashMap<String, Vec<String>>,
+    conditions: TablePermissionConditions<'_>,
 ) -> S3Result<()> {
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
@@ -2842,19 +3180,33 @@ async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
     let resource_object = resource.catalog_resource_object();
-    let allowed = iam_store
-        .is_allowed(&Args {
-            account: &cred.access_key,
-            groups: &cred.groups,
-            action: Action::AdminAction(admin_action),
-            bucket: resource.table_bucket.as_str(),
-            conditions,
-            is_owner,
-            object: resource_object.as_str(),
-            claims,
-            deny_only: false,
-        })
-        .await;
+    let args = Args {
+        account: &cred.access_key,
+        groups: &cred.groups,
+        action: Action::AdminAction(admin_action),
+        bucket: resource.table_bucket.as_str(),
+        conditions: conditions.evaluation,
+        is_owner,
+        object: resource_object.as_str(),
+        claims,
+        deny_only: false,
+    };
+    let allowed = if req.permission_probe() {
+        let probe_args = Args {
+            conditions: conditions.probe.unwrap_or(conditions.evaluation),
+            ..args.clone()
+        };
+        let prepared = iam_store.prepare_auth(&probe_args).await;
+        if prepared.has_unknown_probe_conditions(&probe_args).await {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks table operation facts").into());
+        }
+        iam_store
+            .try_eval_prepared(&prepared, &args)
+            .await
+            .map_err(iam_authorization_error)?
+    } else {
+        iam_store.is_allowed(&args).await
+    };
     if allowed {
         if table_data_plane_publication_fence_required(req, action) {
             retain_table_publication_guard(req, &resource).await?;

@@ -21,6 +21,7 @@ pub mod opa;
 #[allow(clippy::module_inception)]
 mod policy;
 mod principal;
+pub mod probe;
 pub mod resource;
 pub mod statement;
 pub(crate) mod utils;
