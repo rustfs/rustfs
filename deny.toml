@@ -43,6 +43,9 @@ allow-git = [
     # Completion ownership patch fixed to rustfs/uring#20.
     # owner: overtrue  review: 2026-10
     "https://github.com/rustfs/uring.git",
+    # NIXL bindings fork pinned for the optional RustFS RDMA transport.
+    # owner: houseme  review: 2027-02
+    "https://github.com/houseme/nixl",
 ]
 
 [bans]

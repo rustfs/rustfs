@@ -15,10 +15,16 @@
 #[cfg(test)]
 use crate::cluster::rpc::http_auth::RPC_REPLAY_SCOPE_VERSION_HEADER;
 use crate::cluster::rpc::http_auth::{
-    AuthenticatedPeerReplayCapabilities, RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2, RPC_BOOT_EPOCH_CHALLENGE_HEADER,
-    RPC_CONTENT_SHA256_HEADER, RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+    AuthenticatedPeerMsgpackCapabilities, AuthenticatedPeerReplayCapabilities, RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2,
+    RPC_BOOT_EPOCH_CHALLENGE_HEADER, RPC_CONTENT_SHA256_HEADER, RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+    RPC_MSGPACK_MANIFEST_CAPABILITY_V1, RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
     RollingMutationBodyDigest, TIMESTAMP_HEADER, gen_tonic_replay_scope_headers_with_admission, internode_rpc_body_digest_strict,
-    rpc_background_admission, verify_tonic_peer_replay_capabilities_response,
+    rpc_background_admission, verify_tonic_peer_msgpack_capability_for_authenticated_epoch,
+    verify_tonic_peer_replay_capabilities_response,
+};
+#[cfg(test)]
+use crate::cluster::rpc::http_auth::{
+    tonic_boot_epoch_response_headers_with_msgpack_capability, tonic_msgpack_manifest_capability_requested,
 };
 use crate::cluster::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
 #[cfg(test)]
@@ -349,10 +355,18 @@ enum PeerReplayCapability {
     Revoked,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerMsgpackCapability {
+    Capable { boot_epoch: Uuid },
+    Unsupported { boot_epoch: Uuid },
+    Revoked,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PeerReplayState {
     boot_epoch: Option<Uuid>,
     cache_capability: Option<PeerReplayCapability>,
+    msgpack_capability: Option<PeerMsgpackCapability>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -375,6 +389,27 @@ fn peer_replay_state(audience: &str) -> PeerReplayState {
         .unwrap_or_default()
 }
 
+/// Whether the next authenticated response should carry a fresh capability proof.
+///
+/// This state is observational and must not by itself authorize omitting JSON: tonic can
+/// transparently reconnect before RustFS observes a new peer boot epoch.
+fn should_request_msgpack_capability(state: PeerReplayState) -> bool {
+    match (state.boot_epoch, state.msgpack_capability) {
+        (
+            Some(boot_epoch),
+            Some(
+                PeerMsgpackCapability::Capable {
+                    boot_epoch: capability_epoch,
+                }
+                | PeerMsgpackCapability::Unsupported {
+                    boot_epoch: capability_epoch,
+                },
+            ),
+        ) => boot_epoch != capability_epoch,
+        _ => true,
+    }
+}
+
 pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()> {
     let uri = addr
         .parse::<Uri>()
@@ -389,22 +424,32 @@ pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_peer_replay_response(
     audience: String,
     sent_state: PeerReplayState,
     response: std::io::Result<AuthenticatedPeerReplayCapabilities>,
 ) {
+    apply_peer_capabilities_response(audience, sent_state, response, None);
+}
+
+fn apply_peer_capabilities_response(
+    audience: String,
+    sent_state: PeerReplayState,
+    replay_response: std::io::Result<AuthenticatedPeerReplayCapabilities>,
+    msgpack_response: Option<std::io::Result<AuthenticatedPeerMsgpackCapabilities>>,
+) {
     if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
         let current_state = states.get(&audience).copied().unwrap_or_default();
         let mut next_state = current_state;
-        if let Ok(response) = &response
+        if let Ok(response) = &replay_response
             && sent_state.boot_epoch == current_state.boot_epoch
         {
             next_state.boot_epoch = Some(response.boot_epoch);
         }
 
         if sent_state.boot_epoch == current_state.boot_epoch {
-            let response_capability = response
+            let response_capability = replay_response
                 .as_ref()
                 .ok()
                 .filter(|response| response.dynamic_replay_cache)
@@ -439,6 +484,20 @@ fn apply_peer_replay_response(
                     next_state.cache_capability = Some(PeerReplayCapability::Revoked);
                 }
                 _ => {}
+            }
+
+            if sent_state.msgpack_capability == current_state.msgpack_capability
+                && let Some(response) = msgpack_response
+            {
+                next_state.msgpack_capability = Some(match response {
+                    Ok(response) if response.msgpack_compat_manifest => PeerMsgpackCapability::Capable {
+                        boot_epoch: response.boot_epoch,
+                    },
+                    Ok(response) => PeerMsgpackCapability::Unsupported {
+                        boot_epoch: response.boot_epoch,
+                    },
+                    Err(_) => PeerMsgpackCapability::Revoked,
+                });
             }
         }
         states.insert(audience, next_state);
@@ -492,6 +551,7 @@ where
             .get::<PeerReplayStateSnapshot>()
             .map(|snapshot| snapshot.0)
             .unwrap_or_default();
+        let msgpack_capability_requested = authenticated && should_request_msgpack_capability(sent_state);
         if let (Some(audience), Some(challenge)) = (self.audience.as_deref(), challenge) {
             // The challenge is independently HMAC-authenticated by the response proof. It is not
             // part of v2 so old peers ignore it, while a new peer can safely advertise its epoch.
@@ -499,6 +559,14 @@ where
                 RPC_BOOT_EPOCH_CHALLENGE_HEADER,
                 challenge.to_string().parse().expect("UUID must be a valid header value"),
             );
+            if msgpack_capability_requested {
+                request.headers_mut().insert(
+                    RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+                    RPC_MSGPACK_MANIFEST_CAPABILITY_V1
+                        .parse()
+                        .expect("static msgpack capability must be a valid header value"),
+                );
+            }
             if let (Some(boot_epoch), Some(timestamp), Some(content_sha256)) = (
                 sent_state.boot_epoch,
                 request.headers().get(TIMESTAMP_HEADER).and_then(|value| value.to_str().ok()),
@@ -550,6 +618,15 @@ where
             };
             if let (Some(audience), Some(challenge)) = (audience, challenge) {
                 let response_state = verify_tonic_peer_replay_capabilities_response(&audience, challenge, response.headers());
+                let msgpack_response = msgpack_capability_requested.then(|| match &response_state {
+                    Ok(authenticated) => verify_tonic_peer_msgpack_capability_for_authenticated_epoch(
+                        &audience,
+                        challenge,
+                        authenticated.boot_epoch,
+                        response.headers(),
+                    ),
+                    Err(_) => Err(std::io::Error::other("RPC boot epoch capability verification failed")),
+                });
                 if let Err(error) = &response_state
                     && (response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
                         || response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)
@@ -571,7 +648,7 @@ where
                         "internode RPC capability proof rejected"
                     )
                 }
-                apply_peer_replay_response(audience, sent_state, response_state);
+                apply_peer_capabilities_response(audience, sent_state, response_state, msgpack_response);
             }
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
@@ -925,9 +1002,14 @@ mod tests {
             let challenge = tonic_boot_epoch_challenge(request.headers())
                 .expect("client challenge must be syntactically valid")
                 .expect("authenticated client request must carry a boot epoch challenge");
+            let msgpack_capability_requested = tonic_msgpack_manifest_capability_requested(request.headers());
             let mut response = HttpResponse::new(());
-            let mut headers = tonic_boot_epoch_response_headers(&self.audience, challenge)
-                .expect("test server must be able to sign an epoch proof");
+            let mut headers = tonic_boot_epoch_response_headers_with_msgpack_capability(
+                &self.audience,
+                challenge,
+                self.include_capability && msgpack_capability_requested,
+            )
+            .expect("test server must be able to sign an epoch proof");
             if !self.include_capability {
                 headers.remove(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
                 headers.remove(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
@@ -1154,6 +1236,13 @@ mod tests {
         AuthenticatedPeerReplayCapabilities {
             boot_epoch,
             dynamic_replay_cache,
+        }
+    }
+
+    fn authenticated_msgpack_response(boot_epoch: Uuid, msgpack_compat_manifest: bool) -> AuthenticatedPeerMsgpackCapabilities {
+        AuthenticatedPeerMsgpackCapabilities {
+            boot_epoch,
+            msgpack_compat_manifest,
         }
     }
 
@@ -1491,6 +1580,12 @@ mod tests {
         let state = peer_replay_state(audience);
         assert!(state.boot_epoch.is_some(), "authenticated legacy proof must enable replay-scoped v3");
         assert_eq!(state.cache_capability, None);
+        assert_eq!(
+            state.msgpack_capability,
+            state
+                .boot_epoch
+                .map(|boot_epoch| PeerMsgpackCapability::Unsupported { boot_epoch })
+        );
 
         let mut interceptor = test_interceptor_for(audience, false);
         let request = rolling_mutation_request("Lock");
@@ -1520,6 +1615,10 @@ mod tests {
             headers[1].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "authenticated legacy boot proof must enable v3 on a non-Ping request"
         );
+        assert!(
+            !headers[1].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "an unsupported capability bound to the current epoch must not be probed per request"
+        );
     }
 
     #[test]
@@ -1535,6 +1634,7 @@ mod tests {
         let epoch_one_state = PeerReplayState {
             boot_epoch: Some(epoch_one),
             cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: epoch_one }),
+            msgpack_capability: None,
         };
         assert_eq!(peer_replay_state(audience), epoch_one_state);
 
@@ -1545,6 +1645,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_one),
                 cache_capability: Some(PeerReplayCapability::Revoked),
+                msgpack_capability: None,
             }
         );
 
@@ -1556,6 +1657,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_two),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: epoch_two }),
+                msgpack_capability: None,
             }
         );
         clear_peer_capability(audience);
@@ -1572,6 +1674,7 @@ mod tests {
         let revoked_epoch_one = PeerReplayState {
             boot_epoch: Some(epoch_one),
             cache_capability: Some(PeerReplayCapability::Revoked),
+            msgpack_capability: None,
         };
         PEER_REPLAY_STATES
             .lock()
@@ -1590,9 +1693,104 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_three),
                 cache_capability: Some(PeerReplayCapability::Revoked),
+                msgpack_capability: None,
             },
             "a stale dynamic-cache proof must not cross a newer authenticated boot epoch"
         );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn msgpack_capability_is_epoch_bound_and_reordered_responses_cannot_restore_it() {
+        let audience = "msgpack-capability-epoch-test:9000";
+        let epoch_one = Uuid::new_v4();
+        let epoch_two = Uuid::new_v4();
+        clear_peer_capability(audience);
+
+        let unknown = PeerReplayState::default();
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            unknown,
+            Ok(authenticated_peer_response(epoch_one, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_one, true))),
+        );
+        let epoch_one_state = peer_replay_state(audience);
+        assert_eq!(
+            epoch_one_state.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable { boot_epoch: epoch_one })
+        );
+        assert!(!should_request_msgpack_capability(epoch_one_state));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            epoch_one_state,
+            Ok(authenticated_peer_response(epoch_two, true)),
+            None,
+        );
+        let needs_epoch_two_probe = peer_replay_state(audience);
+        assert_eq!(needs_epoch_two_probe.boot_epoch, Some(epoch_two));
+        assert_eq!(
+            needs_epoch_two_probe.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable { boot_epoch: epoch_one })
+        );
+        assert!(
+            should_request_msgpack_capability(needs_epoch_two_probe),
+            "a new boot epoch must require a fresh capability proof"
+        );
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            needs_epoch_two_probe,
+            Ok(authenticated_peer_response(epoch_two, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_two, false))),
+        );
+        let epoch_two_state = peer_replay_state(audience);
+        assert_eq!(
+            epoch_two_state.msgpack_capability,
+            Some(PeerMsgpackCapability::Unsupported { boot_epoch: epoch_two })
+        );
+        assert!(!should_request_msgpack_capability(epoch_two_state));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            epoch_one_state,
+            Ok(authenticated_peer_response(epoch_one, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_one, true))),
+        );
+        assert_eq!(
+            peer_replay_state(audience),
+            epoch_two_state,
+            "a delayed capability proof must not cross a newer boot epoch"
+        );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn invalid_msgpack_capability_proof_remains_retryable_without_enabling_send_policy() {
+        let audience = "msgpack-capability-retry-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        clear_peer_capability(audience);
+
+        let unknown = PeerReplayState::default();
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            unknown,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Err(std::io::Error::other("forged msgpack capability proof"))),
+        );
+        let revoked = peer_replay_state(audience);
+        assert_eq!(revoked.msgpack_capability, Some(PeerMsgpackCapability::Revoked));
+        assert!(should_request_msgpack_capability(revoked));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            revoked,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+        );
+        let recovered = peer_replay_state(audience);
+        assert_eq!(recovered.msgpack_capability, Some(PeerMsgpackCapability::Capable { boot_epoch }));
+        assert!(!should_request_msgpack_capability(recovered));
         clear_peer_capability(audience);
     }
 
@@ -1605,6 +1803,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(boot_epoch),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+                msgpack_capability: None,
             },
         );
 
@@ -1635,6 +1834,7 @@ mod tests {
         let capable_state = PeerReplayState {
             boot_epoch: Some(boot_epoch),
             cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+            msgpack_capability: None,
         };
         PEER_REPLAY_STATES
             .lock()
@@ -1706,6 +1906,7 @@ mod tests {
                 PeerReplayState {
                     boot_epoch: Some(boot_epoch),
                     cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+                    msgpack_capability: None,
                 },
             );
         let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()));
@@ -1763,6 +1964,7 @@ mod tests {
             let pinned = PeerReplayState {
                 boot_epoch: Some(old_epoch),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: old_epoch }),
+                msgpack_capability: None,
             };
             set_peer_capability(&audience, pinned);
             apply_peer_replay_response(audience.clone(), pinned, Err(std::io::Error::other("startup response omitted proof")));
@@ -1944,12 +2146,27 @@ mod tests {
         assert_eq!(headers.len(), 2);
         assert!(headers[0].contains_key(RPC_BOOT_EPOCH_CHALLENGE_HEADER));
         assert!(
+            headers[0].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "the first authenticated request must probe an unknown peer capability"
+        );
+        assert!(
             !headers[0].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "the first request must remain v2-compatible until the peer proves its epoch"
         );
         assert!(
             headers[1].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "the second request must carry the replay-scoped v3 signature"
+        );
+        assert!(
+            !headers[1].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "a capability proved for the current boot epoch must not be probed per request"
+        );
+        let state = peer_replay_state(audience);
+        assert_eq!(
+            state.msgpack_capability,
+            state
+                .boot_epoch
+                .map(|boot_epoch| PeerMsgpackCapability::Capable { boot_epoch })
         );
         clear_peer_capability(audience);
     }

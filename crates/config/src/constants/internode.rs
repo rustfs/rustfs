@@ -294,6 +294,14 @@ pub const DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT: usize = 64;
 pub const ENV_INTERNODE_BULK_BUFFER_SIZE: &str = "RUSTFS_INTERNODE_BULK_BUFFER_SIZE";
 pub const DEFAULT_INTERNODE_BULK_BUFFER_SIZE: usize = 1024;
 
+/// Per-peer limit held through complete bulk-unary response decoding and validation. Zero keeps
+/// the compatibility behavior with no additional admission gate.
+pub const ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT";
+pub const DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: usize = 0;
+pub const ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: &str = "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS";
+pub const DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: u64 = 1_000;
+const _: () = assert!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT == 0);
+
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
 pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
@@ -501,8 +509,12 @@ mod tests {
     fn internode_channel_isolation_defaults_and_env_names() {
         // The isolation-off default is asserted at compile time next to the constant definition.
         assert_eq!(DEFAULT_INTERNODE_BULK_CHANNELS, 2);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, 0);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, 1_000);
         assert_eq!(ENV_INTERNODE_CHANNEL_ISOLATION, "RUSTFS_INTERNODE_CHANNEL_ISOLATION");
         assert_eq!(ENV_INTERNODE_BULK_CHANNELS, "RUSTFS_INTERNODE_BULK_CHANNELS");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS");
     }
 
     #[test]

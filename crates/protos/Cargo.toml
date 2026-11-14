@@ -34,6 +34,9 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Exact HTTP/2 keepalive timeout observation through Hyper's unstable tracing
+# event. Requires `RUSTFLAGS="--cfg hyper_unstable_tracing"`.
+diagnostic-internode-http2-ping = ["dep:hyper", "rustfs-io-metrics/diagnostic-internode-http2-ping"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -75,6 +78,7 @@ prost = { workspace = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aws-lc", "gzip", "deflate"] }
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
+hyper = { workspace = true, optional = true, features = ["tracing"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -90,3 +94,4 @@ serde_json = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+tracing-subscriber = { workspace = true }

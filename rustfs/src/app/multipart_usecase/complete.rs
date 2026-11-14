@@ -2255,9 +2255,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn completion_absent_binding_refusal_order_baseline() {
+    fn completion_absent_binding_refusal_order_baseline() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "completion-absent-binding-refusal-order",
+            completion_absent_binding_refusal_order_baseline_inner,
+        );
+    }
+
+    async fn completion_absent_binding_refusal_order_baseline_inner() {
         use crate::app::storage_api::test::bucket::quota::BucketQuota;
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
