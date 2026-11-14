@@ -22,11 +22,11 @@
 use crate::error::ApiError;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
+use crate::storage::persisted_from_s3s;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
-use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
-    get_bucket_acl, get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
+    get_bucket_acl, get_bucket_notification_configuration, get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
@@ -89,26 +89,13 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
         record_s3_op(S3Operation::GetBucketNotificationConfiguration);
         let usecase = s3_api::bucket_usecase_for(self);
-        let notification_configuration = usecase
-            .execute_get_bucket_notification_configuration(req)
-            .await?
-            .as_ref()
-            .map(persisted_to_s3s::<_, NotificationConfiguration>)
-            .transpose()?;
-        match notification_configuration {
-            Some(NotificationConfiguration {
-                event_bridge_configuration,
-                lambda_function_configurations,
-                queue_configurations,
-                topic_configurations,
-            }) => Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
-                event_bridge_configuration,
-                lambda_function_configurations,
-                queue_configurations,
-                topic_configurations,
-            })),
-            None => Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default())),
-        }
+        through_gateway_seam(
+            req,
+            get_bucket_notification_configuration::input_from_s3s,
+            get_bucket_notification_configuration::output_to_s3s,
+            |_, input| usecase.execute_get_bucket_notification_configuration(input),
+        )
+        .await
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_policy_edge(
