@@ -52,7 +52,7 @@ use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::tonic_service::make_server_for_slot;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-    tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
+    verify_tonic_rpc_signature_with_bootstrap,
 };
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
@@ -451,13 +451,21 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
+        let msgpack_manifest_capability_requested = storage::tonic_msgpack_manifest_capability_requested(req.headers());
         let response_headers = tonic_boot_epoch_challenge(req.headers())
             .ok()
             .flatten()
             .and_then(|challenge| {
                 storage::try_current_local_node_name()
                     .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
-                    .and_then(|audience| tonic_boot_epoch_response_headers(&audience, challenge).ok())
+                    .and_then(|audience| {
+                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
+                            &audience,
+                            challenge,
+                            msgpack_manifest_capability_requested,
+                        )
+                        .ok()
+                    })
             });
         let future = self.inner.call(req);
         Box::pin(async move {
@@ -6353,6 +6361,62 @@ mod tests {
         assert_eq!(captured.uri.path(), expected_path);
         assert_eq!(captured.uri.authority().map(|authority| authority.as_str()), Some("node-a:9000"));
         assert_eq!(captured.method, Method::POST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_request_path_service_advertises_msgpack_capability_only_when_requested() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-msgpack-capability-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        rustfs_common::set_global_local_node_name(audience).await;
+        let challenge = uuid::Uuid::new_v4();
+
+        let response_for = |request_capability: bool| async move {
+            let mut request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/node_service.NodeService/Ping")
+                .body(())
+                .expect("capability request");
+            request.headers_mut().insert(
+                "x-rustfs-rpc-boot-epoch-challenge",
+                challenge.to_string().parse().expect("challenge header"),
+            );
+            if request_capability {
+                request.headers_mut().insert(
+                    "x-rustfs-rpc-msgpack-manifest-request",
+                    HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                );
+            }
+            RpcRequestPathService::new(RpcPathObserver)
+                .call(request)
+                .await
+                .expect("capability response")
+        };
+
+        let legacy = response_for(false).await;
+        assert!(!legacy.headers().contains_key("x-rustfs-rpc-msgpack-manifest-capability"));
+        assert!(
+            !legacy
+                .headers()
+                .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
+        );
+
+        let capable = response_for(true).await;
+        assert_eq!(
+            capable
+                .headers()
+                .get("x-rustfs-rpc-msgpack-manifest-capability")
+                .and_then(|value| value.to_str().ok()),
+            Some("msgpack-compat-manifest-v1")
+        );
+        assert!(
+            capable
+                .headers()
+                .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
     #[tokio::test]
