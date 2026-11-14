@@ -49,7 +49,7 @@ pub fn conditions_known_for_probe(functions: &Functions, conditions: &std::colle
             return conditions.contains_key(PROBE_IF_NONE_MATCH_KNOWN) || conditions.contains_key(&name);
         }
         is_server_derived_condition_key(&name)
-            && !matches!(name.as_str(), "Referer" | "UserAgent" | "SignatureAge" | "LocationConstraint")
+            && !matches!(name.as_str(), "Referer" | "UserAgent" | "signatureAge" | "LocationConstraint")
             && !name.starts_with("x-amz-")
     })
 }
@@ -335,6 +335,47 @@ mod tests {
         let mut args = args(&conditions, &claims);
         args.object = "object";
         assert!(policy_has_unknown_probe_conditions(&policy, &args).await);
+    }
+
+    #[tokio::test]
+    async fn permission_probe_signature_age_is_unknown_even_for_null_conditions() {
+        let policy: Policy = decode(serde_json::json!({"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::alice-data/*",
+            "Condition":{"Null":{"s3:signatureAge":"true"}}
+        }]}))
+        .expect("signature-age IAM policy");
+        let bucket_policy: BucketPolicy = decode(serde_json::json!({"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::alice-data/*",
+            "Condition":{"Null":{"s3:signatureAge":"true"}}
+        }]}))
+        .expect("signature-age bucket policy");
+        let claims = HashMap::new();
+        for conditions in [
+            HashMap::new(),
+            HashMap::from([("signatureAge".to_owned(), vec!["0".to_owned()])]),
+        ] {
+            let args = Args {
+                object: "object",
+                ..args(&conditions, &claims)
+            };
+            assert_eq!(policy_probe_decision(&policy, &args).await, None);
+            assert_eq!(
+                bucket_policy_probe_decision(
+                    &bucket_policy,
+                    &BucketPolicyArgs {
+                        account: "alice",
+                        groups: &None,
+                        action: args.action,
+                        bucket: "alice-data",
+                        object: "object",
+                        conditions: &conditions,
+                        is_owner: false,
+                    }
+                )
+                .await,
+                None
+            );
+        }
     }
 
     #[tokio::test]

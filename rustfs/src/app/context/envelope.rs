@@ -223,6 +223,7 @@ pub struct RequestEnvelope {
     requested_object_tags: Option<RequestedObjectTags>,
     requested_copy_source: Option<RequestedCopySource>,
     permission_probe: bool,
+    permission_probe_caller_authentication: Option<crate::auth::facts::CallerAuthentication>,
     permission_probe_auth_type: Option<crate::auth::facts::AuthTypeCondition>,
     permission_probe_known_request_facts: u8,
     residual_extensions: Extensions,
@@ -272,6 +273,7 @@ impl RequestEnvelope {
             requested_object_tags: extensions.remove(),
             requested_copy_source: extensions.remove(),
             permission_probe: false,
+            permission_probe_caller_authentication: None,
             permission_probe_auth_type: None,
             permission_probe_known_request_facts: 0,
             residual_extensions: extensions,
@@ -324,6 +326,7 @@ impl RequestEnvelope {
             requested_object_tags: self.requested_object_tags.clone(),
             requested_copy_source: self.requested_copy_source.clone(),
             permission_probe: self.permission_probe,
+            permission_probe_caller_authentication: self.permission_probe_caller_authentication,
             permission_probe_auth_type: self.permission_probe_auth_type,
             permission_probe_known_request_facts: self.permission_probe_known_request_facts,
             residual_extensions: self.residual_extensions.clone(),
@@ -331,8 +334,15 @@ impl RequestEnvelope {
     }
 
     /// A read-only policy query preserves verified connection and identity facts, without
-    /// operation guards, body metadata or internal authorization shortcuts.
+    /// operation guards, body metadata or internal authorization shortcuts. The caller
+    /// must already be authenticated by the accepting edge; its signing facts are captured
+    /// before the operation URI is replaced, independently of any planned placement.
     pub(crate) fn fork_for_permission_probe(&self, method: Method, uri: Uri, req_info: ReqInfo) -> Self {
+        let caller_authentication = self.credentials.as_ref().filter(|_| req_info.cred.is_some()).map(|_| {
+            self.permission_probe_caller_authentication.unwrap_or_else(|| {
+                crate::auth::facts::CallerAuthentication::from_authenticated_request_parts(&self.headers, self.uri.query())
+            })
+        });
         let mut extensions = Extensions::new();
         if let Some(addr) = self.remote_addr {
             extensions.insert(Some(RemoteAddr(addr)));
@@ -365,6 +375,7 @@ impl RequestEnvelope {
             extensions,
         );
         probe.permission_probe = true;
+        probe.permission_probe_caller_authentication = caller_authentication;
         probe
     }
 
@@ -570,6 +581,9 @@ impl RequestEnvelope {
 /// The authorization core in `storage` reads requests only through
 /// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
 impl AuthorizationRequest for RequestEnvelope {
+    fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
+        self.permission_probe_caller_authentication
+    }
     fn permission_probe_request_fact_known(&self, fact: crate::storage::access::PermissionProbeRequestFact) -> bool {
         self.permission_probe_known_request_facts & (fact as u8) != 0
     }

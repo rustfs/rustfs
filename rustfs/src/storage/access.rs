@@ -79,6 +79,12 @@ use url::Url;
 #[path = "access_owned/mod.rs"]
 pub(crate) mod access_owned;
 #[cfg(test)]
+#[path = "access_permission_auth_test.rs"]
+mod permission_auth_test;
+#[cfg(test)]
+#[path = "access_permission_probe_test.rs"]
+mod permission_probe_test;
+#[cfg(test)]
 #[path = "access_readers_test.rs"]
 mod readers_test;
 
@@ -1077,6 +1083,9 @@ fn merge_request_object_tag_conditions(
 /// same policy evaluation without constructing another request type; the
 /// owned `RequestEnvelope` implements it in the app layer.
 pub(crate) trait AuthorizationRequest {
+    fn permission_probe_caller_authentication(&self) -> Option<crate::auth::facts::CallerAuthentication> {
+        None
+    }
     fn permission_probe_request_fact_known(&self, _fact: PermissionProbeRequestFact) -> bool {
         false
     }
@@ -1290,6 +1299,11 @@ fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut target: Au
         target,
         OffsetDateTime::now_utc(),
     )
+    .with_caller_authentication(if req.permission_probe() {
+        req.permission_probe_caller_authentication()
+    } else {
+        None
+    })
     .with_planned_auth_type(if req.permission_probe() {
         req.permission_probe_auth_type()
     } else {
@@ -1884,9 +1898,9 @@ pub(crate) async fn query_list_buckets_permission<R: AuthorizationRequest + ?Siz
         }
     }
     if unknown {
-        Err(s3_error!(NotImplemented, "permission query lacks operation facts"))
+        Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into())
     } else {
-        Err(s3_error!(AccessDenied, "Access Denied"))
+        Err(rustfs_s3_types::s3_error!(AccessDenied, "Access Denied").into())
     }
 }
 
@@ -2195,7 +2209,7 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
     let cred = info
         .cred
         .as_ref()
-        .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
+        .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
     let bucket = info.bucket.as_deref().unwrap_or_default();
     let root = root_access_key();
     let principal = AuthzPrincipal::new(cred, &root).with_owner(info.is_owner);
@@ -2221,7 +2235,7 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
     let policy = match store.get_bucket_policy(bucket).await {
         Ok((policy, _)) => policy,
         Err(error) if error == StorageError::ConfigNotFound || is_err_bucket_not_found(&error) => return Ok(iam_potential),
-        Err(_) => return Err(s3_error!(NotImplemented, "permission query is unavailable")),
+        Err(_) => return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query is unavailable").into()),
     };
     let bucket_args = BucketPolicyArgs {
         bucket,
@@ -2453,7 +2467,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
             match store.get_bucket_policy(&bucket).await {
                 Ok((policy, _)) => Some(policy),
                 Err(error) if error == StorageError::ConfigNotFound || is_err_bucket_not_found(&error) => None,
-                Err(_) => return Err(s3_error!(NotImplemented, "permission query is unavailable")),
+                Err(_) => return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query is unavailable").into()),
             }
         } else {
             None
@@ -2488,7 +2502,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                 Some(true)
             };
             if guard.is_none() {
-                return Err(s3_error!(NotImplemented, "permission query lacks operation facts"));
+                return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
             }
             if guard != Some(false) && prepared.has_unknown_probe_conditions(&args).await {
                 let fallback = if let Some(policy) = &probe_bucket_policy {
@@ -2516,7 +2530,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                     true
                 };
                 if !prepared.permits_bucket_policy_probe_fallback() || fallback != Some(true) || !deletion_deny_known {
-                    return Err(s3_error!(NotImplemented, "permission query lacks operation facts"));
+                    return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
                 }
             }
         }
@@ -2616,7 +2630,10 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                     object.as_str(),
                     cred,
                     is_owner,
-                    evaluation_conditions,
+                    TablePermissionConditions {
+                        evaluation: evaluation_conditions,
+                        probe: Some(&conditions),
+                    },
                 )
                 .await?;
             }
@@ -2647,7 +2664,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
             .await
             .is_none()
             {
-                return Err(s3_error!(NotImplemented, "permission query lacks operation facts"));
+                return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts").into());
             }
         }
 
@@ -2675,7 +2692,10 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
                     object.as_str(),
                     cred,
                     is_owner,
-                    evaluation_conditions,
+                    TablePermissionConditions {
+                        evaluation: evaluation_conditions,
+                        probe: Some(&conditions),
+                    },
                 )
                 .await?;
             }
@@ -3079,7 +3099,7 @@ async fn table_data_plane_resource_for_request<R: AuthorizationRequest + ?Sized>
     let store = table_catalog_store_for_data_plane(req)?;
     let resource = if catalog_metadata {
         crate::table_catalog::table_metadata_data_plane_resource_for_object(&store, bucket, object).await
-    } else if publication_held {
+    } else if publication_held || req.permission_probe() {
         store
             .resolve_table_data_plane_resource_for_authorization(bucket, object)
             .await
@@ -3122,6 +3142,12 @@ async fn table_data_plane_resource_for_authorization<R: AuthorizationRequest + ?
     table_data_plane_resource_for_request(req, bucket, object, table_bucket_enabled).await
 }
 
+/// Probe analysis retains trusted known-fact markers; real IAM and OPA evaluation use clean facts.
+struct TablePermissionConditions<'a> {
+    evaluation: &'a HashMap<String, Vec<String>>,
+    probe: Option<&'a HashMap<String, Vec<String>>>,
+}
+
 async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     action: Action,
@@ -3129,7 +3155,7 @@ async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     object: &str,
     cred: &rustfs_credentials::Credentials,
     is_owner: bool,
-    conditions: &HashMap<String, Vec<String>>,
+    conditions: TablePermissionConditions<'_>,
 ) -> S3Result<()> {
     let Some(admin_action) = table_data_plane_admin_action(action) else {
         return Ok(());
@@ -3154,19 +3180,33 @@ async fn authorize_table_data_plane_if_needed<R: AuthorizationRequest + ?Sized>(
     let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
     let resource_object = resource.catalog_resource_object();
-    let allowed = iam_store
-        .is_allowed(&Args {
-            account: &cred.access_key,
-            groups: &cred.groups,
-            action: Action::AdminAction(admin_action),
-            bucket: resource.table_bucket.as_str(),
-            conditions,
-            is_owner,
-            object: resource_object.as_str(),
-            claims,
-            deny_only: false,
-        })
-        .await;
+    let args = Args {
+        account: &cred.access_key,
+        groups: &cred.groups,
+        action: Action::AdminAction(admin_action),
+        bucket: resource.table_bucket.as_str(),
+        conditions: conditions.evaluation,
+        is_owner,
+        object: resource_object.as_str(),
+        claims,
+        deny_only: false,
+    };
+    let allowed = if req.permission_probe() {
+        let probe_args = Args {
+            conditions: conditions.probe.unwrap_or(conditions.evaluation),
+            ..args.clone()
+        };
+        let prepared = iam_store.prepare_auth(&probe_args).await;
+        if prepared.has_unknown_probe_conditions(&probe_args).await {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks table operation facts").into());
+        }
+        iam_store
+            .try_eval_prepared(&prepared, &args)
+            .await
+            .map_err(iam_authorization_error)?
+    } else {
+        iam_store.is_allowed(&args).await
+    };
     if allowed {
         if table_data_plane_publication_fence_required(req, action) {
             retain_table_publication_guard(req, &resource).await?;

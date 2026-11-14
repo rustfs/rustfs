@@ -15,6 +15,8 @@
 //! a prefix or object. Unsupported operation facts and unavailable dependencies are `unknown`.
 //! Invalid schema returns `InvalidRequest`; authentication errors retain the normal S3 codes.
 //! Responses are uncached and expose no policies, claims, credentials, or internal denial reasons.
+//! S3 bucket-only actions ignore unrelated object/version targets. Namespace-root checks explicitly
+//! use an empty object; table/view creation checks use their parent namespace resource.
 
 use crate::admin::auth::{
     AdminResourceScope, authenticate_envelope_credentials, validate_admin_action_with_bucket_object_for_iam,
@@ -33,7 +35,10 @@ use crate::storage::access::{
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use matchit::Params;
 use rustfs_credentials::Credentials;
-use rustfs_policy::policy::{Args, action::Action};
+use rustfs_policy::policy::{
+    Args,
+    action::{Action, S3Action},
+};
 use rustfs_s3_types::{Body, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -174,6 +179,7 @@ impl PermissionsRequest {
                     && matches!(
                         check.action.as_str(),
                         "s3:GetObject"
+                            | "s3:GetObjectAttributes"
                             | "s3:DeleteObject"
                             | "s3:GetObjectTagging"
                             | "s3:PutObjectTagging"
@@ -365,26 +371,66 @@ fn has_value(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
 
+fn s3_object_target(action: S3Action) -> bool {
+    matches!(
+        action,
+        S3Action::AbortMultipartUploadAction
+            | S3Action::ForceDeleteObjectAction
+            | S3Action::DeleteObjectAction
+            | S3Action::GetObjectAction
+            | S3Action::GetObjectAclAction
+            | S3Action::GetObjectAttributesAction
+            | S3Action::ListMultipartUploadPartsAction
+            | S3Action::PutObjectAction
+            | S3Action::PutObjectAclAction
+            | S3Action::DeleteObjectVersionAction
+            | S3Action::DeleteObjectVersionTaggingAction
+            | S3Action::GetObjectVersionAction
+            | S3Action::GetObjectVersionAttributesAction
+            | S3Action::GetObjectVersionTaggingAction
+            | S3Action::PutObjectVersionTaggingAction
+            | S3Action::BypassGovernanceRetentionAction
+            | S3Action::PutObjectRetentionAction
+            | S3Action::GetObjectRetentionAction
+            | S3Action::GetObjectLegalHoldAction
+            | S3Action::PutObjectLegalHoldAction
+            | S3Action::GetObjectTaggingAction
+            | S3Action::PutObjectTaggingAction
+            | S3Action::DeleteObjectTaggingAction
+            | S3Action::ReplicateObjectAction
+            | S3Action::ReplicateDeleteAction
+            | S3Action::ReplicateTagsAction
+            | S3Action::GetObjectVersionForReplicationAction
+            | S3Action::RestoreObjectAction
+            | S3Action::PutObjectFanOutAction
+    )
+}
+
+fn canonical_object(check: &PermissionCheck, action: Action) -> Option<&str> {
+    match action {
+        Action::S3Action(action) if !s3_object_target(action) => None,
+        _ => check.object.as_deref(),
+    }
+}
+
 fn missing_target(check: &PermissionCheck, action: Action) -> bool {
     match action {
-        Action::S3Action(_) => {
-            if check.action == "s3:ListAllMyBuckets" {
+        Action::S3Action(s3_action) => {
+            if s3_action == S3Action::ListAllMyBucketsAction {
                 return false;
             }
             if !has_value(check.bucket.as_deref()) {
                 return true;
             }
-            let name = check.action.trim_start_matches("s3:");
-            let object_action = name.contains("Object") && !name.contains("Bucket")
-                || matches!(name, "AbortMultipartUpload" | "ListMultipartUploadParts");
-            object_action && !has_value(check.object.as_deref())
+            s3_object_target(s3_action) && !has_value(check.object.as_deref())
                 || matches!(
-                    name,
-                    "GetObjectVersion"
-                        | "DeleteObjectVersion"
-                        | "GetObjectVersionTagging"
-                        | "PutObjectVersionTagging"
-                        | "DeleteObjectVersionTagging"
+                    s3_action,
+                    S3Action::GetObjectVersionAction
+                        | S3Action::GetObjectVersionAttributesAction
+                        | S3Action::DeleteObjectVersionAction
+                        | S3Action::GetObjectVersionTaggingAction
+                        | S3Action::PutObjectVersionTaggingAction
+                        | S3Action::DeleteObjectVersionTaggingAction
                 ) && !has_value(check.version_id.as_deref())
         }
         Action::KmsAction(_) => {
@@ -410,7 +456,12 @@ fn missing_target(check: &PermissionCheck, action: Action) -> bool {
                 || name.contains("TableLocation")
                 || name.contains("TableMaintenance");
             (bucket_action || catalog_action) && !has_value(check.bucket.as_deref())
-                || catalog_action && !has_value(check.object.as_deref())
+                || catalog_action
+                    && if matches!(name, "GetTableNamespace" | "SetTableNamespace") {
+                        check.object.is_none()
+                    } else {
+                        !has_value(canonical_object(check, action))
+                    }
         }
         _ => true,
     }
@@ -456,12 +507,22 @@ async fn evaluate_check(
     check: &PermissionCheck,
     action: Action,
 ) -> S3Result<PermissionResult> {
+    let bucket = if action == Action::S3Action(S3Action::ListAllMyBucketsAction) {
+        None
+    } else {
+        check.bucket.as_deref()
+    };
+    let object = canonical_object(check, action);
+    let version_id = match action {
+        Action::S3Action(action) if s3_object_target(action) => check.version_id.as_deref(),
+        _ => None,
+    };
     let info = ReqInfo {
         cred: Some(cred.clone()),
         is_owner: owner,
-        bucket: check.bucket.clone(),
-        object: check.object.clone(),
-        version_id: check.version_id.clone(),
+        bucket: bucket.map(str::to_owned),
+        object: object.map(str::to_owned),
+        version_id: version_id.map(str::to_owned),
         suppress_denial_log: true,
         suppress_denial_audit: true,
         ..Default::default()
@@ -503,8 +564,8 @@ async fn evaluate_check(
             });
         };
         let conditions = get_condition_values(probe.headers(), cred, None, None, envelope.policy_source_addr());
-        let bucket = check.bucket.as_deref().unwrap_or_default();
-        let object = check.key_id.as_deref().or(check.object.as_deref()).unwrap_or_default();
+        let bucket = bucket.unwrap_or_default();
+        let object = check.key_id.as_deref().or(object).unwrap_or_default();
         let args = Args {
             account: &cred.access_key,
             groups: &cred.groups,
@@ -580,14 +641,16 @@ impl Operation for AccountPermissionsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::context::{AppContext, IamInterface, RequestCredentials, RequestHead, ServerContextSlot};
+    use crate::admin::runtime_sources::{AppContext, IamInterface, ServerContextSlot};
+    use crate::admin::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::admin::storage_api::contract::object::ObjectOperations as _;
+    use crate::admin::storage_api::runtime::ECStore;
+    use crate::app::{RequestCredentials, RequestHead};
     use crate::storage::access::AuthorizationRequest;
-    use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
     use rustfs_iam::store::object::ObjectStore;
     use rustfs_iam::store::{Store, UserType};
     use rustfs_iam::sys::IamSys;
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
-    use rustfs_storage_api::ObjectOperations as _;
     use std::sync::Arc;
 
     struct ReadyIam(Arc<IamSys<ObjectStore>>);
@@ -600,13 +663,7 @@ mod tests {
         }
     }
 
-    async fn fixture() -> (
-        tempfile::TempDir,
-        Arc<crate::storage::ECStore>,
-        Arc<IamSys<ObjectStore>>,
-        RequestEnvelope,
-        Credentials,
-    ) {
+    async fn fixture() -> (tempfile::TempDir, Arc<ECStore>, Arc<IamSys<ObjectStore>>, RequestEnvelope, Credentials) {
         let (directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
         ObjectStore::new(store.clone())
             .save_iam_config(
@@ -648,11 +705,11 @@ mod tests {
         (directory, store, iam, envelope, cred)
     }
 
-    async fn bucket_policy(store: &crate::storage::ECStore, bucket: &str, value: serde_json::Value) {
+    async fn bucket_policy(store: &ECStore, bucket: &str, value: serde_json::Value) {
         store
             .update_bucket_metadata_config(
                 bucket,
-                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                crate::admin::storage_api::bucket::metadata::BUCKET_POLICY_CONFIG,
                 serde_json::to_vec(&value).expect("serialize bucket policy"),
             )
             .await
@@ -793,6 +850,10 @@ mod tests {
             let policy = rustfs_policy::policy::Policy::parse_config(
                 br#"{"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":"admin:DeleteTable","Resource":"arn:aws:s3:::warehouse/namespaces/ns/tables/one"},
+                {"Effect":"Allow","Action":["admin:GetTableNamespace","admin:SetTableNamespace"],"Resource":"arn:aws:s3:::warehouse"},
+                {"Effect":"Allow","Action":"admin:CreateTable","Resource":"arn:aws:s3:::warehouse/namespaces/ns"},
+                {"Effect":"Allow","Action":"admin:CreateTable","Resource":["arn:aws:s3:::warehouse/namespaces/sales/tables/orders","arn:aws:s3:::warehouse/namespaces/sales/views/orders"]},
+                {"Effect":"Allow","Action":"admin:ClaimTableLocation","Resource":"arn:aws:s3:::warehouse/data/custom"},
                 {"Effect":"Allow","Action":"kms:DisableKey","Resource":"arn:aws:kms:::key/one"}
             ]}"#,
             )
@@ -807,18 +868,130 @@ mod tests {
                 {"id":"table-one","action":"admin:DeleteTable","bucket":"warehouse","object":"namespaces/ns/tables/one"},
                 {"id":"table-two","action":"admin:DeleteTable","bucket":"warehouse","object":"namespaces/ns/tables/two"},
                 {"id":"key-one","action":"kms:DisableKey","keyId":"one"},
-                {"id":"key-two","action":"kms:DisableKey","keyId":"two"}
+                {"id":"key-two","action":"kms:DisableKey","keyId":"two"},
+                {"id":"namespace-root-read","action":"admin:GetTableNamespace","bucket":"warehouse","object":""},
+                {"id":"namespace-root-create","action":"admin:SetTableNamespace","bucket":"warehouse","object":""},
+                {"id":"namespace-missing-read","action":"admin:GetTableNamespace","bucket":"warehouse"},
+                {"id":"namespace-missing-create","action":"admin:SetTableNamespace","bucket":"warehouse"},
+                {"id":"namespace-target-read","action":"admin:GetTableNamespace","bucket":"warehouse","object":"namespaces/ns"},
+                {"id":"namespace-exact-resource","action":"admin:SetTableNamespace","bucket":"warehouse","object":"namespaces/new"},
+                {"id":"table-create-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/ns"},
+                {"id":"table-create-longer-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/ns/tables/new"},
+                {"id":"view-create-longer-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/ns/views/new"},
+                {"id":"tables-segment-in-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/sales/tables/orders"},
+                {"id":"views-segment-in-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/sales/views/orders"},
+                {"id":"table-create-other-parent","action":"admin:CreateTable","bucket":"warehouse","object":"namespaces/other/tables/new"},
+                {"id":"location-allowed","action":"admin:ClaimTableLocation","bucket":"warehouse","object":"data/custom"},
+                {"id":"location-denied","action":"admin:ClaimTableLocation","bucket":"warehouse","object":"data/other"}
             ]}));
+            let expected = [
+                Decision::Allowed,
+                Decision::Denied,
+                Decision::Allowed,
+                Decision::Denied,
+                Decision::Allowed,
+                Decision::Allowed,
+                Decision::Unknown,
+                Decision::Unknown,
+                Decision::Denied,
+                Decision::Denied,
+                Decision::Allowed,
+                Decision::Denied,
+                Decision::Denied,
+                Decision::Allowed,
+                Decision::Allowed,
+                Decision::Denied,
+                Decision::Allowed,
+                Decision::Denied,
+            ];
+            assert_eq!(expected.len(), request.checks.len(), "every catalog resource scenario must run");
             for ((check, action), expected) in request
                 .checks
                 .iter()
                 .zip(request.validate().expect("valid scoped checks"))
-                .zip([Decision::Allowed, Decision::Denied, Decision::Allowed, Decision::Denied])
+                .zip(expected)
             {
                 let result = evaluate_check(&envelope, &cred, false, check, action)
                     .await
                     .expect("scoped query");
                 assert_eq!(result.decision, expected, "{}", check.id);
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn permission_queries_use_action_specific_s3_targets() {
+        crate::app::gating_test_env::run_large_stack_test("permission-query-targets", || async {
+            let (_directory, store, iam, envelope, cred) = fixture().await;
+            let bucket = format!("permission-targets-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create target bucket");
+            let policy = rustfs_policy::policy::Policy::parse_config(
+                serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["s3:GetBucketLocation","s3:BypassGovernanceRetention","s3:ReplicateDelete","s3:ReplicateTags","s3:GetObjectVersionAttributes"],
+                     "Resource":[format!("arn:aws:s3:::{bucket}"),format!("arn:aws:s3:::{bucket}/*")]}
+                ]})).expect("target policy JSON").as_slice(),
+            ).expect("target policy");
+            iam.set_policy("permission-targets", policy)
+                .await
+                .expect("store target policy");
+            iam.policy_db_set(&cred.access_key, UserType::Reg, false, "permission-targets")
+                .await
+                .expect("attach target policy");
+            bucket_policy(
+                &store,
+                &bucket,
+                serde_json::json!({"Version":"2012-10-17","Statement":[
+                    {"Effect":"Deny","Principal":"*","Action":"s3:GetBucketLocation","Resource":format!("arn:aws:s3:::{bucket}")}
+                ]}),
+            )
+            .await;
+            for action in ["s3:BypassGovernanceRetention", "s3:ReplicateDelete", "s3:ReplicateTags"] {
+                for (object, expected) in [(None, Decision::Unknown), (Some("known"), Decision::Allowed)] {
+                    let mut value = serde_json::json!({"id":"object-target","action":action,"bucket":bucket});
+                    if let Some(object) = object {
+                        value["object"] = object.into();
+                    }
+                    let request = parse(serde_json::json!({"checks":[value]}));
+                    let result =
+                        evaluate_check(&envelope, &cred, false, &request.checks[0], request.validate().expect("object check")[0])
+                            .await
+                            .expect("object query");
+                    assert_eq!(result.decision, expected, "{action} {object:?}");
+                    if expected == Decision::Unknown {
+                        assert_eq!(result.potential, Some(true));
+                    }
+                }
+            }
+            for (extra_object, extra_version) in [(None, None), (Some("escape"), Some("unrelated"))] {
+                let mut value = serde_json::json!({"id":"bucket-target","action":"s3:GetBucketLocation","bucket":bucket});
+                if let Some(object) = extra_object {
+                    value["object"] = object.into();
+                }
+                if let Some(version) = extra_version {
+                    value["versionId"] = version.into();
+                }
+                let request = parse(serde_json::json!({"checks":[value]}));
+                let result =
+                    evaluate_check(&envelope, &cred, false, &request.checks[0], request.validate().expect("bucket check")[0])
+                        .await
+                        .expect("bucket query");
+                assert_eq!(result.decision, Decision::Denied, "unused fields must not bypass a bucket deny");
+            }
+            for (version, expected) in [(None, Decision::Unknown), (Some("known-version"), Decision::Allowed)] {
+                let mut value = serde_json::json!({"id":"version-target","action":"s3:GetObjectVersionAttributes","bucket":bucket,"object":"known"});
+                if let Some(version) = version {
+                    value["versionId"] = version.into();
+                }
+                let request = parse(serde_json::json!({"checks":[value]}));
+                let result =
+                    evaluate_check(&envelope, &cred, false, &request.checks[0], request.validate().expect("version check")[0])
+                        .await
+                        .expect("version query");
+                assert_eq!(result.decision, expected, "{version:?}");
             }
         });
     }
@@ -1037,6 +1210,7 @@ mod tests {
             serde_json::json!([{"id":"x","action":"s3:*"}]),
             serde_json::json!([{"id":"x","action":"s3:GetObject"},{"id":"x","action":"s3:PutObject"}]),
             serde_json::json!([{"id":"x","action":"s3:GetObject","versionId":"v1"}]),
+            serde_json::json!([{"id":"x","action":"s3:GetObjectAttributes","versionId":"v1"}]),
         ] {
             assert!(parse(serde_json::json!({"checks":checks})).validate().is_err());
         }
