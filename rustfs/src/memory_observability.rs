@@ -20,6 +20,12 @@ use serde::Serialize;
 #[cfg(any(not(target_os = "windows"), test))]
 use serde_json::Value;
 use std::path::Path;
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +40,38 @@ const CGROUP_V2_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
 const CGROUP_V1_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory/memory.stat";
 const CGROUP_V1_MEMORY_USAGE_PATH: &str = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
 const CGROUP_V1_MEMORY_LIMIT_PATH: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+static DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+fn adjust_diagnostic_global_allocator_live_bytes(counter: &AtomicUsize, old_size: usize, new_size: usize) {
+    if new_size > old_size {
+        counter.fetch_add(new_size - old_size, Ordering::Relaxed);
+    } else if old_size > new_size {
+        counter.fetch_sub(old_size - new_size, Ordering::Relaxed);
+    }
+}
+
+/// Update the diagnostic-only live requested-byte counter for Rust allocations
+/// routed through the binary's `GlobalAlloc` wrapper.
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+#[doc(hidden)]
+pub fn record_diagnostic_global_allocator_resize(old_size: usize, new_size: usize) {
+    adjust_diagnostic_global_allocator_live_bytes(&DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES, old_size, new_size);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -457,7 +495,46 @@ fn allocator_snapshot_or_unavailable(snapshot: Option<AllocatorMemorySnapshot>) 
     })
 }
 
+/// Record the serving Tokio runtime's worker and blocking-pool thread counts.
+/// Blocking-pool counts require a diagnostic build with `tokio_unstable`.
+fn record_tokio_runtime_metrics() {
+    let runtime = tokio::runtime::Handle::current().metrics();
+    metrics::gauge!("rustfs_runtime_worker_threads").set(runtime.num_workers() as f64);
+
+    #[cfg(tokio_unstable)]
+    {
+        let total = runtime.num_blocking_threads();
+        let idle = runtime.num_idle_blocking_threads().min(total);
+        metrics::gauge!("rustfs_runtime_blocking_pool_metrics_available").set(1.0);
+        metrics::gauge!("rustfs_runtime_blocking_threads_total").set(total as f64);
+        metrics::gauge!("rustfs_runtime_blocking_threads_idle").set(idle as f64);
+        metrics::gauge!("rustfs_runtime_blocking_threads_active").set(total.saturating_sub(idle) as f64);
+    }
+
+    #[cfg(not(tokio_unstable))]
+    metrics::gauge!("rustfs_runtime_blocking_pool_metrics_available").set(0.0);
+
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    {
+        metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes_available").set(1.0);
+        metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes")
+            .set(DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES.load(Ordering::Relaxed) as f64);
+    }
+
+    #[cfg(not(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    )))]
+    metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes_available").set(0.0);
+}
+
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
+    record_tokio_runtime_metrics();
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
@@ -535,6 +612,35 @@ pub fn init_memory_observability(ctx: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    use std::sync::atomic::AtomicUsize;
+
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    #[test]
+    fn diagnostic_global_allocator_counter_tracks_alloc_realloc_and_free() {
+        let counter = AtomicUsize::new(0);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 0, 32);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 32);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 32, 64);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 64);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 64, 8);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 8);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 8, 0);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     use super::{
         CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
         MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
@@ -543,6 +649,45 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn runtime_diagnostics_publish_feature_availability() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, super::record_tokio_runtime_metrics);
+        let rows = recorder.snapshotter().snapshot().into_vec();
+        let gauge = |name: &str| {
+            rows.iter()
+                .find_map(|(key, _, _, value)| match value {
+                    DebugValue::Gauge(value) if key.key().name() == name => Some(value.into_inner()),
+                    _ => None,
+                })
+                .expect("diagnostic gauge is published")
+        };
+        assert_eq!(
+            gauge("rustfs_runtime_worker_threads"),
+            f64::from(
+                u32::try_from(tokio::runtime::Handle::current().metrics().num_workers()).expect("Tokio worker count fits u32")
+            )
+        );
+        assert_eq!(
+            gauge("rustfs_runtime_blocking_pool_metrics_available"),
+            if cfg!(tokio_unstable) { 1.0 } else { 0.0 }
+        );
+        let allocator_available = cfg!(all(
+            feature = "diagnostic-allocator-live",
+            not(target_os = "windows"),
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ));
+        assert_eq!(
+            gauge("rustfs_memory_allocator_rust_global_requested_live_bytes_available"),
+            if allocator_available { 1.0 } else { 0.0 }
+        );
+        if allocator_available {
+            assert!(gauge("rustfs_memory_allocator_rust_global_requested_live_bytes") >= 0.0);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
