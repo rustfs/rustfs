@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use self::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_objects_v2, prepare_table_data_plane_list_access,
+    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
 };
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
@@ -3688,14 +3688,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await?;
-        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketMultipartUploadsAction).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        Ok(authorize_list_multipart_uploads(self.server_ctx(), req, &bucket).await?)
     }
 
     /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.

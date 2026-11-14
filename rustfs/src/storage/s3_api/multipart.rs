@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::s3_api::bucket::encode_list_output_value;
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use crate::storage::storage_api::effective_storage_class;
-use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
-    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
-};
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
 use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
-use s3s::dto::{CommonPrefix, EncodingType, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
+use s3s::dto::{ListPartsOutput, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
@@ -163,69 +160,16 @@ pub(crate) fn parse_list_multipart_uploads_params(
     })
 }
 
-pub(crate) fn build_list_multipart_uploads_output(
-    bucket: String,
-    prefix: String,
-    result: ListMultipartsInfo,
-    encoding_type: Option<&EncodingType>,
-) -> ListMultipartUploadsOutput {
-    let owner = rustfs_owner();
-    let initiator = rustfs_initiator();
-
-    ListMultipartUploadsOutput {
-        bucket: Some(bucket),
-        prefix: Some(encode_list_output_value(prefix, encoding_type)),
-        delimiter: result.delimiter.map(|value| encode_list_output_value(value, encoding_type)),
-        key_marker: result.key_marker.map(|value| encode_list_output_value(value, encoding_type)),
-        upload_id_marker: result.upload_id_marker,
-        next_key_marker: result
-            .next_key_marker
-            .map(|value| encode_list_output_value(value, encoding_type)),
-        next_upload_id_marker: result.next_upload_id_marker,
-        max_uploads: Some(result.max_uploads as i32),
-        is_truncated: Some(result.is_truncated),
-        uploads: Some(
-            result
-                .uploads
-                .into_iter()
-                .map(|u| MultipartUpload {
-                    key: Some(encode_list_output_value(u.object, encoding_type)),
-                    upload_id: Some(u.upload_id),
-                    initiated: u.initiated.map(Timestamp::from),
-                    owner: Some(owner.clone()),
-                    initiator: Some(initiator.clone()),
-                    ..Default::default()
-                })
-                .collect(),
-        ),
-        common_prefixes: Some(
-            result
-                .common_prefixes
-                .into_iter()
-                .map(|c| CommonPrefix {
-                    prefix: Some(encode_list_output_value(c, encoding_type)),
-                })
-                .collect(),
-        ),
-        encoding_type: encoding_type.cloned(),
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
-        parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+        MAX_MULTIPART_UPLOADS_LIST, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+        parse_upload_part_number,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
-        ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo,
-    };
+    use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, PartInfo};
     use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
     use s3s::S3ErrorCode;
-    use s3s::dto::Timestamp;
-    use time::OffsetDateTime;
 
     #[test]
     fn test_list_parts_output_maps_parts_and_owner() {
@@ -457,119 +401,6 @@ mod tests {
             Some("STANDARD"),
             "legacy uploads without a stored class must report their effective STANDARD layout"
         );
-    }
-
-    #[test]
-    fn test_list_multipart_uploads_output_encoding_type() {
-        for (encoding_type, expected) in [
-            (None, "dir a/file+b%é\u{0001}"),
-            (Some(s3s::dto::EncodingType::from_static("url")), "dir%20a/file%2Bb%25%C3%A9%01"),
-        ] {
-            let raw = "dir a/file+b%é\u{0001}";
-            let result = ListMultipartsInfo {
-                delimiter: Some(raw.to_string()),
-                key_marker: Some(raw.to_string()),
-                next_key_marker: Some(raw.to_string()),
-                upload_id_marker: Some("upload+id%".to_string()),
-                next_upload_id_marker: Some("next+id%".to_string()),
-                max_uploads: 1,
-                is_truncated: true,
-                uploads: vec![MultipartInfo {
-                    object: raw.to_string(),
-                    upload_id: "upload+id%".to_string(),
-                    ..Default::default()
-                }],
-                common_prefixes: vec![raw.to_string()],
-                ..Default::default()
-            };
-            let output =
-                build_list_multipart_uploads_output("bucket-a".to_string(), raw.to_string(), result, encoding_type.as_ref());
-            assert_eq!(output.prefix.as_deref(), Some(expected));
-            assert_eq!(output.delimiter.as_deref(), Some(expected));
-            assert_eq!(output.key_marker.as_deref(), Some(expected));
-            assert_eq!(output.next_key_marker.as_deref(), Some(expected));
-            assert_eq!(output.uploads.as_ref().unwrap()[0].key.as_deref(), Some(expected));
-            assert_eq!(output.common_prefixes.as_ref().unwrap()[0].prefix.as_deref(), Some(expected));
-            if encoding_type.is_some() {
-                let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).unwrap()).unwrap();
-                assert!(xml.contains("<EncodingType>url</EncodingType>"));
-                for tag in ["Prefix", "Delimiter", "KeyMarker", "NextKeyMarker", "Key"] {
-                    assert!(xml.contains(&format!("<{tag}>{expected}</{tag}>")), "{xml}");
-                }
-            }
-            assert_eq!(output.encoding_type, encoding_type);
-            assert_eq!(output.bucket.as_deref(), Some("bucket-a"));
-            assert_eq!(output.upload_id_marker.as_deref(), Some("upload+id%"));
-            assert_eq!(output.next_upload_id_marker.as_deref(), Some("next+id%"));
-            assert_eq!(output.uploads.as_ref().unwrap()[0].upload_id.as_deref(), Some("upload+id%"));
-            assert_eq!(output.is_truncated, Some(true));
-            assert_eq!(output.max_uploads, Some(1));
-        }
-    }
-
-    #[test]
-    fn test_list_multipart_uploads_output_encoding_preserves_empty_and_absent_fields() {
-        let encoding_type = s3s::dto::EncodingType::from_static("url");
-        let output = build_list_multipart_uploads_output(
-            "bucket-a".to_string(),
-            String::new(),
-            ListMultipartsInfo::default(),
-            Some(&encoding_type),
-        );
-        assert_eq!(output.encoding_type, Some(encoding_type));
-        assert_eq!(output.prefix.as_deref(), Some(""));
-        assert_eq!(output.delimiter, None);
-        assert_eq!(output.key_marker, None);
-        assert_eq!(output.next_key_marker, None);
-        assert!(output.uploads.unwrap().is_empty());
-        assert!(output.common_prefixes.unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_list_multipart_uploads_output_maps_uploads_and_prefixes() {
-        let result = ListMultipartsInfo {
-            delimiter: Some("/".to_string()),
-            key_marker: Some("key-marker".to_string()),
-            upload_id_marker: Some("upload-id-marker".to_string()),
-            next_key_marker: Some("next-key-marker".to_string()),
-            next_upload_id_marker: Some("next-upload-id-marker".to_string()),
-            max_uploads: 1000,
-            is_truncated: true,
-            uploads: vec![MultipartInfo {
-                object: "obj-a".to_string(),
-                upload_id: "upload-a".to_string(),
-                initiated: Some(OffsetDateTime::UNIX_EPOCH),
-                ..Default::default()
-            }],
-            common_prefixes: vec!["prefix-a/".to_string(), "prefix-b/".to_string()],
-            ..Default::default()
-        };
-
-        let output = build_list_multipart_uploads_output("bucket-a".to_string(), "root/".to_string(), result, None);
-
-        let uploads = output.uploads.as_ref().expect("uploads should be present");
-        let common_prefixes = output.common_prefixes.as_ref().expect("common prefixes should be present");
-
-        assert_eq!(output.bucket.as_deref(), Some("bucket-a"));
-        assert_eq!(output.prefix.as_deref(), Some("root/"));
-        assert_eq!(output.delimiter.as_deref(), Some("/"));
-        assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
-        assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
-        assert_eq!(output.next_key_marker.as_deref(), Some("next-key-marker"));
-        assert_eq!(output.next_upload_id_marker.as_deref(), Some("next-upload-id-marker"));
-        assert_eq!(output.max_uploads, Some(1000));
-        assert_eq!(output.is_truncated, Some(true));
-
-        assert_eq!(uploads.len(), 1);
-        assert_eq!(uploads[0].key.as_deref(), Some("obj-a"));
-        assert_eq!(uploads[0].upload_id.as_deref(), Some("upload-a"));
-        assert_eq!(uploads[0].initiated, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
-        assert_eq!(uploads[0].owner, Some(rustfs_owner()));
-        assert_eq!(uploads[0].initiator, Some(rustfs_initiator()));
-
-        assert_eq!(common_prefixes.len(), 2);
-        assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));
-        assert_eq!(common_prefixes[1].prefix.as_deref(), Some("prefix-b/"));
     }
 
     #[test]
