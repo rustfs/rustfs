@@ -15,7 +15,6 @@
 use crate::cluster::rpc::client::{
     AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error,
     node_service_delete_recovery_client, node_service_time_out_client, node_service_time_out_client_for_class,
-    node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::http_auth::{current_rpc_background_request, with_rpc_background_request};
 use crate::cluster::rpc::internode_data_transport::{
@@ -64,7 +63,6 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
 };
 use rustfs_io_metrics::walk_metrics::{RemoteWalkFailureReason, RemoteWalkGuard};
-use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
@@ -80,6 +78,7 @@ use rustfs_protos::proto_gen::node_service::{
     SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteAllResponse,
     WriteFormatControlRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
+use rustfs_protos::{ChannelClass, prewarm_channel_class};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     future::Future,
@@ -1140,9 +1139,19 @@ fn spawn_control_channel_prewarm(addr: String) {
         return;
     }
     tokio::spawn(async move {
-        match node_service_time_out_client_no_auth(&addr).await {
-            Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
-            Err(err) => {
+        let control = prewarm_channel_class(&addr, ChannelClass::Control)
+            .await
+            .map_err(|err| err.to_string());
+        let bulk = if control.is_ok() {
+            prewarm_channel_class(&addr, ChannelClass::Bulk)
+                .await
+                .map_err(|err| err.to_string())
+        } else {
+            Ok(())
+        };
+        match (control, bulk) {
+            (Ok(()), Ok(())) => debug!(addr = %addr, "internode control and bulk channels prewarmed"),
+            (Err(err), _) | (_, Err(err)) => {
                 release_control_channel_prewarm(&addr);
                 debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)");
             }
