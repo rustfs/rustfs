@@ -51,6 +51,9 @@ async fn candidate_with_budget(
             ..Default::default()
         },
     );
+    // This fixture commits real checkpoints after count stops; CI disk latency
+    // must not turn the accelerated drain used by timing doubles into lost work.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = crate::scanner_io::nsscanner_with_storage_status_scoped(
         store.as_ref(),
