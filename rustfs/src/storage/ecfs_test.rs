@@ -748,6 +748,10 @@ mod tests {
         // [1] Normal case: No retention specified (empty metadata)
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
+        let cleared = parse_object_lock_retention(Some(ObjectLockRetention::default())).unwrap();
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some(""));
+        assert_eq!(cleared.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str), Some(""));
+        assert!(contains_key_str(&cleared, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
         let valid_compliance_retention = ObjectLockRetention {
