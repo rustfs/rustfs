@@ -22,6 +22,9 @@ mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
 mod listing_multipart;
+
+#[cfg(test)]
+pub(crate) use listing_multipart::list_objects_v2_through_legacy_edge;
 mod object_meta;
 mod object_misc;
 mod object_read;

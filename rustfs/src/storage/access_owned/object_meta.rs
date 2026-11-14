@@ -20,3 +20,18 @@
 //! policy evaluation itself (`authorize_request`), or the operation's use case.
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_meta.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
+
+use super::super::{AuthorizationRequest, S3Result, authorize_object_request, versioned_tagging_action};
+use rustfs_policy::policy::action::S3Action;
+
+/// GetObjectTagging and DeleteObjectTagging: the plain object shape, with the tagging action
+/// swapped for its version action when the request names a version.
+pub(crate) async fn authorize_object_tagging_request<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    action: S3Action,
+) -> S3Result<()> {
+    authorize_object_request(req, bucket, key, version_id, versioned_tagging_action(action, version_id)).await
+}

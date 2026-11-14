@@ -15,11 +15,9 @@
 //! Bucket create, delete, head and location use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    BucketLocationConstraint, DeleteBucketInput, DeleteBucketOutput, GetBucketLocationInput, GetBucketLocationOutput,
-};
+use crate::app::storage_api::bucket_usecase::access::requested_bucket_force_delete;
+use crate::app::storage_api::s3::S3Error;
 use crate::app::storage_api::s3::region::Region;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 /// Whether `CreateBucket` may record `location`: the server's own region, or
 /// one of the further regions listed after it in `RUSTFS_REGION`. `location`
@@ -204,43 +202,55 @@ impl DefaultBucketUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    /// Deletes `input.bucket`, for either edge, on a fresh admitted task. The access phase has
+    /// authorized `s3:DeleteBucket`, and `s3:ForceDeleteBucket` when a force-delete header is
+    /// present; a force delete asks it again here, as the legacy body did.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized; the refusal of
+    /// `requested_bucket_force_delete` for a force-delete header it cannot read; `AccessDenied`
+    /// for a force delete the caller may not make; otherwise the admission refusal or the storage
+    /// error of the deletion (`NoSuchBucket`, `BucketNotEmpty`).
+    #[instrument(level = "debug", skip(self, envelope, input))]
+    pub async fn execute_delete_bucket(
+        &self,
+        envelope: RequestEnvelope,
+        input: gateway_dto::DeleteBucketInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::DeleteBucketOutput> {
         rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::DeleteBucket);
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket deletion", move |mutation_permit| async move {
             let _mutation_permit = mutation_permit;
-            usecase.execute_delete_bucket_inner(req).await
+            Ok(usecase.execute_delete_bucket_inner(envelope, input).await)
         })
-        .await
+        .await?
     }
 
     async fn execute_delete_bucket_inner(
         &self,
-        mut req: S3Request<DeleteBucketInput>,
-    ) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
-        let input = req.input.clone();
+        mut envelope: RequestEnvelope,
+        input: gateway_dto::DeleteBucketInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::DeleteBucketOutput> {
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::BucketRemoved, S3Operation::DeleteBucket);
+        let bucket = input.bucket.as_str().to_owned();
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
-        let force = match force_delete_header(&req.headers) {
-            Ok(value) => value.unwrap_or(false),
-            Err(_) => return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")),
-        };
+        let force = requested_bucket_force_delete(envelope.headers())?.unwrap_or(false);
 
         if force {
-            authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
+            authorize_request(&mut envelope, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
 
         // Keep the local namespace mutation and its peer hook ordered across
         // every node in this site so an older delete cannot overtake a new
         // same-name make while it waits for repair coordination.
-        let operation_bucket = input.bucket.clone();
+        let operation_bucket = bucket.clone();
         let operation_store = store.clone();
-        with_site_replication_bucket_mutation_lock(store, &input.bucket, move || async move {
+        with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
             let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
             let delete_result = operation_store
                 .delete_bucket(
@@ -276,17 +286,16 @@ impl DefaultBucketUsecase {
         // force-delete path, which share this single delete_bucket call
         // (ODC-28, backlog#1133).
         let cache_adapter = current_object_data_cache_for_context(self.context.as_deref());
-        let _ = invalidate_object_data_cache_bucket_after_delete(&cache_adapter, &input.bucket).await;
+        let _ = invalidate_object_data_cache_bucket_after_delete(&cache_adapter, &bucket).await;
 
         // Re-evaluate lifecycle and replication after bucket removal.
-        rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
+        rustfs_scanner::record_scanner_maintenance_change(&bucket);
 
         // Notify peers to drop their cached metadata for the now-deleted bucket.
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        notify_bucket_metadata_delete(input.bucket.clone(), request_context);
+        notify_bucket_metadata_delete(bucket, envelope.request_context().cloned());
 
-        let result = Ok(S3Response::new(DeleteBucketOutput {}));
-        let _ = helper.complete(&result);
+        let result = Ok(gateway_dto::DeleteBucketOutput::default());
+        let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
         result
     }
 
@@ -313,27 +322,32 @@ impl DefaultBucketUsecase {
         Ok(gateway_dto::HeadBucketOutput::default())
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    /// Answers the region `input.bucket` is in, for either edge: none for the default region,
+    /// as AWS answers for `us-east-1`. The access phase has authorized it.
+    ///
+    /// # Errors
+    ///
+    /// `InternalError` when the store is not initialized; otherwise the storage error of the
+    /// lookup, `NoSuchBucket` among them.
+    #[instrument(level = "debug", skip(self, input))]
     pub async fn execute_get_bucket_location(
         &self,
-        req: S3Request<GetBucketLocationInput>,
-    ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        let input = req.input;
-
+        input: gateway_dto::GetBucketLocationInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketLocationOutput> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&input.bucket, &BucketOptions::default())
+            .get_bucket_info(input.bucket.as_str(), &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
         let location_constraint = self
             .global_region()
             .filter(|region| region.as_str() != RUSTFS_REGION)
-            .map(|region| BucketLocationConstraint::from(region.to_string()));
-        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
+            .map(|region| gateway_dto::LocationConstraint::custom(region.to_string()));
+        Ok(gateway_dto::GetBucketLocationOutput { location_constraint })
     }
 }
 
@@ -495,20 +509,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_delete_bucket_returns_internal_error_when_store_uninitialized() {
-        let input = DeleteBucketInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::DELETE);
+        let input = gateway_dto::DeleteBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
         let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("DELETE");
-        let mut call = Box::pin(usecase.execute_delete_bucket(req));
+        let mut call = Box::pin(usecase.execute_delete_bucket(envelope(None), input));
         let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
             .await
             .expect_err("an uninitialized store must fail");
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(
             request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
             Some("s3:DeleteBucket")
@@ -532,15 +544,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_location_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketLocationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
+        let input = gateway_dto::GetBucketLocationInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_location(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_location(input).await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{StorageError, decode_tags_to_map, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use crate::app::RequestEnvelope;
+use crate::app::{Answered, RequestEnvelope};
 use crate::error::ApiErrorDiagnostic;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::object::ObjectOperations as _;
@@ -23,12 +23,9 @@ use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_buckets;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use rustfs_utils::http::headers::{AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
@@ -180,30 +177,6 @@ pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Op
 const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
 const MAXIMUM_RETENTION_YEARS: i32 = 100;
 
-pub(crate) fn object_lock_retention_from_metadata(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRetention> {
-    let mode = metadata
-        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-        .map(|value| ObjectLockRetentionMode::from(value.as_str().to_string()));
-    let retain_until_date = metadata
-        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        // The S3 timestamp serializer emits a literal Z, so its wall clock
-        // must be UTC before it is serialized.
-        .map(|date| {
-            date.checked_to_offset(time::UtcOffset::UTC)
-                .filter(|date| (0..=9999).contains(&date.year()))
-                .map(Timestamp::from)
-                .ok_or_else(|| {
-                    S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        "Stored retention date is outside the supported UTC range".to_string(),
-                    )
-                })
-        })
-        .transpose()?;
-    Ok(ObjectLockRetention { mode, retain_until_date })
-}
-
 fn invalid_object_lock_configuration(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::MalformedXML, message.into())
 }
@@ -295,10 +268,31 @@ pub(in crate::storage) async fn through_gateway_seam<I, GatewayInput, GatewayOut
 where
     F: Future<Output = rustfs_s3_types::S3Result<GatewayOutput>>,
 {
+    through_gateway_seam_answered(req, input_from_s3s, output_to_s3s, |envelope, input| {
+        let answer = use_case(envelope, input);
+        async move { answer.await.map(Answered::new) }
+    })
+    .await
+}
+
+/// [`through_gateway_seam`] for a use case that answers a status or response headers of its own:
+/// both are written onto the response unchanged.
+pub(in crate::storage) async fn through_gateway_seam_answered<I, GatewayInput, GatewayOutput, O, F>(
+    req: S3Request<I>,
+    input_from_s3s: fn(I) -> Result<GatewayInput, ConversionError>,
+    output_to_s3s: fn(GatewayOutput) -> Result<O, ConversionError>,
+    use_case: impl FnOnce(RequestEnvelope, GatewayInput) -> F,
+) -> S3Result<S3Response<O>>
+where
+    F: Future<Output = rustfs_s3_types::S3Result<Answered<GatewayOutput>>>,
+{
     let envelope = RequestEnvelope::from_s3s(&req);
     let input = input_from_s3s(req.input).map_err(seam_error)?;
-    let output = use_case(envelope, input).await?;
-    output_to_s3s(output).map(S3Response::new).map_err(seam_error)
+    let Answered { output, status, headers } = use_case(envelope, input).await?;
+    let mut response = output_to_s3s(output).map(S3Response::new).map_err(seam_error)?;
+    response.status = status;
+    response.headers = headers;
+    Ok(response)
 }
 
 fn seam_error(error: ConversionError) -> S3Error {
@@ -308,6 +302,8 @@ fn seam_error(error: ConversionError) -> S3Error {
 // The bodies of the methods below, one file per migration batch (rustfs/backlog#2765).
 #[path = "legacy_edge/mod.rs"]
 mod legacy_edge;
+#[cfg(test)]
+pub(crate) use legacy_edge::list_objects_v2_through_legacy_edge;
 
 #[async_trait::async_trait]
 impl S3 for FS {

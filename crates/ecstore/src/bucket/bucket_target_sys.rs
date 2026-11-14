@@ -26,6 +26,8 @@ use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::runtime::sources as runtime_sources;
+use aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef;
+use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -53,8 +55,9 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING_LOWER, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header,
-    is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING, AMZ_OBJECT_TAGGING_LOWER, AMZ_STORAGE_CLASS,
+    AMZ_TAGGING_DIRECTIVE_LOWER, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header, is_rustfs_header,
+    is_standard_header, is_storageclass_header,
 };
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
@@ -131,6 +134,36 @@ impl From<&BucketTarget> for RemoteS3EndpointSpec {
 }
 
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
+
+/// Captures the `x-amz-tagging` response header of a replication HEAD, which
+/// the SDK drops while deserializing `HeadObjectOutput`.
+#[derive(Clone, Debug, Default)]
+struct HeadObjectTaggingCapture(Arc<std::sync::Mutex<Option<String>>>);
+
+impl HeadObjectTaggingCapture {
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+    }
+}
+
+impl Intercept for HeadObjectTaggingCapture {
+    fn name(&self) -> &'static str {
+        "HeadObjectTaggingCapture"
+    }
+
+    fn read_before_deserialization(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        // Overwrite on every attempt so a retried HEAD reports the tags of the
+        // response that was actually deserialized.
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            context.response().headers().get(AMZ_OBJECT_TAGGING_LOWER).map(str::to_string);
+        Ok(())
+    }
+}
 
 /// Whether an edited bucket target still addresses the same remote service
 /// (endpoint, bucket, path style, TLS and identity), so a verdict learned
@@ -2100,12 +2133,19 @@ impl TargetClient {
         // object with an identical ETag, and the worker concludes the object
         // already converged — so it never actually replicates it.
         insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "false");
-        self.client
+        // Ask for the tag set itself (MinIO `x-amz-tagging-directive: ACCESS`):
+        // a plain HEAD reports only the tag count, which cannot tell the
+        // replica's tags from the source's.
+        headers.insert(HeaderName::from_static(AMZ_TAGGING_DIRECTIVE_LOWER), HeaderValue::from_static("ACCESS"));
+        let target_tagging = HeadObjectTaggingCapture::default();
+        let mut output = self
+            .client
             .head_object()
             .bucket(bucket)
             .key(object)
             .set_version_id(resolve_read_api_version_id(version_id))
             .customize()
+            .interceptor(target_tagging.clone())
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
                     if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
@@ -2117,7 +2157,17 @@ impl TargetClient {
             })
             .send()
             .await
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        // The SDK's typed output has no field for the tag set; carry it where
+        // the replication comparison reads it. A target that ignores the
+        // directive leaves the key absent, which compares as "tags unknown".
+        if let Some(tagging) = target_tagging.take() {
+            output
+                .metadata
+                .get_or_insert_default()
+                .insert(AMZ_OBJECT_TAGGING.to_string(), tagging);
+        }
+        Ok(output)
     }
 
     /// Candidate replicas by content identity on a target that mints its own
@@ -4554,6 +4604,62 @@ mod tests {
             "a concrete source version must pass through unchanged: {}",
             request_uris[1]
         );
+    }
+
+    #[derive(Clone, Debug)]
+    struct TaggingHeadConnector {
+        target_tagging: Option<&'static str>,
+        tagging_directives: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl SmithyHttpConnector for TaggingHeadConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.tagging_directives
+                .lock()
+                .expect("recorded directive lock should not be poisoned")
+                .push(request.headers().get(AMZ_TAGGING_DIRECTIVE_LOWER).map(str::to_string));
+            let mut response = HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
+                SdkBody::empty(),
+            );
+            response.headers_mut().insert("x-amz-meta-owner", "team-a");
+            if let Some(tagging) = self.target_tagging {
+                response.headers_mut().insert(AMZ_OBJECT_TAGGING_LOWER, tagging);
+            }
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    #[tokio::test]
+    async fn head_object_requests_and_reports_the_target_tag_set() {
+        for target_tagging in [Some("env=prod&team=a"), None] {
+            let tagging_directives = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connector = SharedHttpConnector::new(TaggingHeadConnector {
+                target_tagging,
+                tagging_directives: Arc::clone(&tagging_directives),
+            });
+            let http_client = http_client_fn(move |_settings, _components| connector.clone());
+            let (mut client, _) = recording_target_client();
+            client.client = Arc::new(s3_client_for_test(443, Some(http_client)));
+
+            let head = client
+                .head_object("target-bucket", "object", None)
+                .await
+                .expect("canned HEAD should succeed");
+
+            assert_eq!(
+                *tagging_directives
+                    .lock()
+                    .expect("recorded directive lock should not be poisoned"),
+                vec![Some("ACCESS".to_string())],
+                "the replication HEAD must ask the target for its tag set"
+            );
+            let metadata = head.metadata.expect("user metadata should be parsed");
+            assert_eq!(metadata.get("owner").map(String::as_str), Some("team-a"));
+            // Absent means "tags unknown": the comparison then keeps treating a
+            // tagged replica as different instead of trusting the count alone.
+            assert_eq!(metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str), target_tagging);
+        }
     }
 
     #[tokio::test]

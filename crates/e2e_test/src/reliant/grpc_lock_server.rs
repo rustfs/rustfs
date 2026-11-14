@@ -439,6 +439,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn write_format_control(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::WriteFormatControlRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::WriteAllResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn compare_and_update_file(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::CompareAndUpdateFileRequest>,

@@ -20,7 +20,6 @@
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::FS;
-use crate::app::storage_api::owned_parity::authorize_create_bucket;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
 use crate::app::storage_api::owned_parity::{
@@ -28,6 +27,7 @@ use crate::app::storage_api::owned_parity::{
     RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
     TableDataPlanePublicationGuards,
 };
+use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
     ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, S3Access, S3ErrorCode, S3Request, Tag,
@@ -534,9 +534,11 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
         .expect("dropping the request must release its publication guard");
 }
 
-#[tokio::test]
-#[serial]
-async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() {
+/// A server context whose IAM holds one user under `policy`, and that user's credentials. The
+/// temporary directory keeps the store alive for the test.
+async fn server_with_one_policy_user(
+    policy: &[u8],
+) -> (tempfile::TempDir, Arc<ServerContextSlot>, rustfs_credentials::Credentials) {
     use rustfs_iam::store::{Store as _, UserType};
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::Policy;
@@ -552,7 +554,7 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
         }
     }
 
-    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let (temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     ObjectStore::new(Arc::clone(&store))
         .save_iam_config(
             serde_json::json!({"version": 1}),
@@ -572,15 +574,9 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     )
     .await
     .expect("create IAM user");
-    iam.set_policy(
-        "location-create-policy",
-        Policy::parse_config(
-            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":["arn:aws:s3:::location-policy-bucket","arn:aws:s3:::location-lock-bucket"],"Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},{"Effect":"Allow","Action":["s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"arn:aws:s3:::location-lock-bucket"}]}"#,
-        )
-        .expect("parse location policy"),
-    )
-    .await
-    .expect("store location policy");
+    iam.set_policy("location-create-policy", Policy::parse_config(policy).expect("parse location policy"))
+        .await
+        .expect("store location policy");
     iam.policy_db_set(access_key, UserType::Reg, false, "location-create-policy")
         .await
         .expect("attach location policy");
@@ -588,6 +584,16 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
     let slot = ServerContextSlot::new();
     assert!(slot.install(context), "install request context");
+    (temp_dir, slot, credentials)
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() {
+    let (_temp_dir, slot, credentials) = server_with_one_policy_user(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":["arn:aws:s3:::location-policy-bucket","arn:aws:s3:::location-lock-bucket"],"Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},{"Effect":"Allow","Action":["s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"arn:aws:s3:::location-lock-bucket"}]}"#,
+    )
+    .await;
 
     for (region, allowed) in [("eu-west-1", true), ("us-west-2", false)] {
         let mut legacy = build_request(
@@ -676,6 +682,54 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
         assert_eq!(handed_on(legacy.extensions.get::<ReqInfo>()), Some(bucket.to_owned()), "{case}");
         assert_eq!(handed_on(owned.req_info()), Some(bucket.to_owned()), "{case}");
         assert_eq!(legacy.headers, *owned.headers(), "{case}");
+    }
+}
+
+/// DeleteBucket, legacy hook against the owned function: `s3:ForceDeleteBucket` is asked whenever
+/// a force-delete header is present, `false` included, and an unparsable value is refused only
+/// after `s3:DeleteBucket` allowed the caller. Same decision, same bucket handed on, both ways.
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_delete_bucket_authorization_agree() {
+    let (_temp_dir, slot, credentials) = server_with_one_policy_user(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:DeleteBucket","Resource":["arn:aws:s3:::plain-delete-bucket","arn:aws:s3:::force-delete-bucket"]},{"Effect":"Allow","Action":"s3:ForceDeleteBucket","Resource":"arn:aws:s3:::force-delete-bucket"}]}"#,
+    )
+    .await;
+    let fs = FS::with_server_ctx(Arc::clone(&slot));
+    for (bucket, header, refusal) in [
+        ("plain-delete-bucket", None, None),
+        ("plain-delete-bucket", Some(("x-rustfs-force-delete", "false")), Some("AccessDenied")),
+        ("plain-delete-bucket", Some(("x-minio-force-delete", "true")), Some("AccessDenied")),
+        ("plain-delete-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("InvalidRequest")),
+        ("other-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("AccessDenied")),
+        ("force-delete-bucket", Some(("x-rustfs-force-delete", "true")), None),
+    ] {
+        let mut legacy = build_request(
+            crate::app::storage_api::s3::dto::DeleteBucketInput {
+                bucket: bucket.to_owned(),
+                ..Default::default()
+            },
+            Method::DELETE,
+        );
+        if let Some((name, value)) = header {
+            legacy.headers.insert(name, HeaderValue::from_static(value));
+        }
+        legacy.extensions.insert(Arc::clone(&slot));
+        legacy.extensions.insert(ReqInfo {
+            cred: Some(credentials.clone()),
+            ..Default::default()
+        });
+        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+
+        let legacy_result = fs.delete_bucket(&mut legacy).await;
+        let owned_result = authorize_delete_bucket(&mut owned, bucket).await;
+
+        let case = format!("{bucket} {header:?}");
+        assert_eq!(legacy_result.as_ref().err().map(|error| error.code().as_str()), refusal, "legacy: {case}");
+        assert_eq!(owned_result.as_ref().err().map(|error| error.code().as_str()), refusal, "owned: {case}");
+        let handed_on = |req_info: Option<&ReqInfo>| req_info.and_then(|info| info.bucket.clone());
+        assert_eq!(handed_on(legacy.extensions.get::<ReqInfo>()), Some(bucket.to_owned()), "{case}");
+        assert_eq!(handed_on(owned.req_info()), Some(bucket.to_owned()), "{case}");
     }
 }
 
@@ -1872,4 +1926,241 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
         }
     }
     assert!(mismatches.is_empty(), "bucket config mutation mismatches:\n{}", mismatches.join("\n"));
+}
+
+/// The write-path checks whose decision and hand-on are compared across the two request forms.
+#[derive(Clone, Copy, Debug)]
+enum WriteShape {
+    ReplicationOnlyHeaders,
+    WriteEtag { specific_dto_etag: bool },
+    StagedPart,
+}
+
+/// The refusal code, if any, then the replication flag and the staged-part marker.
+type WriteOutcome = (Option<String>, bool, bool);
+
+/// Runs one write check and reports its decision and the state it leaves on the request.
+async fn run_write_shape<R: crate::app::storage_api::owned_parity::AuthorizationRequest + ?Sized>(
+    shape: WriteShape,
+    req: &mut R,
+) -> WriteOutcome {
+    use crate::app::storage_api::owned_parity::{
+        authorize_replication_only_put_headers, authorize_staged_multipart_part, authorize_write_etag_condition,
+        replication_request_authorized,
+    };
+    let result = match shape {
+        WriteShape::ReplicationOnlyHeaders => authorize_replication_only_put_headers(req).await,
+        WriteShape::WriteEtag { specific_dto_etag } => authorize_write_etag_condition(req, specific_dto_etag).await,
+        WriteShape::StagedPart => authorize_staged_multipart_part(req).await,
+    };
+    let decision = result.err().map(|err| err.code().as_str().to_owned());
+    (decision, replication_request_authorized(req), req.staged_multipart_part())
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
+    let (_store_dirs, _store, slot, user, owner) = decision_world().await;
+    let denied = Some("AccessDenied".to_owned());
+    let replication_status = |req: &mut S3Request<()>| {
+        req.headers
+            .insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
+    };
+    // The access phase marks every multipart upload step; a staged part is one.
+    let staging = |req: &mut S3Request<()>| {
+        req.extensions.insert(MultipartStagingOperation);
+    };
+    let if_match = |value: &'static str| {
+        move |req: &mut S3Request<()>| {
+            req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static(value));
+        }
+    };
+    // (name, shape, bucket, object, principal, request facts, expected decision and state)
+    type Case = (
+        &'static str,
+        WriteShape,
+        &'static str,
+        &'static str,
+        Principal,
+        Box<dyn Fn(&mut S3Request<()>)>,
+        WriteOutcome,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "replication headers, owner",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Owner,
+            Box::new(replication_status),
+            (None, true, false),
+        ),
+        (
+            "replication headers, user without ReplicateObject",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::User,
+            Box::new(replication_status),
+            (denied.clone(), false, false),
+        ),
+        (
+            "replication headers, anonymous",
+            WriteShape::ReplicationOnlyHeaders,
+            PUBLIC,
+            "open/obj",
+            Principal::Anonymous,
+            Box::new(replication_status),
+            (denied.clone(), false, false),
+        ),
+        (
+            "no replication headers asks nothing",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|_: &mut S3Request<()>| {}),
+            (None, false, false),
+        ),
+        (
+            "POST form replication field asks nothing",
+            WriteShape::ReplicationOnlyHeaders,
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|req: &mut S3Request<()>| {
+                let mut form = req.headers.clone();
+                form.insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
+                req.extensions.insert(PostObjectRequestMarker);
+                req.extensions.insert(PostObjectPolicyHeaders(form));
+            }),
+            (None, false, false),
+        ),
+        (
+            "specific If-Match, user may read",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::User,
+            Box::new(if_match("\"abc\"")),
+            (None, false, false),
+        ),
+        (
+            "specific If-Match, user denied the read",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "iam-denied",
+            Principal::User,
+            Box::new(if_match("\"abc\"")),
+            (denied.clone(), false, false),
+        ),
+        (
+            "specific If-Match, anonymous",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(if_match("\"abc\"")),
+            (denied.clone(), false, false),
+        ),
+        (
+            "specific DTO ETag, anonymous",
+            WriteShape::WriteEtag { specific_dto_etag: true },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|_: &mut S3Request<()>| {}),
+            (denied.clone(), false, false),
+        ),
+        (
+            "wildcard If-Match asks nothing",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(if_match("*")),
+            (None, false, false),
+        ),
+        (
+            "POST form If-Match wins over the header",
+            WriteShape::WriteEtag {
+                specific_dto_etag: false,
+            },
+            PRIVATE,
+            "allowed",
+            Principal::Anonymous,
+            Box::new(|req: &mut S3Request<()>| {
+                req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static("*"));
+                let mut form = req.headers.clone();
+                form.insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
+                req.extensions.insert(PostObjectRequestMarker);
+                req.extensions.insert(PostObjectPolicyHeaders(form));
+            }),
+            (denied.clone(), false, false),
+        ),
+        (
+            "staged part creates no object",
+            WriteShape::StagedPart,
+            PUBLIC,
+            "stage/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (None, false, false),
+        ),
+        (
+            "staged part outside the staged grant",
+            WriteShape::StagedPart,
+            PUBLIC,
+            "open/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (denied.clone(), false, false),
+        ),
+        (
+            "staged part on a private bucket",
+            WriteShape::StagedPart,
+            PRIVATE,
+            "stage/obj",
+            Principal::Anonymous,
+            Box::new(staging),
+            (denied.clone(), false, false),
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (name, shape, bucket, object, principal, facts, expected) in cases {
+        let mut legacy = build_request((), Method::PUT);
+        legacy.uri = format!("/{bucket}/{object}").parse().expect("case uri");
+        legacy.extensions.insert(Arc::clone(&slot));
+        let (cred, is_owner) = match principal {
+            Principal::Anonymous => (None, false),
+            Principal::User => (Some(user.clone()), false),
+            Principal::Owner => (Some(owner.clone()), true),
+        };
+        legacy.extensions.insert(ReqInfo {
+            cred,
+            is_owner,
+            bucket: Some(bucket.to_owned()),
+            object: Some(object.to_owned()),
+            ..Default::default()
+        });
+        facts(&mut legacy);
+        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let legacy_outcome = run_write_shape(shape, &mut legacy).await;
+        let owned_outcome = run_write_shape(shape, &mut owned).await;
+        if legacy_outcome != expected || owned_outcome != expected {
+            mismatches.push(format!(
+                "{name}: expected {expected:?}, legacy {legacy_outcome:?}, owned {owned_outcome:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "write check mismatches:\n{}", mismatches.join("\n"));
 }

@@ -71,7 +71,6 @@ tracing.workspace = true
 moka = { workspace = true, features = ["future"] }
 async-trait.workspace = true
 futures.workspace = true
-pollster.workspace = true
 hotpath.workspace = true
 
 [dev-dependencies]

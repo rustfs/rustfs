@@ -4066,6 +4066,11 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
 }
 
 pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    // Without a lifecycle document there is nothing to expire; skip the
+    // metadata-transaction lock and incarnation read that only validate it.
+    if !metadata_boundary::cached_metadata_may_have_lifecycle(&api, &oi.bucket).await {
+        return;
+    }
     let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
@@ -13566,6 +13571,105 @@ mod tests {
             state.read().await.stats.pending_tasks(),
             0,
             "confirmed absence must not fall back to the old ObjectInfo"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn immediate_expiry_without_lifecycle_skips_metadata_transaction() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-absent-expiry-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        let oi = ecstore
+            .put_object(
+                &bucket,
+                "object",
+                &mut PutObjReader::from_vec(b"payload".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("create object without lifecycle");
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, 4).await;
+        let transaction = ecstore
+            .new_ns_lock(
+                crate::disk::RUSTFS_META_BUCKET,
+                &metadata_sys::bucket_metadata_transaction_lock_key(&bucket),
+            )
+            .await
+            .expect("metadata transaction namespace");
+        let opts = ObjectOptions::default();
+
+        // A configuration writer outlasts the hook's lock wait; without
+        // lifecycle there is no incarnation to validate.
+        let writer = transaction
+            .get_write_lock(StdDuration::from_secs(5))
+            .await
+            .expect("hold metadata transaction");
+        tokio::time::timeout(
+            StdDuration::from_secs(1),
+            super::enqueue_immediate_expiry(Arc::clone(&ecstore), &oi, LcEventSrc::S3PutObject, &opts),
+        )
+        .await
+        .expect("no lifecycle must not wait for the metadata transaction");
+        assert_eq!(state.read().await.stats.pending_tasks(), 0, "nothing to expire");
+        drop(writer);
+
+        // An unreadable lifecycle document keeps the authoritative path, which
+        // reports the metadata failure instead of treating it as absent.
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata")).clone();
+        metadata.lifecycle_config_xml = b"<LifecycleConfiguration>".to_vec();
+        metadata.lifecycle_config = None;
+        sys.persist_and_set(metadata).await.expect("persist unreadable lifecycle");
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_events = Arc::clone(&observed);
+        let _observer = set_lifecycle_observability_observer(move |event, state, reason| {
+            observed_events
+                .lock()
+                .expect("lifecycle observer should not poison")
+                .push((event, state, reason));
+        });
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &oi, LcEventSrc::S3PutObject, &opts).await;
+        assert!(
+            observed.lock().expect("observed events should not poison").contains(&(
+                EVENT_LIFECYCLE_EVALUATION_FAILED,
+                "failed",
+                Some("metadata_unavailable")
+            )),
+            "an unreadable lifecycle document must keep the authoritative path"
+        );
+        assert_eq!(state.read().await.stats.pending_tasks(), 0, "nothing enqueued");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cached_lifecycle_check_keeps_creation_pending_and_uncached_buckets() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-cached-check-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system");
+        let sys = sys.read().await.clone();
+        assert!(
+            !super::metadata_boundary::cached_metadata_may_have_lifecycle(&ecstore, &bucket).await,
+            "a cached bucket without lifecycle skips the lookup"
+        );
+
+        let mut pending = (*sys.get(&bucket).await.expect("bucket metadata")).clone();
+        pending.lock_enabled = true;
+        pending.bucket_incarnation_sidecar = true;
+        pending.bucket_creation_committed = false;
+        assert!(pending.needs_bucket_creation_commit(), "fixture is creation-pending");
+        sys.set(bucket.clone(), Arc::new(pending)).await;
+        assert!(
+            super::metadata_boundary::cached_metadata_may_have_lifecycle(&ecstore, &bucket).await,
+            "a creation-pending bucket keeps the migration path"
+        );
+
+        assert!(sys.remove(&bucket).await, "cached entry removed");
+        assert!(
+            super::metadata_boundary::cached_metadata_may_have_lifecycle(&ecstore, &bucket).await,
+            "an uncached bucket keeps the authoritative path"
         );
     }
 

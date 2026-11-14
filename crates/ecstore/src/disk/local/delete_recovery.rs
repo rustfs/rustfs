@@ -1925,28 +1925,40 @@ impl LocalDisk {
         // The directory owner accompanies the blocking rename, so cancelling
         // its waiter cannot delete staged files while activation is running.
         let publication_owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((owner.clone(), staged.clone())));
-        os::rename_all_with_owner(staged.path(), &destination, &bucket, &self.publication_root, publication_owner).await?;
         if sync {
-            let mut dirs_to_sync = Vec::new();
-            let mut path = root.as_path();
-            loop {
-                dirs_to_sync.push(path.to_path_buf());
-                if !destination_was_absent || path == bucket {
-                    break;
+            // Rename and its directory syncs share one fsync-lane closure; the
+            // one-worker foreground lane serves metadata reads. The pinned
+            // parent is `root`; a new object also persists its ancestors.
+            let mut ancestors = Vec::new();
+            if destination_was_absent {
+                let mut path = root.as_path();
+                while path != bucket {
+                    path = path.parent().ok_or(DiskError::InvalidPath)?;
+                    ancestors.push(path.to_path_buf());
                 }
-                path = path.parent().ok_or(DiskError::InvalidPath)?;
             }
-            let sync_owner = owner.clone();
-            self.blocking_queue
-                .run_fsync_cancellable(move |_| {
-                    let _owner = sync_owner;
-                    for dir in dirs_to_sync {
-                        os::fsync_dir_std(&dir)?;
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(to_file_error)?;
+            let source = staged.path().to_path_buf();
+            let publication_root = self.publication_root.clone();
+            os::record_native_publication(&destination);
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, publication_owner).await;
+            os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+                os::rename_all_with_precondition_and_parent_sync_std(
+                    &source,
+                    &destination,
+                    &bucket,
+                    &publication_root,
+                    None,
+                    true,
+                )?;
+                for dir in ancestors {
+                    os::fsync_dir_std(&dir)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(to_file_error)?;
+        } else {
+            os::rename_all_with_owner(staged.path(), &destination, &bucket, &self.publication_root, publication_owner).await?;
         }
         self.delete_recovery_barrier(volume, object, transaction, "PREPARED").await?;
         Ok(target)
@@ -4814,6 +4826,404 @@ mod tests {
         assert!(!physical_rollback.exists(), "the real rollback directory is pruned after proof removal");
         assert!(!physical_object.exists(), "completed deletion leaves no original-volume object residue");
         assert!(temp.path().join("recovery").is_dir(), "finalization must preserve its original volume");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_activation_leaves_metadata_reads_on_foreground_lane() {
+        assert_activation_leaves_metadata_reads_on_foreground_lane("object", |disk, transaction| async move {
+            let result = disk
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![super::super::FileInfoVersions {
+                        name: "object".to_owned(),
+                        versions: vec![request()],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if result.len() == 1 && result[0].is_none() {
+                Ok(())
+            } else {
+                Err(format!("{result:?}"))
+            }
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_missing_original_activation_leaves_metadata_reads_on_foreground_lane() {
+        assert_activation_leaves_metadata_reads_on_foreground_lane("prefix/missing", |disk, transaction| async move {
+            let marker = FileInfo {
+                name: "prefix/missing".to_owned(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let context = DeletePreparationContext {
+                transaction,
+                bucket_incarnation: None,
+                namespace_owner: None,
+            };
+            match disk
+                .prepare_delete_recovery("recovery", "prefix/missing", None, &[marker], None, context)
+                .await
+            {
+                Ok(Some(_)) => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+    }
+
+    /// Pause the actual activation rename and require an unrelated metadata
+    /// read on the same disk to complete before the rename is released.
+    #[cfg(unix)]
+    async fn assert_activation_leaves_metadata_reads_on_foreground_lane<Fut>(
+        object: &str,
+        activate: impl FnOnce(Arc<LocalDisk>, Uuid) -> Fut,
+    ) where
+        Fut: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+    {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let (temp, disk, _, _) = fixture().await;
+        let disk = Arc::new(disk);
+        let metadata = temp.path().join("unrelated-metadata");
+        fs::write(&metadata, b"readable during activation")
+            .await
+            .expect("unrelated metadata fixture");
+        let transaction = Uuid::new_v4();
+        let destination = disk
+            .io_get_object_path("recovery", &format!("{object}/{transaction}"))
+            .expect("transaction path");
+        let staging_root = disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("staging root");
+        let (observer_tx, observer_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let expected_destination = destination.clone();
+        set_owned_file_before_open(&destination.join(PREPARED), move || {
+            let stages: Vec<_> = std::fs::read_dir(&staging_root)
+                .expect("staging directory")
+                .map(|entry| entry.expect("staging entry").path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("delete-preparation-"))
+                })
+                .collect();
+            assert_eq!(stages.len(), 1, "the isolated fixture has one pending preparation");
+            // Unlike a Stage::Rename pause, this observer does not add a replacement lane worker.
+            let observer = hooks::observe_rename_destination(&stages[0], move |destination| {
+                assert_eq!(destination, expected_destination);
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            });
+            let _ = observer_tx.send(observer);
+        });
+        let task = tokio::spawn(activate(Arc::clone(&disk), transaction));
+        let observer = tokio::time::timeout(Duration::from_secs(5), observer_rx).await;
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx).await;
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            disk.run_metadata_read(None, metadata, |opened| {
+                let mut file = opened?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok::<_, std::io::Error>(bytes)
+            }),
+        )
+        .await;
+        let _ = release_tx.send(());
+        let activated = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("activation finishes after release")
+            .expect("activation task joined");
+        drop(observer.expect("preparation registered observer").expect("observer received"));
+        entered.expect("actual rename reached").expect("rename observation received");
+        activated.expect("recoverable activation succeeds");
+        assert_eq!(
+            read.expect("metadata reads must progress while activation is paused")
+                .expect("metadata read queued")
+                .expect("metadata read completed"),
+            b"readable during activation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_activation_preserves_sync_modes_and_rollback() {
+        for mode in [DurabilityMode::Strict, DurabilityMode::Relaxed, DurabilityMode::None] {
+            let _mode = durability_mode_override::set(mode);
+            let (_temp, disk, _, original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            // The next fixture can reuse this disk's fd alias; compare physical paths.
+            let recorded_root = root.canonicalize().expect("physical object path");
+            assert!(!os::fsync_dir_recorder::was_fsynced(&recorded_root), "fresh object sync history");
+            let transaction = Uuid::new_v4();
+            let result = disk
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![super::super::FileInfoVersions {
+                        name: "object".to_owned(),
+                        versions: vec![request()],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(result.len(), 1);
+            assert!(result[0].is_none(), "prepare deletion in {mode:?}: {result:?}");
+            assert_eq!(
+                os::fsync_dir_recorder::was_fsynced(&recorded_root),
+                mode == DurabilityMode::Strict,
+                "activation must preserve the selected metadata sync mode"
+            );
+            let prepared = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect applied preparation");
+            assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+            assert_eq!(prepared.backup_digest, Some(digest(&original)));
+            assert!(prepared.current_digest.is_none(), "delete is applied before its receipt is published");
+            let restored = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    prepared.fingerprint,
+                    DeleteRecoveryAction::Rollback,
+                )
+                .await
+                .expect("roll back unpublished deletion");
+            assert_eq!(restored.state, DeleteRecoveryState::Absent);
+            assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("restored metadata"), original);
+            assert!(!root.join(transaction.to_string()).exists(), "rollback removes its transaction");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn delete_recovery_existing_activation_records_native_publication_before_rename() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let (_temp, disk, _, original) = fixture().await;
+        let bucket = format!("activation-history-{}", Uuid::new_v4());
+        let object = "prefix/object";
+        let witness = disk
+            .publication_history
+            .as_ref()
+            .expect("native publication history")
+            .witness(&bucket, Uuid::new_v4(), Arc::clone(&disk.io_backend))
+            .expect("fresh bucket publication history");
+        let root = disk.io_get_object_path(&bucket, object).expect("existing nested object path");
+        // Seed existing parents without consuming the history being tested at activation.
+        std::fs::create_dir_all(&root).expect("raw existing hierarchy");
+        std::fs::write(root.join(STORAGE_FORMAT_FILE), &original).expect("raw original metadata");
+        assert!(os::validate_native_creation_witnesses(std::slice::from_ref(&witness)));
+        let transaction = Uuid::new_v4();
+        let observed = Arc::new(AtomicBool::new(false));
+        let hook_observed = Arc::clone(&observed);
+        let _hook = hooks::install_at(hooks::Stage::Rename, &root.join(transaction.to_string()), move || {
+            assert!(
+                !os::validate_native_creation_witnesses(std::slice::from_ref(&witness)),
+                "activation must consume history before the native rename runs"
+            );
+            hook_observed.store(true, Ordering::Release);
+        });
+        disk.prepare_delete_recovery(
+            &bucket,
+            object,
+            Some(&original),
+            &[request()],
+            None,
+            DeletePreparationContext {
+                transaction,
+                bucket_incarnation: None,
+                namespace_owner: None,
+            },
+        )
+        .await
+        .expect("activate existing nested object preparation");
+        assert!(observed.load(Ordering::Acquire), "the actual activation rename hook must run");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_activation_sync_failure_preserves_original_and_preparation() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let (_temp, disk, _, original) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").expect("object path");
+        let transaction = Uuid::new_v4();
+        os::fsync_dir_recorder::set_failure(&root, ErrorKind::Other);
+        let result = disk
+            .delete_versions_recoverable(
+                "recovery",
+                vec![super::super::FileInfoVersions {
+                    name: "object".to_owned(),
+                    versions: vec![request()],
+                    ..Default::default()
+                }],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_some(), "activation sync failure must reach the caller");
+        assert!(os::fsync_dir_recorder::take_failure(&root).is_none(), "the injected failure was consumed");
+        assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("unchanged head"), original);
+        let prepared = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .expect("inspect failed activation");
+        assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+        assert_eq!(prepared.backup_digest, Some(digest(&original)));
+        assert_eq!(prepared.current_digest, Some(digest(&original)));
+        let restored = disk
+            .settle_delete_transaction("recovery", "object", transaction, prepared.fingerprint, DeleteRecoveryAction::Rollback)
+            .await
+            .expect("retry can settle failed activation");
+        assert_eq!(restored.state, DeleteRecoveryState::Absent);
+        assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("settled head"), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_activation_owner_outlives_cancelled_parent_sync() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use futures::FutureExt;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let (temp, disk, _, original) = fixture().await;
+        let disk = Arc::new(disk);
+        let transaction = Uuid::new_v4();
+        let root = disk.io_get_object_path("recovery", "object").expect("object path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hook = hooks::install_at(hooks::Stage::DirFsync, &root, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let deleting = Arc::clone(&disk);
+        let task = tokio::spawn(async move {
+            deleting
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![super::super::FileInfoVersions {
+                        name: "object".to_owned(),
+                        versions: vec![request()],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        let mut removal = None;
+        let observations = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .expect("activation reached parent sync")
+                .expect("parent sync observation received");
+            assert!(root.join(transaction.to_string()).join(PREPARED).is_file());
+            assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("head before sync"), original);
+            task.abort();
+            assert!(task.await.expect_err("delete waiter was cancelled").is_cancelled());
+            let removing = Arc::clone(&disk);
+            removal = Some(tokio::spawn(async move { removing.delete_volume("recovery", true).await }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), removal.as_mut().expect("volume removal started"))
+                    .await
+                    .is_err(),
+                "the active sync must retain the volume mutation owner after cancellation"
+            );
+            assert!(root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP).is_file());
+        })
+        .catch_unwind()
+        .await;
+        let _ = release_tx.send(());
+        drop(hook);
+        if let Some(removal) = removal {
+            tokio::time::timeout(Duration::from_secs(5), removal)
+                .await
+                .expect("volume removal resumes after sync")
+                .expect("volume removal joined")
+                .expect("volume removal succeeds");
+        }
+        if let Err(panic) = observations {
+            std::panic::resume_unwind(panic);
+        }
+        disk.make_volume("recovery")
+            .await
+            .expect("recreate volume after sync drained");
+        assert!(
+            !temp.path().join("recovery/object").exists(),
+            "cancelled activation cannot publish into the new volume"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_missing_original_preparation_syncs_ancestors() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let (_temp, disk, _, _) = fixture().await;
+        let object = "prefix/missing";
+        let root = disk.io_get_object_path("recovery", object).expect("missing object path");
+        let transaction = Uuid::new_v4();
+        let marker = FileInfo {
+            name: object.to_owned(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let target = disk
+            .prepare_delete_recovery(
+                "recovery",
+                object,
+                None,
+                &[marker],
+                None,
+                DeletePreparationContext {
+                    transaction,
+                    bucket_incarnation: None,
+                    namespace_owner: None,
+                },
+            )
+            .await
+            .expect("prepare missing-object marker");
+        assert!(target.is_some(), "the marker has a planned metadata target");
+        for directory in [
+            &root,
+            root.parent().expect("prefix"),
+            root.parent().and_then(Path::parent).expect("bucket"),
+        ] {
+            // Physical paths: a reused fd alias from another test cannot match.
+            let physical = directory.canonicalize().expect("physical ancestor path");
+            assert!(os::fsync_dir_recorder::was_fsynced(&physical), "persist created ancestors: {physical:?}");
+        }
+        let prepared = disk
+            .inspect_delete_transaction("recovery", object, transaction)
+            .await
+            .expect("inspect missing-object preparation");
+        assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+        assert!(prepared.backup_digest.is_none());
+        assert!(prepared.current_digest.is_none());
     }
 
     #[cfg(unix)]

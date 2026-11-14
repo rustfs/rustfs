@@ -73,7 +73,6 @@ bytes = { workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["stream"] }
 rustls-pki-types.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-faster-hex.workspace = true
 futures.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics.workspace = true
@@ -92,6 +91,7 @@ xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+faster-hex.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }

@@ -144,6 +144,15 @@ pub struct WriteAllRequest {
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteFormatControlRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteAllResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
@@ -2452,6 +2461,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "WriteAll"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn write_format_control(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WriteFormatControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/WriteFormatControl");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "WriteFormatControl"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn compare_and_update_file(
             &mut self,
             request: impl tonic::IntoRequest<super::CompareAndUpdateFileRequest>,
@@ -4047,6 +4071,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::WriteAllRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status>;
+        async fn write_format_control(
+            &self,
+            request: tonic::Request<super::WriteFormatControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status>;
         async fn compare_and_update_file(
             &self,
             request: tonic::Request<super::CompareAndUpdateFileRequest>,
@@ -4789,6 +4817,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WriteAllSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/WriteFormatControl" => {
+                    #[allow(non_camel_case_types)]
+                    struct WriteFormatControlSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::WriteFormatControlRequest> for WriteFormatControlSvc<T> {
+                        type Response = super::WriteAllResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::WriteFormatControlRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::write_format_control(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteFormatControlSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
