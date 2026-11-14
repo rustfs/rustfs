@@ -15,6 +15,7 @@
 pub mod account;
 pub(crate) mod account_audit;
 pub mod account_info;
+pub mod account_permissions;
 pub mod audit;
 mod audit_runtime_config;
 pub mod batch_job;

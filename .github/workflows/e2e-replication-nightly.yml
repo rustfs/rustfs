@@ -65,6 +65,7 @@ jobs:
     strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFS_BUILD_FEATURES: ${{ matrix.stack == 'gateway' && 'gateway-stack' || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -96,7 +97,7 @@ jobs:
       # Build once and carry its source/binary identity into the test invocation.
       - name: Build rustfs binary
         run: |
-          python3 scripts/e2e_binary.py build --bins
+          python3 scripts/e2e_binary.py build --bins --features "$RUSTFS_BUILD_FEATURES"
 
       # A gateway binary that refuses to start skips the suite; the summary says why.
       - name: Gateway preflight
@@ -114,7 +115,7 @@ jobs:
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-repl-nightly-logs
           RUSTFS_S3_STACK: ${{ matrix.stack }}
-        run: python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-repl-nightly -p e2e_test
+        run: python3 scripts/e2e_binary.py run --features "$RUSTFS_BUILD_FEATURES" -- cargo nextest run --profile e2e-repl-nightly -p e2e_test
 
       - name: Prove the stack and upload the leg
         if: always()
@@ -213,7 +214,7 @@ jobs:
     strategy: { fail-fast: false, matrix: { stack: [legacy, gateway] } }
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      RUSTFS_BUILD_FEATURES: ftps,webdav,sftp
+      RUSTFS_BUILD_FEATURES: ${{ matrix.stack == 'gateway' && 'ftps,webdav,sftp,gateway-stack' || 'ftps,webdav,sftp' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7

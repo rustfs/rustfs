@@ -46,6 +46,8 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_COMPLETE_OBSERVATION_QUERY: &str = "ns_scanner_complete_observation";
+pub const NS_SCANNER_DURABLE_PROGRESS_QUERY: &str = "ns_scanner_durable_progress";
 pub const NS_SCANNER_CHECKPOINT_COVERAGE_QUERY: &str = "ns_scanner_checkpoint_coverage";
 pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
@@ -72,6 +74,22 @@ pub struct NsScannerCapabilityResponse {
     pub supports_tier_registry_generation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_checkpoint_coverage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_durable_progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_complete_observation: Option<bool>,
+    /// Independent challenge-bound capability; omitted for older strict readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_watch_proof: Option<Vec<u8>>,
+}
+
+/// Authenticated scanner capabilities for one peer startup epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NsScannerCapabilities {
+    pub server_epoch: uuid::Uuid,
+    pub supports_durable_progress: bool,
+    pub supports_complete_observation: bool,
+    pub supports_usage_watch: bool,
 }
 
 pub mod admin;

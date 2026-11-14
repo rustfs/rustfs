@@ -553,6 +553,98 @@ pub struct DataUsageEntryInfo {
     /// requires generation fencing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_registry_generation: Option<u64>,
+    /// Per-source provenance; absence is a readable legacy value, not a certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_origin: Option<DataUsageBucketValueOrigin>,
+}
+
+/// Diagnostic provenance of a canonical bucket contribution on one set.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketValueOrigin {
+    pub epoch: u64,
+    pub cycle: u64,
+    pub completed_at: SystemTime,
+    pub carried: bool,
+}
+
+/// Evidence of forward motion within one admitted bucket sweep. This never
+/// proves completed coverage and is used only to schedule another service turn.
+#[derive(Clone, Debug)]
+pub(crate) struct DataUsageDurableProgress {
+    bucket: String,
+    source: Option<DataUsageCacheSource>,
+    identity: Option<DataUsageScanIdentity>,
+    started_plan: Option<DataUsageScanPlanDigest>,
+    frontier: Option<String>,
+    raw: HashMap<String, crate::raw_page_index::RawEnumerationDurableProgress>,
+}
+
+impl DataUsageDurableProgress {
+    pub(crate) fn advanced_from(&self, previous: &Self) -> bool {
+        if self.bucket != previous.bucket
+            || self.source.is_none()
+            || self.source != previous.source
+            || !self.identity.is_some_and(|identity| identity.is_valid())
+            || self.identity != previous.identity
+            || self.started_plan.is_none()
+            || self.started_plan != previous.started_plan
+        {
+            return false;
+        }
+        let mut advanced = match (&previous.frontier, &self.frontier) {
+            (Some(before), Some(after)) => {
+                if !scan_frontier_covers_path(before, after) {
+                    return false;
+                }
+                before != after
+            }
+            (Some(_), None) => return false,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        for (parent, before) in &previous.raw {
+            match self.raw.get(parent) {
+                Some(after) if after.extends(before) => {}
+                None if self
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| scan_frontier_covers_path(parent, frontier)) => {}
+                _ => return false,
+            }
+        }
+        for (parent, after) in &self.raw {
+            let before = previous.raw.get(parent).map_or(0, |value| value.committed_entries());
+            advanced |= after.committed_entries() > before;
+        }
+        advanced
+    }
+}
+
+/// Latest complete cross-cycle observation, never a canonical cache value.
+/// Keeping the flattened value separate lets subsequent partial walks retain it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataUsageBucketObservation {
+    pub version: u16,
+    pub source: DataUsageCacheSource,
+    pub identity: DataUsageScanIdentity,
+    pub started_plan: DataUsageScanPlanDigest,
+    pub requested_plan: DataUsageScanPlanDigest,
+    pub completed_epoch: u64,
+    pub completed_cycle: u64,
+    pub completed_at: SystemTime,
+    pub entry: DataUsageEntry,
+}
+
+impl DataUsageBucketObservation {
+    pub(crate) fn matches(&self, source: DataUsageCacheSource, identity: DataUsageScanIdentity) -> bool {
+        self.version == 1
+            && self.source == source
+            && self.identity == identity
+            && identity.is_valid()
+            && self.started_plan != self.requested_plan
+            && self.entry.children.is_empty()
+            && self.entry.failed_objects == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -822,6 +914,10 @@ pub struct DataUsageCacheInfo {
     pub scan_identity: Option<DataUsageScanIdentity>,
     #[serde(default)]
     pub scan_progress: Option<DataUsageScanProgress>,
+    /// Original per-owner mutation witness for the complete sweep. Absent on
+    /// legacy/global coverage plans; renewal never rewrites its start revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_usage_watch: Option<crate::scanner_io::ScannerUsageWatchProof>,
     #[serde(default)]
     pub scan_coverage_receipt: Option<DataUsageScanCoverageReceipt>,
     #[serde(default)]
@@ -880,6 +976,11 @@ pub struct DataUsageCacheInfo {
     /// Bucket service order of a set cache; absent from bucket caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_bucket_service: Option<DataUsageBucketServiceLedger>,
+    /// One immutable completed observation per bucket on this source. Older readers ignore it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_observations: HashMap<String, DataUsageBucketObservation>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub scan_bucket_value_origins: HashMap<String, DataUsageBucketValueOrigin>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -895,6 +996,7 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(!self.scan_raw_enumeration_path_page_indexes.is_empty())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
+            + usize::from(self.scan_usage_watch.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
             + usize::from(self.scan_coverage_digest.is_some())
             + usize::from(self.tier_registry_generation.is_some())
@@ -907,7 +1009,9 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.scan_execution_digest.is_some())
             + usize::from(self.segment_invalidation_proof.is_some())
             + usize::from(!self.scan_bucket_incarnations.is_empty())
-            + usize::from(self.scan_bucket_service.is_some());
+            + usize::from(self.scan_bucket_service.is_some())
+            + usize::from(!self.scan_bucket_observations.is_empty())
+            + usize::from(!self.scan_bucket_value_origins.is_empty());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -933,6 +1037,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(progress) = self.scan_progress {
             state.serialize_entry("scan_progress", &progress)?;
+        }
+        if let Some(watch) = &self.scan_usage_watch {
+            state.serialize_entry("scan_usage_watch", watch)?;
         }
         if let Some(receipt) = &self.scan_coverage_receipt {
             state.serialize_entry("scan_coverage_receipt", receipt)?;
@@ -978,6 +1085,12 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(ledger) = &self.scan_bucket_service {
             state.serialize_entry("scan_bucket_service", ledger)?;
+        }
+        if !self.scan_bucket_observations.is_empty() {
+            state.serialize_entry("scan_bucket_observations", &self.scan_bucket_observations)?;
+        }
+        if !self.scan_bucket_value_origins.is_empty() {
+            state.serialize_entry("scan_bucket_value_origins", &self.scan_bucket_value_origins)?;
         }
         state.end()
     }
@@ -1116,28 +1229,23 @@ impl DataUsageCache {
         }
     }
 
-    /// Identifies how far durable resume state has advanced. Discovery alone
-    /// does not change it; only committed raw pages or coverage frontier do.
-    pub(crate) fn durable_scan_position(&self) -> (Option<String>, Option<String>, u64) {
-        let raw_entries = self
-            .info
-            .scan_raw_enumeration_page_index
-            .iter()
-            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
-            .map(|index| match index.status() {
-                RawEnumerationPageOwnerStatus::Unsupported => 0,
-                RawEnumerationPageOwnerStatus::Building { indexed_entries, .. }
-                | RawEnumerationPageOwnerStatus::Ready { indexed_entries, .. } => indexed_entries,
-            })
-            .fold(0, u64::saturating_add);
-        (
-            self.info.scan_resume_after.clone(),
-            self.info
-                .scan_coverage_receipt
-                .as_ref()
-                .map(|receipt| receipt.through.clone()),
-            raw_entries,
-        )
+    pub(crate) fn durable_scan_progress(&self) -> DataUsageDurableProgress {
+        DataUsageDurableProgress {
+            bucket: self.info.name.clone(),
+            source: self.info.source,
+            identity: self.info.scan_identity,
+            started_plan: self.info.scan_progress.map(|progress| progress.started_plan),
+            frontier: self.validated_scan_frontier().map(str::to_owned),
+            raw: self
+                .info
+                .scan_raw_enumeration_page_index
+                .iter()
+                .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+                .filter_map(|index| index.durable_progress())
+                .filter(|progress| path_is_in_bucket_scope(&self.info.name, &progress.parent))
+                .map(|progress| (progress.parent.clone(), progress))
+                .collect(),
+        }
     }
 
     pub(crate) fn has_scan_position(&self) -> bool {
@@ -1195,6 +1303,10 @@ impl DataUsageCache {
         }
         let previous_cycle = self.info.next_cycle;
         let previous_leader_epoch = self.info.leader_epoch;
+        let retained_observations = std::mem::take(&mut self.info.scan_bucket_observations)
+            .into_iter()
+            .filter(|(bucket, observation)| bucket == name && observation.matches(source, identity))
+            .collect();
         // A checkpoint is a durable traversal frontier, not a publication
         // result.  A newer leader may adopt it only when the frontier is
         // independently fenced by the bucket identity and has a validated
@@ -1280,6 +1392,8 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_cursor().is_none() {
             self.info.scan_raw_enumeration_cursor = None;
         }
+        self.info.scan_bucket_observations = retained_observations;
+        self.info.scan_bucket_value_origins.clear();
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
             self.info.scan_raw_enumeration_path_page_indexes.clear();
@@ -1531,6 +1645,48 @@ impl DataUsageCache {
             .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
         self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(clone_cache_value(through), reason));
         Ok(())
+    }
+
+    /// Record only a fully traversed, healthy mixed sweep. Persistence callers
+    /// save this companion together with terminal cursor cleanup and retry debt.
+    pub(crate) fn record_completed_bucket_observation(&mut self) {
+        let (Some(source), Some(identity), Some(progress), Some(completed_at)) =
+            (self.info.source, self.info.scan_identity, self.info.scan_progress, self.info.last_update)
+        else {
+            return;
+        };
+        if !identity.is_valid() || progress.started_plan == progress.requested_plan {
+            return;
+        }
+        let Some(mut entry) = self.checked_flatten_complete_scope(&self.info.name) else {
+            return;
+        };
+        if entry.failed_objects != 0 || !self.info.failed_objects.is_empty() || !self.info.size_reconciliation.is_empty() {
+            return;
+        }
+        entry.children.clear();
+        self.info.scan_bucket_observations.insert(
+            self.info.name.clone(),
+            DataUsageBucketObservation {
+                version: 1,
+                source,
+                identity,
+                started_plan: progress.started_plan,
+                requested_plan: progress.requested_plan,
+                completed_epoch: self.info.leader_epoch,
+                completed_cycle: self.info.next_cycle,
+                completed_at,
+                entry,
+            },
+        );
+    }
+
+    pub(crate) fn completed_bucket_observation(&self) -> Option<&DataUsageBucketObservation> {
+        let observation = self.info.scan_bucket_observations.get(&self.info.name)?;
+        (observation.matches(self.info.source?, self.info.scan_identity?)
+            && observation.completed_epoch <= self.info.leader_epoch
+            && observation.completed_cycle <= self.info.next_cycle)
+            .then_some(observation)
     }
 
     fn ensure_cache_save_metrics_registered() {

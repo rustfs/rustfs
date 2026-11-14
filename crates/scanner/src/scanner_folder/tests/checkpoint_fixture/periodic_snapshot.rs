@@ -285,7 +285,12 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
             .await;
         if round == 0 {
             assert!(saved.is_err(), "injected terminal persistence failure must be observable");
+            assert!(terminal.completed_bucket_observation().is_some());
             let retained = store.strict_load().await;
+            assert!(
+                retained.info.scan_bucket_observations.is_empty(),
+                "a failed CAS cannot publish the terminal companion"
+            );
             assert_eq!(retained.info.scan_coverage_receipt, periodic.info.scan_coverage_receipt);
             assert_eq!(retained.info.scan_checkpoint, periodic.info.scan_checkpoint);
             assert!(
@@ -297,6 +302,7 @@ async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certific
             let retained = store.strict_load().await;
             assert!(!retained.has_scan_position());
             assert_eq!(retained.info.snapshot_complete, round == 2);
+            assert_eq!(retained.completed_bucket_observation().is_some(), round == 1);
         }
         store.reject_save.store(false, Ordering::SeqCst);
     }

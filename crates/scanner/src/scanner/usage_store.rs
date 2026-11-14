@@ -779,6 +779,12 @@ where
         if ctx.is_cancelled() {
             break;
         }
+        // Display projections contain companion values and must never become
+        // quota baselines, persisted observations, or publication receipts.
+        if data_usage_info.usage_snapshot_admin_projection {
+            outcome = DataUsagePersistOutcome::Failed;
+            continue;
+        }
         if let Some(leader_epoch) = leader_epoch {
             data_usage_info.scanner_epoch = Some(leader_epoch);
         }
@@ -917,7 +923,7 @@ where
             data_usage_info.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
         }
 
-        if !data_usage_info.is_complete_bucket_usage_snapshot() && !data_usage_info.usage_snapshot_partial {
+        if !data_usage_info.is_complete_bucket_usage_snapshot() && !data_usage_info.is_valid_partial_snapshot() {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,

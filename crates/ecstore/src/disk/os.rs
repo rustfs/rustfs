@@ -3817,20 +3817,6 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
     Ok(volumes)
 }
 
-#[tracing::instrument(level = "debug", skip_all)]
-pub async fn rename_all(
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    publication_root: &PublicationRoot,
-) -> Result<()> {
-    reliable_rename(src_file_path, dst_file_path.as_ref(), base_dir, publication_root)
-        .await
-        .map_err(to_file_error)?;
-
-    Ok(())
-}
-
 /// Retain mutation ownership through both metadata publication and its directory
 /// barriers, even when the async caller stops waiting after the rename starts.
 pub(crate) async fn rename_metadata_and_sync_with_lease(
@@ -3873,6 +3859,19 @@ pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Ar
         let _ = namespace_owner;
         fsync_dir_std(path)
     }
+}
+
+/// Preserve file, symlink, and empty-directory removal semantics while the
+/// actual filesystem executor retains namespace ownership after cancellation.
+pub(crate) async fn remove_with_owner(path: impl AsRef<Path>, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        super::fs::remove_std(path)
+    })
+    .await
 }
 
 /// Retain namespace ownership in the actual filesystem executor after timeout.
@@ -4553,6 +4552,7 @@ pub(crate) mod multipart_source_syscall_failures {
     use super::*;
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(crate) enum Stage {
+        Read,
         Create,
         Write,
         FileSync,
@@ -4560,7 +4560,7 @@ pub(crate) mod multipart_source_syscall_failures {
     }
     type Key = (Stage, PathBuf);
     struct Failure {
-        kind: io::ErrorKind,
+        error: Mutex<Option<io::Error>>,
         triggered: std::sync::atomic::AtomicUsize,
     }
     static FAILURES: LazyLock<Mutex<HashMap<Key, Arc<Failure>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -4585,9 +4585,12 @@ pub(crate) mod multipart_source_syscall_failures {
         }
     }
     pub(crate) fn fail_once(stage: Stage, path: &Path, kind: io::ErrorKind) -> FailureGuard {
+        fail_once_with_error(stage, path, io::Error::new(kind, "injected native physical syscall failure"))
+    }
+    pub(crate) fn fail_once_with_error(stage: Stage, path: &Path, error: io::Error) -> FailureGuard {
         let key = (stage, path.to_path_buf());
         let failure = Arc::new(Failure {
-            kind,
+            error: Mutex::new(Some(error)),
             triggered: std::sync::atomic::AtomicUsize::new(0),
         });
         assert!(
@@ -4599,7 +4602,7 @@ pub(crate) mod multipart_source_syscall_failures {
     pub(crate) fn check(stage: Stage, path: &Path) -> io::Result<()> {
         if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
             failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
-            return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
+            return Err(failure.error.lock().take().expect("one-shot physical fault owns its error"));
         }
         Ok(())
     }
@@ -4960,15 +4963,6 @@ pub(crate) fn rename_source_is_missing(src_file_path: &Path, publication_root: &
 #[cfg(not(windows))]
 pub(crate) fn rename_source_is_missing(src_file_path: &Path, _publication_root: &PublicationRoot) -> bool {
     matches!(std::fs::symlink_metadata(src_file_path), Err(err) if err.kind() == io::ErrorKind::NotFound)
-}
-
-async fn reliable_rename(
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    publication_root: &PublicationRoot,
-) -> io::Result<()> {
-    reliable_rename_inner(src_file_path, dst_file_path, base_dir, publication_root, true).await
 }
 
 async fn reliable_rename_inner(
@@ -8076,6 +8070,8 @@ pub(crate) fn read_multipart_source_metadata_in_pinned(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Read, &parent.join(name))?;
     read_multipart_metadata_in_pinned(pinned, parent, name, base, publication_root, Some(16 * 1024 * 1024))
 }
 
@@ -9165,7 +9161,7 @@ mod tests {
         let dst_file_path = dst_file_path.as_ref();
         let base_dir = base_dir.as_ref();
         let publication_root = test_publication_root(&[src_file_path, dst_file_path, base_dir]);
-        super::rename_all(src_file_path, dst_file_path, base_dir, &publication_root).await
+        super::rename_all_with_owner(src_file_path, dst_file_path, base_dir, &publication_root, None).await
     }
 
     async fn rename_all_ignore_missing_source(
@@ -10010,7 +10006,7 @@ mod tests {
         let configured_dst = configured_base.join("object");
         std::fs::create_dir(&configured_base).expect("create bucket through configured root");
         std::fs::write(&configured_src, b"configured").expect("write staged object through configured root");
-        super::rename_all(&configured_src, &configured_dst, &configured_base, &publication_root)
+        super::rename_all_with_owner(&configured_src, &configured_dst, &configured_base, &publication_root, None)
             .await
             .expect("publish a configured path relative to the pinned root");
         assert_eq!(
@@ -10023,7 +10019,7 @@ mod tests {
         let resolved_dst = resolved_base.join("object");
         std::fs::create_dir(&resolved_base).expect("create bucket through resolved root");
         std::fs::write(&resolved_src, b"resolved").expect("write staged object through resolved root");
-        super::rename_all(&resolved_src, &resolved_dst, &resolved_base, &publication_root)
+        super::rename_all_with_owner(&resolved_src, &resolved_dst, &resolved_base, &publication_root, None)
             .await
             .expect("publish a resolved path relative to the pinned root");
 
@@ -10443,7 +10439,7 @@ mod tests {
         std::fs::write(&dst, b"uncommitted-metadata").expect("write metadata to replace");
         let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root above the object tree");
 
-        super::rename_all(&src, &dst, &object_dir, &publication_root)
+        super::rename_all_with_owner(&src, &dst, &object_dir, &publication_root, None)
             .await
             .expect("a rollback source below its destination parent must not conflict with its own guards");
 

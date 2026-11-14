@@ -17,3 +17,4 @@
 pub(crate) mod global;
 pub(crate) mod instance;
 pub(crate) mod sources;
+pub(crate) mod usage_watch;
