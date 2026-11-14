@@ -2313,7 +2313,12 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
             put_commit_future,
         );
+        let commit_owner_submit_started = rustfs_io_metrics::put_stage_timer();
         let put_commit = spawn_traced_join(async move {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START,
+                commit_owner_submit_started,
+            );
             let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
             let result = std::panic::AssertUnwindSafe(put_commit_future).catch_unwind().await;
             rustfs_io_metrics::record_put_object_stage_duration_from("store_commit", commit_stage_start);
