@@ -102,6 +102,15 @@ impl Functions {
         self.for_all_values.is_empty() && self.for_any_value.is_empty() && self.for_normal.is_empty()
     }
 
+    /// Condition keys, with their namespace prefixes removed as in the evaluation map.
+    pub fn key_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.for_any_value
+            .iter()
+            .chain(self.for_all_values.iter())
+            .chain(self.for_normal.iter())
+            .flat_map(Condition::key_names)
+    }
+
     pub fn references_key_name(&self, key_name: &KeyName) -> bool {
         self.for_any_value
             .iter()

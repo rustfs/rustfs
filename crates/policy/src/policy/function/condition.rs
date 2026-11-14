@@ -145,6 +145,39 @@ impl Condition {
         }
     }
 
+    pub fn key_names(&self) -> Vec<String> {
+        use Condition::*;
+        match self {
+            StringEquals(s)
+            | StringNotEquals(s)
+            | StringEqualsIgnoreCase(s)
+            | StringNotEqualsIgnoreCase(s)
+            | StringLike(s)
+            | StringNotLike(s)
+            | ArnLike(s)
+            | ArnNotLike(s)
+            | ArnEquals(s)
+            | ArnNotEquals(s) => s.key_names().collect(),
+            BinaryEquals(s) => s.key_names().collect(),
+            IpAddress(s) | NotIpAddress(s) => s.key_names().collect(),
+            Null(s) | Bool(s) => s.key_names().collect(),
+            NumericEquals(s)
+            | NumericNotEquals(s)
+            | NumericLessThan(s)
+            | NumericLessThanEquals(s)
+            | NumericGreaterThan(s)
+            | NumericGreaterThanIfExists(s)
+            | NumericGreaterThanEquals(s) => s.key_names().collect(),
+            DateEquals(s)
+            | DateNotEquals(s)
+            | DateLessThan(s)
+            | DateLessThanEquals(s)
+            | DateGreaterThan(s)
+            | DateGreaterThanEquals(s) => s.key_names().collect(),
+            IfExists(inner) => inner.key_names(),
+        }
+    }
+
     pub fn has_any_key_in(&self, values: &HashMap<String, Vec<String>>) -> bool {
         use Condition::*;
         match self {

@@ -222,6 +222,9 @@ pub struct RequestEnvelope {
     requested_object_legal_hold: Option<RequestedObjectLegalHold>,
     requested_object_tags: Option<RequestedObjectTags>,
     requested_copy_source: Option<RequestedCopySource>,
+    permission_probe: bool,
+    permission_probe_auth_type: Option<crate::auth::facts::AuthTypeCondition>,
+    permission_probe_known_request_facts: u8,
     residual_extensions: Extensions,
 }
 
@@ -268,6 +271,9 @@ impl RequestEnvelope {
             requested_object_legal_hold: extensions.remove(),
             requested_object_tags: extensions.remove(),
             requested_copy_source: extensions.remove(),
+            permission_probe: false,
+            permission_probe_auth_type: None,
+            permission_probe_known_request_facts: 0,
             residual_extensions: extensions,
         }
     }
@@ -317,7 +323,66 @@ impl RequestEnvelope {
             requested_object_legal_hold: self.requested_object_legal_hold.clone(),
             requested_object_tags: self.requested_object_tags.clone(),
             requested_copy_source: self.requested_copy_source.clone(),
+            permission_probe: self.permission_probe,
+            permission_probe_auth_type: self.permission_probe_auth_type,
+            permission_probe_known_request_facts: self.permission_probe_known_request_facts,
             residual_extensions: self.residual_extensions.clone(),
+        }
+    }
+
+    /// A read-only policy query preserves verified connection and identity facts, without
+    /// operation guards, body metadata or internal authorization shortcuts.
+    pub(crate) fn fork_for_permission_probe(&self, method: Method, uri: Uri, req_info: ReqInfo) -> Self {
+        let mut extensions = Extensions::new();
+        if let Some(addr) = self.remote_addr {
+            extensions.insert(Some(RemoteAddr(addr)));
+        }
+        if let Some(client_info) = &self.client_info {
+            extensions.insert(client_info.clone());
+        }
+        if let Some(transport) = self.native_tls_transport {
+            extensions.insert(NativeTlsTransport(transport));
+        }
+        if let Some(context) = &self.server_context {
+            extensions.insert(context.clone());
+        }
+        extensions.insert(req_info);
+        let mut headers = HeaderMap::new();
+        for name in ["authorization", "x-amz-date", "x-amz-security-token"] {
+            if let Some(value) = self.headers.get(name) {
+                headers.insert(http::header::HeaderName::from_static(name), value.clone());
+            }
+        }
+        let mut probe = Self::from_parts(
+            RequestHead {
+                method,
+                uri,
+                headers,
+                credentials: self.credentials.clone(),
+                region: self.region.clone(),
+                service: self.service.clone(),
+            },
+            extensions,
+        );
+        probe.permission_probe = true;
+        probe
+    }
+
+    pub(crate) fn set_permission_probe_auth_type(&mut self, auth_type: crate::auth::facts::AuthTypeCondition) {
+        if self.permission_probe {
+            self.permission_probe_auth_type = Some(auth_type);
+        }
+    }
+
+    pub(crate) fn mark_permission_probe_request_fact_known(&mut self, fact: crate::storage::access::PermissionProbeRequestFact) {
+        if self.permission_probe {
+            self.permission_probe_known_request_facts |= fact as u8;
+        }
+    }
+
+    pub(crate) fn set_permission_probe_operation(&mut self, operation: &str) {
+        if self.permission_probe {
+            self.multipart_staging_operation = MultipartStagingOperation::for_operation(operation);
         }
     }
 
@@ -505,6 +570,15 @@ impl RequestEnvelope {
 /// The authorization core in `storage` reads requests only through
 /// [`AuthorizationRequest`]; this impl hands it the envelope's named fields.
 impl AuthorizationRequest for RequestEnvelope {
+    fn permission_probe_request_fact_known(&self, fact: crate::storage::access::PermissionProbeRequestFact) -> bool {
+        self.permission_probe_known_request_facts & (fact as u8) != 0
+    }
+    fn permission_probe(&self) -> bool {
+        self.permission_probe
+    }
+    fn permission_probe_auth_type(&self) -> Option<crate::auth::facts::AuthTypeCondition> {
+        self.permission_probe_auth_type
+    }
     fn headers(&self) -> &HeaderMap {
         self.headers()
     }

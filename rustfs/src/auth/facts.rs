@@ -185,6 +185,14 @@ pub(crate) struct AuthzFacts {
 }
 
 impl AuthzFacts {
+    /// An authenticated permission query may describe the authentication placement of the
+    /// intended S3 operation. Identity, source address, transport and signing version stay verified.
+    pub(crate) fn with_planned_auth_type(mut self, auth_type: Option<AuthTypeCondition>) -> Self {
+        if let Some(auth_type) = auth_type {
+            self.auth_type = Some(auth_type);
+        }
+        self
+    }
     /// The facts of a request the legacy edge received, resolved by its rules.
     ///
     /// The client address is the one a trusted proxy attested, else the socket
