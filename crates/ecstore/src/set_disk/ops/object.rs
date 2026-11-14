@@ -52,13 +52,13 @@ use super::super::{
     get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
     get_small_object_direct_memory_threshold, get_stage_timer_if_enabled, get_str,
     get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
-    is_explicit_null_version, is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled,
-    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
-    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
-    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
-    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
+    inline_erasure_shard_size, inline_put_fits_buffer, insert_str, is_deadlock_detection_enabled, is_err_object_not_found,
+    is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
+    is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
+    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
+    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
+    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
     republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
     resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
     restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
@@ -4782,25 +4782,17 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            // Transformed streams (unknown stored size) are admitted by their
-            // plaintext size and then take the streaming encode with inline
-            // buffer writers, since the single-block fast path needs a known length.
-            // Every inline candidate keeps the single-block bound on its admission
-            // size: the inline buffer writer grows without a cap, so an explicit
-            // INLINE_BLOCK budget above `block_size` must not admit multi-block
-            // payloads into memory and xl.meta. Protected inline writes also need
-            // a known stored length for their proof metadata, so they never fall
-            // back to the plaintext size.
-            let inline_admission_size = if put_object_size >= 0 || protect_write {
-                put_object_size
-            } else {
-                data.actual_size()
-            };
-            let is_inline_buffer = storage_class_config.should_inline(
-                inline_admission_shard_size(&erasure, put_object_size, data.actual_size()),
-                erasure.data_shards,
-                opts.versioned,
-            ) && usize::try_from(inline_admission_size).is_ok_and(|size| size <= erasure.block_size);
+            // Known unprotected streams may span bounded inline frames. The
+            // direct encoder remains single-block, and transformed/protected
+            // writes keep their existing admission contract.
+            let is_inline_buffer =
+                storage_class_config.should_inline(
+                    inline_admission_shard_size(&erasure, put_object_size, data.actual_size()),
+                    erasure.data_shards,
+                    opts.versioned,
+                ) && inline_put_fits_buffer(put_object_size, data.actual_size(), erasure.block_size, protect_write);
+            let multi_block_inline =
+                is_inline_buffer && usize::try_from(put_object_size).is_ok_and(|size| size > erasure.block_size);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
@@ -4955,6 +4947,9 @@ impl SetDisks {
             }
 
             let _ = mem::replace(&mut data.stream, reader);
+            if multi_block_inline && usize::try_from(put_object_size).ok() != Some(w_size) {
+                return Err(Error::other("inline stream length differs from its admitted storage size"));
+            }
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
             //     error!("close_bitrot_writers err {:?}", err);
             // }
@@ -15071,7 +15066,7 @@ mod inline_put_commit_path_tests {
 
     #[tokio::test]
     #[serial]
-    async fn unprotected_puts_keep_multi_block_inline_candidates_external() {
+    async fn unprotected_puts_keep_oversized_inline_candidates_external() {
         for transformed in [true, false] {
             let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
             let storage_class =
@@ -15081,9 +15076,9 @@ mod inline_put_commit_path_tests {
             let bucket = "unprotected-inline-candidates";
             let object = "object.bin";
             make_bucket(&disk_stores, bucket).await;
-            // Above the single erasure block: an explicit INLINE_BLOCK budget must
-            // not pull a multi-block payload into the unbounded inline buffer.
-            let plaintext = compressible_payload(1024 * 1024 + 17);
+            // The bounded extension cannot admit this payload even when the
+            // configured per-shard budget is much larger.
+            let plaintext = compressible_payload(2 * 1024 * 1024 + 17);
             let (mut reader, opts) = if transformed {
                 transformed_put(plaintext.clone())
             } else {
@@ -15106,7 +15101,7 @@ mod inline_put_commit_path_tests {
                     .unwrap_or_else(|err| panic!("disk {disk_index} should persist metadata: {err}"));
                 assert!(
                     !file_info.inline_data(),
-                    "disk {disk_index}: a payload above block_size must stay external (transformed={transformed})"
+                    "disk {disk_index}: a payload above the materialization cap must stay external (transformed={transformed})"
                 );
             }
             assert!(
@@ -15497,6 +15492,153 @@ mod inline_put_commit_path_tests {
                 assert_eq!(restored, payload, "body for {object}");
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multi_block_inline_preserves_default_geometry_and_exact_budget() {
+        temp_env::async_with_vars([(rustfs_config::ENV_ERASURE_SHARD_BYTES, Some("0"))], async {
+            let (directories, disks, set) = hermetic_set_disks(16).await;
+            set.set_test_storage_class_config(
+                lookup_config_for_pools_without_env(&KVS::new(), &[16]).expect("EC12+4 configuration"),
+            );
+            let bucket = "multi-block-inline-boundary";
+            make_bucket(&disks, bucket).await;
+            let block = 1024 * 1024;
+            for length in [block + 1, 1280 * 1024, 1_572_855, 1_572_856, 1_572_857] {
+                let object = format!("size-{length}");
+                let payload: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+                let mut input = PutObjReader::from_vec(payload.clone());
+                set.put_object(
+                    bucket,
+                    &object,
+                    &mut input,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write boundary object");
+                let inline = length <= 1_572_856;
+                for disk in &disks {
+                    let info = disk
+                        .read_version(
+                            "",
+                            bucket,
+                            &object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read persisted geometry");
+                    assert_eq!(info.erasure.block_size, block);
+                    assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (12, 4));
+                    assert_eq!(info.inline_data(), inline, "placement at {length}");
+                    if inline {
+                        let shard_payload = block.div_ceil(12) + (length - block).div_ceil(12);
+                        assert!(shard_payload <= 128 * 1024);
+                        assert_eq!(info.data.as_ref().expect("framed inline data").len(), shard_payload + 64);
+                    }
+                }
+                assert_eq!(count_part_files(&directories), if inline { 0 } else { 16 });
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read boundary object");
+                if inline {
+                    assert_eq!(reader.buffered_body.as_ref().map(Bytes::len), Some(length));
+                }
+                let mut restored = Vec::new();
+                reader.stream.read_to_end(&mut restored).await.expect("read all frames");
+                assert_eq!(restored, payload);
+                if inline {
+                    assert_eq!(calls.total(disk_call_counters::KIND_BODY_DECODE), 1);
+                }
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: (block - 7) as i64,
+                    end: (block + 7).min(length - 1) as i64,
+                });
+                let mut reader = set
+                    .get_object_reader(bucket, &object, range, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read across the frame boundary");
+                restored.clear();
+                reader.stream.read_to_end(&mut restored).await.expect("read bounded range");
+                assert_eq!(restored, payload[block - 7..(block + 8).min(length)]);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multi_block_inline_recovers_corrupt_or_truncated_second_frame() {
+        temp_env::async_with_vars([(rustfs_config::ENV_ERASURE_SHARD_BYTES, Some("0"))], async {
+            let (_directories, disks, set) = hermetic_set_disks(16).await;
+            set.set_test_storage_class_config(
+                lookup_config_for_pools_without_env(&KVS::new(), &[16]).expect("EC12+4 configuration"),
+            );
+            let bucket = "multi-block-inline-recovery";
+            make_bucket(&disks, bucket).await;
+            let payload: Vec<u8> = (0..1280 * 1024).map(|index| (index % 251) as u8).collect();
+            for truncated in [false, true] {
+                let object = if truncated { "truncated" } else { "corrupt" };
+                let mut input = PutObjReader::from_vec(payload.clone());
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut input,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write multi-frame fixture");
+                let mut changed = false;
+                for disk in &disks {
+                    let mut info = disk
+                        .read_version(
+                            "",
+                            bucket,
+                            object,
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read inline shard");
+                    if info.erasure.index != 1 {
+                        continue;
+                    }
+                    let mut raw = info.data.as_ref().expect("inline bytes").to_vec();
+                    let second_frame = info.erasure.block_size.div_ceil(12) + 32;
+                    if truncated {
+                        raw.truncate(second_frame + 33);
+                    } else {
+                        raw[second_frame + 32] ^= 1;
+                    }
+                    info.data = Some(Bytes::from(raw));
+                    disk.write_metadata("", bucket, object, info)
+                        .await
+                        .expect("persist test corruption");
+                    changed = true;
+                    break;
+                }
+                assert!(changed);
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+                assert_eq!(read_back(&set, bucket, object).await, payload);
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

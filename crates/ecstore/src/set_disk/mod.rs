@@ -6051,15 +6051,28 @@ fn should_use_inline_fast_path(
     should_use_inline_fast_path_with_plan(range, object_info, fi, opts, ReadPathPlan::new(object_info, fi))
 }
 
+fn inline_body_fits_buffer(size: usize, block_size: usize) -> bool {
+    size > 0
+        && size <= INLINE_FAST_PATH_MAX_OBJECT_SIZE
+        && block_size != 0
+        && size.div_ceil(block_size) <= INLINE_FAST_PATH_MAX_BLOCKS
+}
+
+fn inline_put_fits_buffer(stored_size: i64, actual_size: i64, block_size: usize, protected: bool) -> bool {
+    let admission_size = if stored_size >= 0 || protected {
+        stored_size
+    } else {
+        actual_size
+    };
+    usize::try_from(admission_size)
+        .is_ok_and(|size| size <= block_size || (stored_size >= 0 && !protected && inline_body_fits_buffer(size, block_size)))
+}
+
 fn inline_body_buffering_miss_reason(fi: &FileInfo) -> Option<&'static str> {
     let Ok(size) = usize::try_from(fi.size) else {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     };
-    if size == 0
-        || size > INLINE_FAST_PATH_MAX_OBJECT_SIZE
-        || fi.erasure.block_size == 0
-        || size.div_ceil(fi.erasure.block_size) > INLINE_FAST_PATH_MAX_BLOCKS
-    {
+    if !inline_body_fits_buffer(size, fi.erasure.block_size) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
     // Proof-protected parts use the readers that bind their PartProofReader.
@@ -15133,6 +15146,20 @@ mod tests {
         fi.erasure.distribution = distribution.to_vec();
         fi.data = data.map(Bytes::from_static);
         fi
+    }
+
+    #[test]
+    fn inline_put_admission_bounds_only_the_multi_block_extension() {
+        let block = 1024 * 1024;
+        assert!(inline_put_fits_buffer(1280 * 1024, 1280 * 1024, block, false));
+        assert!(!inline_put_fits_buffer(1280 * 1024, 1280 * 1024, block, true));
+        assert!(!inline_put_fits_buffer(-1, 1280 * 1024, block, false));
+        assert!(inline_put_fits_buffer(-1, block as i64, block, false));
+        assert!(!inline_put_fits_buffer(-1, block as i64, block, true));
+        assert!(!inline_put_fits_buffer(2 * 1024 * 1024 + 1, 0, block, false));
+        assert!(inline_put_fits_buffer(32 * 4096, 0, 4096, false));
+        assert!(!inline_put_fits_buffer(32 * 4096 + 1, 0, 4096, false));
+        assert!(inline_put_fits_buffer(0, 0, block, false));
     }
 
     #[test]

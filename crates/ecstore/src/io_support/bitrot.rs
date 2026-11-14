@@ -844,7 +844,26 @@ pub async fn create_bitrot_writer_with_orig_volume(
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<BitrotWriterWrapper> {
     let writer = if is_inline_buffer {
-        CustomWriter::new_inline_buffer()
+        if length < 0 {
+            CustomWriter::new_inline_buffer()
+        } else {
+            let payload = usize::try_from(length).map_err(|_| DiskError::other("inline shard length exceeds usize"))?;
+            let overhead = if payload == 0 || checksum_algo.size() == 0 {
+                0
+            } else {
+                if shard_size == 0 {
+                    return Err(DiskError::other("inline bitrot shard size is zero"));
+                }
+                payload
+                    .div_ceil(shard_size)
+                    .checked_mul(checksum_algo.size())
+                    .ok_or_else(|| DiskError::other("inline bitrot overhead overflows"))?
+            };
+            let limit = payload
+                .checked_add(overhead)
+                .ok_or_else(|| DiskError::other("inline buffer limit overflows"))?;
+            CustomWriter::new_bounded_inline_buffer(limit)
+        }
     } else if let Some(disk) = disk {
         let length = bitrot_create_file_size(length, shard_size, &checksum_algo);
 
@@ -1760,6 +1779,28 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_inline_bitrot_writer_counts_each_frame_header() {
+        let mut writer = create_bitrot_writer(true, None, "bucket", "object", 6, 4, HashAlgorithm::HighwayHash256S)
+            .await
+            .expect("bounded inline writer");
+        writer.write(b"abcd").await.expect("first full frame");
+        writer.write(b"ef").await.expect("final partial frame");
+        let raw = writer.into_inline_data().expect("export framed bytes");
+        assert_eq!(raw.len(), 6 + 2 * 32);
+        let mut exact = create_bitrot_writer(true, None, "bucket", "object", 4, 4, HashAlgorithm::HighwayHash256S)
+            .await
+            .expect("exact bounded writer");
+        exact.write(b"abcd").await.expect("fill admitted frame");
+        assert!(exact.write(b"e").await.is_err());
+        assert_eq!(exact.into_inline_data().expect("intact first frame").len(), 4 + 32);
+        assert!(
+            create_bitrot_writer(true, None, "bucket", "object", 1, 0, HashAlgorithm::HighwayHash256S)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

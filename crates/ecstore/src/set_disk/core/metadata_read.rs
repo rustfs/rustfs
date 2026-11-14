@@ -36,10 +36,10 @@ use crate::disk::{
     self, BATCH_READ_VERSION_MAX_ITEMS, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp, Disk, DiskAPI,
 };
 use crate::set_disk::{
-    DiskError, DiskStore, FileInfo, HashAlgorithm, ReadOptions, SetDisks, can_try_inline_data_shards_direct,
-    codec_streaming_rollout_applies, collect_inline_data_shard_fileinfos_from_observations, file_info_is_valid_for_metadata,
-    get_metadata_slowtail_fault_request, inline_body_buffering_miss_reason, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    DiskError, DiskStore, FileInfo, HashAlgorithm, ReadOptions, SetDisks, codec_streaming_rollout_applies,
+    collect_inline_data_shard_fileinfos_from_observations, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request,
+    inline_body_buffering_miss_reason, inline_erasure_shard_file_size, inline_erasure_shard_size,
+    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
     is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_version_early_stop_enabled,
     object_fits_single_block,
 };
@@ -668,25 +668,14 @@ fn verify_inline_body_from_observations<'a>(
     } else {
         checksum_info.algorithm
     };
-    let read_length = inline_erasure_shard_file_offset(
-        0,
-        object_size,
-        object_size,
-        candidate.erasure.block_size,
-        data_shards,
-        candidate.uses_legacy_checksum,
-    );
     let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, data_shards, candidate.uses_legacy_checksum);
-    if object_size == 0 || read_length == 0 || read_length > shard_size || data_files.len() < data_shards {
+    let hash_size = checksum_algo.size();
+    let stride = shard_size
+        .checked_add(hash_size)
+        .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)?;
+    if shard_size == 0 || data_files.len() < data_shards {
         return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     }
-    let shards_needed = object_size.div_ceil(read_length);
-    if shards_needed > data_shards {
-        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-    }
-    let Some(encoded_capacity) = read_length.checked_mul(shards_needed) else {
-        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-    };
     #[cfg(test)]
     {
         for file in &data_files {
@@ -697,27 +686,45 @@ fn verify_inline_body_from_observations<'a>(
         crate::set_disk::disk_call_counters::record(_object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     }
 
-    let hash_size = checksum_algo.size();
-    let need = hash_size + read_length;
-    let mut body = Vec::with_capacity(encoded_capacity);
-    for file in data_files.iter().take(shards_needed) {
-        let Some(raw) = file.data.as_deref() else {
-            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-        };
-        let Some(block) = raw.get(..need) else {
-            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-        };
-        let (hash, data) = block.split_at(hash_size);
-        if hash_size > 0 && checksum_algo.hash_encode(data).as_ref() != hash {
+    let mut body = Vec::with_capacity(object_size);
+    for (frame, offset) in (0..object_size).step_by(candidate.erasure.block_size).enumerate() {
+        let block_length = candidate.erasure.block_size.min(object_size - offset);
+        let read_length = inline_erasure_shard_file_size(
+            block_length,
+            candidate.erasure.block_size,
+            data_shards,
+            candidate.uses_legacy_checksum,
+        );
+        if read_length == 0 || read_length > shard_size {
             return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
         }
-        body.extend_from_slice(data);
-        if body.len() >= object_size {
-            body.truncate(object_size);
-            return Ok(bytes::Bytes::from(body));
+        let start = frame
+            .checked_mul(stride)
+            .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)?;
+        let end = start
+            .checked_add(hash_size)
+            .and_then(|value| value.checked_add(read_length))
+            .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)?;
+        let mut remaining = block_length;
+        for file in data_files.iter().take(block_length.div_ceil(read_length)) {
+            let block = file
+                .data
+                .as_deref()
+                .and_then(|raw| raw.get(start..end))
+                .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)?;
+            let (hash, data) = block.split_at(hash_size);
+            if hash_size > 0 && checksum_algo.hash_encode(data).as_ref() != hash {
+                return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+            }
+            let take = remaining.min(data.len());
+            body.extend_from_slice(&data[..take]);
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
         }
     }
-    Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
+    Ok(bytes::Bytes::from(body))
 }
 
 fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Option<&'static str> {
@@ -754,9 +761,6 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     };
     if candidate.parts.first().is_none_or(|part| part.size != object_size) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
-    }
-    if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
     inline_body_buffering_miss_reason(candidate)
 }

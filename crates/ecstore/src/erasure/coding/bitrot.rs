@@ -965,10 +965,11 @@ pub struct InlineBuffer {
     foreground: Vec<u8>,
     background: Option<crate::disk::background_memory::BackgroundBuffer>,
     filled: usize,
+    max_len: Option<usize>,
 }
 
 impl InlineBuffer {
-    fn new() -> Self {
+    fn new(max_len: Option<usize>) -> Self {
         let background = crate::disk::current_resource_unit()
             .and_then(|unit| unit.memory_budget())
             .map(|budget| crate::disk::background_memory::BackgroundBuffer::new(Some(budget)));
@@ -976,6 +977,7 @@ impl InlineBuffer {
             foreground: Vec::new(),
             background,
             filled: 0,
+            max_len,
         }
     }
 
@@ -990,10 +992,22 @@ impl InlineBuffer {
         let total = bufs
             .iter()
             .try_fold(0usize, |length, buf| length.checked_add(buf.len()).ok_or(std::io::ErrorKind::OutOfMemory))?;
+        let length = self
+            .as_slice()
+            .len()
+            .checked_add(total)
+            .ok_or(std::io::ErrorKind::OutOfMemory)?;
+        if self.max_len.is_some_and(|limit| length > limit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inline shard exceeds its admitted buffer limit",
+            ));
+        }
         if let Some(buffer) = &mut self.background {
-            let length = self.filled.checked_add(total).ok_or(std::io::ErrorKind::OutOfMemory)?;
             if length > buffer.as_slice().len() {
-                let capacity = buffer.as_slice().len().checked_mul(2).unwrap_or(length).max(length);
+                let capacity = self
+                    .max_len
+                    .unwrap_or_else(|| buffer.as_slice().len().checked_mul(2).unwrap_or(length).max(length));
                 // Admission includes both allocations until the prefix has been copied.
                 buffer.grow(capacity, self.filled)?;
             }
@@ -1004,6 +1018,13 @@ impl InlineBuffer {
             }
             self.filled = length;
         } else {
+            if let Some(limit) = self.max_len
+                && length > self.foreground.capacity()
+            {
+                self.foreground
+                    .try_reserve_exact(limit - self.foreground.len())
+                    .map_err(std::io::Error::other)?;
+            }
             for buf in bufs {
                 self.foreground.extend_from_slice(buf);
             }
@@ -1022,7 +1043,11 @@ impl InlineBuffer {
 impl CustomWriter {
     /// Create a new inline buffer writer
     pub fn new_inline_buffer() -> Self {
-        Self::InlineBuffer(InlineBuffer::new())
+        Self::InlineBuffer(InlineBuffer::new(None))
+    }
+
+    pub(crate) fn new_bounded_inline_buffer(max_len: usize) -> Self {
+        Self::InlineBuffer(InlineBuffer::new(Some(max_len)))
     }
 
     /// Create a new disk writer from any AsyncWrite implementation
@@ -2943,6 +2968,25 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bounded_inline_buffer_rejects_vectored_overflow_atomically() {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = CustomWriter::new_bounded_inline_buffer(64);
+        writer.write_all(&[7; 32]).await.expect("initial inline prefix");
+        let error = writer
+            .write_vectored(&[IoSlice::new(&[8; 16]), IoSlice::new(&[9; 17])])
+            .await
+            .expect_err("combined vectored data exceeds the bound");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.get_inline_data(), Some(&[7; 32][..]));
+        writer.write_all(&[8; 32]).await.expect("fill exactly to the bound");
+        assert!(writer.write_all(&[1]).await.is_err());
+        if let CustomWriter::InlineBuffer(buffer) = &writer {
+            assert!(buffer.foreground.capacity() <= 64);
+        }
+        assert_eq!(writer.into_inline_data().expect("export bounded bytes").len(), 64);
+    }
+
     mod inline_memory_regressions {
         use super::*;
         use crate::disk::background_memory::is_memory_pressure;
@@ -2955,6 +2999,25 @@ mod tests {
             let (resources, _) = test_resource_units(1);
             with_optional_resource_unit(Some(resources.with_memory_budget(memory)), async { CustomWriter::new_inline_buffer() })
                 .await
+        }
+
+        #[tokio::test]
+        async fn bounded_inline_writer_retains_its_memory_receipt() {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(256, Duration::from_secs(30));
+            let (resources, _) = test_resource_units(1);
+            let mut writer = with_optional_resource_unit(Some(resources.with_memory_budget(Arc::clone(&memory))), async {
+                CustomWriter::new_bounded_inline_buffer(64)
+            })
+            .await;
+            writer.write_all(&[3; 32]).await.expect("bounded background write");
+            let bytes = writer.into_inline_data().expect("bounded bytes");
+            let clone = bytes.clone();
+            assert_eq!(memory.snapshot().used, 64);
+            drop(bytes);
+            assert_eq!(memory.snapshot().used, 64);
+            drop(clone);
+            assert_eq!(memory.snapshot().used, 0);
         }
 
         #[tokio::test]

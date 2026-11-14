@@ -17545,9 +17545,9 @@ impl DiskAPI for LocalDisk {
                 fi.data = None;
             }
 
-            // Match PUT's per-shard budget and single-block admission bound.
-            // Larger external objects remain on the normal EC reader, even
-            // when a wide layout puts each shard below the inline budget.
+            // Keep legacy external prefetch within one block during metadata
+            // fanout. Persisted inline payloads are loaded by their marker and
+            // can contain several frames without reading external part files.
             let storage_class_config = runtime_sources::storage_class_config_snapshot();
             if should_read_legacy_inline_part(&fi, storage_class_config.as_ref()) {
                 let part_path = path_join_buf(&[
@@ -18545,7 +18545,7 @@ mod test {
     }
 
     #[test]
-    fn legacy_inline_read_ahead_matches_writer_policy_for_ec_layouts() {
+    fn legacy_inline_read_ahead_stays_single_block_for_ec_layouts() {
         let config = crate::config::storageclass::Config::default();
         let object_sizes = [
             128 * 1024_i64,
