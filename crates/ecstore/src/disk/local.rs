@@ -15582,57 +15582,53 @@ impl DiskAPI for LocalDisk {
                 let mut created_transaction_parent = false;
                 if let Some((integrity, source, destination, expected_len)) = integrity_prep {
                     let presynced_proof = take_presynced_tmp_file(&source);
-                    let verify_and_sync = if presynced_proof {
-                        Ok(true)
-                    } else {
-                        (|| -> std::io::Result<bool> {
-                            #[cfg(unix)]
-                            let mut file =
-                                if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
-                                    use rustix::fs::{Mode, OFlags, openat};
-                                    match openat(
-                                        src_p_fd,
-                                        src_name,
-                                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                                        Mode::empty(),
-                                    ) {
-                                        Ok(fd) => std::fs::File::from(fd),
-                                        Err(rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR) => return Ok(false),
-                                        Err(err) => return Err(std::io::Error::from(err)),
-                                    }
-                                } else {
-                                    let stat = std::fs::symlink_metadata(&source)?;
-                                    if !stat.is_file() || stat.len() != expected_len {
-                                        return Ok(false);
-                                    }
-                                    os::open_file_for_sync_std(&source)?
-                                };
-                            #[cfg(not(unix))]
-                            let mut file = {
-                                let stat = std::fs::symlink_metadata(&source)?;
-                                if !stat.is_file() || stat.len() != expected_len {
-                                    return Ok(false);
-                                }
-                                os::open_file_for_sync_std(&source)?
-                            };
-                            #[cfg(unix)]
-                            if src_parent_fd.is_some() {
-                                let stat = file.metadata()?;
-                                if !stat.is_file() || stat.len() != expected_len {
-                                    return Ok(false);
-                                }
+                    // A presync receipt skips the sync after validating the proof bound to this transaction.
+                    let verify_and_sync = (|| -> std::io::Result<bool> {
+                        #[cfg(unix)]
+                        let mut file = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
+                            use rustix::fs::{Mode, OFlags, openat};
+                            match openat(
+                                src_p_fd,
+                                src_name,
+                                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            ) {
+                                Ok(fd) => std::fs::File::from(fd),
+                                Err(rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR) => return Ok(false),
+                                Err(err) => return Err(std::io::Error::from(err)),
                             }
-                            let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
-                            std::io::Read::read_exact(&mut file, &mut header)?;
-                            if header != integrity.index_header() {
+                        } else {
+                            let stat = std::fs::symlink_metadata(&source)?;
+                            if !stat.is_file() || stat.len() != expected_len {
                                 return Ok(false);
                             }
-                            if durability.syncs_data_shards() {
-                                file.sync_all()?;
+                            os::open_file_for_sync_std(&source)?
+                        };
+                        #[cfg(not(unix))]
+                        let mut file = {
+                            let stat = std::fs::symlink_metadata(&source)?;
+                            if !stat.is_file() || stat.len() != expected_len {
+                                return Ok(false);
                             }
-                            Ok(true)
-                        })()
-                    };
+                            os::open_file_for_sync_std(&source)?
+                        };
+                        #[cfg(unix)]
+                        if src_parent_fd.is_some() {
+                            let stat = file.metadata()?;
+                            if !stat.is_file() || stat.len() != expected_len {
+                                return Ok(false);
+                            }
+                        }
+                        let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                        std::io::Read::read_exact(&mut file, &mut header)?;
+                        if header != integrity.index_header() {
+                            return Ok(false);
+                        }
+                        if durability.syncs_data_shards() && !presynced_proof {
+                            file.sync_all()?;
+                        }
+                        Ok(true)
+                    })();
                     match verify_and_sync {
                         Ok(true) => {}
                         Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
@@ -21418,6 +21414,63 @@ mod test {
                     .await
                     .is_ok();
                 assert_eq!(exists, index == retained, "obsolete proof is reclaimed after settlement");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_integrity_part_transaction_validates_presynced_index() {
+        use crate::io_support::shard_integrity::IntegrityBuilder;
+        use rustfs_filemeta::shard_integrity::IntegrityLayout;
+
+        for damage in ["valid", "length", "header"] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("path")).expect("endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+            ensure_test_volume(&disk, "tmp").await;
+            ensure_test_volume(&disk, "bucket").await;
+            let mut builder = IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+            builder.push([b"data".as_slice(); 4].into_iter()).await.expect("stripe");
+            let prepared = builder.finish(8).await.expect("index");
+            let mut index = prepared.inline_bytes().expect("index bytes").to_vec();
+            match damage {
+                "length" => index.truncate(index.len() - 1),
+                "header" => index[0] ^= 1,
+                _ => {}
+            }
+            let index_name = prepared.part.file_name();
+            let index_path = format!("upload/{index_name}");
+            disk.write_all("tmp", &index_path, Bytes::from(index))
+                .await
+                .expect("staged index");
+            disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"data"))
+                .await
+                .expect("staged payload");
+            let source_index = disk.get_object_path_for_io("tmp", &index_path).expect("index path");
+            // A sync receipt establishes durability, independently of the index's contents.
+            mark_presynced_tmp_file(&source_index);
+            let metadata = Bytes::from(
+                ObjectPartInfo {
+                    number: 1,
+                    size: 8,
+                    integrity: Some(prepared.part),
+                    ..Default::default()
+                }
+                .marshal_msg()
+                .expect("metadata"),
+            );
+            let result = disk
+                .prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", metadata)
+                .await;
+            if damage == "valid" {
+                result.expect("a valid presynced index can be prepared");
+            } else {
+                assert_eq!(result.expect_err(damage), DiskError::FileCorrupt, "{damage}");
+                assert!(source_index.exists(), "a rejected index must stay in staging");
+                assert!(
+                    disk.read_all("bucket", &format!("object/{index_name}")).await.is_err(),
+                    "a corrupt index must never be published"
+                );
             }
         }
     }
