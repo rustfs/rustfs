@@ -36,6 +36,9 @@ pub mod io;
 #[cfg(feature = "hash")]
 pub mod hash;
 
+#[cfg(any(feature = "crypto", feature = "hash"))]
+mod sha256;
+
 #[cfg(feature = "os")]
 pub mod os;
 

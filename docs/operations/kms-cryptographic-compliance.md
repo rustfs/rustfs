@@ -20,6 +20,7 @@ This document records where RustFS stands on cryptographic module validation and
 | Local KMS backend master key | `crates/kms/src/backends/local.rs` | RustCrypto `argon2`, `aes-gcm` | Argon2id KDF, AES-256-GCM | No |
 | Config and IAM blobs at rest | `crates/crypto/src/encdec/` (`rustfs-crypto`) | RustCrypto `pbkdf2`/`argon2`, `aes-gcm`, `chacha20poly1305`, `sha2` | see [the `rustfs-crypto` `fips` feature](#the-rustfs-crypto-fips-feature-what-it-actually-does) | No |
 | JWT signing and verification | `jsonwebtoken` with the `aws_lc_rs` feature (`crates/crypto`, `crates/iam`, `crates/policy`) | AWS-LC through `aws-lc-rs` | Non-FIPS `aws-lc-sys` in the standalone default build; the FIPS backend can be enabled by Cargo feature unification | No in the standalone default build; linking the FIPS backend does not establish validation of each operation |
+| S3 requests signed by `rustfs-signer` | `rustfs-signer` and `rustfs-s3-client` via `rustfs-utils` | RustCrypto by default, AWS-LC when building either crate with `fips` | SHA-256 for canonical requests and signed payload digests, HMAC-SHA256 for signing keys and signatures | The opt-in build uses `aws-lc-fips-sys` for these operations |
 
 Two consequences are commonly assumed the other way:
 

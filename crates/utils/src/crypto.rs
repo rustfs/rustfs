@@ -19,7 +19,7 @@ pub use hmac::{KeyInit, Mac};
 use hyper::body::Bytes;
 #[cfg(not(feature = "fips"))]
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::mem::MaybeUninit;
 
 #[cfg(not(feature = "fips"))]
@@ -186,16 +186,6 @@ fn hex_bytes32<R>(src: impl AsRef<[u8]>, f: impl FnOnce(&str) -> R) -> R {
     f(ans)
 }
 
-fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> + use<> {
-    <Sha256 as Digest>::digest(data)
-}
-
-fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
-    let mut h = <Sha256 as Digest>::new();
-    chunk.iter().for_each(|data| h.update(data));
-    h.finalize()
-}
-
 /// hex of sha256 `f(hex(sha256(data)))`
 ///
 /// # Arguments
@@ -207,12 +197,12 @@ fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
 /// representation of the SHA-256 hash of the input data
 ///
 pub fn hex_sha256<R>(data: &[u8], f: impl FnOnce(&str) -> R) -> R {
-    hex_bytes32(sha256(data).as_ref(), f)
+    hex_bytes32(crate::sha256::hash(data), f)
 }
 
 /// `f(hex(sha256(chunk)))`
 pub fn hex_sha256_chunk<R>(chunk: &[Bytes], f: impl FnOnce(&str) -> R) -> R {
-    hex_bytes32(sha256_chunk(chunk).as_ref(), f)
+    hex_bytes32(crate::sha256::hash_slices(chunk.iter().map(Bytes::as_ref)), f)
 }
 
 #[test]
@@ -240,6 +230,24 @@ fn sha256_checksum_rejects_wrong_length_or_non_lowercase_hex() {
     assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"));
     assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
     assert!(!is_sha256_checksum("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"));
+}
+
+#[test]
+fn sha256_matches_known_digests_for_contiguous_and_chunked_input() {
+    #[cfg(feature = "fips")]
+    aws_lc_rs::try_fips_mode().expect("AWS-LC FIPS mode must be active for SHA-256");
+
+    for (input, expected) in [
+        (&b""[..], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (
+            &b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"[..],
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+    ] {
+        let chunks: Vec<_> = input.chunks(7).map(Bytes::from_static).collect();
+        assert_eq!(hex_sha256(input, str::to_owned), expected);
+        assert_eq!(hex_sha256_chunk(&chunks, str::to_owned), expected);
+    }
 }
 
 #[test]
