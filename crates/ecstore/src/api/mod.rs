@@ -208,7 +208,8 @@ pub mod bucket {
 
     pub mod durability {
         pub use crate::bucket::durability::{
-            BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED, BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
+            BUCKET_DURABILITY_MODE_FILE_SYNC, BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED,
+            BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
         };
     }
 
