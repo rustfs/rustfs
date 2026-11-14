@@ -1733,7 +1733,7 @@ mod tests {
 
     async fn protected_object_aliases(disk: &LocalDisk) -> Vec<(String, String)> {
         let object = disk.root.join(RUSTFS_META_BUCKET).join(OBJECT);
-        let mut aliases = vec![
+        let aliases = vec![
             (format!("{RUSTFS_META_BUCKET}/."), OBJECT.to_string()),
             (format!("{RUSTFS_META_BUCKET}/"), OBJECT.to_string()),
             (format!("{RUSTFS_META_BUCKET}/{OBJECT}"), String::new()),
@@ -1743,8 +1743,9 @@ mod tests {
             (object.to_str().expect("UTF-8 object path").to_string(), String::new()),
         ];
         #[cfg(unix)]
-        {
+        let aliases = {
             use std::os::unix::fs::MetadataExt;
+            let mut aliases = aliases;
             let head = fs::metadata(object.join(STORAGE_FORMAT_FILE))
                 .await
                 .expect("canonical head metadata");
@@ -1761,7 +1762,8 @@ mod tests {
                     aliases.push((volume, path));
                 }
             }
-        }
+            aliases
+        };
         aliases
     }
 

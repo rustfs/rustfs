@@ -58,8 +58,7 @@ use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
-    ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-    build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
+    ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
 };
 use super::storage_api::bucket_usecase::{
@@ -71,7 +70,6 @@ use super::storage_api::diagnostic;
 use crate::app::RequestEnvelope;
 use crate::app::bucket_list_through as list_through;
 use crate::app::dto_values;
-use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
@@ -81,7 +79,6 @@ use crate::app::runtime_sources::{
 use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
     cancel_site_replication_delete_bucket, commit_site_replication_delete_bucket, prepare_site_replication_delete_bucket,
     site_replication_bucket_meta_hook, site_replication_make_bucket_hook, with_site_replication_bucket_mutation_lock,
@@ -109,8 +106,7 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
-use rustfs_trusted_proxies::ClientInfo;
-use rustfs_utils::http::{force_delete_header, get_header};
+use rustfs_utils::http::get_header;
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::region::Region;
 use s3s::{S3Error, S3ErrorCode, S3Result};
@@ -129,11 +125,15 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 mod accelerate;
 mod acl;
 mod core;
+#[cfg(any(test, feature = "gateway-stack"))]
+pub(crate) use self::core::requested_location_constraint;
 mod cors;
 mod encryption;
 #[cfg(test)]
 mod guards;
 mod lifecycle;
+mod list_object_versions;
+pub(crate) mod list_objects;
 mod listing;
 mod logging;
 mod notification;

@@ -18,6 +18,7 @@ use crate::storage::storage_api::ecstore_disk::{
     MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
     PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
+    validate_format_control_path,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
@@ -76,6 +77,14 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: Bytes) -> Result<(), DiskError> {
+        match self {
+            Self::Ready(store) => store.write_local_format_control(disk_ref, path, data).await,
+            Self::Bootstrap(target) => target.write_local_format_control(disk_ref, path, data).await,
+            Self::Unbound => Err(DiskError::DiskNotFound),
+        }
+    }
+
     async fn recover_local_multipart_source(
         &self,
         disk_ref: &str,
@@ -2748,6 +2757,48 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_write_format_control(
+        &self,
+        request: Request<WriteFormatControlRequest>,
+    ) -> Result<Response<WriteAllResponse>, Status> {
+        let _duration = InternodeRpcDurationGuard::handler(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+        let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("format control request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|_| Status::permission_denied("format control requires a signed canonical body"))?;
+        validate_format_control_path(&request.get_ref().path)
+            .map_err(|_| Status::invalid_argument("unsupported format control filename"))?;
+        let request = request.into_inner();
+        let metrics = runtime_sources::current_internode_metrics();
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            request.data.len(),
+        );
+        let target = self.local_mutation_target();
+        let result = target
+            .write_local_format_control(&request.disk, &request.path, request.data)
+            .await;
+        match result {
+            Ok(()) => Ok(Response::new(WriteAllResponse {
+                success: true,
+                error: None,
+            })),
+            Err(error) => {
+                metrics
+                    .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+                Ok(Response::new(WriteAllResponse {
+                    success: false,
+                    error: Some(error.into()),
+                }))
+            }
+        }
+    }
+
     pub(super) async fn handle_compare_and_update_file(
         &self,
         request: Request<CompareAndUpdateFileRequest>,
@@ -3026,6 +3077,82 @@ mod tests {
                 other => panic!("duration metric must be a histogram, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn format_control_handler_metrics_count_admitted_payload_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::WriteFormatControlRequest;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let enabled = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler metrics runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let message = WriteFormatControlRequest {
+                    disk: "missing-format-target".into(),
+                    path: "format.json.bootstrap".into(),
+                    data: bytes::Bytes::from_static(b"format-plan"),
+                };
+                let mut request = Request::new(message.clone());
+                let canonical =
+                    rustfs_protos::canonical_write_format_control_request_body(request.get_ref()).expect("canonical control");
+                crate::storage::storage_api::set_tonic_canonical_body_digest(&mut request, &canonical).expect("control digest");
+                request
+                    .metadata_mut()
+                    .insert("x-rustfs-rpc-auth-version", "2".parse().expect("v2 header"));
+                let response = server
+                    .handle_write_format_control(request)
+                    .await
+                    .expect("typed target failure")
+                    .into_inner();
+                assert!(!response.success);
+                let error = server
+                    .handle_write_format_control(Request::new(message))
+                    .await
+                    .expect_err("unsigned control rejection");
+                assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            });
+        });
+        rustfs_io_metrics::set_metrics_enabled(enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let value = |name: &str| {
+            &entries
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "grpc_write_all")
+                })
+                .expect("format-control handler metric")
+                .3
+        };
+        for (name, expected) in [
+            ("rustfs_system_network_internode_operation_requests_incoming_total", 1),
+            ("rustfs_system_network_internode_operation_recv_bytes_total", 11),
+            ("rustfs_system_network_internode_operation_errors_total", 1),
+        ] {
+            assert!(matches!(value(name), DebugValue::Counter(count) if *count == expected), "{name}");
+        }
+        assert!(
+            matches!(value("rustfs_system_network_internode_operation_server_duration_ms"), DebugValue::Histogram(samples) if samples.len() == 2)
+        );
+        assert!(
+            matches!(value("rustfs_system_network_internode_rpc_active"), DebugValue::Gauge(active) if active.into_inner() == 0.0)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(key, _, _, _)| key.key().name() != "rustfs_system_network_internode_operation_duration_ms")
+        );
     }
 
     #[test]

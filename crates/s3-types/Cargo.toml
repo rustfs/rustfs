@@ -37,14 +37,13 @@ default = []
 # crate carries no s3s unless a consumer asks.
 # DELETE BY T4.2 (rustfs/backlog#2784) together with src/compat_s3s.rs.
 compat-s3s = ["dep:legacy-s3s"]
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+hotpath = []
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
 
 [dependencies]
 bytes = { workspace = true }
 futures-core = { workspace = true }
-hotpath.workspace = true
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }

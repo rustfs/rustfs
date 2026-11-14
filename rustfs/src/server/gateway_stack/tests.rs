@@ -14,6 +14,8 @@
 //! The assembled gateway stack, driven through [`GatewayStack::call`] exactly as `server/http.rs`
 //! drives it. Requests that need object storage are in `rustfs/tests/embedded_gateway_stack_test.rs`.
 
+mod ssec;
+
 use super::*;
 use crate::server::gateway_handlers::rows;
 use crate::server::gateway_handlers::test_support::{CLIENT, PEER, REQUEST_ID, Signed, request_context, signed_request};
@@ -489,4 +491,19 @@ async fn the_early_gate_allows_only_what_the_table_serves() {
     let (status, _, body) = answer_request(&gated(OPERATIONS), request()).await;
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(!body.contains("AccessDenied"), "{body}");
+}
+
+#[tokio::test]
+async fn the_reported_owner_is_every_bucket_s_owner_and_without_one_nothing_is() {
+    let photos = BucketName::new("photos").expect("a bucket name");
+    let reported = owner().id.expect("RustFS reports an owner id");
+
+    assert_eq!(
+        ReportedOwner(Some(Arc::from(reported.as_str())))
+            .owner(&photos)
+            .await
+            .as_deref(),
+        Ok(reported.as_str())
+    );
+    assert_eq!(ReportedOwner(None).owner(&photos).await, Err(BucketOwnerError::unavailable()));
 }

@@ -52,3 +52,4 @@ mod bucket_access;
 mod bucket_replication_lifecycle;
 mod listing_multipart;
 mod object_meta;
+mod object_read;

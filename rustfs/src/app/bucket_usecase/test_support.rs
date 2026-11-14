@@ -40,6 +40,16 @@ pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     }
 }
 
+/// A bucket name for an owned use-case input.
+pub(super) fn gateway_bucket(name: &str) -> rustfs_gateway_types::BucketName {
+    rustfs_gateway_types::BucketName::new(name).expect("valid bucket name")
+}
+
+/// The envelope of a request that carries nothing but `method`.
+pub(super) fn owned_envelope(method: Method) -> RequestEnvelope {
+    RequestEnvelope::from_s3s(&build_request((), method))
+}
+
 pub(super) fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
     let mut req = build_request(input, method);
     req.extensions.insert(req_info);
