@@ -15504,15 +15504,18 @@ mod inline_put_commit_path_tests {
         let bucket = "inline-direct-post-encode-quorum";
         let object = "exact-quorum.bin";
         make_bucket(&disk_stores, bucket).await;
+        let tail_drained_opts = ObjectOptions {
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
         let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
         let put = {
             let set_disks = Arc::clone(&set_disks);
             let payload = payload.clone();
+            let opts = tail_drained_opts.clone();
             tokio::spawn(async move {
                 let mut reader = PutObjReader::from_vec(payload);
-                set_disks
-                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-                    .await
+                set_disks.put_object(bucket, object, &mut reader, &opts).await
             })
         };
         barrier.wait_until_paused().await;
@@ -15538,7 +15541,7 @@ mod inline_put_commit_path_tests {
         make_bucket(&disk_stores, bucket).await;
         let mut old_reader = PutObjReader::from_vec(old_payload.clone());
         set_disks
-            .put_object(bucket, object, &mut old_reader, &ObjectOptions::default())
+            .put_object(bucket, object, &mut old_reader, &tail_drained_opts)
             .await
             .expect("old inline object should commit");
         let read_data = ReadOptions {
@@ -15559,11 +15562,10 @@ mod inline_put_commit_path_tests {
         let put = {
             let set_disks = Arc::clone(&set_disks);
             let payload = payload.clone();
+            let opts = tail_drained_opts.clone();
             tokio::spawn(async move {
                 let mut reader = PutObjReader::from_vec(payload);
-                set_disks
-                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-                    .await
+                set_disks.put_object(bucket, object, &mut reader, &opts).await
             })
         };
         barrier.wait_until_paused().await;
