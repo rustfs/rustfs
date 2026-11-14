@@ -100,7 +100,6 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use s3s::S3ErrorCode;
-use s3s::dto::ServerSideEncryption;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "rio-v2")]
@@ -167,7 +166,6 @@ use rustfs_utils::http::headers::{
 #[cfg(test)]
 use rustfs_utils::http::headers::{AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
@@ -185,19 +183,19 @@ const SUPPORT_SSE_ALGORITHMS: &[&str] = &[DEFAULT_SSE_ALGORITHM];
 // check sse type
 #[allow(unused)]
 pub fn get_sse_type(
-    server_side_encryption: Option<&ServerSideEncryption>,
-    customer_algorithm: Option<&SSECustomerAlgorithm>,
-    customer_key: Option<&SSECustomerKey>,
-    customer_key_md5: Option<&SSECustomerKeyMD5>,
+    server_side_encryption: Option<&str>,
+    customer_algorithm: Option<&String>,
+    customer_key: Option<&String>,
+    customer_key_md5: Option<&String>,
 ) -> Option<SSEType> {
     if customer_algorithm.is_some() && customer_key.is_some() && customer_key_md5.is_some() {
         return Some(SSEType::SseC);
     }
 
     let sse = server_side_encryption?;
-    match sse.as_str() {
-        ServerSideEncryption::AES256 => Some(SSEType::SseS3),
-        ServerSideEncryption::AWS_KMS => Some(SSEType::SseKms),
+    match sse {
+        AMZ_ENCRYPTION_AES => Some(SSEType::SseS3),
+        AMZ_ENCRYPTION_KMS => Some(SSEType::SseKms),
         _ => None,
     }
 }
@@ -206,9 +204,9 @@ pub fn get_sse_type(
 #[derive(Debug)]
 pub struct SseConfiguration {
     /// Effective server-side encryption algorithm (after considering bucket defaults)
-    pub effective_sse: ServerSideEncryption,
+    pub effective_sse: String,
     /// Effective KMS key ID (after considering bucket defaults)
-    pub effective_kms_key_id: Option<SSEKMSKeyId>,
+    pub effective_kms_key_id: Option<String>,
 }
 /// Managed SSE resolved from a bucket default encryption rule on a write path.
 ///
@@ -222,13 +220,11 @@ pub struct SseConfiguration {
 /// becomes unreadable. PutBucketEncryption refuses unknown algorithms, so this
 /// is reachable only through a configuration stored before that check or
 /// through hand-edited bucket metadata (backlog#1826).
-pub(crate) fn bucket_default_write_sse(
-    sse: &rustfs_gateway_types::persistence::PersistedEncryptionByDefault,
-) -> ServerSideEncryption {
+pub(crate) fn bucket_default_write_sse(sse: &rustfs_gateway_types::persistence::PersistedEncryptionByDefault) -> String {
     match sse.sse_algorithm.as_str() {
-        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        "AES256" => String::from(AMZ_ENCRYPTION_AES),
+        "aws:kms" => String::from(AMZ_ENCRYPTION_KMS),
+        _ => String::from(AMZ_ENCRYPTION_AES),
     }
 }
 
@@ -249,11 +245,11 @@ pub(crate) fn bucket_default_write_sse(
 /// `SseConfiguration` with resolved encryption parameters and metadata headers
 async fn prepare_sse_configuration(
     bucket: &str,
-    server_side_encryption: Option<ServerSideEncryption>,
-    ssekms_key_id: Option<SSEKMSKeyId>,
+    server_side_encryption: Option<String>,
+    ssekms_key_id: Option<String>,
 ) -> Result<Option<SseConfiguration>, ApiError> {
     if let Some(server_side_encryption) = server_side_encryption.clone()
-        && server_side_encryption.as_str() == ServerSideEncryption::AES256
+        && server_side_encryption.as_str() == AMZ_ENCRYPTION_AES
     {
         return Ok(Some(SseConfiguration {
             effective_sse: server_side_encryption,
@@ -347,25 +343,35 @@ async fn prepare_sse_configuration(
 }
 
 fn resolve_effective_kms_key_id<F>(
-    effective_sse: Option<&ServerSideEncryption>,
-    requested_kms_key_id: Option<SSEKMSKeyId>,
+    effective_sse: Option<&str>,
+    requested_kms_key_id: Option<String>,
     bucket_default_kms_key_id: F,
-) -> Option<SSEKMSKeyId>
+) -> Option<String>
 where
-    F: FnOnce() -> Option<SSEKMSKeyId>,
+    F: FnOnce() -> Option<String>,
 {
-    if effective_sse.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+    if effective_sse.is_none_or(|sse| sse != AMZ_ENCRYPTION_KMS) {
         return requested_kms_key_id;
     }
 
     requested_kms_key_id.or_else(bucket_default_kms_key_id)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SseTypeV2 {
-    SseS3(ServerSideEncryption),
-    SseKms(ServerSideEncryption, Option<SSEKMSKeyId>),
-    SseC(SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5),
+    SseS3(String),
+    SseKms(String, Option<String>),
+    SseC(String, String, String),
+}
+
+impl std::fmt::Debug for SseTypeV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SseS3(_) => "SseS3(..)",
+            Self::SseKms(_, _) => "SseKms(..)",
+            Self::SseC(_, _, _) => "SseC(..)",
+        })
+    }
 }
 
 impl SseTypeV2 {
@@ -377,11 +383,11 @@ impl SseTypeV2 {
 
 pub async fn prepare_sse_configuration_v2(
     bucket: &str,
-    server_side_encryption: Option<ServerSideEncryption>,
-    customer_algorithm: Option<SSECustomerAlgorithm>,
-    customer_key: Option<SSECustomerKey>,
-    customer_key_md5: Option<SSECustomerKeyMD5>,
-    ssekms_key_id: Option<SSEKMSKeyId>,
+    server_side_encryption: Option<String>,
+    customer_algorithm: Option<String>,
+    customer_key: Option<String>,
+    customer_key_md5: Option<String>,
+    ssekms_key_id: Option<String>,
 ) -> Result<Option<SseTypeV2>, ApiError> {
     if let Some(customer_algorithm) = customer_algorithm
         && let Some(customer_key_md5) = customer_key_md5
@@ -396,10 +402,8 @@ pub async fn prepare_sse_configuration_v2(
 
     if let Some(sse_config) = sse_config {
         return match sse_config.effective_sse.as_str() {
-            ServerSideEncryption::AES256 => Ok(Some(SseTypeV2::SseS3(sse_config.effective_sse))),
-            ServerSideEncryption::AWS_KMS => {
-                Ok(Some(SseTypeV2::SseKms(sse_config.effective_sse.clone(), sse_config.effective_kms_key_id)))
-            }
+            AMZ_ENCRYPTION_AES => Ok(Some(SseTypeV2::SseS3(sse_config.effective_sse))),
+            AMZ_ENCRYPTION_KMS => Ok(Some(SseTypeV2::SseKms(sse_config.effective_sse.clone(), sse_config.effective_kms_key_id))),
             _ => Ok(None),
         };
     }
@@ -438,28 +442,43 @@ pub fn sse_configuration_to_metadata(sse_configuration: &SseTypeV2) -> HashMap<S
 // ============================================================================
 
 /// Request parameters for unified encryption
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EncryptionRequest<'a> {
     /// Bucket name
     pub bucket: &'a str,
     /// Object key
     pub key: &'a str,
     /// Server-side encryption algorithm (SSE-S3 or SSE-KMS)
-    pub server_side_encryption: Option<ServerSideEncryption>,
+    pub server_side_encryption: Option<String>,
     /// KMS key ID (for SSE-KMS)
-    pub ssekms_key_id: Option<SSEKMSKeyId>,
+    pub ssekms_key_id: Option<String>,
     /// Optional client-provided KMS context for SSE-KMS.
     pub ssekms_context: Option<HashMap<String, String>>,
     /// SSE-C algorithm (customer-provided key)
-    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    pub sse_customer_algorithm: Option<String>,
     /// SSE-C key (Base64-encoded)
-    pub sse_customer_key: Option<SSECustomerKey>,
+    pub sse_customer_key: Option<String>,
     /// SSE-C key MD5 (Base64-encoded)
-    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub sse_customer_key_md5: Option<String>,
     /// Content size (for metadata)
     pub content_size: i64,
     /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
     pub principal: Option<&'a SseKmsPrincipal>,
+}
+
+impl std::fmt::Debug for EncryptionRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionRequest")
+            .field("server_side_encryption", &self.server_side_encryption)
+            .field("content_size", &self.content_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DecryptionRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptionRequest").finish_non_exhaustive()
+    }
 }
 
 impl EncryptionRequest<'_> {
@@ -543,7 +562,7 @@ fn sse_invalid_argument(message: &str) -> ApiError {
 }
 
 /// SSE-C parameters extracted from headers (algorithm, key, key MD5).
-pub(crate) type SsecParamsFromHeaders = (Option<SSECustomerAlgorithm>, Option<SSECustomerKey>, Option<SSECustomerKeyMD5>);
+pub(crate) type SsecParamsFromHeaders = (Option<String>, Option<String>, Option<String>);
 
 /// Extract SSE-C parameters from request headers.
 /// Used as fallback when the S3 layer does not populate them in the input struct.
@@ -555,7 +574,7 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
         None => Ok(None),
         Some(v) => v
             .to_str()
-            .map(|s| Some(SSECustomerAlgorithm::from(s.to_string())))
+            .map(|s| Some(s.to_string()))
             .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-algorithm header must be valid UTF-8.")),
     }?;
 
@@ -563,7 +582,7 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
         None => Ok(None),
         Some(v) => v
             .to_str()
-            .map(|s| Some(SSECustomerKey::from(s.to_string())))
+            .map(|s| Some(s.to_string()))
             .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-key header must be valid UTF-8.")),
     }?;
 
@@ -571,7 +590,7 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
         None => Ok(None),
         Some(v) => v
             .to_str()
-            .map(|s| Some(SSECustomerKeyMD5::from(s.to_string())))
+            .map(|s| Some(s.to_string()))
             .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption-customer-key-md5 header must be valid UTF-8.")),
     }?;
 
@@ -583,12 +602,12 @@ pub(crate) fn extract_ssec_params_from_headers(headers: &HeaderMap) -> Result<Ss
 ///
 /// Returns an error if the header is present but cannot be parsed as valid UTF-8,
 /// ensuring malformed headers do not bypass validation.
-pub(crate) fn extract_server_side_encryption_from_headers(headers: &HeaderMap) -> Result<Option<ServerSideEncryption>, ApiError> {
+pub(crate) fn extract_server_side_encryption_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     match headers.get("x-amz-server-side-encryption") {
         None => Ok(None),
         Some(v) => v
             .to_str()
-            .map(|s| Some(ServerSideEncryption::from(s.to_string())))
+            .map(|s| Some(s.to_string()))
             .map_err(|_| sse_invalid_argument("The x-amz-server-side-encryption header must be valid UTF-8.")),
     }
 }
@@ -612,17 +631,17 @@ pub(crate) fn extract_ssekms_context_from_headers(headers: &HeaderMap) -> Result
 
 #[inline]
 pub(crate) fn validate_sse_headers_for_write(
-    server_side_encryption: Option<&ServerSideEncryption>,
-    ssekms_key_id: Option<&SSEKMSKeyId>,
+    server_side_encryption: Option<&str>,
+    ssekms_key_id: Option<&String>,
     ssekms_context: Option<&HashMap<String, String>>,
-    sse_customer_algorithm: Option<&SSECustomerAlgorithm>,
-    sse_customer_key: Option<&SSECustomerKey>,
-    sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
+    sse_customer_algorithm: Option<&String>,
+    sse_customer_key: Option<&String>,
+    sse_customer_key_md5: Option<&String>,
     require_sse_customer_key: bool,
 ) -> Result<(), ApiError> {
     if let Some(sse) = server_side_encryption {
-        let s = sse.as_str();
-        if s != ServerSideEncryption::AES256 && s != ServerSideEncryption::AWS_KMS {
+        let s = sse;
+        if s != AMZ_ENCRYPTION_AES && s != AMZ_ENCRYPTION_KMS {
             return Err(sse_invalid_argument(
                 "The SSE algorithm specified is not supported. The valid values are AES256 or aws:kms.",
             ));
@@ -659,13 +678,13 @@ pub(crate) fn validate_sse_headers_for_write(
         }
     }
 
-    if ssekms_key_id.is_some() && server_side_encryption.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+    if ssekms_key_id.is_some() && server_side_encryption.is_none_or(|sse| sse != AMZ_ENCRYPTION_KMS) {
         return Err(sse_invalid_argument(
             "The SSE-KMS key ID header can only be used when x-amz-server-side-encryption is set to aws:kms.",
         ));
     }
 
-    if ssekms_context.is_some() && server_side_encryption.is_none_or(|sse| sse.as_str() != ServerSideEncryption::AWS_KMS) {
+    if ssekms_context.is_some() && server_side_encryption.is_none_or(|sse| sse != AMZ_ENCRYPTION_KMS) {
         return Err(sse_invalid_argument(
             "The SSE-KMS context header can only be used when x-amz-server-side-encryption is set to aws:kms.",
         ));
@@ -793,7 +812,6 @@ fn map_ssec_get_object_reader_error_message(err: &StorageError) -> Option<String
 }
 
 /// Request parameters for unified decryption
-#[derive(Debug)]
 pub struct DecryptionRequest<'a> {
     /// Bucket name
     pub bucket: &'a str,
@@ -802,23 +820,22 @@ pub struct DecryptionRequest<'a> {
     /// Object metadata containing encryption headers
     pub metadata: &'a HashMap<String, String>,
     /// SSE-C key (Base64-encoded) - required if object was encrypted with SSE-C
-    pub sse_customer_key: Option<&'a SSECustomerKey>,
+    pub sse_customer_key: Option<&'a String>,
     /// SSE-C key MD5 (Base64-encoded) - required if object was encrypted with SSE-C
-    pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
+    pub sse_customer_key_md5: Option<&'a String>,
     /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
     pub principal: Option<&'a SseKmsPrincipal>,
 }
 
 /// Encryption material returned by `sse_encryption()` / `sse_prepare_encryption()`.
-#[derive(Debug)]
 pub struct EncryptionMaterial {
     #[allow(unused)]
     pub sse_type: SSEType,
-    pub server_side_encryption: ServerSideEncryption,
-    pub kms_key_id: Option<SSEKMSKeyId>,
+    pub server_side_encryption: String,
+    pub kms_key_id: Option<String>,
 
     #[allow(unused)]
-    pub algorithm: SSECustomerAlgorithm,
+    pub algorithm: String,
 
     /// Encryption key bytes
     pub key_bytes: [u8; 32],
@@ -827,7 +844,7 @@ pub struct EncryptionMaterial {
     /// Encrypted DEK for managed SSE. Absent for SSE-C.
     pub encrypted_data_key: Option<Vec<u8>>,
     /// SSE-C key MD5 if customer-managed encryption is in use.
-    pub customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub customer_key_md5: Option<String>,
     /// Original plaintext size when it should be persisted alongside metadata.
     pub original_size: Option<i64>,
     /// Indicates whether `key_bytes` is a direct stream key or a MinIO-style object key.
@@ -840,15 +857,14 @@ pub struct EncryptionMaterial {
 }
 
 /// Decryption material returned by `sse_decryption()`.
-#[derive(Debug)]
 pub struct DecryptionMaterial {
     #[allow(unused)]
     pub sse_type: SSEType,
-    pub server_side_encryption: ServerSideEncryption,
-    pub kms_key_id: Option<SSEKMSKeyId>,
+    pub server_side_encryption: String,
+    pub kms_key_id: Option<String>,
     #[allow(unused)]
-    pub algorithm: SSECustomerAlgorithm,
-    pub customer_key_md5: Option<SSECustomerKeyMD5>, // if use SSE-C, check key md5
+    pub algorithm: String,
+    pub customer_key_md5: Option<String>, // if use SSE-C, check key md5
 
     /// Decryption key bytes
     pub key_bytes: [u8; 32],
@@ -856,6 +872,25 @@ pub struct DecryptionMaterial {
     pub base_nonce: [u8; 12],
     /// Indicates whether `key_bytes` is a direct stream key or a MinIO-style object key.
     pub key_kind: EncryptionKeyKind,
+}
+
+impl std::fmt::Debug for EncryptionMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionMaterial")
+            .field("sse_type", &self.sse_type)
+            .field("server_side_encryption", &self.server_side_encryption)
+            .field("original_size", &self.original_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DecryptionMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecryptionMaterial")
+            .field("sse_type", &self.sse_type)
+            .field("server_side_encryption", &self.server_side_encryption)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1674,7 +1709,7 @@ impl EncryptionMaterial {
     /// internal detail of an `AES256` object: only an `aws:kms` object names
     /// a key the caller can act on, and `x-amz-server-side-encryption-aws-kms-key-id`
     /// is defined only for that scheme.
-    pub fn response_kms_key_id(&self) -> Option<SSEKMSKeyId> {
+    pub fn response_kms_key_id(&self) -> Option<String> {
         matches!(self.sse_type, SSEType::SseKms)
             .then(|| self.kms_key_id.clone())
             .flatten()
@@ -1709,10 +1744,10 @@ fn managed_sse_domain(sse_type: SSEType) -> &'static str {
 /// The public `x-amz-server-side-encryption` value a managed scheme reports.
 fn managed_sse_public_header(sse_type: SSEType) -> &'static str {
     match sse_type {
-        SSEType::SseKms => ServerSideEncryption::AWS_KMS,
+        SSEType::SseKms => AMZ_ENCRYPTION_KMS,
         // SSE-C never reaches the managed path; reporting AES256 keeps this
         // total without inventing a third public value.
-        SSEType::SseS3 | SSEType::SseC => ServerSideEncryption::AES256,
+        SSEType::SseS3 | SSEType::SseC => AMZ_ENCRYPTION_AES,
     }
 }
 
@@ -1948,11 +1983,7 @@ fn try_decode_minio_sealing_iv(bytes: &str) -> Result<Option<[u8; SEALED_KEY_IV_
     }
 }
 
-pub(crate) fn build_ssec_read_headers(
-    algorithm: Option<&SSECustomerAlgorithm>,
-    key: Option<&SSECustomerKey>,
-    key_md5: Option<&SSECustomerKeyMD5>,
-) -> HeaderMap {
+pub(crate) fn build_ssec_read_headers(algorithm: Option<&String>, key: Option<&String>, key_md5: Option<&String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     if let Some(algorithm) = algorithm
@@ -2043,10 +2074,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
                 material.server_side_encryption.as_str().to_string(),
             );
 
-            let internal_key_id = material
-                .kms_key_id
-                .clone()
-                .unwrap_or_else(|| SSEKMSKeyId::from("default".to_string()));
+            let internal_key_id = material.kms_key_id.clone().unwrap_or_else(|| "default".to_string());
             metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), internal_key_id.clone());
 
             if matches!(material.sse_type, SSEType::SseKms) {
@@ -2184,7 +2212,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
 /// ```
 pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     validate_sse_headers_for_write(
-        request.server_side_encryption.as_ref(),
+        request.server_side_encryption.as_deref(),
         request.ssekms_key_id.as_ref(),
         request.ssekms_context.as_ref(),
         request.sse_customer_algorithm.as_ref(),
@@ -2234,17 +2262,17 @@ pub struct PrepareEncryptionRequest<'a> {
     /// Object key
     pub key: &'a str,
     /// Server-side encryption algorithm (SSE-S3 or SSE-KMS)
-    pub server_side_encryption: Option<ServerSideEncryption>,
+    pub server_side_encryption: Option<String>,
     /// KMS key ID (for SSE-KMS)
-    pub ssekms_key_id: Option<SSEKMSKeyId>,
+    pub ssekms_key_id: Option<String>,
     /// Optional client-provided KMS context for SSE-KMS.
     pub ssekms_context: Option<HashMap<String, String>>,
     /// SSE-C algorithm (customer-provided key)
-    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    pub sse_customer_algorithm: Option<String>,
     /// SSE-C key (Base64-encoded)
-    pub sse_customer_key: Option<SSECustomerKey>,
+    pub sse_customer_key: Option<String>,
     /// SSE-C key MD5 (Base64-encoded)
-    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub sse_customer_key_md5: Option<String>,
     /// Caller the SSE-KMS key usage is authorized as. `None` marks an internal caller.
     ///
     /// This is the only point at which a multipart upload evaluates KMS key permissions:
@@ -2255,7 +2283,7 @@ pub struct PrepareEncryptionRequest<'a> {
 
 pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, ApiError> {
     validate_sse_headers_for_write(
-        request.server_side_encryption.as_ref(),
+        request.server_side_encryption.as_deref(),
         request.ssekms_key_id.as_ref(),
         request.ssekms_context.as_ref(),
         request.sse_customer_algorithm.as_ref(),
@@ -2373,10 +2401,10 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 /// Response headers derived for a decrypted read without unwrapping the data key.
 #[derive(Debug)]
 pub struct SseReadResponseHeaders {
-    pub server_side_encryption: ServerSideEncryption,
-    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
-    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
-    pub ssekms_key_id: Option<SSEKMSKeyId>,
+    pub server_side_encryption: String,
+    pub sse_customer_algorithm: Option<String>,
+    pub sse_customer_key_md5: Option<String>,
+    pub ssekms_key_id: Option<String>,
 }
 
 fn invalid_sse_response_metadata() -> ApiError {
@@ -2397,8 +2425,8 @@ fn insert_sse_response_header(headers: &mut HeaderMap, name: HeaderName, value: 
 /// validation and KMS authorization path.
 pub(crate) fn project_sse_read_response_headers(
     metadata: &HashMap<String, String>,
-    sse_customer_algorithm: Option<&SSECustomerAlgorithm>,
-    sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
+    sse_customer_algorithm: Option<&String>,
+    sse_customer_key_md5: Option<&String>,
 ) -> Result<HeaderMap, ApiError> {
     if metadata.keys().any(|key| {
         key.eq_ignore_ascii_case(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY)
@@ -2580,8 +2608,8 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
         })?;
 
         return Ok(Some(SseReadResponseHeaders {
-            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-            sse_customer_algorithm: Some(SSECustomerAlgorithm::from(algorithm)),
+            server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
+            sse_customer_algorithm: Some(String::from(algorithm)),
             sse_customer_key_md5: Some(key_md5.clone()),
             ssekms_key_id: None,
         }));
@@ -2592,7 +2620,7 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
     }
 
     let sse_type = match request.metadata.get("x-amz-server-side-encryption").map(String::as_str) {
-        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(AMZ_ENCRYPTION_KMS) => SSEType::SseKms,
         Some(_) => SSEType::SseS3,
         #[cfg(feature = "rio-v2")]
         None => match infer_minio_managed_sse_type(request.metadata) {
@@ -2638,12 +2666,12 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
     );
 
     Ok(Some(SseReadResponseHeaders {
-        server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(sse_type).to_string()),
+        server_side_encryption: managed_sse_public_header(sse_type).to_string(),
         sse_customer_algorithm: None,
         sse_customer_key_md5: None,
         // The key id was needed above to authorize the read, but an AES256
         // object's wrapping key is internal: only aws:kms objects advertise it.
-        ssekms_key_id: matches!(sse_type, SSEType::SseKms).then(|| SSEKMSKeyId::from(kms_key_id)),
+        ssekms_key_id: matches!(sse_type, SSEType::SseKms).then_some(kms_key_id),
     }))
 }
 
@@ -2654,9 +2682,9 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
 async fn apply_ssec_prepare_encryption_material(
     bucket: &str,
     key: &str,
-    algorithm: SSECustomerAlgorithm,
-    sse_key: Option<SSECustomerKey>,
-    sse_key_md5: SSECustomerKeyMD5,
+    algorithm: String,
+    sse_key: Option<String>,
+    sse_key_md5: String,
 ) -> Result<EncryptionMaterial, ApiError> {
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = if let Some(sse_key) = sse_key {
@@ -2688,7 +2716,7 @@ async fn apply_ssec_prepare_encryption_material(
 
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
         kms_key_id: None,
         algorithm,
         key_bytes,
@@ -2705,9 +2733,9 @@ async fn apply_ssec_prepare_encryption_material(
 async fn apply_ssec_encryption_material(
     bucket: &str,
     key: &str,
-    algorithm: SSECustomerAlgorithm,
-    sse_key: SSECustomerKey,
-    sse_key_md5: SSECustomerKeyMD5,
+    algorithm: String,
+    sse_key: String,
+    sse_key_md5: String,
     content_size: i64,
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
@@ -2741,7 +2769,7 @@ async fn apply_ssec_encryption_material(
     // Build metadata
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
         kms_key_id: None,
         algorithm: validated.algorithm,
         key_bytes,
@@ -2813,9 +2841,9 @@ async fn apply_ssec_decryption_material(
 
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256), // const
+        server_side_encryption: String::from(AMZ_ENCRYPTION_AES), // const
         kms_key_id: None,
-        algorithm: SSECustomerAlgorithm::from(algorithm),
+        algorithm: String::from(algorithm),
 
         customer_key_md5: None,
         key_bytes,
@@ -2831,8 +2859,8 @@ async fn apply_ssec_decryption_material(
 async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
-    server_side_encryption: ServerSideEncryption,
-    kms_key_id: Option<SSEKMSKeyId>,
+    server_side_encryption: String,
+    kms_key_id: Option<String>,
     ssekms_context: Option<HashMap<String, String>>,
     content_size: i64,
     principal: Option<&SseKmsPrincipal>,
@@ -2875,7 +2903,7 @@ async fn apply_managed_encryption_material(
 /// encryption and decryption paths do.
 fn managed_sse_type(server_side_encryption: &str) -> SSEType {
     match server_side_encryption {
-        ServerSideEncryption::AWS_KMS => SSEType::SseKms,
+        AMZ_ENCRYPTION_KMS => SSEType::SseKms,
         _ => SSEType::SseS3,
     }
 }
@@ -2883,8 +2911,8 @@ fn managed_sse_type(server_side_encryption: &str) -> SSEType {
 async fn apply_managed_encryption_material_inner(
     bucket: &str,
     key: &str,
-    server_side_encryption: ServerSideEncryption,
-    kms_key_id: Option<SSEKMSKeyId>,
+    server_side_encryption: String,
+    kms_key_id: Option<String>,
     ssekms_context: Option<HashMap<String, String>>,
     content_size: i64,
     principal: Option<&SseKmsPrincipal>,
@@ -3096,7 +3124,7 @@ async fn apply_managed_decryption_material_inner(
     }
 
     let encryption_type = match metadata.get("x-amz-server-side-encryption").map(String::as_str) {
-        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(AMZ_ENCRYPTION_KMS) => SSEType::SseKms,
         Some(_) => SSEType::SseS3,
         // MinIO never persists the public scheme header: `crypto.S3.CreateMetadata`
         // writes only the `X-Minio-Internal-*` family and the public header is
@@ -3297,8 +3325,8 @@ async fn apply_managed_decryption_material_inner(
         // metadata: a MinIO-written object has no stored scheme header, which is
         // exactly why the gate above had to infer it. MinIO synthesizes the same
         // header onto its own responses.
-        server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(encryption_type).to_string()),
-        kms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
+        server_side_encryption: managed_sse_public_header(encryption_type).to_string(),
+        kms_key_id: Some(kms_key_id),
         algorithm,
         customer_key_md5: None,
 
@@ -3316,22 +3344,22 @@ async fn apply_managed_decryption_material_inner(
 #[derive(Debug, Clone)]
 pub struct ValidatedSsecParams {
     /// Encryption algorithm (always "AES256" for SSE-C)
-    pub algorithm: SSECustomerAlgorithm,
+    pub algorithm: String,
     /// Decoded encryption key bytes (32 bytes for AES-256)
     pub key_bytes: [u8; 32],
     /// Base64-encoded MD5 of the key
-    pub key_md5: SSECustomerKeyMD5,
+    pub key_md5: String,
 }
 
 /// SSE-C parameters from client request
 #[derive(Debug, Clone)]
 pub struct SsecParams {
     /// Encryption algorithm
-    pub algorithm: SSECustomerAlgorithm,
+    pub algorithm: String,
     /// Base64-encoded encryption key
-    pub key: SSECustomerKey,
+    pub key: String,
     /// Base64-encoded MD5 of the key
-    pub key_md5: SSECustomerKeyMD5,
+    pub key_md5: String,
 }
 
 // ============================================================================
@@ -3380,7 +3408,7 @@ pub(crate) async fn rewrap_object_encryption_metadata(
     }
 
     let encryption_type = match metadata.get("x-amz-server-side-encryption").map(String::as_str) {
-        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(AMZ_ENCRYPTION_KMS) => SSEType::SseKms,
         Some(_) => SSEType::SseS3,
         // MinIO-written objects synthesize the public header on read; their
         // sealed data keys are not RustFS envelopes and fall out below.
@@ -4309,8 +4337,8 @@ fn test_injected_sse_dek_provider() -> Option<Arc<dyn SseDekProvider>> {
 
 /// Check if the server_side_encryption is a managed SSE type (SSE-S3 or SSE-KMS)
 #[inline]
-pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
-    matches!(server_side_encryption.as_str(), "AES256" | "aws:kms")
+pub fn is_managed_sse(server_side_encryption: &str) -> bool {
+    matches!(server_side_encryption, "AES256" | "aws:kms")
 }
 
 /// Strip source encryption metadata before constructing metadata for a copy destination.
@@ -4543,8 +4571,8 @@ pub fn verify_ssec_key_match(provided_md5: &str, stored_md5: Option<&String>, mi
 /// headers are provided and the key matches. Returns 400 InvalidRequest otherwise.
 pub fn validate_ssec_for_read(
     metadata: &HashMap<String, String>,
-    sse_customer_key: Option<&SSECustomerKey>,
-    sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
+    sse_customer_key: Option<&String>,
+    sse_customer_key_md5: Option<&String>,
 ) -> Result<(), ApiError> {
     if !stored_ssec_metadata(metadata) {
         return Ok(());
@@ -4589,7 +4617,7 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 #[allow(unused_imports)]
 pub(crate) mod tests {
     use super::{
-        ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
+        ApiError, DataKey, DecryptionMaterial, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
         EncryptionResolutionError, EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsAction,
         KmsKeyAuthorizer, KmsSseDekProvider, KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
@@ -4651,9 +4679,9 @@ pub(crate) mod tests {
     #[test]
     fn ssec_read_headers_are_sensitive() {
         let headers = super::build_ssec_read_headers(
-            Some(&SSECustomerAlgorithm::from("AES256".to_string())),
-            Some(&SSECustomerKey::from("dHJhbnNwb3J0LXNlY3JldA==".to_string())),
-            Some(&SSECustomerKeyMD5::from("bWQ1LXNlY3JldA==".to_string())),
+            Some(&"AES256".to_string()),
+            Some(&"dHJhbnNwb3J0LXNlY3JldA==".to_string()),
+            Some(&"bWQ1LXNlY3JldA==".to_string()),
         );
 
         assert_eq!(headers.len(), 3);
@@ -4776,7 +4804,7 @@ pub(crate) mod tests {
         EncryptionRequest {
             bucket: "finance",
             key: "ledger.csv",
-            server_side_encryption: Some(ServerSideEncryption::from_static(algorithm)),
+            server_side_encryption: Some(String::from(algorithm)),
             ssekms_key_id: kms_key_id.map(str::to_string),
             ssekms_context: None,
             sse_customer_algorithm: None,
@@ -4801,12 +4829,9 @@ pub(crate) mod tests {
                 ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode_to_string([9u8; 32]))),
             ],
             async {
-                let error = sse_encryption(managed_write(
-                    ServerSideEncryption::AWS_KMS,
-                    Some("arn:aws:kms:us-east-1:123:key/nonexistent"),
-                ))
-                .await
-                .expect_err("SSE-KMS must not be served by the local master key");
+                let error = sse_encryption(managed_write(AMZ_ENCRYPTION_KMS, Some("arn:aws:kms:us-east-1:123:key/nonexistent")))
+                    .await
+                    .expect_err("SSE-KMS must not be served by the local master key");
 
                 assert_eq!(error.code, S3ErrorCode::InvalidRequest);
                 assert!(error.message.contains("SSE-KMS requires"), "message was {}", error.message);
@@ -4831,7 +4856,7 @@ pub(crate) mod tests {
                 ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
             ],
             async {
-                let error = sse_encryption(managed_write(ServerSideEncryption::AWS_KMS, Some("finance-key")))
+                let error = sse_encryption(managed_write(AMZ_ENCRYPTION_KMS, Some("finance-key")))
                     .await
                     .expect_err("SSE-KMS must be refused when no KMS is configured");
 
@@ -4870,7 +4895,7 @@ pub(crate) mod tests {
                     let error = apply_managed_encryption_material(
                         "finance",
                         "ledger.csv",
-                        ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                        String::from(AMZ_ENCRYPTION_KMS),
                         None,
                         None,
                         128,
@@ -4912,18 +4937,18 @@ pub(crate) mod tests {
                 ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode_to_string([9u8; 32]))),
             ],
             async {
-                let material = sse_encryption(managed_write(ServerSideEncryption::AES256, None))
+                let material = sse_encryption(managed_write(AMZ_ENCRYPTION_AES, None))
                     .await
                     .expect("SSE-S3 keeps its local master key fallback")
                     .expect("managed sse-s3 material");
 
                 assert_eq!(material.sse_type, SSEType::SseS3);
-                assert_eq!(material.algorithm, ServerSideEncryption::AES256);
+                assert_eq!(material.algorithm, AMZ_ENCRYPTION_AES);
 
                 // No object may claim aws:kms while its DEK is wrapped locally.
                 let metadata = encryption_material_to_metadata(&material).expect("sse-s3 metadata should serialize");
                 assert!(
-                    !metadata.iter().any(|(_, value)| value == ServerSideEncryption::AWS_KMS),
+                    !metadata.iter().any(|(_, value)| value == AMZ_ENCRYPTION_KMS),
                     "local-master-key material must never be stamped aws:kms: {metadata:?}"
                 );
             },
@@ -4949,8 +4974,8 @@ pub(crate) mod tests {
     use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
     use rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT;
+    use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
     use s3s::S3ErrorCode;
-    use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, ServerSideEncryption};
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
     use temp_env::async_with_vars;
@@ -5270,7 +5295,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_sse_headers_for_write_rejects_algorithm_without_key() {
-        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
+        let algorithm = "AES256".to_string();
         let result = validate_sse_headers_for_write(
             None,
             None,
@@ -5287,8 +5312,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_sse_headers_for_write_rejects_algorithm_and_key_without_md5() {
-        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
-        let key = SSECustomerKey::from("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string());
+        let algorithm = "AES256".to_string();
+        let key = "pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string();
         let result = validate_sse_headers_for_write(
             None,
             None,
@@ -5305,7 +5330,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_sse_headers_for_write_rejects_invalid_sse_algorithm() {
-        let bad_sse = ServerSideEncryption::from_static("aes:kms");
+        let bad_sse = String::from("aes:kms");
         let result = validate_sse_headers_for_write(Some(&bad_sse), None, None, None, None, None, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -5314,10 +5339,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_sse_headers_for_write_rejects_ssec_with_managed_sse() {
-        let algorithm = SSECustomerAlgorithm::from("AES256".to_string());
-        let key = SSECustomerKey::from("pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string());
-        let key_md5 = SSECustomerKeyMD5::from("DWygnHRtgiJ77HCm+1rvHw==".to_string());
-        let server_side_encryption = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let algorithm = "AES256".to_string();
+        let key = "pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=".to_string();
+        let key_md5 = "DWygnHRtgiJ77HCm+1rvHw==".to_string();
+        let server_side_encryption = String::from(AMZ_ENCRYPTION_AES);
         let result = validate_sse_headers_for_write(
             Some(&server_side_encryption),
             None,
@@ -5334,8 +5359,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_is_managed_sse() {
-        assert!(is_managed_sse(&ServerSideEncryption::from_static("AES256")));
-        assert!(is_managed_sse(&ServerSideEncryption::from_static("aws:kms")));
+        assert!(is_managed_sse(&String::from("AES256")));
+        assert!(is_managed_sse(&String::from("aws:kms")));
     }
 
     #[test]
@@ -5497,7 +5522,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_sse_headers_for_write_allows_aws_kms_without_key_id() {
-        let server_side_encryption: ServerSideEncryption = "aws:kms".to_string().into();
+        let server_side_encryption: String = "aws:kms".to_string();
 
         let result = validate_sse_headers_for_write(Some(&server_side_encryption), None, None, None, None, None, true);
 
@@ -5773,9 +5798,9 @@ pub(crate) mod tests {
     fn test_encryption_material_to_metadata_persists_ssec_original_size() {
         let metadata = encryption_material_to_metadata(&EncryptionMaterial {
             sse_type: SSEType::SseC,
-            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+            server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
             kms_key_id: None,
-            algorithm: SSECustomerAlgorithm::from("AES256".to_string()),
+            algorithm: "AES256".to_string(),
             key_bytes: [0u8; 32],
             base_nonce: [0u8; 12],
             encrypted_data_key: None,
@@ -5793,21 +5818,15 @@ pub(crate) mod tests {
     fn material_variant(sse_type: SSEType, key_kind: EncryptionKeyKind) -> EncryptionMaterial {
         let (server_side_encryption, kms_key_id, encrypted_data_key, customer_key_md5, managed_kms_context) = match sse_type {
             SSEType::SseC => (
-                ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                String::from(AMZ_ENCRYPTION_AES),
                 None,
                 None,
                 Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
                 None,
             ),
-            SSEType::SseS3 => (
-                ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                None,
-                Some(vec![0u8; 32]),
-                None,
-                None,
-            ),
+            SSEType::SseS3 => (String::from(AMZ_ENCRYPTION_AES), None, Some(vec![0u8; 32]), None, None),
             SSEType::SseKms => (
-                ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                String::from(AMZ_ENCRYPTION_KMS),
                 Some("kms-key-1".to_string()),
                 Some(vec![0u8; 32]),
                 None,
@@ -5818,7 +5837,7 @@ pub(crate) mod tests {
             sse_type,
             server_side_encryption,
             kms_key_id,
-            algorithm: SSECustomerAlgorithm::from("AES256".to_string()),
+            algorithm: "AES256".to_string(),
             key_bytes: [0u8; 32],
             base_nonce: [0u8; 12],
             encrypted_data_key,
@@ -5828,6 +5847,69 @@ pub(crate) mod tests {
             managed_kms_context,
             managed_sealed_key: None,
         }
+    }
+
+    #[test]
+    fn native_request_debug_withholds_encryption_customer_key() {
+        let mut request = managed_write(AMZ_ENCRYPTION_AES, None);
+        request.sse_customer_key = Some("fixture-key-must-stay-private".to_owned());
+        let diagnostic = format!("{request:?}");
+        assert!(!diagnostic.contains("sse_customer_key"), "customer keys must not be debug fields");
+    }
+
+    #[test]
+    fn native_request_debug_withholds_decryption_customer_key() {
+        let metadata = HashMap::new();
+        let key = "fixture-key-must-stay-private".to_owned();
+        let request = DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&key),
+            sse_customer_key_md5: None,
+            principal: None,
+        };
+        let diagnostic = format!("{request:?}");
+        assert!(!diagnostic.contains("sse_customer_key"), "customer keys must not be debug fields");
+    }
+
+    #[test]
+    fn native_material_debug_withholds_encryption_keys() {
+        let material = material_variant(SSEType::SseC, EncryptionKeyKind::Direct);
+        let diagnostic = format!("{material:?}");
+        assert!(
+            !diagnostic.contains("key_bytes")
+                && !diagnostic.contains("encrypted_data_key")
+                && !diagnostic.contains("managed_sealed_key"),
+            "encryption keys must not be debug fields"
+        );
+    }
+
+    #[test]
+    fn native_material_debug_withholds_decryption_keys() {
+        let material = DecryptionMaterial {
+            sse_type: SSEType::SseC,
+            server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
+            kms_key_id: None,
+            algorithm: "AES256".to_owned(),
+            customer_key_md5: None,
+            key_bytes: [0; 32],
+            base_nonce: [0; 12],
+            key_kind: EncryptionKeyKind::Direct,
+        };
+        let diagnostic = format!("{material:?}");
+        assert!(!diagnostic.contains("key_bytes"), "decryption keys must not be debug fields");
+    }
+
+    #[test]
+    fn native_material_debug_withholds_customer_key() {
+        let material =
+            super::SseTypeV2::SseC("AES256".to_owned(), "fixture-key-must-stay-private".to_owned(), "fixture-md5".to_owned());
+        let diagnostic = format!("{material:?}");
+        assert!(
+            !diagnostic.contains("fixture-key-must-stay-private"),
+            "customer keys must not appear in diagnostics"
+        );
     }
 
     /// Reconciliation contract with the replication boundary (backlog#1783):
@@ -5879,7 +5961,7 @@ pub(crate) mod tests {
         let request = EncryptionRequest {
             bucket,
             key,
-            server_side_encryption: Some("AES256".to_string().into()),
+            server_side_encryption: Some("AES256".to_string()),
             ssekms_key_id: Some("test-key".to_string()),
             ssekms_context: None,
             sse_customer_algorithm: None,
@@ -5927,7 +6009,7 @@ pub(crate) mod tests {
         let request = EncryptionRequest {
             bucket,
             key,
-            server_side_encryption: Some("aws:kms".to_string().into()),
+            server_side_encryption: Some("aws:kms".to_string()),
             ssekms_key_id: Some("test-key".to_string()),
             ssekms_context: None,
             sse_customer_algorithm: Some("AES256".to_string()),
@@ -5943,7 +6025,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_resolve_effective_kms_key_id_ignores_bucket_default_for_explicit_sse_s3() {
-        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let effective_sse = String::from(AMZ_ENCRYPTION_AES);
 
         let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
 
@@ -5952,7 +6034,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_resolve_effective_kms_key_id_uses_bucket_default_for_sse_kms() {
-        let effective_sse = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);
+        let effective_sse = String::from(AMZ_ENCRYPTION_KMS);
 
         let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
 
@@ -6239,9 +6321,9 @@ pub(crate) mod tests {
     async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
         let material = EncryptionMaterial {
             sse_type: SSEType::SseKms,
-            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+            server_side_encryption: String::from(AMZ_ENCRYPTION_KMS),
             kms_key_id: Some("test-key".to_string()),
-            algorithm: SSECustomerAlgorithm::from(ServerSideEncryption::AWS_KMS.to_string()),
+            algorithm: AMZ_ENCRYPTION_KMS.to_string(),
             key_bytes: [7u8; 32],
             base_nonce: [9u8; 12],
             encrypted_data_key: Some(vec![1, 2, 3, 4]),
@@ -6296,7 +6378,7 @@ pub(crate) mod tests {
         let request = EncryptionRequest {
             bucket: "bucket",
             key: "dir/object",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("kms-test".to_string()),
             ssekms_context: Some(client_context.clone()),
             sse_customer_algorithm: None,
@@ -6366,9 +6448,9 @@ pub(crate) mod tests {
         let encoded_key = BASE64_STANDARD.encode_to_string([1u8, 2, 3, 4]);
         let metadata = encryption_material_to_metadata(&EncryptionMaterial {
             sse_type: SSEType::SseKms,
-            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+            server_side_encryption: String::from(AMZ_ENCRYPTION_KMS),
             kms_key_id: Some("test-key".to_string()),
-            algorithm: SSECustomerAlgorithm::from(ServerSideEncryption::AWS_KMS.to_string()),
+            algorithm: AMZ_ENCRYPTION_KMS.to_string(),
             key_bytes: [7u8; 32],
             base_nonce: [9u8; 12],
             encrypted_data_key: Some(vec![1, 2, 3, 4]),
@@ -6415,7 +6497,7 @@ pub(crate) mod tests {
                 let request = EncryptionRequest {
                     bucket: "test-bucket",
                     key: "test-key",
-                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    server_side_encryption: Some(String::from(AMZ_ENCRYPTION_AES)),
                     ssekms_key_id: None,
                     ssekms_context: None,
                     sse_customer_algorithm: None,
@@ -6652,7 +6734,7 @@ pub(crate) mod tests {
                 let request = EncryptionRequest {
                     bucket: "bucket",
                     key: "object",
-                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    server_side_encryption: Some(String::from(AMZ_ENCRYPTION_AES)),
                     ssekms_key_id: None,
                     ssekms_context: None,
                     sse_customer_algorithm: None,
@@ -7413,7 +7495,7 @@ pub(crate) mod tests {
                 let err = sse_encryption(EncryptionRequest {
                     bucket: "test-bucket",
                     key: "test-key",
-                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    server_side_encryption: Some(String::from(AMZ_ENCRYPTION_AES)),
                     ssekms_key_id: None,
                     ssekms_context: None,
                     sse_customer_algorithm: None,
@@ -7450,7 +7532,7 @@ pub(crate) mod tests {
                 let err = sse_encryption(EncryptionRequest {
                     bucket: "test-bucket",
                     key: "test-key",
-                    server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                    server_side_encryption: Some(String::from(AMZ_ENCRYPTION_AES)),
                     ssekms_key_id: None,
                     ssekms_context: None,
                     sse_customer_algorithm: None,
@@ -7557,7 +7639,7 @@ pub(crate) mod tests {
             ],
             async {
                 let metadata = HashMap::from([
-                    ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
+                    ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_KMS.to_string()),
                     (
                         INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
                         BASE64_STANDARD.encode_to_string(encrypted_dek),
@@ -7592,7 +7674,7 @@ pub(crate) mod tests {
             "created_at": "2024-01-01T00:00:00+00:00"
         }"#;
         let metadata = HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_AES.to_string()),
             (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(kms_envelope)),
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([0x14; 12])),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
@@ -7790,7 +7872,7 @@ pub(crate) mod tests {
         EncryptionRequest {
             bucket: "bucket",
             key: "dir/object",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("test-key".to_string()),
             ssekms_context: None,
             sse_customer_algorithm: None,
@@ -7916,7 +7998,7 @@ pub(crate) mod tests {
 
         async_with_vars([("RUSTFS_SSE_S3_MASTER_KEY", None::<&str>), ("__RUSTFS_SSE_SIMPLE_CMK", None)], async {
             let metadata = HashMap::from([
-                ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
+                ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_KMS.to_string()),
                 (
                     INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
                     BASE64_STANDARD.encode_to_string([0x01, 0x02, 0x02, 0x00, 0x78, 0x80, 0x81]),
@@ -8113,7 +8195,7 @@ pub(crate) mod tests {
             "created_at": "2024-01-01T00:00:00+00:00"
         }"#;
         let metadata = HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_AES.to_string()),
             (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(kms_envelope)),
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([0x14; 12])),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "envelope-key".to_string()),
@@ -8151,24 +8233,17 @@ pub(crate) mod tests {
         *super::GLOBAL_SSE_DEK_PROVIDER.write().expect("update SSE DEK provider cache") =
             Some(Arc::new(UnavailableSseDekProvider));
 
-        let error = match apply_managed_encryption_material(
-            "bucket",
-            "object",
-            ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-            None,
-            None,
-            0,
-            None,
-        )
-        .await
-        {
-            Ok(_) => panic!("provider unavailability must fail managed encryption"),
-            Err(error) => error,
-        };
+        let error =
+            match apply_managed_encryption_material("bucket", "object", String::from(AMZ_ENCRYPTION_AES), None, None, 0, None)
+                .await
+            {
+                Ok(_) => panic!("provider unavailability must fail managed encryption"),
+                Err(error) => error,
+            };
         assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
 
         let metadata = HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_AES.to_string()),
             (
                 INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
                 BASE64_STANDARD.encode_to_string(b"local-provider-format"),
@@ -8661,7 +8736,7 @@ pub(crate) mod tests {
         EncryptionRequest {
             bucket: "finance",
             key: "ledger.csv",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("finance-key".to_string()),
             ssekms_context: None,
             sse_customer_algorithm: None,
@@ -8674,7 +8749,7 @@ pub(crate) mod tests {
 
     pub(crate) fn sse_kms_object_metadata() -> HashMap<String, String> {
         HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_KMS.to_string()),
             ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "finance-key".to_string()),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "finance-key".to_string()),
             (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string([7u8; 48])),
@@ -8685,7 +8760,7 @@ pub(crate) mod tests {
 
     fn sse_s3_object_metadata() -> HashMap<String, String> {
         HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_AES.to_string()),
             (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string([7u8; 48])),
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([9u8; 12])),
             (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
@@ -8757,7 +8832,7 @@ pub(crate) mod tests {
         let metadata = sse_s3_object_metadata();
 
         let write = sse_encryption(EncryptionRequest {
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_AES)),
             ssekms_key_id: None,
             ..sse_kms_write(Some(&principal))
         })
@@ -8995,7 +9070,7 @@ pub(crate) mod tests {
         let material = sse_encryption(EncryptionRequest {
             bucket: "finance",
             key: "ledger.csv",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("audit-key".to_string()),
             ssekms_context: Some(HashMap::from([("tenant".to_string(), "acct-4711".to_string())])),
             sse_customer_algorithm: None,
@@ -9077,7 +9152,7 @@ pub(crate) mod tests {
         EncryptionRequest {
             bucket,
             key,
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("binding-key".to_string()),
             ssekms_context: Some(context),
             sse_customer_algorithm: None,
@@ -9109,7 +9184,7 @@ pub(crate) mod tests {
         let err = sse_prepare_encryption(PrepareEncryptionRequest {
             bucket: "finance",
             key: "ledger.csv",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("binding-key".to_string()),
             ssekms_context: Some(context),
             sse_customer_algorithm: None,
@@ -9176,7 +9251,7 @@ pub(crate) mod tests {
         let material = apply_managed_encryption_material_inner(
             "finance",
             "ledger.csv",
-            ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+            String::from(AMZ_ENCRYPTION_KMS),
             Some("binding-key".to_string()),
             Some(context),
             64,
@@ -9213,9 +9288,9 @@ pub(crate) mod tests {
             server_side_encryption: None,
             ssekms_key_id: None,
             ssekms_context: None,
-            sse_customer_algorithm: Some(SSECustomerAlgorithm::from("AES256".to_string())),
-            sse_customer_key: Some(SSECustomerKey::from(BASE64_STANDARD.encode_to_string(key))),
-            sse_customer_key_md5: Some(SSECustomerKeyMD5::from(md5_base64(key))),
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(BASE64_STANDARD.encode_to_string(key)),
+            sse_customer_key_md5: Some(md5_base64(key)),
             content_size: 128,
             principal: Some(&principal),
         })
@@ -9254,7 +9329,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn classification_withholds_the_wrapping_key_for_sse_s3_reads() {
         let metadata = HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            ("x-amz-server-side-encryption".to_string(), AMZ_ENCRYPTION_AES.to_string()),
             (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "service-default".to_string()),
             (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string([1u8; 16])),
             (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([2u8; 12])),
@@ -9270,7 +9345,7 @@ pub(crate) mod tests {
         .await
         .expect("sse-s3 classification should succeed")
         .expect("managed metadata should classify");
-        assert_eq!(headers.server_side_encryption.as_str(), ServerSideEncryption::AES256);
+        assert_eq!(headers.server_side_encryption.as_str(), AMZ_ENCRYPTION_AES);
         assert_eq!(headers.ssekms_key_id, None);
     }
 
@@ -9303,7 +9378,7 @@ pub(crate) mod tests {
         let material = sse_encryption(EncryptionRequest {
             bucket: "finance",
             key: "ledger.csv",
-            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            server_side_encryption: Some(String::from(AMZ_ENCRYPTION_KMS)),
             ssekms_key_id: Some("classify-key".to_string()),
             ssekms_context: None,
             sse_customer_algorithm: None,
@@ -9477,8 +9552,8 @@ pub(crate) mod tests {
             ),
             (super::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5.to_string(), key_md5.to_string()),
         ]);
-        let algorithm = SSECustomerAlgorithm::from(super::AMZ_ENCRYPTION_AES);
-        let key_md5 = SSECustomerKeyMD5::from(key_md5);
+        let algorithm = String::from(super::AMZ_ENCRYPTION_AES);
+        let key_md5 = String::from(key_md5);
 
         let headers = project_sse_read_response_headers(&metadata, Some(&algorithm), Some(&key_md5))
             .expect("validated SSE-C values should project response headers");
@@ -9586,14 +9661,14 @@ pub(crate) mod tests {
             bucket: "finance",
             key: "ledger.csv",
             metadata: &metadata,
-            sse_customer_key: Some(&SSECustomerKey::from(key_b64.clone())),
-            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(key_md5.clone())),
+            sse_customer_key: Some(&key_b64.clone()),
+            sse_customer_key_md5: Some(&key_md5.clone()),
             principal: None,
         })
         .await
         .expect("a matching customer key should classify")
         .expect("SSE-C metadata must classify as encrypted");
-        assert_eq!(headers.server_side_encryption.as_str(), ServerSideEncryption::AES256);
+        assert_eq!(headers.server_side_encryption.as_str(), AMZ_ENCRYPTION_AES);
         assert_eq!(headers.sse_customer_algorithm.as_deref(), Some("AES256"));
         assert_eq!(headers.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
         assert_eq!(headers.ssekms_key_id, None);
@@ -9617,8 +9692,8 @@ pub(crate) mod tests {
             bucket: "finance",
             key: "ledger.csv",
             metadata: &metadata,
-            sse_customer_key: Some(&SSECustomerKey::from(BASE64_STANDARD.encode_to_string(other_key))),
-            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(md5_base64(other_key))),
+            sse_customer_key: Some(&BASE64_STANDARD.encode_to_string(other_key)),
+            sse_customer_key_md5: Some(&md5_base64(other_key)),
             principal: None,
         })
         .await
@@ -9627,8 +9702,8 @@ pub(crate) mod tests {
             bucket: "finance",
             key: "ledger.csv",
             metadata: &metadata,
-            sse_customer_key: Some(&SSECustomerKey::from(BASE64_STANDARD.encode_to_string(other_key))),
-            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(md5_base64(other_key))),
+            sse_customer_key: Some(&BASE64_STANDARD.encode_to_string(other_key)),
+            sse_customer_key_md5: Some(&md5_base64(other_key)),
             principal: None,
         })
         .await

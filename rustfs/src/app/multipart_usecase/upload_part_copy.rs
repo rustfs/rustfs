@@ -322,14 +322,7 @@ impl DefaultMultipartUsecase {
             HashReader::from_stream(src_stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
 
-        let server_side_encryption = mp_info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| {
-                ServerSideEncryption::from_str(s)
-                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
-            })
-            .transpose()?;
+        let server_side_encryption = mp_info.user_defined.get("x-amz-server-side-encryption").cloned();
         let has_ssec = mp_info
             .user_defined
             .contains_key("x-amz-server-side-encryption-customer-algorithm");
@@ -438,7 +431,7 @@ impl DefaultMultipartUsecase {
         let output = UploadPartCopyOutput {
             copy_part_result: Some(copy_part_result),
             copy_source_version_id: resolved_src_version_id,
-            server_side_encryption: requested_sse,
+            server_side_encryption: requested_sse.map(ServerSideEncryption::from),
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
