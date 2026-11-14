@@ -17,8 +17,8 @@
 use super::*;
 use crate::app::storage_api::object_usecase::object_utils::to_s3s_xml_etag;
 use crate::app::storage_api::s3::dto::{
-    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag, MetadataDirective, StorageClass, TaggingDirective,
-    Timestamp,
+    ChecksumType, CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, ETag, MetadataDirective, StorageClass,
+    TaggingDirective, Timestamp,
 };
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use futures::FutureExt;
@@ -912,7 +912,7 @@ impl DefaultObjectUsecase {
             checksum_xxhash3,
             checksum_xxhash64,
             checksum_xxhash128,
-            checksum_type: response_checksums.checksum_type,
+            checksum_type: response_checksums.checksum_type.map(ChecksumType::from),
         };
 
         let output = CopyObjectOutput {

@@ -27,6 +27,9 @@ mod listing_multipart;
 pub(crate) use listing_multipart::list_objects_v2_through_legacy_edge;
 mod object_meta;
 mod object_misc;
+
+#[cfg(test)]
+pub(crate) use object_misc::complete_multipart_upload_input;
 mod object_read;
 mod object_write;
 

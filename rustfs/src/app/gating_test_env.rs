@@ -106,6 +106,8 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    // Health probes need the topology that storage startup publishes before disk initialization.
+    crate::storage::storage_api::bootstrap_instance_ctx().set_endpoints(endpoint_pools.clone());
     super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();

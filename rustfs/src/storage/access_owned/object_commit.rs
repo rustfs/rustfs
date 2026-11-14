@@ -27,6 +27,29 @@ use super::super::{
 };
 use crate::error::ApiError;
 
+/// Authorizes completion and records the bucket generation before publication.
+pub(crate) async fn authorize_complete_multipart_upload<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+    specific_etag: bool,
+) -> S3Result<()> {
+    use super::super::{
+        authorize_replication_only_put_headers, authorize_write_etag_condition, complete_multipart_upload_authorize_action,
+        load_bucket_generation,
+    };
+    let generation = load_bucket_generation(server, req, bucket).await;
+    let info = req.req_info_mut().ok_or_else(missing_req_info_error)?;
+    info.bucket = Some(bucket.to_owned());
+    info.object = Some(key.to_owned());
+    authorize_request(req, complete_multipart_upload_authorize_action()).await?;
+    authorize_write_etag_condition(req, specific_etag).await?;
+    authorize_replication_only_put_headers(req).await?;
+    req.install_bucket_generation(generation?);
+    Ok(())
+}
+
 /// The object a copy names as its source, as decoded from `x-amz-copy-source`.
 pub(crate) struct CopySourceObject<'a> {
     pub(crate) bucket: &'a str,

@@ -208,6 +208,9 @@ mod delete;
 mod extract;
 mod get;
 mod head;
+#[cfg(feature = "gateway-stack")]
+pub(crate) use head::ResponseEtag;
+pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod on_demand_migration_put;
 mod put;

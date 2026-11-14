@@ -1273,12 +1273,23 @@ impl PeerRestClient {
 
 impl PeerRestClient {
     pub async fn local_storage_info(&self) -> Result<rustfs_madmin::StorageInfo> {
-        self.finalize_result(self.local_storage_info_inner().await).await
+        self.local_storage_info_with_metrics(true).await
     }
 
-    async fn local_storage_info_inner(&self) -> Result<rustfs_madmin::StorageInfo> {
+    /// Collect fresh local inventory from this peer, optionally including disk metrics.
+    ///
+    /// # Errors
+    /// Returns the existing transport, control-plane or inventory decoding error.
+    pub async fn local_storage_info_with_metrics(&self, include_metrics: bool) -> Result<rustfs_madmin::StorageInfo> {
+        self.finalize_result(self.local_storage_info_inner(include_metrics).await)
+            .await
+    }
+
+    async fn local_storage_info_inner(&self, include_metrics: bool) -> Result<rustfs_madmin::StorageInfo> {
         let mut client = self.get_client().await?;
-        let request = Request::new(LocalStorageInfoRequest { metrics: true });
+        let request = Request::new(LocalStorageInfoRequest {
+            metrics: include_metrics,
+        });
 
         let response = client.local_storage_info(request).await?.into_inner();
         if !response.success {

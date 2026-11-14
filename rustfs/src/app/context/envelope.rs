@@ -178,13 +178,6 @@ pub(crate) struct RequestHead {
 /// There is deliberately no generic extension lookup: a payload the app layer
 /// needs gets a named field here, so an edge that builds an envelope can see
 /// everything it has to supply.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fields read only by the crate-private accessors stay unread until call sites move in T1.8 (rustfs/backlog#2749)"
-    )
-)]
 pub struct RequestEnvelope {
     method: Method,
     uri: Uri,
@@ -286,10 +279,6 @@ impl RequestEnvelope {
     /// budget. The table publication guards are one shared set, so a lock the copy's
     /// authorization retains stays held for the original's write too. Anything else installed on
     /// the copy does not show on the original.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the PutObject archive member loop of batch D is its first caller")
-    )]
     pub(crate) fn fork_for_authorization(&self) -> Self {
         Self {
             method: self.method.clone(),

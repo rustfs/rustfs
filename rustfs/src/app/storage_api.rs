@@ -1607,7 +1607,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        StorageError, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
@@ -1751,6 +1751,18 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
+    pub(crate) async fn head_cors_headers(
+        bucket: &str,
+        method: &http::Method,
+        headers: &http::HeaderMap,
+    ) -> Option<http::HeaderMap> {
+        crate::storage_api::server::layer::apply_cors_headers(
+            bucket,
+            method,
+            &crate::server::cors::CorsRequest::from_headers(headers),
+        )
+        .await
+    }
     pub(crate) use super::storage_contracts::object::DeleteObjectCondition;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 

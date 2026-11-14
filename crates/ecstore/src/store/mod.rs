@@ -1974,7 +1974,12 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 
     #[instrument(skip(self))]
     async fn local_storage_info(&self) -> Self::StorageInfo {
-        self.handle_local_storage_info().await
+        self.handle_local_storage_info(true).await
+    }
+
+    #[instrument(skip(self))]
+    async fn local_storage_info_with_metrics(&self, include_metrics: bool) -> Self::StorageInfo {
+        self.handle_local_storage_info(include_metrics).await
     }
 
     #[instrument(skip(self))]

@@ -20,6 +20,7 @@
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
 pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
+pub(crate) use crate::app::object_usecase::{HeadObjectFields, HeadObjectOutputFacts};
 use crate::app::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 
 pub(crate) mod bucket;

@@ -4165,7 +4165,7 @@ impl DefaultObjectUsecase {
             checksum_sha1: checksums.sha1,
             checksum_sha256: checksums.sha256,
             checksum_crc64nvme: checksums.crc64nvme,
-            checksum_type: checksums.checksum_type,
+            checksum_type: checksums.checksum_type.map(ChecksumType::from),
             version_id: output_version_id,
             restore,
             expiration,
@@ -4855,7 +4855,7 @@ impl DefaultObjectUsecase {
                 checksum_sha1,
                 checksum_sha256,
                 checksum_crc64nvme,
-                checksum_type,
+                checksum_type: checksum_type.map(ChecksumType::from),
                 ..Default::default()
             })
         } else {
@@ -6362,8 +6362,7 @@ mod tests {
                 http::header::IF_NONE_MATCH,
                 HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header"),
             );
-            let error = usecase
-                .execute_head_object(req)
+            let error = crate::app::test_seams::head_object(&usecase, req)
                 .await
                 .expect_err("conditional HEAD returns 304");
             assert_eq!(error.code(), &S3ErrorCode::NotModified);

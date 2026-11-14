@@ -3684,6 +3684,25 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
     .map_err(channel_acquisition_timeout)?
 }
 
+/// Prewarms every cached channel used by a peer and channel class.
+///
+/// Control prewarm performs one dial. When isolation is enabled, bulk prewarm
+/// fills the configured per-peer pool so the first large RPC does not pay a
+/// connection setup cost. With isolation disabled, bulk resolves to the
+/// existing control cache and keeps the legacy connection count.
+pub async fn prewarm_channel_class(addr: &str, class: ChannelClass) -> Result<(), Box<dyn Error>> {
+    let count = if class == ChannelClass::Bulk && channel_isolation_enabled() {
+        bulk_channel_pool_size()
+    } else {
+        1
+    };
+
+    for _ in 0..count {
+        get_channel_for_class(addr, class).await?;
+    }
+    Ok(())
+}
+
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
 /// This function is designed to detect dead peers quickly using env-configurable
@@ -4953,6 +4972,26 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_channel_class_reuses_legacy_cache_when_isolation_is_disabled() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://prewarm-legacy-cache.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("false"))], async {
+            prewarm_channel_class(addr, ChannelClass::Control)
+                .await
+                .expect("control prewarm cache hit");
+            prewarm_channel_class(addr, ChannelClass::Bulk)
+                .await
+                .expect("bulk prewarm reuses legacy cache");
+            assert!(rustfs_common::has_cached_connection(addr).await);
+        })
+        .await;
+
+        evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
     }
 
     #[tokio::test]

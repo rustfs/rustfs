@@ -6679,10 +6679,10 @@ impl SetDisks {
     pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
-        get_storage_info(&disks, &self.set_endpoints).await
+        get_storage_info(&disks, &self.set_endpoints, true).await
     }
 
-    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+    pub(crate) async fn local_storage_info_snapshot(&self, include_metrics: bool) -> rustfs_madmin::StorageInfo {
         let disks = self.get_disks_internal().await;
 
         let mut local_disks: Vec<Option<DiskStore>> = Vec::new();
@@ -6695,7 +6695,7 @@ impl SetDisks {
             }
         }
 
-        get_storage_info(&local_disks, &local_endpoints).await
+        get_storage_info(&local_disks, &local_endpoints, include_metrics).await
     }
 
     pub(crate) async fn disk_inventory(&self) -> Vec<Option<DiskStore>> {
@@ -7779,11 +7779,17 @@ fn heal_metadata_identity_matches(meta: &FileInfo, latest_meta: &FileInfo) -> bo
 /// drive `disk_info` timeout, and the admin peer probe budget only covers one
 /// such timeout; a sequential walk over several stalled drives after a power
 /// cut would exceed it and make healthy peers render as unknown (#6488).
-async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<rustfs_madmin::Disk> {
-    join_all(disks.iter().zip(eps).map(|(disk, ep)| disk_admin_info(disk.as_ref(), ep))).await
+async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint], include_metrics: bool) -> Vec<rustfs_madmin::Disk> {
+    join_all(
+        disks
+            .iter()
+            .zip(eps)
+            .map(|(disk, ep)| disk_admin_info(disk.as_ref(), ep, include_metrics)),
+    )
+    .await
 }
 
-async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint) -> rustfs_madmin::Disk {
+async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint, include_metrics: bool) -> rustfs_madmin::Disk {
     let Some(disk) = disk else {
         return rustfs_madmin::Disk {
             endpoint: ep.to_string(),
@@ -7807,14 +7813,14 @@ async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint) -> rustfs_madm
     let cached_disk_id = disk.cached_disk_id().await;
     if !(runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect) {
         let mut disk_info = build_runtime_snapshot_disk(ep, runtime_state, offline_duration_seconds, capacity_snapshot);
-        disk_info.metrics = disk.metrics_snapshot();
+        disk_info.metrics = include_metrics.then(|| disk.metrics_snapshot()).flatten();
         disk_info.uuid = cached_disk_id.map_or_else(String::new, |id| id.to_string());
         return disk_info;
     }
 
     match disk
         .disk_info(&DiskInfoOptions {
-            metrics: true,
+            metrics: include_metrics,
             ..Default::default()
         })
         .await
@@ -7849,7 +7855,7 @@ async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint) -> rustfs_madm
                 utilization: utilization_percent(res.total, res.used),
                 used_inodes: res.used_inodes,
                 free_inodes: res.free_inodes,
-                metrics: Some(res.metrics),
+                metrics: include_metrics.then_some(res.metrics),
                 ..Default::default()
             }
         }
@@ -7864,7 +7870,7 @@ async fn disk_admin_info(disk: Option<&DiskStore>, ep: &Endpoint) -> rustfs_madm
                 disk_index: ep.disk_idx,
                 runtime_state: Some(runtime_state.as_str().to_string()),
                 offline_duration_seconds,
-                metrics: disk.metrics_snapshot(),
+                metrics: include_metrics.then(|| disk.metrics_snapshot()).flatten(),
                 uuid: cached_disk_id.map_or_else(String::new, |id| id.to_string()),
                 ..Default::default()
             };
@@ -7935,7 +7941,7 @@ fn capacity_snapshot_age_seconds(probe_unix_secs: u64) -> u64 {
         .unwrap_or(probe_unix_secs);
     now_unix_secs.saturating_sub(probe_unix_secs)
 }
-async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
+async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint], include_metrics: bool) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;
     // disks.sort_by(|a, b| a.total_space.cmp(&b.total_space));
     //
@@ -7946,7 +7952,7 @@ async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rust
     //         ..Default::default()
     //     },
     // }
-    let mut disks = get_disks_info(disks, eps).await;
+    let mut disks = get_disks_info(disks, eps, include_metrics).await;
     disks.sort_by_key(|a| a.total_space);
 
     // Provide minimal backend shape for callers. Do NOT guess parity here since it belongs to higher-level config.
@@ -13095,7 +13101,7 @@ mod tests {
             .expect("disk 2 should exist")
             .force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
 
-        let info = get_disks_info(&disks, &endpoints).await;
+        let info = get_disks_info(&disks, &endpoints, true).await;
         assert_eq!(info.len(), 3);
 
         assert_eq!(info[0].state, "ok");
@@ -13141,6 +13147,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_storage_info_without_metrics_preserves_fresh_disk_observations() {
+        let format = FormatV3::new(1, 4);
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_idx in 0..4 {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        let failed_disk = disks[3].as_ref().expect("failed-probe disk");
+        failed_disk
+            .set_disk_id_state(Some(Uuid::new_v4()))
+            .await
+            .expect("cache a stale disk identity");
+        let mut missing = endpoints[3].clone();
+        missing.set_disk_index(4);
+        endpoints.push(missing);
+        disks.push(None);
+
+        let mut observations = Vec::new();
+        for include_metrics in [true, false] {
+            for (index, state) in [
+                RuntimeDriveHealthState::Online,
+                RuntimeDriveHealthState::Returning,
+                RuntimeDriveHealthState::Offline,
+                RuntimeDriveHealthState::Suspect,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let disk = disks[index].as_ref().expect("configured test disk");
+                disk.force_runtime_state_for_test(state);
+                if state == RuntimeDriveHealthState::Offline {
+                    disk.record_capacity_probe(100, 40, 60);
+                }
+            }
+            let info = get_disks_info(&disks, &endpoints, include_metrics).await;
+            assert_eq!(info.len(), 5);
+            assert!(info[..4].iter().all(|disk| disk.metrics.is_some() == include_metrics));
+            assert!(info[4].metrics.is_none(), "a missing slot has no metric owner");
+            assert_eq!(info[0].state, "ok", "online disk must retain its live probe");
+            assert!(info[0].total_space > 0, "online disk must retain capacity information");
+            assert_eq!(info[0].capacity_observation_source.as_deref(), Some("live_probe"));
+            assert_eq!(info[1].state, "ok", "returning disk must retain its live probe");
+            assert_eq!(info[1].runtime_state.as_deref(), Some("returning"));
+            assert_eq!(info[2].state, "offline");
+            assert_eq!(info[2].capacity_observation_source.as_deref(), Some("snapshot"));
+            assert_eq!((info[2].total_space, info[2].used_space, info[2].available_space), (100, 40, 60));
+            assert_ne!(info[3].state, "ok", "a stale disk identity must still fail its fresh probe");
+            assert_eq!(info[3].runtime_state.as_deref(), Some("suspect"));
+            observations.push(info);
+        }
+        for (with_metrics, without_metrics) in observations[0].iter().zip(&observations[1]) {
+            assert_eq!(with_metrics.endpoint, without_metrics.endpoint);
+            assert_eq!(with_metrics.drive_path, without_metrics.drive_path);
+            assert_eq!(with_metrics.uuid, without_metrics.uuid);
+            assert_eq!(with_metrics.state, without_metrics.state);
+            assert_eq!(with_metrics.runtime_state, without_metrics.runtime_state);
+            assert_eq!(with_metrics.pool_index, without_metrics.pool_index);
+            assert_eq!(with_metrics.set_index, without_metrics.set_index);
+            assert_eq!(with_metrics.disk_index, without_metrics.disk_index);
+            assert_eq!(with_metrics.total_space, without_metrics.total_space);
+        }
+    }
+
+    #[tokio::test]
     async fn test_get_disks_info_probes_drives_concurrently() {
         use crate::disk::disk_store::DISK_INFO_PROBE_DELAY_FOR_TEST;
 
@@ -13160,7 +13234,7 @@ mod tests {
         let probe_delay = std::time::Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let info = DISK_INFO_PROBE_DELAY_FOR_TEST
-            .scope(probe_delay, get_disks_info(&disks, &endpoints))
+            .scope(probe_delay, get_disks_info(&disks, &endpoints, true))
             .await;
         let elapsed = started.elapsed();
 
@@ -13186,7 +13260,7 @@ mod tests {
             .expect("remote disk id should be cached");
         disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
 
-        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+        let info = get_disks_info(&[Some(disk)], &[endpoint], true).await;
 
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].state, "offline");
@@ -13204,7 +13278,7 @@ mod tests {
             .expect("disk id should be cached before the failed probe");
         disk.force_runtime_state_for_test(RuntimeDriveHealthState::Suspect);
 
-        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+        let info = get_disks_info(&[Some(disk)], &[endpoint], true).await;
 
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].runtime_state.as_deref(), Some("suspect"));
@@ -13223,7 +13297,7 @@ mod tests {
         disk.record_capacity_probe(100, 40, 60);
         disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
 
-        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+        let info = get_disks_info(&[Some(disk)], &[endpoint], true).await;
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].state, "offline");
         assert_eq!(info[0].runtime_state.as_deref(), Some("offline"));

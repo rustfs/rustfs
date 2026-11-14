@@ -422,9 +422,7 @@ async fn website_head_redirect(
     req_info.cred = None;
     req_info.is_owner = false;
     S3Access::head_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), &mut request).await?;
-    let response = DefaultObjectUsecase::with_context(server_ctx.installed_app_context())
-        .execute_head_object(request)
-        .await?;
+    let response = s3s::S3::head_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), request).await?;
     Ok(response.output.website_redirect_location)
 }
 

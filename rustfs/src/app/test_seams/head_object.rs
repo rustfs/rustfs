@@ -14,15 +14,24 @@
 
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::app::storage_api::s3::{HeadObjectInput, HeadObjectOutput, S3Request, S3Response, S3Result};
-use std::future::Future;
 
 /// Calls `DefaultObjectUsecase::execute_head_object` with today's arguments.
 ///
 /// Owned by the HeadObject batch (C). Tests outside that batch's files call this seam instead of the use-case method;
 /// when batch C changes the use-case signature it changes only this body.
-pub(crate) fn head_object(
+pub(crate) async fn head_object(
     usecase: &DefaultObjectUsecase,
     req: S3Request<HeadObjectInput>,
-) -> impl Future<Output = S3Result<S3Response<HeadObjectOutput>>> + '_ {
-    usecase.execute_head_object(req)
+) -> S3Result<S3Response<HeadObjectOutput>> {
+    use crate::app::object_usecase::HeadObjectFields;
+    use crate::app::{Answered, RequestEnvelope};
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+    let envelope = RequestEnvelope::from_s3s(&req);
+    let Answered { output, status, headers } = usecase
+        .execute_head_object_fields(envelope, HeadObjectFields::from_s3s(req.input))
+        .await?;
+    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
+    response.status = status;
+    response.headers = headers;
+    Ok(response)
 }

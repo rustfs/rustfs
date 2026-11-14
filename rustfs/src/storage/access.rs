@@ -3348,17 +3348,10 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn complete_multipart_upload(&self, req: &mut S3Request<CompleteMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, complete_multipart_upload_authorize_action()).await?;
+        let key = req.input.key.clone();
         let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
-        authorize_write_etag_condition(req, specific_etag).await?;
-        authorize_replication_only_put_headers(req).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        access_owned::object_commit::authorize_complete_multipart_upload(req, self.server_ctx(), &bucket, &key, specific_etag)
+            .await
     }
 
     /// Checks whether the CopyObject request has accesses to the resources.
@@ -3968,23 +3961,15 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn head_object(&self, req: &mut S3Request<HeadObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
-        // Replication permission additionally unlocks the SSE-C convergence
-        // check; it does not replace permission to read this version's metadata.
-        if get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true") {
-            authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
-            req_info_mut(req)?.replication_request_authorized = true;
-        }
-
-        req.install_odm_read_generation(source_generation);
-        Ok(())
+        let input = req.input.clone();
+        access_owned::object_read::authorize_head_object(
+            self.server_ctx(),
+            req,
+            &input.bucket,
+            &input.key,
+            input.version_id.as_deref(),
+        )
+        .await
     }
 
     /// Checks whether the ListBucketAnalyticsConfigurations request has accesses to the resources.
