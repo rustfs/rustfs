@@ -260,6 +260,7 @@ pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION: &str = "put_objec
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP: &str = "put_object_quota_begin_object_store_lookup";
 pub const PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD: &str = "put_object_quota_begin_context_build";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER: &str = "put_object_commit_submit_to_closure_enter";
+pub const PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START: &str = "app_put_commit_owner_submit_to_start";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT: &str = "put_object_commit_closure_enter_to_first_await";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL: &str = "put_object_commit_closure_total";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME: &str = "put_object_commit_before_rename";
@@ -359,6 +360,11 @@ pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL: &str = "set_disk_rename_disk_wait_local";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_disk_wait_remote";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE: &str = "set_disk_rename_remote_client_prepare";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE: &str = "set_disk_rename_remote_client_json_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE: &str = "set_disk_rename_remote_client_msgpack_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT: &str = "set_disk_rename_remote_client_get_client";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST: &str =
+    "set_disk_rename_remote_client_canonical_body_digest";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC: &str = "set_disk_rename_remote_client_rpc";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT: &str = "set_disk_rename_remote_client_rpc_await";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_POLL_PENDING_COUNT: &str =
@@ -4027,6 +4033,7 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_SNAPSHOT_ADMISSION,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_OBJECT_STORE_LOOKUP,
             PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CONTEXT_BUILD,
+            PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START,
             PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
             PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
@@ -4106,6 +4113,10 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT,
+            PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT,
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_RPC_AWAIT_FIRST_PENDING_TO_READY,
@@ -4164,6 +4175,7 @@ mod tests {
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY
                 || stage.starts_with("put_object_commit_ready_")
                 || stage.starts_with("put_object_quota_begin_")
+                || *stage == PUT_STAGE_APP_PUT_COMMIT_OWNER_SUBMIT_TO_START
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT
                 || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL
