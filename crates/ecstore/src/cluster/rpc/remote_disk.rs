@@ -77,8 +77,8 @@ use rustfs_protos::proto_gen::node_service::{
     RecoverMultipartSourceRequest as RecoverMultipartSourceRpcRequest,
     RecoverMultipartSourceResponse as RecoverMultipartSourceRpcResponse, RenameDataRequest, RenameFileRequest,
     SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteAllResponse,
+    WriteFormatControlRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -271,6 +271,35 @@ fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result
         return Err(Error::other("remote snapshot lease protocol is incompatible"));
     }
     SnapshotLeaseToken::from_slice(&response.token)
+}
+
+fn format_control_write_response(response: WriteAllResponse) -> Result<()> {
+    match (response.success, response.error) {
+        (true, None) => Ok(()),
+        (false, Some(error)) if DiskError::from_u32(error.code).is_some() => Err(error.into()),
+        _ => Err(DiskError::FileCorrupt),
+    }
+}
+
+// One dispatched format-control attempt ends at its validated durable reply.
+// Keeping response validation in the measured future classifies remote and
+// malformed replies as failures and accounts for cancellation through Drop.
+async fn complete_format_control_write(
+    data_len: usize,
+    future: impl std::future::Future<Output = std::result::Result<tonic::Response<WriteAllResponse>, tonic::Status>>,
+) -> Result<()> {
+    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
+    measure_client_rpc(INTERNODE_OPERATION_GRPC_WRITE_ALL, async {
+        let response = match future.await {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == Code::Unimplemented => return Err(DiskError::MethodNotAllowed),
+            Err(status) => return Err(status.into()),
+        };
+        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
+        format_control_write_response(response)
+    })
+    .await
+    .inspect_err(|_| crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error())
 }
 
 fn conditional_file_update_from_wire(outcome: i32) -> Result<ConditionalFileUpdate> {
@@ -4952,6 +4981,30 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        crate::disk::validate_format_control_path(path)?;
+        self.execute_with_timeout(
+            || async {
+                let data_len = data.len();
+                let disk = self.disk_ref().await;
+                let mut client = self.get_client().await.inspect_err(|_| {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
+                })?;
+                let mut request = Request::new(WriteFormatControlRequest {
+                    disk,
+                    path: path.to_owned(),
+                    data,
+                });
+                let canonical = rustfs_protos::canonical_write_format_control_request_body(request.get_ref())
+                    .map_err(|_| DiskError::InvalidPath)?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                complete_format_control_write(data_len, client.write_format_control(request)).await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     async fn compare_and_update_file(
         &self,
         volume: &str,
@@ -5093,6 +5146,132 @@ impl DiskAPI for RemoteDisk {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn format_control_attempt_metrics_count_each_outcome_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::future::{Future, pending};
+        use std::task::{Context, Poll, Waker};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let enabled = rustfs_io_metrics::metrics_enabled();
+        rustfs_io_metrics::set_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("metrics runtime");
+            runtime.block_on(async {
+                super::complete_format_control_write(7, async {
+                    Ok(tonic::Response::new(super::WriteAllResponse {
+                        success: true,
+                        error: None,
+                    }))
+                })
+                .await
+                .expect("durable reply succeeds");
+                let error = super::complete_format_control_write(9, async {
+                    Ok(tonic::Response::new(super::WriteAllResponse {
+                        success: false,
+                        error: Some(super::DiskError::FileNotFound.into()),
+                    }))
+                })
+                .await
+                .expect_err("typed remote failure is measured as an error");
+                assert!(matches!(error, super::DiskError::FileNotFound));
+                let error = super::complete_format_control_write(11, async { Err(tonic::Status::unimplemented("old peer")) })
+                    .await
+                    .expect_err("unsupported transport fails closed");
+                assert!(matches!(error, super::DiskError::MethodNotAllowed));
+                let mut cancelled = Box::pin(super::complete_format_control_write(13, pending()));
+                assert!(matches!(cancelled.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+                drop(cancelled);
+            });
+        });
+        rustfs_io_metrics::set_metrics_enabled(enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let value = |name: &str| {
+            &entries
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "grpc_write_all")
+                })
+                .expect("format-control metric")
+                .3
+        };
+        for (name, expected) in [
+            ("rustfs_system_network_internode_operation_requests_outgoing_total", 4),
+            ("rustfs_system_network_internode_operation_sent_bytes_total", 16),
+            ("rustfs_system_network_internode_operation_errors_total", 2),
+        ] {
+            assert!(matches!(value(name), DebugValue::Counter(count) if *count == expected), "{name}");
+        }
+        assert!(
+            matches!(value("rustfs_system_network_internode_operation_duration_ms"), DebugValue::Histogram(samples) if samples.len() == 4)
+        );
+        let mut outcomes = std::collections::HashMap::new();
+        for (key, _, _, sample) in &entries {
+            if key.key().name() == "rustfs_system_network_internode_rpc_completions_total" {
+                let outcome = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "outcome")
+                    .expect("outcome label");
+                let DebugValue::Counter(count) = sample else {
+                    panic!("completion counter");
+                };
+                outcomes.insert(outcome.value(), *count);
+            }
+            if key.key().name() == "rustfs_system_network_internode_rpc_active" {
+                assert!(matches!(sample, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+            }
+        }
+        assert_eq!(
+            outcomes,
+            std::collections::HashMap::from([("success", 1), ("error", 2), ("cancelled", 1)])
+        );
+    }
+
+    #[test]
+    fn format_control_requires_explicit_durable_success_response() {
+        use super::{DiskError, WriteAllResponse, format_control_write_response};
+        format_control_write_response(WriteAllResponse {
+            success: true,
+            error: None,
+        })
+        .expect("explicit durable success");
+        for response in [
+            WriteAllResponse {
+                success: false,
+                error: None,
+            },
+            WriteAllResponse {
+                success: true,
+                error: Some(DiskError::FileNotFound.into()),
+            },
+            WriteAllResponse {
+                success: false,
+                error: Some(rustfs_protos::proto_gen::node_service::Error {
+                    code: u32::MAX,
+                    error_info: "unknown peer error".into(),
+                }),
+            },
+        ] {
+            assert!(matches!(format_control_write_response(response), Err(DiskError::FileCorrupt)));
+        }
+        assert!(matches!(
+            format_control_write_response(WriteAllResponse {
+                success: false,
+                error: Some(DiskError::FileNotFound.into())
+            }),
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
     use super::*;
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use crate::erasure::coding::{BitrotReader, Erasure, decode::ParallelReader};

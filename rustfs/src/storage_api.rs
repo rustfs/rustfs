@@ -238,7 +238,8 @@ pub(crate) mod server {
             /// The per-batch authorization shapes, one module per migration batch.
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
-                AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+                AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
+                resolve_req_info,
             };
         }
 

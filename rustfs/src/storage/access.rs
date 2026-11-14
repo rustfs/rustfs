@@ -130,8 +130,11 @@ fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
         || rustfs_utils::http::has_ssec_transport_headers(headers)
 }
 
-async fn authorize_replication_only_put_headers<T>(req: &mut S3Request<T>) -> S3Result<()> {
-    if !has_replication_only_put_headers(&req.headers) {
+/// Asks `s3:ReplicateObject` when the request headers carry a replication-only header, and on
+/// Allow marks the request as an authorized replication request for the use case. A POST form
+/// cannot carry these headers, so the request headers are read, not the policy headers.
+pub(crate) async fn authorize_replication_only_put_headers<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
+    if !has_replication_only_put_headers(req.headers()) {
         return Ok(());
     }
 
@@ -1082,6 +1085,7 @@ pub(crate) trait AuthorizationRequest {
     fn internal_object_authorization(&self) -> bool;
     fn multipart_staging(&self) -> bool;
     fn staged_multipart_part(&self) -> bool;
+    fn set_staged_multipart_part(&mut self, staged: bool);
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention>;
     fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil>;
     fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
@@ -1173,6 +1177,13 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn staged_multipart_part(&self) -> bool {
         self.extensions.get::<StagedMultipartPartAuthorization>().is_some()
+    }
+    fn set_staged_multipart_part(&mut self, staged: bool) {
+        if staged {
+            self.extensions.insert(StagedMultipartPartAuthorization);
+        } else {
+            self.extensions.remove::<StagedMultipartPartAuthorization>();
+        }
     }
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
         self.extensions.get::<RequestedObjectLockRetention>()
@@ -2141,12 +2152,12 @@ pub(crate) async fn authorize_copy_object_tags(
 
 /// A specific destination ETag reveals stored content and requires read access.
 /// Wildcard existence conditions retain the existing write-only contract.
-async fn authorize_write_etag_condition<T>(req: &mut S3Request<T>, specific_dto_etag: bool) -> S3Result<()> {
-    let headers = req
-        .extensions
-        .get::<PostObjectPolicyHeaders>()
-        .map_or(&req.headers, |form| &form.0);
-    let specific_header_etag = headers
+pub(crate) async fn authorize_write_etag_condition<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    specific_dto_etag: bool,
+) -> S3Result<()> {
+    let specific_header_etag = req
+        .policy_headers()
         .get_all(http::header::IF_MATCH)
         .iter()
         .any(|value| value.to_str().map_or(true, |value| value.trim() != "*"));
@@ -2493,10 +2504,12 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
 
 // Multipart parts are staged and become visible only after CompleteMultipartUpload,
 // which uses the normal publication-fenced authorization path.
-async fn authorize_staged_multipart_part<T>(req: &mut S3Request<T>) -> S3Result<()> {
-    req.extensions.insert(StagedMultipartPartAuthorization);
+/// Authorizes `s3:PutObject` for one staged multipart part: the part creates no object, and the
+/// staged-part marker is set only for this decision.
+pub(crate) async fn authorize_staged_multipart_part<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
+    req.set_staged_multipart_part(true);
     let result = authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await;
-    req.extensions.remove::<StagedMultipartPartAuthorization>();
+    req.set_staged_multipart_part(false);
     result
 }
 
@@ -3112,21 +3125,10 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
-
-        // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
-        // including the value `false`. Only a parsed `true` later skips the
-        // emptiness check. `s3:*` does not grant this action.
-        if force_delete_header(&req.headers)
-            .map_err(|_| invalid_force_delete_header())?
-            .is_some()
-        {
-            authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
-        }
-        Ok(())
+        let bucket = req.input.bucket.clone();
+        access_owned::bucket_core::authorize_delete_bucket(req, &bucket)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the DeleteBucketAnalyticsConfiguration request has accesses to the resources.
@@ -3391,10 +3393,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_location(&self, req: &mut S3Request<GetBucketLocationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketLocationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketLocationAction)).await
     }
 
     /// Checks whether the GetBucketLogging request has accesses to the resources.
@@ -6654,28 +6654,50 @@ mod tests {
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
-    /// The table-policy, anonymous table and force-delete exits live deep in the authorization
-    /// flow and need a table catalog to reach. This source-level guard reads each exit in the file
-    /// that holds it and fails if one stops auditing; it does not execute them.
+    fn production_sources_audit_reason(sources: &[&str], reason: &str) -> bool {
+        sources.iter().any(|source| {
+            let production = source.split("\nmod tests {").next().expect("source has a production section");
+            production
+                .match_indices("audit_request_denial(")
+                .any(|(at, _)| production[at..].chars().take(260).collect::<String>().contains(reason))
+        })
+    }
+
+    /// Request-level denial exits span the legacy and owned authorization modules.
+    /// Check each exit in its owning file alongside the audit behavior tests.
     #[test]
     fn denial_exits_without_a_context_call_the_audit_function() {
-        // Only the production code counts; the tests' own calls must not satisfy the guard.
-        let access = include_str!("access.rs").split("\nmod tests {").next().unwrap();
-        // DeleteObject's decision lives in the owned module both edges call.
+        let access = include_str!("access.rs");
         let object_misc = include_str!("access_owned/object_misc.rs")
             .split("\nmod tests;")
             .next()
-            .unwrap();
+            .expect("owned source has a production section");
         for (source, reason) in [
             (access, "\"table_resource_policy_denied\""),
             (access, "\"anonymous_table_data_plane_access\""),
             (object_misc, "\"recursive_force_delete_requires_authenticated_caller\""),
         ] {
-            let call = source
-                .match_indices("audit_request_denial(")
-                .any(|(at, _)| source[at..].chars().take(260).collect::<String>().contains(reason));
-            assert!(call, "{reason} exit does not call audit_request_denial");
+            assert!(
+                production_sources_audit_reason(&[source], reason),
+                "{reason} exit does not call audit_request_denial"
+            );
         }
+    }
+
+    #[test]
+    fn denial_source_guard_tracks_moved_calls_and_rejects_removed_calls() {
+        let reason = "\"recursive_force_delete_requires_authenticated_caller\"";
+        let original = "fn original_exit() {}";
+        let moved = format!("fn moved_exit() {{ audit_request_denial(req, auditor, {reason}, action); }}");
+
+        assert!(!production_sources_audit_reason(&[original], reason));
+        assert!(production_sources_audit_reason(&[original, &moved], reason));
+
+        let removed = moved.replace("audit_request_denial(", "unrecorded_denial(");
+        assert!(!production_sources_audit_reason(&[original, &removed], reason));
+
+        let test_only = format!("{original}\nmod tests {{\n{moved}\n}}");
+        assert!(!production_sources_audit_reason(&[original, &test_only], reason));
     }
 
     /// DeleteObjects audits its refused keys as one entry per denied action, carrying the count and

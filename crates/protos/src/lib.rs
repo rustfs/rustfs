@@ -906,6 +906,35 @@ pub trait CanonicalMutationBody {
     fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError>;
 }
 
+pub const MRF_LIFECYCLE_PROTOCOL_VERSION: u32 = 1;
+pub const MRF_LIFECYCLE_MAX_COMMAND_BYTES: usize = 16 * 1024;
+pub const MRF_LIFECYCLE_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+impl CanonicalMutationBody for proto_gen::node_service::MrfLifecycleRequest {
+    fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+        let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-request-v1\0");
+        body.push_u32(self.protocol_version);
+        body.push_str(&self.topology_fingerprint)?;
+        body.push_str(&self.node_id)?;
+        body.push_bytes(&self.command)?;
+        body.push_bytes(&self.challenge)?;
+        Ok(body.finish())
+    }
+}
+
+/// Binds a node observation or action acknowledgement to the exact challenged request.
+/// Returns a length conversion error if a field cannot be represented on the wire.
+pub fn canonical_mrf_lifecycle_response_body(
+    request: &proto_gen::node_service::MrfLifecycleRequest,
+    response: &proto_gen::node_service::MrfLifecycleResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-response-v1\0");
+    body.push_bytes(&request.canonical_body()?)?;
+    body.push_u32(response.protocol_version);
+    body.push_bytes(&response.result)?;
+    Ok(body.finish())
+}
+
 macro_rules! impl_canonical_mutation_body {
     ($request:ty, $domain:expr, |$value:ident, $body:ident| $fields:block) => {
         impl CanonicalMutationBody for $request {
@@ -1429,6 +1458,20 @@ pub fn canonical_write_all_request_body(
     let mut body = CanonicalBodyBuilder::new(b"rustfs-write-all-request-v1\0");
     body.push_str(&request.disk)?;
     body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+/// Build the signed semantic body for atomic format-control publication.
+///
+/// # Errors
+/// Returns a length conversion error when a field exceeds the canonical wire limit.
+pub fn canonical_write_format_control_request_body(
+    request: &proto_gen::node_service::WriteFormatControlRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-format-control-request-v1\0");
+    body.push_str(&request.disk)?;
     body.push_str(&request.path)?;
     body.push_bytes(&request.data)?;
     Ok(body.finish())
@@ -2734,6 +2777,124 @@ mod scanner_activity_tests {
 }
 
 #[cfg(test)]
+mod mrf_lifecycle_canonical_tests {
+    use super::{CanonicalMutationBody as _, canonical_mrf_lifecycle_response_body};
+    use crate::proto_gen::node_service::{MrfLifecycleRequest, MrfLifecycleResponse};
+
+    fn request() -> MrfLifecycleRequest {
+        MrfLifecycleRequest {
+            protocol_version: 1,
+            topology_fingerprint: "ab".into(),
+            node_id: "c".into(),
+            command: b"de".to_vec().into(),
+            challenge: b"f".to_vec().into(),
+        }
+    }
+
+    fn changed_requests(baseline: &MrfLifecycleRequest) -> Vec<MrfLifecycleRequest> {
+        [
+            |r: &mut MrfLifecycleRequest| r.protocol_version += 1,
+            |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "ac".into(),
+            |r: &mut MrfLifecycleRequest| r.node_id = "d".into(),
+            |r: &mut MrfLifecycleRequest| r.command = b"df".to_vec().into(),
+            |r: &mut MrfLifecycleRequest| r.challenge = b"g".to_vec().into(),
+        ]
+        .into_iter()
+        .map(|change| {
+            let mut request = baseline.clone();
+            change(&mut request);
+            request
+        })
+        .collect()
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_binds_every_field_and_wire_layout() {
+        let request = request();
+        let actual = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-request-v1\0".to_vec();
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        for field in [b"ab".as_slice(), b"c", b"de", b"f"] {
+            expected.extend_from_slice(&u64::try_from(field.len()).expect("fixture length").to_be_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(actual, expected);
+        for changed in changed_requests(&request) {
+            assert_ne!(actual, changed.canonical_body().expect("changed MRF request"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_separates_adjacent_field_boundaries() {
+        let baseline = request();
+        let baseline_body = baseline.canonical_body().expect("MRF request canonical body");
+        let changes = [
+            MrfLifecycleRequest {
+                topology_fingerprint: "a".into(),
+                node_id: "bc".into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                node_id: "cd".into(),
+                command: b"e".to_vec().into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                command: b"d".to_vec().into(),
+                challenge: b"ef".to_vec().into(),
+                ..baseline
+            },
+        ];
+        for changed in changes {
+            assert_ne!(baseline_body, changed.canonical_body().expect("shifted MRF fields"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_response_canonical_body_binds_request_and_response_fields() {
+        let request = request();
+        let response = MrfLifecycleResponse {
+            protocol_version: 1,
+            result: b"result".to_vec().into(),
+            response_proof: b"proof".to_vec().into(),
+        };
+        let actual = canonical_mrf_lifecycle_response_body(&request, &response).expect("MRF response canonical body");
+        let request_body = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-response-v1\0".to_vec();
+        expected.extend_from_slice(&u64::try_from(request_body.len()).expect("fixture length").to_be_bytes());
+        expected.extend_from_slice(&request_body);
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        expected.extend_from_slice(&6_u64.to_be_bytes());
+        expected.extend_from_slice(b"result");
+        assert_eq!(actual, expected);
+        assert_ne!(actual, request_body, "request and response domains must differ");
+        for changed in changed_requests(&request) {
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&changed, &response).expect("changed response context")
+            );
+        }
+        for change in [
+            |r: &mut MrfLifecycleResponse| r.protocol_version += 1,
+            |r: &mut MrfLifecycleResponse| r.result = b"changed".to_vec().into(),
+        ] {
+            let mut changed = response.clone();
+            change(&mut changed);
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&request, &changed).expect("changed response")
+            );
+        }
+        let mut changed_proof = response;
+        changed_proof.response_proof = b"other-proof".to_vec().into();
+        assert_eq!(
+            actual,
+            canonical_mrf_lifecycle_response_body(&request, &changed_proof).expect("proof excluded from its own input")
+        );
+    }
+}
+
+#[cfg(test)]
 mod heal_control_tests {
     use super::{
         CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
@@ -3794,6 +3955,36 @@ mod tests {
 
         fields.sort();
         fields
+    }
+
+    #[test]
+    fn format_control_canonical_body_binds_every_field_and_operation() {
+        use proto_gen::node_service::{WriteAllRequest, WriteFormatControlRequest};
+        let request = WriteFormatControlRequest {
+            disk: "http://node-a:9000/data".into(),
+            path: "format.json.bootstrap".into(),
+            data: vec![1, 2, 3].into(),
+        };
+        let canonical = canonical_write_format_control_request_body(&request).expect("canonical format control");
+        for mutate in [
+            |r: &mut WriteFormatControlRequest| r.disk = "http://node-b:9000/data".into(),
+            |r: &mut WriteFormatControlRequest| r.path = "format.json".into(),
+            |r: &mut WriteFormatControlRequest| r.data = vec![1, 2, 4].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                canonical_write_format_control_request_body(&changed).expect("changed canonical body"),
+                canonical
+            );
+        }
+        let ordinary = WriteAllRequest {
+            disk: request.disk,
+            volume: ".rustfs.sys".into(),
+            path: request.path,
+            data: request.data,
+        };
+        assert_ne!(canonical_write_all_request_body(&ordinary).expect("ordinary canonical body"), canonical);
     }
 
     #[test]

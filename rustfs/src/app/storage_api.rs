@@ -326,6 +326,7 @@ pub(crate) mod runtime_sources {
 pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+    pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
@@ -1849,8 +1850,9 @@ pub(crate) mod owned_parity {
         PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
         RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG,
         TableDataPlanePublicationGuards, authorization_denial_entry, authorization_denial_entry_for_view,
-        authorize_bucket_config_mutation, authorize_create_bucket, authorize_object_request, authorize_request,
-        bucket_config_mutation_incarnation, parity_test_support,
+        authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket, authorize_object_request,
+        authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+        authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
 }
 

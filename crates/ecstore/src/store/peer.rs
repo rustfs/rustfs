@@ -46,6 +46,15 @@ impl BootstrapLocalTarget {
         Arc::ptr_eq(&self.ctx, &store.ctx)
     }
 
+    /// Atomically publish a format control file on this bootstrap instance.
+    ///
+    /// # Errors
+    /// Returns a disk error for an unsupported path, unavailable local endpoint,
+    /// publication failure, or failed durability barrier.
+    pub async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
+        write_local_format_control_with_ctx(&self.ctx, disk_ref, path, data).await
+    }
+
     pub async fn rename_local_data(
         &self,
         disk_ref: &str,
@@ -85,6 +94,15 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Atomically publish a format control file on this storage instance.
+    ///
+    /// # Errors
+    /// Returns a disk error for an unsupported path, unavailable local endpoint,
+    /// publication failure, or failed durability barrier.
+    pub async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
+        write_local_format_control_with_ctx(&self.ctx, disk_ref, path, data).await
+    }
+
     /// Resolve a quota lease against this request's captured storage instance.
     pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
@@ -307,6 +325,18 @@ impl ECStore {
 }
 
 // The optional ID is a cold lookup to cache only after final admission.
+async fn write_local_format_control_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    path: &str,
+    data: bytes::Bytes,
+) -> DiskResult<()> {
+    crate::disk::validate_format_control_path(path)?;
+    let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
+    let _owner = admit_local_disk(ctx, &disk, id, false, None).await?;
+    disk.write_format_control(path, data).await
+}
+
 async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
     let map = ctx.local_disk_map();
     let path_disk = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned();

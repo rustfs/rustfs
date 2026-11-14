@@ -572,6 +572,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn staged_multipart_part(&self) -> bool {
         self.staged_multipart_part_authorization().is_some()
     }
+    fn set_staged_multipart_part(&mut self, staged: bool) {
+        self.staged_multipart_part_authorization = staged.then_some(StagedMultipartPartAuthorization);
+    }
     fn requested_retention(&self) -> Option<&RequestedObjectLockRetention> {
         self.requested_object_lock_retention()
     }
@@ -711,13 +714,6 @@ impl RequestEnvelope {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the operation batches of rustfs/backlog#2749 are its first callers (task H2)"
-    )
-)]
 impl RequestEnvelope {
     /// Runs `handler` on this request and records its outcome as an audit-only
     /// entry for `op`, the owned form of the legacy edge's `audit_only_operation`.

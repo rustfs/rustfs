@@ -776,29 +776,9 @@ impl PartialWrites {
     ) -> (Vec<MrfLegacyResponsibility>, Option<Uuid>) {
         let mut selected = BTreeMap::new();
         for entry in self.entries.values() {
-            let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
-                ResponsibilityState::Active {} if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
-                ResponsibilityState::Active {} => continue,
-                ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms, .. } => {
-                    ("source_and_current_generation_unknown", None, Some(*since_ms))
-                }
-                ResponsibilityState::HeldUnverifiedLegacy {
-                    bucket_incarnation_id,
-                    since_ms,
-                } => ("held_unverified_legacy", Some(*bucket_incarnation_id), Some(*since_ms)),
-                ResponsibilityState::LegacyGenerationUnknown {
-                    observed_bucket_incarnation_id,
-                    detected_at_ms,
-                } => ("legacy_generation_unknown", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
-                ResponsibilityState::BucketIncarnationChanged {
-                    observed_bucket_incarnation_id,
-                    detected_at_ms,
-                    ..
-                } => ("bucket_incarnation_changed", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
-                ResponsibilityState::OperatorAcceptedUnverified {
-                    bucket_incarnation_id, ..
-                } => ("operator_accepted_unverified", Some(*bucket_incarnation_id), None),
-            };
+            if !entry.is_parked() {
+                continue;
+            }
             if after.is_some_and(|after| entry.responsibility_id <= after) {
                 continue;
             }
@@ -809,33 +789,7 @@ impl PartialWrites {
             {
                 continue;
             }
-            let row = MrfLegacyResponsibility {
-                responsibility_id: entry.responsibility_id,
-                bucket: entry.intent.bucket.to_string(),
-                object: entry.intent.object.to_string(),
-                source_bucket_incarnation_id: entry.source_bucket_incarnation_id,
-                version_id: entry
-                    .intent
-                    .version_id
-                    .and_then(|bytes| Uuid::from_slice(&bytes).ok())
-                    .filter(|version| !version.is_nil())
-                    .map(|version| version.to_string()),
-                pool_index: entry.intent.scope.map(|scope| scope.pool_index),
-                set_index: entry.intent.scope.map(|scope| scope.set_index),
-                bucket_incarnation_id,
-                enqueued_at_ms: entry.intent.enqueued_at_ms,
-                status,
-                held_since_ms,
-                accepted: entry.last_operator_acceptance.clone(),
-                last_identity_probe_result: entry.last_identity_probe_result,
-                last_identity_probe_at_ms: entry.last_identity_probe_at_ms,
-                next_identity_probe_at_ms: entry.generation_unobserved().then(|| {
-                    unix_now_ms().saturating_add(
-                        u64::try_from(entry.next_attempt.saturating_duration_since(Instant::now()).as_millis())
-                            .unwrap_or(u64::MAX),
-                    )
-                }),
-            };
+            let row = Self::responsibility_row(entry);
             selected.insert(entry.responsibility_id, row);
             if selected.len() > limit + 1 {
                 selected.pop_last();
@@ -850,6 +804,65 @@ impl PartialWrites {
             selected.pop_last();
         }
         (selected.into_values().collect(), next_cursor)
+    }
+
+    pub(super) fn responsibility(&self, id: Uuid) -> Option<MrfLegacyResponsibility> {
+        self.entries
+            .values()
+            .find(|entry| entry.responsibility_id == id)
+            .map(Self::responsibility_row)
+    }
+
+    fn responsibility_row(entry: &Responsibility) -> MrfLegacyResponsibility {
+        let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
+            ResponsibilityState::Active {} if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
+            ResponsibilityState::Active {} => ("active", None, None),
+            ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms, .. } => {
+                ("source_and_current_generation_unknown", None, Some(*since_ms))
+            }
+            ResponsibilityState::HeldUnverifiedLegacy {
+                bucket_incarnation_id,
+                since_ms,
+            } => ("held_unverified_legacy", Some(*bucket_incarnation_id), Some(*since_ms)),
+            ResponsibilityState::LegacyGenerationUnknown {
+                observed_bucket_incarnation_id,
+                detected_at_ms,
+            } => ("legacy_generation_unknown", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
+            ResponsibilityState::BucketIncarnationChanged {
+                observed_bucket_incarnation_id,
+                detected_at_ms,
+                ..
+            } => ("bucket_incarnation_changed", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
+            ResponsibilityState::OperatorAcceptedUnverified {
+                bucket_incarnation_id, ..
+            } => ("operator_accepted_unverified", Some(*bucket_incarnation_id), None),
+        };
+        MrfLegacyResponsibility {
+            responsibility_id: entry.responsibility_id,
+            bucket: entry.intent.bucket.to_string(),
+            object: entry.intent.object.to_string(),
+            source_bucket_incarnation_id: entry.source_bucket_incarnation_id,
+            version_id: entry
+                .intent
+                .version_id
+                .and_then(|bytes| Uuid::from_slice(&bytes).ok())
+                .filter(|version| !version.is_nil())
+                .map(|version| version.to_string()),
+            pool_index: entry.intent.scope.map(|scope| scope.pool_index),
+            set_index: entry.intent.scope.map(|scope| scope.set_index),
+            bucket_incarnation_id,
+            enqueued_at_ms: entry.intent.enqueued_at_ms,
+            status: status.to_string(),
+            held_since_ms,
+            accepted: entry.last_operator_acceptance.clone(),
+            last_identity_probe_result: entry.last_identity_probe_result.map(str::to_string),
+            last_identity_probe_at_ms: entry.last_identity_probe_at_ms,
+            next_identity_probe_at_ms: entry.generation_unobserved().then(|| {
+                unix_now_ms().saturating_add(
+                    u64::try_from(entry.next_attempt.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX),
+                )
+            }),
+        }
     }
 
     pub(super) fn replace_observed_incarnation(
@@ -1154,7 +1167,7 @@ fn validate_operator_audit_fields(actor: &str, reason: &str, reference: &str, re
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MrfLegacyResponsibility {
     pub responsibility_id: Uuid,
@@ -1166,11 +1179,11 @@ pub struct MrfLegacyResponsibility {
     pub set_index: Option<u32>,
     pub bucket_incarnation_id: Option<Uuid>,
     pub enqueued_at_ms: u64,
-    pub status: &'static str,
+    pub status: String,
     pub held_since_ms: Option<u64>,
     pub accepted: Option<MrfOperatorAcceptance>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_identity_probe_result: Option<&'static str>,
+    pub last_identity_probe_result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_identity_probe_at_ms: Option<u64>,
     /// Process-local schedule; replay restarts the conservative probe delay.
@@ -1228,6 +1241,71 @@ mod tests {
         };
         assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
         intent
+    }
+
+    #[test]
+    fn management_query_scale_baseline_and_active_lookup() {
+        for budget in [8 * 1024 * 1024, 128 * 1024 * 1024] {
+            let mut writes = PartialWrites::default();
+            let source = Uuid::new_v4();
+            let started = std::time::Instant::now();
+            for index in 0..100_000 {
+                let item = MrfIntent {
+                    bucket: Arc::from("management-scale"),
+                    object: Arc::from(format!("key-{index:06}")),
+                    version_id: None,
+                    kind: MrfKind::PartialWrite,
+                    scope: Some(MrfScope {
+                        pool_index: 0,
+                        set_index: 0,
+                    }),
+                    lease: None,
+                    enqueued_at_ms: 1,
+                    attempts: 0,
+                    delete_marker_purge: None,
+                };
+                if writes
+                    .admit_with_source_incarnation(item, if index % 10 == 0 { Some(source) } else { None }, 100_000, budget)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let admission_ms = started.elapsed().as_millis();
+            assert!(writes.depth() > 1000);
+            let active = writes
+                .entries
+                .values()
+                .find(|entry| !entry.is_parked())
+                .unwrap()
+                .responsibility_id;
+            assert_eq!(writes.responsibility(active).unwrap().status, "active");
+            assert!(writes.responsibility(Uuid::new_v4()).is_none());
+            let mut elapsed = Vec::new();
+            let mut after = None;
+            for _ in 0..32 {
+                let start = std::time::Instant::now();
+                let (rows, next) = writes.list_unverified_legacy(after, 256);
+                let _ = writes.lifecycle_summary();
+                assert!(writes.responsibility(active).is_some());
+                elapsed.push(start.elapsed().as_micros());
+                assert!(rows.len() <= 256);
+                assert!(
+                    rows.iter()
+                        .all(|row| row.responsibility_id != active && after.is_none_or(|id| row.responsibility_id > id))
+                );
+                after = next;
+            }
+            elapsed.sort_unstable();
+            eprintln!(
+                "MRF query baseline: entries={} bytes={} admission_ms={} page_summary_id_p50_us={} p99_us={}",
+                writes.depth(),
+                writes.bytes(),
+                admission_ms,
+                elapsed[16],
+                elapsed[31]
+            );
+        }
     }
 
     fn risk_acceptance(

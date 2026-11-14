@@ -144,6 +144,16 @@ pub struct WriteAllRequest {
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteFormatControlRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteAllResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
@@ -1765,6 +1775,31 @@ pub struct BackgroundHealStatusRequest {
     #[prost(uint32, tag = "1")]
     pub protocol_version: u32,
 }
+/// The signed body binds the authenticated admin actor, target node and topology.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MrfLifecycleRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(string, tag = "2")]
+    pub topology_fingerprint: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub command: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub challenge: ::prost::bytes::Bytes,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MrfLifecycleResponse {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub result: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusResponse {
@@ -2489,6 +2524,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "WriteAll"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn write_format_control(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WriteFormatControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/WriteFormatControl");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "WriteFormatControl"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn compare_and_update_file(
@@ -3830,6 +3880,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "BackgroundHealStatus"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn mrf_lifecycle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MrfLifecycleRequest>,
+        ) -> std::result::Result<tonic::Response<super::MrfLifecycleResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/MrfLifecycle");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "MrfLifecycle"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn replacement_recovery_status(
             &mut self,
             request: impl tonic::IntoRequest<super::ReplacementRecoveryStatusRequest>,
@@ -4070,6 +4135,10 @@ pub mod node_service_server {
         async fn write_all(
             &self,
             request: tonic::Request<super::WriteAllRequest>,
+        ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status>;
+        async fn write_format_control(
+            &self,
+            request: tonic::Request<super::WriteFormatControlRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteAllResponse>, tonic::Status>;
         async fn compare_and_update_file(
             &self,
@@ -4443,6 +4512,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::BackgroundHealStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::BackgroundHealStatusResponse>, tonic::Status>;
+        async fn mrf_lifecycle(
+            &self,
+            request: tonic::Request<super::MrfLifecycleRequest>,
+        ) -> std::result::Result<tonic::Response<super::MrfLifecycleResponse>, tonic::Status>;
         async fn replacement_recovery_status(
             &self,
             request: tonic::Request<super::ReplacementRecoveryStatusRequest>,
@@ -4809,6 +4882,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WriteAllSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/WriteFormatControl" => {
+                    #[allow(non_camel_case_types)]
+                    struct WriteFormatControlSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::WriteFormatControlRequest> for WriteFormatControlSvc<T> {
+                        type Response = super::WriteAllResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::WriteFormatControlRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::write_format_control(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteFormatControlSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -7311,6 +7412,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = BackgroundHealStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/MrfLifecycle" => {
+                    #[allow(non_camel_case_types)]
+                    struct MrfLifecycleSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::MrfLifecycleRequest> for MrfLifecycleSvc<T> {
+                        type Response = super::MrfLifecycleResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::MrfLifecycleRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::mrf_lifecycle(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = MrfLifecycleSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
