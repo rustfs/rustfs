@@ -21,6 +21,7 @@
 //! ([`dto_values`]).
 
 pub mod admin_usecase;
+mod answered;
 pub(crate) mod bucket_list_through;
 pub mod bucket_usecase;
 pub mod context;
@@ -29,6 +30,7 @@ pub(crate) mod metadata_route;
 pub mod multipart_usecase;
 pub mod object;
 pub(crate) mod object_data_cache;
+pub(crate) mod object_meta;
 pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
@@ -40,6 +42,7 @@ pub(crate) mod trailer_adapter;
 
 // Request-scoped facts are not AppContext resolution, so consumers import them
 // from here rather than through `app::context`.
+pub(crate) use answered::Answered;
 pub(crate) use context::RequestHead;
 pub use context::{RequestCredentials, RequestEnvelope};
 pub(crate) use context::{authorize_owned_internal_object_request, authorize_owned_request};

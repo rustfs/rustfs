@@ -60,7 +60,7 @@ async fn undo_delete_only_removes_the_current_matching_delete_marker() {
         .await
         .expect("object version should be written");
     let marker = Box::pin(
-        usecase.execute_delete_object(build_request(
+        usecase.execute_delete_object_from_s3s(build_request(
             DeleteObjectInput::builder()
                 .bucket(bucket.clone())
                 .key(object.to_string())
@@ -71,7 +71,6 @@ async fn undo_delete_only_removes_the_current_matching_delete_marker() {
     )
     .await
     .expect("delete marker should be created")
-    .output
     .version_id
     .expect("versioned delete should return the marker version");
 
@@ -88,7 +87,7 @@ async fn undo_delete_only_removes_the_current_matching_delete_marker() {
         RUSTFS_EXPECTED_CURRENT_VERSION_ID,
         HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
     );
-    let err = Box::pin(usecase.execute_delete_object(stale_req))
+    let err = Box::pin(usecase.execute_delete_object_from_s3s(stale_req))
         .await
         .expect_err("mismatched delete marker must fail");
     assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
@@ -97,7 +96,7 @@ async fn undo_delete_only_removes_the_current_matching_delete_marker() {
     matching_req
         .headers
         .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&marker).unwrap());
-    Box::pin(usecase.execute_delete_object(matching_req))
+    Box::pin(usecase.execute_delete_object_from_s3s(matching_req))
         .await
         .expect("current matching delete marker should be removed");
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"visible again");
@@ -151,7 +150,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         ..Default::default()
     });
 
-    Box::pin(usecase.execute_delete_object(req))
+    Box::pin(usecase.execute_delete_object_from_s3s(req))
         .await
         .expect("Failed to delete object through usecase");
 
@@ -215,7 +214,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         ..Default::default()
     });
 
-    Box::pin(usecase.execute_delete_object(req))
+    Box::pin(usecase.execute_delete_object_from_s3s(req))
         .await
         .expect("Failed to delete object through usecase after compensation-driven transition");
 
@@ -271,7 +270,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
         Method::DELETE,
     );
 
-    Box::pin(usecase.execute_delete_object(req))
+    Box::pin(usecase.execute_delete_object_from_s3s(req))
         .await
         .expect("Failed to issue versioned delete after compensation-driven transition");
 
@@ -515,7 +514,7 @@ async fn delete_object_versioning_config_failure_leaves_latest_object_intact() {
     });
 
     let err = usecase
-        .execute_delete_object(req)
+        .execute_delete_object_from_s3s(req)
         .await
         .expect_err("versioning config failure must reject DeleteObject");
 
@@ -550,7 +549,7 @@ async fn delete_object_replication_config_failure_leaves_latest_object_intact() 
     });
 
     let err = usecase
-        .execute_delete_object(req)
+        .execute_delete_object_from_s3s(req)
         .await
         .expect_err("replication config failure must reject DeleteObject");
 
@@ -612,10 +611,10 @@ async fn delete_object_uses_one_replication_config_generation() {
         install_delete_replication_config(&bucket, false, false, None).await;
         resume.wait().await;
     };
-    let (response, ()) = tokio::join!(usecase.execute_delete_object(req), update_config);
+    let (response, ()) = tokio::join!(usecase.execute_delete_object_from_s3s(req), update_config);
     let response = response.expect("delete admitted by the first config generation should succeed");
 
-    assert_eq!(response.output.version_id.as_deref(), Some(version_id_string.as_str()));
+    assert_eq!(response.version_id.as_deref(), Some(version_id_string.as_str()));
     let scheduled = take_scheduled_replication_deletes();
     assert_eq!(scheduled.len(), 1, "the first config generation must control post-delete queueing");
     assert_eq!(scheduled[0].version_id, Some(version_id));
@@ -711,10 +710,10 @@ async fn replica_delete_uses_authorized_source_version_and_its_tags() {
             .expect("tag update ordered before the locked delete should succeed");
         resume_delete.wait().await;
     };
-    let (response, ()) = tokio::join!(usecase.execute_delete_object(req), update_tags);
+    let (response, ()) = tokio::join!(usecase.execute_delete_object_from_s3s(req), update_tags);
     let response = response.expect("authorized replica version delete should succeed");
 
-    assert_eq!(response.output.version_id.as_deref(), Some(old_version_id_string.as_str()));
+    assert_eq!(response.version_id.as_deref(), Some(old_version_id_string.as_str()));
     let scheduled = take_scheduled_replication_deletes();
     assert_eq!(
         scheduled.len(),
@@ -761,7 +760,7 @@ async fn force_delete_replication_config_failure_leaves_prefix_intact() {
     });
 
     let err = usecase
-        .execute_delete_object(req)
+        .execute_delete_object_from_s3s(req)
         .await
         .expect_err("replication config failure must reject force delete");
 
@@ -798,7 +797,7 @@ async fn replica_delete_replication_config_failure_leaves_object_intact() {
     });
 
     let err = usecase
-        .execute_delete_object(req)
+        .execute_delete_object_from_s3s(req)
         .await
         .expect_err("replication config failure must reject incoming replica delete");
 
@@ -910,7 +909,7 @@ async fn nonexistent_bucket_fails_before_versioning_lookup_on_get_head_delete() 
         .version_id(Some("not-a-uuid".to_string()))
         .build()
         .expect("delete input should build");
-    let err = Box::pin(usecase.execute_delete_object(build_request(del, Method::DELETE)))
+    let err = Box::pin(usecase.execute_delete_object_from_s3s(build_request(del, Method::DELETE)))
         .await
         .expect_err("DeleteObject on a missing bucket must fail");
     assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);

@@ -31,7 +31,7 @@ use crate::encryption::{
 };
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
-use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
+use crate::policy::{self, AttemptError, OpClass, OwnWrite, OwnWrites, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
 use base64_simd::STANDARD as BASE64;
@@ -43,7 +43,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use vaultrs::{api::kv2::requests::SetSecretRequestOptions, error::ClientError, kv2};
+use vaultrs::{
+    api::kv2::requests::{ReadSecretRequest, SetSecretRequestOptions},
+    error::ClientError,
+    kv2,
+};
 use zeroize::Zeroize as _;
 
 /// Vault KMS client implementation
@@ -68,6 +72,9 @@ pub struct VaultKmsClient {
     /// construction. The outer lock is only ever held to look up or insert the
     /// per-key entry, never across an await.
     wrap_budgets: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<WrapBudget>>>>,
+    /// What this client last did to each KV path it wrote, so a read answered
+    /// by a lagging replica is re-read instead of trusted.
+    own_writes: OwnWrites,
 }
 
 /// Key data stored in Vault
@@ -381,10 +388,23 @@ struct VaultKeyVersionRecord {
 const KEY_VERSIONS_SUBPATH: &str = "versions";
 
 /// Upper bound on read-modify-write attempts for a check-and-set lifecycle
-/// mutation. A lost race means live contention on the key; each retry re-reads
-/// and re-validates, and a small bound keeps a pathologically contended key
-/// from spinning while still absorbing ordinary interleavings.
-const LIFECYCLE_CAS_ATTEMPTS: u32 = 3;
+/// mutation. A lost race means either live contention on the key or a read
+/// served by a replica that has not applied the latest write yet; each retry
+/// pauses ([`policy::stale_read_backoff`]), re-reads and re-validates, and
+/// the bound keeps a pathologically contended key from spinning.
+const LIFECYCLE_CAS_ATTEMPTS: u32 = 5;
+
+/// Whether a read of a key record is older than this client's own last write
+/// of it: the record is missing or at an earlier KV2 version after a write, or
+/// still present after a delete.
+fn key_record_read_predates(read_version: std::result::Result<u64, &KmsError>, own: OwnWrite) -> bool {
+    match (read_version, own) {
+        (Ok(version), OwnWrite::Version(written)) => version < u64::from(written),
+        (Err(KmsError::KeyNotFound { .. }), OwnWrite::Version(_)) => true,
+        (Ok(_), OwnWrite::Deleted) => true,
+        (Err(_), _) => false,
+    }
+}
 
 /// Typed error for a lifecycle write that lost its check-and-set race (and, in
 /// the retry loop, kept losing it up to the attempt bound).
@@ -579,6 +599,7 @@ impl VaultKmsClient {
             retry: RetryPolicy::for_backend(kms_config, "vault-kv2", &config.address, config.namespace.as_deref(), "operations"),
             cancel: CancellationToken::new(),
             wrap_budgets: std::sync::Mutex::new(HashMap::new()),
+            own_writes: OwnWrites::new(),
         })
     }
 
@@ -712,6 +733,19 @@ impl VaultKmsClient {
     /// mask a tampered envelope version at worst.
     async fn get_key_version_record(&self, key_id: &str, version: u32) -> Result<VaultKeyVersionRecord> {
         let path = self.key_version_path(key_id, version);
+        // Version records are immutable, so the only way a read can predate
+        // this client's own write is by not finding the record yet.
+        self.own_writes
+            .read(
+                &path,
+                || self.read_key_version_record(key_id, version),
+                |result, own| matches!((result, own), (Err(KmsError::KeyVersionNotFound { .. }), OwnWrite::Version(_))),
+            )
+            .await
+    }
+
+    async fn read_key_version_record(&self, key_id: &str, version: u32) -> Result<VaultKeyVersionRecord> {
+        let path = self.key_version_path(key_id, version);
 
         let path = path.as_str();
         let record: VaultKeyVersionRecord = self
@@ -775,6 +809,17 @@ impl VaultKmsClient {
     /// later write can be check-and-set against exactly this snapshot.
     async fn get_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
         let path = self.key_path(key_id)?;
+        self.own_writes
+            .read(
+                &path,
+                || self.read_key_data_versioned(key_id),
+                |result, own| key_record_read_predates(result.as_ref().map(|(version, _)| u64::from(*version)), own),
+            )
+            .await
+    }
+
+    async fn read_key_data_versioned(&self, key_id: &str) -> Result<(u32, VaultKeyData)> {
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
         let metadata = self
@@ -835,12 +880,13 @@ impl VaultKmsClient {
             })
             .await?;
 
-        written
-            .map(|written| {
-                u32::try_from(written.version)
-                    .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))
-            })
-            .transpose()
+        let Some(written) = written else {
+            return Ok(None);
+        };
+        let version = u32::try_from(written.version)
+            .map_err(|_| KmsError::backend_error(format!("KV2 secret version for key {key_id} exceeds u32")))?;
+        self.own_writes.wrote(path, version).await;
+        Ok(Some(version))
     }
 
     /// Check-and-set write of the key record, surfacing a lost race as the
@@ -881,6 +927,9 @@ impl VaultKmsClient {
                         return Ok((key_data, value));
                     }
                     debug!(key_id, attempt, "Vault KV2 lifecycle write lost a check-and-set race; re-reading");
+                    if attempt < LIFECYCLE_CAS_ATTEMPTS {
+                        policy::stale_read_backoff(attempt).await;
+                    }
                 }
             }
         }
@@ -900,17 +949,23 @@ impl VaultKmsClient {
         // Single attempt: the create-only CAS makes a duplicate replay fail
         // with a conflict, which the caller resolves by reading the record
         // back, so retrying here would only mask that recovery path.
-        self.run("vault_kv2_create_key_version", OpClass::MutatingNonIdempotent, move || async move {
-            let vault = self.vault().map_err(AttemptError::fatal)?;
-            match kv2::set_with_options(&vault.client, &self.kv_mount, path, record, SetSecretRequestOptions { cas: 0 }).await {
-                Ok(_) => Ok(true),
-                Err(e) if is_cas_conflict(&e) => Ok(false),
-                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                    KmsError::backend_error(format!("Failed to store key version record in Vault: {e}"))
-                })),
-            }
-        })
-        .await
+        let created = self
+            .run("vault_kv2_create_key_version", OpClass::MutatingNonIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::set_with_options(&vault.client, &self.kv_mount, path, record, SetSecretRequestOptions { cas: 0 }).await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) if is_cas_conflict(&e) => Ok(false),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to store key version record in Vault: {e}"))
+                    })),
+                }
+            })
+            .await?;
+        if created {
+            self.own_writes.wrote(path, 1).await;
+        }
+        Ok(created)
     }
 
     /// Create-only write of the top-level key record (KV2 check-and-set of 0).
@@ -925,17 +980,25 @@ impl VaultKmsClient {
         // Single attempt: the create-only CAS makes a duplicate replay fail
         // with a conflict, which create_key reports as the key already
         // existing, so retrying here would only mask that signal.
-        self.run("vault_kv2_create_key", OpClass::MutatingNonIdempotent, move || async move {
-            let vault = self.vault().map_err(AttemptError::fatal)?;
-            match kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas: 0 }).await {
-                Ok(_) => Ok(true),
-                Err(e) if is_cas_conflict(&e) => Ok(false),
-                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
-                    KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
-                })),
-            }
-        })
-        .await
+        let created = self
+            .run("vault_kv2_create_key", OpClass::MutatingNonIdempotent, move || async move {
+                let vault = self.vault().map_err(AttemptError::fatal)?;
+                match kv2::set_with_options(&vault.client, &self.kv_mount, path, key_data, SetSecretRequestOptions { cas: 0 })
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) if is_cas_conflict(&e) => Ok(false),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to store key in Vault: {e}"))
+                    })),
+                }
+            })
+            .await?;
+        if created {
+            // A create-only write always produces the first KV2 version.
+            self.own_writes.wrote(path, 1).await;
+        }
+        Ok(created)
     }
 
     /// Blind, last-writer-wins overwrite of the key record.
@@ -964,7 +1027,7 @@ impl VaultKmsClient {
         Ok(())
     }
 
-    async fn store_key_metadata(&self, key_id: &str, request: &CreateKeyRequest) -> Result<()> {
+    async fn store_key_metadata(&self, key_id: &str, request: &CreateKeyRequest) -> Result<VaultKeyData> {
         debug!("Storing key metadata for {}, input tags: {:?}", key_id, request.tags);
 
         // Read-modify-write under check-and-set: only the request-driven
@@ -987,26 +1050,51 @@ impl VaultKmsClient {
             key_data.tags = request.tags.clone();
             Ok(CasMutation::Write(()))
         })
-        .await?;
-        Ok(())
+        .await
+        .map(|(key_data, ())| key_data)
     }
 
     /// Retrieve key data from Vault
     async fn get_key_data(&self, key_id: &str) -> Result<VaultKeyData> {
         let path = self.key_path(key_id)?;
+        self.own_writes
+            .read(
+                &path,
+                || self.read_key_data(key_id),
+                |result, own| key_record_read_predates(result.as_ref().map(|(version, _)| *version), own),
+            )
+            .await
+            .map(|(_, key_data)| key_data)
+    }
+
+    /// One read of the current key record, with the KV2 secret version the
+    /// response says it came from.
+    async fn read_key_data(&self, key_id: &str) -> Result<(u64, VaultKeyData)> {
+        let path = self.key_path(key_id)?;
         let path = path.as_str();
 
-        let secret: VaultKeyData = self
+        let (version, key_data) = self
             .run("vault_kv2_read_key", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
-                kv2::read(&vault.client, &self.kv_mount, path)
+                let endpoint = ReadSecretRequest::builder()
+                    .mount(self.kv_mount.as_str())
+                    .path(path)
+                    .build()
+                    .map_err(|e| AttemptError::fatal(KmsError::internal_error(format!("invalid KV2 read request: {e}"))))?;
+                let secret = vaultrs::api::exec_with_result(&vault.client, endpoint)
                     .await
-                    .map_err(|e| AttemptError::from_vaultrs(e, |e| map_key_record_read_error(key_id, "key record", e)))
+                    .map_err(|e| AttemptError::from_vaultrs(e, |e| map_key_record_read_error(key_id, "key record", e)))?;
+                let key_data: VaultKeyData = serde_json::from_value(secret.data).map_err(|source| {
+                    AttemptError::from_vaultrs(ClientError::JsonParseError { source }, |e| {
+                        map_key_record_read_error(key_id, "key record", e)
+                    })
+                })?;
+                Ok((secret.metadata.version, key_data))
             })
             .await?;
 
-        debug!("Retrieved key {} from Vault, tags: {:?}", key_id, secret.tags);
-        Ok(secret)
+        debug!("Retrieved key {} from Vault, tags: {:?}", key_id, key_data.tags);
+        Ok((version, key_data))
     }
 
     /// List all keys stored in Vault
@@ -1171,6 +1259,7 @@ impl VaultKmsClient {
             })
         })
         .await?;
+        self.own_writes.deleted(path).await;
 
         debug!("Permanently deleted key {} metadata from Vault at path {}", key_id, path);
         Ok(())
@@ -1543,11 +1632,28 @@ impl VaultKmsClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_key(
         &self,
         key_id: &str,
         algorithm: &str,
         _context: Option<&OperationContext>,
+    ) -> Result<MasterKeyInfo> {
+        self.create_key_with_attributes(key_id, algorithm, None).await
+    }
+
+    /// Create a master key, persisting the request's usage, description and
+    /// tags in the same create-only write as the key material.
+    ///
+    /// One write, with no read-back of the record just written: the create
+    /// either lands whole or not at all, and it does not depend on the backend
+    /// serving a read of its own write (a replica that answers reads may lag
+    /// the write it just forwarded).
+    async fn create_key_with_attributes(
+        &self,
+        key_id: &str,
+        algorithm: &str,
+        attributes: Option<&CreateKeyRequest>,
     ) -> Result<MasterKeyInfo> {
         debug!("Creating master key: {} with algorithm: {}", key_id, algorithm);
 
@@ -1569,6 +1675,20 @@ impl VaultKmsClient {
                         key_id,
                         "Vault KMS create found an identical active key; treating it as a recovered create"
                     );
+                    // A retried create carries the attributes the caller asked
+                    // for; the stored record may predate them (a create whose
+                    // response was lost, or a record written before attributes
+                    // were part of the create write).
+                    let existing = match attributes {
+                        Some(request)
+                            if existing.usage != request.key_usage
+                                || existing.description != request.description
+                                || existing.tags != request.tags =>
+                        {
+                            self.store_key_metadata(key_id, request).await?
+                        }
+                        _ => existing,
+                    };
                     Ok(MasterKeyInfo {
                         key_id: key_id.to_string(),
                         version: existing.version,
@@ -1597,13 +1717,13 @@ impl VaultKmsClient {
         // Create key data
         let key_data = VaultKeyData {
             algorithm: algorithm.to_string(),
-            usage: KeyUsage::EncryptDecrypt,
+            usage: attributes.map_or(KeyUsage::EncryptDecrypt, |request| request.key_usage.clone()),
             created_at: Zoned::now(),
             status: KeyStatus::Active,
             version: 1,
-            description: None,
+            description: attributes.and_then(|request| request.description.clone()),
             metadata: HashMap::new(),
-            tags: HashMap::new(),
+            tags: attributes.map(|request| request.tags.clone()).unwrap_or_default(),
             deletion_date: None,
             rotated_at: None,
             encrypted_key_material: encrypted_material,
@@ -1626,7 +1746,7 @@ impl VaultKmsClient {
             algorithm: key_data.algorithm.clone(),
             usage: key_data.usage,
             status: key_data.status,
-            description: None, // This method doesn't receive description parameter
+            description: key_data.description.clone(),
             metadata: key_data.metadata.clone(),
             created_at: key_data.created_at,
             rotated_at: None,
@@ -2015,11 +2135,9 @@ impl KmsBackend for VaultKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let key_id = request.key_name.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        // Create key in Vault transit engine
-        let _master_key = self.client.create_key(&key_id, "AES_256", None).await?;
-
-        // Also store key metadata in KV store with tags
-        self.client.store_key_metadata(&key_id, &request).await?;
+        self.client
+            .create_key_with_attributes(&key_id, "AES_256", Some(&request))
+            .await?;
 
         let metadata = KeyMetadata {
             key_id: key_id.clone(),
@@ -2419,6 +2537,11 @@ mod tests {
 
     /// KV2 read payload (the `data` field of the Vault envelope) for a key record.
     fn kv2_read_data(key_data: &VaultKeyData) -> serde_json::Value {
+        kv2_read_data_at(key_data, 1)
+    }
+
+    /// A KV2 read response served from the given secret version.
+    fn kv2_read_data_at(key_data: &VaultKeyData, secret_version: u64) -> serde_json::Value {
         serde_json::json!({
             "data": serde_json::to_value(key_data).expect("serialize key data"),
             "metadata": {
@@ -2426,7 +2549,7 @@ mod tests {
                 "deletion_time": "",
                 "custom_metadata": null,
                 "destroyed": false,
-                "version": 1,
+                "version": secret_version,
             },
         })
     }
@@ -3608,13 +3731,14 @@ mod tests {
     #[tokio::test]
     async fn wired_kv2_encrypt_round_trips_through_decrypt() {
         // One key-record read plus the first wrap's budget reservation for the
-        // encrypt, one read for the decrypt.
+        // encrypt, one read for the decrypt. The reservation was acknowledged
+        // as secret version 2, so that is the version the decrypt reads.
         let (_vault, client) = scripted_client(vec![
             ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
             ScriptedResponse::ok(kv2_metadata_read_data(1)),
             ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
             ScriptedResponse::ok(kv2_write_ack()),
-            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_read_data_at(&healthy_key_data(), 2)),
         ])
         .await;
         let context = HashMap::from([("bucket".to_string(), "kv2".to_string())]);
@@ -4279,6 +4403,34 @@ mod tests {
         );
     }
 
+    /// A replica that answers reads may keep returning the version a lost
+    /// write was based on. The loop pauses between attempts and keeps
+    /// re-reading until the winning version is visible instead of spending the
+    /// whole budget on the same stale snapshot.
+    #[tokio::test]
+    async fn wired_lifecycle_cas_outlasts_a_replica_that_lags_the_winning_write() {
+        let mut responses = Vec::new();
+        for _ in 1..LIFECYCLE_CAS_ATTEMPTS {
+            responses.push(ScriptedResponse::ok(kv2_metadata_read_data(1)));
+            responses.push(ScriptedResponse::ok(kv2_read_data(&healthy_key_data())));
+            responses.push(ScriptedResponse::error(400, CAS_CONFLICT_MESSAGE));
+        }
+        responses.push(ScriptedResponse::ok(kv2_metadata_read_data(2)));
+        responses.push(ScriptedResponse::ok(kv2_read_data(&healthy_key_data())));
+        responses.push(ScriptedResponse::ok(kv2_write_ack()));
+        let (vault, client) = scripted_client(responses).await;
+
+        client
+            .disable_key("wired-key", None)
+            .await
+            .expect("the write must land once the replica serves the winning version");
+
+        let bodies = vault.request_bodies();
+        assert_eq!(bodies.len(), 3 * LIFECYCLE_CAS_ATTEMPTS as usize, "{:?}", vault.requests());
+        let last_write = parse_write_body(bodies.last().expect("final write"));
+        assert_eq!(last_write["options"]["cas"], serde_json::json!(2), "{last_write}");
+    }
+
     /// Concurrent rotations use KV2 create-only records and a CAS pointer
     /// switch. The stateful scripted Vault applies those preconditions to real
     /// HTTP requests, so this test proves committed versions are unique and
@@ -4375,17 +4527,16 @@ mod tests {
         );
     }
 
-    /// The tags write-back after a create is a check-and-set read-modify-write
-    /// that carries the key material over from the freshly read record.
+    /// A create persists usage, description and tags in the same create-only
+    /// write as the key material, and never reads the record back. A backend
+    /// whose reads lag its writes (reads answered by a replica) would answer
+    /// such a read-back with "not found" and fail a create that had landed.
     #[tokio::test]
-    async fn wired_create_key_tags_writeback_is_check_and_set() {
+    async fn wired_create_key_writes_attributes_in_the_create_only_write() {
         let vault = ScriptedVault::serve(vec![
-            // create_key: existence pre-check misses, create-only write lands.
+            // Existence pre-check misses, create-only write lands. Nothing
+            // else is scripted: any further request would be a read-back.
             ScriptedResponse::error(404, "not found"),
-            ScriptedResponse::ok(kv2_write_ack()),
-            // store_key_metadata: versioned read plus check-and-set write.
-            ScriptedResponse::ok(kv2_metadata_read_data(1)),
-            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
             ScriptedResponse::ok(kv2_write_ack()),
         ])
         .await;
@@ -4400,18 +4551,126 @@ mod tests {
             .create_key(CreateKeyRequest {
                 key_name: Some("wired-key".to_string()),
                 key_usage: KeyUsage::EncryptDecrypt,
+                description: Some("wired description".to_string()),
                 tags: HashMap::from([("team".to_string(), "storage".to_string())]),
                 ..Default::default()
             })
             .await
             .expect("create with tags must succeed");
         assert_eq!(response.key_id, "wired-key");
+        assert_eq!(response.key_metadata.tags.get("team").map(String::as_str), Some("storage"));
 
         let bodies = vault.request_bodies();
+        assert_eq!(bodies.len(), 2, "a create is one pre-check read and one write: {:?}", vault.requests());
         let create = parse_write_body(&bodies[1]);
         assert_eq!(create["options"]["cas"], serde_json::json!(0), "{create}");
+        assert_eq!(create["data"]["tags"]["team"], serde_json::json!("storage"), "{create}");
+        assert_eq!(create["data"]["description"], serde_json::json!("wired description"), "{create}");
+        assert!(
+            create["data"]["encrypted_key_material"]
+                .as_str()
+                .is_some_and(|material| !material.is_empty()),
+            "the create-only write must carry the key material: {create}"
+        );
+    }
 
-        let writeback = parse_write_body(&bodies[4]);
+    /// A read that follows this client's own create may be answered by a
+    /// replica that has not applied the create yet. "Not found" is re-read
+    /// rather than reported for a key whose create was just acknowledged.
+    #[tokio::test]
+    async fn wired_read_after_own_create_outlasts_a_lagging_replica() {
+        let (vault, client) = scripted_client(vec![
+            // create_key: existence pre-check misses, create-only write lands.
+            ScriptedResponse::error(404, "not found"),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // describe_key: the replica lags twice, then serves the record.
+            ScriptedResponse::error(404, "not found"),
+            ScriptedResponse::error(404, "not found"),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+        ])
+        .await;
+
+        client.create_key("wired-key", "AES_256", None).await.expect("create");
+        let info = client
+            .describe_key("wired-key", None)
+            .await
+            .expect("a key this client just created must be readable");
+        assert_eq!(info.key_id, "wired-key");
+        assert_eq!(vault.requests().len(), 5, "{:?}", vault.requests());
+    }
+
+    /// A read that follows this client's own lifecycle write may be answered
+    /// from the secret version the write replaced. The acknowledged version is
+    /// the floor: an older answer is re-read instead of reported.
+    #[tokio::test]
+    async fn wired_read_after_own_update_outlasts_a_lagging_replica() {
+        let mut disabled = healthy_key_data();
+        disabled.status = KeyStatus::Disabled;
+        let (vault, client) = scripted_client(vec![
+            // disable_key: versioned read, then the write acknowledged as version 2.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // describe_key: the replica still serves version 1, then catches up.
+            ScriptedResponse::ok(kv2_read_data_at(&healthy_key_data(), 1)),
+            ScriptedResponse::ok(kv2_read_data_at(&disabled, 2)),
+        ])
+        .await;
+
+        client.disable_key("wired-key", None).await.expect("disable");
+        let info = client.describe_key("wired-key", None).await.expect("describe");
+        assert_eq!(info.status, KeyStatus::Disabled, "the read must reflect this client's own write");
+        assert_eq!(vault.requests().len(), 5, "{:?}", vault.requests());
+    }
+
+    /// The re-read is reserved for records this client wrote: any other missing
+    /// key is reported after a single read.
+    #[tokio::test]
+    async fn wired_missing_key_this_client_did_not_write_is_reported_at_once() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::error(404, "not found")]).await;
+
+        let error = client
+            .describe_key("wired-key", None)
+            .await
+            .expect_err("an unknown key must be reported missing");
+        assert!(matches!(error, KmsError::KeyNotFound { .. }), "got {error:?}");
+        assert_eq!(vault.requests().len(), 1, "{:?}", vault.requests());
+    }
+
+    /// A retried create that finds its own key already stored attaches the
+    /// requested attributes with a check-and-set read-modify-write that
+    /// carries the key material over from the freshly read record.
+    #[tokio::test]
+    async fn wired_recovered_create_attaches_attributes_with_check_and_set() {
+        let vault = ScriptedVault::serve(vec![
+            // Existence pre-check finds an identical key without attributes.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // store_key_metadata: versioned read plus check-and-set write.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_write_ack()),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        backend
+            .create_key(CreateKeyRequest {
+                key_name: Some("wired-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                tags: HashMap::from([("team".to_string(), "storage".to_string())]),
+                ..Default::default()
+            })
+            .await
+            .expect("a recovered create must succeed");
+
+        let bodies = vault.request_bodies();
+        assert_eq!(bodies.len(), 4, "{:?}", vault.requests());
+        let writeback = parse_write_body(&bodies[3]);
         assert_eq!(writeback["options"]["cas"], serde_json::json!(1), "{writeback}");
         assert_eq!(writeback["data"]["tags"]["team"], serde_json::json!("storage"), "{writeback}");
         assert_eq!(

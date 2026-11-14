@@ -4,6 +4,8 @@
 
 **Source of truth:** `crates/kms/src/backends/vault_credentials.rs` (`DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS`, `refresh_safety_window_secs`, the renewal loop and its log lines), `crates/kms/src/config.rs` (`RUSTFS_KMS_TIMEOUT_SECS` default). For what each backend stores in Vault and the KV2/Transit policy scopes, see [KMS backend security properties](kms-backend-security.md).
 
+Running OpenBao instead of HashiCorp Vault uses the same configuration; its high-availability caveat and deployment differences are in [OpenBao as the Vault KMS backend](kms-openbao-compatibility.md).
+
 ## Choosing an authentication method
 
 | Method | Config tag | Credential lifetime | Background renewal | Recommended for |

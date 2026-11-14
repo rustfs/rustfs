@@ -39,12 +39,20 @@
 //! also writes its denial audit record. No policy source and no authorization audit sink is
 //! installed: nothing reads a policy snapshot, and the gate's only refusal is an operation without
 //! a handler, which the gateway answers `501 NotImplemented`.
+//!
+//! # Expected bucket owner
+//!
+//! The gateway checks `x-amz-expected-bucket-owner` after the early gate allowed a request,
+//! against the one owner id RustFS reports. RustFS stores no per-bucket owner, so
+//! the answer is that id for every bucket, with no lookup: a missing bucket is the handler's own
+//! `NoSuchBucket`.
 
 // The stack is under construction, so a build without debug assertions must not carry it. The
 // message is checked by `scripts/check_connect_release_boundary.py`.
 #[cfg(not(debug_assertions))]
 compile_error!("gateway-stack is restricted to debug builds");
 
+use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
 use crate::server::ssec_transport::is_secure_transport;
@@ -53,9 +61,9 @@ use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
-    AssemblyError, Authorizer, BoxFuture, ClientAddr, DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass,
-    HandlerDeadlineConfig, MintedTraces, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator,
-    SseConfig, TransportSecurity, decide_with,
+    AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
+    DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces, RegionSet,
+    RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource, host_request_id,
@@ -166,6 +174,7 @@ impl GatewayStack {
             .rustfs_profile()
             .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
             .authorizer(authorizer)
+            .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
             // The outer SSE-C transport layer answers first; the gateway's own gate stays strict
             // behind it.
             .sse_config(SseConfig::strict())
@@ -283,6 +292,16 @@ fn live_root(server_ctx: Arc<ServerContextSlot>) -> impl Fn() -> Option<Arc<Root
         RootCredentials::new(&root.access_key, &root.secret_key, &signing_key)
             .ok()
             .map(Arc::new)
+    }
+}
+
+/// The owner id RustFS reports, answered for every bucket. Without one, every owner check refuses.
+struct ReportedOwner(Option<Arc<str>>);
+
+impl BucketOwnerSource for ReportedOwner {
+    fn owner<'a>(&'a self, _bucket: &'a BucketName) -> BoxFuture<'a, Result<Arc<str>, BucketOwnerError>> {
+        let answer = self.0.clone().ok_or_else(BucketOwnerError::unavailable);
+        Box::pin(async move { answer })
     }
 }
 

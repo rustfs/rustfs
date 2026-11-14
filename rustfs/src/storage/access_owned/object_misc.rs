@@ -21,29 +21,46 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_misc.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 //!
-//! DeleteObject: the caller loads the bucket generation before the decision and installs the guard
-//! returned; the decisions its use case adds afterwards (`ReplicateDelete`, every descendant of a
-//! recursive force delete) are not here.
+//! DeleteObject: the decisions its use case adds afterwards (`ReplicateDelete`, every descendant of
+//! a recursive force delete) are not here.
 
 use crate::storage::ReplicationStatusType;
+#[cfg(test)]
+use crate::storage::access::wait_for_object_generation_test_hook;
 use crate::storage::access::{
     AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, S3Error, S3ErrorCode, S3Result,
-    audit_request_denial, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
-    invalid_force_delete_header, missing_req_info_error, recursive_force_delete_has_authenticated_caller, s3_error,
+    ServerContextSlot, audit_request_denial, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
+    invalid_force_delete_header, load_bucket_generation, missing_req_info_error, recursive_force_delete_has_authenticated_caller,
+    s3_error,
 };
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::options::destination_version_id;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, force_delete_header};
 
+/// DeleteObject's authorization on either edge: the bucket generation is loaded before the
+/// decision, and the guard it becomes is installed for the use case after an allow.
+pub(crate) async fn authorize_delete_object<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    #[cfg(test)]
+    wait_for_object_generation_test_hook(bucket).await;
+    let guard = decide_delete_object(req, bucket, key, version_id, bucket_generation).await?;
+    req.install_pending_delete_bucket_generation(guard);
+    Ok(())
+}
+
 /// DeleteObject's decision, in the legacy order: `NoSuchBucket` before policy, then
 /// `DeleteObject[Version]` for the version storage deletes (a replica delete names it through its
 /// source-version header), `ForceDeleteObject` for a force delete, the authenticated-caller rule
 /// for a recursive force delete, and `BypassGovernanceRetention` when the header asks for it.
-///
-/// `bucket_generation` is the bucket's generation as loaded before the decision; the guard it
-/// becomes is returned for the caller to install.
-pub(crate) async fn authorize_delete_object<R: AuthorizationRequest + ?Sized>(
+/// Returns the guard `bucket_generation` becomes.
+async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     bucket: &str,
     key: &str,

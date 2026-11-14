@@ -93,15 +93,15 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod list {
-        pub(crate) use super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
+        pub(crate) use super::super::storage_contracts::ListOperations;
     }
 
     pub(crate) mod multipart {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
+        pub(crate) use super::super::storage_contracts::ListPartsInfo;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartInfo, MultipartOperations, PartInfo};
-        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -148,10 +148,11 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::access_owned;
+    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
         AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
-        resolve_req_info,
+        authorize_object_request, resolve_req_info,
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
@@ -173,7 +174,7 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::authorize_create_bucket;
+    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::{
         AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo,
         RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
@@ -383,20 +384,9 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
-
-        pub(crate) mod contract {
-            pub(crate) mod list {
-                pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
-            }
-        }
-
-        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
-
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod common {
@@ -406,18 +396,16 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod multipart {
         pub(crate) use super::super::super::s3_api::multipart::{
-            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+            parse_upload_part_number,
         };
 
         pub(crate) mod contract {
             pub(crate) mod multipart {
-                pub(crate) use super::super::super::super::contract::multipart::{
-                    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
-                };
+                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
 
                 #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};
+                pub(crate) use super::super::super::super::contract::multipart::PartInfo;
             }
         }
 
@@ -821,6 +809,7 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
+pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;

@@ -15,15 +15,22 @@
 //! Both request forms through the one decision: the same answer and the same state handed on
 //! (the caller's `ReqInfo` and the guard), allowed and refused.
 
-use super::authorize_delete_object;
+use super::decide_delete_object;
 use crate::app::RequestEnvelope;
 use crate::storage::access::{
     AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, ReqInfo, S3Error, S3ErrorCode, S3Request,
     S3Result,
 };
-use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
+use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+use crate::storage::storage_api::runtime_sources_consumer::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+use rustfs_iam::store::{Store as _, UserType};
+use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_kms::KmsServiceManager;
+use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+use rustfs_policy::policy::Policy;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_SOURCE_VERSION_ID, insert_header};
+use serial_test::serial;
 use std::sync::Arc;
 
 const BUCKET: &str = "e2-delete-parity";
@@ -40,7 +47,7 @@ struct Case {
 }
 
 /// What an allowed decision hands on: the version it authorized and whether the guard is ready.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Handed {
     version_id: Option<String>,
     guard_ready: bool,
@@ -184,16 +191,34 @@ fn request(case: &Case, server_ctx: &Arc<ServerContextSlot>) -> S3Request<()> {
     }
 }
 
-async fn decide<R: AuthorizationRequest + ?Sized>(req: &mut R, case: &Case) -> Result<Handed, S3ErrorCode> {
-    let guard = authorize_delete_object(req, BUCKET, "key", case.query_version, (case.generation)())
+async fn decide<R: AuthorizationRequest + ?Sized>(req: &mut R, bucket: &str, case: &Case) -> Result<Handed, S3ErrorCode> {
+    let guard = decide_delete_object(req, bucket, "key", case.query_version, (case.generation)())
         .await
         .map_err(|error| error.code().clone())?;
     let info = req.req_info().expect("an allowed decision keeps the caller");
-    assert_eq!((info.bucket.as_deref(), info.object.as_deref()), (Some(BUCKET), Some("key")));
+    assert_eq!((info.bucket.as_deref(), info.object.as_deref()), (Some(bucket), Some("key")));
     Ok(Handed {
         version_id: info.version_id.clone(),
         guard_ready: matches!(guard, PendingDeleteBucketGenerationGuard::Ready(_)),
     })
+}
+
+/// Runs every case in both request forms; one run names every case a defect breaks.
+async fn assert_cases(cases: Vec<Case>, bucket: &str, server_ctx: &Arc<ServerContextSlot>) {
+    let mut wrong = Vec::new();
+    for case in cases {
+        let mut legacy = request(&case, server_ctx);
+        let mut envelope = RequestEnvelope::from_s3s(&legacy);
+        for (form, answer) in [
+            ("legacy request", decide(&mut legacy, bucket, &case).await),
+            ("envelope", decide(&mut envelope, bucket, &case).await),
+        ] {
+            if answer != case.expected {
+                wrong.push(format!("{} ({form}): {answer:?}", case.name));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
@@ -202,20 +227,171 @@ fn both_request_forms_decide_and_hand_on_the_same() {
         let context = crate::app::gating_test_env::shared_gating_ambient().await;
         let server_ctx = ServerContextSlot::new();
         assert!(server_ctx.install(Arc::clone(&context)));
-        // Every case runs, so one run names every case a defect breaks.
-        let mut wrong = Vec::new();
-        for case in cases() {
-            let mut legacy = request(&case, &server_ctx);
-            let mut envelope = RequestEnvelope::from_s3s(&legacy);
-            for (form, answer) in [
-                ("legacy request", decide(&mut legacy, &case).await),
-                ("envelope", decide(&mut envelope, &case).await),
-            ] {
-                if answer != case.expected {
-                    wrong.push(format!("{} ({form}): {answer:?}", case.name));
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_cases(cases(), BUCKET, &server_ctx).await;
     });
+}
+
+const FORCE: (&str, &str) = ("x-rustfs-force-delete", "true");
+const BYPASS: (&str, &str) = ("x-amz-bypass-governance-retention", "true");
+
+/// A caller allowed `s3:DeleteObject` but not the action a header adds is refused that action;
+/// the caller allowed both is served.
+#[tokio::test]
+#[serial]
+async fn the_actions_a_header_adds_are_decided_for_the_caller() {
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    ObjectStore::new(Arc::clone(&store))
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("seed IAM format");
+    let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+    let mut callers = Vec::new();
+    for (user, actions) in [
+        ("e2-delete-only", r#""s3:DeleteObject""#),
+        ("e2-delete-force", r#""s3:DeleteObject","s3:ForceDeleteObject""#),
+        ("e2-delete-bypass", r#""s3:DeleteObject","s3:BypassGovernanceRetention""#),
+    ] {
+        iam.create_user(
+            user,
+            &AddOrUpdateUserReq {
+                secret_key: format!("{user}-secret-key"),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create IAM user");
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":[{actions}],"Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+        );
+        iam.set_policy(user, Policy::parse_config(policy.as_bytes()).expect("parse policy"))
+            .await
+            .expect("store policy");
+        iam.policy_db_set(user, UserType::Reg, false, user)
+            .await
+            .expect("attach policy");
+        let credentials = iam.get_user(user).await.expect("load IAM user").credentials;
+        callers.push(ReqInfo {
+            cred: Some(credentials),
+            ..Default::default()
+        });
+    }
+    let server_ctx = ServerContextSlot::new();
+    assert!(server_ctx.install(Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)))));
+    let [delete_only, delete_force, delete_bypass] = <[ReqInfo; 3]>::try_from(callers).expect("three callers");
+    let served = Ok(Handed {
+        version_id: None,
+        guard_ready: true,
+    });
+    type Headers = &'static [(&'static str, &'static str)];
+    let case = |name: &'static str, headers: Headers, caller: &ReqInfo, expected: Result<Handed, S3ErrorCode>| Case {
+        name,
+        headers,
+        query_version: None,
+        caller: Some(caller.clone()),
+        generation: ready,
+        expected,
+    };
+    let cases = vec![
+        case(
+            "force delete without s3:ForceDeleteObject",
+            &[FORCE],
+            &delete_only,
+            Err(S3ErrorCode::AccessDenied),
+        ),
+        case("force delete with s3:ForceDeleteObject", &[FORCE], &delete_force, served.clone()),
+        case(
+            "bypass without s3:BypassGovernanceRetention",
+            &[BYPASS],
+            &delete_only,
+            Err(S3ErrorCode::AccessDenied),
+        ),
+        case("bypass with s3:BypassGovernanceRetention", &[BYPASS], &delete_bypass, served.clone()),
+        case("a plain delete needs neither", &[], &delete_only, served),
+    ];
+    assert_cases(cases, BUCKET, &server_ctx).await;
+}
+
+/// A recursive force delete needs an authenticated caller, even where a bucket policy grants an
+/// anonymous one both actions; a replica request is exempt.
+#[test]
+fn a_recursive_force_delete_by_an_anonymous_caller_needs_a_replica_request() {
+    crate::app::gating_test_env::run_large_stack_test("e2-delete-object-anonymous-force", || async {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let bucket = format!("e2-delete-public-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the public bucket");
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket).await.expect("bucket metadata")).clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy).expect("parse bucket policy"));
+        metadata.policy_config_json = policy.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("publish bucket policy");
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(store, Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let served = Ok(Handed {
+            version_id: None,
+            guard_ready: true,
+        });
+        type Headers = &'static [(&'static str, &'static str)];
+        let case = |name: &'static str, headers: Headers, expected: Result<Handed, S3ErrorCode>| Case {
+            name,
+            headers,
+            query_version: None,
+            caller: anonymous(),
+            generation: ready,
+            expected,
+        };
+        // A replica delete is decided for its source version (`request` always sends one).
+        let replica = Ok(Handed {
+            version_id: Some(SOURCE_VERSION.to_owned()),
+            guard_ready: true,
+        });
+        let cases = vec![
+            case("an anonymous recursive force delete", &[FORCE], Err(S3ErrorCode::AccessDenied)),
+            case("an anonymous replica recursive force delete", &[FORCE, REPLICA], replica),
+            case("an anonymous plain delete the bucket policy grants", &[], served),
+        ];
+        assert_cases(cases, &bucket, &server_ctx).await;
+    });
+}
+
+struct ReadyIam(Arc<IamSys<ObjectStore>>);
+
+impl IamInterface for ReadyIam {
+    fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+        Arc::clone(&self.0)
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+struct UnreadyIam;
+
+impl IamInterface for UnreadyIam {
+    fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+        panic!("a bucket-policy decision does not resolve IAM")
+    }
+
+    fn is_ready(&self) -> bool {
+        false
+    }
+}
+
+struct TestKms;
+
+impl KmsInterface for TestKms {
+    fn handle(&self) -> Arc<KmsServiceManager> {
+        Arc::new(KmsServiceManager::new())
+    }
 }

@@ -20,7 +20,6 @@
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::FS;
-use crate::app::storage_api::owned_parity::authorize_create_bucket;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
 use crate::app::storage_api::owned_parity::{
@@ -28,6 +27,7 @@ use crate::app::storage_api::owned_parity::{
     RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
     TableDataPlanePublicationGuards,
 };
+use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
     ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, PutObjectInput, S3Access, S3ErrorCode, S3Request, Tag,
@@ -534,9 +534,11 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
         .expect("dropping the request must release its publication guard");
 }
 
-#[tokio::test]
-#[serial]
-async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() {
+/// A server context whose IAM holds one user under `policy`, and that user's credentials. The
+/// temporary directory keeps the store alive for the test.
+async fn server_with_one_policy_user(
+    policy: &[u8],
+) -> (tempfile::TempDir, Arc<ServerContextSlot>, rustfs_credentials::Credentials) {
     use rustfs_iam::store::{Store as _, UserType};
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::Policy;
@@ -552,7 +554,7 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
         }
     }
 
-    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let (temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     ObjectStore::new(Arc::clone(&store))
         .save_iam_config(
             serde_json::json!({"version": 1}),
@@ -572,15 +574,9 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     )
     .await
     .expect("create IAM user");
-    iam.set_policy(
-        "location-create-policy",
-        Policy::parse_config(
-            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":["arn:aws:s3:::location-policy-bucket","arn:aws:s3:::location-lock-bucket"],"Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},{"Effect":"Allow","Action":["s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"arn:aws:s3:::location-lock-bucket"}]}"#,
-        )
-        .expect("parse location policy"),
-    )
-    .await
-    .expect("store location policy");
+    iam.set_policy("location-create-policy", Policy::parse_config(policy).expect("parse location policy"))
+        .await
+        .expect("store location policy");
     iam.policy_db_set(access_key, UserType::Reg, false, "location-create-policy")
         .await
         .expect("attach location policy");
@@ -588,6 +584,16 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
     let slot = ServerContextSlot::new();
     assert!(slot.install(context), "install request context");
+    (temp_dir, slot, credentials)
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() {
+    let (_temp_dir, slot, credentials) = server_with_one_policy_user(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:CreateBucket","Resource":["arn:aws:s3:::location-policy-bucket","arn:aws:s3:::location-lock-bucket"],"Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},{"Effect":"Allow","Action":["s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"arn:aws:s3:::location-lock-bucket"}]}"#,
+    )
+    .await;
 
     for (region, allowed) in [("eu-west-1", true), ("us-west-2", false)] {
         let mut legacy = build_request(
@@ -676,6 +682,54 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
         assert_eq!(handed_on(legacy.extensions.get::<ReqInfo>()), Some(bucket.to_owned()), "{case}");
         assert_eq!(handed_on(owned.req_info()), Some(bucket.to_owned()), "{case}");
         assert_eq!(legacy.headers, *owned.headers(), "{case}");
+    }
+}
+
+/// DeleteBucket, legacy hook against the owned function: `s3:ForceDeleteBucket` is asked whenever
+/// a force-delete header is present, `false` included, and an unparsable value is refused only
+/// after `s3:DeleteBucket` allowed the caller. Same decision, same bucket handed on, both ways.
+#[tokio::test]
+#[serial]
+async fn owned_and_legacy_delete_bucket_authorization_agree() {
+    let (_temp_dir, slot, credentials) = server_with_one_policy_user(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:DeleteBucket","Resource":["arn:aws:s3:::plain-delete-bucket","arn:aws:s3:::force-delete-bucket"]},{"Effect":"Allow","Action":"s3:ForceDeleteBucket","Resource":"arn:aws:s3:::force-delete-bucket"}]}"#,
+    )
+    .await;
+    let fs = FS::with_server_ctx(Arc::clone(&slot));
+    for (bucket, header, refusal) in [
+        ("plain-delete-bucket", None, None),
+        ("plain-delete-bucket", Some(("x-rustfs-force-delete", "false")), Some("AccessDenied")),
+        ("plain-delete-bucket", Some(("x-minio-force-delete", "true")), Some("AccessDenied")),
+        ("plain-delete-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("InvalidRequest")),
+        ("other-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("AccessDenied")),
+        ("force-delete-bucket", Some(("x-rustfs-force-delete", "true")), None),
+    ] {
+        let mut legacy = build_request(
+            crate::app::storage_api::s3::dto::DeleteBucketInput {
+                bucket: bucket.to_owned(),
+                ..Default::default()
+            },
+            Method::DELETE,
+        );
+        if let Some((name, value)) = header {
+            legacy.headers.insert(name, HeaderValue::from_static(value));
+        }
+        legacy.extensions.insert(Arc::clone(&slot));
+        legacy.extensions.insert(ReqInfo {
+            cred: Some(credentials.clone()),
+            ..Default::default()
+        });
+        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+
+        let legacy_result = fs.delete_bucket(&mut legacy).await;
+        let owned_result = authorize_delete_bucket(&mut owned, bucket).await;
+
+        let case = format!("{bucket} {header:?}");
+        assert_eq!(legacy_result.as_ref().err().map(|error| error.code().as_str()), refusal, "legacy: {case}");
+        assert_eq!(owned_result.as_ref().err().map(|error| error.code().as_str()), refusal, "owned: {case}");
+        let handed_on = |req_info: Option<&ReqInfo>| req_info.and_then(|info| info.bucket.clone());
+        assert_eq!(handed_on(legacy.extensions.get::<ReqInfo>()), Some(bucket.to_owned()), "{case}");
+        assert_eq!(handed_on(owned.req_info()), Some(bucket.to_owned()), "{case}");
     }
 }
 

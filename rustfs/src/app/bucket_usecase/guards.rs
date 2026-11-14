@@ -35,7 +35,11 @@ fn bucket_create_and_delete_use_admitted_fresh_tasks() {
             "bucket creation",
             "execute_create_bucket_inner(envelope, input, mutation_permit).await",
         ),
-        ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
+        (
+            "execute_delete_bucket",
+            "bucket deletion",
+            "execute_delete_bucket_inner(envelope, input).await",
+        ),
     ] {
         let body = usecase_method_source(source, method);
         assert!(
@@ -82,11 +86,13 @@ fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
             body.contains(operation),
             "{method} should identify the bucket metadata operation in reload logs"
         );
-        let expected_reload = format!(
-            "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
-        );
+        let expected_reload = |bucket| {
+            format!(
+                "notify_bucket_metadata_reload({bucket}, \"{operation}\", request_context, {scanner_maintenance_change}).await;"
+            )
+        };
         assert!(
-            body.contains(&expected_reload),
+            body.contains(&expected_reload("bucket.clone()")) || body.contains(&expected_reload("bucket.to_owned()")),
             "{method} should propagate scanner_maintenance_change={scanner_maintenance_change}"
         );
     }

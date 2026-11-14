@@ -90,10 +90,10 @@ fn single_rule(method: &str, origin: &str) -> CorsConfiguration {
 
 /// Records the status of the one response a request receives.
 #[derive(Clone, Debug, Default)]
-struct StatusCapture(Arc<Mutex<Option<u16>>>);
+pub(super) struct StatusCapture(Arc<Mutex<Option<u16>>>);
 
 impl StatusCapture {
-    fn take(&self) -> Option<u16> {
+    pub(super) fn take(&self) -> Option<u16> {
         self.0.lock().ok().and_then(|mut slot| slot.take())
     }
 }

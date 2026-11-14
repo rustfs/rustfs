@@ -326,11 +326,13 @@ pub(crate) mod runtime_sources {
 pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+    pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
-        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_copy_object_tags, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
-        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        AuthorizationRequest, PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
+        TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+        apply_copy_source_bucket_generation_guard, authorize_copy_object_tags, authorize_request,
+        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
         retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
@@ -1690,9 +1692,8 @@ pub(crate) mod timeout_wrapper {
 pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
@@ -1700,8 +1701,8 @@ pub(crate) mod s3_api {
 
     pub(crate) mod multipart {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::{
-            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+            parse_upload_part_number,
         };
     }
 
@@ -1798,6 +1799,17 @@ pub(crate) mod object_usecase {
     };
 }
 
+pub(crate) mod object_meta_usecase {
+    pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::{BucketOperations, BucketOptions, ObjectOperations};
+    }
+
+    pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::decode_tags as decode_stored_tags;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
+    pub(crate) use crate::storage::storage_api::parse_object_version_id;
+}
+
 pub(crate) mod multipart_usecase {
     pub(crate) mod contract {
         #[cfg(test)]
@@ -1849,7 +1861,7 @@ pub(crate) mod owned_parity {
         PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
         RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, SUPPRESSED_DENIALS_TAG,
         TableDataPlanePublicationGuards, authorization_denial_entry, authorization_denial_entry_for_view,
-        authorize_bucket_config_mutation, authorize_create_bucket, authorize_object_request,
+        authorize_bucket_config_mutation, authorize_create_bucket, authorize_delete_bucket, authorize_object_request,
         authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
         authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };

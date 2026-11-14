@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use self::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_objects_v2, prepare_table_data_plane_list_access,
+    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
 };
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
@@ -3125,21 +3125,10 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_bucket(&self, req: &mut S3Request<DeleteBucketInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
-
-        // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
-        // including the value `false`. Only a parsed `true` later skips the
-        // emptiness check. `s3:*` does not grant this action.
-        if force_delete_header(&req.headers)
-            .map_err(|_| invalid_force_delete_header())?
-            .is_some()
-        {
-            authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
-        }
-        Ok(())
+        let bucket = req.input.bucket.clone();
+        access_owned::bucket_core::authorize_delete_bucket(req, &bucket)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the DeleteBucketAnalyticsConfiguration request has accesses to the resources.
@@ -3265,29 +3254,21 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        #[cfg(test)]
-        wait_for_object_generation_test_hook(&bucket).await;
-        let key = req.input.key.clone();
-        let version_id = req.input.version_id.clone();
-        let guard = authorize_delete_object(req, &bucket, &key, version_id.as_deref(), bucket_generation).await?;
-        req.install_pending_delete_bucket_generation(guard);
-        Ok(())
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        authorize_delete_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
     }
 
     /// Checks whether the DeleteObjectTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object_tagging(&self, req: &mut S3Request<DeleteObjectTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_meta::authorize_object_tagging_request(
             req,
-            versioned_tagging_action(S3Action::DeleteObjectTaggingAction, req.input.version_id.as_deref()),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            S3Action::DeleteObjectTaggingAction,
         )
         .await
     }
@@ -3404,10 +3385,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_location(&self, req: &mut S3Request<GetBucketLocationInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketLocationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketLocationAction)).await
     }
 
     /// Checks whether the GetBucketLogging request has accesses to the resources.
@@ -3597,14 +3576,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_tagging(&self, req: &mut S3Request<GetObjectTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_meta::authorize_object_tagging_request(
             req,
-            versioned_tagging_action(S3Action::GetObjectTaggingAction, req.input.version_id.as_deref()),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            S3Action::GetObjectTaggingAction,
         )
         .await
     }
@@ -3710,14 +3688,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_multipart_uploads(&self, req: &mut S3Request<ListMultipartUploadsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await?;
-        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketMultipartUploadsAction).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        Ok(authorize_list_multipart_uploads(self.server_ctx(), req, &bucket).await?)
     }
 
     /// Checks whether the `ListObjectVersions` request is authorized for the requested bucket.
@@ -7688,7 +7659,7 @@ mod tests {
         assert_eq!(opts.expected_bucket_incarnation_id, Some(captured_incarnation_id));
 
         let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context))
-            .execute_delete_object(req)
+            .execute_delete_object_from_s3s(req)
             .await
             .expect_err("the old authorization must not delete from the recreated bucket");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
