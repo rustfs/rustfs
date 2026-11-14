@@ -51,5 +51,6 @@ fn store_uninitialized_premise_holds() -> bool {
 mod bucket_access;
 mod bucket_replication_lifecycle;
 mod listing_multipart;
+mod object_commit;
 mod object_meta;
 mod object_read;
