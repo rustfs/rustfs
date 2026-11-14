@@ -281,14 +281,7 @@ impl DefaultMultipartUsecase {
         let (server_side_encryption, ssekms_key_id) = if has_ssec || preserve_ciphertext {
             (None, None)
         } else {
-            let sse = fi
-                .user_defined
-                .get("x-amz-server-side-encryption")
-                .map(|s| {
-                    ServerSideEncryption::from_str(s)
-                        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid server-side encryption: {e}"))))
-                })
-                .transpose()?;
+            let sse = fi.user_defined.get("x-amz-server-side-encryption").cloned();
             let key_id = match sse.as_ref() {
                 Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => fi
                     .user_defined
@@ -422,7 +415,7 @@ impl DefaultMultipartUsecase {
         let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
 
         let output = UploadPartOutput {
-            server_side_encryption: requested_sse,
+            server_side_encryption: requested_sse.map(ServerSideEncryption::from),
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,

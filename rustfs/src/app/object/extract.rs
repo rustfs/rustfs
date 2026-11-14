@@ -2069,7 +2069,9 @@ impl DefaultObjectUsecase {
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
-        let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let original_sse = server_side_encryption
+            .map(|value| value.as_str().to_owned())
+            .or(extract_server_side_encryption_from_headers(&req.headers)?);
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
@@ -2084,7 +2086,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
         validate_sse_headers_for_write(
-            effective_sse.as_ref(),
+            effective_sse.as_deref(),
             effective_kms_key_id.as_ref(),
             extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),

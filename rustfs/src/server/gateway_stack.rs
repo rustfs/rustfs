@@ -27,7 +27,7 @@
 //! RustFS's own layers stay in front of the gateway and the gateway's counterparts stay off
 //! (rustfs/backlog#2771): CORS is answered by `ConditionalCorsLayer`, so no CORS source is
 //! installed and the gateway writes no CORS header; the SSE-C transport layer runs first and the
-//! gateway's own strict gate stays behind it; and the request identifier is the one
+//! gateway gate follows the same deployment setting; and the request identifier is the one
 //! `ExternalRequestContextLayer` assigned, handed over as the gateway's `HostRequestId`, so an
 //! answer and RustFS's logs name a request identically.
 //!
@@ -55,15 +55,16 @@ compile_error!("gateway-stack is restricted to debug builds");
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
-use crate::server::ssec_transport::is_secure_transport;
+use crate::server::ssec_transport::{is_secure_transport, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr,
-    DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces, RegionSet,
-    RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity, decide_with,
+    DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
+    PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
+    TransportSecurity, decide_with,
 };
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource, host_request_id,
@@ -149,6 +150,20 @@ impl GatewayStack {
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
+        let builder = Self::configured_builder(&assembly, iam, root, authorizer)?;
+        let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
+        let service = register(OPERATIONS, builder, &backend)
+            .build()
+            .map_err(GatewayAssemblyError::Service)?;
+        Ok(Self { service })
+    }
+
+    fn configured_builder(
+        assembly: &GatewayAssembly,
+        iam: Arc<dyn IamKeyLookup>,
+        root: Arc<dyn RootSource>,
+        authorizer: impl Authorizer,
+    ) -> Result<ServiceBuilder, GatewayAssemblyError> {
         // The pinned gateway admits a request that carries only `X-Auth-Token` as anonymous and
         // runs no authenticator for it, while the RustFS code behind the gateway reads the
         // Keystone identity: the request would be authorized as one caller and served as
@@ -165,8 +180,6 @@ impl GatewayStack {
             region: region.to_owned(),
         })?;
         let hosts = rustfs_host_resolver(&assembly.server_domains).map_err(GatewayAssemblyError::ServerDomains)?;
-        let backend = Arc::new(GatewayBackend::new(Arc::clone(&assembly.server_ctx)));
-
         // Every legacy RustFS reading of a request, a credential scope and an answer, in the
         // gateway's one reviewable preset; its other half is on the authenticator.
         let credentials = Arc::new(IamCredentials::new(iam, root));
@@ -175,17 +188,19 @@ impl GatewayStack {
             .authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile())
             .authorizer(authorizer)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
-            // The outer SSE-C transport layer answers first; the gateway's own gate stays strict
-            // behind it.
-            .sse_config(SseConfig::strict())
+            // Both gates follow the deployment setting; transport facts remain per request.
+            .sse_config(if require_tls() {
+                SseConfig::strict()
+            } else {
+                SseConfig::allowing_customer_keys_over_plaintext(
+                    PlaintextCustomerKeyAck::i_understand_customer_keys_will_be_sent_in_the_clear(),
+                )
+            })
             .host_resolver(hosts)
             // The fallback only: `attach_host_facts` hands RustFS's own identifier over.
             .trace_source(MintedTraces::with_uuid_request_ids());
         let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout));
-        let service = register(OPERATIONS, builder, &backend)
-            .build()
-            .map_err(GatewayAssemblyError::Service)?;
-        Ok(Self { service })
+        Ok(builder)
     }
 
     /// Answers one request on the gateway stack, with the host's facts attached.
