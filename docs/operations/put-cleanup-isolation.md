@@ -193,3 +193,11 @@ The 1024 PUT admission limit includes uploading requests and detached owners;
 it is an object-count bound, not a memory or byte budget. The older deferred queue
 remains optional and disabled by default; its overflow path cannot bypass the
 new coordinator or disk limits. No unbounded foreground fallback is introduced.
+
+## Experimental file-sync follower timeout
+
+`RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE` enables file-sync grouping and defaults to `false`. `RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS` controls the batch collection window, defaults to `0`, and is capped at `1000` microseconds. `RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS` controls how long a follower waits before trying to leave a queued batch. It defaults to `0` (disabled) and is capped at `1000` microseconds. Configure these process-lifetime settings before startup.
+
+After its deadline, a follower can atomically take ownership of its queued files and resource unit. It then executes file sync through the existing per-disk and global limits, followed by source-directory fsync in the normal caller. The original batch loses those paths before the follower can publish its data directory. A worker that has already claimed the batch retains exclusive ownership, and the follower waits for that worker's result. The timeout therefore bounds queued batching delay; disk admission and native sync can take longer. Cancellation retains the existing native-work resource lifetime and worker cleanup guarantees.
+
+With detailed PUT metrics enabled, a successful queue ownership transfer adds a `follower_timeout` role sample to `rustfs_s3_put_object_rename_fdatasync_group_wait_ms`. Evaluate the experiment against the same source, durability setting, topology, and workload. Include sync failures, follower publication before batch completion, cancellation, and peak resource usage in acceptance.
