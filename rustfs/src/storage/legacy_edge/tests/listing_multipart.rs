@@ -95,3 +95,144 @@ fn list_apis_report_storage_read_quorum_as_unavailable() {
         }
     });
 }
+
+/// The legacy edge writes the stored values the use case answers raw the way legacy RustFS wrote
+/// them: each key and rolled-up prefix percent-encoded segment by segment for exactly `url`, raw for
+/// any other value or none, and every entity tag XML-escaped for the legacy encoder.
+#[test]
+fn listing_entries_are_encoded_per_segment_only_for_url_and_tags_are_escaped() {
+    use super::super::listing_multipart::legacy_listing_entries;
+    let (key, prefix) = ("dir a/file+b%.txt", "prefix a/sub+");
+    for (encoding, expected_key, expected_prefix) in [
+        (
+            Some(EncodingType::from_static(EncodingType::URL)),
+            "dir%20a/file%2Bb%25.txt",
+            "prefix%20a/sub%2B",
+        ),
+        (Some(EncodingType::from("URL".to_owned())), key, prefix),
+        (None, key, prefix),
+    ] {
+        let mut contents = Some(vec![Object {
+            key: Some(key.to_owned()),
+            e_tag: Some(ETag::Strong("</ETag><Key>victim</Key>&amp;".to_owned())),
+            ..Default::default()
+        }]);
+        let mut common_prefixes = Some(vec![CommonPrefix {
+            prefix: Some(prefix.to_owned()),
+        }]);
+
+        legacy_listing_entries(&mut contents, &mut common_prefixes, encoding.as_ref());
+
+        let object = &contents.as_deref().expect("contents")[0];
+        assert_eq!(object.key.as_deref(), Some(expected_key), "{encoding:?}");
+        assert_eq!(
+            object.e_tag,
+            Some(ETag::Strong("&lt;/ETag&gt;&lt;Key&gt;victim&lt;/Key&gt;&amp;amp;".to_owned()))
+        );
+        assert_eq!(common_prefixes.as_deref().expect("prefixes")[0].prefix.as_deref(), Some(expected_prefix));
+    }
+}
+
+/// Every key-shaped member of a version listing is encoded as legacy RustFS encodes it, for
+/// exactly `url`; the version id markers never are; entity tags are escaped.
+#[test]
+fn version_listings_encode_every_key_shaped_member_only_for_url() {
+    use super::super::listing_multipart::legacy_list_object_versions;
+    let raw = |value: &str| Some(value.to_owned());
+    for (encoding, encoded) in [(Some(EncodingType::from_static(EncodingType::URL)), true), (None, false)] {
+        let mut output = ListObjectVersionsOutput {
+            prefix: raw("logs and more/"),
+            delimiter: raw("/"),
+            key_marker: raw("logs and more/start marker"),
+            next_key_marker: raw("logs and more/next marker"),
+            version_id_marker: raw("version marker"),
+            next_version_id_marker: raw("next version"),
+            versions: Some(vec![ObjectVersion {
+                key: raw("logs and more/file name.txt"),
+                e_tag: Some(ETag::Strong("<a>".to_owned())),
+                ..Default::default()
+            }]),
+            delete_markers: Some(vec![DeleteMarkerEntry {
+                key: raw("logs and more/delete marker.txt"),
+                ..Default::default()
+            }]),
+            common_prefixes: Some(vec![CommonPrefix {
+                prefix: raw("logs and more/sub prefix/"),
+            }]),
+            ..Default::default()
+        };
+
+        legacy_list_object_versions(&mut output, encoding.as_ref());
+
+        let expect = |value: &str| {
+            if encoded {
+                value.replace(' ', "%20")
+            } else {
+                value.to_owned()
+            }
+        };
+        assert_eq!(output.prefix, Some(expect("logs and more/")));
+        assert_eq!(output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.key_marker, Some(expect("logs and more/start marker")));
+        assert_eq!(output.next_key_marker, Some(expect("logs and more/next marker")));
+        assert_eq!(output.version_id_marker.as_deref(), Some("version marker"));
+        assert_eq!(output.next_version_id_marker.as_deref(), Some("next version"));
+        let version = &output.versions.as_deref().expect("versions")[0];
+        assert_eq!(version.key, Some(expect("logs and more/file name.txt")));
+        assert_eq!(version.e_tag, Some(ETag::Strong("&lt;a&gt;".to_owned())));
+        assert_eq!(
+            output.delete_markers.as_deref().expect("markers")[0].key,
+            Some(expect("logs and more/delete marker.txt"))
+        );
+        assert_eq!(
+            output.common_prefixes.as_deref().expect("prefixes")[0].prefix,
+            Some(expect("logs and more/sub prefix/"))
+        );
+    }
+}
+
+/// The upload listing's key-shaped members are encoded for exactly `url`; upload ids never are.
+#[test]
+fn upload_listings_encode_key_shaped_members_only_for_url() {
+    use super::super::listing_multipart::legacy_list_multipart_uploads;
+    let raw = |value: &str| Some(value.to_owned());
+    for (encoding, encoded) in [(Some(EncodingType::from_static(EncodingType::URL)), true), (None, false)] {
+        let mut output = ListMultipartUploadsOutput {
+            prefix: raw("dir a/"),
+            delimiter: raw("/"),
+            key_marker: raw("dir a/start+1"),
+            next_key_marker: raw("dir a/next+1"),
+            upload_id_marker: raw("upload+id%"),
+            next_upload_id_marker: raw("next+id%"),
+            uploads: Some(vec![MultipartUpload {
+                key: raw("dir a/file%"),
+                upload_id: raw("upload+id%"),
+                ..Default::default()
+            }]),
+            common_prefixes: Some(vec![CommonPrefix {
+                prefix: raw("dir a/sub/"),
+            }]),
+            ..Default::default()
+        };
+
+        legacy_list_multipart_uploads(&mut output, encoding.as_ref());
+
+        let expect = |value: &str| {
+            if encoded {
+                value.replace('%', "%25").replace(' ', "%20").replace('+', "%2B")
+            } else {
+                value.to_owned()
+            }
+        };
+        assert_eq!(output.prefix, Some(expect("dir a/")));
+        assert_eq!(output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.key_marker, Some(expect("dir a/start+1")));
+        assert_eq!(output.next_key_marker, Some(expect("dir a/next+1")));
+        assert_eq!(output.upload_id_marker.as_deref(), Some("upload+id%"));
+        assert_eq!(output.next_upload_id_marker.as_deref(), Some("next+id%"));
+        let upload = &output.uploads.as_deref().expect("uploads")[0];
+        assert_eq!(upload.key, Some(expect("dir a/file%")));
+        assert_eq!(upload.upload_id.as_deref(), Some("upload+id%"));
+        assert_eq!(output.common_prefixes.as_deref().expect("prefixes")[0].prefix, Some(expect("dir a/sub/")));
+    }
+}

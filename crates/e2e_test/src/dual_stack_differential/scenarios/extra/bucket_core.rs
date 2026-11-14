@@ -47,4 +47,26 @@ pub(super) async fn cases(s: &mut Recorder, c: &Client) {
         s.step("CreateBucket", case, c.create_bucket().bucket(name).send(), none)
             .await;
     }
+    for (case, bucket, header) in FORCE_DELETES {
+        // Each case deletes a bucket of its own; the create is setup, not a recorded step.
+        let _ = c.create_bucket().bucket(bucket).send().await;
+        let delete = c
+            .delete_bucket()
+            .bucket(bucket)
+            .customize()
+            .mutate_request(move |request| {
+                request.headers_mut().insert(header.0, header.1);
+            })
+            .send();
+        s.step("DeleteBucket", case, delete, none).await;
+    }
 }
+
+/// Force-delete headers under both spellings, with values each parser reads differently.
+const FORCE_DELETES: [(&str, &str, (&str, &str)); 5] = [
+    ("force-rustfs-true", "dual-stack-force-a", ("x-rustfs-force-delete", "true")),
+    ("force-rustfs-invalid", "dual-stack-force-b", ("x-rustfs-force-delete", "maybe")),
+    ("force-minio-true", "dual-stack-force-c", ("x-minio-force-delete", "true")),
+    ("force-minio-numeric", "dual-stack-force-d", ("x-minio-force-delete", "1")),
+    ("force-minio-invalid", "dual-stack-force-e", ("x-minio-force-delete", "maybe")),
+];

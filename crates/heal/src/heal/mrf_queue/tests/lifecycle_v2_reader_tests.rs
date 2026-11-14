@@ -234,6 +234,7 @@ async fn check_reader_restart(version: u8) {
             after: None,
             limit: 3,
             response,
+            _permit: crate::heal::mrf_queue::management::read_permit().expect("MRF management read permit"),
         })
         .await
         .expect("query the real consumer after its startup replay");

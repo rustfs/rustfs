@@ -93,15 +93,15 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod list {
-        pub(crate) use super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
+        pub(crate) use super::super::storage_contracts::ListOperations;
     }
 
     pub(crate) mod multipart {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
+        pub(crate) use super::super::storage_contracts::ListPartsInfo;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartInfo, MultipartOperations, PartInfo};
-        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -148,9 +148,11 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::access_owned;
+    pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
-        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_request, resolve_req_info,
+        AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
+        authorize_object_request, resolve_req_info,
     };
     pub(crate) use super::super::access::{
         AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
@@ -172,12 +174,13 @@ pub(crate) mod access_consumer {
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
-    pub(crate) use super::super::access::access_owned::bucket_core::authorize_create_bucket;
+    pub(crate) use super::super::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
     pub(crate) use super::super::access::{
         AuthorizationRequest, ObjectTagConditions, PostObjectPolicyHeaders, PostObjectRequestMarker, ReqInfo,
         RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
         RequestedObjectTags, TableDataPlanePublicationGuards, authorize_bucket_config_mutation, authorize_object_request,
-        authorize_request, bucket_config_mutation_incarnation, parity_test_support,
+        authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+        authorize_write_etag_condition, bucket_config_mutation_incarnation, parity_test_support, replication_request_authorized,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
     pub(crate) use super::super::ecfs::FS;
@@ -381,20 +384,9 @@ pub(crate) mod heal_control_startup_consumer {
 pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
-            ListObjectVersionsParams, ListObjectsV2Params, build_list_object_versions_output, build_list_objects_output,
-            build_list_objects_v2_output, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
-
-        pub(crate) mod contract {
-            pub(crate) mod list {
-                pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
-            }
-        }
-
-        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
-
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod common {
@@ -404,18 +396,16 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod multipart {
         pub(crate) use super::super::super::s3_api::multipart::{
-            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+            parse_upload_part_number,
         };
 
         pub(crate) mod contract {
             pub(crate) mod multipart {
-                pub(crate) use super::super::super::super::contract::multipart::{
-                    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
-                };
+                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
 
                 #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};
+                pub(crate) use super::super::super::super::contract::multipart::PartInfo;
             }
         }
 
@@ -559,7 +549,7 @@ pub(crate) mod ecstore_disk {
         RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo,
         RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
         is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
-        with_remote_background_io,
+        validate_format_control_path, with_remote_background_io,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{
@@ -819,6 +809,7 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
+pub(crate) use super::ecfs::parse_object_version_id;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type EtagAlgorithm = ecstore_rio::EtagAlgorithm;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;

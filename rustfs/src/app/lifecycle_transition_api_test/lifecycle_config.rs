@@ -141,7 +141,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         Method::DELETE,
     );
 
-    Box::pin(usecase.execute_delete_object(req))
+    Box::pin(usecase.execute_delete_object_from_s3s(req))
         .await
         .expect("Failed to issue versioned delete after compensation-driven transition");
 
