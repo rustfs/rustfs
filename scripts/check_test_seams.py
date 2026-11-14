@@ -55,6 +55,7 @@ SEAMS = {
     "execute_get_object": Seam(
         batch="C",
         seam_file="rustfs/src/app/test_seams/get_object.rs",
+        entry_method="execute_get_object_fields",
         owners=(
             "rustfs/src/app/object/get.rs",
             "rustfs/src/app/object/head.rs",
@@ -392,7 +393,7 @@ def main(argv: list[str]) -> int:
 
 
 SEAM_BODY = {
-    "execute_get_object": "pub(crate) fn get_object(u: &U, r: R) -> F { u.execute_get_object(r) }\n",
+    "execute_get_object": "pub(crate) fn get_object(u: &U, r: R) -> F { u.execute_get_object_fields(r) }\n",
     "execute_head_object": "pub(crate) fn head_object(u: &U, r: R) -> F { u.execute_head_object_fields(r) }\n",
     "execute_list_objects_v2": "pub(crate) fn list_objects_v2(u: &U, r: R) -> F { u.execute_list_objects_v2(r) }\n",
     "execute_put_object": "pub(crate) fn put_object(u: &U, f: &Fs, r: R) -> F { u.execute_put_object(f, r) }\n",
@@ -431,6 +432,36 @@ class SelfTest(unittest.TestCase):
 
     def run_check(self) -> list[str]:
         return check(self.root, sorted(p for p in self.files if p.endswith(".rs")))
+
+    def test_external_get_fields_call_fails(self):
+        self.write("rustfs/src/app/storage.rs", "#[cfg(test)] fn t() { u.execute_get_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "test calls execute_get_object_fields directly")
+
+    def test_get_fields_seam_missing_call_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() {}")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_fields_seam_duplicate_call_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object_fields(r); u.execute_get_object_fields(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 2")
+
+    def test_get_seam_wrapper_instead_of_fields_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_seam_both_entries_fails(self):
+        self.write(SEAMS["execute_get_object"].seam_file, "fn get_object() { u.execute_get_object_fields(r); u.execute_get_object(r); }")
+        self.assertRegex(" ".join(self.run_check()), "must not call execute_get_object")
+
+    def test_commented_and_quoted_get_fields_calls_do_not_count(self):
+        self.write(SEAMS["execute_get_object"].seam_file, 'fn get_object() { let s = "u.execute_get_object_fields(r)"; /* u.execute_get_object_fields(r); */ }')
+        self.assertRegex(" ".join(self.run_check()), "must call execute_get_object_fields exactly once, found 0")
+
+    def test_get_owners_can_call_both_entries(self):
+        self.write("rustfs/src/app/object/get.rs", "#[cfg(test)] fn t() { u.execute_get_object(r); u.execute_get_object_fields(r); }")
+        self.assertEqual(self.run_check(), [])
+
+    # -- negative cases: each must fail --
 
     def test_external_head_fields_call_fails(self):
         self.write("rustfs/src/app/storage.rs", "#[cfg(test)] fn t() { u.execute_head_object_fields(r); }")
