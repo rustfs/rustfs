@@ -102,7 +102,9 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input.clone();
 
-        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let server_side_encryption = server_side_encryption
+            .map(|value| value.as_str().to_owned())
+            .or(extract_server_side_encryption_from_headers(&req.headers)?);
         let ssekms_key_id = ssekms_key_id.or_else(|| {
             req.headers
                 .get("x-amz-server-side-encryption-aws-kms-key-id")
@@ -301,7 +303,7 @@ impl DefaultMultipartUsecase {
             bucket: Some(bucket),
             key: Some(key),
             upload_id: Some(upload_id),
-            server_side_encryption: effective_sse,
+            server_side_encryption: effective_sse.map(Into::into),
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id,

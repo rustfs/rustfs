@@ -920,7 +920,7 @@ pub(super) struct PutObjectContentInput {
 
 /// Encryption inputs of a PUT after the S3 input/header merge.
 pub(super) struct PutObjectSseInput {
-    pub(super) server_side_encryption: Option<ServerSideEncryption>,
+    pub(super) server_side_encryption: Option<String>,
     pub(super) ssekms_key_id: Option<SSEKMSKeyId>,
     pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
     pub(super) sse_customer_key: Option<s3s::dto::SSECustomerKey>,
@@ -1102,7 +1102,7 @@ fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
 pub(super) struct PutObjectCommitted {
     pub(super) obj_info: ObjectInfo,
     pub(super) put_versioned: bool,
-    pub(super) effective_sse: Option<ServerSideEncryption>,
+    pub(super) effective_sse: Option<String>,
     pub(super) effective_kms_key_id: Option<SSEKMSKeyId>,
     pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
     pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
@@ -1281,7 +1281,9 @@ impl DefaultObjectUsecase {
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
         // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
-        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let server_side_encryption = server_side_encryption
+            .map(|value| value.as_str().to_owned())
+            .or(extract_server_side_encryption_from_headers(&req.headers)?);
 
         // Validate object key
         validate_new_object_key(&key, request_method_name)?;
@@ -1389,7 +1391,8 @@ impl DefaultObjectUsecase {
             server_side_encryption: committed
                 .effective_sse
                 .clone()
-                .filter(|_| committed.sse_customer_algorithm.is_none()),
+                .filter(|_| committed.sse_customer_algorithm.is_none())
+                .map(ServerSideEncryption::from),
             sse_customer_algorithm: committed.sse_customer_algorithm.clone(),
             sse_customer_key_md5: committed.sse_customer_key_md5.clone(),
             ssekms_key_id: committed.effective_kms_key_id.clone(),
@@ -1633,7 +1636,7 @@ impl DefaultObjectUsecase {
 
         // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
         validate_sse_headers_for_write(
-            effective_sse.as_ref(),
+            effective_sse.as_deref(),
             effective_kms_key_id.as_ref(),
             extract_ssekms_context_from_headers(headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
