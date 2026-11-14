@@ -60,7 +60,7 @@ A single local path (`rustfs D:\rustfs\data`) is a single-node single-drive depl
 | `RUSTFS_STORAGE_CLASS_STANDARD` | STANDARD parity as `EC:<n>` | Validated per pool; affects new writes only |
 | `RUSTFS_STORAGE_CLASS_RRS` | RRS parity as `EC:<n>` | Validated per pool; an explicit value fails on a single drive, the persisted default `EC:1` resolves to `0` there |
 | `RUSTFS_STORAGE_CLASS_OPTIMIZE` | Accepted for MinIO compatibility | Stored on `Config`, but `Config::capacity_optimized` has no caller: it changes nothing at runtime today |
-| `RUSTFS_STORAGE_CLASS_INLINE_BLOCK` | Fixed per-shard inline limit (bytesize syntax such as `128KiB`) | Replaces the scaled default in §4.3; values above 128 KiB log `storage_class_inline_block_large` |
+| `RUSTFS_STORAGE_CLASS_INLINE_BLOCK` | Fixed per-shard inline limit (bytesize syntax such as `128KiB`) | Overrides the fixed 128 KiB default in §4.3. Values above 128 KiB log `storage_class_inline_block_large` |
 
 An empty `RUSTFS_STORAGE_CLASS_STANDARD` or `RUSTFS_STORAGE_CLASS_RRS` restores the automatic policy and overrides a persisted value (`standard_policy` / `rrs_policy`). `MINIO_`-prefixed spellings of these keys, of `ERASURE_SET_DRIVE_COUNT`, and of `VOLUMES` are mapped onto the `RUSTFS_` names when the `RUSTFS_` name is unset (`apply_external_env_compat` in `crates/utils/src/envs.rs`); when both are set the `RUSTFS_` value wins and the conflict is reported at startup.
 
@@ -103,7 +103,9 @@ Sixteen drives at `EC:4`: `K = 12`, about 75 percent usable, four failures toler
 
 ### 4.3 Inline objects
 
-An object is stored inline in `xl.meta` when every shard is at most the per-shard budget (`Config::should_inline`). The default budget is `DEFAULT_INLINE_OBJECT_BUDGET / K` capped at `DEFAULT_INLINE_BLOCK` (256 KiB / K, at most 128 KiB per shard), so a wider set does not raise the maximum inline object size; on a versioned bucket the budget is divided by 8. `RUSTFS_STORAGE_CLASS_INLINE_BLOCK` replaces the scaled default with a fixed per-shard limit. Each drive keeps only its own shard inline, so inline data has the same loss semantics as external shards. Compressed or encrypted streams inline only when the stored size is known and within budget.
+An object is stored inline in `xl.meta` when every shard is at most the per-shard budget (`Config::should_inline`). The default is `DEFAULT_INLINE_BLOCK` (128 KiB per shard), matching MinIO's default. A versioned bucket uses one eighth of that budget. `RUSTFS_STORAGE_CLASS_INLINE_BLOCK` sets an explicit fixed per-shard limit. Each drive keeps its own bitrot-protected shard inline. PUT admission also requires the stored size, or the plaintext size for an unprotected transformed stream with unknown stored size, to fit one erasure block. Protected transformed streams require a known stored size. The complete format and transform rules are in [erasure-coding.md §6.6](../architecture/erasure-coding.md#66-inline-data).
+
+Existing inline and external objects are read according to their persisted metadata after a budget change. The former scaled default admitted approximately 256 KiB per unversioned object across wider EC layouts. The fixed per-shard budget admits larger new objects as data-shard count grows, subject to the single-block bound. Operators can pin an explicit smaller per-shard limit for a selected geometry. Changing this setting affects future placement; rollback to a historical binary requires that binary's reader to accept the newly written layouts. Use [MinIO format compatibility](../architecture/minio-file-format-compat.md) for the supported migration direction and encrypted-object constraints.
 
 ### 4.4 Write and read paths
 

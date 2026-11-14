@@ -583,8 +583,9 @@ message DeleteVersionsRequest {
   string volume = 2;
   repeated string versions = 3;
   string opts = 4;
-  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
-  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  // Senders dual-write for legacy peers. A nonempty versions_bin list determines
+  // the batch length and values. Malformed binary items reject the batch.
+  // An empty binary list selects the legacy versions list. Options decode independently.
   repeated bytes versions_bin = 5;
   bytes opts_bin = 6;
 }

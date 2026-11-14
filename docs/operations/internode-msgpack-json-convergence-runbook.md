@@ -80,6 +80,8 @@ Delete messages, kept on dual-write until their own window reads zero with `_bin
 | request | `DeleteVersions.versions` (`FileInfoVersions`) | same |
 | request | `DeleteVersions.opts` (`DeleteOptions`) | same |
 
+`DeleteVersions` receivers select the binary list whenever `versions_bin` contains entries. That list supplies the batch length and every decoded item, including requests whose JSON `versions` list is empty or has a different length. Empty or corrupt binary items reject the complete request before disk mutation. A request with an empty binary list uses the legacy JSON list and its length. Options retain their independent binary-first decoder. Current delete senders continue dual-writing the JSON and binary lists for older peers. Enabling a binary-only delete sender requires the corrected receiver on every destination and its rollback target.
+
 Still JSON-only:
 
 | Direction | Message / field | Note |

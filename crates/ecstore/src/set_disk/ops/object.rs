@@ -15355,14 +15355,14 @@ mod inline_put_commit_path_tests {
 
     #[tokio::test]
     #[serial]
-    async fn ec_8_4_default_budget_keeps_large_inline_candidate_out_of_xl_meta() {
+    async fn ec_8_4_default_budget_inlines_single_block_objects() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
         set_disks.set_test_storage_class_config(
             lookup_config_for_pools_without_env(&KVS::new(), &[12]).expect("EC8+4 storage class should resolve"),
         );
         let bucket = "ec-8-4-inline-budget";
         let object = "object.bin";
-        let payload = vec![0x5c; 300 * 1024];
+        let payload = vec![0x5c; 1024 * 1024];
         make_bucket(&disk_stores, bucket).await;
 
         let mut reader = PutObjReader::from_vec(payload.clone());
@@ -15374,7 +15374,7 @@ mod inline_put_commit_path_tests {
             set_disks.put_object(bucket, object, &mut reader, &ObjectOptions::default()),
         )
         .await
-        .expect("EC8+4 PUT should commit through the non-inline path");
+        .expect("EC8+4 PUT should commit through the inline path");
 
         for (disk_index, disk) in disk_stores.iter().enumerate() {
             let file_info = disk
@@ -15383,19 +15383,19 @@ mod inline_put_commit_path_tests {
                 .unwrap_or_else(|err| panic!("disk {disk_index} should persist EC8+4 metadata: {err}"));
             assert_eq!(file_info.erasure.data_blocks, 8);
             assert_eq!(file_info.erasure.parity_blocks, 4);
-            assert!(!file_info.inline_data(), "disk {disk_index} must keep the shard outside xl.meta");
+            assert!(file_info.inline_data(), "disk {disk_index} must persist the shard in xl.meta");
         }
 
         let mut object_reader = set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
             .await
-            .expect("non-inline EC8+4 object should remain readable");
+            .expect("inline EC8+4 object should remain readable");
         let mut restored = Vec::new();
         object_reader
             .stream
             .read_to_end(&mut restored)
             .await
-            .expect("non-inline EC8+4 object should stream");
+            .expect("inline EC8+4 object should stream");
         assert_eq!(restored, payload);
     }
 
@@ -15408,7 +15408,7 @@ mod inline_put_commit_path_tests {
         );
         let bucket = "ec-8-4-versioned-inline-budget";
         let object = "object.bin";
-        let payload = vec![0x73; 64 * 1024];
+        let payload = vec![0x73; 128 * 1024];
         make_bucket(&disk_stores, bucket).await;
 
         let options = ObjectOptions {
@@ -15431,23 +15431,74 @@ mod inline_put_commit_path_tests {
                 .read_version("", bucket, object, "", &ReadOptions::default())
                 .await
                 .unwrap_or_else(|err| panic!("disk {disk_index} should persist versioned EC8+4 metadata: {err}"));
-            assert!(
-                !file_info.inline_data(),
-                "disk {disk_index} must keep the versioned shard outside xl.meta"
-            );
+            assert!(file_info.inline_data(), "disk {disk_index} must persist the versioned shard in xl.meta");
         }
 
         let mut object_reader = set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &options)
             .await
-            .expect("versioned non-inline EC8+4 object should remain readable");
+            .expect("versioned inline EC8+4 object should remain readable");
         let mut restored = Vec::new();
         object_reader
             .stream
             .read_to_end(&mut restored)
             .await
-            .expect("versioned non-inline EC8+4 object should stream");
+            .expect("versioned inline EC8+4 object should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inline_budget_changes_preserve_existing_inline_and_external_objects() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
+        let default_config =
+            lookup_config_for_pools_without_env(&KVS::new(), &[12]).expect("default EC8+4 storage class should resolve");
+        let legacy_config = temp_env::with_var(INLINE_BLOCK_ENV, Some("32KiB"), || {
+            lookup_config_for_pools(&KVS::new(), &[12]).expect("resolve the historical per-shard limit for this pool")
+        });
+        let bucket = "inline-budget-layout-compat";
+        let payload = vec![0x6b; 300 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+
+        for (object, config, expected_inline) in [
+            ("legacy-external", legacy_config.clone(), false),
+            ("new-inline", default_config.clone(), true),
+        ] {
+            set_disks.set_test_storage_class_config(config);
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("commit object using the selected placement policy");
+            for disk in &disk_stores {
+                let persisted = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("read actual persisted layout");
+                assert_eq!(persisted.inline_data(), expected_inline, "placement for {object}");
+            }
+        }
+
+        for config in [default_config, legacy_config] {
+            set_disks.set_test_storage_class_config(config);
+            for object in ["legacy-external", "new-inline"] {
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read historical layout after changing the budget");
+                let mut restored = Vec::new();
+                reader.stream.read_to_end(&mut restored).await.expect("read object body");
+                assert_eq!(restored, payload, "body for {object}");
+            }
+        }
     }
 
     #[tokio::test]
