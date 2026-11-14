@@ -111,6 +111,8 @@ These metrics cover the disk queue's Fsync lane. Direct fsync dispatches and cle
 
 #### Erasure block geometry experiment
 
+The [isolated Docker inline lab](../../.docker/inline-lab/README.md) provides a frozen-source image and an owned external deployment adapter for the existing ABBA runner.
+
 Freeze the inline per-shard budget, durability mode, codec mode, queue budget, and binary before changing `RUSTFS_ERASURE_SHARD_BYTES`. Use integer bytes for this setting. `configured_erasure_shard_bytes` validates its alignment and upper bound and caches the result. Restart the tested processes and create each leg's measurement dataset after the new geometry is active. Existing versions and active multipart uploads retain their recorded geometry, so pre-existing GET data cannot establish the new-write behavior.
 
 The setting applies to every newly constructed user-object geometry. A fixed shard value produces different block sizes for different data-shard counts, including different storage classes in one pool. Record the persisted block size in each test cell. The default inline per-shard limit and `INLINE_FAST_PATH_MAX_OBJECT_SIZE` are separate controls. An object can be admitted inline above the current 1 MiB GET fast-path limit when the block grows. Trace metadata body verification and subsequent body decoding together when profiling that case.
