@@ -5611,6 +5611,20 @@ impl SetDisks {
         metadata_sys::find_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
+    /// Confirm deletion of this exact generation using immutable retirement evidence.
+    /// Missing directories or unavailable bucket metadata do not prove retirement.
+    ///
+    /// # Errors
+    /// Returns an error when the instance owner or retirement record is unavailable,
+    /// malformed, or bound to a different deployment or generation.
+    pub async fn is_bucket_generation_retired(&self, bucket: &str, incarnation: Uuid) -> Result<bool> {
+        let store = metadata_sys::object_store_in(&self.ctx).await?;
+        if !Arc::ptr_eq(&store.ctx, &self.ctx) {
+            return Err(Error::other("bucket retirement metadata belongs to another instance"));
+        }
+        crate::bucket::retirement::is_retired(store, bucket, incarnation).await
+    }
+
     /// Admit one short scanner cache publication under this set's instance
     /// movement fence. The caller must hold the returned guard through its
     /// final conditional cache write; no scan-round work belongs under it.

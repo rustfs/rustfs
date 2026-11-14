@@ -57,6 +57,7 @@ mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
 mod service_cohort;
+pub(crate) mod source_turn_retirement;
 pub(crate) mod usage_candidate_seal;
 mod usage_expiration;
 pub(crate) mod usage_remote_drain;

@@ -1777,6 +1777,15 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     }))
 }
 
+pub(crate) async fn scanner_bucket_generation_is_retired(set: &SetDisks, bucket: &str, incarnation: Option<uuid::Uuid>) -> bool {
+    let Some(incarnation) = incarnation.filter(|incarnation| !incarnation.is_nil()) else {
+        return false;
+    };
+    set.is_bucket_generation_retired(bucket, incarnation)
+        .await
+        .is_ok_and(|retired| retired)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScannerCycleDeferReason {
     ActivityBaselineUnavailable,

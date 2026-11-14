@@ -23,6 +23,92 @@ use tokio::io::ReadBuf;
 const TEST_SOURCE: DataUsageCacheSource = DataUsageCacheSource::new(1, 2);
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([5; 32]);
 
+#[tokio::test]
+#[serial_test::serial]
+async fn retired_remote_watch_cancels_only_its_exact_deleted_generation() {
+    use crate::scanner_io::tests::{setup_local_scanner_store, wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+    let (directory, store) = setup_local_scanner_store(1, 4).await;
+    let bucket = "remote-retired-generation";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create real remote fixture");
+    wait_for_namespace_commit_tails(&store).await;
+    let proof = crate::scanner_io::ScannerUsageWatchProof::install_for_test(&store, bucket)
+        .await
+        .expect("install real producer watches");
+    assert!(proof.verify_with_store(&store).await);
+    let set = store.pools[0].disk_set[0].clone();
+    let disk = scanner_set_disk_inventory(&set).await[0].clone();
+    let mut request = test_request(Uuid::new_v4());
+    request.bucket = bucket.to_owned();
+    request.scan_mode = HealScanMode::Normal;
+    request.usage_watch = Some(Box::new(proof.clone()));
+    crate::save_config(
+        store.clone(),
+        crate::DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(request.next_cycle, request.leader_epoch),
+    )
+    .await
+    .expect("persist the real cycle fence");
+    store
+        .delete_bucket(bucket, &DeleteBucketOptions::default())
+        .await
+        .expect("complete real generation deletion");
+    wait_for_namespace_commit_tails(&store).await;
+    assert!(!proof.verify_with_store(&store).await);
+    let ctx = CancellationToken::new();
+    let result = scan_and_persist_local_bucket_with_store(
+        disk.clone(),
+        ctx.clone(),
+        ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+        Arc::new(AtomicU8::new(RemoteScannerPhase::Scanning as u8)),
+        Arc::new(Notify::new()),
+        request,
+        store.clone(),
+    )
+    .await
+    .expect("confirmed deletion must not become a remote worker failure");
+    assert!(matches!(result, RemoteScannerFrameResult::NamespaceNotFound));
+
+    let mut unconfirmed = proof;
+    unconfirmed.bucket_incarnation = Uuid::new_v4();
+    let mut request = test_request(Uuid::new_v4());
+    request.bucket = bucket.to_owned();
+    request.usage_watch = Some(Box::new(unconfirmed));
+    let ctx = CancellationToken::new();
+    let error = scan_and_persist_local_bucket_with_store(
+        disk,
+        ctx.clone(),
+        ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+        Arc::new(AtomicU8::new(RemoteScannerPhase::Scanning as u8)),
+        Arc::new(Notify::new()),
+        request,
+        store.clone(),
+    )
+    .await
+    .expect_err("unknown generation must retain retry responsibility");
+    let frame = error.into_frame();
+    assert!(matches!(frame.scope, RemoteScannerErrorScope::Bucket));
+    assert!(frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX), "{}", frame.message);
+    drop(set);
+    drop(store);
+    let path = directory.path().to_path_buf();
+    directory.close().expect("remove remote retirement fixture");
+    assert!(!path.exists());
+}
+
+#[test]
+fn retry_bucket_terminal_frame_preserves_its_wire_disposition() {
+    let frame = RemoteScannerServerError::retry_bucket("checkpoint identity changed").into_frame();
+    assert!(matches!(frame.scope, RemoteScannerErrorScope::Bucket));
+    assert!(frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX), "{}", frame.message);
+    let frame = RemoteScannerServerError::worker("checkpoint identity unavailable").into_frame();
+    assert!(matches!(frame.scope, RemoteScannerErrorScope::Worker));
+    assert!(!frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX));
+}
+
 #[test]
 fn semantic_deadline_is_capped_by_rpc_lifetime_without_overflow() {
     let now = Instant::now();
