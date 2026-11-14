@@ -77,10 +77,7 @@ failure:
   xl.meta bytes nor the rename's directory entry are synced, the commit
   itself can vanish; surviving shard bytes become unreferenced orphans on
   that drive.
-- **Inline (small) objects receive no per-object fsync at all** in this mode:
-  their data lives inside xl.meta, and xl.meta is not synced. This matches
-  MinIO's default posture (no per-object fsync) but means small objects have
-  the widest loss window.
+- **Inline (small) objects receive no per-object fsync at all** in this mode: their data lives inside xl.meta, and xl.meta is not synced. This is weaker than MinIO's default object path, which synchronizes final xl.meta file contents while ordinarily omitting a per-object parent-directory fsync. Small objects therefore have the widest loss window under RustFS relaxed.
 - Durability of acknowledged writes therefore rests on **erasure-coded
   redundancy across other nodes** plus the unclean-shutdown heal converging
   the affected drive afterwards.

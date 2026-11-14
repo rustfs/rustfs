@@ -1625,7 +1625,7 @@ impl LocalDisk {
             .await?;
             // This is system metadata authority, so use its existing strict
             // durability policy even when the object payload is relaxed.
-            if effective_durability(src_volume).syncs_commit_metadata() {
+            if effective_durability(src_volume).syncs_recovery_protocol_state() {
                 os::fsync_dir_with_owner(recovery.parent().ok_or(DiskError::InvalidPath)?, Some(authority_owner.clone()))
                     .await
                     .map_err(to_file_error)?;
@@ -1732,7 +1732,7 @@ impl LocalDisk {
                 shard_sync_res?;
                 prepared_metadata_source
             } else {
-                let tmp_meta_sync = if durability.syncs_commit_metadata() {
+                let tmp_meta_sync = if durability.syncs_metadata_files() {
                     SyncMode::FileOnly
                 } else {
                     SyncMode::None
@@ -1879,11 +1879,7 @@ impl LocalDisk {
             // it keeps SyncMode::FileAndDir: contents and directory entry both
             // durable. It is part of the metadata commit machinery, so relaxed
             // tiers leave it to the page cache like the xl.meta it mirrors.
-            let backup_sync = if durability.syncs_commit_metadata() {
-                SyncMode::FileAndDir
-            } else {
-                SyncMode::None
-            };
+            let backup_sync = durability.recovery_sync_mode();
             if let (Some(old_data_dir), Some(dst_buf)) = (rollback_data_dir, has_dst_buf.as_ref())
                 && multipart_publication.as_ref().is_none_or(|publication| publication.legacy)
             {
@@ -2000,7 +1996,7 @@ impl LocalDisk {
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
-            if durability.syncs_commit_metadata()
+            if durability.syncs_commit_directories()
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
@@ -2040,7 +2036,7 @@ impl LocalDisk {
             // are durable. Overwrites already have a durable object dir. The
             // starts_with guard bounds the walk to the bucket subtree. Relaxed/none
             // accept the wider window, like the commit fsync above.
-            if has_dst_buf.is_none() && durability.syncs_commit_metadata() {
+            if has_dst_buf.is_none() && durability.syncs_commit_directories() {
                 let mut ancestor = dst_file_path.parent().and_then(|object_dir| object_dir.parent());
                 while let Some(dir) = ancestor {
                     if !dir.starts_with(&dst_volume_dir) {
@@ -2153,7 +2149,7 @@ impl LocalDisk {
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
-            let sync = durability.syncs_commit_metadata();
+            let sync = durability.syncs_recovery_protocol_state();
             #[cfg(unix)]
             let receipt_identity = if sync
                 && pool_meta_condition
