@@ -125,6 +125,13 @@ impl SourceSet {
         Self { files }
     }
 
+    /// The files of `self` followed by those of `other`, for a guard whose call sites span two
+    /// source trees while an operation family moves from one to the other.
+    pub(crate) fn and(mut self, other: Self) -> Self {
+        self.files.extend(other.files);
+        self
+    }
+
     /// Whether any one file of the set contains `needle`.
     pub(crate) fn contains(&self, needle: &str) -> bool {
         self.files.iter().any(|file| file.text.contains(needle))
