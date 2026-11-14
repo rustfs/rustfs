@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use rustfs_filemeta::{ErasureAlgo, FileInfo, FileMeta, ObjectPartInfo};
+use serde::Serialize;
 use std::hint::black_box;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -189,12 +190,66 @@ fn bench_delete_version_batches(c: &mut Criterion) {
     group.finish();
 }
 
+fn encode_file_info_msgpack(file_info: &FileInfo) -> Vec<u8> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(1024));
+    file_info.serialize(&mut serializer).expect("serialize FileInfo as msgpack");
+    serializer.into_inner()
+}
+
+fn inline_rpc_file_info(data_size: usize) -> FileInfo {
+    let mut info = make_file_info(
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        100 * 1024,
+        OffsetDateTime::from_unix_timestamp(BENCH_BASE_TIME_UNIX_SECS).expect("fixture timestamp"),
+    );
+    info.erasure.data_blocks = 12;
+    info.erasure.parity_blocks = 4;
+    info.erasure.index = 1;
+    info.erasure.distribution = (1..=16).collect();
+    info.parts.push(ObjectPartInfo {
+        number: 1,
+        size: 100 * 1024,
+        actual_size: 100 * 1024,
+        ..Default::default()
+    });
+    if data_size > 0 {
+        info.set_inline_data();
+        info.data = Some(Bytes::from(vec![42; data_size]));
+    }
+    info
+}
+
+fn bench_rpc_file_info_encoding(c: &mut Criterion) {
+    for (kind, data_size) in [("metadata-only", 0_usize), ("inline-9k", 9 * 1024)] {
+        let file_info = inline_rpc_file_info(data_size);
+        let json_bytes = serde_json::to_vec(&file_info).expect("fixture JSON").len();
+        let msgpack_bytes = encode_file_info_msgpack(&file_info).len();
+        let mut group = c.benchmark_group(format!("rpc_file_info_encode/{kind}"));
+        group.throughput(Throughput::Bytes(u64::try_from(data_size.max(1)).expect("fixture size")));
+        group.bench_function(BenchmarkId::new("json", json_bytes), |b| {
+            b.iter(|| black_box(serde_json::to_string(black_box(&file_info)).expect("encode JSON")))
+        });
+        group.bench_function(BenchmarkId::new("msgpack", msgpack_bytes), |b| {
+            b.iter(|| black_box(encode_file_info_msgpack(black_box(&file_info))))
+        });
+        group.bench_function(BenchmarkId::new("dual", json_bytes + msgpack_bytes), |b| {
+            b.iter(|| {
+                let json = serde_json::to_string(black_box(&file_info)).expect("encode JSON");
+                let msgpack = encode_file_info_msgpack(black_box(&file_info));
+                black_box((json, msgpack))
+            })
+        });
+        group.finish();
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(20)
         .warm_up_time(Duration::from_millis(300))
         .measurement_time(Duration::from_secs(1));
-    targets = bench_rename_data_meta_path, bench_delete_version_batches
+    targets = bench_rename_data_meta_path, bench_delete_version_batches, bench_rpc_file_info_encoding
 }
 criterion_main!(benches);
