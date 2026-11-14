@@ -33,7 +33,7 @@ if cfg["action"] == "create":
     print("{}")
 elif cfg["action"] == "probe":
     records = []
-    for size in (4096, 1048576, 1310720, 1572864):
+    for size in (4096, 1048576, 1048577, 1310720, 1572856, 1572857, 1572864):
         key = "geometry/probe-" + str(size)
         data = random.Random(size).randbytes(size)
         client.put_object(Bucket=cfg["bucket"], Key=key, Body=data)
@@ -118,7 +118,7 @@ class DockerLab:
         return self.docker("compose", "--project-name", self.config["project"],
                            "--file", str(self.state / "compose.json"), *args)
 
-    def make_spec(self, shard_bytes):
+    def make_spec(self, shard_bytes, rpc_mode="json-compat"):
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("RUSTFS_", "OTEL_"))}
         environment["RUSTFS_IMAGE"] = self.config["image_id"]
@@ -127,9 +127,12 @@ class DockerLab:
              "--project-name", self.config["project"], "--file", str(BASE_COMPOSE), "config", "--format", "json"],
             env=environment, check=True, capture_output=True, text=True,
         )
-        return self.customize_spec(json.loads(raw.stdout), shard_bytes)
+        return self.customize_spec(json.loads(raw.stdout), shard_bytes, rpc_mode)
 
-    def customize_spec(self, spec, shard_bytes):
+    def customize_spec(self, spec, shard_bytes, rpc_mode="json-compat"):
+        if rpc_mode not in ("json-compat", "msgpack-only"):
+            raise ValueError("unsupported inline lab RPC mode")
+        msgpack_only = str(rpc_mode == "msgpack-only").lower()
         if set(spec["services"]) != set(NODES):
             raise ValueError("inline lab requires the repository's four-node compose topology")
         if any(item.get("external") for group in ("volumes", "networks") for item in spec.get(group, {}).values()):
@@ -162,6 +165,8 @@ class DockerLab:
                 "RUSTFS_STORAGE_CLASS_INLINE_BLOCK": "128KiB",
                 "RUSTFS_ERASURE_SHARD_BYTES": str(shard_bytes),
                 "RUSTFS_DURABILITY_MODE": "strict",
+                "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY": msgpack_only,
+                "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED": msgpack_only,
             })
         spec["services"]["node1"]["ports"] = [{"target": 9000, "published": str(self.config["port"]),
                                                  "host_ip": "127.0.0.1", "protocol": "tcp"}]
@@ -225,7 +230,7 @@ class DockerLab:
             time.sleep(1)
         raise TimeoutError("inline Docker cluster did not become ready")
 
-    def deploy(self, bucket, keep_data, shard_bytes):
+    def deploy(self, bucket, keep_data, shard_bytes, rpc_mode="json-compat"):
         validate_shard_bytes(shard_bytes)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("a valid isolated S3 bucket is required")
@@ -234,7 +239,7 @@ class DockerLab:
         if sha256_file(self.config["binary"]) != self.config["binary_sha256"]:
             raise ValueError("benchmark binary changed after configuration")
         self.assert_owned()
-        spec = self.make_spec(shard_bytes)
+        spec = self.make_spec(shard_bytes, rpc_mode)
         self.assert_spec_owned(spec)
         candidate = self.state / "compose.next.json"
         write_private(candidate, spec)
@@ -251,7 +256,8 @@ class DockerLab:
             if info["Image"] != self.config["image_id"]:
                 raise ValueError(f"unexpected running image for {node}")
             actual_env = dict(item.split("=", 1) for item in info["Config"]["Env"])
-            for key in ("RUSTFS_ERASURE_SHARD_BYTES", "RUSTFS_STORAGE_CLASS_INLINE_BLOCK", "RUSTFS_DURABILITY_MODE"):
+            for key in ("RUSTFS_ERASURE_SHARD_BYTES", "RUSTFS_STORAGE_CLASS_INLINE_BLOCK", "RUSTFS_DURABILITY_MODE",
+                        "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"):
                 if actual_env.get(key) != spec["services"][node]["environment"][key]:
                     raise ValueError(f"unexpected running {key} for {node}")
             actual_hashes.append(self.docker("exec", identifier, "sha256sum", "/usr/local/bin/rustfs").split()[0])
@@ -266,7 +272,7 @@ class DockerLab:
             "phase": os.environ.get("HOTPATH_ABBA_PHASE", "manual"),
             "bucket": bucket, "binary_sha256": expected,
             "dataset_reset": str(not keep_data).lower(), "shard_bytes": shard_bytes,
-            "inline_block": 131072, "durability": "strict", "topology": "4x4-EC12+4",
+            "inline_block": 131072, "rpc_mode": rpc_mode, "durability": "strict", "topology": "4x4-EC12+4",
             "image_id": self.config["image_id"], "source_revision": self.config["revision"],
         }
         evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -331,7 +337,7 @@ def execute(args):
     lab = DockerLab(state, config)
     lab.assert_owned()
     if args.command == "deploy":
-        lab.deploy(args.bucket, args.keep_data, args.shard_bytes)
+        lab.deploy(args.bucket, args.keep_data, args.shard_bytes, args.rpc_mode)
     elif args.command == "probe":
         lab.probe(args.bucket)
     elif args.command == "mc":
@@ -358,6 +364,8 @@ def main():
     deploy.add_argument("--bucket", default=os.environ.get("HOTPATH_ABBA_BUCKET", ""))
     deploy.add_argument("--shard-bytes", type=int, default=int(os.environ.get("RUSTFS_ERASURE_SHARD_BYTES", "0")))
     deploy.add_argument("--keep-data", action="store_true")
+    deploy.add_argument("--rpc-mode", choices=("json-compat", "msgpack-only"),
+                        default=os.environ.get("RUSTFS_INLINE_LAB_RPC_MODE", "json-compat"))
     probe = commands.add_parser("probe")
     probe.add_argument("--bucket", required=True)
     mc = commands.add_parser("mc")

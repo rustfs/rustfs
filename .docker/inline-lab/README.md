@@ -43,7 +43,7 @@ scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" prob
   --bucket inline-geometry-probe
 ```
 
-The probe verifies complete bytes, HEAD sizes, Range contents, EC12+4 and the actual persisted block. It records inline markers for 4 KiB, 1 MiB, 1.25 MiB and 1.5 MiB objects in `probe.json`. The server-only image includes the existing filemeta decoder through a small geometry inspector. Console assets and the administration CLI are outside this lab image.
+The probe verifies complete bytes, HEAD sizes, Range contents, EC12+4 and the actual persisted block. It records inline markers for 4 KiB, 1 MiB, 1 MiB + 1 byte, 1.25 MiB, 1,572,856 bytes, 1,572,857 bytes and 1.5 MiB objects in `probe.json`. The server-only image includes the existing filemeta decoder through a small geometry inspector. Console assets and the administration CLI are outside this lab image.
 
 ## ABBA deployment hook
 
@@ -76,3 +76,11 @@ mkdir -p "$LAB_TOOLS"
 ln -s "$PWD/scripts/inline_docker_mc.sh" "$LAB_TOOLS/mc"
 export PATH="$LAB_TOOLS:$PATH"
 ```
+
+## Compare transport and placement independently
+
+`deploy --rpc-mode json-compat` explicitly clears both MessagePack-only flags on every node. `deploy --rpc-mode msgpack-only` enables both flags for the selected homogeneous lab fleet. Deployment evidence records the mode and checks both running flags. The default is `json-compat`. The ABBA hook may select the same mode through `RUSTFS_INLINE_LAB_RPC_MODE`.
+
+First compare the base and bounded-multi-block binaries at `--shard-bytes 0` in JSON compatibility mode. Then repeat with MessagePack-only on both sides. A same-binary transport ABBA isolates the encoding effect. Keep the 128 KiB budget, CPU sets, strict durability, load and object set fixed. Check actual markers and block sizes at the boundary sizes before timing. Retain baseline-drift and candidate gates, error logs and raw request distributions.
+
+For a rolling downgrade, redeploy the current binary with `--keep-data --rpc-mode json-compat` before introducing an older node. Check old and new reads, version IDs and batch deletes against the persisted manifest. A running MessagePack-only flag pair establishes the lab configuration. Compatibility with a particular old reader requires the explicit reader test.

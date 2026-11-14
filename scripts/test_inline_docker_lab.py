@@ -52,6 +52,22 @@ class InlineDockerLabTests(unittest.TestCase):
         for kind in ("volumes", "networks"):
             self.assertEqual(next(iter(result[kind].values()))["labels"][LAB.OWNER_LABEL], "test-owner")
 
+    def test_rpc_modes_override_inherited_flags_on_every_node(self):
+        lab = LAB.DockerLab("/unused", configuration())
+        for mode, enabled in (("json-compat", "false"), ("msgpack-only", "true")):
+            spec = compose_fixture()
+            for service in spec["services"].values():
+                service["environment"]["RUSTFS_INTERNODE_RPC_MSGPACK_ONLY"] = "true"
+                service["environment"]["RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"] = "true"
+            result = lab.customize_spec(spec, 0, mode)
+            for node in LAB.NODES:
+                environment = result["services"][node]["environment"]
+                self.assertEqual(environment["RUSTFS_INTERNODE_RPC_MSGPACK_ONLY"], enabled)
+                self.assertEqual(environment["RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"], enabled)
+                self.assertEqual(environment["RUSTFS_ERASURE_SHARD_BYTES"], "0")
+        with self.assertRaisesRegex(ValueError, "RPC mode"):
+            lab.customize_spec(compose_fixture(), 0, "unknown")
+
     def test_external_resources_and_changed_topology_fail(self):
         lab = LAB.DockerLab("/unused", configuration())
         for kind in ("networks", "volumes"):
