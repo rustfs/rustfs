@@ -14361,8 +14361,7 @@ fn table_metadata_pointer_json_round_trips() {
     assert_eq!(pointer.metadata_location, location);
 }
 
-#[test]
-fn object_mutation_entrypoints_call_reserved_prefix_guard() {
+fn assert_object_mutation_reserved_prefix_guards(delete: &str) {
     // Scope every assertion to one implementation method: a guard in a sibling
     // method (or its tests) must not satisfy another entrypoint's contract.
     fn method<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -14387,7 +14386,6 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
 
     let put = include_str!("../app/object/put.rs");
     let copy = include_str!("../app/object/copy.rs");
-    let delete = include_str!("../app/object/delete.rs");
     let extract = include_str!("../app/object/extract.rs");
     let restore = include_str!("../app/object/restore.rs");
 
@@ -14397,7 +14395,12 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         (put, "fn execute_put_object_inner(", "self.execute_put_object_extract(req)"),
         (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
         (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
-        (delete, "fn execute_delete_object(", "owner.execute_delete_object_owned(req)"),
+        (delete, "fn execute_delete_object(", "self.execute_delete_object_fields("),
+        (
+            delete,
+            "fn execute_delete_object_fields(",
+            "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
+        ),
         (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
         (extract, "fn execute_put_object_extract(", "self.execute_put_object_extract_boxed(req)"),
         (
@@ -14411,6 +14414,16 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
             "{signature} must call its guarded implementation"
         );
     }
+    assert_ordered(
+        method(delete, "fn execute_delete_object("),
+        &[
+            "self.execute_delete_object_fields(",
+            "envelope,",
+            "input.bucket.as_str().to_owned(),",
+            "input.key.as_str().to_owned(),",
+            "input.version_id,",
+        ],
+    );
 
     let key_guard = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
     let store_resolution = "let Some(store) = self.object_store()";
@@ -14465,6 +14478,72 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
             "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
             "batch.push(ExtractPreparedMember {",
         ],
+    );
+}
+
+#[test]
+fn object_mutation_entrypoints_call_reserved_prefix_guard() {
+    assert_object_mutation_reserved_prefix_guards(include_str!("../app/object/delete.rs"));
+}
+
+#[test]
+fn object_mutation_guard_rejects_broken_delete_delegation() {
+    let delete = include_str!("../app/object/delete.rs");
+    for (delegate, replacement, signature) in [
+        (
+            "self.execute_delete_object_fields(",
+            "self.execute_delete_object_unguarded(",
+            "fn execute_delete_object(",
+        ),
+        (
+            "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
+            "owner.execute_delete_object_unguarded(envelope, bucket, key, version_id)",
+            "fn execute_delete_object_fields(",
+        ),
+        (
+            "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
+            "owner.execute_delete_object_owned(envelope, other_bucket, key, version_id)",
+            "fn execute_delete_object_fields(",
+        ),
+    ] {
+        let broken = delete.replacen(delegate, replacement, 1);
+        assert_ne!(broken, delete, "fixture must break {signature}");
+        let message = crate::guard_sources::panic_message(move || assert_object_mutation_reserved_prefix_guards(&broken));
+        assert!(
+            message.contains(&format!("{signature} must call its guarded implementation")),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn object_mutation_guard_rejects_wrong_delete_input_forwarding() {
+    let delete = include_str!("../app/object/delete.rs");
+    for field in [
+        "input.bucket.as_str().to_owned(),",
+        "input.key.as_str().to_owned(),",
+        "input.version_id,",
+    ] {
+        let broken = delete.replacen(field, "other_input,", 1);
+        assert_ne!(broken, delete, "fixture must replace {field}");
+        let message = crate::guard_sources::panic_message(move || assert_object_mutation_reserved_prefix_guards(&broken));
+        assert!(
+            message.contains(&format!("missing or out-of-order object mutation guard: {field}")),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn object_mutation_guard_rejects_missing_delete_reserved_prefix_guard() {
+    let delete = include_str!("../app/object/delete.rs");
+    let guard = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+    let broken = delete.replacen(guard, "", 1);
+    assert_ne!(broken, delete, "fixture must remove the DeleteObject guard");
+    let message = crate::guard_sources::panic_message(move || assert_object_mutation_reserved_prefix_guards(&broken));
+    assert!(
+        message.contains(&format!("missing or out-of-order object mutation guard: {guard}")),
+        "{message}"
     );
 }
 
