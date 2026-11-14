@@ -34,6 +34,7 @@ services:
       - RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_DURABILITY_MODE=${RUSTFS_DURABILITY_MODE:-strict}
       # Internode gRPC optimization knobs (grpc-optimization P0-P3). Defaults match the binary
       # defaults, so leaving these unset is a no-op; the A/B driver exports them to toggle a stage.
       - RUSTFS_INTERNODE_RPC_TCP_NODELAY=${RUSTFS_INTERNODE_RPC_TCP_NODELAY:-true}
@@ -81,6 +82,7 @@ services:
       - RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_DURABILITY_MODE=${RUSTFS_DURABILITY_MODE:-strict}
       # Internode gRPC optimization knobs (grpc-optimization P0-P3). Defaults match the binary
       # defaults, so leaving these unset is a no-op; the A/B driver exports them to toggle a stage.
       - RUSTFS_INTERNODE_RPC_TCP_NODELAY=${RUSTFS_INTERNODE_RPC_TCP_NODELAY:-true}
@@ -128,6 +130,7 @@ services:
       - RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_DURABILITY_MODE=${RUSTFS_DURABILITY_MODE:-strict}
       # Internode gRPC optimization knobs (grpc-optimization P0-P3). Defaults match the binary
       # defaults, so leaving these unset is a no-op; the A/B driver exports them to toggle a stage.
       - RUSTFS_INTERNODE_RPC_TCP_NODELAY=${RUSTFS_INTERNODE_RPC_TCP_NODELAY:-true}
@@ -175,6 +178,7 @@ services:
       - RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_LOCK_ACQUIRE_TIMEOUT=${RUSTFS_LOCK_ACQUIRE_TIMEOUT:-5}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_DURABILITY_MODE=${RUSTFS_DURABILITY_MODE:-strict}
       # Internode gRPC optimization knobs (grpc-optimization P0-P3). Defaults match the binary
       # defaults, so leaving these unset is a no-op; the A/B driver exports them to toggle a stage.
       - RUSTFS_INTERNODE_RPC_TCP_NODELAY=${RUSTFS_INTERNODE_RPC_TCP_NODELAY:-true}

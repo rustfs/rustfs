@@ -18,6 +18,7 @@ COMPOSE_UP_NO_BUILD="${COMPOSE_UP_NO_BUILD:-false}"
 RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin-local}"
 RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfssecret-local}"
 RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
+RUSTFS_RC_RELEASE="${RUSTFS_RC_RELEASE:-latest}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
@@ -73,6 +74,7 @@ Environment:
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
   COMPOSE_UP_NO_BUILD (true|false, default: false)
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
+  RUSTFS_RC_RELEASE (default: latest; disabled creates a server-only validation image)
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_PROBE_MODE (service|ready, default: service)
   WAIT_TIMEOUT_SECS FAILOVER_NODE FAILOVER_WARMUP_SECS FAILOVER_SAMPLE_SECS
@@ -758,9 +760,9 @@ main() {
     log_info "Building local image from Dockerfile.source: ${IMAGE_TAG}"
     if [[ -n "${RUSTFS_DOCKER_PLATFORM}" ]]; then
       log_info "Using docker build platform: ${RUSTFS_DOCKER_PLATFORM}"
-      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" --build-arg "RC_RELEASE=${RUSTFS_RC_RELEASE}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
     else
-      docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+      docker build --build-arg "RC_RELEASE=${RUSTFS_RC_RELEASE}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
     fi
   else
     log_info "Skipping image build"
