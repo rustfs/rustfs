@@ -412,6 +412,14 @@ enum FusedCommitAttempt {
     ResumePanic(Box<dyn std::any::Any + Send + 'static>),
 }
 
+/// File fdatasync grouping only owns staged shard files. Inline commits have
+/// no shard directory, so the switch must not evict them from the flat/fused
+/// metadata path where grouping can never run.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn file_fdatasync_grouping_requires_async_shard_sync(no_inline: bool) -> bool {
+    no_inline && os::file_fdatasync_group_commit_enabled()
+}
+
 async fn prepare_rename_commit_and_destination_metadata(
     create_source_parent: bool,
     source_parent: &Path,
@@ -750,7 +758,6 @@ impl LocalDisk {
             && pool_meta_condition.is_none()
             && !fi_healing
             && !os::dst_dir_fsync_group_commit_enabled()
-            && !os::file_fdatasync_group_commit_enabled()
             && !has_rename_data_test_failpoints(dst_path);
         let src_file_path = match multipart_publication.as_ref() {
             Some(publication) => publication.canonical_head(),
@@ -838,7 +845,7 @@ impl LocalDisk {
             && pool_meta_condition.is_none()
             && !fi_healing
             && !os::dst_dir_fsync_group_commit_enabled()
-            && !os::file_fdatasync_group_commit_enabled()
+            && !file_fdatasync_grouping_requires_async_shard_sync(no_inline)
         {
             #[cfg(test)]
             if !no_inline {

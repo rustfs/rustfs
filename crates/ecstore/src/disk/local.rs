@@ -24564,6 +24564,20 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(file_fdatasync_group_commit)]
+    fn test_file_fdatasync_grouping_only_blocks_non_inline_fused_commit() {
+        let _grouping = os::set_file_fdatasync_group_commit_for_test(true);
+        assert!(
+            !commit::file_fdatasync_grouping_requires_async_shard_sync(false),
+            "inline metadata has no shard directory and must keep the fused path"
+        );
+        assert!(
+            commit::file_fdatasync_grouping_requires_async_shard_sync(true),
+            "non-inline shard sync must remain on the grouping-aware async path"
+        );
+    }
+
+    #[test]
     fn test_system_critical_volume_classification() {
         // System namespaces are pinned.
         assert!(is_system_critical_volume(RUSTFS_META_BUCKET));
