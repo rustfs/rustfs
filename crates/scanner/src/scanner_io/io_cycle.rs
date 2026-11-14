@@ -357,6 +357,7 @@ where
     S: ScannerStorage,
 {
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: None,
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
         distributed_segment_invalidation_evidence: None,
@@ -506,7 +507,7 @@ where
         distributed,
         resolution.baseline_proof,
     );
-    default_result(scoped_scan_scope_from_dirty_buckets(
+    let scope = scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
         (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
@@ -514,7 +515,11 @@ where
         segment_reuse_activation_preflight.scanner_segment_reuse_activated,
         resolution.all_buckets,
         resolution.baseline_proof,
-    ))
+    );
+    ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: Some(segment_reuse_activation_preflight),
+        ..default_result(scope)
+    }
 }
 
 /// Runs once between the bucket listing and the dirty-usage snapshot, the
@@ -759,6 +764,9 @@ where
         },
     )
     .await;
+    if let Some(preflight) = scope_resolution.segment_reuse_activation_preflight {
+        preflight.record_observation(ScannerPrefixReuseStage::ScopeResolution);
+    }
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
@@ -770,8 +778,14 @@ where
         baseline_proof,
         distributed,
     );
-    if let Some(reason) = scope_fallback {
+    if let Some(fallback) = scope_fallback {
+        let reason = fallback.reason;
         global_metrics().record_scanner_scope_fallback(reason.as_str());
+        if let Some(failure) = fallback.baseline_rejection {
+            global_metrics()
+                .scan_observation()
+                .record_baseline_rejection(failure.authoritative, failure.observed);
+        }
         tracing::info!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
@@ -785,6 +799,7 @@ where
             "Scanner cycle walks every bucket because its dirty-bucket scope was not admitted"
         );
     }
+    let scope_fallback = scope_fallback.map(|fallback| fallback.reason);
     let segment_invalidation_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot).segment_invalidation_proof();
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -861,6 +876,7 @@ where
             None,
             false,
         );
+        segment_reuse_activation_preflight.record_observation(ScannerPrefixReuseStage::CycleCompletion);
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
@@ -1207,6 +1223,7 @@ where
         distributed_segment_invalidation_evidence,
         cold_zero_walk_oracle,
     );
+    segment_reuse_activation_preflight.record_observation(ScannerPrefixReuseStage::CycleCompletion);
     let pending_maintenance_work = pending_maintenance_work_for_cycle(&pending_maintenance_work, &results);
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
     let required_cycle_floor = (observed_cycle_floor > want_cycle).then_some(observed_cycle_floor);

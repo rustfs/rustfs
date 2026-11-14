@@ -104,6 +104,7 @@ fn scanner_activity_preflight_defers_a_temporarily_offline_peer() {
 
 #[test]
 fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
+    let before = global_metrics().scan_observation().snapshot();
     let preflight = scanner_segment_reuse_activation_preflight();
 
     assert!(preflight.production_activation);
@@ -124,6 +125,9 @@ fn scanner_segment_reuse_activation_preflight_reports_release_gate_inputs() {
             "distributed_without_peer_invalidation",
         ]
     );
+    let after = global_metrics().scan_observation().snapshot();
+    assert_eq!(after.prefix_scope_resolution.evaluated, before.prefix_scope_resolution.evaluated);
+    assert_eq!(after.prefix_cycle_completion.evaluated, before.prefix_cycle_completion.evaluated);
 }
 
 #[test]
@@ -2718,6 +2722,130 @@ fn scoped_scan_requires_a_complete_authoritative_baseline_with_exact_set_provena
 }
 
 #[test]
+fn scoped_scan_baseline_rejections_preserve_the_existing_first_failed_check() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let digest = DataUsageScanPlanDigest([9; 32]);
+    let baseline = complete_usage_baseline(source, digest, 7, 11);
+    let snapshot: DataUsageInfo = serde_json::from_slice(&baseline).expect("decode complete baseline");
+    let proof = ScannerCacheBaselineProof {
+        authoritative_data: Some(&baseline),
+        observed_candidate_data: None,
+        expected_sources: &expected_sources,
+        leader_epoch: 11,
+        want_cycle: 8,
+        scan_plan_digest: digest,
+    };
+    type RejectionCase = (ScannerBaselineRejection, fn(&mut DataUsageInfo));
+    let cases: [RejectionCase; 13] = [
+        (ScannerBaselineRejection::Incomplete, |s| s.usage_snapshot_complete = false),
+        (ScannerBaselineRejection::Partial, |s| s.usage_snapshot_partial = true),
+        (ScannerBaselineRejection::Marks, |s| s.usage_snapshot_converged = None),
+        (ScannerBaselineRejection::Epoch, |s| s.scanner_epoch = Some(10)),
+        (ScannerBaselineRejection::SourceCount, |s| s.usage_snapshot_set_states.clear()),
+        (ScannerBaselineRejection::PlanMissing, |s| {
+            s.usage_snapshot_set_states[0].scan_plan_digest = None
+        }),
+        (ScannerBaselineRejection::PlanMismatch, |s| {
+            s.usage_snapshot_set_states[0].scan_plan_digest = Some([8; 32])
+        }),
+        (ScannerBaselineRejection::SourceMembership, |s| {
+            s.usage_snapshot_set_states[0].set_index = 3
+        }),
+        (ScannerBaselineRejection::SetIncomplete, |s| {
+            s.usage_snapshot_set_states[0].complete = false
+        }),
+        (ScannerBaselineRejection::SetTombstone, |s| {
+            s.usage_snapshot_set_states[0].tombstone = true
+        }),
+        (ScannerBaselineRejection::SetEpoch, |s| {
+            s.usage_snapshot_set_states[0].scanner_epoch = None
+        }),
+        (ScannerBaselineRejection::SetCycle, |s| {
+            s.usage_snapshot_set_states[0].scanner_cycle = Some(9)
+        }),
+        (ScannerBaselineRejection::SetCycle, |s| {
+            s.usage_snapshot_set_states[0].scanner_cycle = None
+        }),
+    ];
+    assert_eq!(validate_scanner_cache_snapshot_plan_digest(&snapshot, proof, None), Ok(digest));
+    for (expected, mutate) in cases {
+        let mut invalid = snapshot.clone();
+        mutate(&mut invalid);
+        assert_eq!(validate_scanner_cache_snapshot_plan_digest(&invalid, proof, None), Err(expected));
+        assert_eq!(complete_scanner_cache_snapshot_plan_digest(&invalid, proof, None), None);
+    }
+    let mut invalid = snapshot.clone();
+    invalid.usage_snapshot_partial = true;
+    invalid.scanner_epoch = Some(10);
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&invalid, proof, None),
+        Err(ScannerBaselineRejection::Partial)
+    );
+
+    let two_sources = HashSet::from([source, DataUsageCacheSource::new(1, 3)]);
+    let mut two_sets = snapshot.clone();
+    two_sets
+        .usage_snapshot_set_states
+        .push(two_sets.usage_snapshot_set_states[0].clone());
+    let two_set_proof = ScannerCacheBaselineProof {
+        expected_sources: &two_sources,
+        ..proof
+    };
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&two_sets, two_set_proof, None),
+        Err(ScannerBaselineRejection::SourceDuplicate)
+    );
+    two_sets.usage_snapshot_set_states[1].set_index = 3;
+    two_sets.usage_snapshot_set_states[1].scan_plan_digest = Some([8; 32]);
+    assert_eq!(
+        validate_scanner_cache_snapshot_plan_digest(&two_sets, two_set_proof, None),
+        Err(ScannerBaselineRejection::SetPlan)
+    );
+
+    let undecodable = Bytes::from_static(b"not-json");
+    for (data, expected) in [
+        (None, ScannerBaselineRejection::Missing),
+        (Some(&undecodable), ScannerBaselineRejection::Decode),
+    ] {
+        assert_eq!(
+            validate_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+                authoritative_data: data,
+                ..proof
+            }),
+            Err(ScannerBaselineValidationFailure {
+                authoritative: expected,
+                observed: None
+            })
+        );
+    }
+    let mut wrong_epoch = snapshot;
+    wrong_epoch.scanner_epoch = Some(10);
+    let wrong_epoch = Bytes::from(serde_json::to_vec(&wrong_epoch).expect("encode stale epoch baseline"));
+    let stale_proof = ScannerCacheBaselineProof {
+        authoritative_data: Some(&wrong_epoch),
+        ..proof
+    };
+    assert_eq!(
+        validate_scanner_cache_baseline_plan_digest(stale_proof),
+        Err(ScannerBaselineValidationFailure {
+            authoritative: ScannerBaselineRejection::Epoch,
+            observed: Some(ScannerBaselineRejection::Missing),
+        })
+    );
+    assert_eq!(
+        validate_scanner_cache_baseline_plan_digest(ScannerCacheBaselineProof {
+            observed_candidate_data: Some(&undecodable),
+            ..stale_proof
+        }),
+        Err(ScannerBaselineValidationFailure {
+            authoritative: ScannerBaselineRejection::Epoch,
+            observed: Some(ScannerBaselineRejection::Decode)
+        })
+    );
+}
+
+#[test]
 fn scoped_scan_accepts_only_a_complete_observation_tied_to_the_authoritative_baseline() {
     let source = DataUsageCacheSource::new(1, 2);
     let expected_sources = HashSet::from([source]);
@@ -3149,6 +3277,12 @@ fn distributed_segment_reuse_activation_keeps_remote_dirty_buckets_at_bucket_sco
     assert!(
         result.scope.prefix_scope_for("photos").is_some(),
         "durable local producer proof may activate local segment reuse after distributed ACK capability evidence"
+    );
+    assert!(
+        result
+            .segment_reuse_activation_preflight
+            .expect("actual scope proof is retained for observation")
+            .scanner_segment_reuse_activated
     );
     assert!(
         result.scope.prefix_scope_for("archive").is_none(),
@@ -4625,11 +4759,35 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         debug: false,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
     let err = disk
-        .get_size(item)
+        .get_size(item.clone())
         .await
         .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
     assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+    let missing = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(missing.attempts, before.attempts + 1);
+    assert_eq!(missing.not_found, before.not_found + 1);
+    assert_eq!(missing.bytes, before.bytes);
+
+    #[cfg(unix)]
+    {
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("recreate object directory");
+        std::os::unix::fs::symlink(STORAGE_FORMAT_FILE, &metadata_path).expect("inject a metadata symlink loop");
+        let err = disk
+            .get_size(item)
+            .await
+            .expect_err("symlink loop must remain a read failure");
+        assert!(is_scanner_metadata_transient_error(&err), "read error: {err:?}");
+        let failed = global_metrics().scan_observation().snapshot().metadata_reads;
+        assert_eq!(failed.attempts, missing.attempts + 1);
+        assert_eq!(failed.errors, missing.errors + 1);
+        assert_eq!(failed.succeeded, before.succeeded);
+        assert_eq!(failed.bytes, before.bytes);
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4681,6 +4839,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
         debug: false,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
     for contents in [b"".as_slice(), b"not-valid-filemeta".as_slice()] {
         tokio::fs::write(&metadata_path, contents)
             .await
@@ -4691,6 +4850,16 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
         assert!(is_scanner_metadata_corrupt_error(&err));
     }
+
+    let reads = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(reads.attempts, before.attempts + 2);
+    assert_eq!(
+        reads.succeeded,
+        before.succeeded + 2,
+        "storage reads succeed before decoding rejects corruption"
+    );
+    assert_eq!(reads.errors, before.errors);
+    assert_eq!(reads.bytes, before.bytes + 18);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -4764,11 +4933,17 @@ async fn get_size_counts_delete_markers_separately_from_versions() {
         debug: false,
     };
 
+    let before = global_metrics().scan_observation().snapshot().metadata_reads;
+    let expected_bytes = tokio::fs::metadata(&metadata_path).await.expect("stat stored metadata").len();
     let summary = disk.get_size(item).await.expect("scanner should read versioned metadata");
 
     assert_eq!(summary.versions, 2);
     assert_eq!(summary.delete_markers, 1);
     assert_eq!(summary.total_size, 30);
+    let reads = global_metrics().scan_observation().snapshot().metadata_reads;
+    assert_eq!(reads.attempts, before.attempts + 1);
+    assert_eq!(reads.succeeded, before.succeeded + 1);
+    assert_eq!(reads.bytes, before.bytes + expected_bytes);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

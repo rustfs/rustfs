@@ -59,6 +59,7 @@ use rustfs_scanner_metrics::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
+use rustfs_scanner_metrics::scan_observation::ScannerCacheReuseKind;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -1064,11 +1065,10 @@ impl FolderScanner {
         // work. Reusing a clean subtree here would silently suppress that
         // independent maintenance path, so prefix reuse is limited to the
         // non-erasure data-usage scanner.
-        if self.is_erasure_mode
-            || folder.parent.is_some()
+        if folder.parent.is_some()
             || folder.name != self.old_cache.info.name
             || into.compacted
-            || !abandoned_children.contains(&clone_cache_value(&child_hash.0))
+            || !abandoned_children.contains(&child_hash.0)
         {
             return false;
         }
@@ -1080,15 +1080,23 @@ impl FolderScanner {
         else {
             return false;
         };
-        !entry.is_empty() && !entry.contains('/') && !prefix_scan_scope.contains(entry)
+        let clean = !entry.is_empty() && !entry.contains('/') && !prefix_scan_scope.contains(entry);
+        if clean && self.is_erasure_mode {
+            global_metrics().scan_observation().record_erasure_clean_prefix_walk();
+        }
+        clean && !self.is_erasure_mode
     }
 
     fn reuse_clean_root_child(&mut self, child: &CachedFolder, child_hash: &DataUsageHash, into: &mut DataUsageEntry) {
+        let started = Instant::now();
         self.new_cache.copy_with_children(&self.old_cache, child_hash, &child.parent);
         if let Some(updates) = &mut self.usage_updates {
             updates.cache.copy_with_children(&self.old_cache, child_hash, &child.parent);
         }
         into.add_child(child_hash);
+        global_metrics()
+            .scan_observation()
+            .record_cache_reuse(ScannerCacheReuseKind::CleanPrefix, started.elapsed());
     }
 
     fn failed_retry_suppressed(&self, path: &str) -> bool {
@@ -2072,7 +2080,11 @@ impl FolderScanner {
                             // The caller stitches this cached child into its
                             // parent; do not clone a growing child set into the
                             // unused provisional accumulator as well.
+                            let started = Instant::now();
                             self.new_cache.copy_with_children(&self.old_cache, &this_hash, &folder.parent);
+                            global_metrics()
+                                .scan_observation()
+                                .record_cache_reuse(ScannerCacheReuseKind::ClassifiedNamespace, started.elapsed());
                             self.budget.record_entries_visited(pending_entry_progress);
                             self.finish_raw_enumeration_parent(&folder.name);
                             done_folder();
@@ -2659,8 +2671,12 @@ impl FolderScanner {
                     FolderScanMode::Namespace
                 };
                 if child_mode == FolderScanMode::Namespace && reuse_covered {
+                    let started = Instant::now();
                     self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                     into.add_child(&h);
+                    global_metrics()
+                        .scan_observation()
+                        .record_cache_reuse(ScannerCacheReuseKind::CoveredNamespace, started.elapsed());
                     continue;
                 }
 
@@ -2714,8 +2730,12 @@ impl FolderScanner {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
                                 if child_mode == FolderScanMode::Namespace {
+                                    let started = Instant::now();
                                     self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                                     into.add_child(&h);
+                                    global_metrics()
+                                        .scan_observation()
+                                        .record_cache_reuse(ScannerCacheReuseKind::SampledNamespace, started.elapsed());
                                     self.record_scan_resume_hint(&folder_item.name);
                                     continue;
                                 }

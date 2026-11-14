@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
+use crate::scan_observation::{
+    ScannerMetadataReadGuard, ScannerMetadataReadOutcome, ScannerScanObservation, ScannerScanObservationSnapshot,
+};
 use crate::usage_candidate::{
     ScannerUsageCandidateCount, ScannerUsageCandidateKind, ScannerUsageCandidateOutcome, USAGE_CANDIDATE_COUNTER_SLOTS,
 };
@@ -999,6 +1002,7 @@ impl ScannerUsagePublicationObservation {
 
 pub struct Metrics {
     startup: crate::startup::ScannerStartupObservation,
+    scan_observation: ScannerScanObservation,
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
     actions: Vec<AtomicU64>,
@@ -1653,6 +1657,9 @@ pub struct ScannerMetricsReport {
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
     pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    /// Node-local, process-lifetime work observations. Older nodes have no evidence.
+    #[serde(default)]
+    pub scan_observation: ScannerScanObservationSnapshot,
     /// Process-lifetime candidate-construction results. Missing on older reports
     /// means unobserved, not accepted or healthy. Publication is tracked separately.
     #[serde(default)]
@@ -2147,9 +2154,38 @@ impl Metrics {
         &self.startup
     }
 
+    pub fn scan_observation(&self) -> &ScannerScanObservation {
+        &self.scan_observation
+    }
+
+    /// Start after scanner node admission, before polling the disk read future.
+    /// Disk-permit and RPC waits remain included; decoding is excluded. Dropping
+    /// an unfinished guard observes cancellation, not physical I/O completion.
+    pub fn start_scanner_metadata_read(&self) -> ScannerMetadataReadGuard<'_> {
+        self.scan_observation.start_metadata_read();
+        ScannerMetadataReadGuard {
+            metrics: self,
+            started: std::time::Instant::now(),
+            outcome: ScannerMetadataReadOutcome::Cancelled,
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn finish_scanner_metadata_read(&self, outcome: ScannerMetadataReadOutcome, bytes: u64, elapsed: Duration) {
+        let bytes = if outcome == ScannerMetadataReadOutcome::Success {
+            bytes
+        } else {
+            0
+        };
+        self.scan_observation.finish_metadata_read(outcome, bytes, elapsed);
+        self.operations[Metric::ReadMetadata as usize].fetch_add(1, Ordering::Relaxed);
+        self.latency[Metric::ReadMetadata as usize].add_size(elapsed, bytes);
+    }
+
     pub fn new() -> Self {
         Self {
             startup: crate::startup::ScannerStartupObservation::default(),
+            scan_observation: ScannerScanObservation::default(),
             operations: (0..Metric::Last as usize).map(|_| AtomicU64::new(0)).collect(),
             // Each slot gets its own fresh LockedLastMinuteLatency so that
             // different metrics never accidentally share state.
@@ -2755,6 +2791,8 @@ impl Metrics {
     /// walked the whole namespace, so an operator can tell why scoped
     /// convergence is not happening.
     pub fn record_scanner_scope_fallback(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.scan_observation.record_scope_fallback(&reason);
         self.scanner_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
         self.scanner_scope_fallback_last_unix_secs
             .store(unix_now_secs(), Ordering::Relaxed);
@@ -2762,7 +2800,7 @@ impl Metrics {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *last_reason = reason.into();
+        *last_reason = reason;
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
@@ -3897,6 +3935,7 @@ impl Metrics {
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
         };
         m.usage_candidates = self.usage_candidate_counts();
+        m.scan_observation = self.scan_observation.snapshot();
         let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
         m.usage_freshness = ScannerUsageFreshnessSnapshot {
             dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
