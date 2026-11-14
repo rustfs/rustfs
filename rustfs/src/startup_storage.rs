@@ -154,6 +154,7 @@ pub(crate) async fn init_startup_storage_runtime(
 ) -> Result<StartupStorageRuntime> {
     rustfs_scanner::register_scanner_pause_backlog_retirement();
     let ctx = CancellationToken::new();
+    let handoff = consume_read_only_scanner_handoff(&instance_ctx, endpoint_pools, server_addr).await?;
 
     debug!(
         target: "rustfs::main::run",
@@ -179,6 +180,7 @@ pub(crate) async fn init_startup_storage_runtime(
             );
         })?;
 
+    restore_read_only_scanner_handoff(store.as_ref(), handoff);
     init_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
     init_background_replication(store.clone()).await;
@@ -197,6 +199,7 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
     instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
     rustfs_scanner::register_scanner_pause_backlog_retirement();
+    let handoff = consume_read_only_scanner_handoff(&instance_ctx, endpoint_pools, server_addr).await?;
     let store =
         match ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), shutdown_token.clone(), instance_ctx).await {
             Ok(store) => store,
@@ -213,11 +216,46 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
             }
         };
 
+    restore_read_only_scanner_handoff(store.as_ref(), handoff);
     init_embedded_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
     init_background_replication(store.clone()).await;
 
     Ok(StartupStorageRuntime { store, shutdown_token })
+}
+
+fn scanner_handoff_owner(endpoint_pools: &EndpointServerPools, server_addr: SocketAddr) -> String {
+    // ECStore initializes the global node name after receipt consumption.
+    let (_, owner) = endpoint_pools.peers();
+    if owner.is_empty() {
+        format!("{}:{}", server_addr.ip(), server_addr.port())
+    } else {
+        owner
+    }
+}
+
+async fn consume_read_only_scanner_handoff(
+    instance_ctx: &InstanceContext,
+    endpoint_pools: &EndpointServerPools,
+    server_addr: SocketAddr,
+) -> Result<Option<String>> {
+    let owner = scanner_handoff_owner(endpoint_pools, server_addr);
+    // ECStore construction can start delete recovery and data movement.
+    rustfs_heal::heal::consume_read_only_scanner_handoff(&owner, &instance_ctx.local_disk_inventory().await)
+        .await
+        .map_err(|error| Error::other(format!("scanner shutdown receipt: {error}")))
+}
+
+fn restore_read_only_scanner_handoff(store: &ECStore, previous: Option<String>) {
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_SCANNER_READ_ONLY_HANDOFF, false)
+        && store.scanner_namespace_mutation_generation() == 0
+        && rustfs_scanner::scanner_process_was_read_only()
+        && let Some(instance) = previous
+    {
+        // Consumption precedes all background producers and Scanner startup.
+        // An already initialized identity remains fresh instead of being replaced.
+        rustfs_scanner::restore_scanner_checkpoint_instance_id(&instance);
+    }
 }
 
 async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
@@ -351,8 +389,9 @@ fn global_config_retry_exhausted(retry_count: usize) -> bool {
 mod tests {
     use super::{
         global_config_retry_exhausted, init_embedded_startup_storage_foundation, init_startup_storage_foundation,
-        storage_pool_has_host_failure_risk,
+        scanner_handoff_owner, storage_pool_has_host_failure_risk,
     };
+    use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::storage_api::startup::storage::{
         INLINE_BLOCK_ENV, InstanceContext, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV, bootstrap_instance_ctx,
     };
@@ -361,6 +400,32 @@ mod tests {
     // The erasure-set-drive-count env var name, kept local to this test to avoid
     // reaching across the storage facade boundary for a bare string constant.
     const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
+
+    #[test]
+    fn scanner_handoff_owner_is_available_before_store_initialization() {
+        assert!(rustfs_common::try_get_global_local_node_name().is_none());
+        for (local, address, expected) in [
+            ("http://127.0.0.1:19020/d1", "0.0.0.0:19020", "127.0.0.1:19020"),
+            ("https://[::1]:19020/d1", "[::]:19020", "[::1]:19020"),
+            ("/tmp/scanner-handoff-owner", "127.0.0.1:19020", "127.0.0.1:19020"),
+        ] {
+            let mut local = Endpoint::try_from(local).expect("local endpoint");
+            local.is_local = true;
+            let mut remote = Endpoint::try_from("http://192.0.2.1:19020/d1").expect("remote endpoint");
+            remote.is_local = false;
+            let mut pools = EndpointServerPools::default();
+            pools.reset(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 2,
+                endpoints: Endpoints::from(vec![remote, local]),
+                cmd_line: "scanner-handoff-owner".to_owned(),
+                platform: "test".to_owned(),
+            }]);
+            assert_eq!(scanner_handoff_owner(&pools, address.parse().expect("listen address")), expected);
+            assert!(rustfs_common::try_get_global_local_node_name().is_none());
+        }
+    }
 
     #[test]
     fn reports_host_failure_risk_only_for_multi_drive_sets() {

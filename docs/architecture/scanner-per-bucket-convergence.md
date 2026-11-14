@@ -255,18 +255,7 @@ walk. Field roles:
 | `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
-The activity snapshot feeds two plan identities with different jobs. The
-coverage identity (bucket list and creation times, `topology_digest`,
-`protocol_version`, `data_movement_active`, `movement_generation`) decides
-whether a resumed bucket checkpoint still describes the same traversal; only
-it may mark a resumed sweep as mixed coverage. The reuse identity adds
-`instance_id` and `maintenance_generation` and decides whether a completed
-cache or a scoped baseline may be reused: a peer restart can lose dirty hints
-inside the journal's coalescing window and a maintenance change needs a fresh
-discovery walk, so both force a full walk, but neither changes what a
-full-walk checkpoint has already covered. `publication_blocked` belongs to
-neither identity. The guardrail compares the reuse identity plus the movement
-fields.
+The activity snapshot feeds separate traversal, bucket-reuse and publication identities. Traversal binds the canonical peer set, bucket list and creation times, topology, protocol, movement state and checkpoint continuity. Bucket reuse also binds namespace, maintenance and dirty generations. Protocol v8 authenticates a checkpoint identity separately from the fresh RPC process identity: only a clean, read-only shutdown with `RUSTFS_SCANNER_READ_ONLY_HANDOFF=true` can hand that identity to the next process. The flag defaults to false and requires reader-first deployment plus receipt-clearing preparation before legacy rollback. Missing, corrupt, mismatched or unconsumed receipts, a writer, or a crash expire it and invalidate old coverage. Protocol v7 remains readable and retains its fresh process fence. `publication_blocked` belongs to neither cache identity; it remains a cycle veto. Publication, dirty ACKs and leases always bind the actual process identity, even across a verified handoff. See [the shutdown receipt contract](scanner-usage-publication.md#read-only-restart-continuity).
 
 The guardrail is bounded in three ways:
 

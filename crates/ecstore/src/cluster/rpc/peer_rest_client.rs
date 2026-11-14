@@ -21,7 +21,7 @@ use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_bo
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
 };
 use crate::{
@@ -192,6 +192,7 @@ fn validate_signal_service_protocol(sig: u64, sub_sys: &str, protocol_version: u
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannerPeerActivity {
     pub instance_id: String,
+    pub checkpoint_instance_id: Option<String>,
     pub namespace_generation: u64,
     pub maintenance_generation: u64,
     pub protocol_version: u32,
@@ -354,6 +355,9 @@ fn decode_scanner_activity_with_verifier(
     challenge: &[u8; 16],
     verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
 ) -> Result<ScannerPeerActivity> {
+    if response.protocol_version != SCANNER_ACTIVITY_PROTOCOL_VERSION && response.checkpoint_instance_id.is_some() {
+        return Err(Error::other("legacy scanner activity peer returned unauthenticated checkpoint identity"));
+    }
     let instance_id = &response.instance_id;
     if !scanner_instance_id_is_valid(instance_id) {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
@@ -423,7 +427,7 @@ fn decode_scanner_activity_with_verifier(
                 None,
             )
         }
-        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+        SCANNER_ACTIVITY_V7_PROTOCOL_VERSION | SCANNER_ACTIVITY_PROTOCOL_VERSION => {
             if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
                 return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
             }
@@ -436,8 +440,20 @@ fn decode_scanner_activity_with_verifier(
             if movement_generation == u64::MAX {
                 return Err(Error::other("scanner activity peer exhausted its movement generation"));
             }
-            let canonical = rustfs_protos::canonical_scanner_activity_v7_response_body(challenge, &response)
-                .map_err(|_| Error::other("scanner activity peer response is too large to authenticate"))?;
+            let canonical = if response.protocol_version == SCANNER_ACTIVITY_PROTOCOL_VERSION {
+                let instance = response
+                    .checkpoint_instance_id
+                    .as_deref()
+                    .filter(|instance| scanner_instance_id_is_valid(instance))
+                    .ok_or_else(|| Error::other("scanner activity peer omitted its checkpoint identity"))?;
+                if instance.bytes().all(|byte| byte == b'0') {
+                    return Err(Error::other("scanner activity peer returned an empty checkpoint identity"));
+                }
+                rustfs_protos::canonical_scanner_activity_v8_response_body(challenge, &response)
+            } else {
+                rustfs_protos::canonical_scanner_activity_v7_response_body(challenge, &response)
+            }
+            .map_err(|_| Error::other("scanner activity peer response is too large to authenticate"))?;
             verify_proof(&canonical, &response.response_proof)?;
             (
                 Some(
@@ -458,6 +474,7 @@ fn decode_scanner_activity_with_verifier(
     };
     Ok(ScannerPeerActivity {
         instance_id: response.instance_id,
+        checkpoint_instance_id: response.checkpoint_instance_id,
         namespace_generation: response.namespace_generation,
         maintenance_generation: response.maintenance_generation,
         protocol_version: response.protocol_version,
@@ -2452,11 +2469,15 @@ impl PeerRestClient {
             .scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_PROTOCOL_VERSION)
             .await;
         if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
-            // A v6 peer cannot parse the v7 marker.  Its authenticated
-            // response is still decoded as untrusted terminal state, so the
-            // scanner will defer publication until every peer is v7.
-            self.scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
-                .await
+            let previous = self
+                .scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION)
+                .await;
+            if previous.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+                self.scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                    .await
+            } else {
+                previous
+            }
         } else {
             result
         }
@@ -2723,8 +2744,15 @@ impl PeerRestClient {
             .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
             .await;
         if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
-            self.scanner_activity_request_with_protocol(instance_id, generation, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
-                .await
+            let previous = self
+                .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION)
+                .await;
+            if previous.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+                self.scanner_activity_request_with_protocol(instance_id, generation, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                    .await
+            } else {
+                previous
+            }
         } else {
             result
         }
@@ -3680,6 +3708,7 @@ mod tests {
     #[test]
     fn scanner_scoped_dirty_usage_ack_reconciliation_requires_same_clean_instance() {
         let activity = |instance_id: &str, generation, pending| ScannerPeerActivity {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: instance_id.to_string(),
             namespace_generation: 1,
             maintenance_generation: 1,
@@ -3962,8 +3991,43 @@ mod tests {
     }
 
     #[test]
+    fn scanner_checkpoint_identity_requires_v8_proof_and_preserves_rpc_epoch() {
+        let response = ScannerActivityResponse {
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            instance_id: "1".repeat(32),
+            checkpoint_instance_id: Some("2".repeat(32)),
+            topology_digest: vec![7; 32].into(),
+            movement_generation: Some(0),
+            publication_blocked: Some(false),
+            response_proof: b"proof".to_vec().into(),
+            ..Default::default()
+        };
+        let decoded = decode_test_scanner_activity(response.clone()).expect("authenticated v8");
+        assert_eq!(decoded.instance_id, "1".repeat(32));
+        assert_eq!(decoded.checkpoint_instance_id, Some("2".repeat(32)));
+        for checkpoint_instance_id in [None, Some(String::new()), Some("0".repeat(32)), Some("A".repeat(32))] {
+            let malformed = ScannerActivityResponse {
+                checkpoint_instance_id,
+                ..response.clone()
+            };
+            assert!(decode_test_scanner_activity(malformed).is_err(), "invalid continuity must fail closed");
+        }
+        let v7 = ScannerActivityResponse {
+            protocol_version: SCANNER_ACTIVITY_V7_PROTOCOL_VERSION,
+            ..response
+        };
+        assert!(decode_test_scanner_activity(v7.clone()).is_err(), "legacy proof does not bind continuity");
+        let v7 = ScannerActivityResponse {
+            checkpoint_instance_id: None,
+            ..v7
+        };
+        assert!(decode_test_scanner_activity(v7).is_ok(), "v7 without continuity remains supported");
+    }
+
+    #[test]
     fn scanner_activity_requires_restart_safe_peer_identity() {
         let legacy = decode_test_scanner_activity(ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -3980,6 +4044,7 @@ mod tests {
         assert_eq!(
             legacy,
             ScannerPeerActivity {
+                checkpoint_instance_id: None,
                 instance_id: "0123456789abcdef0123456789abcdef".to_string(),
                 namespace_generation: 7,
                 maintenance_generation: 3,
@@ -3994,6 +4059,7 @@ mod tests {
         );
 
         let previous = decode_test_scanner_activity(ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4010,6 +4076,7 @@ mod tests {
         assert_eq!(
             previous,
             ScannerPeerActivity {
+                checkpoint_instance_id: None,
                 instance_id: "0123456789abcdef0123456789abcdef".to_string(),
                 namespace_generation: 7,
                 maintenance_generation: 3,
@@ -4024,6 +4091,7 @@ mod tests {
         );
 
         let v6 = decode_test_scanner_activity(ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4042,6 +4110,7 @@ mod tests {
         assert_eq!(v6.dirty_usage_generation, Some(11));
 
         let malformed_topology = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4062,6 +4131,7 @@ mod tests {
         );
 
         let missing_instance = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: String::new(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4082,6 +4152,7 @@ mod tests {
         );
 
         let malformed_instance = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "ABCDEF0123456789ABCDEF0123456789".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4102,6 +4173,7 @@ mod tests {
         );
 
         let activity = decode_test_scanner_activity(ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4118,6 +4190,7 @@ mod tests {
         assert_eq!(
             activity,
             ScannerPeerActivity {
+                checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
                 instance_id: "0123456789abcdef0123456789abcdef".to_string(),
                 namespace_generation: 7,
                 maintenance_generation: 3,
@@ -4132,6 +4205,7 @@ mod tests {
         );
 
         let missing_movement_generation = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4152,6 +4226,7 @@ mod tests {
         );
 
         let pending_without_generation = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4172,6 +4247,7 @@ mod tests {
         );
 
         let previous_with_dirty_usage = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4192,6 +4268,7 @@ mod tests {
         );
 
         let legacy_with_topology = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4212,6 +4289,7 @@ mod tests {
         );
 
         let unsupported_protocol = ScannerActivityResponse {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
@@ -4232,6 +4310,7 @@ mod tests {
         );
 
         let missing_proof = ScannerActivityResponse {
+            checkpoint_instance_id: Some("1123456789abcdef0123456789abcdef".to_owned()),
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,

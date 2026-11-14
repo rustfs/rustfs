@@ -295,11 +295,18 @@ pub(super) fn put_active_multipart_source_head(source: impl AsRef<Path>, raw: By
 }
 
 fn stamp_matches_active_disk(source: &Path, expected_head_stamp: FileStamp) -> bool {
-    FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp)
-        && !(cfg!(test)
-            && (source.join(STATE).exists()
-                || source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
-                || source.join(".mpu-completions").exists()))
+    let stamp_matches = FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp);
+    #[cfg(test)]
+    {
+        stamp_matches
+            && !source.join(STATE).exists()
+            && !source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
+            && !source.join(".mpu-completions").exists()
+    }
+    #[cfg(not(test))]
+    {
+        stamp_matches
+    }
 }
 
 pub(super) fn get_active_multipart_source_head(source: &Path) -> Option<(Bytes, FileInfo)> {

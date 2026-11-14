@@ -985,6 +985,9 @@ message ScannerActivityResponse {
   // response shape while newer readers fail closed when they are absent.
   optional uint64 movement_generation = 10;
   optional bool publication_blocked = 11;
+  // v8 binds checkpoint reuse to a verified clean, read-only handoff.
+  // The process instance above remains fresh for RPC and ACK fencing.
+  optional string checkpoint_instance_id = 12;
 }
 
 message ScannerDirtyUsageBucket {

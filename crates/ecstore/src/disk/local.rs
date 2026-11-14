@@ -3642,10 +3642,17 @@ pub(crate) fn has_delete_version_test_failpoints() -> bool {
 #[cfg(not(test))]
 pub(crate) fn has_delete_version_test_failpoints() -> bool {
     #[cfg(all(feature = "test-util", not(windows)))]
-    if os::prepared_publication_test_hooks::has_any_hooks() {
-        return true;
+    let prepared_hooks = os::prepared_publication_test_hooks::has_any_hooks();
+    #[cfg(not(all(feature = "test-util", not(windows))))]
+    let prepared_hooks = false;
+    #[cfg(feature = "e2e-test-hooks")]
+    {
+        prepared_hooks || std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
     }
-    cfg!(feature = "e2e-test-hooks") && std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    {
+        prepared_hooks
+    }
 }
 
 #[cfg(test)]
@@ -12284,8 +12291,11 @@ impl LocalDisk {
         // Files written here (format.json, ...) stay where they land — no
         // rename follows — so the new directory entry must be fsynced too.
         // System-critical volumes are pinned to strict by effective_durability;
-        // only the legacy full-off switch (historical semantics) skips this.
-        let sync = if effective_durability(volume).syncs_commit_metadata() {
+        // A consumed shutdown receipt must never survive a later writer crash,
+        // including when data-shard syncing is disabled.
+        let sync = if (volume == RUSTFS_META_BUCKET && path == super::UNCLEAN_SHUTDOWN_MARKER_PATH)
+            || effective_durability(volume).syncs_commit_metadata()
+        {
             SyncMode::FileAndDir
         } else {
             SyncMode::None
@@ -22166,6 +22176,33 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&dst_parent),
             "destination parent dir must be fsynced after the commit rename"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_receipt_is_durable_with_legacy_sync_disabled() {
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+        let dir = tempfile::tempdir().expect("shutdown marker disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("local endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            crate::disk::UNCLEAN_SHUTDOWN_MARKER_PATH,
+            Bytes::from_static(b"running"),
+        )
+        .await
+        .expect("consume shutdown receipt");
+        let parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, crate::disk::UNCLEAN_SHUTDOWN_MARKER_PATH)
+            .expect("marker path")
+            .parent()
+            .expect("marker parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&parent),
+            "a stale clean receipt must not reappear after a crash"
         );
     }
 

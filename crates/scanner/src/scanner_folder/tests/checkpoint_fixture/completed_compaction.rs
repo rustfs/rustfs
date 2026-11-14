@@ -134,7 +134,7 @@ async fn assert_completed_compaction_resumes(mode: HealScanMode) {
         .await
         .expect("initial fixture revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist compacted partial cache through the production codec and CAS path");
     let mut reloaded = store.strict_load().await;

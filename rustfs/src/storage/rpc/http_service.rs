@@ -19,9 +19,9 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
     PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
-    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
-    sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
-    with_remote_background_io, with_rpc_background_request,
+    find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
+    sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+    verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io, with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -79,6 +79,7 @@ const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
 const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
+const NS_SCANNER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
@@ -1246,9 +1247,12 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::CONFLICT, "namespace scanner server epoch is stale");
     }
-    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
-        Ok(disk) => disk,
-        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    let disk = match tokio::time::timeout(NS_SCANNER_PREFLIGHT_TIMEOUT, find_local_disk_by_ref_for_scanner_rpc(&query.disk)).await
+    {
+        Ok(Ok(disk)) => disk,
+        Ok(Err(_)) | Err(_) => {
+            return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred");
+        }
     };
     let Some(disk) = disk else {
         warn!(

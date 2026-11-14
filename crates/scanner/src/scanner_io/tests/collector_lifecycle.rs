@@ -130,6 +130,7 @@ async fn scan_plan(set: &Arc<SetDisks>, names: &[&str], cycle: u64) -> ScannerBu
         digest,
         bucket_coverage_digest: digest,
         checkpoint_coverage_digest: digest,
+        completed_checkpoint_cycle_floor: None,
         requires_full_scan: true,
         service_cohort: Some(Arc::new(StdMutex::new(cohort))),
         execution_digest: digest,

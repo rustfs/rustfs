@@ -234,7 +234,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
     startup_runtime_sources::publish_init_time_now().await;
     let event_notifier_reconciler = start_persisted_event_notifier_reconciler(store.clone(), shutdown_token.clone());
 
-    let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store, enable_scanner).await;
+    let scanner_cleanup = init_scanner_with_recovery(shutdown_token.clone(), store.clone(), enable_scanner).await;
 
     let shutdown_signal = wait_for_shutdown().await;
     let (capacity_report, maintenance_result, front_result) = run_startup_shutdown_sequence(
@@ -246,6 +246,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         StartupShutdownServices {
             capacity: capacity_tasks,
             table_maintenance,
+            scanner_cleanup,
+            store,
             #[cfg(feature = "internode-transport")]
             peer_control: peer_control.take(),
         },
@@ -267,9 +269,6 @@ pub(crate) async fn run_startup_runtime_lifecycle(
     shutdown_connect_runtimes(heartbeat, inventory).await;
     if let Some(runtime) = local_trace_capture {
         runtime.shutdown().await;
-    }
-    if let Some(cleanup) = scanner_cleanup {
-        let _ = wait_for_scanner_cleanup(cleanup).await;
     }
     if let Err(err) = event_notifier_reconciler.await {
         tracing::warn!(
@@ -306,7 +305,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
     .into_result()
 }
 
-async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()>) -> bool {
+pub(crate) async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()>) -> bool {
     // Dropping a JoinHandle detaches rather than aborts the task. Keep an
     // in-flight reset's guards owned while this runtime remains alive. This
     // bounded wait does not prove I/O drain at a later runtime/process exit.

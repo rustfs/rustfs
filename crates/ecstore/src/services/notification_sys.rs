@@ -5958,6 +5958,7 @@ mod tests {
     #[test]
     fn scanner_dirty_usage_acknowledgement_preserves_newer_pending_work() {
         let activity = |dirty_usage_pending| ScannerPeerActivity {
+            checkpoint_instance_id: None,
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 1,
             maintenance_generation: 1,

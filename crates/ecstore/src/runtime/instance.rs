@@ -1045,6 +1045,13 @@ impl InstanceContext {
         self.local_disk_map.clone()
     }
 
+    /// Snapshot the boot-time disk registry before a store is published.
+    /// Missing local drives remain explicit so startup receipts cannot treat
+    /// an available subset as the complete instance inventory.
+    pub async fn local_disk_inventory(&self) -> Vec<Option<DiskStore>> {
+        self.local_disk_map.read().await.values().cloned().collect()
+    }
+
     /// Handle to this instance's local disk-id→endpoint map.
     pub(crate) fn local_disk_id_map(&self) -> Arc<RwLock<HashMap<Uuid, String>>> {
         self.local_disk_id_map.clone()

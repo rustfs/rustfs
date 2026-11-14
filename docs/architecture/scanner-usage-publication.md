@@ -110,21 +110,17 @@ snapshot for a missing or corrupt authoritative object.
 
 ## Cache Execution Identity
 
-The structural scan-plan digest can remain stable across ordinary bucket writes
-so a scoped scan can retain unaffected baseline buckets. It is not sufficient
-proof for reusing a completed result within the same cycle. Bucket work uses an
-execution digest combining the structural plan and the full activity snapshot,
-with the bucket's dirty generation included in its cache identity. A bucket
-sweep's checkpoint is keyed separately by the coverage identity
-(`scanner_activity_coverage_digest`, see
-[scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md)), so
-the reuse identity can change without restarting a sweep in progress. Completed
-set caches carry the same execution digest separately from their structural
-plan; a set cache that stands in for buckets whose walk stopped early binds
-the carried bucket names into it (`scanner_carried_execution_digest`), so it
-is never adopted in place of a full walk of the same cycle, nor the reverse.
-The persisted set-root fast path requires equal execution identities as well as
-the existing source, cycle, leader, tier, and cache-structure checks.
+The structural scan-plan digest remains stable across ordinary bucket writes so a scoped scan can retain unaffected baseline buckets. Bucket reuse additionally binds every member's namespace, maintenance and dirty generations; its process component may survive only the read-only handoff described below. The current cycle's execution digest always binds the full activity snapshot with fresh RPC process identities. A set cache carrying buckets whose walk stopped early also binds those bucket names (`scanner_carried_execution_digest`), so it cannot replace a full walk of the same cycle. Completed bucket progress from an older leader is reusable only above the authoritative aggregate's published cycle floor, with identical incarnation, source, layout, tier, scan mode, checkpoint coverage and bucket reuse identity. Adoption never advances the saved cycle. A published aggregate expires this unpublished-progress exception.
+
+## Read-Only Restart Continuity
+
+`RUSTFS_SCANNER_READ_ONLY_HANDOFF` defaults to `false`. Unset, false or invalid values disable both checkpoint-identity restoration and receipt creation; startup still durably consumes existing receipts. Deploy these readers to every possible writer before enabling receipt writes with `true`. Cross-process reuse of unpublished completed buckets requires this opt-in.
+
+The existing `.rustfs.sys/unclean-shutdown` marker can contain a versioned read-only handoff receipt. It binds the node owner, disk UUID, complete local endpoint/disk inventory and checkpoint identity. Startup consumes every receipt by durably replacing it with `running` before constructing the store, because store construction can start recovery writers. Missing or incompatible receipts provide no continuity; an existing or unreadable receipt that cannot be overwritten aborts startup. Marker writes always sync the file and parent directory, including under the legacy data-sync-off setting. A missing local drive, replacement disk, different inventory or inconsistent receipt identity expires continuity.
+
+When enabled, shutdown saves matching receipts only after frontend, heal, capacity, table-maintenance, scanner and detached-mutation shutdown fences succeed, and only if the process observed no namespace or maintenance mutation. Live dirty notifications permanently disqualify that process even if the dirty generation is later acknowledged; replaying an existing durable dirty hint is not a new mutation. A writer follows ordinary marker cleanup and receives a fresh checkpoint identity on restart. Cancellation, failed shutdown, crash and partial receipt writes cannot grant continuity. Activity protocol v8 signs the checkpoint identity while keeping RPC instances, ACKs, publication proofs and leases fresh. v7 responses omit this field and use the old fresh-process fence.
+
+Before any older binary opens the storage, disable the flag on every node, start the current reader with all local drives present, wait for readiness on every node, then shut down cleanly. This preparation consumes receipts without restoring their identities or writing replacements. If a node cannot complete it, rollback must wait. Direct rollback from an enabled writer is unsupported: an older process can start recovery before replacing its marker, and a 1.0.4 writer with Scanner and Heal disabled can acknowledge a foreground write and crash while leaving the receipt unchanged. Metadata synchronization alone does not close that gap. A later opt-in restart after the supported preparation starts a fresh checkpoint lineage.
 
 Remote workers receive the reuse plan as `scan_plan_digest` and the independent
 coverage plan as optional `checkpoint_plan_digest`. The v3 capability proof

@@ -58,7 +58,10 @@ pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
 /// a scanner must not use it as a publication proof because terminal movement
 /// state is not authenticated by that version.
 pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
+/// Authenticates terminal movement state, but carries no checkpoint continuity.
+pub const SCANNER_ACTIVITY_V7_PROTOCOL_VERSION: u32 = 7;
+/// Authenticates read-only checkpoint continuity separately from the RPC epoch.
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 8;
 pub const SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION: u32 = 2;
 pub const SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES: usize = 32;
 pub const SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES: usize = SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES;

@@ -85,3 +85,8 @@ RUST_MIN_STACK=4194304 cargo test -p rustfs-ecstore --lib segment_observation_eq
 ```
 
 [W19](https://github.com/rustfs/backlog/issues/2272) remains open for trustworthy producer coverage, source/incarnation binding, and production shadow observations. No production stream, durable journal, runtime feature switch, scan skipping, or performance claim is introduced here. No restart/gap detection or restart-safe production coverage is established, and the revision-aware file backend does not prove EC publication durability.
+
+
+## Whole-cycle read-only restart regression
+
+`scanner_io::tests::checkpoint_coverage_identity::checkpoint_small_budget_accumulates_across_process_restarts` runs real scanner/store workers in fresh OS processes against four buckets. Every scan keeps the same two-object budget and must publish exact per-bucket totals within 40 rounds. Separate cases inject a write into an already completed bucket before global publication, then either cleanly stop the writer or leave its running marker behind. Both must expire checkpoint continuity and eventually include the extra object; accepting the old total as converged fails the test. This is a local storage regression, separate from whole-daemon multi-node and physical-device acceptance.

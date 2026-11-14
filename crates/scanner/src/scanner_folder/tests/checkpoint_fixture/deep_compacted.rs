@@ -42,7 +42,7 @@ async fn save_reload(store: &Arc<FixtureStore>, cache: &DataUsageCache) -> DataU
         .await
         .expect("fixture save revisions");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("save compacted checkpoint through real codec and revision checks");
     let loaded = store.strict_load().await;

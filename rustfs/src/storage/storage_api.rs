@@ -322,9 +322,9 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
-            sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
-            with_remote_background_io,
+            find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
+            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+            verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
         };
     }
 
@@ -332,7 +332,7 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
-            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION,
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
@@ -717,8 +717,8 @@ pub(crate) mod ecstore_storage {
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks_with_instance_ctx,
-        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -2663,6 +2663,10 @@ pub(crate) use ecstore_storage::find_local_disk_by_ref;
 
 pub(crate) async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
     ecstore_storage::find_local_disk_by_ref_for_rpc(disk_ref).await
+}
+
+pub(crate) async fn find_local_disk_by_ref_for_scanner_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
+    ecstore_storage::find_local_disk_by_ref_for_scanner_rpc(disk_ref).await
 }
 
 pub(crate) trait StorageVersioningConfigExt {

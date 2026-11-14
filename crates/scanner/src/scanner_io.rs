@@ -931,6 +931,7 @@ pub struct ScannerBucketScanPlan {
     /// coordinator restart or a maintenance publication does not turn a
     /// resumed sweep into mixed coverage.
     checkpoint_coverage_digest: DataUsageScanPlanDigest,
+    completed_checkpoint_cycle_floor: Option<u64>,
     requires_full_scan: bool,
     service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
@@ -2145,8 +2146,8 @@ use guards::*;
 
 pub(crate) use cache::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
-    persist_scanner_checkpoint,
+    acquire_scanner_cache_locks, completed_checkpoint_cycle_floor, current_cache_root_or_prepare_with_generation,
+    log_saved_partial_bucket_cache, persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,
@@ -2156,8 +2157,10 @@ pub use dirty_usage::{
     probe_scoped_dirty_usage, record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer,
     record_dirty_usage_bucket_from_producers, record_dirty_usage_object, record_dirty_usage_object_from_producer,
     record_scanner_maintenance_change, record_status_class_mutation, replay_durable_dirty_usage_producer_record,
-    scanner_activity_epoch, scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
-    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
+    restore_scanner_checkpoint_instance_id, scanner_activity_epoch, scanner_checkpoint_instance_id,
+    scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation, scanner_process_was_read_only, set_scanner_dirty_usage_clear_observer,
+    set_scanner_dirty_usage_mutation_observer,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

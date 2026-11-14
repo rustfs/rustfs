@@ -314,6 +314,8 @@ last successful timestamp and values unchanged. Missing/invalid limits, invisibl
 membership, or oversized files must not be interpreted as host capacity or zero
 pressure. Other platforms and cgroup v1 have no sample from this observer.
 
+A missing `cpu.max` or `memory.max` is accepted only when `cgroup.controllers` proves that the controller belongs to the verified v2 hierarchy but is not enabled for that cgroup. Visible ancestor limits and sibling memory use still apply. Missing limits for an available controller, unreadable controller lists, and controllers absent from the v2 root remain unavailable; missing pressure counters remain unknown.
+
 The `cpu_usage_microseconds`, `cpu_throttled_microseconds`, `cpu_stall_microseconds`,
 `memory_stall_microseconds`, and `io_stall_microseconds` gauges, under the same
 prefix, expose cumulative leaf-cgroup counters. Each requires its own

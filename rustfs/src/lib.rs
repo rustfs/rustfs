@@ -72,6 +72,8 @@ macro_rules! hp_guard {
 }
 
 pub mod admin;
+#[cfg(feature = "diagnostic-allocator-live")]
+pub mod allocator_live;
 pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;

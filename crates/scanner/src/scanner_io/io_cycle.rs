@@ -619,6 +619,14 @@ where
     };
 
     let distributed = store.setup_is_dist_erasure().await;
+    let local_node = if distributed {
+        store
+            .scanner_local_node_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| Error::other("scanner local member identity is unavailable"))?
+    } else {
+        crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE.to_string()
+    };
     #[cfg(test)]
     let distributed = distributed || peer_observations.is_some();
     let activity_before = match scanner_activity_preflight(
@@ -723,15 +731,23 @@ where
     let activity_before = remote_start
         .as_ref()
         .map_or(activity_before, ScannerRemoteDirtyUsageWindow::activity_for_walk);
-    let structural_scan_plan_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
+    let structural_scan_plan_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_structural_digest(&activity_before, &local_node),
+    );
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
-    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
-    // A bucket checkpoint must not be invalidated by another bucket joining
-    // the inventory. The set plan above still binds the complete inventory.
-    let checkpoint_coverage_digest = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity_before));
-    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_bucket_reuse_digest(&activity_before, &local_node),
+    );
+    // A bucket checkpoint must survive unrelated inventory changes.
+    let checkpoint_coverage_digest =
+        DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity_before, &local_node));
+    let completed_checkpoint_cycle_floor =
+        completed_checkpoint_cycle_floor(persisted_usage_baseline.as_deref(), &expected_sources, want_cycle, leader_epoch);
+    let execution_digest =
+        scanner_bucket_work_digest(scanner_bucket_plan_digest(&all_buckets, activity_digest), scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
     let baseline_proof = ScannerCacheBaselineProof {
         authoritative_data: persisted_usage_baseline.as_ref(),
@@ -1014,6 +1030,7 @@ where
                 digest: structural_scan_plan_digest,
                 bucket_coverage_digest,
                 checkpoint_coverage_digest,
+                completed_checkpoint_cycle_floor,
                 requires_full_scan,
                 service_cohort: service_cohort.clone(),
                 execution_digest,
@@ -1301,9 +1318,11 @@ where
         })
         .flatten();
     let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
+    // A fully drained fresh result can outlive its work budget. Carried values
+    // do not prove that a budget-stopped bucket finished its pending walk.
     let cycle_status = classify_nsscanner_cycle(
         structurally_complete_snapshot,
-        owner_ctx.is_cancelled(),
+        owner_ctx.is_cancelled() || (budget_elapsed && !partial_buckets.is_empty()),
         bucket_scan_status,
         dirty_usage_status,
         activity_status,

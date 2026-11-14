@@ -932,7 +932,7 @@ async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source()
             progress.started_plan.0[0] ^= 1;
             let epoch = cache.info.scan_identity.expect("checkpoint identity").publication_epoch;
             cache
-                .save_with_revisions_for_epoch(set, &cache_name, &revisions, epoch)
+                .save_with_revisions_for_epoch(set, &cache_name, &revisions, epoch, CancellationToken::new())
                 .await
                 .expect("persist a resumed interval mismatch on one source");
             mixed_source = Some(index);

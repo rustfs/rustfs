@@ -4459,9 +4459,10 @@ pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
     LOCAL_SCANNER_ACTIVITY_NODE, ScannerActivityGuardrailVeto, ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement,
     ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_coverage_digest, scanner_activity_dirty_usage_state_for_host, scanner_activity_guardrail_veto,
-    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_activity_structural_digest,
-    scanner_activity_usage_watch_structure_digest, scanner_dirty_usage_acknowledgements, scanner_peer_dirty_usage_moved,
+    scanner_activity_bucket_reuse_digest, scanner_activity_coverage_digest, scanner_activity_dirty_usage_state_for_host,
+    scanner_activity_guardrail_veto, scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest,
+    scanner_activity_structural_digest, scanner_activity_usage_watch_structure_digest, scanner_dirty_usage_acknowledgements,
+    scanner_peer_dirty_usage_moved,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

@@ -38,6 +38,8 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
             ..Default::default()
         },
     );
+    // The count stop must drain real bucket-cache commits, not a timed mock.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),

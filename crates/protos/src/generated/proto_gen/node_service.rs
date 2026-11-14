@@ -1542,6 +1542,10 @@ pub struct ScannerActivityResponse {
     pub movement_generation: ::core::option::Option<u64>,
     #[prost(bool, optional, tag = "11")]
     pub publication_blocked: ::core::option::Option<bool>,
+    /// v8 binds checkpoint reuse to a verified clean, read-only handoff.
+    /// The process instance above remains fresh for RPC and ACK fencing.
+    #[prost(string, optional, tag = "12")]
+    pub checkpoint_instance_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

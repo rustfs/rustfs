@@ -5,6 +5,7 @@ use super::*;
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant as WallInstant;
+use tokio_util::sync::CancellationToken;
 
 const MAX_WIRE_BYTES: u64 = 32 * 1024 * 1024;
 const CACHE_NAME: &str = "bucket/cache-cost.bin";
@@ -230,7 +231,7 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
         .await
         .expect("initial revisions");
     baseline
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &initial, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &initial, 0, CancellationToken::new())
         .await
         .expect("baseline save");
 
@@ -287,7 +288,7 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
         store.reset_counts();
         let started = WallInstant::now();
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("measured save");
         save_ns.push(elapsed_ns(started));
@@ -309,7 +310,7 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
     conflicting.info.next_cycle += 1;
     assert!(matches!(
         conflicting
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &initial, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &initial, 0, CancellationToken::new())
             .await,
         Err(Error::PreconditionFailed)
     ));

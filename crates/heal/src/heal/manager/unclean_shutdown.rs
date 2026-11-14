@@ -165,22 +165,26 @@ impl HealManager {
             let mut recovery_disks = Vec::new();
             for disk in &local_disks {
                 let endpoint = disk.endpoint();
-                match disk
-                    .read_all(super::super::RUSTFS_META_BUCKET, super::super::UNCLEAN_SHUTDOWN_MARKER_PATH)
-                    .await
-                {
-                    Ok(_) => unclean = true,
-                    Err(DiskError::FileNotFound) | Err(DiskError::VolumeNotFound) => {}
-                    Err(err) => {
-                        debug!(
-                            target: "rustfs::heal::manager",
-                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_MANAGER,
-                            endpoint = %endpoint,
-                            error = ?err,
-                            "Unclean-shutdown marker check failed"
-                        );
+                if let Some(previous) = super::super::shutdown_marker::previous_shutdown_was_unclean(&endpoint.to_string()) {
+                    unclean |= previous;
+                } else {
+                    match disk
+                        .read_all(super::super::RUSTFS_META_BUCKET, super::super::UNCLEAN_SHUTDOWN_MARKER_PATH)
+                        .await
+                    {
+                        Ok(_) => unclean = true,
+                        Err(DiskError::FileNotFound) | Err(DiskError::VolumeNotFound) => {}
+                        Err(err) => {
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                endpoint = %endpoint,
+                                error = ?err,
+                                "Unclean-shutdown marker check failed"
+                            );
+                        }
                     }
                 }
 

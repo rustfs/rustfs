@@ -45,7 +45,7 @@ pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFile
 pub(crate) use io_admission::{DiskIoClass, test_resource_units};
 pub(crate) use io_admission::{
     PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
-    with_optional_disk_io_context, with_optional_resource_unit,
+    with_detached_disk_io_context, with_optional_disk_io_context, with_optional_resource_unit,
 };
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
@@ -77,6 +77,8 @@ pub fn validate_format_control_path(path: &str) -> Result<()> {
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
+/// Boot-time crash fence and clean scanner continuity receipt.
+pub const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = "unclean-shutdown";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 /// Original upload authority after it stops admitting active part mutations.

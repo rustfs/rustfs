@@ -933,8 +933,8 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     /// Full activity and inventory scope of a set scan; only a complete
-    /// snapshot proves coverage. Bucket caches bind this scope into their
-    /// opaque scan plan digest instead.
+    /// snapshot proves coverage. A completed bucket stores its checkpoint
+    /// coverage plan here until the authoritative aggregate includes it.
     #[serde(default)]
     pub scan_coverage_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
