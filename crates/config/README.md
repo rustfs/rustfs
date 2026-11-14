@@ -302,6 +302,8 @@ Drive timeout profile preset:
 
 RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
 
+A local POSIX filesystem bind-mounted into a gVisor sandbox with directfs is a supported storage path. gVisor presents that bind mount as `9p`/`V9FS`, so the host filesystem type is not visible; the startup guard recognizes mountinfo options `trans=fd` and `directfs` and does not treat the mount as unsupported. Genuine 9p, virtio, and NFS shares remain unsupported.
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.
