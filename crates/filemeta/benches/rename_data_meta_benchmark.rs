@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 const VERSION_COUNT_CASES: &[usize] = &[1, 8, 32, 64];
 const BENCH_BASE_TIME_UNIX_SECS: i64 = 1_700_000_000;
+// One EC12 data shard plus the 32-byte inline HighwayHash header.
+const PUT_100_KIB_EC12_INLINE_DATA_SIZE: usize = (100_usize * 1024).div_ceil(12) + 32;
 
 fn make_file_info(version_id: Uuid, data_dir: Uuid, size: i64, mod_time: OffsetDateTime) -> FileInfo {
     FileInfo {
@@ -221,12 +223,19 @@ fn inline_rpc_file_info(data_size: usize) -> FileInfo {
 }
 
 fn bench_rpc_file_info_encoding(c: &mut Criterion) {
-    for (kind, data_size) in [("metadata-only", 0_usize), ("inline-9k", 9 * 1024)] {
+    for (kind, data_size) in [
+        ("metadata-only", 0_usize),
+        ("inline-100k-ec12", PUT_100_KIB_EC12_INLINE_DATA_SIZE),
+    ] {
         let file_info = inline_rpc_file_info(data_size);
         let json_bytes = serde_json::to_vec(&file_info).expect("fixture JSON").len();
         let msgpack_bytes = encode_file_info_msgpack(&file_info).len();
         let mut group = c.benchmark_group(format!("rpc_file_info_encode/{kind}"));
-        group.throughput(Throughput::Bytes(u64::try_from(data_size.max(1)).expect("fixture size")));
+        if data_size == 0 {
+            group.throughput(Throughput::Elements(1));
+        } else {
+            group.throughput(Throughput::Bytes(u64::try_from(data_size).expect("fixture size")));
+        }
         group.bench_function(BenchmarkId::new("json", json_bytes), |b| {
             b.iter(|| black_box(serde_json::to_string(black_box(&file_info)).expect("encode JSON")))
         });
