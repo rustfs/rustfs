@@ -108,6 +108,28 @@ Claim values are used verbatim as policy names (after `claim_prefix`, if any). N
 
 For first-contact testing only, `RUSTFS_IDENTITY_OPENID_ROLE_POLICY=consoleAdmin` grants every login full access; remove it before production.
 
+### Creating access keys for a local user
+
+In the Console, open **Users → select the local user → Access Keys → Create**. An unrestricted root Console session or a local or OIDC administrator with the built-in `consoleAdmin` policy can create a key for an enabled local user. The key uses the target user's permissions and any narrower session policy supplied at creation.
+
+For a custom administrator, grant both actions. The following policy permits delegated creation only for `backup-user`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": "admin:CreateServiceAccount"},
+    {
+      "Effect": "Allow",
+      "Action": "admin:CreateServiceAccountForUser",
+      "Condition": {"StringEquals": {"svc:TargetUser": "backup-user"}}
+    }
+  ]
+}
+```
+
+Self-service uses the existing `admin:CreateServiceAccount` permission. The built-in `consoleAdmin` policy and custom policies granting `admin:*` cover both actions. This also applies to existing wildcard grants after an upgrade. To exclude delegation from a wildcard grant, add an explicit deny for `admin:CreateServiceAccountForUser`. Deploy the new server version to all nodes before installing policies that name the new action or condition.
+
 ## Validation
 
 1. Discovery:

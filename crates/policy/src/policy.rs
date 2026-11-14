@@ -30,6 +30,7 @@ pub mod variables;
 pub use action::ActionSet;
 pub use doc::PolicyDoc;
 pub use effect::Effect;
+pub use function::key_name::SVC_TARGET_USER;
 pub use function::{Functions, is_server_derived_condition_key};
 pub use id::ID;
 pub use policy::*;
