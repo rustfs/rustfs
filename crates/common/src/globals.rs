@@ -231,6 +231,12 @@ pub async fn evict_connection(addr: &str) {
 
 /// Evict a stale/dead connection from the global connection cache with an explicit log level.
 pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    let _ = remove_connection_with_log_level(addr, log_level).await;
+}
+
+/// Remove a cached connection and report whether it existed. Transport owners use this to
+/// attach a rebuild reason only to real cache transitions.
+pub async fn remove_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) -> bool {
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
         match log_level {
@@ -254,6 +260,7 @@ pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEv
             }
         }
     }
+    removed.is_some()
 }
 
 /// Get a cached gRPC connection for the given address.
@@ -362,5 +369,18 @@ mod tls_snapshot_tests {
         let debug = format!("{identity:?}");
         assert!(!debug.contains("PRIVATE-KEY-MARKER"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn conditional_connection_removal_preserves_legacy_evict_api() {
+        let key = "http://conditional-eviction-test.invalid";
+        cache_connection(
+            key.to_owned(),
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )
+        .await;
+        assert!(remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        assert!(!remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        let _: () = evict_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await;
     }
 }

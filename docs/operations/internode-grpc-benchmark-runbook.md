@@ -81,6 +81,10 @@ Explicit channel dial metrics start after endpoint settings validate and cover T
 | `rustfs_system_network_internode_operation_payload_bytes` | payload size distribution (P0/P1 sizing) |
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing a channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `rustfs_system_network_internode_dial_errors_total` | connect cost and failures (P3) |
+| `rustfs_system_network_internode_channel_rebuild_attempts_total{class,reason,outcome}` | explicit RustFS cache rebuild attempts after a bounded eviction reason |
+| `rustfs_system_network_internode_bulk_body_{waiters,active}` | work waiting for or holding complete bulk-unary admission |
+| `rustfs_system_network_internode_bulk_body_wait_duration_ms` | time spent before a complete bulk-unary attempt enters tonic |
+| `rustfs_system_network_internode_bulk_body_admissions_total{outcome}` | admitted attempts and waits cancelled by an outer deadline |
 | `rustfs_system_network_internode_msgpack_json_decode_total{direction,message,codec}`, `..._msgpack_json_fallback_total`, `..._msgpack_json_decode_error_total` | P2 gate inputs |
 | `rustfs_cluster_servers_offline_total` | offline detection correctness (P3 bypass) |
 | lock p99 (lock metrics, needs `RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true`) | P1 head-of-line-blocking win |
@@ -99,10 +103,20 @@ P1 phase files clear bulk-specific overrides so an isolation experiment inherits
 | `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE` | Inherit `RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE` | Bulk response receive credit per connection, bytes |
 | `RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT` | `64` | Active tonic transport response futures per bulk channel; minimum 1 |
 | `RUSTFS_INTERNODE_BULK_BUFFER_SIZE` | `1024` | Pending tonic service buffer capacity per bulk channel; minimum 1 |
+| `RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT` | `0` | Complete bulk-unary attempts per peer, held through response decoding and validation; `0` disables the additional gate |
+| `RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS` | `1000` | Local wait budget before returning `DiskOngoingReq`; minimum 1 ms |
 
 Zero receive-window values select the linked library default. In the locked Hyper 1.12 client this is 2 MiB per stream and 5 MiB per connection, while RustFS explicitly defaults to 1 MiB and 2 MiB. Record which policy the experiment actually selects. Values above the HTTP/2 31-bit limit fail channel acquisition with an invalid-input error. Change connection receive credit first, then stream credit only when measured bandwidth-delay product and resource budgets justify it. For example, compare the default 2 MiB connection window with `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE=8388608`, holding other settings fixed. Request-upload flow control is configured by the receiving server. Keep server-wide window changes in a separate experiment.
 
 Bulk selection advances independently for each peer. Cursor bookkeeping caches up to 512 peer addresses. Each entry keeps four immutable slot keys so common bulk pools borrow their cache keys on hits. Larger pools construct the remaining slot keys on demand with the same cache identity. Replacing an entry restarts its selection sequence while established channels keep their existing cache keys. HTTPS cache hits share the TLS-generation read lock, with generation validation retained before handoff. Connection misses still coalesce under the existing per-key dial lock.
+
+The complete-body gate is per peer and applies to every RPC routed through the bulk client, including recovery inventories. Acquire it before the existing remote-operation deadline so queued work does not occupy tonic's transport queue or mark a healthy peer faulty. Its own bounded wait returns `DiskOngoingReq`. The permit remains owned by the caller through protobuf body decoding and application response validation. It does not reduce memory already owned by a queued WriteAll caller. Start with an explicit value such as `32`, check waiters, active work, p99 and memory, and keep the value and wait timeout identical across all nodes in one cell.
+
+The body limit is read when remote-disk handles are built and therefore requires a process restart. The per-peer registry retains weak entries and uses one conservative shared overflow gate only if more than 512 peer identities remain live. Values above Tokio's semaphore capacity fail startup instead of being truncated.
+
+Explicit rebuild reasons are `rpc_failure`, `operation_timeout`, `transport_failure`, `lock_timeout`, `lock_transport`, `peer_probe`, `tls_generation_changed`, and `manual`; unexpected inputs collapse to `unknown`. Outcomes are `connected` and `failed_or_cancelled`; `connected` means the explicit tonic connection completed, while TLS-generation publication can still reject that result and retry under the same reason. One eviction can schedule control and bulk rebuilds independently, and every failed attempt remains visible until a replacement is published. These metrics do not claim that tonic's private reconnect loop was observed.
+
+The locked tonic/Hyper public API does not expose HTTP/2 PING ACK timeout outcomes. Hyper also compiles those debug events out unless its unstable tracing configuration is enabled, so the runtime does not infer a PING failure from a later generic channel-close error. Tonic-internal reconnects without a RustFS cache eviction remain separate from explicit rebuild attempts. Exact PING failure accounting requires a stable upstream transport hook or a separately reviewed owned transport implementation.
 
 Custom-CA channels use tonic's endpoint URI handling for certificate names and SNI, including IPv6 literals. The regression suite exercises real control and bulk TLS connections to IPv6 loopback and verifies that a trusted certificate for a different host is rejected.
 

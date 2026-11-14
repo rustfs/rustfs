@@ -21,7 +21,9 @@ pub mod heal_control;
 mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{cache_connection, cached_connection, evict_connection_with_log_level};
+#[cfg(test)]
+use rustfs_common::evict_connection_with_log_level;
+use rustfs_common::{cache_connection, cached_connection, remove_connection_with_log_level};
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -3439,6 +3441,75 @@ pub enum ChannelClass {
     Bulk,
 }
 
+/// Bounded reasons that make RustFS discard a cached channel and establish another one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRebuildReason {
+    RpcFailure,
+    OperationTimeout,
+    TransportFailure,
+    LockTimeout,
+    LockTransport,
+    PeerProbe,
+    TlsGenerationChanged,
+    Manual,
+}
+
+impl ChannelRebuildReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RpcFailure => "rpc_failure",
+            Self::OperationTimeout => "operation_timeout",
+            Self::TransportFailure => "transport_failure",
+            Self::LockTimeout => "lock_timeout",
+            Self::LockTransport => "lock_transport",
+            Self::PeerProbe => "peer_probe",
+            Self::TlsGenerationChanged => "tls_generation_changed",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+const CHANNEL_REBUILD_REASON_CAPACITY: usize = 1024;
+static CHANNEL_REBUILD_REASONS: LazyLock<StdMutex<HashMap<String, ChannelRebuildReason>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn mark_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.len() >= CHANNEL_REBUILD_REASON_CAPACITY
+        && !reasons.contains_key(cache_key)
+        && let Some(victim) = reasons.keys().next().cloned()
+    {
+        reasons.remove(&victim);
+    }
+    reasons.insert(cache_key.to_owned(), reason);
+}
+
+fn pending_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .copied()
+}
+
+fn clear_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.get(cache_key).copied() == Some(reason) {
+        reasons.remove(cache_key);
+    }
+}
+
+fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) {
+    if let Some(reason) = pending_channel_rebuild(cache_key) {
+        runtime_sources::record_channel_rebuild_attempt(channel_cache_class(dial_addr, cache_key), reason.as_str(), true);
+        clear_channel_rebuild(cache_key, reason);
+    }
+}
+
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
 
@@ -3544,7 +3615,9 @@ async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> 
     if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
         return Some(channel);
     }
-    evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+    if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+        mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+    }
     generations.remove(cache_key);
     runtime_sources::record_stale_grpc_channel_tls_generation();
     None
@@ -3563,7 +3636,9 @@ async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channe
     cache_connection(cache_key.to_string(), channel.clone()).await;
     // Publication can advance while the common cache's async lock is awaited.
     if generation != Some(runtime_sources::outbound_tls_generation()) {
-        evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+        if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+            mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+        }
         generations.remove(cache_key);
         runtime_sources::record_stale_grpc_channel_tls_generation();
         return false;
@@ -3719,6 +3794,7 @@ async fn build_channel_until(
 ) -> Result<Channel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+            complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
             return Ok(channel);
         }
         let slot = DialLock::for_key(cache_key);
@@ -3726,12 +3802,16 @@ async fn build_channel_until(
         loop {
             // A successful concurrent miss has already populated this exact key.
             if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
                 return Ok(channel);
             }
             let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
             if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
                 && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
             {
+                if let Some(reason) = pending_channel_rebuild(cache_key) {
+                    clear_channel_rebuild(cache_key, reason);
+                }
                 debug!(
                     "Successfully created and cached gRPC channel to: {} (cache key: {})",
                     dial_addr, cache_key
@@ -3749,11 +3829,29 @@ async fn build_channel_until(
 struct GrpcDialMetricsGuard {
     started_at: Instant,
     connected: bool,
+    rebuild_reason: Option<ChannelRebuildReason>,
+    channel_class: &'static str,
 }
 
 impl Drop for GrpcDialMetricsGuard {
     fn drop(&mut self) {
         runtime_sources::record_grpc_dial_result(self.started_at.elapsed(), self.connected);
+        if let Some(reason) = self.rebuild_reason {
+            runtime_sources::record_channel_rebuild_attempt(self.channel_class, reason.as_str(), self.connected);
+        }
+    }
+}
+
+fn channel_cache_class(dial_addr: &str, cache_key: &str) -> &'static str {
+    if cache_key
+        .strip_prefix(dial_addr)
+        .is_some_and(|suffix| suffix.starts_with("\0bulk\0"))
+    {
+        "bulk"
+    } else if cache_key.starts_with("delete-recovery:") {
+        "recovery"
+    } else {
+        "control"
     }
 }
 
@@ -3816,6 +3914,8 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     let mut dial_metrics = GrpcDialMetricsGuard {
         started_at: dial_started_at,
         connected: false,
+        rebuild_reason: pending_channel_rebuild(cache_key),
+        channel_class: channel_cache_class(dial_addr, cache_key),
     };
     let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
@@ -3854,19 +3954,41 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Warn).await;
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, ConnectionEvictionLogLevel::Warn).await;
 }
 
+#[cfg(test)]
 async fn evict_cached_channel(cache_key: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_cached_channel_for_reason(cache_key, log_level, None).await;
+}
+
+async fn evict_cached_channel_for_reason(
+    cache_key: &str,
+    log_level: ConnectionEvictionLogLevel,
+    reason: Option<ChannelRebuildReason>,
+) {
     // Match publication's lock order. Holding the generation guard across the short in-memory
     // cache mutation prevents an older eviction from deleting a replacement's generation.
     let mut generations = TLS_GENERATION_CACHE.write().await;
-    evict_connection_with_log_level(cache_key, log_level).await;
+    if remove_connection_with_log_level(cache_key, log_level).await
+        && let Some(reason) = reason
+    {
+        mark_channel_rebuild(cache_key, reason);
+    }
     generations.remove(cache_key);
 }
 
 /// Evict a connection from the cache after a failure with an explicit log level.
 pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, log_level).await;
+}
+
+/// Evict every cached channel for one peer and retain a bounded reason for the next dial attempt.
+pub async fn evict_failed_connection_with_reason(
+    addr: &str,
+    reason: ChannelRebuildReason,
+    log_level: ConnectionEvictionLogLevel,
+) {
     match log_level {
         ConnectionEvictionLogLevel::Warn => {
             warn!(
@@ -3892,7 +4014,7 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
         ConnectionEvictionLogLevel::Warn => ConnectionEvictionLogLevel::Info,
         level => level,
     };
-    evict_cached_channel(addr, cache_log_level).await;
+    evict_cached_channel_for_reason(addr, cache_log_level, Some(reason)).await;
 
     // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
     // the peer flips offline after enough consecutive failures (grpc-optimization P3).
@@ -3904,7 +4026,7 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
     if channel_isolation_enabled() {
         for idx in 0..bulk_channel_pool_size() {
             let cache_key = bulk_cache_key(addr, idx);
-            evict_cached_channel(&cache_key, cache_log_level).await;
+            evict_cached_channel_for_reason(&cache_key, cache_log_level, Some(reason)).await;
         }
     }
 }
@@ -4679,9 +4801,61 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         cache_connection(addr.to_string(), channel).await;
 
-        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+        evict_failed_connection_with_reason(addr, ChannelRebuildReason::TransportFailure, ConnectionEvictionLogLevel::Debug)
+            .await;
 
         assert!(!rustfs_common::has_cached_connection(addr).await);
+        assert_eq!(pending_channel_rebuild(addr), Some(ChannelRebuildReason::TransportFailure));
+        clear_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+    }
+
+    #[tokio::test]
+    async fn channel_rebuild_reason_survives_until_replacement_is_published() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind h2 peer");
+        let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        build_channel(&addr, &addr).await.expect("initial channel");
+        evict_failed_connection_with_reason(&addr, ChannelRebuildReason::OperationTimeout, ConnectionEvictionLogLevel::Debug)
+            .await;
+        assert_eq!(pending_channel_rebuild(&addr), Some(ChannelRebuildReason::OperationTimeout));
+        build_channel(&addr, &addr).await.expect("replacement channel");
+        assert_eq!(pending_channel_rebuild(&addr), None);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer accepts replacement connection");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_publication_consumes_pending_rebuild_reason_on_cache_hit() {
+        let addr = "http://overlapping-rebuild-publication.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+        build_channel(addr, addr).await.expect("cache hit completes pending rebuild");
+        assert_eq!(pending_channel_rebuild(addr), None);
+        evict_cached_channel(addr, ConnectionEvictionLogLevel::Debug).await;
     }
 
     #[test]

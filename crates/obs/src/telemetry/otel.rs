@@ -107,6 +107,7 @@ const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
 const INTERNODE_DURATION_HISTOGRAM_METRICS: &[&str] = &[
     "rustfs_system_network_internode_operation_duration_ms",
     "rustfs_system_network_internode_operation_server_duration_ms",
+    "rustfs_system_network_internode_bulk_body_wait_duration_ms",
 ];
 // Internode instruments record milliseconds, including sub-millisecond control RPCs.
 const INTERNODE_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
@@ -1181,6 +1182,7 @@ mod tests {
             (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
             (INTERNODE_DURATION_HISTOGRAM_METRICS[0], [0.04, 3.2, 31000.0]),
             (INTERNODE_DURATION_HISTOGRAM_METRICS[1], [0.02, 1.2, 1300.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[2], [0.01, 4.2, 1200.0]),
         ] {
             let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
             for seconds in observations {
@@ -1200,6 +1202,7 @@ mod tests {
                 "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
                 "rustfs_system_network_internode_operation_duration_ms" => [(0.05, 1), (4.0, 1), (60000.0, 1)],
                 "rustfs_system_network_internode_operation_server_duration_ms" => [(0.025, 1), (1.5, 1), (2500.0, 1)],
+                "rustfs_system_network_internode_bulk_body_wait_duration_ms" => [(0.01, 1), (5.0, 1), (2500.0, 1)],
                 _ => continue,
             };
             let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
@@ -1215,7 +1218,7 @@ mod tests {
             assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
             checked += 1;
         }
-        assert_eq!(checked, 4, "lock and internode duration histograms were exported");
+        assert_eq!(checked, 5, "lock and internode duration histograms were exported");
         provider.shutdown().expect("stop lock histogram test provider");
     }
 

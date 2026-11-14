@@ -63,7 +63,6 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
 };
 use rustfs_io_metrics::walk_metrics::{RemoteWalkFailureReason, RemoteWalkGuard};
-use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
@@ -78,20 +77,24 @@ use rustfs_protos::proto_gen::node_service::{
     SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteAllResponse,
     WriteFormatControlRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
-use rustfs_protos::{ChannelClass, prewarm_channel_class};
+use rustfs_protos::{
+    ChannelClass, ChannelRebuildReason, ConnectionEvictionLogLevel, evict_failed_connection_with_reason, prewarm_channel_class,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    collections::HashMap,
     future::Future,
     io::Cursor,
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -103,6 +106,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, service::interceptor::InterceptedService};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
+
+type NodeRpcClient = NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FailureHealthAction {
@@ -1036,10 +1041,70 @@ pub struct RemoteDisk {
     /// numbers per operation. Per handle, so one peer cannot hide another's.
     timeout_logs: rustfs_utils::LogThrottle,
     network_error_logs: rustfs_utils::LogThrottle,
+    /// Optional per-peer gate held through complete bulk-unary decoding and validation.
+    bulk_body_admission: Option<Arc<Semaphore>>,
+    bulk_body_wait_timeout: Duration,
 }
 
 /// Shortest gap between two failure warnings of one kind from one remote disk.
 const REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS: u64 = 5_000;
+const BULK_BODY_ADMISSION_REGISTRY_CAPACITY: usize = 512;
+
+#[derive(Default)]
+struct BulkBodyAdmissionRegistry {
+    peers: HashMap<String, Weak<Semaphore>>,
+    overflow: Option<Arc<Semaphore>>,
+}
+
+static BULK_BODY_ADMISSION_REGISTRY: std::sync::LazyLock<StdMutex<BulkBodyAdmissionRegistry>> =
+    std::sync::LazyLock::new(|| StdMutex::new(BulkBodyAdmissionRegistry::default()));
+
+struct BulkBodyPermit {
+    _metrics: rustfs_io_metrics::internode_metrics::InternodeBulkBodyAdmissionGuard,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn bulk_body_concurrency_limit() -> Result<usize> {
+    let limit = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT,
+        rustfs_config::DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT,
+    );
+    if limit > Semaphore::MAX_PERMITS {
+        return Err(Error::other("internode bulk-body concurrency exceeds the semaphore capacity limit"));
+    }
+    Ok(limit)
+}
+
+fn bulk_body_wait_timeout() -> Duration {
+    Duration::from_millis(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS,
+            rustfs_config::DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS,
+        )
+        .max(1),
+    )
+}
+
+fn peer_bulk_body_admission(addr: &str, limit: usize) -> Option<Arc<Semaphore>> {
+    if limit == 0 {
+        return None;
+    }
+    let mut registry = BULK_BODY_ADMISSION_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(semaphore) = registry.peers.get(addr).and_then(Weak::upgrade) {
+        return Some(semaphore);
+    }
+    if registry.peers.len() >= BULK_BODY_ADMISSION_REGISTRY_CAPACITY {
+        registry.peers.retain(|_, semaphore| semaphore.strong_count() > 0);
+    }
+    if registry.peers.len() >= BULK_BODY_ADMISSION_REGISTRY_CAPACITY {
+        return Some(Arc::clone(registry.overflow.get_or_insert_with(|| Arc::new(Semaphore::new(limit)))));
+    }
+    let semaphore = Arc::new(Semaphore::new(limit));
+    registry.peers.insert(addr.to_owned(), Arc::downgrade(&semaphore));
+    Some(semaphore)
+}
 
 struct RecoveryMonitorLease {
     active: Arc<AtomicBool>,
@@ -1483,6 +1548,8 @@ impl RemoteDisk {
 
         let env_health_check =
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
+        let bulk_body_admission = peer_bulk_body_admission(&addr, bulk_body_concurrency_limit()?);
+        let bulk_body_wait_timeout = bulk_body_wait_timeout();
 
         let disk = Self {
             handle_id: Uuid::new_v4(),
@@ -1503,6 +1570,8 @@ impl RemoteDisk {
             external_streams: false,
             timeout_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
             network_error_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
+            bulk_body_admission,
+            bulk_body_wait_timeout,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -2043,7 +2112,11 @@ impl RemoteDisk {
 
         if evict_cached_connection {
             // Cache contention must not hold the recovery lease indefinitely.
-            let _ = timeout(get_drive_active_check_timeout(), evict_failed_connection(addr)).await;
+            let _ = timeout(
+                get_drive_active_check_timeout(),
+                evict_failed_connection_with_reason(addr, ChannelRebuildReason::PeerProbe, ConnectionEvictionLogLevel::Debug),
+            )
+            .await;
         }
 
         result
@@ -2353,7 +2426,12 @@ impl RemoteDisk {
                 state = "evict_cached_connection",
                 "Remote disk cached connection evicted"
             );
-            evict_failed_connection(&self.addr).await;
+            let rebuild_reason = if reason == "operation_timeout" {
+                ChannelRebuildReason::OperationTimeout
+            } else {
+                ChannelRebuildReason::TransportFailure
+            };
+            evict_failed_connection_with_reason(&self.addr, rebuild_reason, ConnectionEvictionLogLevel::Debug).await;
         }
     }
 
@@ -2366,7 +2444,7 @@ impl RemoteDisk {
         internode_offline_bypass_reason(&self.addr).map(Error::RemoteClientUnavailable)
     }
 
-    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
+    async fn get_client(&self) -> Result<NodeRpcClient> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
@@ -2379,7 +2457,30 @@ impl RemoteDisk {
     /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
-    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
+    async fn acquire_bulk_body(&self) -> Result<Option<BulkBodyPermit>> {
+        let Some(semaphore) = &self.bulk_body_admission else {
+            return Ok(None);
+        };
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
+        let mut metrics = rustfs_io_metrics::internode_metrics::InternodeBulkBodyAdmissionGuard::waiting();
+        let permit = match tokio::time::timeout(self.bulk_body_wait_timeout, Arc::clone(semaphore).acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(Error::RemoteClientUnavailable("internode bulk-body admission closed".to_owned())),
+            Err(_) => {
+                metrics.timed_out();
+                return Err(DiskError::DiskOngoingReq);
+            }
+        };
+        metrics.admitted();
+        Ok(Some(BulkBodyPermit {
+            _metrics: metrics,
+            _permit: permit,
+        }))
+    }
+
+    async fn get_bulk_client(&self) -> Result<NodeRpcClient> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
         }
@@ -3899,6 +4000,7 @@ impl DiskAPI for RemoteDisk {
         let request_payload_bytes = batch_read_version_attribution_enabled
             .then(|| batch_read_version_request_payload_len(&req, &batch_read_version_req, &batch_read_version_req_bin));
         let request_opts = req.opts;
+        let bulk_body = self.acquire_bulk_body().await?;
         let batch_result = self
             .execute_with_timeout_for_op(
                 "batch_read_version",
@@ -3994,7 +4096,10 @@ impl DiskAPI for RemoteDisk {
             // Run the unary fallback outside the batch RPC deadline so each
             // read_version keeps its own per-op timeout and health accounting
             // instead of racing the whole batch against one drive timeout.
-            None => batch_read_version_one_by_one(self, req).await,
+            None => {
+                drop(bulk_body);
+                batch_read_version_one_by_one(self, req).await
+            }
         }
     }
 
@@ -4081,6 +4186,7 @@ impl DiskAPI for RemoteDisk {
         &self,
         operation: PoolMetaNativeRecoveryRequest,
     ) -> Result<PoolMetaNativeRecoveryResponse> {
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_with_timeout_for_op(
             "pool_meta_native_recovery",
             || async {
@@ -4123,6 +4229,7 @@ impl DiskAPI for RemoteDisk {
         if payload.len() > MultipartSourceOperation::max_wire_payload_bytes() {
             return Err(DiskError::FileCorrupt);
         }
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_with_timeout_for_op(
             "recover_multipart_source",
             || async {
@@ -4934,6 +5041,7 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_with_timeout(
             || async {
                 let read_multiple_req = compat_json(&req)?;
@@ -4981,6 +5089,7 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_with_timeout(
             || async {
                 let data_len = data.len();
@@ -5051,6 +5160,7 @@ impl DiskAPI for RemoteDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_with_timeout(
             || async {
                 let data_len = expected
@@ -5113,6 +5223,7 @@ impl DiskAPI for RemoteDisk {
         // Idempotent full read: eligible for the bounded transient-network retry so a single
         // reset-by-peer during the read-after-write window does not erode the read quorum
         // (see issue #2761).
+        let _bulk_body = self.acquire_bulk_body().await?;
         self.execute_read_with_retry(
             "read_all",
             || async {
@@ -12618,5 +12729,151 @@ mod tests {
         release_control_channel_prewarm(addr);
         assert!(claim_control_channel_prewarm(addr));
         release_control_channel_prewarm(addr);
+    }
+
+    #[tokio::test]
+    async fn bulk_body_admission_is_shared_per_peer_and_releases_on_drop() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let first = peer_bulk_body_admission("http://bulk-body-peer-a", 1).expect("enabled gate");
+        let same = peer_bulk_body_admission("http://bulk-body-peer-a", 1).expect("same peer gate");
+        let other = peer_bulk_body_admission("http://bulk-body-peer-b", 1).expect("other peer gate");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(peer_bulk_body_admission("http://bulk-body-disabled", 0).is_none());
+
+        let held = Arc::clone(&first).acquire_owned().await.expect("first permit");
+        let mut waiting = Box::pin(Arc::clone(&same).acquire_owned());
+        assert!(matches!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+        drop(held);
+        let _ = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("released permit wakes waiter")
+            .expect("shared gate remains open");
+    }
+
+    #[tokio::test]
+    async fn remote_disk_builds_optional_complete_body_gate_from_configuration() {
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("3"))], async {
+            let disk = remote_disk_for_addr("http://127.0.0.1:59996").await;
+            let gate = disk.bulk_body_admission.expect("configured body gate");
+            assert_eq!(gate.available_permits(), 3);
+        })
+        .await;
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("0"))], async {
+            let disk = remote_disk_for_addr("http://127.0.0.1:59995").await;
+            assert!(disk.bulk_body_admission.is_none());
+        })
+        .await;
+        temp_env::with_var(
+            rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT,
+            Some(usize::MAX.to_string()),
+            || {
+                assert!(bulk_body_concurrency_limit().is_err());
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_body_gate_wait_is_cancellation_safe_before_channel_lookup() {
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("1"))], async {
+            let disk = remote_disk_for_addr("http://127.0.0.1:59994").await;
+            let gate = Arc::clone(disk.bulk_body_admission.as_ref().expect("configured gate"));
+            let held = Arc::clone(&gate).acquire_owned().await.expect("held permit");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), disk.acquire_bulk_body())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(gate.available_permits(), 0);
+            drop(held);
+            assert_eq!(gate.available_permits(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_body_wait_timeout_does_not_mark_peer_faulty() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("1")),
+                (rustfs_config::ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, Some("10")),
+            ],
+            async {
+                let disk = remote_disk_for_addr("http://127.0.0.1:59992").await;
+                let gate = Arc::clone(disk.bulk_body_admission.as_ref().expect("configured gate"));
+                let held = gate.acquire_owned().await.expect("held permit");
+                let error = disk.read_all("bucket", "key").await.expect_err("local admission timeout");
+                assert!(matches!(error, DiskError::DiskOngoingReq));
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+                drop(held);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_body_permit_holds_peer_slot_until_caller_scope_ends() {
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("1"))], async {
+            let disk = remote_disk_for_addr("http://127.0.0.1:59993").await;
+            let first = disk
+                .acquire_bulk_body()
+                .await
+                .expect("first admission")
+                .expect("enabled gate");
+            let mut second = Box::pin(disk.acquire_bulk_body());
+            use std::future::Future;
+            use std::task::{Context, Poll, Waker};
+            assert!(matches!(second.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            drop(first);
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("permit drop releases peer slot")
+                .expect("second admission")
+                .expect("enabled gate");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_body_gate_serializes_real_unary_response_lifetimes() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some(peer) = TestGrpcPeer::spawn(Bytes::from_static(b"format"), Bytes::from_static(b"object")).await else {
+            return;
+        };
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, Some("1")),
+                (rustfs_config::ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, Some("1000")),
+            ],
+            async {
+                let disk = Arc::new(remote_disk_for_addr(&peer.addr).await);
+                let response_gate = peer.peer.pause_next_format_read();
+                let first_disk = Arc::clone(&disk);
+                let first = tokio::spawn(async move {
+                    first_disk
+                        .read_all(crate::disk::RUSTFS_META_BUCKET, crate::disk::FORMAT_CONFIG_FILE)
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(1), response_gate.entered.notified())
+                    .await
+                    .expect("first unary reaches response body");
+                let second_disk = Arc::clone(&disk);
+                let second = tokio::spawn(async move {
+                    second_disk
+                        .read_all(crate::disk::RUSTFS_META_BUCKET, crate::disk::FORMAT_CONFIG_FILE)
+                        .await
+                });
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert_eq!(peer.peer.read_all_calls(), 1, "second unary waits before entering tonic");
+                response_gate.release.cancel();
+                assert_eq!(first.await.expect("first task").expect("first read"), Bytes::from_static(b"format"));
+                assert_eq!(second.await.expect("second task").expect("second read"), Bytes::from_static(b"format"));
+                assert_eq!(peer.peer.read_all_calls(), 2);
+                rustfs_protos::evict_failed_connection(&peer.addr).await;
+            },
+        )
+        .await;
+        peer.stop().await;
     }
 }
