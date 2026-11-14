@@ -31,6 +31,12 @@ A previously published gauge can remain visible after a statistic becomes unavai
 
 When live requested bytes are unavailable, capture a supported heap profile or allocation/free trace. Preserve attribution to allocation stacks and lifetime; committed bytes and RSS alone cannot establish a leak. Other raw allocator statistics, including page accounting, depend on the allocator build and are not interchangeable with live application bytes.
 
+### Diagnostic allocator and runtime metrics
+
+Build with `--features diagnostic-allocator-live` to count live requested bytes for Rust allocations routed through the binary's MiMalloc `GlobalAlloc` wrapper. Read `rustfs_memory_allocator_rust_global_requested_live_bytes` together with `rustfs_memory_allocator_rust_global_requested_live_bytes_available`. Availability is `1` for this feature on non-Windows builds when the `hotpath` and `hotpath-alloc` combination is inactive. Direct native allocations are outside this counter. The wrapper records successful allocations, zeroed allocations, reallocations, and frees using allocation-free atomic updates. Per-allocation accounting adds overhead, so collect diagnostic and throughput measurements in separate runs.
+
+The memory sampler also exports `rustfs_runtime_worker_threads`. With `RUSTFLAGS="--cfg tokio_unstable"`, it exports serving-runtime blocking-thread total, idle, and active gauges under `rustfs_runtime_blocking_threads_*`, with `rustfs_runtime_blocking_pool_metrics_available = 1`. An ordinary build reports availability `0`. These metrics describe the serving runtime; isolated disk fsync and cleanup runtimes have their own execution ownership. Enable the allocator feature separately when both views are needed. Tokio's `tokio_unstable` configuration uses the stable compiler and opts into Tokio's unstable telemetry API.
+
 ### Linux transparent huge pages
 
 Linux RustFS binaries disable transparent huge pages for mimalloc by default. This reduces resident memory when reclaimable allocations occupy only part of a huge page. Check `THP_enabled` in `/proc/<pid>/status` and `AnonHugePages` in `/proc/<pid>/smaps_rollup` to verify the running process. Both values should be zero with the default. The Linux binary also defaults to immediately purging free arena ranges. Set `MIMALLOC_PURGE_DELAY` before startup to override the delay in milliseconds.

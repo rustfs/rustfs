@@ -193,3 +193,15 @@ The 1024 PUT admission limit includes uploading requests and detached owners;
 it is an object-count bound, not a memory or byte budget. The older deferred queue
 remains optional and disabled by default; its overflow path cannot bypass the
 new coordinator or disk limits. No unbounded foreground fallback is introduced.
+
+## Experimental file-sync follower timeout
+
+`RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE` enables file-sync grouping and defaults to `false`. `RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS` controls the batch collection window, defaults to `0`, and is capped at `1000` microseconds. `RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS` controls how long a follower waits before trying to leave a queued batch. It defaults to `0` (disabled) and is capped at `1000` microseconds. Configure these process-lifetime settings before startup.
+
+After its deadline, a follower can atomically take ownership of its queued files and resource unit. It then executes file sync through the existing per-disk and global limits, followed by source-directory fsync in the normal caller. The original batch loses those paths before the follower can publish its data directory. A worker that has already claimed the batch retains exclusive ownership, and the follower waits for that worker's result. The timeout therefore bounds queued batching delay; disk admission and native sync can take longer. Cancellation retains the existing native-work resource lifetime and worker cleanup guarantees.
+
+Pending followers use indexed slab slots and a monotonic waiter identity. Detaching a queued follower performs constant-time lookup under the coordinator locks. The identity check protects a claimed request when its old slot is reused by a later batch. Queue capacity remains bounded by the existing file and waiter limits.
+
+A source that disappears before native open fails its own waiter, while healthy requests in that batch still complete file and directory sync. Other file-sync errors retain the existing fail-fast batch behavior, preventing repeated I/O against a failing disk. Admission or native-dispatch failure also fails the batch. File sets and their existing resource units move together into one blocking dispatch, and result senders remain with the async worker so cancellation keeps its established notification contract.
+
+With detailed PUT metrics enabled, a successful queue ownership transfer adds a `follower_timeout` role sample to `rustfs_s3_put_object_rename_fdatasync_group_wait_ms`. Evaluate the experiment against the same source, durability setting, topology, and workload. Include sync failures, follower publication before batch completion, cancellation, and peak resource usage in acceptance.

@@ -20,6 +20,7 @@ use crate::disk::error_conv::to_file_error;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 use rustfs_utils::path::SLASH_SEPARATOR;
+use slab::Slab;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
@@ -696,6 +697,15 @@ const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE: bool = false;
 const ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: &str = "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS";
 const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 0;
 const MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 1_000;
+const ENV_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS: &str =
+    "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS";
+const MAX_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS: u64 = 1_000;
+static FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    file_fdatasync_group_commit_follower_timeout_duration(rustfs_utils::get_env_u64(
+        ENV_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS,
+        0,
+    ))
+});
 #[cfg(not(test))]
 const MAX_DST_DIR_FSYNC_GROUPS: usize = 1024;
 #[cfg(test)]
@@ -722,6 +732,10 @@ static DST_DIR_FSYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 static FILE_FDATASYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(ENV_FILE_FDATASYNC_GROUP_COMMIT_ENABLE, DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE)
 });
+fn file_fdatasync_group_commit_follower_timeout_duration(timeout_micros: u64) -> Duration {
+    Duration::from_micros(timeout_micros.min(MAX_FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT_MICROS))
+}
+
 fn file_fdatasync_group_commit_wait_duration(wait_micros: u64) -> Duration {
     Duration::from_micros(wait_micros.min(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS))
 }
@@ -781,6 +795,7 @@ mod file_fdatasync_group_commit_override {
 
     static OVERRIDE: RwLock<Option<bool>> = RwLock::new(None);
     static WAIT_OVERRIDE_MICROS: RwLock<Option<u64>> = RwLock::new(None);
+    static FOLLOWER_TIMEOUT_OVERRIDE_MICROS: RwLock<Option<u64>> = RwLock::new(None);
     static SERIAL: Mutex<()> = Mutex::new(());
 
     pub(crate) fn get() -> Option<bool> {
@@ -795,6 +810,9 @@ mod file_fdatasync_group_commit_override {
         fn drop(&mut self) {
             *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
             *WAIT_OVERRIDE_MICROS.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
@@ -810,6 +828,18 @@ mod file_fdatasync_group_commit_override {
 
     pub(crate) fn wait_micros() -> Option<u64> {
         *WAIT_OVERRIDE_MICROS.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_follower_timeout_micros(timeout_micros: u64) {
+        *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(timeout_micros);
+    }
+
+    pub(crate) fn follower_timeout_micros() -> Option<u64> {
+        *FOLLOWER_TIMEOUT_OVERRIDE_MICROS
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -839,6 +869,14 @@ fn file_fdatasync_group_commit_wait() -> Duration {
     }
 
     *FILE_FDATASYNC_GROUP_COMMIT_WAIT
+}
+
+fn file_fdatasync_group_commit_follower_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout_micros) = file_fdatasync_group_commit_override::follower_timeout_micros() {
+        return file_fdatasync_group_commit_follower_timeout_duration(timeout_micros);
+    }
+    *FILE_FDATASYNC_GROUP_COMMIT_FOLLOWER_TIMEOUT
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -1393,11 +1431,24 @@ fn clear_dst_dir_fsync_group_commit_for_test() {
 type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
+    id: u64,
     files: Vec<PathBuf>,
     resource_unit: Option<super::io_admission::ResourceIoUnit>,
     enqueued_at: Option<Instant>,
     wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
+}
+
+struct FileFdatasyncEnqueued {
+    result_rx: oneshot::Receiver<SharedFileFdatasyncResult>,
+    worker: Option<Arc<FileFdatasyncGroup>>,
+    follower: Option<FileFdatasyncFollower>,
+}
+
+struct FileFdatasyncFollower {
+    group: Arc<FileFdatasyncGroup>,
+    id: u64,
+    slot: usize,
 }
 
 #[derive(Clone)]
@@ -1430,8 +1481,9 @@ struct FileFdatasyncGroup {
 #[derive(Default)]
 struct FileFdatasyncGroupInner {
     worker_running: bool,
+    next_waiter_id: u64,
     pending_files: usize,
-    pending: VecDeque<FileFdatasyncWaiter>,
+    pending: Slab<FileFdatasyncWaiter>,
 }
 
 #[derive(Default)]
@@ -1455,7 +1507,8 @@ impl FileFdatasyncGroupCommit {
         &self,
         disk_permits: Arc<Semaphore>,
         files: Vec<PathBuf>,
-    ) -> io::Result<(oneshot::Receiver<SharedFileFdatasyncResult>, Option<Arc<FileFdatasyncGroup>>)> {
+        track_follower: bool,
+    ) -> io::Result<FileFdatasyncEnqueued> {
         if files.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1498,13 +1551,18 @@ impl FileFdatasyncGroupCommit {
         };
         let file_count = files.len();
         let mut group_state = group.inner.lock();
+        let id = group_state.next_waiter_id;
+        group_state.next_waiter_id = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "file fdatasync group waiter identity exhausted"))?;
         let start_worker = !group_state.worker_running;
         let wait_role = if start_worker {
             rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER
         } else {
             rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER
         };
-        group_state.pending.push_back(FileFdatasyncWaiter {
+        let slot = group_state.pending.insert(FileFdatasyncWaiter {
+            id,
             files,
             resource_unit: super::io_admission::current_resource_unit(),
             enqueued_at: rustfs_io_metrics::put_stage_timer(),
@@ -1527,7 +1585,40 @@ impl FileFdatasyncGroupCommit {
         registry.total_files += file_count;
         drop(group_state);
         drop(registry);
-        Ok((result_rx, start_worker.then_some(group)))
+        let follower = (!start_worker && track_follower).then(|| FileFdatasyncFollower {
+            group: group.clone(),
+            id,
+            slot,
+        });
+        Ok(FileFdatasyncEnqueued {
+            result_rx,
+            worker: start_worker.then_some(group),
+            follower,
+        })
+    }
+
+    fn take_queued_follower(&self, follower: &FileFdatasyncFollower) -> Option<FileFdatasyncWaiter> {
+        // Match enqueue's registry -> group order. Draining the queue and
+        // detaching a follower are mutually exclusive ownership transfers.
+        let mut registry = self.inner.lock();
+        if !registry
+            .groups
+            .get(&follower.group.key)
+            .is_some_and(|group| Arc::ptr_eq(group, &follower.group))
+        {
+            return None;
+        }
+        let mut state = follower.group.inner.lock();
+        // A drained slab can reuse a slot while its old native batch is still
+        // running. The monotonic identity rejects stale follower tickets.
+        if state.pending.get(follower.slot)?.id != follower.id {
+            return None;
+        }
+        let waiter = state.pending.try_remove(follower.slot)?;
+        state.pending_files -= waiter.files.len();
+        registry.total_waiters -= 1;
+        registry.total_files -= waiter.files.len();
+        Some(waiter)
     }
 
     fn complete_batch(&self, waiters: usize, files: usize) {
@@ -1623,7 +1714,7 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
                 let mut group_state = group.inner.lock();
                 let batch_file_count = group_state.pending_files;
                 group_state.pending_files = 0;
-                (group_state.pending.drain(..).collect(), batch_file_count)
+                (group_state.pending.drain().collect(), batch_file_count)
             };
             if batch.is_empty() {
                 let mut group_state = group.inner.lock();
@@ -1654,9 +1745,9 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             }
             // Move each producer's existing path buffer and unit into the physical
             // batch. No path cloning or separate resource-owner allocation is needed.
-            let batch_files: Vec<_> = batch
+            let mut batch_files: Vec<_> = batch
                 .iter_mut()
-                .map(|waiter| (std::mem::take(&mut waiter.files), waiter.resource_unit.take()))
+                .map(|waiter| (std::mem::take(&mut waiter.files), waiter.resource_unit.take(), Ok(())))
                 .collect();
             #[cfg(test)]
             file_sync_probe::record_group_batch(batch_file_count);
@@ -1666,17 +1757,19 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             );
             let result = if let Some(disk_permits) = group.disk_permits.upgrade() {
                 run_file_sync_blocking(disk_permits, move || {
-                    for (files, _resource_unit) in &batch_files {
-                        sync_files(files)?;
+                    for (files, _resource_unit, result) in &mut batch_files {
+                        // Missing sources are request-local. Other errors keep
+                        // the existing fail-fast contract for a failing disk.
+                        match sync_files(files) {
+                            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                            request_result => *result = request_result,
+                        }
                     }
-                    Ok(())
+                    Ok(batch_files)
                 })
                 .await
-                .map_err(SharedFileFdatasyncError::from_error)
             } else {
-                Err(SharedFileFdatasyncError::from_error(io::Error::other(
-                    "file fdatasync group commit limiter dropped",
-                )))
+                Err(io::Error::other("file fdatasync group commit limiter dropped"))
             };
             FILE_FDATASYNC_GROUP_COMMIT.complete_batch(batch.len(), batch_file_count);
             worker_guard.in_flight_waiters = 0;
@@ -1695,8 +1788,18 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             if should_stop {
                 FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
             }
-            for waiter in batch {
-                let _ = waiter.result_tx.send(result.clone());
+            match result {
+                Ok(results) => {
+                    for (waiter, (_files, _resource_unit, result)) in batch.into_iter().zip(results) {
+                        let _ = waiter.result_tx.send(result.map_err(SharedFileFdatasyncError::from_error));
+                    }
+                }
+                Err(err) => {
+                    let err = SharedFileFdatasyncError::from_error(err);
+                    for waiter in batch {
+                        let _ = waiter.result_tx.send(Err(err.clone()));
+                    }
+                }
             }
             if should_stop {
                 return;
@@ -1706,12 +1809,45 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
 }
 
 async fn sync_files_group_commit(files: Vec<PathBuf>, disk_permits: Arc<Semaphore>) -> io::Result<()> {
-    let (result_rx, worker) = FILE_FDATASYNC_GROUP_COMMIT.enqueue(disk_permits, files)?;
+    let timeout = file_fdatasync_group_commit_follower_timeout();
+    let FileFdatasyncEnqueued {
+        mut result_rx,
+        worker,
+        follower,
+    } = FILE_FDATASYNC_GROUP_COMMIT.enqueue(disk_permits.clone(), files, !timeout.is_zero())?;
     if let Some(group) = worker {
         tokio::spawn(run_file_fdatasync_group_worker(group));
     }
 
-    match result_rx.await {
+    let result = if let Some(follower) = follower
+        && !timeout.is_zero()
+    {
+        match tokio::time::timeout(timeout, &mut result_rx).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(waiter) = FILE_FDATASYNC_GROUP_COMMIT.take_queued_follower(&follower) {
+                    if let Some(enqueued_at) = waiter.enqueued_at {
+                        rustfs_io_metrics::record_put_rename_fdatasync_group_wait(
+                            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT,
+                            enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                    return run_file_sync_blocking(disk_permits, move || {
+                        let _resource_unit = waiter.resource_unit;
+                        sync_files(&waiter.files)
+                    })
+                    .await;
+                }
+                // A claimed batch owns the paths until its native sync completes.
+                // Waiting here prevents publication from invalidating its source paths.
+                result_rx.await
+            }
+        }
+    } else {
+        result_rx.await
+    };
+
+    match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err.into_error()),
         Err(_) => Err(io::Error::other("file fdatasync group worker dropped the waiter")),
@@ -3402,7 +3538,8 @@ pub(crate) mod file_sync_probe {
     }
 
     pub(super) fn run_before_group_batch() {
-        if let Some(hook) = BEFORE_GROUP_BATCH.lock().expect("file sync group batch hook poisoned").take() {
+        let hook = BEFORE_GROUP_BATCH.lock().expect("file sync group batch hook poisoned").take();
+        if let Some(hook) = hook {
             hook();
         }
     }
@@ -9050,8 +9187,12 @@ mod tests {
         let file_groups = Arc::new(FileFdatasyncGroupCommit::default());
         let disk_permits = Arc::new(Semaphore::new(1));
         let (_, dst_worker) = dst_groups.enqueue_for_test(dir.path()).unwrap();
-        let (_, file_worker) = file_groups
-            .enqueue(disk_permits.clone(), vec![dir.path().join("one")])
+        let FileFdatasyncEnqueued {
+            result_rx: _,
+            worker: file_worker,
+            follower: _,
+        } = file_groups
+            .enqueue(disk_permits.clone(), vec![dir.path().join("one")], true)
             .unwrap();
         assert!(dst_worker.is_some());
         assert!(file_worker.is_some());
@@ -9060,8 +9201,12 @@ mod tests {
         std::thread::spawn(move || {
             use_current_runtime_for_fsync();
             let (_, dst_worker) = cleanup_dst_groups.enqueue_for_test(dir.path()).unwrap();
-            let (_, file_worker) = cleanup_file_groups
-                .enqueue(disk_permits, vec![dir.path().join("two")])
+            let FileFdatasyncEnqueued {
+                result_rx: _,
+                worker: file_worker,
+                follower: _,
+            } = cleanup_file_groups
+                .enqueue(disk_permits, vec![dir.path().join("two")], true)
                 .unwrap();
             assert!(dst_worker.is_some(), "cleanup must not join a foreground directory worker");
             assert!(file_worker.is_some(), "cleanup must not join a foreground file worker");
@@ -12149,6 +12294,7 @@ mod tests {
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
         set_file_fdatasync_group_commit_wait_for_test(0);
+        file_fdatasync_group_commit_override::set_follower_timeout_micros(1_000);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
@@ -12176,7 +12322,7 @@ mod tests {
 
         let second_limiter = limiter.clone();
         let second_path = second_dir.clone();
-        let second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
+        let mut second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if file_fdatasync_group_commit_counts_for_test().1 == 2 {
@@ -12189,6 +12335,11 @@ mod tests {
         .expect("second waiter should enqueue before releasing the grouped batch");
         release_batch_tx.send(()).expect("release group batch hook");
         file_sync_probe::wait_for_active(1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut second).await.is_err(),
+            "a claimed follower waits for its batch even after its queue deadline"
+        );
+        assert_eq!(file_sync_probe::attempts(), 1, "claimed files must not enter an independent sync");
 
         assert_eq!(
             file_sync_probe::group_batches(),
@@ -12213,6 +12364,190 @@ mod tests {
             "second source directory must still be fsynced"
         );
         assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
+    }
+
+    async fn assert_file_fdatasync_follower_timeout_ownership(fail_sync: bool) {
+        use std::sync::mpsc;
+
+        let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(0);
+        file_fdatasync_group_commit_override::set_follower_timeout_micros(1_000);
+        clear_file_fdatasync_group_commit_for_test();
+        let temp_dir = tempdir().expect("create temp dir");
+        let first_dir = temp_dir.path().join("first");
+        let second_dir = temp_dir.path().join("second");
+        std::fs::create_dir(&first_dir).expect("create leader dir");
+        std::fs::create_dir(&second_dir).expect("create follower dir");
+        std::fs::write(first_dir.join("part.1"), b"first").expect("write leader part");
+        std::fs::write(second_dir.join("part.1"), b"second").expect("write follower part");
+        let _probe = if fail_sync {
+            file_sync_probe::set_failing_blocking(&second_dir)
+        } else {
+            file_sync_probe::set_blocking(&second_dir)
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        file_sync_probe::set_before_group_batch(move || {
+            entered_tx.send(()).expect("signal paused group worker");
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release paused group worker");
+        });
+        let limiter = file_sync_limiter();
+        let leader_limiter = limiter.clone();
+        let leader_path = first_dir.clone();
+        let leader = tokio::spawn(async move { sync_dir_files_with_limiter(leader_path, leader_limiter).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("join group signal waiter")
+            .expect("group worker paused before claiming files");
+        let follower_path = second_dir.clone();
+        let follower = tokio::spawn(async move { sync_dir_files_with_limiter(follower_path, limiter).await });
+        if !fail_sync {
+            file_sync_probe::wait_for_active(1).await;
+            file_sync_probe::release();
+        }
+        let follower_result = tokio::time::timeout(Duration::from_secs(30), follower)
+            .await
+            .expect("follower completes while group worker is paused")
+            .expect("join follower");
+        let queued_counts = file_fdatasync_group_commit_counts_for_test();
+        let follower_dir_synced = fsync_dir_recorder::was_fsynced(&second_dir);
+        if follower_result.is_ok() {
+            std::fs::rename(&second_dir, temp_dir.path().join("published")).expect("publish follower before group resumes");
+        }
+        release_tx.send(()).expect("resume original group worker");
+        let leader_result = tokio::time::timeout(Duration::from_secs(30), leader)
+            .await
+            .expect("leader completes")
+            .expect("join leader");
+        assert_eq!(queued_counts, (1, 1, 1), "detached follower returns its group queue budget");
+        assert!(
+            leader_result.is_ok(),
+            "original batch must never reopen the detached source: {leader_result:?}"
+        );
+        assert_eq!(file_sync_probe::group_batches(), vec![1], "only the leader remains in the original batch");
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
+        assert!(fsync_dir_recorder::was_fsynced(&first_dir));
+        if fail_sync {
+            assert!(follower_result.is_err(), "independent sync failure must reach the caller");
+            assert!(!follower_dir_synced, "failed file sync must prevent directory fsync");
+        } else {
+            follower_result.expect("independent sync succeeds");
+            assert!(follower_dir_synced, "follower must sync its source directory before publication");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_follower_timeout_detaches_before_rename() {
+        assert_file_fdatasync_follower_timeout_ownership(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_follower_timeout_propagates_sync_failure() {
+        assert_file_fdatasync_follower_timeout_ownership(true).await;
+    }
+
+    #[tokio::test]
+    async fn file_fdatasync_group_commit_follower_cannot_detach_claimed_batch() {
+        let registry = FileFdatasyncGroupCommit::default();
+        let limiter = Arc::new(Semaphore::new(1));
+        let FileFdatasyncEnqueued {
+            result_rx: _leader_rx,
+            worker,
+            follower: _,
+        } = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("leader")], true)
+            .expect("enqueue leader");
+        let FileFdatasyncEnqueued {
+            result_rx: _follower_rx,
+            worker: _,
+            follower,
+        } = registry
+            .enqueue(limiter, vec![PathBuf::from("follower")], true)
+            .expect("enqueue follower");
+        let group = worker.expect("leader starts a worker");
+        let follower = follower.expect("follower ticket");
+        let batch = {
+            let mut state = group.inner.lock();
+            state.pending_files = 0;
+            state.pending.drain().collect::<Vec<_>>()
+        };
+        assert!(
+            registry.take_queued_follower(&follower).is_none(),
+            "native batch has exclusive path ownership"
+        );
+        assert_eq!(registry.counts_for_test(), (1, 2, 2), "claimed work retains the registry budget");
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_fdatasync_group_commit_disabled_timeout_has_no_follower_ticket() {
+        let registry = FileFdatasyncGroupCommit::default();
+        let limiter = Arc::new(Semaphore::new(1));
+        let leader = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("leader")], false)
+            .expect("enqueue leader");
+        let follower = registry
+            .enqueue(limiter, vec![PathBuf::from("follower")], false)
+            .expect("enqueue follower");
+        assert!(leader.worker.is_some());
+        assert!(follower.worker.is_none());
+        assert!(
+            follower.follower.is_none(),
+            "disabled timeout avoids retaining a follower group reference"
+        );
+        assert_eq!(registry.counts_for_test(), (1, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn file_fdatasync_group_commit_stale_follower_cannot_take_reused_slot() {
+        let registry = FileFdatasyncGroupCommit::default();
+        let limiter = Arc::new(Semaphore::new(1));
+        let first = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("leader")], true)
+            .expect("enqueue leader");
+        let second = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("claimed")], true)
+            .expect("enqueue claimed follower");
+        let group = first.worker.expect("leader starts worker");
+        let stale = second.follower.expect("claimed follower ticket");
+        let claimed = {
+            let mut state = group.inner.lock();
+            state.pending_files = 0;
+            state.pending.drain().collect::<Vec<_>>()
+        };
+        let third = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("next-first")], true)
+            .expect("enqueue next batch");
+        let fourth = registry
+            .enqueue(limiter, vec![PathBuf::from("next-second")], true)
+            .expect("reuse old slot");
+        let current = fourth.follower.expect("current follower ticket");
+        assert_eq!(stale.slot, current.slot, "fixture reuses the claimed follower's slab slot");
+        assert_ne!(stale.id, current.id, "each enqueue has a distinct identity");
+        assert!(
+            registry.take_queued_follower(&stale).is_none(),
+            "claimed follower cannot steal a later request"
+        );
+        let waiter = registry
+            .take_queued_follower(&current)
+            .expect("current ticket owns the queued work");
+        assert_eq!(waiter.files, vec![PathBuf::from("next-second")]);
+        assert_eq!(registry.counts_for_test(), (1, 3, 3), "only the current queued waiter returns its budget");
+        drop((claimed, third, waiter));
+    }
+
+    #[test]
+    fn file_fdatasync_group_commit_follower_timeout_duration_is_disabled_or_bounded() {
+        assert_eq!(file_fdatasync_group_commit_follower_timeout_duration(0), Duration::ZERO);
+        assert_eq!(file_fdatasync_group_commit_follower_timeout_duration(250), Duration::from_micros(250));
+        assert_eq!(
+            file_fdatasync_group_commit_follower_timeout_duration(u64::MAX),
+            Duration::from_micros(1_000)
+        );
     }
 
     #[test]
@@ -12316,6 +12651,67 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_missing_source_does_not_skip_healthy_waiter() {
+        use std::sync::mpsc;
+        let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(0);
+        file_fdatasync_group_commit_override::set_follower_timeout_micros(0);
+        clear_file_fdatasync_group_commit_for_test();
+        let root = tempdir().expect("temporary batch root");
+        let missing = root.path().join("missing");
+        let healthy = root.path().join("healthy");
+        std::fs::create_dir(&missing).expect("create missing source directory");
+        std::fs::create_dir(&healthy).expect("create healthy source directory");
+        std::fs::write(missing.join("part.1"), b"missing").expect("stage disappearing source");
+        std::fs::write(healthy.join("part.1"), b"healthy").expect("stage healthy source");
+        let _probe = file_sync_probe::set_blocking(root.path());
+        file_sync_probe::release();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        file_sync_probe::set_before_group_batch(move || {
+            entered_tx.send(()).expect("signal batch claim barrier");
+            resume_rx.recv_timeout(Duration::from_secs(30)).expect("resume batch claim");
+        });
+        let limiter = file_sync_limiter();
+        let first_limiter = limiter.clone();
+        let first_path = missing.clone();
+        let first = tokio::spawn(async move { sync_dir_files_with_limiter(first_path, first_limiter).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("join claim barrier waiter")
+            .expect("worker reaches claim barrier");
+        let second_path = healthy.clone();
+        let second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, limiter).await });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while file_fdatasync_group_commit_counts_for_test().1 != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both source directories enter the same batch");
+        std::fs::remove_file(missing.join("part.1")).expect("remove queued source before native open");
+        resume_tx.send(()).expect("resume physical batch");
+        let first_result = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .expect("missing source finishes")
+            .expect("join missing source");
+        let second_result = tokio::time::timeout(Duration::from_secs(30), second)
+            .await
+            .expect("healthy source finishes")
+            .expect("join healthy source");
+        assert_eq!(first_result.expect_err("missing source must fail").kind(), io::ErrorKind::NotFound);
+        assert!(second_result.is_ok(), "healthy waiter must run its own file sync: {second_result:?}");
+        assert!(
+            fsync_dir_recorder::was_fsynced(&healthy),
+            "healthy source directory is synced before publication"
+        );
+        assert!(!fsync_dir_recorder::was_fsynced(&missing), "failed source must not reach directory fsync");
+        assert_eq!(file_sync_probe::attempts(), 2, "every independent source receives a file-sync attempt");
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
     async fn file_fdatasync_group_commit_failure_fails_all_waiters_before_dir_fsync() {
         use std::sync::mpsc;
 
@@ -12370,6 +12766,7 @@ mod tests {
             .expect("join second grouped file sync")
             .expect_err("second grouped waiter must fail closed");
 
+        assert_eq!(file_sync_probe::attempts(), 1, "a batch I/O failure stops additional disk work");
         assert_eq!(first_err.kind(), io::ErrorKind::Other);
         assert_eq!(second_err.kind(), io::ErrorKind::Other);
         assert_eq!(file_sync_probe::group_batches(), vec![2]);
@@ -12391,15 +12788,19 @@ mod tests {
         let mut limiters = Vec::new();
         for index in 0..MAX_FILE_FDATASYNC_GROUPS {
             let limiter = Arc::new(Semaphore::new(1));
-            let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
-                .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))])
+            let FileFdatasyncEnqueued {
+                result_rx,
+                worker: _worker,
+                follower: _follower,
+            } = FILE_FDATASYNC_GROUP_COMMIT
+                .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))], true)
                 .expect("group below cap should enqueue");
             limiters.push(limiter);
             receivers.push(result_rx);
         }
 
         let overflow_limiter = Arc::new(Semaphore::new(1));
-        let err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(overflow_limiter, vec![PathBuf::from("overflow")]) {
+        let err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(overflow_limiter, vec![PathBuf::from("overflow")], true) {
             Ok(_) => panic!("active group max+1 must fail closed"),
             Err(err) => err,
         };
@@ -12419,13 +12820,17 @@ mod tests {
         let limiter = Arc::new(Semaphore::new(1));
         let mut receivers = Vec::new();
         for index in 0..MAX_FILE_FDATASYNC_WAITERS {
-            let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
-                .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))])
+            let FileFdatasyncEnqueued {
+                result_rx,
+                worker: _worker,
+                follower: _follower,
+            } = FILE_FDATASYNC_GROUP_COMMIT
+                .enqueue(limiter.clone(), vec![PathBuf::from(format!("part-{index}"))], true)
                 .expect("waiter below cap should enqueue");
             receivers.push(result_rx);
         }
 
-        let waiter_err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter, vec![PathBuf::from("overflow-waiter")]) {
+        let waiter_err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter, vec![PathBuf::from("overflow-waiter")], true) {
             Ok(_) => panic!("waiter max+1 must fail closed"),
             Err(err) => err,
         };
@@ -12436,17 +12841,22 @@ mod tests {
 
         let mut receivers = Vec::new();
         let file_limit_limiter = Arc::new(Semaphore::new(1));
-        let (result_rx, _worker) = FILE_FDATASYNC_GROUP_COMMIT
+        let FileFdatasyncEnqueued {
+            result_rx,
+            worker: _worker,
+            follower: _follower,
+        } = FILE_FDATASYNC_GROUP_COMMIT
             .enqueue(
                 file_limit_limiter.clone(),
                 (0..MAX_FILE_FDATASYNC_BATCH_FILES)
                     .map(|index| PathBuf::from(format!("part-{index}")))
                     .collect(),
+                true,
             )
             .expect("file count up to cap should enqueue");
         receivers.push(result_rx);
 
-        let file_err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(file_limit_limiter, vec![PathBuf::from("overflow-file")]) {
+        let file_err = match FILE_FDATASYNC_GROUP_COMMIT.enqueue(file_limit_limiter, vec![PathBuf::from("overflow-file")], true) {
             Ok(_) => panic!("file max+1 must fail closed"),
             Err(err) => err,
         };
@@ -12712,8 +13122,12 @@ mod tests {
 
         let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
         let retired = Arc::new(Semaphore::new(1));
-        let (old_rx, old_group) = with_background_resource_unit(gate.acquire().await, async {
-            FILE_FDATASYNC_GROUP_COMMIT.enqueue(retired.clone(), vec![PathBuf::from("retired")])
+        let FileFdatasyncEnqueued {
+            result_rx: old_rx,
+            worker: old_group,
+            follower: _follower,
+        } = with_background_resource_unit(gate.acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(retired.clone(), vec![PathBuf::from("retired")], true)
         })
         .await
         .expect("enqueue retiring producer");
@@ -12721,8 +13135,12 @@ mod tests {
         drop(retired);
 
         let live = Arc::new(Semaphore::new(1));
-        let (new_rx, new_group) = FILE_FDATASYNC_GROUP_COMMIT
-            .enqueue(live, vec![PathBuf::from("successor")])
+        let FileFdatasyncEnqueued {
+            result_rx: new_rx,
+            worker: new_group,
+            follower: _follower,
+        } = FILE_FDATASYNC_GROUP_COMMIT
+            .enqueue(live, vec![PathBuf::from("successor")], true)
             .expect("enqueue new producer");
         let new_worker = run_file_fdatasync_group_worker(new_group.expect("new group"));
         let before_cleanup = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
@@ -12748,8 +13166,12 @@ mod tests {
 
         let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
         let limiter = Arc::new(Semaphore::new(1));
-        let (rx, group) = with_background_resource_unit(gate.acquire().await, async {
-            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter, vec![PathBuf::from("never-dispatched")])
+        let FileFdatasyncEnqueued {
+            result_rx: rx,
+            worker: group,
+            follower: _follower,
+        } = with_background_resource_unit(gate.acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter, vec![PathBuf::from("never-dispatched")], true)
         })
         .await
         .expect("enqueue producer");
@@ -12773,18 +13195,30 @@ mod tests {
     async fn file_fdatasync_stale_idle_cleanup_preserves_the_successor_group() {
         let registry = FileFdatasyncGroupCommit::default();
         let limiter = Arc::new(Semaphore::new(1));
-        let (first_rx, old) = registry
-            .enqueue(limiter.clone(), vec![PathBuf::from("old")])
+        let FileFdatasyncEnqueued {
+            result_rx: first_rx,
+            worker: old,
+            follower: _follower,
+        } = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("old")], true)
             .expect("first group");
         let old = old.expect("first group starts worker");
-        let first_waiter = old.inner.lock().pending.pop_front().expect("freeze first batch");
+        let first_waiter = {
+            let mut state = old.inner.lock();
+            let slot = state.pending.iter().next().map(|(slot, _)| slot).expect("queued first batch");
+            state.pending.remove(slot)
+        };
         old.inner.lock().pending_files = 0;
         registry.complete_batch(1, 1);
         old.inner.lock().worker_running = false;
         registry.remove_idle_group(&old);
         assert_eq!(registry.counts_for_test(), (0, 0, 0));
-        let (mut next_rx, next) = registry
-            .enqueue(limiter, vec![PathBuf::from("new")])
+        let FileFdatasyncEnqueued {
+            result_rx: mut next_rx,
+            worker: next,
+            follower: _follower,
+        } = registry
+            .enqueue(limiter, vec![PathBuf::from("new")], true)
             .expect("successor group");
         let next = next.expect("successor starts worker");
         assert!(!Arc::ptr_eq(&old, &next));
@@ -12824,8 +13258,12 @@ mod tests {
         let mut receivers = Vec::new();
         let mut group = None;
         for index in 0..2 {
-            let (rx, worker) = with_background_resource_unit(resources[index].acquire().await, async {
-                FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[index].clone()])
+            let FileFdatasyncEnqueued {
+                result_rx: rx,
+                worker,
+                follower: _follower,
+            } = with_background_resource_unit(resources[index].acquire().await, async {
+                FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[index].clone()], true)
             })
             .await
             .expect("enqueue producer");
@@ -12839,8 +13277,12 @@ mod tests {
         let group = group.expect("first producer starts worker");
         let worker = tokio::spawn(run_file_fdatasync_group_worker(group.clone()));
         file_sync_probe::wait_for_active(1).await;
-        let (queued, new_worker) = with_background_resource_unit(resources[2].acquire().await, async {
-            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[2].clone()])
+        let FileFdatasyncEnqueued {
+            result_rx: queued,
+            worker: new_worker,
+            follower: _follower,
+        } = with_background_resource_unit(resources[2].acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[2].clone()], true)
         })
         .await
         .expect("enqueue after batch is frozen");
