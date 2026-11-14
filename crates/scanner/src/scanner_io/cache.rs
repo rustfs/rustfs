@@ -1605,6 +1605,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     }
     if persisted.info.scan_coverage_digest == Some(coverage_digest)
         && persisted.info.scan_execution_digest == Some(execution_digest)
+        && persisted.info.scan_bucket_incarnations == cache_snapshot.info.scan_bucket_incarnations
         && matches!(
             current_cache_root_entry_with_generation(
                 &persisted,

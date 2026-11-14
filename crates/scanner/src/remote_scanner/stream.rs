@@ -330,6 +330,7 @@ impl RemoteScannerFailure {
 struct RemoteScannerServerError {
     scope: RemoteScannerErrorScope,
     error: ScannerError,
+    retry_bucket: bool,
 }
 
 impl RemoteScannerServerError {
@@ -337,6 +338,7 @@ impl RemoteScannerServerError {
         Self {
             scope: RemoteScannerErrorScope::Worker,
             error: ScannerError::Other(message.into()),
+            retry_bucket: false,
         }
     }
 
@@ -348,20 +350,29 @@ impl RemoteScannerServerError {
                 RemoteScannerErrorScope::Worker
             },
             error,
+            retry_bucket: false,
         }
     }
 
     fn retry_bucket(message: impl Into<String>) -> Self {
         Self {
             scope: RemoteScannerErrorScope::Bucket,
-            error: ScannerError::Other(format!("{}{}", NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX, message.into())),
+            error: ScannerError::Other(message.into()),
+            retry_bucket: true,
         }
     }
 
     fn into_frame(self) -> RemoteScannerErrorFrame {
+        // The client recognizes this prefix on the wire. Error Display labels
+        // must not turn a retry disposition into an ordinary bucket failure.
+        let message = if self.retry_bucket {
+            format!("{}{}", NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX, self.error)
+        } else {
+            self.error.to_string()
+        };
         RemoteScannerErrorFrame {
             scope: self.scope,
-            message: limit_error_message(self.error.to_string()),
+            message: limit_error_message(message),
         }
     }
 }
@@ -863,6 +874,20 @@ async fn scan_and_persist_local_bucket(
     phase_changed: Arc<Notify>,
     request: RemoteScannerRequestWire,
 ) -> std::result::Result<RemoteScannerFrameResult, RemoteScannerServerError> {
+    let store = resolve_scanner_object_store_handle()
+        .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
+    scan_and_persist_local_bucket_with_store(disk, ctx, budget, phase, phase_changed, request, store).await
+}
+
+async fn scan_and_persist_local_bucket_with_store(
+    disk: Arc<Disk>,
+    ctx: CancellationToken,
+    budget: Arc<ScannerCycleBudget>,
+    phase: Arc<AtomicU8>,
+    phase_changed: Arc<Notify>,
+    request: RemoteScannerRequestWire,
+    store: Arc<crate::ECStore>,
+) -> std::result::Result<RemoteScannerFrameResult, RemoteScannerServerError> {
     let RemoteScannerRequestWire {
         bucket,
         next_cycle,
@@ -881,15 +906,6 @@ async fn scan_and_persist_local_bucket(
     // while this request is still running and allow a second registry to be
     // selected for the same cycle.
     let _tier_cycle_guard = crate::begin_tier_registry_cycle(next_cycle, leader_epoch);
-    let store = resolve_scanner_object_store_handle()
-        .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
-    if let Some(proof) = usage_watch.as_deref()
-        && !proof.verify_with_store(&store).await
-    {
-        return Err(RemoteScannerServerError::retry_bucket(
-            "remote namespace scanner usage watch is unavailable at admission",
-        ));
-    }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
         .map_err(|err| {
@@ -916,6 +932,16 @@ async fn scan_and_persist_local_bucket(
             "remote namespace scanner disk does not belong to its storage instance",
         ));
     }
+    if let Some(proof) = usage_watch.as_deref()
+        && !proof.verify_with_store(&store).await
+    {
+        if crate::scanner_io::scanner_bucket_generation_is_retired(&set, &bucket, Some(proof.bucket_incarnation)).await {
+            return Ok(RemoteScannerFrameResult::NamespaceNotFound);
+        }
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote namespace scanner usage watch is unavailable at admission",
+        ));
+    }
     let expected_publication_epoch = scanner_publication_epoch(set.clone()).await.ok_or_else(|| {
         RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
     })?;
@@ -933,6 +959,11 @@ async fn scan_and_persist_local_bucket(
     let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
+    let expected_incarnation = cache
+        .info
+        .scan_identity
+        .map(|identity| identity.bucket_incarnation)
+        .or_else(|| usage_watch.as_deref().map(|proof| proof.bucket_incarnation));
     if let Some(proof) = usage_watch.as_deref()
         && cache.info.snapshot_complete
         && cache
@@ -951,6 +982,24 @@ async fn scan_and_persist_local_bucket(
     let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
         .await
         .generation;
+    let current_identity = crate::scanner_io::scanner_bucket_checkpoint_identity(
+        &set,
+        &bucket,
+        expected_publication_epoch,
+        tier_registry_generation,
+        scan_mode,
+    )
+    .await
+    .map_err(|err| {
+        RemoteScannerServerError::retry_bucket(format!(
+            "remote namespace scanner checkpoint identity unavailable during admission: {err}"
+        ))
+    })?;
+    if current_identity.map(|identity| identity.bucket_incarnation) != expected_incarnation
+        && crate::scanner_io::scanner_bucket_generation_is_retired(&set, &bucket, expected_incarnation).await
+    {
+        return Ok(RemoteScannerFrameResult::NamespaceNotFound);
+    }
     let scan_state = current_cache_root_or_prepare_with_generation(
         &mut cache,
         &bucket,
@@ -961,19 +1010,7 @@ async fn scan_and_persist_local_bucket(
         DataUsageCacheReuseOptions {
             require_source: true,
             tier_registry_generation: Some(tier_registry_generation),
-            checkpoint_identity: crate::scanner_io::scanner_bucket_checkpoint_identity(
-                &set,
-                &bucket,
-                expected_publication_epoch,
-                tier_registry_generation,
-                scan_mode,
-            )
-            .await
-            .map_err(|err| {
-                RemoteScannerServerError::retry_bucket(format!(
-                    "remote namespace scanner checkpoint identity unavailable during admission: {err}"
-                ))
-            })?,
+            checkpoint_identity: current_identity,
             checkpoint_plan_digest,
         },
     );
@@ -1202,6 +1239,9 @@ async fn scan_and_persist_local_bucket(
             ))
         })? != Some(expected)
     {
+        if crate::scanner_io::scanner_bucket_generation_is_retired(&set, &bucket, Some(expected.bucket_incarnation)).await {
+            return Ok(RemoteScannerFrameResult::NamespaceNotFound);
+        }
         return Err(RemoteScannerServerError::retry_bucket(
             "remote scanner checkpoint identity changed during scanning",
         ));
@@ -1227,7 +1267,24 @@ async fn scan_and_persist_local_bucket(
         .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch)
         .await;
     done_save();
-    save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;
+    if let Err(err) = save_result {
+        if crate::scanner_io::scanner_bucket_generation_is_retired(
+            &set,
+            &bucket,
+            cache
+                .info
+                .scan_identity
+                .map(|identity| identity.bucket_incarnation)
+                .or(expected_incarnation),
+        )
+        .await
+        {
+            return Ok(RemoteScannerFrameResult::NamespaceNotFound);
+        }
+        return Err(RemoteScannerServerError::worker(format!(
+            "remote namespace scanner cache save failed: {err}"
+        )));
+    }
     if scanner_publication_admission_for_epoch(set, expected_publication_epoch)
         .await
         .is_none()

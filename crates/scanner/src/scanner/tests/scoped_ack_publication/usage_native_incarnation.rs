@@ -162,6 +162,9 @@ async fn usage_recreated_bucket_rejects_old_carry_overlay_certificate_and_ack() 
     let path = directory.path().to_path_buf();
     directory.close().expect("remove recreation fixture");
     assert!(!path.exists());
+    let source_turn = crate::scanner_io::tests::source_turn_retirement::assert_source_turn_retirement_contract().await;
+    let mut evidence = evidence;
+    evidence["source_turn_retirement"] = source_turn;
     println!(
         "usage_assertion: {}",
         serde_json::json!({"case_id": "USAGE-11", "assertion_id": "USAGE-11-A02", "status": "PASS", "evidence": evidence})
