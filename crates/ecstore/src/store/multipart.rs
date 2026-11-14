@@ -845,6 +845,50 @@ impl ECStore {
         .await
     }
 
+    /// Observe an upload's original namespace without recovering or acknowledging it.
+    ///
+    /// Only ordinary active metadata is returned for application preflight. This
+    /// observation grants no right to publish; completion revalidates under its locks.
+    /// Cancellation leaves storage unchanged, and callers may retry this lookup.
+    ///
+    /// # Errors
+    /// Preserves argument, bucket lifetime, access, I/O and quorum errors. Fallback
+    /// discovery runs only after every ordinary probe reports InvalidUploadID.
+    pub async fn lookup_multipart_completion_binding(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<crate::object_api::MultipartCompletionBinding>> {
+        check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let order = if self.single_pool() {
+            vec![0]
+        } else {
+            self.existing_multipart_pool_order().await
+        };
+        for &index in &order {
+            match self.pools[index].get_multipart_info(bucket, object, upload_id, &opts).await {
+                Ok(info) => return Ok(Some(crate::object_api::MultipartCompletionBinding::active(info))),
+                Err(error) if is_err_invalid_upload_id(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for index in order {
+            if let Some(binding) = self.pools[index]
+                .get_disks_by_key(object)
+                .lookup_recorded_multipart_completion(bucket, object, upload_id, &opts)
+                .await?
+            {
+                return Ok(Some(binding));
+            }
+        }
+        Ok(None)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_get_multipart_info(
         &self,

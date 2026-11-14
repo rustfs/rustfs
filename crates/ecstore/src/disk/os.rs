@@ -4553,6 +4553,7 @@ pub(crate) mod multipart_source_syscall_failures {
     use super::*;
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(crate) enum Stage {
+        Read,
         Create,
         Write,
         FileSync,
@@ -4560,7 +4561,7 @@ pub(crate) mod multipart_source_syscall_failures {
     }
     type Key = (Stage, PathBuf);
     struct Failure {
-        kind: io::ErrorKind,
+        error: Mutex<Option<io::Error>>,
         triggered: std::sync::atomic::AtomicUsize,
     }
     static FAILURES: LazyLock<Mutex<HashMap<Key, Arc<Failure>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -4585,9 +4586,12 @@ pub(crate) mod multipart_source_syscall_failures {
         }
     }
     pub(crate) fn fail_once(stage: Stage, path: &Path, kind: io::ErrorKind) -> FailureGuard {
+        fail_once_with_error(stage, path, io::Error::new(kind, "injected native physical syscall failure"))
+    }
+    pub(crate) fn fail_once_with_error(stage: Stage, path: &Path, error: io::Error) -> FailureGuard {
         let key = (stage, path.to_path_buf());
         let failure = Arc::new(Failure {
-            kind,
+            error: Mutex::new(Some(error)),
             triggered: std::sync::atomic::AtomicUsize::new(0),
         });
         assert!(
@@ -4599,7 +4603,7 @@ pub(crate) mod multipart_source_syscall_failures {
     pub(crate) fn check(stage: Stage, path: &Path) -> io::Result<()> {
         if let Some(failure) = FAILURES.lock().remove(&(stage, path.to_path_buf())) {
             failure.triggered.fetch_add(1, std::sync::atomic::Ordering::Release);
-            return Err(io::Error::new(failure.kind, "injected native physical syscall failure"));
+            return Err(failure.error.lock().take().expect("one-shot physical fault owns its error"));
         }
         Ok(())
     }
@@ -8076,6 +8080,8 @@ pub(crate) fn read_multipart_source_metadata_in_pinned(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Read, &parent.join(name))?;
     read_multipart_metadata_in_pinned(pinned, parent, name, base, publication_root, Some(16 * 1024 * 1024))
 }
 
