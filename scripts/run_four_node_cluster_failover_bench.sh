@@ -21,6 +21,10 @@ RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
 RUSTFS_RC_RELEASE="${RUSTFS_RC_RELEASE:-latest}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
+RUSTFS_NODE1_PORT="${RUSTFS_NODE1_PORT:-9000}"
+RUSTFS_NODE2_PORT="${RUSTFS_NODE2_PORT:-9001}"
+RUSTFS_NODE3_PORT="${RUSTFS_NODE3_PORT:-9002}"
+RUSTFS_NODE4_PORT="${RUSTFS_NODE4_PORT:-9003}"
 
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
 BENCH_READY_TIMEOUT_SECS="${BENCH_READY_TIMEOUT_SECS:-180}"
@@ -30,8 +34,8 @@ FAILOVER_SAMPLE_SECS="${FAILOVER_SAMPLE_SECS:-60}"
 FAILOVER_INTERVAL_SECS="${FAILOVER_INTERVAL_SECS:-1}"
 BENCH_WAIT_MODE="${BENCH_WAIT_MODE:-ready}"
 
-BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:9000}"
-BENCH_WARP_HOSTS="${BENCH_WARP_HOSTS:-http://127.0.0.1:9000,http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003}"
+BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:${RUSTFS_NODE1_PORT}}"
+BENCH_WARP_HOSTS="${BENCH_WARP_HOSTS:-http://127.0.0.1:${RUSTFS_NODE1_PORT},http://127.0.0.1:${RUSTFS_NODE2_PORT},http://127.0.0.1:${RUSTFS_NODE3_PORT},http://127.0.0.1:${RUSTFS_NODE4_PORT}}"
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
 BENCH_AUTO_NEW_BUCKET="${BENCH_AUTO_NEW_BUCKET:-true}"
 BENCH_BUCKET_PREFIX="${BENCH_BUCKET_PREFIX:-rustfs-four-node-bench}"
@@ -76,6 +80,7 @@ Environment:
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
   COMPOSE_UP_NO_BUILD (true|false, default: false)
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
+  RUSTFS_NODE1_PORT RUSTFS_NODE2_PORT RUSTFS_NODE3_PORT RUSTFS_NODE4_PORT
   RUSTFS_RC_RELEASE (default: latest; disabled creates a server-only validation image)
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_PROBE_MODE (service|ready, default: service)
@@ -265,7 +270,7 @@ cleanup_existing_project_containers() {
 
 check_required_ports_free() {
   local required_ports=(
-    9000 9001 9002 9003
+    "${RUSTFS_NODE1_PORT}" "${RUSTFS_NODE2_PORT}" "${RUSTFS_NODE3_PORT}" "${RUSTFS_NODE4_PORT}"
   )
   local occupied_ports=()
   local port
@@ -345,10 +350,10 @@ run_precheck_after_build() {
 
 node_port() {
   case "$1" in
-    node1) echo "9000" ;;
-    node2) echo "9001" ;;
-    node3) echo "9002" ;;
-    node4) echo "9003" ;;
+    node1) echo "${RUSTFS_NODE1_PORT}" ;;
+    node2) echo "${RUSTFS_NODE2_PORT}" ;;
+    node3) echo "${RUSTFS_NODE3_PORT}" ;;
+    node4) echo "${RUSTFS_NODE4_PORT}" ;;
     *)
       log_error "unknown node name: $1 (expected node1..node4)"
       exit 1
@@ -465,7 +470,7 @@ wait_node_probe_ok() {
 
 wait_cluster_ready() {
   local port
-  for port in 9000 9001 9002 9003; do
+  for port in "${RUSTFS_NODE1_PORT}" "${RUSTFS_NODE2_PORT}" "${RUSTFS_NODE3_PORT}" "${RUSTFS_NODE4_PORT}"; do
     wait_node_probe_ok "${port}"
   done
 }
@@ -473,7 +478,7 @@ wait_cluster_ready() {
 probe_survivors_ready() {
   local failover_port="$1"
   local port
-  for port in 9000 9001 9002 9003; do
+  for port in "${RUSTFS_NODE1_PORT}" "${RUSTFS_NODE2_PORT}" "${RUSTFS_NODE3_PORT}" "${RUSTFS_NODE4_PORT}"; do
     if [[ "${port}" == "${failover_port}" ]]; then
       continue
     fi
@@ -761,6 +766,7 @@ main() {
   export RUSTFS_SECRET_KEY
   export RUSTFS_OBS_ENDPOINT
   export RUSTFS_UNSAFE_BYPASS_DISK_CHECK
+  export RUSTFS_NODE1_PORT RUSTFS_NODE2_PORT RUSTFS_NODE3_PORT RUSTFS_NODE4_PORT
 
   run_precheck_before_build
 
