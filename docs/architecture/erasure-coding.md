@@ -296,6 +296,8 @@ Small objects store their payload inline after the container CRC ([filemeta_inli
 
 ---
 
+Inline body materialization uses the shared `inline_body_buffering_miss_reason` contract ([set_disk/mod.rs](../../crates/ecstore/src/set_disk/mod.rs)) with a 2 MiB response limit and a bounded frame count. Metadata pre-verification and buffered GET consumption use this same contract, and an already verified body is reused within the selected snapshot. Parts carrying `PartIntegrity` use the readers that bind their proof verifier. The specialized metadata verifier currently accepts a single block, while the generic bounded inline decoder handles its interleaved frames.
+
 ## 7. Write path and write quorum
 
 `put_object` and multipart resolve the write layout (§2.2), encode (§4), write shards with bitrot (§5), then commit atomically.

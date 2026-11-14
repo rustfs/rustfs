@@ -38,8 +38,8 @@ use crate::disk::{
 use crate::set_disk::{
     DiskError, DiskStore, FileInfo, HashAlgorithm, ReadOptions, SetDisks, can_try_inline_data_shards_direct,
     codec_streaming_rollout_applies, collect_inline_data_shard_fileinfos_from_observations, file_info_is_valid_for_metadata,
-    get_metadata_slowtail_fault_request, inline_erasure_shard_file_offset, inline_erasure_shard_size,
-    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    get_metadata_slowtail_fault_request, inline_body_buffering_miss_reason, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
     is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_version_early_stop_enabled,
     object_fits_single_block,
 };
@@ -758,7 +758,7 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
-    None
+    inline_body_buffering_miss_reason(candidate)
 }
 
 pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {

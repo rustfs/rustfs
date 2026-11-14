@@ -3112,9 +3112,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
-            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
-                && let Some(body) = verified_inline_body.filter(|body| body.len() == object_size)
-            {
+            if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
                 if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
                     rustfs_io_metrics::record_get_object_stage_duration_by_size(
                         GET_OBJECT_PATH_INLINE_DIRECT,
@@ -15499,6 +15497,120 @@ mod inline_put_commit_path_tests {
                 assert_eq!(restored, payload, "body for {object}");
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn large_single_block_inline_get_reuses_verified_body() {
+        temp_env::async_with_vars([(rustfs_config::ENV_ERASURE_SHARD_BYTES, Some("131072"))], async {
+            let (_directories, disks, set) = hermetic_set_disks(16).await;
+            set.set_test_storage_class_config(
+                lookup_config_for_pools_without_env(&KVS::new(), &[16]).expect("EC12+4 configuration"),
+            );
+            let bucket = "large-inline-body-reuse";
+            let object = "object.bin";
+            let payload = vec![0x6d; 1280 * 1024];
+            make_bucket(&disks, bucket).await;
+            let mut input = PutObjReader::from_vec(payload.clone());
+            set.put_object(
+                bucket,
+                object,
+                &mut input,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write one-block inline fixture");
+            let stored = disks[0]
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("read persisted geometry");
+            assert_eq!(stored.erasure.block_size, 1536 * 1024);
+            assert!(stored.inline_data());
+
+            let calls = disk_call_counters::observe(object);
+            let mut reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("read large inline body");
+            assert_eq!(reader.buffered_body.as_ref().map(Bytes::len), Some(payload.len()));
+            let mut restored = Vec::new();
+            reader.stream.read_to_end(&mut restored).await.expect("stream verified body");
+            assert_eq!(restored, payload);
+            assert_eq!(calls.total(disk_call_counters::KIND_BODY_DECODE), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn protected_inline_get_validates_proof_after_bitrot_is_recomputed() {
+        let (_directories, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "inline-proof-binding";
+        let object = "object.bin";
+        let payload = vec![0x52; 16 * 1024];
+        make_bucket(&disks, bucket).await;
+        let mut input = PutObjReader::from_vec(payload.clone());
+        set.put_object(
+            bucket,
+            object,
+            &mut input,
+            &ObjectOptions {
+                no_lock: true,
+                shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write protected inline object");
+        let mut changed = false;
+        for disk in &disks {
+            let mut info = disk
+                .read_version(
+                    "",
+                    bucket,
+                    object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read inline shard");
+            assert!(info.parts[0].integrity.is_some());
+            if info.erasure.index != 1 {
+                continue;
+            }
+            let mut raw = info.data.as_ref().expect("inline shard payload").to_vec();
+            let hash_size = HashAlgorithm::HighwayHash256S.size();
+            raw[hash_size] ^= 1;
+            {
+                let (stored_hash, payload) = raw.split_at_mut(hash_size);
+                let hash = HashAlgorithm::HighwayHash256S.hash_encode(payload);
+                stored_hash.copy_from_slice(hash.as_ref());
+            }
+            info.data = Some(Bytes::from(raw));
+            disk.write_metadata("", bucket, object, info)
+                .await
+                .expect("persist test corruption");
+            changed = true;
+            break;
+        }
+        assert!(changed, "a systematic data shard must be changed");
+        set.invalidate_get_object_metadata_cache(bucket, object).await;
+        let mut reader = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("recover from the proof-rejected shard");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("read reconstructed body");
+        assert_eq!(restored, payload);
     }
 
     #[tokio::test]

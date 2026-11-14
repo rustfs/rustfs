@@ -51,12 +51,13 @@ use crate::bucket::replication::{ReplicateDecision, ReplicationObjectBridge, Rep
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
-    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
-    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
     GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
-    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
-    GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE,
+    GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
+    GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY,
+    GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX,
     GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE,
     GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION, GET_STAGE_READER_SETUP,
     classify_storage_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
@@ -787,7 +788,8 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 // Bound the in-memory inline decoder independently from the configurable
 // storage-class admission policy. This protects its Vec allocation while
 // allowing explicitly configured EC layouts to inline objects above 128 KiB.
-const INLINE_FAST_PATH_MAX_OBJECT_SIZE: i64 = 1024 * 1024;
+const INLINE_FAST_PATH_MAX_OBJECT_SIZE: usize = 2 * 1024 * 1024;
+const INLINE_FAST_PATH_MAX_BLOCKS: usize = 32;
 
 // --- Metadata Early-Stop Configuration ---
 
@@ -6049,6 +6051,24 @@ fn should_use_inline_fast_path(
     should_use_inline_fast_path_with_plan(range, object_info, fi, opts, ReadPathPlan::new(object_info, fi))
 }
 
+fn inline_body_buffering_miss_reason(fi: &FileInfo) -> Option<&'static str> {
+    let Ok(size) = usize::try_from(fi.size) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    };
+    if size == 0
+        || size > INLINE_FAST_PATH_MAX_OBJECT_SIZE
+        || fi.erasure.block_size == 0
+        || size.div_ceil(fi.erasure.block_size) > INLINE_FAST_PATH_MAX_BLOCKS
+    {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    }
+    // Proof-protected parts use the readers that bind their PartProofReader.
+    if fi.parts.iter().any(|part| part.integrity.is_some()) {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+    }
+    None
+}
+
 fn should_use_inline_fast_path_with_plan(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -6060,18 +6080,12 @@ fn should_use_inline_fast_path_with_plan(
         return false;
     }
 
-    let Some(shape) = plan.shape() else {
+    if plan.shape().is_none() {
         return false;
-    };
-    // The persisted marker is authoritative for the storage decision, but it
-    // is still untrusted metadata at this boundary. Revalidate its geometry so
-    // a stale/corrupt marker cannot route an oversized payload into the
-    // in-memory decoder. The independent direct-memory reader remains capped
-    // at 128 KiB below.
-    plan.is_plain()
-        && shape.object_size <= usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
-        && fi.erasure.data_blocks != 0
-        && fi.erasure.block_size != 0
+    }
+    // Apply the same materialization contract as metadata pre-verification.
+    // The independent direct-memory reader retains its 128 KiB gate.
+    plan.is_plain() && inline_body_buffering_miss_reason(fi).is_none() && fi.erasure.data_blocks != 0
 }
 
 enum SmallWritePath {
@@ -15119,6 +15133,26 @@ mod tests {
         fi.erasure.distribution = distribution.to_vec();
         fi.data = data.map(Bytes::from_static);
         fi
+    }
+
+    #[test]
+    fn inline_body_buffering_limits_size_and_frame_count() {
+        let mut info = FileInfo::new("bucket/object", 12, 4);
+        info.size = 2 * 1024 * 1024;
+        info.erasure.block_size = 1024 * 1024;
+        assert!(inline_body_buffering_miss_reason(&info).is_none());
+        info.size += 1;
+        assert!(inline_body_buffering_miss_reason(&info).is_some());
+        info.erasure.block_size = 4096;
+        info.size = 32 * 4096;
+        assert!(inline_body_buffering_miss_reason(&info).is_none());
+        info.size += 1;
+        assert!(inline_body_buffering_miss_reason(&info).is_some());
+        info.size = -1;
+        assert!(inline_body_buffering_miss_reason(&info).is_some());
+        info.size = 1;
+        info.erasure.block_size = 0;
+        assert!(inline_body_buffering_miss_reason(&info).is_some());
     }
 
     #[test]
