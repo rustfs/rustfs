@@ -40,6 +40,7 @@ use rustfs_lock::{LockError, NamespaceLockGuard};
 use rustfs_scanner_metrics::metrics::{
     Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
 };
+use rustfs_scanner_metrics::scan_observation::{PREFIX_REUSE_BLOCKERS, ScannerBaselineRejection, ScannerPrefixReuseStage};
 use rustfs_utils::path::path_join_buf;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -112,16 +113,7 @@ pub(crate) const SCANNER_SEGMENT_ACTIVATION_PROOF_INPUTS: [&str; 9] = [
     "durable_dirty_producer_journal",
     "ack_generation_guard",
 ];
-pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 8] = [
-    "missing_producer_identity",
-    "missing_durable_journal_replay",
-    "restart_gap",
-    "generation_gap",
-    "overflow",
-    "stale_ack_generation",
-    "missing_cold_zero_walk_oracle",
-    "distributed_without_peer_invalidation",
-];
+pub(crate) const SCANNER_SEGMENT_ACTIVATION_FAIL_CLOSED_CHECKS: [&str; 8] = PREFIX_REUSE_BLOCKERS;
 
 pub type DirtyUsageBuckets = HashMap<String, u64>;
 
@@ -197,6 +189,7 @@ struct VerifiedRemoteDirtyUsage {
 }
 
 struct ScannerBucketScopeResolutionResult {
+    segment_reuse_activation_preflight: Option<ScannerSegmentReuseActivationPreflight>,
     scope: ScannerBucketScanScope,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -236,6 +229,13 @@ pub(crate) struct ScannerSegmentReuseActivationPreflight {
 }
 
 impl ScannerSegmentReuseActivationPreflight {
+    fn record_observation(&self, stage: ScannerPrefixReuseStage) {
+        global_metrics().scan_observation().record_prefix_reuse(
+            stage,
+            self.scanner_segment_reuse_activated,
+            &self.fail_closed_blockers,
+        );
+    }
     #[cfg(test)]
     pub(crate) fn fail_closed_blockers(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.fail_closed_blockers.iter().filter_map(|blocker| *blocker)
@@ -319,6 +319,7 @@ fn resolve_remote_dirty_usage_scope(
     baseline_proof: ScannerCacheBaselineProof<'_>,
 ) -> ScannerBucketScopeResolutionResult {
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: None,
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
         distributed_segment_invalidation_evidence: None,
@@ -410,6 +411,7 @@ fn resolve_remote_dirty_usage_scope(
     };
 
     ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: Some(segment_reuse_activation_preflight),
         scope,
         remote_dirty_usage_acknowledgements: scoped_acknowledgements,
         distributed_segment_invalidation_evidence,
@@ -427,43 +429,81 @@ fn complete_scanner_cache_snapshot_plan_digest(
     proof: ScannerCacheBaselineProof<'_>,
     expected_converged: Option<bool>,
 ) -> Option<DataUsageScanPlanDigest> {
+    validate_scanner_cache_snapshot_plan_digest(snapshot, proof, expected_converged).ok()
+}
+
+fn validate_scanner_cache_snapshot_plan_digest(
+    snapshot: &DataUsageInfo,
+    proof: ScannerCacheBaselineProof<'_>,
+    expected_converged: Option<bool>,
+) -> std::result::Result<DataUsageScanPlanDigest, ScannerBaselineRejection> {
     // The observational mark disqualifies only the authoritative slot: an
     // observed candidate carries it by construction.
     let marks_accepted = match expected_converged {
         Some(expected) => snapshot.usage_snapshot_converged == Some(expected),
         None => snapshot.usage_snapshot_converged.is_some() && !snapshot.usage_snapshot_observational,
     };
-    if !snapshot.is_complete_bucket_usage_snapshot()
-        || snapshot.usage_snapshot_partial
-        || !marks_accepted
-        || snapshot.scanner_epoch != Some(proof.leader_epoch)
-        || snapshot.usage_snapshot_set_states.len() != proof.expected_sources.len()
-    {
-        return None;
+    if !snapshot.is_complete_bucket_usage_snapshot() {
+        return Err(ScannerBaselineRejection::Incomplete);
+    }
+    if snapshot.usage_snapshot_partial {
+        return Err(ScannerBaselineRejection::Partial);
+    }
+    if !marks_accepted {
+        return Err(ScannerBaselineRejection::Marks);
+    }
+    if snapshot.scanner_epoch != Some(proof.leader_epoch) {
+        return Err(ScannerBaselineRejection::Epoch);
+    }
+    if snapshot.usage_snapshot_set_states.len() != proof.expected_sources.len() {
+        return Err(ScannerBaselineRejection::SourceCount);
     }
 
     // Completed maintenance also covers ordinary usage. Keep its exact stored
     // proof for cache reuse, and reject mixtures of different set work proofs.
-    let baseline_plan_digest = DataUsageScanPlanDigest(snapshot.usage_snapshot_set_states.first()?.scan_plan_digest?);
+    let baseline_plan_digest = DataUsageScanPlanDigest(
+        snapshot
+            .usage_snapshot_set_states
+            .first()
+            .and_then(|state| state.scan_plan_digest)
+            .ok_or(ScannerBaselineRejection::PlanMissing)?,
+    );
     if !scanner_plan_digest_is_work_variant(proof.scan_plan_digest, baseline_plan_digest) {
-        return None;
+        return Err(ScannerBaselineRejection::PlanMismatch);
     }
     let mut states = HashSet::with_capacity(snapshot.usage_snapshot_set_states.len());
     for state in &snapshot.usage_snapshot_set_states {
-        let source = DataUsageCacheSource::new(usize::try_from(state.pool_index).ok()?, usize::try_from(state.set_index).ok()?);
-        if !proof.expected_sources.contains(&source)
-            || !states.insert(source)
-            || !state.complete
-            || state.tombstone
-            || state.scanner_epoch != Some(proof.leader_epoch)
-            || state.scanner_cycle.is_none_or(|cycle| cycle > proof.want_cycle)
-            || state.scan_plan_digest != Some(baseline_plan_digest.0)
-        {
-            return None;
+        let source = DataUsageCacheSource::new(
+            usize::try_from(state.pool_index).map_err(|_| ScannerBaselineRejection::SourceIndex)?,
+            usize::try_from(state.set_index).map_err(|_| ScannerBaselineRejection::SourceIndex)?,
+        );
+        if !proof.expected_sources.contains(&source) {
+            return Err(ScannerBaselineRejection::SourceMembership);
+        }
+        if !states.insert(source) {
+            return Err(ScannerBaselineRejection::SourceDuplicate);
+        }
+        if !state.complete {
+            return Err(ScannerBaselineRejection::SetIncomplete);
+        }
+        if state.tombstone {
+            return Err(ScannerBaselineRejection::SetTombstone);
+        }
+        if state.scanner_epoch != Some(proof.leader_epoch) {
+            return Err(ScannerBaselineRejection::SetEpoch);
+        }
+        if state.scanner_cycle.is_none_or(|cycle| cycle > proof.want_cycle) {
+            return Err(ScannerBaselineRejection::SetCycle);
+        }
+        if state.scan_plan_digest != Some(baseline_plan_digest.0) {
+            return Err(ScannerBaselineRejection::SetPlan);
         }
     }
 
-    (states == *proof.expected_sources).then_some(baseline_plan_digest)
+    if states != *proof.expected_sources {
+        return Err(ScannerBaselineRejection::SourceCoverage);
+    }
+    Ok(baseline_plan_digest)
 }
 
 /// Whether `digest` is `structural` under any work flag: the same bucket
@@ -493,10 +533,35 @@ fn scanner_baseline_pending_buckets(proof: &ScannerCacheBaselineProof<'_>) -> Ve
 }
 
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
-    let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, None) {
-        return Some(validated_digest);
-    }
+    validate_scanner_cache_baseline_plan_digest(proof).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerBaselineValidationFailure {
+    authoritative: ScannerBaselineRejection,
+    observed: Option<ScannerBaselineRejection>,
+}
+
+fn validate_scanner_cache_baseline_plan_digest(
+    proof: ScannerCacheBaselineProof<'_>,
+) -> std::result::Result<DataUsageScanPlanDigest, ScannerBaselineValidationFailure> {
+    let authoritative_error = |authoritative| ScannerBaselineValidationFailure {
+        authoritative,
+        observed: None,
+    };
+    let authoritative_data = proof
+        .authoritative_data
+        .ok_or_else(|| authoritative_error(ScannerBaselineRejection::Missing))?;
+    let authoritative = serde_json::from_slice::<DataUsageInfo>(authoritative_data)
+        .map_err(|_| authoritative_error(ScannerBaselineRejection::Decode))?;
+    let authoritative_rejection = match validate_scanner_cache_snapshot_plan_digest(&authoritative, proof, None) {
+        Ok(validated_digest) => return Ok(validated_digest),
+        Err(reason) => reason,
+    };
+    let observed_error = |observed| ScannerBaselineValidationFailure {
+        authoritative: authoritative_rejection,
+        observed: Some(observed),
+    };
 
     // A complete but superseded observation may reuse its per-set cache only
     // when it was explicitly tied to the durable authoritative baseline. It
@@ -506,14 +571,18 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         && !authoritative.usage_snapshot_observational)
         || crate::scanner::data_usage_info_is_bootstrap_pending(&authoritative);
     if !authoritative_has_identity {
-        return None;
+        return Err(observed_error(ScannerBaselineRejection::AuthoritativeIdentity));
     }
-    let observed = serde_json::from_slice::<DataUsageInfo>(proof.observed_candidate_data?).ok()?;
+    let observed_data = proof
+        .observed_candidate_data
+        .ok_or_else(|| observed_error(ScannerBaselineRejection::Missing))?;
+    let observed =
+        serde_json::from_slice::<DataUsageInfo>(observed_data).map_err(|_| observed_error(ScannerBaselineRejection::Decode))?;
     if !observed_data_usage_is_newer(&observed, &authoritative) {
-        return None;
+        return Err(observed_error(ScannerBaselineRejection::NotNewer));
     }
 
-    complete_scanner_cache_snapshot_plan_digest(&observed, proof, Some(false))
+    validate_scanner_cache_snapshot_plan_digest(&observed, proof, Some(false)).map_err(observed_error)
 }
 
 fn scanner_segment_reuse_baseline_producer_evidence(
@@ -658,6 +727,12 @@ impl ScannerScopeFallbackReason {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScannerScopeFallback {
+    reason: ScannerScopeFallbackReason,
+    baseline_rejection: Option<ScannerBaselineValidationFailure>,
+}
+
 /// Classify a resolved full-namespace scope against the preconditions
 /// `resolve_scanner_bucket_scan_scope` checks, in the same order. Returns
 /// `None` when the cycle was required to walk everything or was scoped.
@@ -668,18 +743,24 @@ fn scanner_scope_fallback_reason(
     all_buckets: &[BucketInfo],
     baseline_proof: ScannerCacheBaselineProof<'_>,
     distributed: bool,
-) -> Option<ScannerScopeFallbackReason> {
+) -> Option<ScannerScopeFallback> {
+    let fallback = |reason| {
+        Some(ScannerScopeFallback {
+            reason,
+            baseline_rejection: None,
+        })
+    };
     if !scope_eligible || !resolved_scope.is_default() {
         return None;
     }
     if dirty_usage_snapshot.generation == u64::MAX {
-        return Some(ScannerScopeFallbackReason::DirtyGenerationExhausted);
+        return fallback(ScannerScopeFallbackReason::DirtyGenerationExhausted);
     }
     if !dirty_usage_snapshot.covers_listed_pending {
-        return Some(ScannerScopeFallbackReason::DirtySnapshotIncomplete);
+        return fallback(ScannerScopeFallbackReason::DirtySnapshotIncomplete);
     }
     if dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
-        return Some(ScannerScopeFallbackReason::DirtyBucketOverflow);
+        return fallback(ScannerScopeFallbackReason::DirtyBucketOverflow);
     }
     // Peers may contribute dirty buckets the local snapshot does not hold.
     if !distributed {
@@ -689,13 +770,19 @@ fn scanner_scope_fallback_reason(
             .keys()
             .any(|bucket| listed.contains(bucket.as_str()))
         {
-            return Some(ScannerScopeFallbackReason::NoListedDirtyBuckets);
+            return fallback(ScannerScopeFallbackReason::NoListedDirtyBuckets);
         }
     }
-    if complete_scanner_cache_baseline_plan_digest(baseline_proof).is_none() {
-        return Some(ScannerScopeFallbackReason::BaselineUnavailable);
+    if let Err(failure) = validate_scanner_cache_baseline_plan_digest(baseline_proof) {
+        return Some(ScannerScopeFallback {
+            reason: ScannerScopeFallbackReason::BaselineUnavailable,
+            baseline_rejection: Some(failure),
+        });
     }
-    distributed.then_some(ScannerScopeFallbackReason::PeerScopeUnavailable)
+    distributed.then_some(ScannerScopeFallback {
+        reason: ScannerScopeFallbackReason::PeerScopeUnavailable,
+        baseline_rejection: None,
+    })
 }
 
 fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {

@@ -15,6 +15,7 @@ use super::*;
 use crate::UNKNOWN_TIER;
 /// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use crate::data_usage_define::clone_cache_value;
+use rustfs_scanner_metrics::scan_observation::ScannerMetadataReadOutcome;
 
 ///
 /// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
@@ -62,8 +63,20 @@ impl ScannerIODisk for Disk {
 
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let metadata_object_path = item.object_path();
-        let metadata_result =
-            crate::workload_admission::with_scanner_metadata_io(self.read_metadata(&item.bucket, &metadata_object_path)).await;
+        let metadata_result = crate::workload_admission::with_scanner_metadata_io(async {
+            let read = global_metrics().start_scanner_metadata_read();
+            let result = self.read_metadata(&item.bucket, &metadata_object_path).await;
+            let (outcome, bytes) = match &result {
+                Ok(data) => (ScannerMetadataReadOutcome::Success, u64::try_from(data.len()).unwrap_or(u64::MAX)),
+                Err(e) if DiskError::is_err_object_not_found(e) || DiskError::is_err_version_not_found(e) => {
+                    (ScannerMetadataReadOutcome::NotFound, 0)
+                }
+                Err(_) => (ScannerMetadataReadOutcome::Error, 0),
+            };
+            read.finish(outcome, bytes);
+            result
+        })
+        .await;
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let data = match metadata_result {
             Ok(data) => data,
