@@ -586,11 +586,13 @@ impl SourceStore {
         let disk_id = self.disk_id;
         let physical_slot = self.physical_slot;
         let disk_ids = self.disk_ids.clone();
+        // Keep the loaded state out of each blocking-queue and oneshot poll frame.
         os::run_blocking_namespace_operation(self.lease.clone(), move || {
-            Ok(load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids))
+            Ok(load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids).map(Box::new))
         })
         .await
         .map_err(DiskError::from)?
+        .map(|loaded| *loaded)
     }
     pub async fn persist(&self, state: &SourceState) -> Result<()> {
         self.persist_with_source_sync(state, false).await.map(|_| ())

@@ -122,17 +122,27 @@ fn validate_certificate_shape(
 }
 
 impl LocalDisk {
-    // Give readonly inspection its own future layout while retaining one
-    // selected Box per request and constructing it outside caller poll frames.
+    // Separate inspection, abort and recovery layouts, and construct the
+    // selected boxed future outside caller poll frames.
     #[inline(never)]
     pub(super) fn recover_multipart_source_native(
         &self,
         request: MultipartSourceRequest,
     ) -> impl std::future::Future<Output = Result<MultipartSourceResponse>> + Send + '_ {
-        if matches!(&request.operation, MultipartSourceOperation::Inspect { .. }) {
-            futures::future::Either::Left(Box::pin(self.inspect_multipart_source_native(request)))
-        } else {
-            futures::future::Either::Right(Box::pin(self.recover_multipart_source_native_inner(request)))
+        match &request.operation {
+            MultipartSourceOperation::Inspect { .. } => {
+                futures::future::Either::Left(Box::pin(self.inspect_multipart_source_native(request)))
+            }
+            MultipartSourceOperation::UpgradeLegacy { .. }
+            | MultipartSourceOperation::PrepareAbort { .. }
+            | MultipartSourceOperation::CommitAbort { .. }
+            | MultipartSourceOperation::DeleteAborted { .. }
+            | MultipartSourceOperation::ConfirmCleanupTarget { .. } => futures::future::Either::Right(
+                futures::future::Either::Left(Box::pin(self.abort_multipart_source_native(request))),
+            ),
+            _ => futures::future::Either::Right(futures::future::Either::Right(Box::pin(
+                self.recover_multipart_source_native_inner(request),
+            ))),
         }
     }
 
@@ -180,20 +190,24 @@ impl LocalDisk {
         }))
     }
 
+    async fn abort_multipart_source_native(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
+        request.validate()?;
+        let store = self.open_multipart_source_store(&request.path, None).await?;
+        self.recover_multipart_abort_owned(store, request.operation).await
+    }
+
     async fn recover_multipart_source_native_inner(&self, request: MultipartSourceRequest) -> Result<MultipartSourceResponse> {
         request.validate()?;
         // Source RW ownership precedes source namespace, target metadata, and
         // target publication ownership. Every filesystem tail retains it.
         let store = self.open_multipart_source_store(&request.path, None).await?;
         match request.operation {
-            operation @ (MultipartSourceOperation::UpgradeLegacy { .. }
+            MultipartSourceOperation::Inspect { .. }
+            | MultipartSourceOperation::UpgradeLegacy { .. }
             | MultipartSourceOperation::PrepareAbort { .. }
             | MultipartSourceOperation::CommitAbort { .. }
             | MultipartSourceOperation::DeleteAborted { .. }
-            | MultipartSourceOperation::ConfirmCleanupTarget { .. }) => {
-                self.recover_multipart_abort_owned(store, operation).await
-            }
-            MultipartSourceOperation::Inspect { .. } => Err(DiskError::UnsupportedDisk),
+            | MultipartSourceOperation::ConfirmCleanupTarget { .. } => Err(DiskError::UnsupportedDisk),
             MultipartSourceOperation::Claim { expected, round } => {
                 let loaded = store.load().await?;
                 require_expected(&loaded, &expected)?;
