@@ -459,6 +459,9 @@ fn allocator_snapshot_or_unavailable(snapshot: Option<AllocatorMemorySnapshot>) 
 }
 
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
+    #[cfg(feature = "diagnostic-allocator-live")]
+    crate::allocator_live::record_snapshot();
+
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();

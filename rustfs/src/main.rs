@@ -49,19 +49,74 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 }
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
+#[cfg(all(
+    feature = "hotpath",
+    feature = "hotpath-alloc",
+    not(target_os = "windows"),
+    not(feature = "diagnostic-allocator-live")
+))]
 #[global_allocator]
 static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::with(MiMallocAllocator);
 
-#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", target_os = "windows"))]
+#[cfg(all(
+    feature = "hotpath",
+    feature = "hotpath-alloc",
+    target_os = "windows",
+    not(feature = "diagnostic-allocator-live")
+))]
 #[global_allocator]
 static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::CountingAllocator::with(std::alloc::System);
 
-#[cfg(all(not(all(feature = "hotpath", feature = "hotpath-alloc")), not(target_os = "windows")))]
+#[cfg(all(
+    not(all(feature = "hotpath", feature = "hotpath-alloc")),
+    not(target_os = "windows"),
+    not(feature = "diagnostic-allocator-live")
+))]
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    feature = "hotpath",
+    feature = "hotpath-alloc",
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: rustfs::allocator_live::DiagnosticAllocator<hotpath::CountingAllocator<MiMallocAllocator>> =
+    rustfs::allocator_live::DiagnosticAllocator::new(hotpath::CountingAllocator::with(MiMallocAllocator));
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    feature = "hotpath",
+    feature = "hotpath-alloc",
+    target_os = "windows"
+))]
+#[global_allocator]
+static GLOBAL: rustfs::allocator_live::DiagnosticAllocator<hotpath::CountingAllocator<std::alloc::System>> =
+    rustfs::allocator_live::DiagnosticAllocator::new(hotpath::CountingAllocator::with(std::alloc::System));
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(all(feature = "hotpath", feature = "hotpath-alloc")),
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: rustfs::allocator_live::DiagnosticAllocator<rustfs_mimalloc::MiMalloc> =
+    rustfs::allocator_live::DiagnosticAllocator::new(rustfs_mimalloc::MiMalloc);
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(all(feature = "hotpath", feature = "hotpath-alloc")),
+    target_os = "windows"
+))]
+#[global_allocator]
+static GLOBAL: rustfs::allocator_live::DiagnosticAllocator<std::alloc::System> =
+    rustfs::allocator_live::DiagnosticAllocator::new(std::alloc::System);
+
 fn main() -> std::process::ExitCode {
+    #[cfg(feature = "diagnostic-allocator-live")]
+    GLOBAL.enable_metrics();
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     // SAFETY: The binary entrypoint runs this before RustFS creates any threads.
