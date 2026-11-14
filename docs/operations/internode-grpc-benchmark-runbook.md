@@ -82,6 +82,7 @@ Explicit channel dial metrics start after endpoint settings validate and cover T
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing a channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `rustfs_system_network_internode_dial_errors_total` | connect cost and failures (P3) |
 | `rustfs_system_network_internode_channel_rebuild_attempts_total{class,reason,outcome}` | explicit RustFS cache rebuild attempts after a bounded eviction reason |
+| `rustfs_system_network_internode_http2_ping_timeouts_total` | exact Hyper keepalive PING ACK timeouts in diagnostic builds; generic closes and RPC errors do not contribute |
 | `rustfs_system_network_internode_bulk_body_{waiters,active}` | work waiting for or holding complete bulk-unary admission |
 | `rustfs_system_network_internode_bulk_body_wait_duration_ms` | time spent before a complete bulk-unary attempt enters tonic |
 | `rustfs_system_network_internode_bulk_body_admissions_total{outcome}` | admitted attempts and waits cancelled by an outer deadline |
@@ -116,7 +117,14 @@ The body limit is read when remote-disk handles are built and therefore requires
 
 Explicit rebuild reasons are `rpc_failure`, `operation_timeout`, `transport_failure`, `lock_timeout`, `lock_transport`, `peer_probe`, `tls_generation_changed`, and `manual`; unexpected inputs collapse to `unknown`. Outcomes are `connected` and `failed_or_cancelled`; `connected` means a replacement passed TLS-generation validation and was published or observed in the cache. A transport connection rejected during publication counts as `failed_or_cancelled` and retries under the same pending reason. Concurrent cache hits atomically consume the successful reason once. One eviction can schedule control and bulk rebuilds independently, and every failed attempt remains visible until a replacement is published. These metrics do not claim that tonic's private reconnect loop was observed.
 
-The locked tonic/Hyper public API does not expose HTTP/2 PING ACK timeout outcomes. Hyper also compiles those debug events out unless its unstable tracing configuration is enabled, so the runtime does not infer a PING failure from a later generic channel-close error. Tonic-internal reconnects without a RustFS cache eviction remain separate from explicit rebuild attempts. Exact PING failure accounting requires a stable upstream transport hook or a separately reviewed owned transport implementation.
+The locked tonic/Hyper public API does not expose HTTP/2 PING ACK timeout outcomes. A default-off diagnostic build can enable Hyper's exact internal timeout event and the RustFS counter without adding a second timer or changing reconnect behavior:
+
+```bash
+RUSTFLAGS="--cfg hyper_unstable_tracing" \
+  cargo build -p rustfs --features diagnostic-internode-http2-ping
+```
+
+The build scripts reject the feature when the required cfg is missing. The subscriber enables only Hyper's HTTP/2 client debug target and counts the exact `connection keep-alive timed out` event. Other low-frequency debug events from that target can also reach configured diagnostic log/export sinks, but generic connection errors, TCP closure, GOAWAY and RPC timeouts are not classified as PING failures. The feature is diagnostic-only because Hyper documents its tracing event contract as unstable; ordinary builds do not enable the dependency feature or pay its tracing cost. Tonic-internal reconnects without a RustFS cache eviction remain separate from explicit rebuild attempts. A stable production-default metric still requires an upstream typed observer.
 
 Custom-CA channels use tonic's endpoint URI handling for certificate names and SNI, including IPv6 literals. The regression suite exercises real control and bulk TLS connections to IPv6 loopback and verifies that a trusted certificate for a different host is rejected.
 

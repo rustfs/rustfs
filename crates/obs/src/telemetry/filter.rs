@@ -24,6 +24,9 @@ use tracing_subscriber::{
     filter::{FilterFn, LevelFilter, filter_fn},
 };
 
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+use super::http2_ping::HYPER_HTTP2_CLIENT_TARGET;
+
 pub const HTTP_SERVER_LOG_TARGET: &str = "rustfs::server::http";
 
 /// Pyroscope emits raw reqwest errors from its background session manager.
@@ -57,7 +60,9 @@ pub(super) fn s3s_log_filter() -> FilterFn {
 /// `RUST_LOG` environment variable takes precedence over `logger_level`.
 /// For non-verbose levels (`info`, `warn`, `error`), noisy dependency targets
 /// are automatically suppressed based on the effective log configuration.
-/// Transport internals are disabled, while `s3s` remains visible at WARN.
+/// Transport internals are disabled, while `s3s` remains visible at WARN. The
+/// diagnostic HTTP/2 PING feature adds back only Hyper's client target at DEBUG
+/// so its exact keepalive timeout event reaches the metrics layer.
 ///
 /// # Arguments
 /// * `logger_level` - The desired log level string (e.g., `"info"`, `"debug"`).
@@ -292,6 +297,14 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
                 }
             }
         }
+    }
+
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    {
+        let directive = format!("{HYPER_HTTP2_CLIENT_TARGET}=debug")
+            .parse()
+            .expect("static Hyper HTTP/2 PING tracing directive must parse");
+        filter = filter.add_directive(directive);
     }
 
     filter

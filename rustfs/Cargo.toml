@@ -97,6 +97,12 @@ dial9 = ["rustfs-obs/dial9"]
 diagnostic-allocator-live = []
 # Default-off sampled local batch wall/CPU and request correlation diagnostics.
 diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
+# Exact Hyper HTTP/2 PING ACK timeout accounting. Diagnostic-only because the
+# upstream tracing event is unstable and requires an explicit build cfg.
+diagnostic-internode-http2-ping = [
+    "rustfs-obs/diagnostic-internode-http2-ping",
+    "rustfs-protos/diagnostic-internode-http2-ping",
+]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 # Diagnostic-only fixed-prefix attribution for actual Scanner metadata visits.

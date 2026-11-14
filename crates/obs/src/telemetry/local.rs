@@ -421,6 +421,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(super::http2_ping_timeout_layer())
         .with(pyroscope_log_filter())
         .with(s3s_log_filter())
         .with(ErrorLayer::default())
@@ -534,6 +535,7 @@ fn init_file_logging_internal(
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(super::http2_ping_timeout_layer())
         .with(pyroscope_log_filter())
         .with(s3s_log_filter())
         .with(ErrorLayer::default())
