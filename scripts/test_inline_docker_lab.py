@@ -2,10 +2,15 @@
 """Regression checks for ownership and geometry lab configuration."""
 
 import argparse
+import contextlib
+import hashlib
+import io
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -181,6 +186,102 @@ class InlineDockerLabTests(unittest.TestCase):
             for endpoint in ("https://other.example:9000", "https://127.0.0.1:19080"):
                 with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "loopback"):
                     lab.mc_proxy("client", ["alias", "set", "probe", endpoint, "test-access", "test-secret"])
+
+    def test_readiness_checks_every_node_dependency_endpoint(self):
+        lab = LAB.DockerLab("/unused", configuration())
+        lab.container = mock.Mock(side_effect=lambda node: node)
+        lab.docker = mock.Mock(return_value="200")
+        with mock.patch.object(LAB.time, "monotonic", side_effect=[0, 0]):
+            lab.wait_ready()
+        self.assertEqual(lab.docker.call_count, 4)
+        self.assertEqual([call.args[1] for call in lab.docker.call_args_list], list(LAB.NODES))
+        self.assertTrue(all(call.args[-1].endswith("/health/ready") for call in lab.docker.call_args_list))
+
+    def test_readiness_rejects_a_live_cluster_with_one_unready_node(self):
+        lab = LAB.DockerLab("/unused", configuration())
+        lab.container = mock.Mock(side_effect=lambda node: node)
+        lab.docker = mock.Mock(side_effect=lambda *args: "503" if args[1] == "node4" else "200")
+        with mock.patch.object(LAB.time, "monotonic", side_effect=[0, 0, 241]), mock.patch.object(LAB.time, "sleep"):
+            with self.assertRaisesRegex(TimeoutError, "node4"):
+                lab.wait_ready()
+        self.assertEqual(lab.docker.call_count, 4)
+
+    def test_readiness_waits_for_transient_dependency_recovery(self):
+        lab = LAB.DockerLab("/unused", configuration())
+        lab.container = mock.Mock(side_effect=lambda node: node)
+        lab.docker = mock.Mock(side_effect=["200", "200", "200", "503", "200", "200", "200", "200"])
+        with mock.patch.object(LAB.time, "monotonic", side_effect=[0, 0, 1, 241]), mock.patch.object(LAB.time, "sleep") as sleep:
+            lab.wait_ready()
+        self.assertEqual(lab.docker.call_count, 8)
+        sleep.assert_called_once_with(1)
+
+    def test_cleanup_archives_manifests_only_when_volumes_are_purged(self):
+        for purge in (False, True):
+            with self.subTest(purge=purge), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                (state / "config.json").write_text(json.dumps(configuration()))
+                (state / "compose.json").write_text("{}")
+                manifest = state / "compat-inline-test.json"
+                manifest.write_text("known oracle")
+                args = argparse.Namespace(command="down", state_dir=directory, purge=purge)
+                with mock.patch.object(LAB.DockerLab, "assert_owned"), mock.patch.object(LAB.DockerLab, "compose") as compose:
+                    LAB.execute(args)
+                compose.assert_called_once_with("down", *(["--volumes"] if purge else []))
+                self.assertEqual(manifest.exists(), not purge)
+                if purge:
+                    archived = list((state / "compat-history").glob("*/compat-inline-test.json"))
+                    self.assertEqual(len(archived), 1)
+                    self.assertEqual(archived[0].read_text(), "known oracle")
+
+    def test_dataset_reset_archives_only_compatibility_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            manifest = state / "compat-inline-test.json"
+            manifest.write_text("known oracle")
+            config = state / "config.json"
+            config.write_text("configuration")
+            lab = LAB.DockerLab(state, configuration())
+            lab.archive_compat_manifests()
+            self.assertFalse(manifest.exists())
+            archived = list((state / "compat-history").glob("*/compat-inline-test.json"))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0].read_text(), "known oracle")
+            self.assertEqual(config.read_text(), "configuration")
+            lab.archive_compat_manifests()
+            self.assertEqual(len(list((state / "compat-history").iterdir())), 1)
+
+    def test_compatibility_client_rejects_external_coordinators_before_docker(self):
+        lab = LAB.DockerLab("/unused", configuration())
+        lab.docker = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "owned lab node"):
+            lab.client("inline-test", "compat-check", coordinator="other.example")
+        lab.docker.assert_not_called()
+
+    def test_compatibility_client_rejects_wrong_bytes_and_version_inventory(self):
+        manifest = {"bucket": "inline-test", "records": [{"key": "compat/plain", "version_id": "null",
+                    "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest()}]}
+        client = mock.Mock()
+        client.head_object.return_value = {"ContentLength": 3}
+        config_module = types.ModuleType("botocore.config")
+        config_module.Config = mock.Mock()
+        boto_module = types.ModuleType("boto3")
+        boto_module.client = mock.Mock(return_value=client)
+        modules = {"boto3": boto_module, "botocore": types.ModuleType("botocore"), "botocore.config": config_module}
+        for inventory, body, valid in (([], b"abc", False),
+                                       ([{"Key": "compat/plain", "VersionId": "null"}], b"bad", False),
+                                       ([{"Key": "compat/plain", "VersionId": "null"}], b"abc", True)):
+            client.get_paginator.return_value.paginate.return_value = [{"Versions": inventory}]
+            client.get_object.return_value = {"Body": io.BytesIO(body)}
+            request = {"bucket": "inline-test", "action": "compat-check", "access_key": "test-access",
+                       "secret_key": "test-secret", "manifest": manifest}
+            output = io.StringIO()
+            with mock.patch.dict(sys.modules, modules), mock.patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                if valid:
+                    exec(LAB.CLIENT, {})
+                    self.assertEqual(json.loads(output.getvalue()), manifest)
+                else:
+                    with self.assertRaises(AssertionError):
+                        exec(LAB.CLIENT, {})
 
     def test_embedded_client_is_valid_python(self):
         compile(LAB.CLIENT, "inline lab S3 client", "exec")

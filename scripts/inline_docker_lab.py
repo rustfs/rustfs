@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.request
 import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +24,7 @@ CLIENT = r'''
 import boto3, hashlib, json, random, sys
 from botocore.config import Config
 cfg = json.load(sys.stdin)
-client = boto3.client("s3", endpoint_url="http://node1:9000", region_name="us-east-1",
+client = boto3.client("s3", endpoint_url="http://" + cfg.get("coordinator", "node1") + ":9000", region_name="us-east-1",
     aws_access_key_id=cfg["access_key"], aws_secret_access_key=cfg["secret_key"],
     config=Config(signature_version="s3v4", proxies={}, s3={"addressing_style":"path"}))
 if cfg["action"] == "create":
@@ -49,6 +48,93 @@ elif cfg["action"] == "probe":
             assert result["Body"].read() == data[start:end + 1]
         records.append({"key":key, "size":size, "sha256":hashlib.sha256(data).hexdigest()})
     print(json.dumps(records))
+elif cfg["action"] in ("compat-seed", "compat-check", "compat-finish-mpu", "compat-delete"):
+    def payload(size, seed):
+        return random.Random(seed).randbytes(size)
+
+    def record(key, size, seed, response):
+        return {"key": key, "size": size, "seed": seed,
+                "version_id": response.get("VersionId", "null"),
+                "sdk_retry_attempts": response.get("ResponseMetadata", {}).get("RetryAttempts", 0),
+                "sha256": hashlib.sha256(payload(size, seed)).hexdigest()}
+
+    manifest = cfg.get("manifest")
+    if cfg["action"] == "compat-seed":
+        from botocore.exceptions import ClientError
+        try:
+            client.head_bucket(Bucket=cfg["bucket"])
+        except ClientError as error:
+            if error.response["ResponseMetadata"]["HTTPStatusCode"] != 404:
+                raise
+            client.create_bucket(Bucket=cfg["bucket"])
+        records = []
+        for size in (0, 4096, 1048577, 1310720, 1572856, 1572857):
+            key = "compat/plain-" + str(size)
+            result = client.put_object(Bucket=cfg["bucket"], Key=key, Body=payload(size, size))
+            records.append(record(key, size, size, result))
+        client.put_bucket_versioning(Bucket=cfg["bucket"], VersioningConfiguration={"Status": "Enabled"})
+        for seed, size in enumerate((0, 4096, 196608, 196609), 100):
+            result = client.put_object(Bucket=cfg["bucket"], Key="compat/versions", Body=payload(size, seed))
+            records.append(record("compat/versions", size, seed, result))
+        key = "compat/resumed-multipart"
+        upload = client.create_multipart_upload(Bucket=cfg["bucket"], Key=key)
+        first = client.upload_part(Bucket=cfg["bucket"], Key=key, UploadId=upload["UploadId"],
+                                   PartNumber=1, Body=payload(5 * 1024 * 1024, 200))
+        manifest = {"bucket": cfg["bucket"], "records": records,
+                    "multipart": {"key": key, "upload_id": upload["UploadId"], "first_etag": first["ETag"]}}
+        # Capture the complete seed inventory, including additional versions
+        # whose contents match a known body oracle.
+        expected = {(item["key"], item["version_id"]) for item in records}
+        for page in client.get_paginator("list_object_versions").paginate(Bucket=cfg["bucket"], Prefix="compat/"):
+            assert not page.get("DeleteMarkers"), "unexpected seed delete marker"
+            for version in page.get("Versions", []):
+                identity = (version["Key"], version["VersionId"])
+                if identity in expected:
+                    continue
+                data = client.get_object(Bucket=cfg["bucket"], Key=identity[0], VersionId=identity[1])["Body"].read()
+                digest = hashlib.sha256(data).hexdigest()
+                match = next((item for item in records if item["key"] == identity[0]
+                              and item["sha256"] == digest and item["size"] == len(data)), None)
+                assert match is not None, "unexpected seed object or content"
+                records.append(dict(match, version_id=identity[1]))
+                expected.add(identity)
+    else:
+        assert manifest["bucket"] == cfg["bucket"]
+        if cfg["action"] == "compat-finish-mpu" and not manifest["multipart"].get("complete"):
+            upload = manifest["multipart"]
+            second = client.upload_part(Bucket=cfg["bucket"], Key=upload["key"], UploadId=upload["upload_id"],
+                                        PartNumber=2, Body=payload(1024 * 1024, 201))
+            result = client.complete_multipart_upload(Bucket=cfg["bucket"], Key=upload["key"], UploadId=upload["upload_id"],
+                MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": upload["first_etag"]}, {"PartNumber": 2, "ETag": second["ETag"]}]})
+            data = payload(5 * 1024 * 1024, 200) + payload(1024 * 1024, 201)
+            manifest["records"].append({"key": upload["key"], "size": len(data), "seed": None,
+                                        "version_id": result["VersionId"], "sha256": hashlib.sha256(data).hexdigest()})
+            manifest["multipart"]["complete"] = True
+        elif cfg["action"] == "compat-delete":
+            selected = [item for item in manifest["records"] if item["key"] == "compat/versions"]
+            assert selected, "manifest has no versions to delete"
+            result = client.delete_objects(Bucket=cfg["bucket"], Delete={"Objects": [
+                {"Key": item["key"], "VersionId": item["version_id"]} for item in selected]})
+            assert not result.get("Errors"), result.get("Errors")
+            assert len(result.get("Deleted", [])) == len(selected)
+            manifest["deleted_versions"] = selected
+            manifest["records"] = [item for item in manifest["records"] if item["key"] != "compat/versions"]
+    if cfg["action"] != "compat-seed":
+        actual_versions = set()
+        for page in client.get_paginator("list_object_versions").paginate(Bucket=cfg["bucket"], Prefix="compat/"):
+            assert not page.get("DeleteMarkers"), "unexpected delete marker"
+            actual_versions.update((item["Key"], item["VersionId"]) for item in page.get("Versions", []))
+        expected_versions = {(item["key"], item["version_id"]) for item in manifest["records"]}
+        assert actual_versions == expected_versions, {"missing": sorted(expected_versions - actual_versions), "unexpected": sorted(actual_versions - expected_versions)}
+        for item in manifest["records"]:
+            args = {"Bucket": cfg["bucket"], "Key": item["key"], "VersionId": item["version_id"]}
+            assert client.head_object(**args)["ContentLength"] == item["size"]
+            data = client.get_object(**args)["Body"].read()
+            assert len(data) == item["size"] and hashlib.sha256(data).hexdigest() == item["sha256"]
+            if item["size"] > 1048576:
+                result = client.get_object(**args, Range="bytes=1048570-1048582")
+                assert result["Body"].read() == data[1048570:1048583]
+    print(json.dumps(manifest))
 '''
 
 
@@ -181,12 +267,14 @@ class DockerLab:
             raise ValueError(f"expected one running {node} container")
         return result
 
-    def client(self, bucket, action):
+    def client(self, bucket, action, manifest=None, coordinator="node1"):
+        if coordinator not in NODES:
+            raise ValueError("compatibility coordinator must be an owned lab node")
         spec = json.loads((self.state / "compose.json").read_text())
         network_key = next(iter(spec["services"]["node1"]["networks"]))
         network = spec["networks"][network_key]["name"]
         payload = {key: self.config[key] for key in ("access_key", "secret_key")}
-        payload.update(bucket=bucket, action=action)
+        payload.update(bucket=bucket, action=action, manifest=manifest, coordinator=coordinator)
         result = self.docker("run", "--rm", "--pull", "never", "--label", OWNER_LABEL + "=" + self.config["owner"],
                              "--network", network, "--entrypoint", "python3", "-i", self.config["client_image_id"],
                              "-c", CLIENT, input_text=json.dumps(payload))
@@ -218,17 +306,32 @@ class DockerLab:
             raise RuntimeError(f"Linux mc probe exited with code {result.returncode}")
 
     def wait_ready(self):
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + 240
+        pending = list(NODES)
         while time.monotonic() < deadline:
-            try:
-                with opener.open(f"http://127.0.0.1:{self.config['port']}/health", timeout=2) as response:
-                    if response.status == 200:
-                        return
-            except (OSError, urllib.error.URLError):
-                pass
+            pending = []
+            for node in NODES:
+                try:
+                    status = self.docker("exec", self.container(node), "curl", "--silent", "--show-error",
+                                         "--connect-timeout", "2", "--max-time", "3", "--output", "/dev/null",
+                                         "--write-out", "%{http_code}", "http://127.0.0.1:9000/health/ready").strip()
+                    if status != "200":
+                        pending.append(node)
+                except RuntimeError:
+                    pending.append(node)
+            if not pending:
+                return
             time.sleep(1)
-        raise TimeoutError("inline Docker cluster did not become ready")
+        raise TimeoutError("inline Docker nodes did not become ready: " + ", ".join(pending))
+
+    def archive_compat_manifests(self):
+        manifests = sorted(self.state.glob("compat-*.json"))
+        if not manifests:
+            return
+        history = self.state / "compat-history" / secrets.token_hex(8)
+        history.mkdir(parents=True, mode=0o700)
+        for manifest in manifests:
+            manifest.rename(history / manifest.name)
 
     def deploy(self, bucket, keep_data, shard_bytes, rpc_mode="json-compat"):
         validate_shard_bytes(shard_bytes)
@@ -246,6 +349,8 @@ class DockerLab:
         self.docker("compose", "--project-name", self.config["project"], "--file", str(candidate), "config", "--quiet")
         if (self.state / "compose.json").exists():
             self.compose("down", *([] if keep_data else ["--volumes"]))
+        if not keep_data:
+            self.archive_compat_manifests()
         candidate.replace(self.state / "compose.json")
         self.compose("up", "--detach", "--no-build", "--pull", "never")
         self.wait_ready()
@@ -340,10 +445,37 @@ def execute(args):
         lab.deploy(args.bucket, args.keep_data, args.shard_bytes, args.rpc_mode)
     elif args.command == "probe":
         lab.probe(args.bucket)
+    elif args.command.startswith("compat-"):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", args.bucket):
+            raise ValueError("a valid isolated compatibility bucket is required")
+        manifest_path = state / f"compat-{args.bucket}.json"
+        if args.command == "compat-seed":
+            if manifest_path.exists():
+                raise ValueError("compatibility manifest already exists")
+            manifest = None
+        else:
+            manifest = json.loads(manifest_path.read_text())
+        result = lab.client(args.bucket, args.command, manifest, args.coordinator)
+        node = lab.container("node1")
+        for record in result["records"]:
+            path = f"/data/rustfs0/{args.bucket}/{record['key']}/xl.meta"
+            version = "00000000-0000-0000-0000-000000000000" if record["version_id"] == "null" else record["version_id"]
+            geometry = lab.docker_json("exec", node, "/usr/local/bin/inline_lab_inspect", path, version)
+            if "geometry" in record and geometry != record["geometry"]:
+                raise ValueError(f"persisted geometry changed for {record['key']} version {record['version_id']}")
+            record["geometry"] = geometry
+        if args.command == "compat-seed":
+            coordinator = lab.docker_json("inspect", lab.container(args.coordinator))[0]
+            result["writer_revision"] = coordinator["Config"]["Labels"]["org.opencontainers.image.revision"]
+            result["writer_coordinator"] = args.coordinator
+        write_private(manifest_path, result)
+        print(f"{args.command} verified {len(result['records'])} objects/versions")
     elif args.command == "mc":
         lab.mc_proxy(args.image, args.arguments)
     elif (state / "compose.json").exists():
         lab.compose("down", *(["--volumes"] if args.purge else []))
+        if args.purge:
+            lab.archive_compat_manifests()
 
 
 def main():
@@ -368,6 +500,10 @@ def main():
                         default=os.environ.get("RUSTFS_INLINE_LAB_RPC_MODE", "json-compat"))
     probe = commands.add_parser("probe")
     probe.add_argument("--bucket", required=True)
+    for action in ("compat-seed", "compat-check", "compat-finish-mpu", "compat-delete"):
+        command = commands.add_parser(action)
+        command.add_argument("--bucket", required=True)
+        command.add_argument("--coordinator", choices=NODES, default="node1")
     mc = commands.add_parser("mc")
     mc.add_argument("--image", required=True)
     mc.add_argument("arguments", nargs=argparse.REMAINDER)

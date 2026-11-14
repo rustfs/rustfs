@@ -30,7 +30,7 @@ docker --context "$LAB_CONTEXT" rm "$LAB_EXPORT_ID"
 
 ## Configure and probe
 
-Select a new compose project and a private state directory. The adapter generates test credentials there. Existing resources require matching ownership labels. Configure checks the image's source revision and pins immutable image IDs. Each operation takes an exclusive state lock.
+Select a new compose project and a private state directory. The adapter generates test credentials there. Existing resources require matching ownership labels. Configure checks the image's source revision and pins immutable image IDs. Each operation takes an exclusive state lock. Deployment waits for `/health/ready` on every node, covering storage, IAM, lock quorum and peer dependencies.
 
 ```bash
 scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" configure \
@@ -84,3 +84,48 @@ export PATH="$LAB_TOOLS:$PATH"
 First compare the base and bounded-multi-block binaries at `--shard-bytes 0` in JSON compatibility mode. Then repeat with MessagePack-only on both sides. A same-binary transport ABBA isolates the encoding effect. Keep the 128 KiB budget, CPU sets, strict durability, load and object set fixed. Check actual markers and block sizes at the boundary sizes before timing. Retain baseline-drift and candidate gates, error logs and raw request distributions.
 
 For a rolling downgrade, redeploy the current binary with `--keep-data --rpc-mode json-compat` before introducing an older node. Check old and new reads, version IDs and batch deletes against the persisted manifest. A running MessagePack-only flag pair establishes the lab configuration. Compatibility with a particular old reader requires the explicit reader test.
+
+## Preserve a compatibility manifest
+
+Run the seed once in a fresh lab bucket. It records full byte oracles and the observed version inventory, including any additional version matching a known body, and leaves a 5 MiB multipart part ready for the next reader. Each bucket has its own private `compat-<bucket>.json` manifest. Keep the same state and volumes across image changes. A fresh deployment or cleanup that resets volumes moves existing compatibility manifests into `compat-history`. Retained-data deployments preserve the active manifests.
+
+```bash
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-seed --bucket inline-compat
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-check --bucket inline-compat
+# Configure the next frozen image and binary, then retain the data.
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" deploy \
+  --bucket inline-compat --shard-bytes 0 --rpc-mode json-compat --keep-data
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-check --bucket inline-compat
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-finish-mpu --bucket inline-compat
+```
+
+The check compares every persisted version ID, HEAD length, complete SHA256, cross-block Range and per-version geometry from `xl.meta`. The seed includes zero-length objects, null versions, the 192 KiB versioned admission boundary and the accumulated 128 KiB shard boundary. Seed a second bucket on the new writer before the downgrade, then check both manifests using the selected old reader. Complete an old upload on the new binary and a new upload on the old binary. After returning to the current fleet, `compat-delete --bucket <bucket>` deletes the recorded versions in one S3 batch and checks the exact remaining inventory and bytes.
+
+For mixed-version testing, retain JSON compatibility mode throughout the rolling replacement. Verify each node's immutable image and binary, then perform manifest checks and new writes through both coordinator versions using `--coordinator node1` and `--coordinator node4`. The manifest records the actual writer coordinator revision from the running image. Stop one owned node to check read availability at EC12+4, restore it and check the manifests again. Record the exact oldest tested source revision, toolchain and build profile with the evidence. The version boundary is established by these executed cells.
+
+An owned lab can replace just its fourth node through a compose image override. Select the frozen old image first and verify its revision label. Keep `compose.json` in JSON compatibility mode for this cell.
+
+```bash
+set -euo pipefail
+OLD_IMAGE_ID="$(docker --context "$LAB_CONTEXT" image inspect "$OLD_IMAGE" --format '{{.Id}}')"
+test "$(docker --context "$LAB_CONTEXT" image inspect "$OLD_IMAGE_ID" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$OLD_REVISION"
+INLINE_OLD_IMAGE_ID="$OLD_IMAGE_ID" scripts/python_bin.sh - <<'PYTHON' > "$LAB_STATE/mixed-image.json"
+import json
+import os
+import sys
+
+override = {"services": {"node4": {"image": os.environ["INLINE_OLD_IMAGE_ID"]}}}
+json.dump(override, sys.stdout)
+PYTHON
+docker --context "$LAB_CONTEXT" compose --project-name "$LAB_PROJECT" \
+  --file "$LAB_STATE/compose.json" --file "$LAB_STATE/mixed-image.json" \
+  up --detach --no-deps --no-build --pull never node4
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-check \
+  --bucket inline-compat --coordinator node4
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-seed \
+  --bucket inline-mixed-writer --coordinator node4
+scripts/python_bin.sh scripts/inline_docker_lab.py --state-dir "$LAB_STATE" compat-check \
+  --bucket inline-mixed-writer --coordinator node1
+```
+
+Inspect all four running image IDs and binary hashes before recording the mixed-fleet result. Redeploy the configured current image with `--keep-data --rpc-mode json-compat` to restore a homogeneous fleet. The same manifest checks apply after stopping and restarting one owned node through the base compose file.
