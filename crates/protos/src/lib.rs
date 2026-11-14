@@ -681,6 +681,7 @@ pub fn canonical_scanner_activity_v7_response_body(
 }
 
 pub mod scoped_dirty_usage;
+pub mod usage_watch;
 
 pub fn canonical_scanner_dirty_usage_snapshot_request_body(
     request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,

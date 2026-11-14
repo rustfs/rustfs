@@ -179,6 +179,7 @@ fn is_windows_dir_access_denied(_path: &Path, _e: &io::Error) -> bool {
     false
 }
 
+#[cfg(test)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref().to_path_buf();

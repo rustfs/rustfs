@@ -25,6 +25,12 @@ use rustfs_config::{
     SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SPEED, SCANNER_START_DELAY,
     SCANNER_WALKERS_PER_DISK, SCANNER_YIELD_EVERY_N_OBJECTS,
 };
+use rustfs_config::{
+    DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES, DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS,
+    DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES, DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES, DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS,
+    SCANNER_BUCKET_QUANTUM_DIRECTORIES, SCANNER_BUCKET_QUANTUM_DURATION, SCANNER_BUCKET_QUANTUM_ENTRIES,
+    SCANNER_BUCKET_QUANTUM_NAME_BYTES, SCANNER_BUCKET_QUANTUM_OBJECTS,
+};
 use std::sync::LazyLock;
 
 pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
@@ -67,6 +73,31 @@ pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
         KV {
             key: SCANNER_CYCLE_MAX_DIRECTORIES.to_owned(),
             value: DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: SCANNER_BUCKET_QUANTUM_DURATION.to_owned(),
+            value: DEFAULT_SCANNER_BUCKET_QUANTUM_DURATION_SECS.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: SCANNER_BUCKET_QUANTUM_OBJECTS.to_owned(),
+            value: DEFAULT_SCANNER_BUCKET_QUANTUM_OBJECTS.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: SCANNER_BUCKET_QUANTUM_DIRECTORIES.to_owned(),
+            value: DEFAULT_SCANNER_BUCKET_QUANTUM_DIRECTORIES.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: SCANNER_BUCKET_QUANTUM_ENTRIES.to_owned(),
+            value: DEFAULT_SCANNER_BUCKET_QUANTUM_ENTRIES.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: SCANNER_BUCKET_QUANTUM_NAME_BYTES.to_owned(),
+            value: DEFAULT_SCANNER_BUCKET_QUANTUM_NAME_BYTES.to_string(),
             hidden_if_empty: false,
         },
         KV {

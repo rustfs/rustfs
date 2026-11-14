@@ -264,10 +264,11 @@ const SCANNER_CYCLE_RECOVERY_PAUSED_INTERVAL: Duration = Duration::from_secs(5 *
 /// races the wait registration cannot leave the scanner asleep forever.
 const SCANNER_CYCLE_RECOVERY_BLOCKED_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const SCANNER_PRODUCTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
-const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = SCANNER_PRODUCTION_SHUTDOWN_GRACE;
 #[cfg(test)]
-const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
+pub(crate) const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAINTENANCE_FEATURE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const SCANNER_STARTUP_USAGE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -2047,10 +2048,17 @@ where
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
+    let usage_watch_cohort = scheduling.service_cohort.as_ref().map(|cohort| {
+        cohort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .usage_watch_cohort()
+    });
     let scan_result = crate::scanner_io::nsscanner_with_storage_status_scoped(
         storeapi.as_ref(),
         crate::scanner_io::ScannerCycleRequest {
             ctx: cycle_budget.token(),
+            owner_ctx: ctx.clone(),
             budget: cycle_budget.clone(),
             updates: sender,
             want_cycle: cycle_info.current,
@@ -2063,6 +2071,8 @@ where
             service_cohort: scheduling.service_cohort,
             #[cfg(test)]
             resolved_scope_observer: None,
+            #[cfg(test)]
+            post_walk_hook: None,
             #[cfg(test)]
             post_walk_gate: None,
             #[cfg(test)]
@@ -2082,6 +2092,22 @@ where
         .as_ref()
         .map(ScannerCyclePublicationPlan::for_result)
         .unwrap_or(ScannerCyclePublicationPlan::ProgressOnly);
+    let watch_retirements = scan_result
+        .as_ref()
+        .ok()
+        .map(|result| result.usage_watch_retirements().to_vec())
+        .unwrap_or_default();
+    let usage_watch_release = if watch_retirements.is_empty() {
+        None
+    } else {
+        Some(
+            crate::scanner_io::ScannerUsageWatchReleaseGuard::new(
+                storeapi.scanner_usage_watch_store_handle().await,
+                watch_retirements,
+            )
+            .with_cohort(usage_watch_cohort),
+        )
+    };
     let publication_defer_reason = match &scan_result {
         Ok(result)
             if result
@@ -2217,7 +2243,6 @@ where
     let publication_defer_reason = publication_defer_reason.or(post_lease_activity_defer_reason);
     // Include reasons discovered while acquiring or validating remote leases.
     let publication_deferred = publication_defer_reason.is_some();
-    let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
         .filter(|_| publication_plan.has_usage_update())
@@ -2240,6 +2265,11 @@ where
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
             let route_probe_observational_only = observational_only;
+            let usage_watch_proofs = scan_result
+                .as_ref()
+                .ok()
+                .map(|result| result.usage_watch_proofs().to_vec())
+                .unwrap_or_default();
             let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
             let remote_lease_tokens = remote_publication_leases
                 .as_ref()
@@ -2268,8 +2298,12 @@ where
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();
+                        let usage_watch_proofs = usage_watch_proofs.clone();
                         let observational_only = route_probe_observational_only;
                         async move {
+                            if !storeapi.scanner_verify_usage_watches(&usage_watch_proofs).await {
+                                return Some(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                            }
                             if let Some((notification_system, grants)) = remote_lease_probe.as_ref()
                                 && notification_system.validate_scanner_publication_leases(grants).await.is_err()
                             {
@@ -2502,7 +2536,98 @@ where
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
-    if budget_elapsed {
+
+    usage_publication_result.restrict_outcome(usage_persist_outcome);
+    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
+        "saved_bucket_progress"
+    } else if scan_cycle_result.has_usage_update()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
+    {
+        "activity_unverified_observation"
+    } else {
+        "incomplete_coverage"
+    };
+    #[cfg(feature = "e2e-test-hooks")]
+    let durable_observation = scan_cycle_result
+        .publication_expectation()
+        .as_ref()
+        .and_then(|expected| usage_publication_result.e2e_durable_observation(leader_epoch, cycle_info.current, expected));
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(observation) = &durable_observation {
+        let _ = crate::e2e_barrier::checkpoint("root_durable", observation.clone()).await;
+    }
+    let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
+    // Ownership can be lost while an asynchronous publication hook or peer
+    // operation yields. Durable bytes do not authorize an ACK after that loss.
+    if ctx.is_cancelled() {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Failed;
+    }
+    let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
+        finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(mut observation) = durable_observation {
+        observation["acks"] = crate::e2e_barrier::acknowledgement_observations(&remote_dirty_usage_acknowledgements);
+        observation["pending_bucket_count"] = serde_json::json!(pending_dirty_usage_buckets);
+        let _ = crate::e2e_barrier::checkpoint("ack_send", observation).await;
+    }
+    if ctx.is_cancelled() {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Failed;
+    }
+    let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
+        false
+    } else if let Some(notification_system) = storeapi.scanner_notification_system() {
+        let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
+        let acknowledgement_proof = remote_dirty_usage_acknowledgements.clone();
+        let acknowledgements = remote_dirty_usage_acknowledgements.into_iter().map(Into::into).collect();
+        await_scanner_dirty_ack_with_owner(
+            ctx,
+            remote_dirty_usage_acknowledgement_pending(
+                cycle_info.current,
+                acknowledgement_count,
+                &acknowledgement_proof,
+                notification_system.acknowledge_scanner_dirty_usage(acknowledgements),
+                || probe_scanner_activity(storeapi.as_ref(), true),
+            ),
+        )
+        .await
+        .unwrap_or(true)
+    } else {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            cycle = cycle_info.current,
+            state = "remote_dirty_usage_acknowledgement_unavailable",
+            "Scanner cycle cannot acknowledge remote dirty usage without a notification system"
+        );
+        true
+    };
+    if ctx.is_cancelled() {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Failed;
+    }
+    // Retire only terminal sweeps after publication and ACK have consumed the
+    // proof. Early return or cancellation uses the guard's bounded fallback.
+    if let Some(release) = usage_watch_release
+        && !release.finish().await
+    {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "usage_watch_retirement_deferred",
+            cycle = cycle_info.current,
+            "Scanner usage watches retain their bounded lease after incomplete retirement"
+        );
+    }
+    if cycle_budget.budget_elapsed() {
         warn!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
@@ -2548,63 +2673,6 @@ where
         };
     }
 
-    usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
-        "saved_bucket_progress"
-    } else if scan_cycle_result.has_usage_update()
-        && matches!(
-            scan_cycle_result.status,
-            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        )
-    {
-        "activity_unverified_observation"
-    } else {
-        "incomplete_coverage"
-    };
-    #[cfg(feature = "e2e-test-hooks")]
-    let durable_observation = scan_cycle_result
-        .publication_expectation()
-        .as_ref()
-        .and_then(|expected| usage_publication_result.e2e_durable_observation(leader_epoch, cycle_info.current, expected));
-    #[cfg(feature = "e2e-test-hooks")]
-    if let Some(observation) = &durable_observation {
-        let _ = crate::e2e_barrier::checkpoint("root_durable", observation.clone()).await;
-    }
-    let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
-    let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
-        finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
-    #[cfg(feature = "e2e-test-hooks")]
-    if let Some(mut observation) = durable_observation {
-        observation["acks"] = crate::e2e_barrier::acknowledgement_observations(&remote_dirty_usage_acknowledgements);
-        observation["pending_bucket_count"] = serde_json::json!(pending_dirty_usage_buckets);
-        let _ = crate::e2e_barrier::checkpoint("ack_send", observation).await;
-    }
-    let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
-        false
-    } else if let Some(notification_system) = storeapi.scanner_notification_system() {
-        let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
-        let acknowledgement_proof = remote_dirty_usage_acknowledgements.clone();
-        let acknowledgements = remote_dirty_usage_acknowledgements.into_iter().map(Into::into).collect();
-        remote_dirty_usage_acknowledgement_pending(
-            cycle_info.current,
-            acknowledgement_count,
-            &acknowledgement_proof,
-            notification_system.acknowledge_scanner_dirty_usage(acknowledgements),
-            || probe_scanner_activity(storeapi.as_ref(), true),
-        )
-        .await
-    } else {
-        warn!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            cycle = cycle_info.current,
-            state = "remote_dirty_usage_acknowledgement_unavailable",
-            "Scanner cycle cannot acknowledge remote dirty usage without a notification system"
-        );
-        true
-    };
     let pending_maintenance_work = scanner_pending_maintenance_work || unresolved_heal_work || remote_dirty_usage_pending;
     match completion_outcome {
         ScannerCycleOutcome::Failed | ScannerCycleOutcome::StatePersistenceFailed => {
@@ -3994,14 +4062,9 @@ impl ScannerCyclePublicationPlan {
         F: FnMut(bool) -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        // Exhausting the walk budget must not cancel the movement proof needed
-        // to save partial progress. No usage update means namespace stability
-        // is unnecessary, but peer session/generation and movement checks stay.
-        let proof_ctx = if self == Self::ProgressOnly {
-            parent.clone()
-        } else {
-            budget.token()
-        };
+        // Finalization belongs to the cycle owner. A walk stop only limits the
+        // remaining drain window; it cannot invalidate an otherwise valid proof.
+        let proof_ctx = parent.clone();
         debug!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_CYCLE_STATE,
@@ -4024,14 +4087,25 @@ impl ScannerCyclePublicationPlan {
             || acquire(self.uses_observational_lease()),
             |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
         );
-        if self == Self::ProgressOnly {
-            // Object/directory budgets can expire with no runtime deadline.
-            // Bound the control-plane drain independently of the walk budget.
-            tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, proof)
-                .await
-                .unwrap_or(ScannerPublicationProofWait::Cancelled)
-        } else {
-            proof.await
+        let drain = async {
+            budget.wait_for_stop().await;
+            if let Some(deadline) = budget.drain_deadline(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT) {
+                tokio::time::sleep_until(deadline).await;
+            }
+        };
+        let progress_timeout = async {
+            if self == Self::ProgressOnly {
+                tokio::time::sleep(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = parent.cancelled() => ScannerPublicationProofWait::Cancelled,
+            _ = drain => ScannerPublicationProofWait::Cancelled,
+            _ = progress_timeout => ScannerPublicationProofWait::Cancelled,
+            result = proof => result,
         }
     }
 }
@@ -4221,6 +4295,19 @@ fn scanner_cycle_completion_outcome(
     }
 }
 
+/// A cancelled owner cannot start polling a new ACK operation or report its
+/// completion. Requests sent before cancellation may still finish at the peer.
+async fn await_scanner_dirty_ack_with_owner<F>(owner: &CancellationToken, acknowledgement: F) -> Option<bool>
+where
+    F: Future<Output = bool>,
+{
+    tokio::select! {
+        biased;
+        _ = owner.cancelled() => None,
+        pending = acknowledgement => Some(pending),
+    }
+}
+
 fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
     publication: DataUsagePublicationResult,
@@ -4374,7 +4461,7 @@ pub(crate) use activity::{
     ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity, scanner_activity_allows_usage_publication,
     scanner_activity_coverage_digest, scanner_activity_dirty_usage_state_for_host, scanner_activity_guardrail_veto,
     scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_activity_structural_digest,
-    scanner_dirty_usage_acknowledgements, scanner_peer_dirty_usage_moved,
+    scanner_activity_usage_watch_structure_digest, scanner_dirty_usage_acknowledgements, scanner_peer_dirty_usage_moved,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

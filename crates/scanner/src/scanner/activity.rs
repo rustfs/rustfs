@@ -1185,6 +1185,27 @@ pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapsho
     hasher.finalize().into()
 }
 
+/// Structural part of a complete per-owner watch proof. Owner order makes
+/// this independent of which node is the local RPC worker; mutation counters
+/// are supplied by the separately verified, bucket-specific watch revisions.
+pub(crate) fn scanner_activity_usage_watch_structure_digest(
+    snapshot: &ScannerActivitySnapshot,
+    owners: &BTreeMap<uuid::Uuid, Option<String>>,
+) -> Option<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"scanner-usage-watch-structure-v1");
+    hash.update((owners.len() as u64).to_be_bytes());
+    for (owner, host) in owners {
+        let node = snapshot.get(host.as_deref().unwrap_or(LOCAL_SCANNER_ACTIVITY_NODE))?;
+        hash.update(owner.as_bytes());
+        hash.update(node.protocol_version.to_be_bytes());
+        hash.update(node.topology_digest);
+        hash.update([u8::from(node.data_movement_active)]);
+        hash.update(node.movement_generation.to_be_bytes());
+    }
+    Some(hash.finalize().into())
+}
+
 /// An attributed veto of the cluster activity guardrail: the named field on
 /// the named host moved between the pre-walk and post-walk probes.
 #[derive(Clone, Debug, PartialEq, Eq)]

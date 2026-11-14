@@ -26,6 +26,7 @@ async fn run_full_cycle(
     store: &Arc<ECStore>,
     cycle: u64,
     max_objects: Option<u64>,
+    baseline: Option<&DataUsageInfo>,
 ) -> (ScannerCycleResult, Option<DataUsageInfo>, Arc<ScannerCycleBudget>) {
     let ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -35,12 +36,15 @@ async fn run_full_cycle(
             ..Default::default()
         },
     );
+    // Checkpoints and source-cache commits use real storage in this fixture.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget: Arc::clone(&budget),
                 updates,
@@ -48,11 +52,14 @@ async fn run_full_cycle(
                 leader_epoch: LEADER_EPOCH,
                 scan_mode: HealScanMode::Normal,
                 scan_scope: ScannerBucketScanScope::default(),
-                persisted_usage_baseline: None,
+                persisted_usage_baseline: baseline.map(|snapshot| {
+                    Bytes::from(serde_json::to_vec(snapshot).expect("the actual candidate must encode as a baseline"))
+                }),
                 observed_usage_candidate: None,
                 requires_full_scan: true,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
@@ -86,25 +93,67 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
     wait_for_namespace_commit_tails(store.as_ref()).await;
 
     // Cycle 1: a quiet full walk certifies both buckets.
-    let (result, first, _) = run_full_cycle(&store, 1, None).await;
+    let (result, first, _) = run_full_cycle(&store, 1, None, None).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete, "the first cycle must publish");
     let first = first.expect("a complete cycle publishes");
-    assert_eq!(result.status, ScannerCycleStatus::Complete);
     assert_eq!(first.usage_snapshot_converged, Some(true));
     assert_eq!(first.buckets_usage["hot-bucket"].objects_count, 6);
+    let first_hot_certification = first.buckets_usage["hot-bucket"]
+        .usage_certification
+        .expect("the first complete hot-bucket value must be certified");
     assert!(result.clear_verified_usage().is_empty());
     assert!(dirty_usage_buckets_for_tests().is_empty());
 
-    // Cycle 2: the object budget stops the written bucket's sweep with a
-    // checkpoint; the cycle itself is incomplete. Service order follows the
-    // wait, so the budget leaves it two objects even behind the idle bucket.
+    // Cycle 2: the budget interrupts the hot bucket. The first cycle's
+    // equally aged buckets run in shuffled order, which determines whether
+    // the idle bucket runs before this stop. Only that order can finish the
+    // set by carrying the hot bucket's previously certified value.
     for object in ["p6/g", "p7/h"] {
         put_fixture_object(&store, "hot-bucket", object).await;
     }
     record_dirty_usage_bucket("hot-bucket");
     wait_for_namespace_commit_tails(store.as_ref()).await;
-    let (result, _, budget) = run_full_cycle(&store, 2, Some(3)).await;
-    assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+    let pending_generation = dirty_usage_buckets_for_tests()["hot-bucket"];
+    let (result, second, budget) = run_full_cycle(&store, 2, Some(3), Some(&first)).await;
+    match result.status {
+        ScannerCycleStatus::Complete => {
+            let second = second.expect("a carried complete cycle must publish its candidate");
+            assert!(second.is_complete_bucket_usage_snapshot());
+            assert!(!second.usage_snapshot_observational);
+            assert_eq!(second.scanner_cycle, Some(2));
+            assert_eq!(second.usage_snapshot_converged, Some(false));
+            assert_eq!(second.usage_snapshot_pending_buckets, vec!["hot-bucket".to_string()]);
+            assert_eq!(second.usage_snapshot_pending_bucket_count, 1);
+            assert_eq!(result.pending_dirty_usage_buckets(), 1);
+            let carried = &second.buckets_usage["hot-bucket"];
+            assert_eq!(carried.objects_count, 6);
+            assert_eq!(carried.size, 6 * 16);
+            assert_eq!(carried.usage_value_state, Some(rustfs_data_usage::BucketUsageValueState::Carried));
+            assert_eq!(
+                carried.usage_certification,
+                Some(first_hot_certification),
+                "the original value certification must survive carrying unchanged"
+            );
+            assert_eq!(second.buckets_usage["idle-bucket"].objects_count, 1);
+            assert_eq!(second.buckets_usage["idle-bucket"].size, 16);
+            assert_eq!(second.objects_total_count, 7);
+            assert_eq!(second.objects_total_size, 7 * 16);
+        }
+        ScannerCycleStatus::Incomplete => assert!(
+            second.is_none_or(|candidate| {
+                candidate.usage_snapshot_observational && !candidate.is_complete_bucket_usage_snapshot()
+            }),
+            "unserved bucket work cannot produce a complete canonical candidate"
+        ),
+        status => panic!("the quiet budget-stopped cycle cannot be {status:?}"),
+    }
     assert!(budget.budget_elapsed());
+    assert!(result.clear_verified_usage().is_empty());
+    assert_eq!(
+        dirty_usage_buckets_for_tests().get("hot-bucket"),
+        Some(&pending_generation),
+        "the interrupted sweep must retain its exact dirty responsibility"
+    );
     let set = Arc::clone(&store.pools[0].disk_set[0]);
     let mut checkpoint = DataUsageCache::default();
     checkpoint
@@ -142,9 +191,9 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
 
     // Cycle 3: the hot bucket resumes from its checkpoint and certifies;
     // a fresh walk would have read all nine objects.
-    let (result, third, budget) = run_full_cycle(&store, 3, None).await;
+    let (result, third, budget) = run_full_cycle(&store, 3, None, None).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete, "the resumed cycle must publish");
     let third = third.expect("a complete cycle publishes");
-    assert_eq!(result.status, ScannerCycleStatus::Complete);
     assert_eq!(result.pending_dirty_usage_buckets(), 0);
     assert_eq!(third.usage_snapshot_converged, Some(true));
     assert_eq!(third.buckets_usage["hot-bucket"].objects_count, 8);
