@@ -1663,6 +1663,35 @@ struct FileFdatasyncWorkerGuard {
     armed: bool,
 }
 
+impl FileFdatasyncWorkerGuard {
+    fn claim_batch(&mut self) -> Option<Vec<FileFdatasyncWaiter>> {
+        let mut state = self.group.inner.lock();
+        if state.pending.is_empty() {
+            // Publish idleness while still excluding enqueue. A successor can
+            // then claim worker ownership before this worker removes the group.
+            state.worker_running = false;
+            self.armed = false;
+            return None;
+        }
+        self.in_flight_waiters = state.pending.len();
+        self.in_flight_files = std::mem::take(&mut state.pending_files);
+        Some(state.pending.drain().collect())
+    }
+
+    fn complete_batch(&mut self) -> bool {
+        FILE_FDATASYNC_GROUP_COMMIT.complete_batch(self.in_flight_waiters, self.in_flight_files);
+        self.in_flight_waiters = 0;
+        self.in_flight_files = 0;
+        let mut state = self.group.inner.lock();
+        if !state.pending.is_empty() {
+            return false;
+        }
+        state.worker_running = false;
+        self.armed = false;
+        true
+    }
+}
+
 impl Drop for FileFdatasyncWorkerGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -1710,23 +1739,13 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             if !wait.is_zero() {
                 tokio::time::sleep(wait).await;
             }
-            let (mut batch, batch_file_count): (Vec<FileFdatasyncWaiter>, usize) = {
-                let mut group_state = group.inner.lock();
-                let batch_file_count = group_state.pending_files;
-                group_state.pending_files = 0;
-                (group_state.pending.drain().collect(), batch_file_count)
-            };
-            if batch.is_empty() {
-                let mut group_state = group.inner.lock();
-                worker_guard.armed = false;
-                group_state.worker_running = false;
-                drop(group_state);
+            let Some(mut batch) = worker_guard.claim_batch() else {
+                #[cfg(test)]
+                file_sync_probe::run_after_empty_group_batch();
                 FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
                 return;
-            }
-
-            worker_guard.in_flight_waiters = batch.len();
-            worker_guard.in_flight_files = batch_file_count;
+            };
+            let batch_file_count = worker_guard.in_flight_files;
             rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
                 rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS,
                 batch.len(),
@@ -1771,20 +1790,7 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             } else {
                 Err(io::Error::other("file fdatasync group commit limiter dropped"))
             };
-            FILE_FDATASYNC_GROUP_COMMIT.complete_batch(batch.len(), batch_file_count);
-            worker_guard.in_flight_waiters = 0;
-            worker_guard.in_flight_files = 0;
-
-            let should_stop = {
-                let mut group_state = group.inner.lock();
-                if group_state.pending.is_empty() {
-                    worker_guard.armed = false;
-                    group_state.worker_running = false;
-                    true
-                } else {
-                    false
-                }
-            };
+            let should_stop = worker_guard.complete_batch();
             if should_stop {
                 FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
             }
@@ -3367,6 +3373,7 @@ pub(crate) mod file_sync_probe {
     static BLOCK: AtomicBool = AtomicBool::new(false);
     static GROUP_BATCHES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     static BEFORE_GROUP_BATCH: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+    static AFTER_EMPTY_GROUP_BATCH: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
     const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub(crate) struct ProbeGuard;
@@ -3394,6 +3401,7 @@ pub(crate) mod file_sync_probe {
             FAIL_ON_ATTEMPT.store(usize::MAX, Ordering::SeqCst);
             GROUP_BATCHES.lock().expect("file sync group batch recorder poisoned").clear();
             BEFORE_GROUP_BATCH.lock().expect("file sync group batch hook poisoned").take();
+            AFTER_EMPTY_GROUP_BATCH.lock().expect("empty group hook poisoned").take();
             ROOTS.write().expect("file sync probe lock poisoned").clear();
         }
     }
@@ -3405,6 +3413,7 @@ pub(crate) mod file_sync_probe {
         FAIL_ON_ATTEMPT.store(fail_on_attempt.unwrap_or(usize::MAX), Ordering::SeqCst);
         GROUP_BATCHES.lock().expect("file sync group batch recorder poisoned").clear();
         BEFORE_GROUP_BATCH.lock().expect("file sync group batch hook poisoned").take();
+        AFTER_EMPTY_GROUP_BATCH.lock().expect("empty group hook poisoned").take();
         {
             let _guard = BLOCK_MUTEX.lock().expect("file sync probe blocker poisoned");
             BLOCK.store(block, Ordering::SeqCst);
@@ -3535,6 +3544,17 @@ pub(crate) mod file_sync_probe {
 
     pub(crate) fn set_before_group_batch(hook: impl FnOnce() + Send + 'static) {
         *BEFORE_GROUP_BATCH.lock().expect("file sync group batch hook poisoned") = Some(Box::new(hook));
+    }
+
+    pub(crate) fn set_after_empty_group_batch(hook: impl FnOnce() + Send + 'static) {
+        *AFTER_EMPTY_GROUP_BATCH.lock().expect("empty group hook poisoned") = Some(Box::new(hook));
+    }
+
+    pub(super) fn run_after_empty_group_batch() {
+        let hook = AFTER_EMPTY_GROUP_BATCH.lock().expect("empty group hook poisoned").take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub(super) fn run_before_group_batch() {
@@ -12448,6 +12468,74 @@ mod tests {
     #[serial_test::serial(file_sync_probe)]
     async fn file_fdatasync_group_commit_follower_timeout_propagates_sync_failure() {
         assert_file_fdatasync_follower_timeout_ownership(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_empty_claim_preserves_successor_worker() {
+        let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(0);
+        clear_file_fdatasync_group_commit_for_test();
+        let root = tempdir().expect("create handoff root");
+        let next_file = root.path().join("successor");
+        std::fs::write(&next_file, b"successor").expect("stage successor file");
+        let _probe = file_sync_probe::set(root.path());
+        let limiter = file_sync_limiter();
+        let first = FILE_FDATASYNC_GROUP_COMMIT
+            .enqueue(limiter.clone(), vec![PathBuf::from("finished")], true)
+            .expect("enqueue initial leader");
+        let last = FILE_FDATASYNC_GROUP_COMMIT
+            .enqueue(limiter.clone(), vec![PathBuf::from("detached")], true)
+            .expect("enqueue last follower");
+        let group = first.worker.expect("initial worker");
+        let finished = {
+            let mut state = group.inner.lock();
+            let slot = state
+                .pending
+                .iter()
+                .find(|(_, waiter)| waiter.wait_role == rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER)
+                .map(|(slot, _)| slot)
+                .expect("leader slot");
+            let finished = state.pending.remove(slot);
+            state.pending_files -= finished.files.len();
+            finished
+        };
+        FILE_FDATASYNC_GROUP_COMMIT.complete_batch(1, finished.files.len());
+        drop(finished);
+        let detached = FILE_FDATASYNC_GROUP_COMMIT
+            .take_queued_follower(&last.follower.expect("last follower ticket"))
+            .expect("last follower leaves before the next claim");
+        drop(detached);
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (1, 0, 0));
+        let (handoff_tx, handoff_rx) = oneshot::channel();
+        let successor_limiter = limiter.clone();
+        file_sync_probe::set_after_empty_group_batch(move || {
+            let successor = FILE_FDATASYNC_GROUP_COMMIT
+                .enqueue(successor_limiter, vec![next_file], false)
+                .expect("enqueue during idle handoff");
+            assert!(handoff_tx.send(successor).is_ok(), "deliver successor ownership");
+        });
+        tokio::spawn(run_file_fdatasync_group_worker(group))
+            .await
+            .expect("empty worker exits normally");
+        let successor = tokio::time::timeout(Duration::from_secs(5), handoff_rx)
+            .await
+            .expect("idle hook must run")
+            .expect("receive handoff");
+        if successor.worker.is_none() {
+            clear_file_fdatasync_group_commit_for_test();
+            panic!("a request arriving after an empty claim must start a successor worker");
+        }
+        assert_eq!(
+            file_fdatasync_group_commit_counts_for_test(),
+            (1, 1, 1),
+            "old idle cleanup preserves new work"
+        );
+        let worker = tokio::spawn(run_file_fdatasync_group_worker(successor.worker.expect("successor worker")));
+        assert!(successor.result_rx.await.expect("successor response").is_ok());
+        worker.await.expect("successor finishes");
+        assert_eq!(file_sync_probe::attempts(), 1);
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
     }
 
     #[tokio::test]
