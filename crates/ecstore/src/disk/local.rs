@@ -2287,10 +2287,29 @@ impl DurabilityMode {
         matches!(self, Self::Strict | Self::Relaxed)
     }
 
-    /// Whether metadata commits must be fsynced: xl.meta contents, rollback
-    /// backups, and the directory entries created by commit renames.
-    fn syncs_commit_metadata(self) -> bool {
+    /// Whether metadata file contents, including xl.meta and rollback
+    /// backups, must be fdatasynced before publication.
+    fn syncs_metadata_files(self) -> bool {
         matches!(self, Self::Strict)
+    }
+
+    /// Whether ordinary commit rename directory entries and newly created
+    /// ancestor directories must be fsynced before acknowledgement.
+    fn syncs_commit_directories(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    /// Whether a target has the complete file-and-directory durability proof
+    /// required by recovery protocols that may otherwise resync it.
+    fn fully_syncs_commit_target(self) -> bool {
+        self.syncs_metadata_files() && self.syncs_commit_directories()
+    }
+
+    /// Compatibility gate for recovery and maintenance paths whose file and
+    /// directory barriers have not yet been separated. Keeping those paths
+    /// strict prevents a partial policy split from weakening their protocol.
+    fn syncs_commit_metadata(self) -> bool {
+        self.fully_syncs_commit_target()
     }
 }
 
@@ -12176,7 +12195,9 @@ impl LocalDisk {
 
         let durability = effective_durability(volume);
 
-        let do_sync = sync && durability.syncs_commit_metadata();
+        let sync_file = sync && durability.syncs_metadata_files();
+        let sync_directory = sync && durability.syncs_commit_directories();
+        let uses_sync_lane = sync_file || sync_directory;
         if let Some(ref admission) = admission
             && !admission.is_initial()
         {
@@ -12186,7 +12207,7 @@ impl LocalDisk {
             let precondition = admission.as_ref().map(|a| a.precondition());
             let root = self.publication_root.clone();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
-            os::run_blocking_namespace_operation_with_sync(lease, do_sync, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, uses_sync_lane, move || {
                 let _index_pin = prepared_index.map(|record| record.run_std()).transpose()?;
                 #[cfg(test)]
                 if let Some(pin) = &_index_pin {
@@ -12197,7 +12218,7 @@ impl LocalDisk {
                 run_owned_file_before_open(&tmp_file_path);
                 let mut file = root.create_truncate(&tmp_file_path)?;
                 std::io::Write::write_all(&mut file, buf.as_ref())?;
-                if do_sync {
+                if sync_file {
                     file.sync_data()?;
                 }
                 drop(file);
@@ -12207,7 +12228,7 @@ impl LocalDisk {
                     &volume_dir,
                     &root,
                     precondition.as_deref(),
-                    do_sync,
+                    sync_directory,
                 )
             })
             .await
@@ -12218,9 +12239,9 @@ impl LocalDisk {
         // The tmp file is renamed to its final location right below, so only
         // its contents must be durable here (SyncMode::FileOnly): the rename
         // drops the tmp directory entry, and the destination parent directory
-        // is fsynced after the rename. Both are metadata commits, so relaxed
-        // tiers skip them.
-        let tmp_sync = if do_sync { SyncMode::FileOnly } else { SyncMode::None };
+        // is fsynced after the rename when the selected durability tier
+        // requires namespace persistence.
+        let tmp_sync = if sync_file { SyncMode::FileOnly } else { SyncMode::None };
         self.write_all_internal(&tmp_file_path, buf, tmp_sync, &tmp_volume_dir)
             .await?;
 
@@ -12245,13 +12266,13 @@ impl LocalDisk {
             &self.publication_root,
             publication_owner,
             admission.as_ref().map(|admission| admission.precondition()),
-            admission.is_some() && sync && durability.syncs_commit_metadata(),
+            admission.is_some() && sync_directory,
         )
         .await?;
 
         if sync
             && admission.is_none()
-            && durability.syncs_commit_metadata()
+            && sync_directory
             && let Some(parent) = file_path.parent()
         {
             os::fsync_dir_with_owner(parent, namespace_owner)
@@ -12285,10 +12306,12 @@ impl LocalDisk {
         // rename follows — so the new directory entry must be fsynced too.
         // System-critical volumes are pinned to strict by effective_durability;
         // only the legacy full-off switch (historical semantics) skips this.
-        let sync = if effective_durability(volume).syncs_commit_metadata() {
-            SyncMode::FileAndDir
-        } else {
-            SyncMode::None
+        let durability = effective_durability(volume);
+        let sync = match (durability.syncs_metadata_files(), durability.syncs_commit_directories()) {
+            (true, true) => SyncMode::FileAndDir,
+            (true, false) => SyncMode::FileOnly,
+            (false, false) => SyncMode::None,
+            (false, true) => SyncMode::FileAndDir,
         };
         self.write_all_private(volume, path, data, sync, &volume_dir).await?;
 
@@ -24463,15 +24486,21 @@ mod test {
     fn test_durability_mode_sync_gates() {
         // Strict = current main behavior: every commit point synced.
         assert!(DurabilityMode::Strict.syncs_data_shards());
-        assert!(DurabilityMode::Strict.syncs_commit_metadata());
+        assert!(DurabilityMode::Strict.syncs_metadata_files());
+        assert!(DurabilityMode::Strict.syncs_commit_directories());
+        assert!(DurabilityMode::Strict.fully_syncs_commit_target());
         // Relaxed keeps payload durability, drops metadata-commit fsyncs.
         assert!(DurabilityMode::Relaxed.syncs_data_shards());
-        assert!(!DurabilityMode::Relaxed.syncs_commit_metadata());
+        assert!(!DurabilityMode::Relaxed.syncs_metadata_files());
+        assert!(!DurabilityMode::Relaxed.syncs_commit_directories());
+        assert!(!DurabilityMode::Relaxed.fully_syncs_commit_target());
         // None and the legacy full-off switch sync nothing on the data path.
         assert!(!DurabilityMode::None.syncs_data_shards());
-        assert!(!DurabilityMode::None.syncs_commit_metadata());
+        assert!(!DurabilityMode::None.syncs_metadata_files());
+        assert!(!DurabilityMode::None.syncs_commit_directories());
         assert!(!DurabilityMode::LegacyOff.syncs_data_shards());
-        assert!(!DurabilityMode::LegacyOff.syncs_commit_metadata());
+        assert!(!DurabilityMode::LegacyOff.syncs_metadata_files());
+        assert!(!DurabilityMode::LegacyOff.syncs_commit_directories());
     }
 
     #[test]

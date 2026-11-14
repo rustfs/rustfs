@@ -845,8 +845,9 @@ impl LocalDisk {
                 run_inline_before_file_sync_admission(dst_path);
             }
             let sync_data_shards = no_inline && durability.syncs_data_shards();
-            let sync_commit_metadata = durability.syncs_commit_metadata();
-            let file_sync_admission = if sync_data_shards || sync_commit_metadata {
+            let sync_metadata_files = durability.syncs_metadata_files();
+            let sync_commit_directories = durability.syncs_commit_directories();
+            let file_sync_admission = if sync_data_shards || sync_metadata_files || sync_commit_directories {
                 Some(
                     os::acquire_file_sync_admission(self.file_sync_permits.clone())
                         .await
@@ -966,7 +967,7 @@ impl LocalDisk {
                         &dst_file_path_owned,
                         &src_file_path_owned,
                         old_metadata,
-                        sync_commit_metadata,
+                        sync_metadata_files,
                     ) {
                         Ok(path) => path,
                         Err(err) => {
@@ -995,7 +996,7 @@ impl LocalDisk {
                         }
                         return Err(err);
                     }
-                    if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
+                    if sync_metadata_files && let Err(err) = prepared_metadata_source.sync_data() {
                         if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                             let _ = remove_file_if_exists(backup_path);
                         }
@@ -1014,7 +1015,7 @@ impl LocalDisk {
                             return Err(err);
                         }
                     }
-                } else if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
+                } else if sync_metadata_files && let Err(err) = prepared_metadata_source.sync_data() {
                     drop(prepared_metadata_source);
                     cleanup_flat_tmp();
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
@@ -1105,8 +1106,8 @@ impl LocalDisk {
                         if let Err(err) = backup_path_guard.write_file_for_path_access(
                             &backup_path,
                             dst_buf.as_ref(),
-                            sync_commit_metadata,
-                            sync_commit_metadata,
+                            sync_metadata_files,
+                            sync_commit_directories,
                         ) {
                             return Ok(FusedCommitAttempt::RestoreDataSource(guard, to_file_error(err).into()));
                         }
@@ -1125,7 +1126,7 @@ impl LocalDisk {
                         &skip_parent,
                         &publication_root_owned,
                         None,
-                        sync_commit_metadata,
+                        sync_commit_directories,
                     ) {
                         drop(prepared_metadata_source);
                         cleanup_flat_tmp();
@@ -1178,7 +1179,7 @@ impl LocalDisk {
                     return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
                 }
 
-                if sync_commit_metadata {
+                if sync_commit_directories {
                     if staged_rollback_path.is_none()
                         && rollback_data_dir.is_none()
                         && let Some(ref old_metadata) = has_dst_buf
@@ -1320,7 +1321,7 @@ impl LocalDisk {
             let publication_root_owned = self.publication_root.clone();
             let has_data_dir_path_owned = has_data_dir_path.clone();
             let sync_data_shards = durability.syncs_data_shards();
-            let sync_commit_metadata = durability.syncs_commit_metadata();
+            let sync_commit_directories = durability.syncs_commit_directories();
             let staging_cleanup = multipart_staging.as_ref().map(|s| s.cleanup_handle());
             let dst_volume_str = dst_volume.to_string();
             let dst_path_str = dst_path.to_string();
@@ -1472,7 +1473,7 @@ impl LocalDisk {
                     if crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, &dst_path_str) {
                         return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::Unexpected));
                     }
-                    if sync_commit_metadata {
+                    if sync_commit_directories {
                         if let Some(parent) = dst_file_path_owned.parent()
                             && let Err(err) = os::fsync_commit_directory_limited_std(parent, &directory_guard_owned)
                         {
@@ -1505,7 +1506,7 @@ impl LocalDisk {
                         }
                     }
                     match publication_owned.finish_on_thread(
-                        sync_commit_metadata,
+                        durability.fully_syncs_commit_target(),
                         !cfg!(test),
                         staging_cleanup,
                         Some(&directory_guard_owned),
@@ -2106,7 +2107,7 @@ impl LocalDisk {
 
             let multipart_source = match multipart_publication.as_ref() {
                 Some(publication) => {
-                    let target_already_synced = durability.syncs_commit_metadata();
+                    let target_already_synced = durability.fully_syncs_commit_target();
                     let staging_cleanup = multipart_staging.as_ref().map(|s| s.cleanup_handle());
                     match pin_multipart_future(|| {
                         publication.finish(commit.mutation_lease.clone(), target_already_synced, staging_cleanup)
