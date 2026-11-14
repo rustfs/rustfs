@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ETag, ServerSideEncryption,
+    ChecksumType, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CompletedPart, ETag, ServerSideEncryption,
 };
 use crate::app::storage_api::s3::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
@@ -560,7 +560,7 @@ impl DefaultMultipartUsecase {
             None
         };
         let checksum_type = if disclose_checksums {
-            classified.checksum_type.or(input.checksum_type)
+            classified.checksum_type.map(ChecksumType::from).or(input.checksum_type)
         } else {
             None
         };

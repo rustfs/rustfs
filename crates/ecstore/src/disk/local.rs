@@ -4842,6 +4842,7 @@ pub(crate) struct LazyLocalFileWriter {
     parent_exists: bool,
     bytes_written: usize,
     last_integrity_digest: Option<[u8; 32]>,
+    pending_integrity_idx: Option<(String, Bytes)>,
     state: LazyLocalFileWriterState,
 }
 
@@ -4875,6 +4876,7 @@ impl LazyLocalFileWriter {
             parent_exists,
             bytes_written: 0,
             last_integrity_digest: None,
+            pending_integrity_idx: None,
             state: LazyLocalFileWriterState::Unopened,
         }
     }
@@ -4887,7 +4889,8 @@ impl LazyLocalFileWriter {
     ) {
         let hash_len = hash_algo.as_ref().map_or(0, rustfs_utils::HashAlgorithm::size);
         let wire_len = hash_len.saturating_add(payload.len());
-        let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(wire_len) >= self.reclaim_len;
+        let close_after =
+            integrity_spec.is_none() && self.reclaim_len > 0 && self.bytes_written.saturating_add(wire_len) >= self.reclaim_len;
         let reclaim_len = self.bytes_written.saturating_add(wire_len).max(self.reclaim_len);
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
         let sync_on_close = self.sync_on_close;
@@ -4982,6 +4985,21 @@ impl LazyLocalFileWriter {
         self.start_write_payload(shard, Some(hash_algo), integrity_spec);
         std::future::poll_fn(|cx| self.poll_in_flight_write(cx)).await?;
         Ok((shard_len, self.last_integrity_digest.take()))
+    }
+
+    pub(crate) fn set_pending_integrity_index(&mut self, idx_file_name: &str, idx_payload: Bytes) -> bool {
+        if !matches!(self.state, LazyLocalFileWriterState::Open(_) | LazyLocalFileWriterState::Writing(_)) {
+            return false;
+        }
+        let Some(parent) = self.file_path.parent() else {
+            return false;
+        };
+        let idx_path = parent.join(idx_file_name);
+        if check_path_length(idx_path.to_string_lossy().as_ref()).is_err() {
+            return false;
+        }
+        self.pending_integrity_idx = Some((idx_file_name.to_owned(), idx_payload));
+        true
     }
 
     fn poll_in_flight_write(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<usize>> {
@@ -5088,16 +5106,45 @@ impl AsyncWrite for LazyLocalFileWriter {
                 }
                 LazyLocalFileWriterState::Open(file) => {
                     let file_path = self.file_path.clone();
+                    let volume_dir = self.volume_dir.clone();
+                    let pending_idx = self.pending_integrity_idx.take();
                     let reclaim_len = self.bytes_written.max(self.reclaim_len);
                     let reclaim_on_shutdown = self.reclaim_on_shutdown;
                     let sync_on_close = self.sync_on_close;
                     let mark_dir_presynced = self.mark_dir_presynced;
                     self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        let idx_written = if let Some((idx_file_name, idx_payload)) = pending_idx {
+                            let parent = file_path.parent().ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory")
+                            })?;
+                            let idx_path = parent.join(idx_file_name);
+                            if file_path.starts_with(&volume_dir) {
+                                unmark_presynced_tmp_file(&idx_path);
+                                let _ = unmark_presynced_tmp_data_dir(parent);
+                            }
+                            os::record_native_publication(&idx_path);
+                            let mut open_opts = std::fs::OpenOptions::new();
+                            open_opts.write(true).create(true).truncate(true);
+                            let mut idx_file = open_opts.open(&idx_path).map_err(to_file_error)?;
+                            std::io::Write::write_all(&mut idx_file, &idx_payload).map_err(to_file_error)?;
+                            Some((idx_file, idx_path))
+                        } else {
+                            None
+                        };
                         if sync_on_close {
                             file.sync_data().map_err(to_file_error)?;
+                            if let Some((ref idx_file, _)) = idx_written {
+                                idx_file.sync_data().map_err(to_file_error)?;
+                            }
                         }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
+                        if let Some((idx_file, idx_path)) = idx_written {
+                            drop(idx_file);
+                            if sync_on_close {
+                                mark_presynced_tmp_file(idx_path);
+                            }
+                        }
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
                                 mark_presynced_tmp_data_dir(parent);
@@ -5258,7 +5305,7 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WriteMode {
     Truncate { size_hint: i64 },
-    TruncateSync { size_hint: i64 },
+    TruncateSync { size_hint: i64, sync_parent_dir: bool },
     Append,
 }
 
@@ -5489,7 +5536,7 @@ impl StdBackend {
             options.write(true).create(true);
             let (reclaim_len, reclaim_on_shutdown) = match mode {
                 // Leaving the data directory unmarked keeps commit's full file sync.
-                WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint } => {
+                WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint, .. } => {
                     options.truncate(true);
                     (size_hint.max(0) as usize, should_reclaim_file_cache_after_write(size_hint))
                 }
@@ -6137,8 +6184,11 @@ impl LocalIoBackend for StdBackend {
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
         self.invalidate_cached_fd(volume, path).await;
         match mode {
-            WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint } => {
-                let sync_on_close = matches!(mode, WriteMode::TruncateSync { .. });
+            WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint, .. } => {
+                let (sync_on_close, sync_parent_dir) = match mode {
+                    WriteMode::TruncateSync { sync_parent_dir, .. } => (true, sync_parent_dir),
+                    _ => (false, false),
+                };
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -6152,7 +6202,9 @@ impl LocalIoBackend for StdBackend {
                         let parent_was_presynced = unmark_presynced_tmp_data_dir(parent);
                         parent_exists |= parent_was_presynced;
                         let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                        mark_dir_presynced = sync_on_close
+                        parent_exists |= file_name.contains(".integrity.")
+                            || (file_name.starts_with(".part.") && file_name.contains(".proof."));
+                        mark_dir_presynced = sync_parent_dir
                             && (file_name == "part.1"
                                 || (parent_was_presynced
                                     && (file_name.starts_with("part.1.integrity.")
@@ -15562,6 +15614,7 @@ impl DiskAPI for LocalDisk {
                 let mut created_transaction_parent = false;
                 if let Some((integrity, source, destination, expected_len)) = integrity_prep {
                     let presynced_proof = take_presynced_tmp_file(&source);
+                    // A presync receipt skips the sync after validating the proof bound to this transaction.
                     let verify_and_sync = (|| -> std::io::Result<bool> {
                         #[cfg(unix)]
                         let mut file = if let (Some(src_p_fd), Some(src_name)) = (src_parent_fd.as_deref(), source.file_name()) {
@@ -16608,13 +16661,15 @@ impl DiskAPI for LocalDisk {
         let probe_active = false;
         let sync_on_close = cfg!(target_os = "linux")
             && !origvolume.is_empty()
-            && origvolume != RUSTFS_META_MULTIPART_BUCKET
             && is_tmp_part_or_proof
             && effective_durability(origvolume).syncs_data_shards()
             && !os::file_fdatasync_group_commit_enabled()
             && !probe_active;
         let mode = if sync_on_close {
-            WriteMode::TruncateSync { size_hint: _file_size }
+            WriteMode::TruncateSync {
+                size_hint: _file_size,
+                sync_parent_dir: origvolume != RUSTFS_META_MULTIPART_BUCKET,
+            }
         } else {
             WriteMode::Truncate { size_hint: _file_size }
         };
@@ -21467,6 +21522,63 @@ mod test {
     }
 
     #[tokio::test]
+    async fn shard_integrity_part_transaction_validates_presynced_index() {
+        use crate::io_support::shard_integrity::IntegrityBuilder;
+        use rustfs_filemeta::shard_integrity::IntegrityLayout;
+
+        for damage in ["valid", "length", "header"] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("path")).expect("endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+            ensure_test_volume(&disk, "tmp").await;
+            ensure_test_volume(&disk, "bucket").await;
+            let mut builder = IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+            builder.push([b"data".as_slice(); 4].into_iter()).await.expect("stripe");
+            let prepared = builder.finish(8).await.expect("index");
+            let mut index = prepared.inline_bytes().expect("index bytes").to_vec();
+            match damage {
+                "length" => index.truncate(index.len() - 1),
+                "header" => index[0] ^= 1,
+                _ => {}
+            }
+            let index_name = prepared.part.file_name();
+            let index_path = format!("upload/{index_name}");
+            disk.write_all("tmp", &index_path, Bytes::from(index))
+                .await
+                .expect("staged index");
+            disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"data"))
+                .await
+                .expect("staged payload");
+            let source_index = disk.get_object_path_for_io("tmp", &index_path).expect("index path");
+            // A sync receipt establishes durability, independently of the index's contents.
+            mark_presynced_tmp_file(&source_index);
+            let metadata = Bytes::from(
+                ObjectPartInfo {
+                    number: 1,
+                    size: 8,
+                    integrity: Some(prepared.part),
+                    ..Default::default()
+                }
+                .marshal_msg()
+                .expect("metadata"),
+            );
+            let result = disk
+                .prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", metadata)
+                .await;
+            if damage == "valid" {
+                result.expect("a valid presynced index can be prepared");
+            } else {
+                assert_eq!(result.expect_err(damage), DiskError::FileCorrupt, "{damage}");
+                assert!(source_index.exists(), "a rejected index must stay in staging");
+                assert!(
+                    disk.read_all("bucket", &format!("object/{index_name}")).await.is_err(),
+                    "a corrupt index must never be published"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn shard_integrity_settlement_never_deletes_another_parts_index() {
         use crate::io_support::shard_integrity::IntegrityBuilder;
         use rustfs_filemeta::shard_integrity::IntegrityLayout;
@@ -24818,6 +24930,73 @@ mod test {
                 .expect("committed shard should resolve");
             assert_eq!(fs::read(shard).await.expect("committed shard should be readable"), b"new-data");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_presynced_multipart_and_coalesced_integrity_sync() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+
+        let layout = rustfs_filemeta::shard_integrity::IntegrityLayout::new(4, 2, 1024, false).expect("layout");
+        let mut part_integrity = rustfs_filemeta::shard_integrity::PartIntegrity::new(layout, 1).expect("part integrity");
+        part_integrity.stripes = 1;
+        part_integrity.size = 8;
+
+        let tmp_part = format!("mp-stage-{}", Uuid::new_v4());
+        let shard_rel = format!("{tmp_part}/part.1");
+        let idx_name = part_integrity.file_name();
+        let idx_rel = format!("{tmp_part}/{idx_name}");
+        let idx_bytes = Bytes::from(part_integrity.index_header().to_vec());
+
+        let mut writer = disk
+            .create_file(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, &shard_rel, 40)
+            .await
+            .expect("open multipart shard writer");
+        let local_writer = super::super::as_lazy_local_file_writer_mut(&mut *writer).expect("lazy local writer");
+        let (written, digest) = local_writer
+            .write_bitrot_shard(
+                Bytes::from_static(b"partdata"),
+                rustfs_utils::HashAlgorithm::HighwayHash256S,
+                Some((part_integrity.clone(), 0, 0)),
+            )
+            .await
+            .expect("write bitrot shard");
+        assert_eq!(written, 8);
+        assert!(digest.is_some());
+        assert!(
+            local_writer.set_pending_integrity_index(&idx_name, idx_bytes.clone()),
+            "protected shard writer should stay open for coalesced integrity index write"
+        );
+        writer.shutdown().await.expect("coalesced shutdown");
+
+        let staged_dir = disk
+            .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &tmp_part)
+            .expect("staged dir path");
+        let staged_part = disk
+            .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &shard_rel)
+            .expect("staged part path");
+        let staged_idx = disk
+            .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &idx_rel)
+            .expect("staged idx path");
+        assert!(
+            PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_none(),
+            "multipart staging dir must not be registered as a presynced object data dir"
+        );
+        assert!(take_presynced_tmp_file(&staged_part), "multipart shard must be registered as presynced");
+        assert!(
+            take_presynced_tmp_file(&staged_idx),
+            "coalesced integrity index must be registered as presynced"
+        );
+        assert_eq!(fs::read(&staged_idx).await.expect("read coalesced idx"), idx_bytes.as_ref());
     }
 
     #[tokio::test]

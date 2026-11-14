@@ -255,7 +255,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -266,7 +266,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1898,9 +1898,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.3"
+version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "bytemuck"
@@ -1986,7 +1986,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -2080,9 +2080,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.11.1"
+version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
+checksum = "33ef9e3e8154a45c7a95cff4c1299702106ad94062d7bb85fdc5d3a5afd91d45"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -4083,7 +4083,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4397,7 +4397,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4865,7 +4865,7 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
  "jiff",
- "jsonwebtoken",
+ "jsonwebtoken 11.1.0",
  "reqwest",
  "rustc_version",
  "rustls",
@@ -6027,10 +6027,26 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
  "js-sys",
- "pem 3.0.6",
  "serde",
  "serde_json",
  "signature 2.2.0",
+ "zeroize",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "12.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f347a975eb5fa8f5c4eadce6c1152c11c326cf32cf839fb64ff12d5cb8f4ce8b"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "js-sys",
+ "pem 4.0.0",
+ "serde",
+ "serde_json",
+ "signature 3.0.0",
  "simple_asn1",
  "zeroize",
 ]
@@ -6281,9 +6297,9 @@ dependencies = [
 
 [[package]]
 name = "libunftp"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d94587cfb90dd87b7cced3bff07d32cb56ad1192baa5d688dfaa8728f22d48d"
+checksum = "96b019a8d208e2672b68fddc84cc9f15c64df3b717b58773d3b2c9dd28729b30"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -6700,9 +6716,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.4"
+version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
 dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
@@ -6989,7 +7005,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8797,7 +8813,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9821,7 +9837,7 @@ dependencies = [
  "argon2",
  "base64-simd",
  "chacha20poly1305",
- "jsonwebtoken",
+ "jsonwebtoken 12.0.0",
  "pbkdf2 0.13.0",
  "rand 0.10.3",
  "rsa 0.10.0-rc.18",
@@ -10024,7 +10040,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway"
 version = "0.63.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10071,7 +10087,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-core"
 version = "0.60.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10092,7 +10108,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10110,7 +10126,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10120,7 +10136,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -10135,7 +10151,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10146,7 +10162,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.40.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10169,7 +10185,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=1bbef5758bfe27aed9b14c38c312de6ebe24a122#1bbef5758bfe27aed9b14c38c312de6ebe24a122"
+source = "git+https://github.com/rustfs/gateway.git?rev=1afff6a91882ec47999f529245a717d10bc4c0fb#1afff6a91882ec47999f529245a717d10bc4c0fb"
 dependencies = [
  "quick-xml 0.41.0",
 ]
@@ -10237,7 +10253,7 @@ dependencies = [
  "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
- "jsonwebtoken",
+ "jsonwebtoken 12.0.0",
  "moka",
  "openidconnect",
  "pollster",
@@ -10679,7 +10695,7 @@ dependencies = [
  "hotpath",
  "ipnetwork",
  "jiff",
- "jsonwebtoken",
+ "jsonwebtoken 12.0.0",
  "moka",
  "pollster",
  "proptest",
@@ -11382,7 +11398,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11464,7 +11480,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12275,7 +12291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12426,7 +12442,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12734,10 +12750,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13852,7 +13868,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

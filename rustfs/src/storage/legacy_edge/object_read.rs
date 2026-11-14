@@ -63,6 +63,46 @@ impl FS {
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         crate::hp_guard!("S3::head_object");
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_head_object(req).await
+        record_s3_op(S3Operation::HeadObject);
+        through_gateway_seam_answered(
+            req,
+            |input| Ok(s3_api::HeadObjectFields::from_s3s(input)),
+            s3_api::HeadObjectOutputFacts::into_s3s,
+            |envelope, input| usecase.execute_head_object_fields(envelope, input),
+        )
+        .await
+    }
+}
+
+impl s3_api::HeadObjectFields {
+    pub(crate) fn from_s3s(input: HeadObjectInput) -> Self {
+        use rustfs_gateway_types::ByteRange;
+        Self {
+            bucket: input.bucket,
+            key: input.key,
+            version_id: input.version_id,
+            part_number: input.part_number,
+            range: input.range.map(|range| match range {
+                Range::Int { first, last: Some(last) } => ByteRange::FromTo { first, last },
+                Range::Int { first, last: None } => ByteRange::From { first },
+                Range::Suffix { length } => ByteRange::Suffix { length },
+            }),
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
+impl s3_api::HeadObjectOutputFacts {
+    pub(crate) fn into_s3s(self) -> Result<HeadObjectOutput, rustfs_gateway_types::compat::ConversionError> {
+        let mut output = rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_object::output_to_s3s(self.dto)?;
+        output.e_tag = self.etag.map(|etag| {
+            if etag.weak {
+                ETag::Weak(etag.opaque)
+            } else {
+                ETag::Strong(etag.opaque)
+            }
+        });
+        Ok(output)
     }
 }

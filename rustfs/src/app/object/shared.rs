@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ChecksumType, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+    ChecksumAlgorithm, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
     ObjectLockRetentionMode, Range, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
 };
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
@@ -159,35 +159,32 @@ pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Resu
 ///     whole object, and [`HTTPRangeSpec::get_length`] clamps it to the real
 ///     size once the object is known.
 pub(super) fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
-    match range {
-        Range::Int { first, last } => {
-            let start = i64::try_from(first).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
-            let end = match last {
-                Some(last) => {
-                    i64::try_from(last).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?
-                }
-                None => -1,
-            };
-            Ok(HTTPRangeSpec {
-                is_suffix_length: false,
-                start,
-                end,
-            })
+    use rustfs_gateway_types::ByteRange;
+    let range = match range {
+        Range::Int { first, last: Some(last) } => ByteRange::FromTo { first, last },
+        Range::Int { first, last: None } => ByteRange::From { first },
+        Range::Suffix { length } => ByteRange::Suffix { length },
+    };
+    Ok(byte_range_to_http_range_spec(range)?)
+}
+
+/// The range rules shared by native HEAD requests and the remaining legacy adapters.
+pub(super) fn byte_range_to_http_range_spec(range: rustfs_gateway_types::ByteRange) -> rustfs_s3_types::S3Result<HTTPRangeSpec> {
+    use rustfs_gateway_types::ByteRange;
+    let (start, end, suffix) = match range {
+        ByteRange::FromTo { first, last } => (first, Some(last), false),
+        ByteRange::From { first } => (first, None, false),
+        ByteRange::Suffix { length: 0 } => {
+            return Err(rustfs_s3_types::s3_error!(InvalidRange, "The requested range is not satisfiable"));
         }
-        Range::Suffix { length } => {
-            if length == 0 {
-                return Err(s3_error!(InvalidRange, "The requested range is not satisfiable"));
-            }
-            // Clamp to i64::MAX: any suffix >= object size returns the whole
-            // object, and object sizes never exceed i64::MAX.
-            let start = i64::try_from(length).unwrap_or(i64::MAX);
-            Ok(HTTPRangeSpec {
-                is_suffix_length: true,
-                start,
-                end: -1,
-            })
-        }
-    }
+        ByteRange::Suffix { length } => (length.min(i64::MAX as u64), None, true),
+    };
+    let invalid = || rustfs_s3_types::s3_error!(InvalidRange, "The requested range is not satisfiable");
+    Ok(HTTPRangeSpec {
+        is_suffix_length: suffix,
+        start: i64::try_from(start).map_err(|_| invalid())?,
+        end: end.map(i64::try_from).transpose().map_err(|_| invalid())?.unwrap_or(-1),
+    })
 }
 
 /// True when the request body actually arrived chunk-framed on the wire, i.e. the payload was
@@ -655,7 +652,7 @@ pub(crate) struct ResponseChecksums {
     pub(crate) sha1: Option<String>,
     pub(crate) sha256: Option<String>,
     pub(crate) crc64nvme: Option<String>,
-    pub(crate) checksum_type: Option<ChecksumType>,
+    pub(crate) checksum_type: Option<String>,
     pub(crate) extra: Vec<(&'static str, String)>,
 }
 
@@ -670,7 +667,7 @@ where
     let mut c = ResponseChecksums::default();
     for (key, checksum) in pairs {
         if key == AMZ_CHECKSUM_TYPE {
-            c.checksum_type = Some(ChecksumType::from(checksum));
+            c.checksum_type = Some(checksum);
             continue;
         }
         let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
@@ -688,7 +685,7 @@ where
         }
     }
     if is_multipart && c.checksum_type.is_none() {
-        c.checksum_type = Some(ChecksumType::from("COMPOSITE".to_string()));
+        c.checksum_type = Some("COMPOSITE".to_string());
     }
     c
 }
@@ -804,7 +801,7 @@ pub(super) fn apply_standard_object_metadata(
     Ok(())
 }
 
-pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+pub(super) fn response_storage_class_name(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<String> {
     let stored_class = info
         .storage_class
         .as_deref()
@@ -814,7 +811,11 @@ pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<Strin
     .then_some(info.transitioned_object.tier.as_str());
     let effective_class = storageclass::effective_class(stored_class, transitioned_tier);
 
-    (effective_class != storageclass::STANDARD).then(|| StorageClass::from(effective_class.to_string()))
+    (effective_class != storageclass::STANDARD).then(|| effective_class.to_string())
+}
+
+pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
+    response_storage_class_name(info, metadata).map(StorageClass::from)
 }
 
 pub(super) fn response_storage_class_for_object_attributes(
@@ -1356,7 +1357,7 @@ mod tests {
     }
 
     // classify_response_checksums is the single point that splits decrypted checksum
-    // pairs into the five s3s-typed fields and the additional-algorithm `extra`
+    // pairs into the five named checksum fields and the additional-algorithm `extra`
     // headers, replacing five copies of the loop. Lock its behaviour (#1252).
     #[test]
     fn classify_response_checksums_splits_typed_and_extra() {
@@ -1404,11 +1405,64 @@ mod tests {
         assert!(c.extra.is_empty() && c.crc32.is_none());
 
         let c = classify_response_checksums(vec![("CRC32".to_string(), "AAAAAA==-2".to_string())], true);
-        assert_eq!(c.checksum_type.as_ref().map(ChecksumType::as_str), Some("COMPOSITE"));
+        assert_eq!(c.checksum_type.as_deref(), Some("COMPOSITE"));
 
         // Empty input yields an all-default result.
         let c = classify_response_checksums(Vec::<(String, String)>::new(), false);
         assert!(c.crc32.is_none() && c.extra.is_empty() && c.checksum_type.is_none());
+    }
+
+    #[test]
+    fn checksum_type_metadata_keeps_unknown_and_empty_values() {
+        for (value, multipart) in [("UNKNOWN-TYPE", false), ("", true), (" mIxEd ", true)] {
+            let classified = classify_response_checksums(vec![(AMZ_CHECKSUM_TYPE.to_owned(), value.to_owned())], multipart);
+            assert_eq!(classified.checksum_type.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn native_range_core_preserves_boundaries() {
+        use rustfs_gateway_types::ByteRange;
+        for (range, expected) in [
+            (ByteRange::From { first: 0 }, (false, 0, -1)),
+            (
+                ByteRange::FromTo {
+                    first: 0,
+                    last: i64::MAX as u64,
+                },
+                (false, 0, i64::MAX),
+            ),
+            (ByteRange::Suffix { length: u64::MAX }, (true, i64::MAX, -1)),
+        ] {
+            let actual = byte_range_to_http_range_spec(range).unwrap();
+            assert_eq!((actual.is_suffix_length, actual.start, actual.end), expected);
+        }
+        native_range_core_rejects_invalid_boundaries();
+    }
+
+    #[test]
+    fn native_range_core_rejects_invalid_boundaries() {
+        use rustfs_gateway_types::ByteRange;
+        for range in [
+            ByteRange::Suffix { length: 0 },
+            ByteRange::From {
+                first: i64::MAX as u64 + 1,
+            },
+            ByteRange::From { first: u64::MAX },
+            ByteRange::FromTo {
+                first: 0,
+                last: i64::MAX as u64 + 1,
+            },
+            ByteRange::FromTo {
+                first: 0,
+                last: u64::MAX,
+            },
+        ] {
+            assert_eq!(
+                byte_range_to_http_range_spec(range).unwrap_err().code(),
+                &rustfs_s3_types::S3ErrorCode::InvalidRange
+            );
+        }
     }
 
     // additional_checksum_echo_pairs derives the PutObject/UploadPart response echo for

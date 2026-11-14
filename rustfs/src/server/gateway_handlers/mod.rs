@@ -94,10 +94,6 @@ pub(crate) trait Served: OperationCodec + Sized {
 
 /// The gateway's answer for a use case's [`Answered`]: its status when it set one, and the headers
 /// its legacy body wrote. The gateway refuses a header it owns or its encoder wrote with a `500`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "HeadObject and GetObject of batch C are its first callers")
-)]
 fn resp<O: Served>(answered: Answered<O::Output>) -> Resp<O> {
     let Answered { output, status, headers } = answered;
     match status {
@@ -234,5 +230,162 @@ mod tests {
         assert_eq!((status, extra), (206, headers));
         assert_eq!(default_status, 200);
         assert!(no_extra.is_empty());
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExtraCase {
+        Repeated,
+        OwnedConflict,
+        EncoderConflict,
+    }
+
+    struct WireAnswer(ExtraCase);
+    impl Handler<rustfs_gateway::dto::HeadObject> for WireAnswer {
+        async fn call(&self, _request: Req<rustfs_gateway::dto::HeadObject>) -> HandlerResult<rustfs_gateway::dto::HeadObject> {
+            let mut headers = http::HeaderMap::new();
+            headers.append("vary", http::HeaderValue::from_static("Origin"));
+            headers.append("vary", http::HeaderValue::from_static("Access-Control-Request-Method"));
+            headers.insert(
+                "x-amz-restore-request-date",
+                http::HeaderValue::from_static("Fri, 02 Jan 2026 03:04:05 GMT"),
+            );
+            match self.0 {
+                ExtraCase::Repeated => {}
+                ExtraCase::OwnedConflict => {
+                    headers.insert("connection", http::HeaderValue::from_static("close"));
+                }
+                ExtraCase::EncoderConflict => {
+                    headers.insert("content-type", http::HeaderValue::from_static("text/html"));
+                }
+            }
+            object_read::head_response(Answered {
+                output: crate::app::object_usecase::HeadObjectOutputFacts {
+                    dto: rustfs_gateway::dto::HeadObjectOutput {
+                        content_type: Some("text/plain".to_owned()),
+                        content_length: Some(7),
+                        ..Default::default()
+                    },
+                    etag: Some(crate::app::object_usecase::ResponseEtag {
+                        opaque: "a\\\"b".to_owned(),
+                        weak: true,
+                    }),
+                },
+                status: Some(http::StatusCode::PARTIAL_CONTENT),
+                headers,
+            })
+            .map_err(handler_error)
+        }
+    }
+
+    async fn answered_over_socket(case: ExtraCase) -> http::Response<bytes::Bytes> {
+        use http_body_util::BodyExt as _;
+        use hyper_util::rt::TokioIo;
+        use rustfs_gateway::{Credentials, RegionSet, SigV4Authenticator, StaticCredentials, allow_when};
+        let credentials =
+            Arc::new(StaticCredentials::new().with(Credentials::new("answeredkey", b"answered-fixture-secret").unwrap()));
+        let service = Arc::new(
+            ServiceBuilder::new()
+                .authenticator(SigV4Authenticator::new(credentials, RegionSet::new(["us-east-1"]).unwrap()))
+                .authorizer(allow_when(|_| true))
+                .register::<rustfs_gateway::dto::HeadObject, _>(Arc::new(WireAnswer(case)))
+                .build()
+                .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    TokioIo::new(socket),
+                    hyper::service::service_fn(move |request| {
+                        let service = Arc::clone(&service);
+                        async move { Ok::<_, std::convert::Infallible>(service.call(request).await) }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(socket)).await.unwrap();
+        let client = tokio::spawn(connection);
+        let request = test_support::signed_request(
+            test_support::Signed::Header,
+            http::Method::HEAD,
+            "/bucket/key",
+            "",
+            "answeredkey",
+            "answered-fixture-secret",
+        );
+        let response = sender.send_request(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        drop(sender);
+        server.await.unwrap();
+        client.await.unwrap().unwrap();
+        http::Response::from_parts(parts, body)
+    }
+
+    #[tokio::test]
+    async fn answered_headers_and_conflicts_are_observed_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (case, status) in [
+                (ExtraCase::Repeated, 206),
+                (ExtraCase::OwnedConflict, 500),
+                (ExtraCase::EncoderConflict, 500),
+            ] {
+                assert_answered_case(case, status).await;
+            }
+        })
+        .await
+        .expect("socket exchange completes");
+    }
+    async fn assert_answered_case(case: ExtraCase, status: u16) {
+        let response = answered_over_socket(case).await;
+        assert_eq!(response.status().as_u16(), status);
+        assert!(response.body().is_empty(), "HEAD never delivers an entity body");
+        if status == 206 {
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all("vary")
+                    .iter()
+                    .map(|v| v.as_bytes())
+                    .collect::<Vec<_>>(),
+                [b"Origin".as_slice(), b"Access-Control-Request-Method".as_slice()]
+            );
+            assert_eq!(response.headers()["x-amz-restore-request-date"], "Fri, 02 Jan 2026 03:04:05 GMT");
+            assert_eq!(response.headers()["content-type"], "text/plain");
+            assert_eq!(response.headers()["etag"].as_bytes(), b"W/\"a\\\"b\"");
+        } else {
+            assert!(
+                response.headers().get("x-amz-restore-request-date").is_none(),
+                "extras do not leak onto the refusal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_raw_headers_are_observed_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::Repeated, 206))
+            .await
+            .expect("socket exchange completes");
+    }
+
+    #[tokio::test]
+    async fn answered_transport_header_conflict_is_rejected_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::OwnedConflict, 500))
+            .await
+            .expect("socket exchange completes");
+    }
+
+    #[tokio::test]
+    async fn answered_encoder_header_conflict_is_rejected_on_the_socket() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), assert_answered_case(ExtraCase::EncoderConflict, 500))
+            .await
+            .expect("socket exchange completes");
     }
 }
