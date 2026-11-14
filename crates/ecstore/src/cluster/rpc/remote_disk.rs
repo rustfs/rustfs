@@ -2690,6 +2690,12 @@ impl RemoteDisk {
                     json_encode_started,
                 );
                 let file_info = file_info?;
+                if collect_prepare_timing {
+                    rustfs_io_metrics::record_put_object_stage_bytes(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES,
+                        file_info.len(),
+                    );
+                }
                 let msgpack_encode_started = collect_prepare_timing.then(Instant::now);
                 let file_info_bin = encode_file_info_msgpack(fi);
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -2697,6 +2703,12 @@ impl RemoteDisk {
                     msgpack_encode_started,
                 );
                 let file_info_bin = file_info_bin?;
+                if collect_prepare_timing {
+                    rustfs_io_metrics::record_put_object_stage_bytes(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES,
+                        file_info_bin.len(),
+                    );
+                }
                 let get_client_started = collect_prepare_timing.then(Instant::now);
                 let client = self.get_client().await;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
