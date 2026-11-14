@@ -898,6 +898,29 @@ done
 
 The `aggregated.scanner` payload preserves the same scanner progress, checkpoint, pacing, source work, maintenance control, lifecycle expiry, and lifecycle transition fields used by the local scanner status, but only for the responding node; `by_host.*.scanner` keeps that node's host view. Compare the per-node artifacts externally to find old active paths, partial checkpoints, pacing pressure, source-level control pressure, or downstream queue admission problems across the deployment.
 
+## Reading Scanner Work Observations
+
+`GET /rustfs/admin/v3/scanner/status` exposes `metrics.scan_observation` for the responding node. Capture timestamped snapshots on every node, including the scanner leader, and compare their deltas over the same workload window. These process-lifetime counters reset on restart; a missing field on an older node means unobserved. They are loaded independently and may briefly disagree while operations finish. This telemetry does not change scan cadence, cached usage reads, quota authority, dirty acknowledgement, or maintenance requirements.
+
+| Field | Meaning |
+|---|---|
+| `metadata_reads.attempts` | Disk metadata read futures started after scanner node admission. Invalid paths and operations cancelled before starting the read do not count. |
+| `metadata_reads.succeeded`, `not_found`, `errors`, `cancelled` | Storage outcomes, including object/version disappearance and dropped read futures. Successful storage reads can still contain corrupt metadata; decoding and lifecycle failures do not become read errors. Cancellation observes the future, not proof that physical I/O stopped. |
+| `metadata_reads.bytes` | Total returned buffer lengths for successful reads, including inline data and corrupt metadata. Failed reads contribute no known bytes; this is not physical disk traffic. |
+| `metadata_reads.elapsed_nanos` | Sum of read-future elapsed time, including disk-permit or RPC waits, failures, and cancellation. Folder pacing, scanner node admission, decoding, and lifecycle work are outside this interval. Concurrent reads overlap, so the sum is not cycle wall time. |
+| `cache_reuse.clean_prefix` | Clean root subtrees copied under an admitted prefix scope by the non-erasure scanner. |
+| `cache_reuse.covered_namespace` | Namespace subtrees copied from validated checkpoint coverage. |
+| `cache_reuse.sampled_namespace` | Cached namespace subtrees copied when the existing periodic sampling selected other work. |
+| `cache_reuse.classified_namespace` | EC candidate namespace subtrees copied only after the current listing finished classifying them. Health/classification work still runs. |
+| `cache_reuse.*.count`, `elapsed_nanos` | Completed subtree reuse decisions and time spent copying/attaching their cache entries. Counts are not objects skipped or a cache hit ratio; times exclude classification/listing and are not total cache maintenance cost. |
+| `erasure_clean_prefix_walks` | Clean root children that still require walking because EC scans perform independent object-health work. |
+| `prefix_scope_resolution.evaluated`, `activated`, `blockers` | Proof evaluations retained by the final scope resolver, admitted proof gates, and every failed prerequisite. An admitted proof does not guarantee a reusable child exists; actual subtree copies appear in `cache_reuse`. Startup/required full scans, early scope rejection, and discarded peer/ACK resolutions do not count here. |
+| `prefix_cycle_completion.evaluated`, `activated`, `blockers` | End-of-cycle proof evaluations for subsequent reuse. An activated completion proof does not mean this cycle reused prefixes or that its later publication/persistence succeeded. One evaluation can increment several blocker counters. |
+| `scope_fallbacks` | Per-reason breakdown of the existing `usage_freshness.scope_fallback_total`; required full scans are excluded. |
+| `authoritative_baseline_rejections`, `observed_baseline_rejections` | First failed validation checks for `baseline_unavailable` fallback cycles, preserving the authoritative rejection when the observed fallback also fails. Missing/undecodable authority never reaches observed validation; `authoritative_identity` means it could not anchor an observed fallback. |
+
+The existing `life_time_ops.read_metadata` and `last_minute.actions.read_metadata` now include finished and cancelled read attempts; the latter reports count, accumulated whole seconds, and returned bytes in its existing window. Use `metadata_reads.elapsed_nanos` for subsecond read costs. Use read-count and byte deltas to assess work growth, and elapsed-time deltas to assess read-future cost. Compare those with reused-subtree deltas, scope fallback reasons, cycle wall time, pacing waits, and source work before attributing freshness delays to metadata I/O or proposing a scan optimization.
+
 ## Reading Lifecycle Transition Status
 
 `metrics.lifecycle_transition`:
