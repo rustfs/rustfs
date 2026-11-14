@@ -5537,6 +5537,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "tracing",
  "want",
 ]
 
@@ -10788,6 +10789,7 @@ version = "1.0.5"
 dependencies = [
  "flatbuffers",
  "hotpath",
+ "hyper",
  "prost 0.14.6",
  "rcgen",
  "rmp-serde",
@@ -10806,6 +10808,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

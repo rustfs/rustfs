@@ -312,6 +312,7 @@ pub(super) fn init_observability_http(
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
+        .with(super::http2_ping_timeout_layer())
         .with(pyroscope_log_filter())
         .with(s3s_log_filter())
         .with(ErrorLayer::default())

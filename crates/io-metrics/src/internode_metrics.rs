@@ -433,6 +433,8 @@ const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_inte
 const INTERNODE_RPC_ACTIVE: &str = "rustfs_system_network_internode_rpc_active";
 const INTERNODE_RPC_COMPLETIONS_TOTAL: &str = "rustfs_system_network_internode_rpc_completions_total";
 const INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL: &str = "rustfs_system_network_internode_channel_rebuild_attempts_total";
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+const INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_http2_ping_timeouts_total";
 const INTERNODE_BULK_BODY_WAIT_DURATION_MS: &str = "rustfs_system_network_internode_bulk_body_wait_duration_ms";
 const INTERNODE_BULK_BODY_WAITERS: &str = "rustfs_system_network_internode_bulk_body_waiters";
 const INTERNODE_BULK_BODY_ACTIVE: &str = "rustfs_system_network_internode_bulk_body_active";
@@ -453,6 +455,23 @@ const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
 const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+tokio::task_local! {
+    static INTERNODE_HTTP2_CLIENT_TASK: ();
+}
+
+/// Scope a tonic/Hyper background task as an internode HTTP/2 client task.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub async fn scope_internode_http2_client_task<T>(future: impl std::future::Future<Output = T>) -> T {
+    INTERNODE_HTTP2_CLIENT_TASK.scope((), future).await
+}
+
+/// Whether the current task belongs to an internode tonic/Hyper client.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn is_internode_http2_client_task() -> bool {
+    INTERNODE_HTTP2_CLIENT_TASK.try_with(|()| ()).is_ok()
+}
 const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_replay_scope_fallback_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
@@ -804,6 +823,19 @@ pub fn record_channel_rebuild_attempt(class: &'static str, reason: &'static str,
         "class" => class,
         REASON_LABEL => reason,
         "outcome" => if connected { "connected" } else { "failed_or_cancelled" }
+    )
+    .increment(1);
+}
+
+/// Record one Hyper-confirmed HTTP/2 keepalive PING ACK timeout.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn record_http2_ping_timeout() {
+    if !crate::metrics_enabled() {
+        return;
+    }
+    metrics::counter!(
+        INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL,
+        SERVER_LABEL => current_server_label()
     )
     .increment(1);
 }
@@ -2035,6 +2067,8 @@ mod tests {
             record_channel_rebuild_attempt("bulk", "tls_generation_changed", true);
             record_channel_rebuild_attempt("control", "transport_failure", false);
             record_channel_rebuild_attempt("untrusted-class", "untrusted-reason", false);
+            #[cfg(feature = "diagnostic-internode-http2-ping")]
+            record_http2_ping_timeout();
         });
         crate::set_metrics_enabled(previously_enabled);
         let entries = snapshotter.snapshot().into_vec();
@@ -2046,6 +2080,10 @@ mod tests {
         assert!(entries.iter().any(|(key, _, _, _)| {
             key.key().name() == INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL
                 && key.key().labels().filter(|label| label.value() == "unknown").count() == 2
+        }));
+        #[cfg(feature = "diagnostic-internode-http2-ping")]
+        assert!(entries.iter().any(|(key, _, _, value)| {
+            key.key().name() == INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL && matches!(value, DebugValue::Counter(1))
         }));
     }
 

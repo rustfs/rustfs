@@ -3891,6 +3891,20 @@ fn channel_cache_class(dial_addr: &str, cache_key: &str) -> &'static str {
     }
 }
 
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+#[derive(Clone, Copy, Debug, Default)]
+struct InternodeHttp2TracingExecutor;
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+impl hyper::rt::Executor<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> for InternodeHttp2TracingExecutor {
+    fn execute(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        // Match tonic's default executor: dropping the handle detaches the connection task.
+        drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+            future,
+        )));
+    }
+}
+
 async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
@@ -3945,6 +3959,10 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     }
     if let Some(conn_window) = conn_window {
         connector = connector.initial_connection_window_size(conn_window);
+    }
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    {
+        connector = connector.executor(InternodeHttp2TracingExecutor);
     }
 
     let mut dial_metrics = GrpcDialMetricsGuard {
@@ -4074,6 +4092,262 @@ mod tests {
     static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    mod http2_ping_observability {
+        use super::*;
+        use std::{
+            future::Future,
+            io,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::{Event, Subscriber, field::Visit};
+        use tracing_subscriber::{Layer, Registry, layer::Context as LayerContext, layer::SubscriberExt};
+
+        const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const FRAME_SETTINGS: u8 = 0x4;
+        const FRAME_PING: u8 = 0x6;
+        const FLAG_ACK: u8 = 0x1;
+        const KEEPALIVE_TIMEOUT_MESSAGE: &str = "connection keep-alive timed out";
+
+        #[derive(Clone, Copy)]
+        enum PingBehavior {
+            AckThree,
+            Ignore,
+            CloseBeforePing,
+        }
+
+        struct Frame {
+            kind: u8,
+            flags: u8,
+            payload: Vec<u8>,
+        }
+
+        async fn read_frame(stream: &mut tokio::net::TcpStream) -> io::Result<Option<Frame>> {
+            let mut header = [0_u8; 9];
+            match stream.read_exact(&mut header).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let length = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]]))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP/2 frame length overflow"))?;
+            if length > 64 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpectedly large test HTTP/2 frame"));
+            }
+            let mut payload = vec![0_u8; length];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(Frame {
+                kind: header[3],
+                flags: header[4],
+                payload,
+            }))
+        }
+
+        async fn write_frame(stream: &mut tokio::net::TcpStream, kind: u8, flags: u8, payload: &[u8]) -> io::Result<()> {
+            let length = u32::try_from(payload.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "test HTTP/2 frame is too large"))?;
+            let length_bytes = length.to_be_bytes();
+            let header = [length_bytes[1], length_bytes[2], length_bytes[3], kind, flags, 0, 0, 0, 0];
+            stream.write_all(&header).await?;
+            stream.write_all(payload).await?;
+            stream.flush().await
+        }
+
+        async fn serve_peer(
+            listener: tokio::net::TcpListener,
+            behavior: PingBehavior,
+            first_ping: tokio::sync::oneshot::Sender<()>,
+        ) -> io::Result<()> {
+            let (mut stream, _) = listener.accept().await?;
+            let mut preface = [0_u8; CLIENT_PREFACE.len()];
+            stream.read_exact(&mut preface).await?;
+            if &preface != CLIENT_PREFACE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 client preface"));
+            }
+
+            let settings = read_frame(&mut stream)
+                .await?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing client SETTINGS"))?;
+            if settings.kind != FRAME_SETTINGS || settings.flags & FLAG_ACK != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "first HTTP/2 frame was not SETTINGS"));
+            }
+            write_frame(&mut stream, FRAME_SETTINGS, 0, &[]).await?;
+            write_frame(&mut stream, FRAME_SETTINGS, FLAG_ACK, &[]).await?;
+
+            if matches!(behavior, PingBehavior::CloseBeforePing) {
+                return stream.shutdown().await;
+            }
+
+            let mut first_ping = Some(first_ping);
+            let mut acknowledged = 0_usize;
+            while let Some(frame) = read_frame(&mut stream).await? {
+                if frame.kind != FRAME_PING || frame.flags & FLAG_ACK != 0 {
+                    continue;
+                }
+                if frame.payload.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 PING payload"));
+                }
+                if let Some(sender) = first_ping.take() {
+                    let _ = sender.send(());
+                }
+                match behavior {
+                    PingBehavior::AckThree => {
+                        write_frame(&mut stream, FRAME_PING, FLAG_ACK, &frame.payload).await?;
+                        acknowledged += 1;
+                        if acknowledged == 3 {
+                            return stream.shutdown().await;
+                        }
+                    }
+                    PingBehavior::Ignore => {}
+                    PingBehavior::CloseBeforePing => unreachable!("close behavior returns before the frame loop"),
+                }
+            }
+            Ok(())
+        }
+
+        #[derive(Default)]
+        struct TimeoutVisitor {
+            matched: bool,
+        }
+
+        impl Visit for TimeoutVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && format!("{value:?}") == KEEPALIVE_TIMEOUT_MESSAGE {
+                    self.matched = true;
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct TimeoutLayer(Arc<AtomicUsize>);
+
+        impl<S: Subscriber> Layer<S> for TimeoutLayer {
+            fn on_event(&self, event: &Event<'_>, _context: LayerContext<'_, S>) {
+                if event.metadata().target() != "hyper::proto::h2::client"
+                    || !rustfs_io_metrics::internode_metrics::is_internode_http2_client_task()
+                {
+                    return;
+                }
+                let mut visitor = TimeoutVisitor::default();
+                event.record(&mut visitor);
+                if visitor.matched {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        struct WithDispatch {
+            future: Pin<Box<dyn Future<Output = ()> + Send>>,
+            dispatch: tracing::Dispatch,
+        }
+
+        impl Future for WithDispatch {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                let dispatch = self.dispatch.clone();
+                tracing::dispatcher::with_default(&dispatch, || self.future.as_mut().poll(context))
+            }
+        }
+
+        #[derive(Clone)]
+        struct DispatchExecutor(tracing::Dispatch);
+
+        impl hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for DispatchExecutor {
+            fn execute(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+                let wrapped = WithDispatch {
+                    future,
+                    dispatch: self.0.clone(),
+                };
+                drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+                    wrapped,
+                )));
+            }
+        }
+
+        async fn connect_to_peer(
+            behavior: PingBehavior,
+            dispatch: tracing::Dispatch,
+        ) -> (
+            tonic::transport::Channel,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::task::JoinHandle<io::Result<()>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake HTTP/2 peer");
+            let addr = format!("http://{}", listener.local_addr().expect("fake peer address"));
+            let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(serve_peer(listener, behavior, ping_tx));
+            let channel = tonic::transport::Endpoint::from_shared(addr)
+                .expect("fake peer endpoint")
+                .http2_keep_alive_interval(Duration::from_millis(20))
+                .keep_alive_timeout(Duration::from_millis(40))
+                .keep_alive_while_idle(true)
+                .executor(DispatchExecutor(dispatch))
+                .connect()
+                .await
+                .expect("connect fake HTTP/2 peer");
+            (channel, ping_rx, peer)
+        }
+
+        #[tokio::test]
+        async fn hyper_timeout_event_distinguishes_ack_timeout_from_ack_and_close() {
+            let timeouts = Arc::new(AtomicUsize::new(0));
+            let subscriber = Registry::default().with(TimeoutLayer(Arc::clone(&timeouts)));
+            let dispatch = tracing::Dispatch::new(subscriber);
+
+            let (closed_channel, _, closed_peer) = connect_to_peer(PingBehavior::CloseBeforePing, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), closed_peer)
+                .await
+                .expect("close-before-PING peer completes")
+                .expect("close-before-PING peer task")
+                .expect("close-before-PING peer protocol");
+            drop(closed_channel);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "generic connection close is not a PING timeout");
+
+            let (ack_channel, first_ack_ping, ack_peer) = connect_to_peer(PingBehavior::AckThree, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), first_ack_ping)
+                .await
+                .expect("ACK peer observes PING")
+                .expect("ACK peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), ack_peer)
+                .await
+                .expect("ACK peer completes")
+                .expect("ACK peer task")
+                .expect("ACK peer protocol");
+            drop(ack_channel);
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "acknowledged PING is not a timeout");
+
+            let (ignored_channel, ignored_ping, ignored_peer) = connect_to_peer(PingBehavior::Ignore, dispatch).await;
+            tokio::time::timeout(Duration::from_secs(2), ignored_ping)
+                .await
+                .expect("ignoring peer observes PING")
+                .expect("ignoring peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while timeouts.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Hyper emits exact keepalive timeout event");
+            assert_eq!(timeouts.load(Ordering::Relaxed), 1, "one physical timeout emits one exact event");
+            drop(ignored_channel);
+            tokio::time::timeout(Duration::from_secs(2), ignored_peer)
+                .await
+                .expect("ignoring peer observes connection close")
+                .expect("ignoring peer task")
+                .expect("ignoring peer protocol");
+        }
+    }
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct BackgroundHealStatusRequestV1 {}
