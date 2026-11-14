@@ -20,21 +20,30 @@ mod generated;
 pub mod heal_control;
 mod runtime_sources;
 
+use hyper_util::client::legacy::connect::HttpConnector;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
+use rustfs_common::{
+    GrpcConnectionSnapshot, GrpcConnectionState, cache_connection_with_state, cached_connection_with_state,
+    remove_connection_with_log_level,
+};
 #[cfg(test)]
-use rustfs_common::evict_connection_with_log_level;
-use rustfs_common::{cache_connection, cached_connection, remove_connection_with_log_level};
+use rustfs_common::{cache_connection, evict_connection_with_log_level};
 use std::{
     borrow::Cow,
     collections::HashMap,
     error::Error,
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     sync::{Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock, Weak},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
 use tonic::{
     Request, Status,
+    body::Body,
+    codegen::{Service, http::Request as HttpRequest, http::Uri},
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
@@ -3441,6 +3450,104 @@ pub enum ChannelClass {
     Bulk,
 }
 
+/// A cached tonic channel paired with the physical transport generation used by its clones.
+#[derive(Clone)]
+pub struct InternodeChannel {
+    channel: Channel,
+    connection_state: Option<GrpcConnectionState>,
+}
+
+impl InternodeChannel {
+    fn tracked(channel: Channel, connection_state: GrpcConnectionState) -> Self {
+        Self {
+            channel,
+            connection_state: Some(connection_state),
+        }
+    }
+
+    fn untracked(channel: Channel) -> Self {
+        Self {
+            channel,
+            connection_state: None,
+        }
+    }
+
+    /// Return the shared state used to observe this channel's physical reconnects.
+    pub fn connection_state(&self) -> Option<GrpcConnectionState> {
+        self.connection_state.clone()
+    }
+
+    /// Snapshot the currently connected physical transport, if the channel is tracked and ready.
+    pub fn connection_snapshot(&self) -> Option<GrpcConnectionSnapshot> {
+        self.connection_state.as_ref().and_then(GrpcConnectionState::snapshot)
+    }
+
+    /// Return the underlying tonic channel without exposing its observation handle to the caller.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+}
+
+impl std::fmt::Debug for InternodeChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InternodeChannel")
+            .field("connection", &self.connection_snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Service<HttpRequest<Body>> for InternodeChannel {
+    type Response = <Channel as Service<HttpRequest<Body>>>::Response;
+    type Error = <Channel as Service<HttpRequest<Body>>>::Error;
+    type Future = <Channel as Service<HttpRequest<Body>>>::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.channel.poll_ready(context)
+    }
+
+    fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+        self.channel.call(request)
+    }
+}
+
+struct ConnectionGenerationConnector<C> {
+    inner: C,
+    connection_state: GrpcConnectionState,
+}
+
+impl<C> ConnectionGenerationConnector<C> {
+    fn new(inner: C, connection_state: GrpcConnectionState) -> Self {
+        Self { inner, connection_state }
+    }
+}
+
+impl<C> Service<Uri> for ConnectionGenerationConnector<C>
+where
+    C: Service<Uri>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let future = self.inner.call(uri);
+        let connection_state = self.connection_state.clone();
+        Box::pin(async move {
+            let io = future.await?;
+            connection_state.record_connected();
+            Ok(io)
+        })
+    }
+}
+
 /// Bounded reasons that make RustFS discard a cached channel and establish another one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelRebuildReason {
@@ -3601,9 +3708,14 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
     format!("{addr}\u{0}bulk\u{0}{idx}")
 }
 
-async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<Channel> {
+async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<InternodeChannel> {
     if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        return cached_connection(cache_key).await;
+        return cached_connection_with_state(cache_key)
+            .await
+            .map(|(channel, state)| match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
     }
     // Cache readers share the generation lock. Both publication and eviction take it before
     // the common connection cache, preserving the lock order and the generation/channel pair.
@@ -3611,19 +3723,25 @@ async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> 
         let generations = TLS_GENERATION_CACHE.read().await;
         let generation = runtime_sources::outbound_tls_generation();
         if generations.get(cache_key).copied() == Some(generation)
-            && let Some(channel) = cached_connection(cache_key).await
+            && let Some((channel, state)) = cached_connection_with_state(cache_key).await
             && runtime_sources::outbound_tls_generation() == generation
         {
-            return Some(channel);
+            return Some(match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
         }
     }
     let mut generations = TLS_GENERATION_CACHE.write().await;
-    let Some(channel) = cached_connection(cache_key).await else {
+    let Some((channel, state)) = cached_connection_with_state(cache_key).await else {
         generations.remove(cache_key);
         return None;
     };
     if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
-        return Some(channel);
+        return Some(match state {
+            Some(state) => InternodeChannel::tracked(channel, state),
+            None => InternodeChannel::untracked(channel),
+        });
     }
     if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
         mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
@@ -3633,9 +3751,12 @@ async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> 
     None
 }
 
-async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channel, generation: Option<u64>) -> bool {
+async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &InternodeChannel, generation: Option<u64>) -> bool {
+    let Some(connection_state) = channel.connection_state() else {
+        return false;
+    };
     if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        cache_connection(cache_key.to_string(), channel.clone()).await;
+        cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
         return true;
     }
     let mut generations = TLS_GENERATION_CACHE.write().await;
@@ -3643,7 +3764,7 @@ async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channe
         runtime_sources::record_stale_grpc_channel_tls_generation();
         return false;
     }
-    cache_connection(cache_key.to_string(), channel.clone()).await;
+    cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
     // Publication can advance while the common cache's async lock is awaited.
     if generation != Some(runtime_sources::outbound_tls_generation()) {
         if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
@@ -3699,6 +3820,18 @@ fn checked_rpc_capacity(value: usize) -> std::io::Result<usize> {
 /// per-peer bulk pool and dialed on demand, physically isolating large transfers from
 /// control-plane RPCs.
 pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
+    get_internode_channel_for_class(addr, class)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Acquire a cached-or-new channel together with its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns an error when the peer URI or transport configuration is invalid, the connection
+/// deadline expires, TLS setup fails, or the initial physical connection cannot be established.
+pub async fn get_internode_channel_for_class(addr: &str, class: ChannelClass) -> Result<InternodeChannel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     tokio::time::timeout_at(deadline, async {
         if class == ChannelClass::Control || !channel_isolation_enabled() {
@@ -3751,7 +3884,7 @@ pub async fn prewarm_channel_class(addr: &str, class: ChannelClass) -> Result<()
 /// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (30s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     // The control channel is cached under the bare address, preserving the legacy key.
-    build_channel(addr, addr).await
+    build_channel(addr, addr).await.map(InternodeChannel::into_channel)
 }
 
 /// Dial a new gRPC channel to `dial_addr` and cache it under `cache_key`.
@@ -3760,7 +3893,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// `cache_key` is the connection-cache key. They are identical for control channels and differ
 /// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
 /// channels to the same peer be cached independently.
-async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
+async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<InternodeChannel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
 }
@@ -3789,6 +3922,21 @@ impl Error for DeleteRecoveryChannelError {
 }
 
 pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
+    create_internode_channel_with_timeout(addr, rpc_timeout)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Create a recovery channel while retaining its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns [`DeleteRecoveryChannelError`] when the peer cannot be connected before the shared
+/// internode acquisition deadline or its transport/TLS configuration is invalid.
+pub async fn create_internode_channel_with_timeout(
+    addr: &str,
+    rpc_timeout: Duration,
+) -> Result<InternodeChannel, DeleteRecoveryChannelError> {
     let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     build_channel_until(addr, &cache_key, deadline, rpc_timeout)
@@ -3801,7 +3949,7 @@ async fn build_channel_until(
     cache_key: &str,
     deadline: tokio::time::Instant,
     rpc_timeout: Duration,
-) -> Result<Channel, Box<dyn Error>> {
+) -> Result<InternodeChannel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
             let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
@@ -3905,7 +4053,11 @@ impl hyper::rt::Executor<std::pin::Pin<Box<dyn std::future::Future<Output = ()> 
     }
 }
 
-async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
+async fn dial_channel(
+    dial_addr: &str,
+    cache_key: &str,
+    rpc_timeout: Duration,
+) -> Result<(InternodeChannel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
@@ -3929,14 +4081,8 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     };
     let stream_window = checked_rpc_window(stream_window)?;
     let conn_window = checked_rpc_window(conn_window)?;
-    let mut connector = Endpoint::from_shared(dial_addr.to_string())?
-        // Fast connection timeout for dead peer detection
-        .connect_timeout(connect_timeout)
+    let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
         .concurrency_limit(concurrency_limit)
-        // TCP-level keepalive - OS will probe connection
-        .tcp_keepalive(Some(tcp_keepalive))
-        // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
-        .tcp_nodelay(internode_rpc_tcp_nodelay())
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -3949,20 +4095,20 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     // Apply the selected receive-credit policy. A zero setting delegates to the linked
     // library's defaults; isolated bulk channels can override the common RPC settings.
     if is_bulk {
-        connector = connector.buffer_size(checked_rpc_capacity(rustfs_utils::get_env_usize(
+        endpoint = endpoint.buffer_size(checked_rpc_capacity(rustfs_utils::get_env_usize(
             rustfs_config::ENV_INTERNODE_BULK_BUFFER_SIZE,
             rustfs_config::DEFAULT_INTERNODE_BULK_BUFFER_SIZE,
         ))?);
     }
     if let Some(stream_window) = stream_window {
-        connector = connector.initial_stream_window_size(stream_window);
+        endpoint = endpoint.initial_stream_window_size(stream_window);
     }
     if let Some(conn_window) = conn_window {
-        connector = connector.initial_connection_window_size(conn_window);
+        endpoint = endpoint.initial_connection_window_size(conn_window);
     }
     #[cfg(feature = "diagnostic-internode-http2-ping")]
     {
-        connector = connector.executor(InternodeHttp2TracingExecutor);
+        endpoint = endpoint.executor(InternodeHttp2TracingExecutor);
     }
 
     let mut dial_metrics = GrpcDialMetricsGuard {
@@ -3983,10 +4129,20 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         }
         // Tonic derives certificate names and SNI from the URI, including IPv6. Native-root
         // loading and certificate parsing run off the async workers under the same deadline.
-        connector = tokio::task::spawn_blocking(move || connector.tls_config(tls)).await??;
+        endpoint = tokio::task::spawn_blocking(move || endpoint.tls_config(tls)).await??;
     }
 
-    let channel = match connector.connect().await {
+    // Tonic invokes this connector for both the initial dial and every transparent reconnect.
+    // Mirror Endpoint's default HttpConnector options so generation observation does not change
+    // TCP behavior or the per-address connect deadline.
+    let connection_state = GrpcConnectionState::new();
+    let mut tcp_connector = HttpConnector::new();
+    tcp_connector.enforce_http(false);
+    tcp_connector.set_connect_timeout(Some(connect_timeout));
+    tcp_connector.set_keepalive(Some(tcp_keepalive));
+    tcp_connector.set_nodelay(internode_rpc_tcp_nodelay());
+    let generation_connector = ConnectionGenerationConnector::new(tcp_connector, connection_state.clone());
+    let channel = match endpoint.connect_with_connector(generation_connector).await {
         Ok(channel) => {
             dial_metrics.connected = true;
             // A successful dial marks the peer online (grpc-optimization P3). Keyed by the real
@@ -4000,7 +4156,7 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         }
     };
 
-    Ok((channel, generation))
+    Ok((InternodeChannel::tracked(channel, connection_state), generation))
 }
 
 /// Evict a connection from the cache after a failure.
@@ -4092,6 +4248,12 @@ mod tests {
     static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tracked_test_channel(channel: Channel) -> InternodeChannel {
+        let connection_state = GrpcConnectionState::new();
+        connection_state.record_connected();
+        InternodeChannel::tracked(channel, connection_state)
+    }
 
     #[cfg(feature = "diagnostic-internode-http2-ping")]
     mod http2_ping_observability {
@@ -4631,7 +4793,7 @@ mod tests {
         publish_global_outbound_tls_state(TlsGeneration(first_generation + 1), &second).await;
         let current = runtime_sources::outbound_tls_state().await;
         let addr = "https://tls02-late-dial.invalid:9000";
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
         let cached = cache_dialed_channel(addr, addr, &channel, Some(captured.generation.0)).await;
         let original_key = captured.mtls_identity.as_ref().expect("captured identity").key_pem.clone();
         let current_key = current.mtls_identity.as_ref().expect("current identity").key_pem.clone();
@@ -5105,6 +5267,7 @@ mod tests {
 
     #[tokio::test]
     async fn evict_failed_connection_with_log_level_removes_cached_connection() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "http://evict-failed-connection-debug-test";
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         cache_connection(addr.to_string(), channel).await;
@@ -5157,7 +5320,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_generation_advances_on_tonic_transparent_reconnect() {
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+
+        async fn serve_until_shutdown(
+            listener: std::net::TcpListener,
+            shutdown: tokio::sync::oneshot::Receiver<()>,
+        ) -> Result<(), tonic::transport::Error> {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener from nonblocking socket");
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown.await;
+                })
+                .await
+        }
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind reconnect peer");
+        listener.set_nonblocking(true).expect("nonblocking reconnect peer");
+        let first_listener = listener.try_clone().expect("clone first reconnect listener");
+        let second_listener = listener.try_clone().expect("clone second reconnect listener");
+        let addr = format!("http://{}", listener.local_addr().expect("reconnect peer address"));
+        drop(listener);
+
+        let (first_shutdown, first_stopped) = tokio::sync::oneshot::channel();
+        let first_server = tokio::spawn(serve_until_shutdown(first_listener, first_stopped));
+        let channel = build_channel(&addr, &addr).await.expect("initial tracked channel");
+        let first = channel.connection_snapshot().expect("initial physical generation");
+        let mut client = NodeServiceClient::new(channel.clone());
+        let first_status = client
+            .ping(proto_gen::node_service::PingRequest::default())
+            .await
+            .expect_err("empty router response");
+        assert_eq!(first_status.code(), tonic::Code::Unimplemented);
+
+        first_shutdown.send(()).expect("stop first reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), first_server)
+            .await
+            .expect("first reconnect server stops")
+            .expect("first reconnect server task")
+            .expect("first reconnect server result");
+
+        let (second_shutdown, second_stopped) = tokio::sync::oneshot::channel();
+        let second_server = tokio::spawn(serve_until_shutdown(second_listener, second_stopped));
+        let second_status =
+            tokio::time::timeout(Duration::from_secs(3), client.ping(proto_gen::node_service::PingRequest::default()))
+                .await
+                .expect("transparent reconnect completes")
+                .expect_err("empty replacement router response");
+        assert_eq!(second_status.code(), tonic::Code::Unimplemented);
+        let second = channel.connection_snapshot().expect("replacement physical generation");
+        assert_eq!(first.channel_id, second.channel_id);
+        assert_ne!(first.generation, second.generation);
+
+        second_shutdown.send(()).expect("stop replacement reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), second_server)
+            .await
+            .expect("replacement reconnect server stops")
+            .expect("replacement reconnect server task")
+            .expect("replacement reconnect server result");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
     async fn overlapping_publication_consumes_pending_rebuild_reason_on_cache_hit() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "http://overlapping-rebuild-publication.invalid:9000";
         cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
         mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
@@ -5314,7 +5542,7 @@ mod tests {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "https://tls02-shared-cache.invalid:9000";
         let generation = runtime_sources::outbound_tls_generation();
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
         assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
         let generations = TLS_GENERATION_CACHE.read().await;
         let cached = tokio::time::timeout(Duration::from_secs(1), cached_channel_for_tls_generation(addr, addr))
@@ -5333,7 +5561,7 @@ mod tests {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "https://tls02-replacement-race.invalid:9000";
         let generation = runtime_sources::outbound_tls_generation();
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
         assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
 
         // Pause eviction on generation metadata. It must retain the cached channel until it

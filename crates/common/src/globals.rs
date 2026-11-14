@@ -23,7 +23,80 @@ pub static GLOBAL_LOCAL_NODE_NAME: LazyLock<RwLock<String>> = LazyLock::new(|| R
 pub static GLOBAL_RUSTFS_HOST: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
 pub static GLOBAL_RUSTFS_PORT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
 pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
+static NEXT_GRPC_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_GRPC_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct GrpcConnectionStateInner {
+    channel_id: u64,
+    generation: AtomicU64,
+}
+
+/// Lock-free identity and physical-connection generation shared by every clone of one gRPC channel.
+#[derive(Clone, Debug)]
+pub struct GrpcConnectionState(Arc<GrpcConnectionStateInner>);
+
+/// A point-in-time identity for the physical connection currently used by a gRPC channel.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GrpcConnectionSnapshot {
+    pub channel_id: u64,
+    pub generation: u64,
+}
+
+impl GrpcConnectionState {
+    pub fn new() -> Self {
+        Self(Arc::new(GrpcConnectionStateInner {
+            channel_id: next_nonzero_id(&NEXT_GRPC_CHANNEL_ID),
+            generation: AtomicU64::new(0),
+        }))
+    }
+
+    /// Publish a successfully opened physical transport before tonic makes it request-ready.
+    pub fn record_connected(&self) -> GrpcConnectionSnapshot {
+        let generation = next_nonzero_id(&NEXT_GRPC_CONNECTION_GENERATION);
+        self.0.generation.store(generation, Ordering::Release);
+        GrpcConnectionSnapshot {
+            channel_id: self.0.channel_id,
+            generation,
+        }
+    }
+
+    /// Return `None` until the first physical transport has connected successfully.
+    pub fn snapshot(&self) -> Option<GrpcConnectionSnapshot> {
+        let generation = self.0.generation.load(Ordering::Acquire);
+        (generation != 0).then_some(GrpcConnectionSnapshot {
+            channel_id: self.0.channel_id,
+            generation,
+        })
+    }
+}
+
+impl Default for GrpcConnectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn next_nonzero_id(counter: &AtomicU64) -> u64 {
+    loop {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Clone)]
+struct TrackedGrpcConnection {
+    channel: Channel,
+    connection_state: GrpcConnectionState,
+}
+
+static GLOBAL_TRACKED_CONN_MAP: LazyLock<RwLock<HashMap<String, TrackedGrpcConnection>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_CONN_CACHE_WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
@@ -237,6 +310,10 @@ pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEv
 /// Remove a cached connection and report whether it existed. Transport owners use this to
 /// attach a rebuild reason only to real cache transitions.
 pub async fn remove_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) -> bool {
+    // Writes are rare and serialized so the optimized tracked cache and public compatibility map
+    // cannot publish different channel clones for one key.
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.remove(addr);
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
         match log_level {
@@ -268,8 +345,37 @@ pub async fn cached_connection(addr: &str) -> Option<Channel> {
     GLOBAL_CONN_MAP.read().await.get(addr).cloned()
 }
 
+/// Get a cached channel together with its shared physical-connection state, when tracked.
+pub async fn cached_connection_with_state(addr: &str) -> Option<(Channel, Option<GrpcConnectionState>)> {
+    if let Some(cached) = GLOBAL_TRACKED_CONN_MAP.read().await.get(addr).cloned() {
+        return Some((cached.channel, Some(cached.connection_state)));
+    }
+    // A miss may race a low-frequency publish/evict. Serialize only this fallback, recheck the
+    // tracked map, then consult legacy entries injected through the compatibility API.
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    if let Some(cached) = GLOBAL_TRACKED_CONN_MAP.read().await.get(addr).cloned() {
+        return Some((cached.channel, Some(cached.connection_state)));
+    }
+    cached_connection(addr).await.map(|channel| (channel, None))
+}
+
 /// Cache a gRPC connection for the given address.
 pub async fn cache_connection(addr: String, channel: Channel) {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.remove(&addr);
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+}
+
+/// Cache a gRPC channel and its physical-connection state as one coherent entry.
+pub async fn cache_connection_with_state(addr: String, channel: Channel, connection_state: GrpcConnectionState) {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.insert(
+        addr.clone(),
+        TrackedGrpcConnection {
+            channel: channel.clone(),
+            connection_state,
+        },
+    );
     GLOBAL_CONN_MAP.write().await.insert(addr, channel);
 }
 
@@ -286,6 +392,8 @@ pub async fn has_cached_connection(addr: &str) -> bool {
 
 /// Clear all cached connections. Useful for full cluster reset/recovery.
 pub async fn clear_all_connections() {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.clear();
     let mut map = GLOBAL_CONN_MAP.write().await;
     let count = map.len();
     map.clear();
@@ -382,5 +490,34 @@ mod tls_snapshot_tests {
         assert!(remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
         assert!(!remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
         let _: () = evict_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn cached_connection_keeps_channel_and_transport_state_coherent() {
+        let key = "http://tracked-connection-test.invalid";
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let state = GrpcConnectionState::new();
+        assert!(state.snapshot().is_none());
+        let first = state.record_connected();
+        cache_connection_with_state(key.to_owned(), channel, state.clone()).await;
+
+        let (_, cached_state) = cached_connection_with_state(key).await.expect("tracked cache entry");
+        let cached_state = cached_state.expect("tracked cache state");
+        assert_eq!(cached_state.snapshot(), Some(first));
+        let second = state.record_connected();
+        assert_eq!(cached_state.snapshot(), Some(second));
+        assert_eq!(first.channel_id, second.channel_id);
+        assert_ne!(first.generation, second.generation);
+
+        cache_connection(
+            key.to_owned(),
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:2").connect_lazy(),
+        )
+        .await;
+        let (_, replacement_state) = cached_connection_with_state(key).await.expect("legacy replacement entry");
+        assert!(replacement_state.is_none(), "legacy replacement must remove stale tracked state");
+
+        assert!(remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        assert!(cached_connection_with_state(key).await.is_none());
     }
 }
