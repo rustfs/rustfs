@@ -778,7 +778,7 @@ pub async fn measure_client_rpc<T, E>(
     result
 }
 
-/// Record one cache-miss reconnect attempt caused by a prior bounded channel eviction.
+/// Record one attempt to publish a replacement after a bounded cached-channel eviction.
 pub fn record_channel_rebuild_attempt(class: &'static str, reason: &'static str, connected: bool) {
     if !crate::metrics_enabled() {
         return;

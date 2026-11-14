@@ -3494,6 +3494,14 @@ fn pending_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
         .copied()
 }
 
+fn take_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(cache_key)
+}
+
+#[cfg(test)]
 fn clear_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
     let mut reasons = CHANNEL_REBUILD_REASONS
         .lock()
@@ -3503,10 +3511,12 @@ fn clear_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
     }
 }
 
-fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) {
-    if let Some(reason) = pending_channel_rebuild(cache_key) {
+fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bool {
+    if let Some(reason) = take_channel_rebuild(cache_key) {
         runtime_sources::record_channel_rebuild_attempt(channel_cache_class(dial_addr, cache_key), reason.as_str(), true);
-        clear_channel_rebuild(cache_key, reason);
+        true
+    } else {
+        false
     }
 }
 
@@ -3794,7 +3804,7 @@ async fn build_channel_until(
 ) -> Result<Channel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
-            complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+            let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
             return Ok(channel);
         }
         let slot = DialLock::for_key(cache_key);
@@ -3802,21 +3812,21 @@ async fn build_channel_until(
         loop {
             // A successful concurrent miss has already populated this exact key.
             if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
-                complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+                let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
                 return Ok(channel);
             }
+            let mut rebuild_metrics =
+                ChannelRebuildMetricsGuard::new(channel_cache_class(dial_addr, cache_key), pending_channel_rebuild(cache_key));
             let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
-            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
-                && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
-            {
-                if let Some(reason) = pending_channel_rebuild(cache_key) {
-                    clear_channel_rebuild(cache_key, reason);
+            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await {
+                rebuild_metrics.published(dial_addr, cache_key);
+                if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                    debug!(
+                        "Successfully created and cached gRPC channel to: {} (cache key: {})",
+                        dial_addr, cache_key
+                    );
+                    return Ok(channel);
                 }
-                debug!(
-                    "Successfully created and cached gRPC channel to: {} (cache key: {})",
-                    dial_addr, cache_key
-                );
-                return Ok(channel);
             }
             // A generation published during dial cannot be returned; rebuilding
             // shares the original deadline with lock wait and all earlier dials.
@@ -3829,15 +3839,41 @@ async fn build_channel_until(
 struct GrpcDialMetricsGuard {
     started_at: Instant,
     connected: bool,
-    rebuild_reason: Option<ChannelRebuildReason>,
-    channel_class: &'static str,
 }
 
 impl Drop for GrpcDialMetricsGuard {
     fn drop(&mut self) {
         runtime_sources::record_grpc_dial_result(self.started_at.elapsed(), self.connected);
-        if let Some(reason) = self.rebuild_reason {
-            runtime_sources::record_channel_rebuild_attempt(self.channel_class, reason.as_str(), self.connected);
+    }
+}
+
+struct ChannelRebuildMetricsGuard {
+    channel_class: &'static str,
+    reason: Option<ChannelRebuildReason>,
+    finished: bool,
+}
+
+impl ChannelRebuildMetricsGuard {
+    fn new(channel_class: &'static str, reason: Option<ChannelRebuildReason>) -> Self {
+        Self {
+            channel_class,
+            reason,
+            finished: false,
+        }
+    }
+
+    fn published(&mut self, dial_addr: &str, cache_key: &str) {
+        let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+        self.finished = true;
+    }
+}
+
+impl Drop for ChannelRebuildMetricsGuard {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Some(reason) = self.reason
+        {
+            runtime_sources::record_channel_rebuild_attempt(self.channel_class, reason.as_str(), false);
         }
     }
 }
@@ -3914,8 +3950,6 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
     let mut dial_metrics = GrpcDialMetricsGuard {
         started_at: dial_started_at,
         connected: false,
-        rebuild_reason: pending_channel_rebuild(cache_key),
-        channel_class: channel_cache_class(dial_addr, cache_key),
     };
     let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
@@ -4856,6 +4890,24 @@ mod tests {
         build_channel(addr, addr).await.expect("cache hit completes pending rebuild");
         assert_eq!(pending_channel_rebuild(addr), None);
         evict_cached_channel(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_hits_consume_one_rebuild_reason_once() {
+        let addr = "http://concurrent-rebuild-publication.invalid:9000";
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+
+        let mut hits = Vec::new();
+        for _ in 0..32 {
+            hits.push(tokio::spawn(async move { complete_pending_rebuild_on_cache_hit(addr, addr) }));
+        }
+
+        let mut completed = 0;
+        for hit in hits {
+            completed += usize::from(hit.await.expect("cache-hit attribution task"));
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(pending_channel_rebuild(addr), None);
     }
 
     #[test]
