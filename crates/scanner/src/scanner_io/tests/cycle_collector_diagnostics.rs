@@ -56,6 +56,8 @@ async fn run_cycle(
             ..Default::default()
         },
     );
+    // Keep real checkpoint persistence inside the production drain window.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
