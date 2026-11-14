@@ -126,6 +126,7 @@ test-util = []
 e2e-test-hooks = []
 
 [dependencies]
+slab.workspace = true
 hashbrown.workspace = true
 hotpath.workspace = true
 rustfs-filemeta.workspace = true

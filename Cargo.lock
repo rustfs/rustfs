@@ -10189,6 +10189,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.1",
  "shadow-rs",
+ "slab",
  "smallvec",
  "temp-env",
  "tempfile",
