@@ -3364,7 +3364,7 @@ impl DefaultObjectUsecase {
                 headers
                     .sse_customer_algorithm
                     .is_none()
-                    .then_some(headers.server_side_encryption),
+                    .then(|| ServerSideEncryption::from(headers.server_side_encryption)),
                 headers.sse_customer_algorithm,
                 headers.sse_customer_key_md5,
                 headers.ssekms_key_id,

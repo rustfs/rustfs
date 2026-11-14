@@ -49,16 +49,7 @@ pub(crate) async fn authorize_copy_source<R: AuthorizationRequest + ?Sized>(
     let Some(source) = source else {
         return Err(s3_error!(NotImplemented));
     };
-    let requested = match source.version_id {
-        Some(version) => format!(
-            "{}/{}?versionId={}",
-            source.bucket,
-            source.key,
-            crate::auth::canonical_policy_version_id(version)
-        ),
-        None => format!("{}/{}", source.bucket, source.key),
-    };
-    req.install_requested_copy_source(RequestedCopySource(requested));
+    req.install_requested_copy_source(RequestedCopySource::from_object(source.bucket, source.key, source.version_id));
     let generation = load_copy_source_bucket_generation(server, source.bucket).await;
 
     let req_info = req.req_info_mut().ok_or_else(missing_req_info_error)?;

@@ -152,6 +152,7 @@ pub struct WriteFormatControlRequest {
     #[prost(bytes = "bytes", tag = "3")]
     pub data: ::prost::bytes::Bytes,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteAllResponse {
     #[prost(bool, tag = "1")]
@@ -1630,6 +1631,70 @@ pub struct ScannerScopedDirtyUsageAckResponse {
     #[prost(uint64, tag = "7")]
     pub cleared: u64,
     #[prost(bytes = "bytes", tag = "8")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
+/// Independent from dirty-list/ACK capability: each requested bucket yields
+/// either a same-session watch proof or an explicit Unknown entry.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerUsageWatchEntry {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub bucket_incarnation: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub watch_id: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "4")]
+    pub release: bool,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub session_id: ::prost::bytes::Bytes,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScannerUsageWatchRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
+    #[prost(string, tag = "3")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub entries: ::prost::alloc::vec::Vec<ScannerUsageWatchEntry>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerUsageWatchResult {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub known: bool,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub bucket_incarnation: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub watch_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub revision: u64,
+    #[prost(uint64, tag = "6")]
+    pub inflight: u64,
+    #[prost(uint32, tag = "7")]
+    pub coverage_version: u32,
+    #[prost(uint64, tag = "8")]
+    pub coverage_epoch: u64,
+    #[prost(uint64, tag = "9")]
+    pub lease_remaining_ms: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScannerUsageWatchResponse {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(string, tag = "2")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub session_id: ::prost::bytes::Bytes,
+    #[prost(message, repeated, tag = "4")]
+    pub entries: ::prost::alloc::vec::Vec<ScannerUsageWatchResult>,
+    #[prost(bytes = "bytes", tag = "5")]
     pub response_proof: ::prost::bytes::Bytes,
 }
 /// A short-lived storage-owned read admission used only around a final
@@ -7870,6 +7935,21 @@ pub mod scanner_control_service_client {
                 .insert(GrpcMethod::new("node_service.ScannerControlService", "ScannerScopedDirtyUsageAck"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn scanner_usage_watch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerUsageWatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerUsageWatchResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.ScannerControlService/ScannerUsageWatch");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.ScannerControlService", "ScannerUsageWatch"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -7883,6 +7963,10 @@ pub mod scanner_control_service_server {
             &self,
             request: tonic::Request<super::ScannerScopedDirtyUsageAckRequest>,
         ) -> std::result::Result<tonic::Response<super::ScannerScopedDirtyUsageAckResponse>, tonic::Status>;
+        async fn scanner_usage_watch(
+            &self,
+            request: tonic::Request<super::ScannerUsageWatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerUsageWatchResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ScannerControlServiceServer<T> {
@@ -7977,6 +8061,34 @@ pub mod scanner_control_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ScannerScopedDirtyUsageAckSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.ScannerControlService/ScannerUsageWatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScannerUsageWatchSvc<T: ScannerControlService>(pub Arc<T>);
+                    impl<T: ScannerControlService> tonic::server::UnaryService<super::ScannerUsageWatchRequest> for ScannerUsageWatchSvc<T> {
+                        type Response = super::ScannerUsageWatchResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ScannerUsageWatchRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as ScannerControlService>::scanner_usage_watch(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScannerUsageWatchSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

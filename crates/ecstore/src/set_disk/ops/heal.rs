@@ -2060,7 +2060,7 @@ impl SetDisks {
                                                     _write_lock_guard.clone(),
                                                     _read_repair_write_lock_guard.clone(),
                                                     bucket_heal_scope.clone(),
-                                                    self.ctx.begin_namespace_commit(),
+                                                    self.ctx.begin_namespace_commit_for_bucket(bucket),
                                                 ))
                                             });
                                             match disk
@@ -3761,7 +3761,7 @@ impl SetDisks {
                         namespace_owner: (!opts.dry_run).then(|| {
                             Arc::new((
                                 scope.clone(),
-                                self.ctx.begin_namespace_commit(),
+                                self.ctx.begin_namespace_commit_for_bucket(bucket),
                                 _write_lock_guard.clone(),
                                 transaction_guard.clone(),
                             )) as Arc<dyn Send + Sync>

@@ -4237,3 +4237,58 @@ fn scan_frontier_receipt_binds_nested_debt_outside_raw_lexical_prefix() {
         "nested debt must be signed even when '/' sorts after '-'"
     );
 }
+
+#[test]
+fn durable_progress_rejects_reset_regression_and_uncommitted_discovery() {
+    let identity = DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::from_u128(7),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 2,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            source: Some(DataUsageCacheSource::new(0, 0)),
+            scan_identity: Some(identity),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(RawEnumerationPageIndex::new("bucket/prefix", 2).expect("owner")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = cache.durable_scan_progress();
+    let index = cache.info.scan_raw_enumeration_page_index.as_mut().expect("owner");
+    index
+        .ingest_partial_owner_entries(vec!["a".to_string(), "b".to_string()], 2, index.generation().expect("generation"))
+        .expect("discover entries");
+    assert!(
+        !cache.durable_scan_progress().advanced_from(&before),
+        "uncommitted discovery is not durable forward motion"
+    );
+    let index = cache.info.scan_raw_enumeration_page_index.as_mut().expect("owner");
+    index
+        .commit_building_page(index.generation().expect("generation"))
+        .expect("commit raw page");
+    let committed = cache.durable_scan_progress();
+    assert!(committed.advanced_from(&before));
+    assert!(!before.advanced_from(&committed), "a reset is not progress");
+    let mut replaced = committed.clone();
+    replaced.identity.as_mut().expect("identity").publication_epoch += 1;
+    assert!(!replaced.advanced_from(&before));
+    replaced = committed;
+    replaced.started_plan = Some(DataUsageScanPlanDigest([99; 32]));
+    assert!(!replaced.advanced_from(&before), "plan changes alone cannot earn another turn");
+    let mut previous = before;
+    previous.raw.clear();
+    previous.frontier = Some("bucket/a/z".to_string());
+    let mut next = previous.clone();
+    next.frontier = Some("bucket/a".to_string());
+    assert!(next.advanced_from(&previous), "DFS ancestor completion covers its descendants");
+    assert!(!previous.advanced_from(&next), "reentering a completed ancestor is a regression");
+}

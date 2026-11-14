@@ -14607,6 +14607,51 @@ fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
     }
 }
 
+#[test]
+fn object_mutation_guard_rejects_wrong_delete_input_forwarding() {
+    let delete = include_str!("../app/object/delete.rs");
+    let legacy = include_str!("../storage/legacy_edge/object_misc.rs");
+    let typed_call = "self.execute_delete_object_fields(\n            envelope,\n            input.bucket.as_str().to_owned(),\n            input.key.as_str().to_owned(),\n            input.version_id,\n        )";
+    let owned_call = "owner.execute_delete_object_owned(envelope, bucket, key, version_id)";
+    let legacy_call = "usecase.execute_delete_object_fields(envelope, input.bucket, input.key, input.version_id)";
+    for (signature, legacy_edge, call, fields) in [
+        (
+            "fn execute_delete_object(",
+            false,
+            typed_call,
+            [
+                "input.bucket.as_str().to_owned()",
+                "input.key.as_str().to_owned()",
+                "input.version_id",
+            ],
+        ),
+        ("fn execute_delete_object_fields(", false, owned_call, ["bucket", "key", "version_id"]),
+        (
+            "fn delete_object_edge(",
+            true,
+            legacy_call,
+            ["input.bucket", "input.key", "input.version_id"],
+        ),
+    ] {
+        for field in fields {
+            let forwarded = call.replacen(field, "other_input", 1);
+            let source = if legacy_edge { legacy } else { delete };
+            let broken = source.replacen(call, &forwarded, 1);
+            assert_ne!(broken, source, "fixture must replace {field} in {signature}");
+            let (delete, legacy) = if legacy_edge {
+                (delete, broken.as_str())
+            } else {
+                (broken.as_str(), legacy)
+            };
+            let message = crate::guard_sources::panic_message(|| assert_object_mutation_reserved_prefix_guards(delete, legacy));
+            assert!(
+                message.contains(&format!("{signature} must call its guarded implementation")),
+                "{field}: {message}"
+            );
+        }
+    }
+}
+
 const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;

@@ -1330,6 +1330,15 @@ impl RemoteDisk {
     }
 
     pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        Ok(self
+            .ns_scanner_progress_capability()
+            .await?
+            .map(|capability| capability.server_epoch))
+    }
+
+    pub(crate) async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
@@ -1337,6 +1346,9 @@ impl RemoteDisk {
             endpoint: self.endpoint.grid_host(),
             supports_tier_registry_generation: true,
             supports_checkpoint_coverage: true,
+            supports_durable_progress: true,
+            supports_complete_observation: true,
+            supports_usage_watch: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
@@ -1347,7 +1359,12 @@ impl RemoteDisk {
                 if response.supports_tier_registry_generation == Some(true)
                     && response.supports_checkpoint_coverage == Some(true) =>
             {
-                Ok(Some(response.server_epoch))
+                Ok(Some(crate::storage_api_contracts::internode::NsScannerCapabilities {
+                    server_epoch: response.server_epoch,
+                    supports_durable_progress: response.supports_durable_progress == Some(true),
+                    supports_complete_observation: response.supports_complete_observation == Some(true),
+                    supports_usage_watch: response.usage_watch_proof.is_some(),
+                }))
             }
             Ok(_) => Ok(None),
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
@@ -2682,9 +2699,28 @@ impl RemoteDisk {
             "rename_data",
             || async {
                 let prepare_started = rustfs_io_metrics::put_stage_timer();
-                let file_info = compat_json(fi)?;
-                let file_info_bin = encode_file_info_msgpack(fi)?;
-                let mut client = self.get_client().await?;
+                let collect_prepare_timing = prepare_started.is_some();
+                let json_encode_started = collect_prepare_timing.then(Instant::now);
+                let file_info = compat_json(fi);
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE,
+                    json_encode_started,
+                );
+                let file_info = file_info?;
+                let msgpack_encode_started = collect_prepare_timing.then(Instant::now);
+                let file_info_bin = encode_file_info_msgpack(fi);
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE,
+                    msgpack_encode_started,
+                );
+                let file_info_bin = file_info_bin?;
+                let get_client_started = collect_prepare_timing.then(Instant::now);
+                let client = self.get_client().await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT,
+                    get_client_started,
+                );
+                let mut client = client?;
                 let mut request = Request::new(RenameDataRequest {
                     bucket_incarnation_id: crate::store::bucket_heal_scope_for_object(dst_volume, dst_path)
                         .map(|scope| scope.incarnation.as_bytes().to_vec().into())
@@ -2700,24 +2736,35 @@ impl RemoteDisk {
                         .map(|token| token.as_bytes().to_vec().into())
                         .unwrap_or_default(),
                 });
-                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                let canonical_body_digest_started = collect_prepare_timing.then(Instant::now);
                 let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
                 let quota_fenced = rustfs_utils::http::metadata_compat::contains_key_str(
                     &fi.metadata,
                     crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
                 );
-                if pool_meta_cas {
-                    let body = canonical_body.map_err(|_| Error::other("pool metadata CAS body length cannot be represented"))?;
-                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
-                } else if quota_fenced {
-                    attach_quota_mutation_body_digest(&mut request, canonical_body)?;
-                } else if multipart_rename || scanner_publication_lease_token.is_some() || incarnation_bound {
-                    let canonical_body =
-                        canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
-                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
-                } else {
-                    attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
-                }
+                let canonical_body_digest = (|| -> Result<()> {
+                    let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                    if pool_meta_cas {
+                        let body =
+                            canonical_body.map_err(|_| Error::other("pool metadata CAS body length cannot be represented"))?;
+                        crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                    } else if quota_fenced {
+                        attach_quota_mutation_body_digest(&mut request, canonical_body)?;
+                    } else if multipart_rename || scanner_publication_lease_token.is_some() || incarnation_bound {
+                        let canonical_body =
+                            canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
+                        crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body)
+                            .map_err(Error::other)?;
+                    } else {
+                        attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                    }
+                    Ok(())
+                })();
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST,
+                    canonical_body_digest_started,
+                );
+                canonical_body_digest?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
                     prepare_started,
@@ -7407,6 +7454,9 @@ mod tests {
                 proof: Vec::new(),
                 supports_tier_registry_generation,
                 supports_checkpoint_coverage: *self.ns_scanner_checkpoint_support.lock().expect("checkpoint capability lock"),
+                supports_durable_progress: None,
+                supports_complete_observation: None,
+                usage_watch_proof: None,
             })
         }
 

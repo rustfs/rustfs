@@ -167,6 +167,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         route(Method::POST, "/"),
         admin_route(Method::GET, "/v3/is-admin"),
         admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::POST, "/v4/account/permissions"),
         admin_route(Method::GET, "/v3/account/info"),
         admin_route(Method::POST, "/v3/account/password"),
         admin_route(Method::GET, "/v3/list-users"),
@@ -1054,6 +1055,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+    assert_route(&router, Method::POST, &admin_path("/v4/account/permissions"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));

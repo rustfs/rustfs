@@ -56,12 +56,15 @@ async fn run_cycle(
             ..Default::default()
         },
     );
+    // Keep real checkpoint persistence inside the production drain window.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         nsscanner_with_storage_status_scoped(
             store.as_ref(),
             ScannerCycleRequest {
+                owner_ctx: ctx.clone(),
                 ctx: budget.token(),
                 budget: Arc::clone(&budget),
                 updates,
@@ -74,6 +77,7 @@ async fn run_cycle(
                 requires_full_scan,
                 service_cohort: None,
                 resolved_scope_observer: None,
+                post_walk_hook: None,
                 post_walk_gate: None,
                 peer_observations: None,
             },
