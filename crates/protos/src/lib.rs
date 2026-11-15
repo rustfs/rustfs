@@ -5817,6 +5817,7 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                cache_fence_stamp: None,
             };
             let result = GenerallyLockResult {
                 success,
@@ -5871,5 +5872,43 @@ mod lock_release_tests {
         let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
         assert_eq!(decoded.acquire_status, 99);
         assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
+    }
+
+    #[test]
+    fn cache_fence_stamp_is_additive_for_single_and_batch_lock_responses() {
+        let stamp = prost::bytes::Bytes::from_static(b"fixed-width-cache-fence-proof");
+        let response = GenerallyLockResponse {
+            success: true,
+            cache_fence_stamp: Some(stamp.clone()),
+            ..Default::default()
+        };
+        let result = GenerallyLockResult {
+            success: true,
+            cache_fence_stamp: Some(stamp),
+            ..Default::default()
+        };
+        for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+            let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive cache proof");
+            assert!(legacy.success);
+        }
+
+        let legacy = LegacyReleaseResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        }
+        .encode_to_vec();
+        assert!(
+            GenerallyLockResponse::decode(legacy.as_slice())
+                .expect("new single response decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
+        assert!(
+            GenerallyLockResult::decode(legacy.as_slice())
+                .expect("new batch result decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
     }
 }
