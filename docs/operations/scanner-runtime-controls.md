@@ -898,6 +898,12 @@ done
 
 The `aggregated.scanner` payload preserves the same scanner progress, checkpoint, pacing, source work, maintenance control, lifecycle expiry, and lifecycle transition fields used by the local scanner status, but only for the responding node; `by_host.*.scanner` keeps that node's host view. Compare the per-node artifacts externally to find old active paths, partial checkpoints, pacing pressure, source-level control pressure, or downstream queue admission problems across the deployment.
 
+## Reading Cached Bucket Statistics
+
+Admin usage reads cache the selected scanner baseline for the existing 30-second TTL, then verify every returned bucket against uncached storage-owned incarnation metadata. Identity reads use at most four concurrent operations and a shared two-second deadline after releasing snapshot/refresh locks. Each bucket read linearizes independently against metadata transactions; the response is not an atomic snapshot of the entire namespace. Delayed peer invalidation cannot authorize a predecessor's statistics for a recreated bucket.
+
+Missing, failed, timed-out, nil, mismatched, or legacy absent identities leave the bucket value absent (unknown), rather than returning the predecessor's value or a confirmed zero. Legacy statistics become visible after a scanner snapshot supplies the current identity. Account-info and usage display apply the existing single-process memory overlay before the final identity filter; distributed local counters are not promoted. When a projection omits values or changes an overlay, totals are partial and `usage_snapshot_converged=false`, and per-tier/replication aggregates are unavailable. Verified cold bucket values remain visible. Such response-only projections cannot be persisted, used for quota admission, or acknowledge dirty work.
+
 ## Reading Scanner Work Observations
 
 `GET /rustfs/admin/v3/scanner/status` exposes `metrics.scan_observation` for the responding node. Capture timestamped snapshots on every node, including the scanner leader, and compare their deltas over the same workload window. These process-lifetime counters reset on restart; a missing field on an older node means unobserved. They are loaded independently and may briefly disagree while operations finish. This telemetry does not change scan cadence, cached usage reads, quota authority, dirty acknowledgement, or maintenance requirements.
