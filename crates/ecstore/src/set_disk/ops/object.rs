@@ -22591,15 +22591,17 @@ mod put_object_tmp_cleanup_tests {
 
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
+    use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::set_disk::core::io_primitives::{
         ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier, rename_fault_injection,
     };
+    use rustfs_config::server_config::KVS;
     use std::{collections::HashSet, time::Duration};
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
-    /// Large enough that the erasure shards are written as real tmp files
-    /// (never inlined into xl.meta), so the cleanup tests exercise actual cleanup.
+    /// Baseline external-shard payload for the four-drive cleanup fixtures.
+    /// Wider layouts derive their payload from the effective inline budget.
     const TEST_OBJECT_SIZE: usize = 1 << 20;
 
     /// Entries under `.rustfs.sys/tmp` on every disk, excluding the `.trash`
@@ -23028,6 +23030,16 @@ mod put_object_tmp_cleanup_tests {
                 disk_count, 0, parity,
             )
             .await;
+            let storage_class =
+                lookup_config_for_pools_without_env(&KVS::new(), &[disk_count]).expect("default fixture storage class");
+            // Exercise physical old-generation cleanup at every erasure width.
+            let external_size = storage_class
+                .inline_block()
+                .checked_mul(disk_count - parity)
+                .and_then(|size| size.checked_add(1))
+                .expect("external cleanup fixture size fits usize");
+            let payload_size = TEST_OBJECT_SIZE.max(external_size);
+            set.set_test_storage_class_config(storage_class);
             let bucket = "native-heal-commit-cleanup";
             let object = format!("generation-{disk_count}-{parity}-{read_repair}.bin");
             for disk in &disks {
@@ -23038,13 +23050,14 @@ mod put_object_tmp_cleanup_tests {
                 shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
                 ..Default::default()
             };
-            set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x17; TEST_OBJECT_SIZE]), &options)
+            set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x17; payload_size]), &options)
                 .await
                 .expect("acknowledge original generation on every disk");
             let old = disks[0]
                 .read_version("", bucket, &object, "", &ReadOptions::default())
                 .await
                 .expect("read actual original generation");
+            assert!(!old.inline_data(), "cleanup fixture must persist external shards");
             let old_dir = old.data_dir.expect("original external data directory");
             let old_part = dirs[0]
                 .path()
@@ -23063,7 +23076,7 @@ mod put_object_tmp_cleanup_tests {
             let writer_set = Arc::clone(&set);
             let writer_object = object.clone();
             let writer_options = options.clone();
-            let payload = vec![0xa3; TEST_OBJECT_SIZE];
+            let payload = vec![0xa3; payload_size];
             let writer_payload = payload.clone();
             let writer = tokio::spawn(async move {
                 writer_set
