@@ -185,31 +185,89 @@ preflight_isolated_project() {
 }
 
 verify_images() {
-  docker image inspect "$CANDIDATE_IMAGE" "$BASELINE_IMAGE" | "$PYTHON_BIN" -c '
-import json, sys
-print(json.dumps([{"Id": image.get("Id"), "Config": {"Labels": {
-    key: value for key, value in (image.get("Config", {}).get("Labels") or {}).items()
-    if key in ("vcs-ref", "org.opencontainers.image.revision")
-}}} for image in json.load(sys.stdin)]))
-' >"$OUT_DIR/images.json"
   local identities
-  identities="$("$PYTHON_BIN" - "$OUT_DIR/images.json" "$CANDIDATE_REVISION" "$BASELINE_REVISION" <<'PYTHON'
+  identities="$("$PYTHON_BIN" - "$OUT_DIR/images.json" "$CANDIDATE_IMAGE" "$BASELINE_IMAGE" \
+    "$CANDIDATE_REVISION" "$BASELINE_REVISION" <<'PYTHON'
 import json
+from pathlib import Path
 import re
+import subprocess
 import sys
-images = json.load(open(sys.argv[1], encoding="utf-8"))
-if len(images) != 2:
-    raise SystemExit("expected two inspected images")
+
+LABEL_KEYS = ("vcs-ref", "org.opencontainers.image.revision")
+IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+REVISION = re.compile(r"[0-9a-f]{40}")
+
+
+def docker_output(*args: str) -> str:
+    result = subprocess.run(["docker", *args], check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"docker {' '.join(args[:2])} failed")
+    return result.stdout
+
+
+def history_labels(image_id: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    history = docker_output("image", "history", "--no-trunc", "--format", "{{json .}}", image_id)
+    for line in history.splitlines():
+        try:
+            created_by = json.loads(line).get("CreatedBy", "")
+        except (AttributeError, json.JSONDecodeError) as error:
+            raise SystemExit("invalid immutable image history") from error
+        if not isinstance(created_by, str):
+            raise SystemExit("invalid immutable image history")
+        instruction = re.search(r"(?:^|\s)LABEL\s+(.+)$", created_by)
+        if instruction is None:
+            continue
+        payload = instruction.group(1)
+        for key in LABEL_KEYS:
+            if key in labels:
+                continue
+            match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", payload)
+            if match is None:
+                if key in payload:
+                    raise SystemExit("image history revision label is not canonical")
+                continue
+            value = match.group(1)
+            if REVISION.fullmatch(value) is None:
+                raise SystemExit("image history revision label is not canonical")
+            labels[key] = value
+    return labels
+
+
+output, candidate, baseline, candidate_revision, baseline_revision = sys.argv[1:]
+sanitized = []
 ids = []
-for image, revision in zip(images, sys.argv[2:]):
+for reference, revision in ((candidate, candidate_revision), (baseline, baseline_revision)):
+    try:
+        images = json.loads(docker_output("image", "inspect", reference))
+    except json.JSONDecodeError as error:
+        raise SystemExit("invalid image inspection") from error
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise SystemExit("expected one inspected image")
+    image = images[0]
     image_id = image.get("Id", "")
-    labels = image.get("Config", {}).get("Labels") or {}
+    if IMAGE_ID.fullmatch(image_id) is None:
+        raise SystemExit("invalid immutable image ID")
+    config = image.get("Config")
+    configured = config.get("Labels") if isinstance(config, dict) else {}
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise SystemExit("invalid image labels")
+    labels = {key: configured[key] for key in LABEL_KEYS if key in configured}
+    evidence = "config-labels"
+    if not labels:
+        labels = history_labels(image_id)
+        evidence = "immutable-history"
     observed = [labels[key] for key in ("vcs-ref", "org.opencontainers.image.revision") if key in labels]
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) or not observed or any(value != revision for value in observed):
+    if not observed or any(value != revision for value in observed):
         raise SystemExit("image identity/revision does not match requested revision")
+    sanitized.append({"Id": image_id, "Config": {"Labels": labels}, "RevisionEvidence": evidence})
     ids.append(image_id)
 if ids[0] == ids[1]:
     raise SystemExit("candidate and baseline resolve to the same image")
+Path(output).write_text(json.dumps(sanitized, sort_keys=True) + "\n", encoding="utf-8")
 print(*ids)
 PYTHON
 )"
