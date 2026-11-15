@@ -26,6 +26,16 @@ def row(timestamp, value, **labels):
 
 
 class MsgpackPeerCanaryTests(unittest.TestCase):
+    def test_rpc_error_query_scopes_application_response_exclusion_to_read_version(self):
+        query = canary.expected_queries(30)["rpc_errors"]
+        self.assertIn('internode_operation_errors_total{backend="grpc",operation!="grpc_read_version"}', query)
+        self.assertIn("internode_operation_classified_errors_total", query)
+        self.assertIn(
+            'backend="grpc",operation="grpc_read_version",classification!="remote_response"',
+            query,
+        )
+        self.assertNotIn("http_status_other", query)
+
     def fixture(self):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)

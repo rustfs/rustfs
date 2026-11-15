@@ -352,7 +352,7 @@ capture_metrics() {
   decisions="sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total[${window}s]))"
   fallback="sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[${window}s])) or vector(0)"
   decode_errors="sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[${window}s])) or vector(0)"
-  rpc_errors="sum(increase(rustfs_system_network_internode_operation_errors_total[${window}s])) or vector(0)"
+  rpc_errors="(sum(increase(rustfs_system_network_internode_operation_errors_total{backend=\"grpc\",operation!=\"grpc_read_version\"}[${window}s])) or vector(0)) + (sum(increase(rustfs_system_network_internode_operation_classified_errors_total{backend=\"grpc\",operation=\"grpc_read_version\",classification!=\"remote_response\"}[${window}s])) or vector(0))"
   prometheus_query "$decisions" "$end" "$phase_dir/decisions.json"
   prometheus_query "$fallback" "$end" "$phase_dir/fallback.json"
   prometheus_query "$decode_errors" "$end" "$phase_dir/decode_errors.json"

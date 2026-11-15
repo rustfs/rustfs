@@ -164,7 +164,13 @@ def expected_queries(window: int) -> dict[str, str]:
         "decode_errors": (
             f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[{window}s])) or vector(0)"
         ),
-        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total[{window}s])) or vector(0)",
+        "rpc_errors": (
+            f'(sum(increase(rustfs_system_network_internode_operation_errors_total{{backend="grpc",'
+            f'operation!="grpc_read_version"}}[{window}s])) or vector(0)) + '
+            "(sum(increase(rustfs_system_network_internode_operation_classified_errors_total"
+            f'{{backend="grpc",operation="grpc_read_version",classification!="remote_response"}}[{window}s])) '
+            "or vector(0))"
+        ),
     }
 
 
