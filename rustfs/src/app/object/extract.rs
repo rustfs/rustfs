@@ -14,16 +14,20 @@
 
 //! Snowball auto-extract (PutObject x-amz-meta-snowball-auto-extract) path.
 
+use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::*;
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::PutObjectInput;
 use crate::app::storage_api::s3::dto::{
-    ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectInput, PutObjectOutput, ServerSideEncryption, Timestamp, TimestampFormat,
+    ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Timestamp, TimestampFormat,
 };
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use crate::app::trailer_adapter::trailer_source;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, s3_error};
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 
@@ -187,7 +191,9 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         this.md5.update(final_buf.filled());
                         *this.bytes_read = match this.bytes_read.checked_add(1) {
                             Some(bytes_read) => bytes_read,
-                            None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
+                            None => {
+                                return Poll::Ready(Err(std::io::Error::other("archive read length overflow")));
+                            }
                         };
                         *this.pending_final_byte = Some(final_buf.filled()[0]);
                         *this.validating_eof = true;
@@ -214,11 +220,15 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
             };
             let read = match u64::try_from(read_len) {
                 Ok(read) => read,
-                Err(_) => return Poll::Ready(Err(std::io::Error::other("archive read length exceeds u64"))),
+                Err(_) => {
+                    return Poll::Ready(Err(std::io::Error::other("archive read length exceeds u64")));
+                }
             };
             *this.bytes_read = match this.bytes_read.checked_add(read) {
                 Some(bytes_read) => bytes_read,
-                None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
+                None => {
+                    return Poll::Ready(Err(std::io::Error::other("archive read length overflow")));
+                }
             };
             buf.advance(read_len);
             return Poll::Ready(Ok(()));
@@ -731,11 +741,6 @@ async fn complete_extract_member_post_commit(
         schedule_object_replication(obj_info.clone(), context.store.clone(), replication).await;
     }
 
-    let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
-    let output = PutObjectOutput {
-        e_tag,
-        ..Default::default()
-    };
     let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);
     let mut event_object = convert_ecstore_object_info(obj_info);
     event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
@@ -744,7 +749,7 @@ async fn complete_extract_member_post_commit(
         bucket_name: context.bucket.clone(),
         object: event_object,
         req_params: context.req_params.clone(),
-        resp_elements: build_event_resp_elements(&S3Response::new(output), &context.request_context.request_id),
+        resp_elements: build_owned_event_resp_elements(&HeaderMap::new(), &context.request_context.request_id),
         version_id: actual_version_id,
         host: context.host.clone(),
         port: context.port,
@@ -1564,9 +1569,9 @@ where
 struct ExtractEntryPaxAuthorization {
     headers: HeaderMap,
     version_id: Option<String>,
-    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    object_lock_mode: Option<ObjectLockMode>,
-    object_lock_retain_until_date: Option<Timestamp>,
+    object_lock_legal_hold_status: Option<String>,
+    object_lock_mode: Option<String>,
+    object_lock_retain_until_date: Option<OffsetDateTime>,
     expanded_metadata_bytes: u64,
 }
 
@@ -1580,9 +1585,9 @@ struct ExtractMemberIamRequirements {
 
 fn extract_member_iam_requirements(
     metadata: &HashMap<String, String>,
-    object_lock_legal_hold_status: Option<&ObjectLockLegalHoldStatus>,
-    object_lock_mode: Option<&ObjectLockMode>,
-    object_lock_retain_until_date: Option<&Timestamp>,
+    object_lock_legal_hold_status: Option<&String>,
+    object_lock_mode: Option<&String>,
+    object_lock_retain_until_date: Option<&OffsetDateTime>,
     explicit_version_id: Option<&str>,
     replica: bool,
 ) -> ExtractMemberIamRequirements {
@@ -1596,8 +1601,8 @@ fn extract_member_iam_requirements(
 
 // Version and replica controls require authorization even when the archive does not set a time.
 // An mtime-only member can still be uploaded with server time when the caller lacks that permission.
-async fn authorized_extract_member_mod_time(
-    req: &mut S3Request<PutObjectInput>,
+async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
     replication_required: bool,
     archive_time: Option<OffsetDateTime>,
 ) -> S3Result<Option<OffsetDateTime>> {
@@ -1672,8 +1677,8 @@ fn apply_extract_pax_overrides(
                 .map(str::to_ascii_uppercase)
                 .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock mode"))?;
             match value.as_str() {
-                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
-                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
+                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::GOVERNANCE.to_owned()),
+                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::COMPLIANCE.to_owned()),
                 _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")),
             }
         })
@@ -1690,11 +1695,12 @@ fn apply_extract_pax_overrides(
                 .map(str::trim)
                 .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
             Timestamp::parse(TimestampFormat::DateTime, value)
+                .map(OffsetDateTime::from)
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
         })
         .transpose()?;
     if let Some(retain_until_date) = object_lock_retain_until_date.as_ref() {
-        let formatted = OffsetDateTime::from(retain_until_date.clone())
+        let formatted = (*retain_until_date)
             .to_offset(time::UtcOffset::UTC)
             .format(&Rfc3339)
             .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
@@ -1709,8 +1715,8 @@ fn apply_extract_pax_overrides(
                     object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock legal-hold status")
                 })?;
             match value.as_str() {
-                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
-                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::ON.to_owned()),
+                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::OFF.to_owned()),
                 _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status")),
             }
         })
@@ -1784,12 +1790,12 @@ fn apply_extract_pax_overrides(
         );
         opts.set_replica_status(ReplicationStatusType::Replica);
     }
-    if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+    if let Some(object_lock_metadata) = build_put_like_object_lock_metadata_native(
         bucket,
         object_lock_config_state,
         object_lock_legal_hold_status.clone(),
         object_lock_mode.clone(),
-        object_lock_retain_until_date.clone(),
+        object_lock_retain_until_date,
     )? {
         metadata.extend(object_lock_metadata);
     }
@@ -1995,48 +2001,41 @@ fn validate_put_object_extract_entry_path(path: &str, limits: ArchiveLimits) -> 
 }
 
 impl DefaultObjectUsecase {
-    #[instrument(level = "debug", skip(self, req))]
+    #[instrument(name = "execute_put_object_extract", level = "debug", skip(self, envelope, input))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
-    pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        self.execute_put_object_extract_boxed(req).await
-    }
-
-    fn execute_put_object_extract_boxed(
+    pub(crate) async fn execute_put_object_extract_owned(
         &self,
-        req: S3Request<PutObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + '_ {
-        Box::pin(self.execute_put_object_extract_inner(req))
+        envelope: RequestEnvelope,
+        input: PutObjectWriteInput,
+    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 
-    async fn execute_put_object_extract_inner(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
-        let request_context = helper.request_context_or_from_request(&req);
-        let extract_options = resolve_put_object_extract_options(&req.headers)?;
-        let member_request_headers = snowball_member_headers(&req.headers);
-        let auth_method = req.method.clone();
-        let auth_uri = req.uri.clone();
-        // Authorization retains the complete signed request context. Snowball
-        // transport controls are filtered only at member metadata/storage boundaries.
-        let auth_headers = req.headers.clone();
-        let auth_extensions = req.extensions.clone();
-        let auth_credentials = req.credentials.clone();
-        let auth_region = req.region.clone();
-        let auth_service = req.service.clone();
-        let auth_trailing_headers = req.trailing_headers.clone();
+    async fn execute_put_object_extract_inner(
+        &self,
+        envelope: RequestEnvelope,
+        input: PutObjectWriteInput,
+    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        use rustfs_s3_types::S3Error;
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectCreatedPut, S3Operation::PutObject)
+            .suppress_event();
+        let request_context = helper.request_context_or_from_view(&envelope.audit_view());
+        let extract_options = resolve_put_object_extract_options(envelope.headers())?;
+        let member_request_headers = snowball_member_headers(envelope.headers());
         // Extract uploads reject SSE-KMS before reaching the SSE layer, so the principal is
         // only carried for the day that restriction lifts; the NotImplemented answer below
         // deliberately stays ahead of any key authorization.
-        let extract_principal = SseKmsPrincipal::from_request(&req);
-        if is_sse_kms_requested(&req.input, &req.headers) {
-            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+        let extract_principal = SseKmsPrincipal::from_request(&envelope);
+        if is_sse_kms_requested(&input, envelope.headers()) {
+            return Err(Into::into(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads")));
         }
-        let replication_authorized = replication_request_authorized(&req);
+        let replication_authorized = replication_request_authorized(&envelope);
         let mut bucket_generation_opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &req.input.bucket, &mut bucket_generation_opts)?;
+        apply_bucket_generation_guard(&envelope, &input.bucket, &mut bucket_generation_opts)?;
         let expected_bucket_incarnation_id = bucket_generation_opts.expected_bucket_incarnation_id;
-        let input = req.input;
+        let trailing_headers = input.trailing_headers.clone();
 
-        let PutObjectInput {
+        let PutObjectWriteInput {
             body,
             bucket,
             key,
@@ -2064,14 +2063,12 @@ impl DefaultObjectUsecase {
         } = input;
 
         let outer_version_id = version_id;
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
+        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
-        let original_sse = server_side_encryption
-            .map(|value| value.as_str().to_owned())
-            .or(extract_server_side_encryption_from_headers(&req.headers)?);
+        let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
@@ -2083,19 +2080,23 @@ impl DefaultObjectUsecase {
             .as_ref()
             .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
         {
-            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
+            return Err(Into::into(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads")));
         }
         validate_sse_headers_for_write(
             effective_sse.as_deref(),
             effective_kms_key_id.as_ref(),
-            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
+            extract_ssekms_context_from_headers(envelope.headers())?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
             true,
         )?;
-        let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
-        let (body, progress_control) = if let Some(control) = req.extensions.get::<super::request_body::BodyReadControl>() {
+        let Some(body) = body else {
+            return Err(Into::into(s3_error!(IncompleteBody)));
+        };
+        let (chunks, _) = super::native_body::BodyChunks::new(body);
+        let body: super::request_body::UploadChunks = Box::new(chunks);
+        let (body, progress_control) = if let Some(control) = envelope.body_read_control() {
             control.activate_upload(
                 put_object_body_read_timeout(),
                 &bucket,
@@ -2105,7 +2106,7 @@ impl DefaultObjectUsecase {
             );
             (body, control.clone())
         } else {
-            super::request_body::guard_upload_progress(
+            super::request_body::guard_native_upload_progress(
                 body,
                 put_object_body_read_timeout(),
                 &bucket,
@@ -2114,23 +2115,23 @@ impl DefaultObjectUsecase {
                 content_length.unwrap_or_default().max(0) as u64,
             )
         };
-        let body = super::request_body::demand_upload_body(body, progress_control.clone());
+        let body = super::request_body::demand_native_upload(body, progress_control.clone());
 
         let size = match content_length {
             Some(c) => c,
             None => {
-                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
+                if let Some(val) = envelope.headers().get(AMZ_DECODED_CONTENT_LENGTH) {
                     match atoi::atoi::<i64>(val.as_bytes()) {
                         Some(x) => x,
-                        None => return Err(s3_error!(UnexpectedContent)),
+                        None => return Err(Into::into(s3_error!(UnexpectedContent))),
                     }
                 } else {
-                    return Err(s3_error!(UnexpectedContent));
+                    return Err(Into::into(s3_error!(UnexpectedContent)));
                 }
             }
         };
         if size < 0 {
-            return Err(s3_error!(UnexpectedContent));
+            return Err(Into::into(s3_error!(UnexpectedContent)));
         }
         validate_new_object_key(&key, "PUT")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
@@ -2138,7 +2139,7 @@ impl DefaultObjectUsecase {
             .check_bucket_quota(
                 &bucket,
                 QuotaOperation::PutObject,
-                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?,
             )
             .await?;
         match get_concurrency_manager()
@@ -2155,10 +2156,10 @@ impl DefaultObjectUsecase {
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
-                return Err(object_s3_error(
+                return Err(Into::into(object_s3_error(
                     S3ErrorCode::SlowDown,
                     "foreground write concurrency limit reached, please reduce your request rate",
-                ));
+                )));
             }
         }
         let mut put_request_guard = ExtractPutRequestGuard::new();
@@ -2179,17 +2180,17 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
+        let sha256hex = get_content_sha256_with_query(envelope.headers(), envelope.uri().query());
         let actual_size = size;
 
         let mut archive_reader =
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
-        if let Err(err) = archive_reader.add_checksum(&req.headers, trailer_source(req.trailing_headers.clone()), false) {
+        if let Err(err) = archive_reader.add_checksum(envelope.headers(), trailing_headers.clone(), false) {
             return Err(ApiError::from(err).into());
         }
 
-        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?;
+        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
         let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
         let tracked_archive =
@@ -2205,7 +2206,7 @@ impl DefaultObjectUsecase {
         })?;
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError.into(), "Not init".to_string()));
         };
 
         let extract_quota_check = if let Some(metadata_sys) = self.bucket_metadata_sys() {
@@ -2220,10 +2221,10 @@ impl DefaultObjectUsecase {
             .as_ref()
             .is_some_and(|result| result.quota_limit.is_some());
         let notify = current_notify_interface_for_context(self.context.as_deref());
-        let req_params = rustfs_targets::extract_params_header(&req.headers);
-        let host = get_request_host(&req.headers);
-        let port = get_request_port(&req.headers);
-        let user_agent = get_request_user_agent(&req.headers);
+        let req_params = rustfs_targets::extract_params_header(envelope.headers());
+        let host = get_request_host(envelope.headers());
+        let port = get_request_port(envelope.headers());
+        let user_agent = get_request_user_agent(envelope.headers());
         let mut extracted_entry_count = 0usize;
         let mut resource_total_size = 0u64;
         let mut legacy_quota_growth = 0u64;
@@ -2348,17 +2349,7 @@ impl DefaultObjectUsecase {
             }
             extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);
 
-            let mut auth_req = S3Request {
-                input: PutObjectInput::default(),
-                method: auth_method.clone(),
-                uri: auth_uri.clone(),
-                headers: auth_headers.clone(),
-                extensions: auth_extensions.clone(),
-                credentials: auth_credentials.clone(),
-                region: auth_region.clone(),
-                service: auth_service.clone(),
-                trailing_headers: auth_trailing_headers.clone(),
-            };
+            let mut auth_req = envelope.fork_for_authorization();
             {
                 let req_info = extract_try!(req_info_mut(&mut auth_req));
                 req_info.bucket = Some(bucket.clone());
@@ -2374,19 +2365,21 @@ impl DefaultObjectUsecase {
             let archive_entry_mod_time = extract_try!(extract_archive_entry_mod_time(f.header()));
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
-            extract_try!(apply_put_request_metadata(
+            extract_try!(apply_put_request_metadata_native(
                 &mut metadata,
                 &member_request_headers,
                 &fpath,
-                cache_control.clone(),
-                content_disposition.clone(),
-                content_encoding.clone(),
-                content_language.clone(),
-                content_type.clone(),
-                expires.clone(),
-                website_redirect_location.clone(),
-                tagging.clone(),
-                storage_class.clone(),
+                PutObjectContentInput {
+                    cache_control: cache_control.clone(),
+                    content_disposition: content_disposition.clone(),
+                    content_encoding: content_encoding.clone(),
+                    content_language: content_language.clone(),
+                    content_type: content_type.clone(),
+                    expires: expires.clone(),
+                    website_redirect_location: website_redirect_location.clone(),
+                    tagging: tagging.clone(),
+                    storage_class: storage_class.clone(),
+                }
             ));
             extract_try!(apply_bucket_default_lock_retention(
                 &bucket,
@@ -2456,7 +2449,7 @@ impl DefaultObjectUsecase {
                 legacy_quota_growth = next_legacy_quota_growth;
             }
             for (name, value) in &pax_authorization.headers {
-                extract_try!(auth_req.headers.try_insert(name.clone(), value.clone()).map_err(|_| {
+                extract_try!(auth_req.headers_mut().try_insert(name.clone(), value.clone()).map_err(|_| {
                     object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
                 }));
             }
@@ -2475,10 +2468,10 @@ impl DefaultObjectUsecase {
                 if pax_authorization.object_lock_mode.is_some() || pax_authorization.object_lock_retain_until_date.is_some() {
                     (
                         pax_authorization.object_lock_mode.clone(),
-                        pax_authorization.object_lock_retain_until_date.clone(),
+                        pax_authorization.object_lock_retain_until_date,
                     )
                 } else {
-                    (object_lock_mode.clone(), object_lock_retain_until_date.clone())
+                    (object_lock_mode.clone(), object_lock_retain_until_date)
                 };
             let iam_requirements = extract_member_iam_requirements(
                 &metadata,
@@ -2489,12 +2482,7 @@ impl DefaultObjectUsecase {
                 opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
             );
             // auth_req inherits the outer request's date; a PAX override replaces it.
-            set_requested_object_lock_retain_until(
-                &mut auth_req,
-                effective_object_lock_retain_until_date
-                    .clone()
-                    .map(time::OffsetDateTime::from),
-            );
+            set_requested_object_lock_retain_until(&mut auth_req, effective_object_lock_retain_until_date);
             extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await);
             if iam_requirements.tagging {
                 extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await);
@@ -2529,7 +2517,7 @@ impl DefaultObjectUsecase {
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
                 write_plan = write_plan.with_compression(algorithm);
             }
-            extract_try!(apply_put_request_object_lock_opts(
+            extract_try!(apply_put_request_object_lock_opts_native(
                 &bucket,
                 object_lock_config_state,
                 effective_object_lock_legal_hold_status,
@@ -2543,7 +2531,7 @@ impl DefaultObjectUsecase {
                     key: &fpath,
                     server_side_encryption: effective_sse.clone(),
                     ssekms_key_id: effective_kms_key_id.clone(),
-                    ssekms_context: extract_try!(extract_ssekms_context_from_headers(&req.headers)),
+                    ssekms_context: extract_try!(extract_ssekms_context_from_headers(envelope.headers())),
                     sse_customer_algorithm: sse_customer_algorithm.clone(),
                     sse_customer_key: sse_customer_key.clone(),
                     sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -2739,7 +2727,9 @@ impl DefaultObjectUsecase {
         drop(entries);
         let mut decoder = match ar.into_inner() {
             Ok(decoder) => decoder,
-            Err(_) => return Err(s3_error!(InvalidArgument, "Failed to finalize archive reader")),
+            Err(_) => {
+                return Err(Into::into(s3_error!(InvalidArgument, "Failed to finalize archive reader")));
+            }
         };
         tokio::io::copy(&mut decoder, &mut tokio::io::sink())
             .await
@@ -2749,23 +2739,19 @@ impl DefaultObjectUsecase {
                 .lock()
                 .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "Archive upload state lock was poisoned"))?;
             if !state.body_complete {
-                return Err(object_s3_error(
+                return Err(Into::into(object_s3_error(
                     S3ErrorCode::UnexpectedContent,
                     "Archive decoder did not consume the complete request body",
-                ));
+                )));
             }
-            state.etag.as_ref().map(|etag| to_s3s_etag(etag))
+            state.etag.clone()
         };
         // Keep decoder admission through body-complete validation, then release
         // it before response checksum and completion bookkeeping.
         drop(decoder);
-        apply_trailing_checksums(
-            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
-            &req.trailing_headers,
-            &mut checksums,
-        );
+        apply_trailing_checksums_native(input.checksum_algorithm.as_deref(), &trailing_headers, &mut checksums);
 
-        let output = PutObjectOutput {
+        let output = PutObjectWriteOutput {
             e_tag: archive_etag,
             checksum_crc32: checksums.crc32,
             checksum_crc32c: checksums.crc32c,
@@ -2774,8 +2760,8 @@ impl DefaultObjectUsecase {
             checksum_crc64nvme: checksums.crc64nvme,
             ..Default::default()
         };
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
+        let result = Ok(output);
+        let _ = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());
         put_request_guard.finish_ok();
         result
     }
@@ -2910,7 +2896,9 @@ mod tests {
         assert!(!held.is_empty(), "the global decoder gate must admit at least one archive");
 
         let error = match build_admitted_extract_archive_decoder(&clone, "archive.tar", PanicOnRead).await {
-            Ok(_) => panic!("a saturated decoder gate must reject without constructing another decoder"),
+            Ok(_) => {
+                panic!("a saturated decoder gate must reject without constructing another decoder")
+            }
             Err(error) => error,
         };
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
@@ -3779,6 +3767,111 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_owned_member_privileges_gate_storage() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-privileges-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create locked bucket");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let mut retention = pax_record("minio.metadata.x-amz-object-lock-mode", b"GOVERNANCE");
+        retention.extend(pax_record("minio.metadata.x-amz-object-lock-retain-until-date", b"2099-01-01T00:00:00Z"));
+        for (action, record, metadata_key, expected) in [
+            (
+                "s3:PutObjectTagging",
+                pax_record("minio.metadata.x-amz-tagging", b"classification=public"),
+                AMZ_OBJECT_TAGGING,
+                "classification=public",
+            ),
+            ("s3:PutObjectRetention", retention, AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
+            (
+                "s3:PutObjectLegalHold",
+                pax_record("minio.metadata.x-amz-object-lock-legal-hold", b"ON"),
+                AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+                "ON",
+            ),
+        ] {
+            for permission in ["missing", "deny", "allow"] {
+                let resource = format!("arn:aws:s3:::{bucket}/*");
+                let mut statements = vec![serde_json::json!({
+                    "Effect":"Allow", "Principal":"*", "Action":["s3:PutObject"], "Resource":resource
+                })];
+                if permission != "missing" {
+                    statements.push(serde_json::json!({
+                        "Effect":if permission == "allow" { "Allow" } else { "Deny" },
+                        "Principal":"*", "Action":[action], "Resource":resource
+                    }));
+                }
+                let policy = serde_json::json!({"Version":"2012-10-17", "Statement":statements});
+                metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+                    .await
+                    .expect("install member policy");
+                let member = format!("{}-{permission}.txt", action.trim_start_matches("s3:"));
+                let mut builder = Builder::new(Vec::new());
+                let mut extension = Header::new_ustar();
+                extension.set_size(record.len() as u64);
+                extension.set_entry_type(EntryType::XHeader);
+                builder
+                    .append_data(&mut extension, "pax", &record[..])
+                    .await
+                    .expect("PAX record");
+                let mut header = Header::new_ustar();
+                header.set_size(1);
+                header.set_mode(0o644);
+                builder
+                    .append_data(&mut header, &member, &b"x"[..])
+                    .await
+                    .expect("archive member");
+                let archive = builder.into_inner().await.expect("finish archive");
+                let input = PutObjectInput {
+                    bucket: bucket.clone(),
+                    key: "archive.tar".to_owned(),
+                    content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                    body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                    ..Default::default()
+                };
+                let mut request = build_request(input, Method::PUT);
+                request.extensions.insert(ReqInfo::default());
+                let envelope = RequestEnvelope::from_s3s(&request);
+                let input = PutObjectWriteInput::from_legacy(request.input, None);
+                let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+                let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
+                if permission == "allow" {
+                    result.expect("authorized member");
+                    let info = stored.expect("authorized member stored");
+                    assert_eq!(info.size, 1);
+                    if metadata_key == AMZ_OBJECT_TAGGING {
+                        assert_eq!(info.user_tags.as_str(), expected, "{action}");
+                    } else {
+                        assert_eq!(info.user_defined.get(metadata_key).map(String::as_str), Some(expected), "{action}");
+                    }
+                } else {
+                    assert_eq!(
+                        result.err().expect("member privilege required").code().as_str(),
+                        "AccessDenied",
+                        "{action}: {permission}"
+                    );
+                    assert!(is_err_object_not_found(&stored.expect_err("refused member must not be stored")));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn archive_etag_reader_validates_sha256_before_completion() {
         let payload = b"archive-with-wrong-sha256".to_vec();
         let expected_length = i64::try_from(payload.len()).expect("fixture length must fit i64");
@@ -4605,9 +4698,9 @@ mod tests {
     #[test]
     fn snowball_iam_requirements_follow_final_member_state() {
         let metadata = HashMap::from([(AMZ_OBJECT_TAGGING.to_string(), "project=snowball".to_string())]);
-        let legal_hold = ObjectLockLegalHoldStatus::from("ON".to_string());
-        let mode = ObjectLockMode::from("GOVERNANCE".to_string());
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc());
+        let legal_hold = "ON".to_string();
+        let mode = "GOVERNANCE".to_string();
+        let retain_until = OffsetDateTime::now_utc();
 
         assert_eq!(
             extract_member_iam_requirements(&metadata, Some(&legal_hold), Some(&mode), Some(&retain_until), Some("null"), true,),

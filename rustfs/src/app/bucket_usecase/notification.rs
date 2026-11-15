@@ -16,11 +16,12 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    GetBucketNotificationConfigurationInput, NotificationConfiguration, NotificationConfigurationFilter,
-    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
+    NotificationConfiguration, NotificationConfigurationFilter, PutBucketNotificationConfigurationInput,
+    PutBucketNotificationConfigurationOutput,
 };
 use crate::app::storage_api::s3::region::Region;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_gateway_types::persistence::parse_notification_dto;
 
 fn is_valid_notification_filter_value(value: &str) -> bool {
     if value.len() > 1024 || value.contains('\\') {
@@ -159,22 +160,22 @@ fn resolve_notification_region(global_region: Option<Region>, request_region: Op
 }
 
 impl DefaultBucketUsecase {
+    /// The stored notification configuration, or an empty answer when none is stored.
     pub async fn execute_get_bucket_notification_configuration(
         &self,
-        req: S3Request<GetBucketNotificationConfigurationInput>,
-    ) -> S3Result<Option<PersistedNotificationConfiguration>> {
-        let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
-
+        input: gateway_dto::GetBucketNotificationConfigurationInput,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::GetBucketNotificationConfigurationOutput> {
+        let bucket = input.bucket.as_str();
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let has_notification_config = match metadata_sys::get_notification_config(&bucket).await {
+        let stored = match metadata_sys::get_notification_config(bucket).await {
             Ok(config) => config,
             // An unreadable config is not "no notifications configured".
             Err(err) if crate::storage_api::error::is_unreadable_config_error(&err) => {
@@ -192,8 +193,22 @@ impl DefaultBucketUsecase {
                 None
             }
         };
+        let Some(stored) = stored else {
+            return Ok(gateway_dto::GetBucketNotificationConfigurationOutput::default());
+        };
 
-        Ok(has_notification_config)
+        let gateway_dto::NotificationConfiguration {
+            event_bridge_configuration,
+            lambda_function_configurations,
+            queue_configurations,
+            topic_configurations,
+        } = dto_values::stored_config(&stored, parse_notification_dto)?;
+        Ok(gateway_dto::GetBucketNotificationConfigurationOutput {
+            event_bridge_configuration,
+            lambda_function_configurations,
+            queue_configurations,
+            topic_configurations,
+        })
     }
 
     pub async fn execute_put_bucket_notification_configuration(
@@ -261,6 +276,21 @@ mod tests {
     use crate::app::bucket_usecase::test_support::build_request;
     use crate::app::storage_api::s3::dto::{FilterRule, FilterRuleName, QueueConfiguration, S3KeyFilter};
     use http::Method;
+
+    #[tokio::test]
+    async fn execute_get_bucket_notification_configuration_returns_internal_error_when_store_uninitialized() {
+        let input = gateway_dto::GetBucketNotificationConfigurationInput {
+            bucket: rustfs_gateway_types::BucketName::new("test-bucket").expect("valid bucket name"),
+            ..Default::default()
+        };
+        let usecase = DefaultBucketUsecase::without_context();
+
+        let err = usecase
+            .execute_get_bucket_notification_configuration(input)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
 
     #[test]
     fn resolve_notification_region_prefers_global_region() {
