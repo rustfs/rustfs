@@ -3346,14 +3346,10 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        access_owned::listing_multipart::authorize_abort_multipart_upload(self.server_ctx(), req, &bucket, &key)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the CompleteMultipartUpload request has accesses to the resources.
@@ -3802,20 +3798,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object_attributes(&self, req: &mut S3Request<GetObjectAttributesInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        if req.input.version_id.is_some() {
-            authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAttributesAction)).await?;
-            authorize_request(req, Action::S3Action(S3Action::GetObjectVersionAction)).await?;
-        } else {
-            authorize_request(req, Action::S3Action(S3Action::GetObjectAttributesAction)).await?;
-            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
-        }
-
-        Ok(())
+        let (bucket, key, version_id) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_read::authorize_get_object_attributes(req, &bucket, &key, version_id.as_deref()).await
     }
 
     /// Checks whether the GetObjectLegalHold request has accesses to the resources.

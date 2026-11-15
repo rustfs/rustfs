@@ -18,10 +18,12 @@
 //! until each helper is moved with dedicated small refactor steps.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-pub(crate) use crate::app::bucket_usecase::{PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
+pub(crate) use crate::app::bucket_usecase::{
+    NotificationDestination, PreparedLifecycleConfiguration, validate_lifecycle_rule_status,
+};
 pub(crate) use crate::app::multipart_usecase::{
-    CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget, UploadPartTarget,
-    UploadPartWriteInput, UploadPartWriteOutput,
+    AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
+    UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput, reject_abort_capabilities,
 };
 pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
 pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
@@ -30,7 +32,8 @@ pub(crate) use crate::app::object::{
 };
 pub(crate) use crate::app::object_usecase::DefaultObjectUsecase;
 pub(crate) use crate::app::object_usecase::{
-    GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields, HeadObjectOutputFacts,
+    GetObjectAttributesFields, GetObjectAttributesOutputFacts, GetObjectBody, GetObjectFields, GetObjectOutputFacts,
+    HeadObjectFields, HeadObjectOutputFacts,
 };
 
 pub(crate) mod bucket;

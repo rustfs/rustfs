@@ -13,21 +13,27 @@
 // limitations under the License.
 
 //! The gateway operations of migration batch C (rustfs/backlog#2765): GetObject, HeadObject and GetObjectAttributes.
-//! GetObject and HeadObject are served; the batch appends the remaining rows here.
 
 use super::{OpRow, Served, resp, row};
 use crate::app::object_usecase::{
-    DefaultObjectUsecase, GetObjectBody, GetObjectOutputFacts, HeadObjectOutputFacts, ResponseEtag,
+    DefaultObjectUsecase, GetObjectAttributesFields, GetObjectAttributesOutputFacts, GetObjectBody, GetObjectOutputFacts,
+    HeadObjectOutputFacts, ResponseEtag,
 };
 use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::object_read::{authorize_get_object, authorize_head_object};
+use crate::storage_api::server::http::access::access_owned::object_read::{
+    authorize_get_object, authorize_get_object_attributes, authorize_head_object,
+};
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3ErrorCode, S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::GetObject>(), row::<dto::HeadObject>()];
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::GetObject>(),
+    row::<dto::HeadObject>(),
+    row::<dto::GetObjectAttributes>(),
+];
 
 impl Served for dto::HeadObject {
     const METRIC: S3Operation = S3Operation::HeadObject;
@@ -78,6 +84,106 @@ impl Served for dto::GetObject {
                 .await,
         )
     }
+}
+
+impl Served for dto::GetObjectAttributes {
+    const METRIC: S3Operation = S3Operation::GetObjectAttributes;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        Ok(
+            authorize_get_object_attributes(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref())
+                .await?,
+        )
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let fields = GetObjectAttributesFields {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            version_id: input.version_id,
+            object_attributes: input
+                .object_attributes
+                .into_iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
+            max_parts: input.max_parts,
+            part_number_marker: input.part_number_marker,
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        };
+        let Answered { output, status, headers } = DefaultObjectUsecase::with_context(context)
+            .execute_get_object_attributes(envelope, fields)
+            .await?;
+        Ok(resp::<Self>(Answered {
+            output: attributes_output(output)?,
+            status,
+            headers,
+        }))
+    }
+}
+
+fn attributes_output(output: GetObjectAttributesOutputFacts) -> S3Result<dto::GetObjectAttributesOutput> {
+    let object_parts = output
+        .object_parts
+        .map(|parts| {
+            let parts_output = parts
+                .parts
+                .into_iter()
+                .map(|part| {
+                    Ok(dto::ObjectPart {
+                        part_number: part
+                            .part_number
+                            .ok_or_else(|| s3_error!(InternalError, "Stored part number is out of range"))?,
+                        size: part.size,
+                        checksum_crc32: part.checksums.crc32,
+                        checksum_crc32c: part.checksums.crc32c,
+                        checksum_crc64nvme: part.checksums.crc64nvme,
+                        checksum_sha1: part.checksums.sha1,
+                        checksum_sha256: part.checksums.sha256,
+                        ..Default::default()
+                    })
+                })
+                .collect::<S3Result<_>>()?;
+            Ok::<_, rustfs_s3_types::S3Error>(dto::GetObjectAttributesParts {
+                is_truncated: parts.is_truncated,
+                max_parts: parts.max_parts,
+                next_part_number_marker: parts.next_part_number_marker.map(|marker| marker.to_string()),
+                part_number_marker: parts.part_number_marker.map(|marker| marker.to_string()),
+                total_parts_count: parts.total_parts_count,
+                parts: parts_output,
+            })
+        })
+        .transpose()?;
+    Ok(dto::GetObjectAttributesOutput {
+        e_tag: output.e_tag.map(attributes_etag),
+        last_modified: output.last_modified.map(crate::app::dto_values::timestamp),
+        version_id: output.version_id,
+        storage_class: output.storage_class.map(dto::StorageClass::custom),
+        object_size: output.object_size,
+        checksum: output.checksum.map(|checksum| dto::Checksum {
+            checksum_crc32: checksum.crc32,
+            checksum_crc32c: checksum.crc32c,
+            checksum_crc64nvme: checksum.crc64nvme,
+            checksum_sha1: checksum.sha1,
+            checksum_sha256: checksum.sha256,
+            checksum_type: checksum.checksum_type.map(dto::ChecksumType::custom),
+            ..Default::default()
+        }),
+        object_parts,
+        ..Default::default()
+    })
+}
+
+fn attributes_etag(tag: ResponseEtag) -> rustfs_gateway_types::ETag {
+    if tag.weak
+        && let Ok(weak) = rustfs_gateway_types::ETag::new_weak(tag.opaque.as_str().to_owned())
+        && weak.opaque_tag() == tag.opaque
+    {
+        return weak;
+    }
+    rustfs_gateway_types::ETag::from_stored(tag.opaque)
 }
 
 fn get_result(result: S3Result<Answered<GetObjectOutputFacts>>) -> S3Result<Resp<dto::GetObject>> {

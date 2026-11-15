@@ -15,6 +15,24 @@
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+/// Ownership observed in the selected upload metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartOwner {
+    /// The bucket recorded by the upload.
+    pub bucket: String,
+    /// The recorded object, decoded after checking the encoded storage namespace.
+    pub object: String,
+}
+
+/// Authorizes Abort against the upload selected under its existing write lock.
+/// An implementation must reject missing ownership and must not acquire storage locks or mutate storage.
+pub trait MultipartAbortAuthorization: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns a refusal before storage prepares or deletes any staged data.
+    fn authorize(&self, owner: Option<&MultipartOwner>) -> Result<(), Self::Error>;
+}
+
 /// Request authorization against the source selected under completion locks.
 /// Implementations must not mutate storage or acquire object/upload locks again.
 /// Called before comparing client checksums/parts or acknowledging a replay.

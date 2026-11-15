@@ -1638,7 +1638,9 @@ pub(crate) mod helper {
 }
 
 pub(crate) mod object_utils {
-    pub(crate) use crate::storage::storage_api::{to_s3s_etag, to_s3s_xml_etag};
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::to_s3s_etag;
+    pub(crate) use crate::storage::storage_api::to_s3s_xml_etag;
 }
 
 pub(crate) mod io {
@@ -1752,8 +1754,7 @@ pub(crate) mod bucket_usecase {
 
     pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
-        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, process_lambda_configurations,
-        process_queue_configurations, process_topic_configurations, validate_list_object_unordered_with_delimiter,
+        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
     };
 }
 
@@ -1816,12 +1817,12 @@ pub(crate) mod object_usecase {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) use super::ecfs;
     pub(crate) use super::{
-        access, bucket, compression, concurrency, data_usage, deadlock_detector, error, head_prefix, helper, io, object_utils,
-        options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
+        access, bucket, compression, concurrency, data_usage, deadlock_detector, error, head_prefix, helper, io, options,
+        request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
+    #[cfg(test)]
+    pub(crate) use super::{ecfs, object_utils};
     pub(crate) use crate::storage::storage_api::{
         ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
@@ -1859,6 +1860,8 @@ pub(crate) mod multipart_usecase {
             pub(crate) use super::super::super::storage_contracts::{
                 CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::{MultipartAbortAuthorization, MultipartOwner};
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 
