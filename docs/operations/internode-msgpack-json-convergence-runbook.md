@@ -104,6 +104,29 @@ An alternative per-peer canary keeps `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CO
 
 The benchmark driver pins these operator states as dry-run phases (`before`, `request-only`, `canary`, `after`, `rollback`); see [internode-grpc-benchmark-runbook.md](internode-grpc-benchmark-runbook.md).
 
+### Per-peer mixed-version evidence gate
+
+The per-peer gate is not qualified by a successful command transcript alone. Record three ordered four-node measurement phases: `mixed-old-peer` (three candidate nodes and one previous-version node), `all-new` (four candidate nodes), and `rollback-old-peer` (replace one candidate with the previous-version image and verify readback). Every candidate node uses `MSGPACK_ONLY=true`, `MSGPACK_PEER_CAPABILITY=true`, and `MSGPACK_ONLY_FLEET_CONFIRMED=false`; previous-version nodes use all three false. Each phase must run real PUT/GET/metadata traffic and retain the exact candidate/baseline revisions, topology, timestamps, workload result, environment, and raw Prometheus HTTP API JSON.
+
+Capture these PromQL vectors over each non-overlapping phase window and store the complete HTTP API response, not extracted numbers:
+
+```promql
+sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total[$WINDOW]))
+sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_operation_errors_total[$WINDOW])) or vector(0)
+```
+
+Build a schema-1 manifest with `scope="internode-msgpack-peer-canary"`, `source_revision`, `baseline_revision`, `stable_connection_affinity=true`, `max_metric_lag_secs`, and the three phase records. Each phase records integer `start_unix`/`end_unix`, exact topology counts plus a `node1..node4` revision map, the new/old node environment maps, the exact four PromQL strings with a window equal to the phase duration, a relative workload JSON path, and relative paths for `decisions`, `fallback`, `decode_errors`, and `rpc_errors`. The workload artifact records `status`, a non-zero integer `requests`, and `rollback_readback` (true only for `rollback-old-peer`). Validate without rewriting raw evidence:
+
+```bash
+python3 scripts/check_internode_msgpack_peer_canary.py \
+  --manifest /path/to/evidence/manifest.json \
+  --out /path/to/evidence/verification.json
+```
+
+The verifier rejects reused/escaping/overwritten artifacts, duplicate or non-exact decision labels, labeled scalar queries, mismatched PromQL windows, wrong per-node revisions, missing peer-capable traffic, missing mixed/rollback dual-write traffic, manual-fleet or not-requested leakage, failed workload/readback, non-zero fallback/decode/RPC errors, stale timestamps, invalid topology, and candidate/baseline identity reuse. Its output includes SHA-256 receipts for every raw query response and workload artifact. Passing this gate is compatibility evidence only; production soak and ABBA performance drift gates remain separate.
+
 ## Stage 2 — Remove the proto JSON fields
 
 Only after Stage 1 has been stable fleet-wide for a full window with the counters still zero.
