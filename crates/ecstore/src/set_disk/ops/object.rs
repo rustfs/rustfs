@@ -18151,6 +18151,7 @@ mod transition_commit_failure_tests {
                     online_disks,
                     read_quorum: 2,
                     verified_inline_body: None,
+                    distributed_fence_proof: None,
                 }),
             )
             .await;

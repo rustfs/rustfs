@@ -242,6 +242,7 @@ pub(in crate::set_disk) enum MetadataCacheLookup {
     Hit(Arc<GetObjectMetadataCacheEntry>),
     Miss,
     RejectedInsufficientQuorum,
+    RejectedFenceProof,
 }
 
 pub(in crate::set_disk) fn is_confirmed_missing_part_error(err: Option<&str>) -> bool {

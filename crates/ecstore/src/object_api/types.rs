@@ -1280,6 +1280,10 @@ pub struct ObjectOptions {
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
     pub metadata_cache_safe: bool,
+    /// Read-quorum proof captured from the live distributed namespace guard.
+    /// This transient value is never serialized or persisted.
+    #[doc(hidden)]
+    pub metadata_cache_fence_proof: Option<Arc<rustfs_lock::CacheFenceProof>>,
 
     pub versioned: bool,
     pub version_suspended: bool,
@@ -1505,6 +1509,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("expected_bucket_incarnation_id", &self.expected_bucket_incarnation_id)
             .field("no_lock", &self.no_lock)
             .field("metadata_cache_safe", &self.metadata_cache_safe)
+            .field("metadata_cache_fence_proof", &self.metadata_cache_fence_proof.is_some())
             .field("versioned", &self.versioned)
             .field("version_suspended", &self.version_suspended)
             .field("incl_free_versions", &self.incl_free_versions)
@@ -1584,6 +1589,7 @@ impl ObjectOptions {
         let mut opts = self.clone();
         opts.no_lock = true;
         opts.metadata_cache_safe = false;
+        opts.metadata_cache_fence_proof = None;
         opts.include_part_checksums = true;
         opts
     }
@@ -1652,6 +1658,11 @@ impl ObjectOptions {
         if let Some(signal) = guard.lock_lost_signal() {
             self.add_namespace_lock_lost_signal(signal);
         }
+    }
+
+    pub(crate) fn add_metadata_cache_read_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        self.add_namespace_lock_guard(guard);
+        self.metadata_cache_fence_proof = guard.cache_fence_proof().cloned().map(Arc::new);
     }
 
     pub fn add_bucket_lifecycle_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
