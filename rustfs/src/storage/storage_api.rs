@@ -415,8 +415,7 @@ pub(crate) mod s3_api_consumer {
 
     pub(crate) mod multipart {
         pub(crate) use super::super::super::s3_api::multipart::{
-            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-            parse_upload_part_number,
+            ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
         };
 
         pub(crate) mod contract {

@@ -83,6 +83,7 @@ use crate::set_disk::core::multipart_source::{
 use crate::set_disk::mem;
 use crate::set_disk::metadata_sys;
 use crate::set_disk::runtime_sources;
+use crate::storage_api_contracts::multipart::ListPartsOwner;
 #[cfg(test)]
 use crate::storage_api_contracts::multipart::MultipartOperations;
 #[cfg(test)]
@@ -3190,7 +3191,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .cloned()
             .unwrap_or_else(|| storageclass::STANDARD.to_string());
 
+        // Use the same metadata snapshot that produced the page.
+        let recorded_owner = match (
+            get_consistent_str(&fi.metadata, "multipart-bucket"),
+            get_consistent_str(&fi.metadata, "multipart-object"),
+        ) {
+            (Some(recorded_bucket), Some(recorded_object)) if recorded_bucket == bucket && recorded_object == object => {
+                Some(ListPartsOwner {
+                    bucket: recorded_bucket.to_owned(),
+                    object: decode_dir_object(recorded_object),
+                })
+            }
+            _ => None,
+        };
         let mut ret = ListPartsInfo {
+            recorded_owner,
             bucket: bucket.to_owned(),
             object: decode_dir_object(object),
             upload_id: upload_id.to_owned(),
@@ -6434,6 +6449,8 @@ mod tests {
         assert!(empty.parts.is_empty());
         assert!(!empty.is_truncated);
         assert_eq!(empty.next_part_number_marker, None);
+        let owner = empty.recorded_owner.expect("the empty page has the recorded owner");
+        assert_eq!((owner.bucket.as_str(), owner.object.as_str()), (bucket, object));
 
         for part_number in [10, 1, 3] {
             put_test_part(&set_disks, bucket, object, &upload.upload_id, part_number, b"part", 4).await;
@@ -6460,6 +6477,66 @@ mod tests {
             assert_eq!(page.parts.iter().map(|part| part.part_num).collect::<Vec<_>>(), expected_parts);
             assert_eq!(page.is_truncated, next_marker.is_some());
             assert_eq!(page.next_part_number_marker, next_marker);
+            assert_eq!(page.recorded_owner.as_ref(), Some(&owner));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_parts_baseline_legacy_owner_metadata() {
+        let (_roots, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "list-parts-owner-observation";
+        let object = "object";
+        let opts = ObjectOptions::default();
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set.new_multipart_upload(bucket, object, &opts).await.expect("real upload");
+        let path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        let owner_keys = [
+            RUSTFS_MULTIPART_BUCKET_KEY,
+            "x-minio-internal-multipart-bucket",
+            RUSTFS_MULTIPART_OBJECT_KEY,
+            "x-minio-internal-multipart-object",
+        ];
+        for (label, values) in [
+            ("rustfs", [Some(bucket), None, Some(object), None]),
+            ("minio", [None, Some(bucket), None, Some(object)]),
+            ("both", [Some(bucket), Some(bucket), Some(object), Some(object)]),
+            ("no bucket", [None, None, Some(object), None]),
+            ("no object", [Some(bucket), None, None, None]),
+            ("other bucket", [Some("other-bucket"), None, Some(object), None]),
+            ("other object", [Some(bucket), None, Some("other-object"), None]),
+            ("bucket aliases differ", [Some(bucket), Some("other-bucket"), Some(object), None]),
+            ("object aliases differ", [Some(bucket), None, Some(object), Some("other-object")]),
+        ] {
+            for disk in &disks {
+                let mut fi = disk
+                    .read_version("", RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                    .await
+                    .expect("read actual upload metadata");
+                for (key, value) in owner_keys.into_iter().zip(values) {
+                    if let Some(value) = value {
+                        fi.metadata.insert(key.to_owned(), value.to_owned());
+                    } else {
+                        fi.metadata.remove(key);
+                    }
+                }
+                disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, fi)
+                    .await
+                    .expect("write the synthetic owner metadata");
+            }
+            let page = set
+                .list_object_parts(bucket, object, &upload.upload_id, None, 1, &opts)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!((page.bucket.as_str(), page.object.as_str()), (bucket, object), "{label}");
+            assert!(page.parts.is_empty(), "{label}");
+            let expected = matches!(label, "rustfs" | "minio" | "both").then_some((bucket, object));
+            assert_eq!(
+                page.recorded_owner
+                    .as_ref()
+                    .map(|owner| (owner.bucket.as_str(), owner.object.as_str())),
+                expected,
+                "{label}"
+            );
         }
     }
 

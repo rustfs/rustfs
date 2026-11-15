@@ -74,6 +74,23 @@ pub(crate) async fn authorize_list_multipart_uploads<R: AuthorizationRequest + ?
     Ok(())
 }
 
+/// Checks ListMultipartUploadParts on the object and hands its bucket generation to the use case.
+pub(crate) async fn authorize_list_parts<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+
+    authorize_request(req, list_parts_authorize_action()).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
 /// Decoded request facts used by both multipart initiation access hooks.
 pub(crate) struct CreateMultipartAuthorization<'a> {
     pub(crate) bucket: &'a str,

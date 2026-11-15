@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use self::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
+    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
@@ -4039,14 +4039,8 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, list_parts_authorize_action()).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        Ok(authorize_list_parts(self.server_ctx(), req, &bucket, &key).await?)
     }
 
     /// Checks whether the PostObject request has accesses to the resources.

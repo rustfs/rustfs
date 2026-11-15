@@ -22,11 +22,15 @@ use super::{
 };
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::multipart_usecase::{CreateMultipartUploadFields, DefaultMultipartUsecase};
+use crate::app::dto_values;
+use crate::app::multipart_usecase::{
+    CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsInfo, ListPartsTarget,
+};
+use crate::app::storage_api::storage_class::effective_class;
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::storage_api::server::http::access::access_owned::listing_multipart::{
     CreateMultipartAuthorization, authorize_bucket_listing, authorize_create_multipart_upload, authorize_list_multipart_uploads,
-    authorize_list_objects_v2,
+    authorize_list_objects_v2, authorize_list_parts,
 };
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_policy::policy::action::S3Action;
@@ -39,6 +43,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListObjects>(),
     row::<dto::ListObjectVersions>(),
     row::<dto::ListMultipartUploads>(),
+    row::<dto::ListParts>(),
     row::<dto::CreateMultipartUpload>(),
 ];
 
@@ -102,6 +107,88 @@ impl Served for dto::ListMultipartUploads {
             .await?;
         Ok(Resp::new(output))
     }
+}
+
+impl Served for dto::ListParts {
+    const METRIC: S3Operation = S3Operation::ListParts;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let server_ctx = server_context(envelope)?;
+        let input = request.input();
+        authorize_list_parts(&server_ctx, envelope, input.bucket.as_str(), input.key.as_str()).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let fields = ListPartsFields {
+            target: ListPartsTarget::Gateway {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
+            part_number_marker: input.part_number_marker,
+            max_parts: input.max_parts,
+        };
+        let page = DefaultMultipartUsecase::with_context(context)
+            .execute_list_parts(envelope, fields)
+            .await?;
+        Ok(Resp::new(list_parts_output(page)?))
+    }
+}
+
+fn list_parts_output(page: ListPartsInfo) -> S3Result<dto::ListPartsOutput> {
+    let owner = dto_values::owner();
+    let initiator = dto::Initiator {
+        id: owner.id.clone(),
+        display_name: owner.display_name.clone(),
+    };
+    let transformed_parts = rustfs_utils::http::contains_key_str(&page.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || page
+            .user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key));
+    let parts = page
+        .parts
+        .into_iter()
+        .map(|part| {
+            let tag = part
+                .etag
+                .as_deref()
+                .ok_or_else(|| s3_error!(InternalError, "a stored part is missing its ETag"))?;
+            let part_number = i32::try_from(part.part_num)
+                .map_err(|_| s3_error!(InternalError, "a stored part number is outside the ListParts response range"))?;
+            let size = if part.actual_size > 0 || (transformed_parts && part.actual_size == 0) {
+                part.actual_size
+            } else {
+                i64::try_from(part.size)
+                    .map_err(|_| s3_error!(InternalError, "a stored part size is outside the ListParts response range"))?
+            };
+            Ok(dto::Part {
+                e_tag: dto_values::stored_etag(tag),
+                last_modified: part.last_mod.map(dto_values::timestamp),
+                part_number,
+                size,
+                ..Default::default()
+            })
+        })
+        .collect::<S3Result<_>>()?;
+    Ok(dto::ListPartsOutput {
+        bucket: dto_values::stored_bucket_name(&page.bucket)?,
+        key: dto_values::stored_object_key(&page.object)?,
+        upload_id: page.upload_id,
+        parts,
+        owner: Some(owner),
+        initiator: Some(initiator),
+        is_truncated: page.is_truncated,
+        next_part_number_marker: page.next_part_number_marker.map(|marker| marker.to_string()),
+        max_parts: i32::try_from(page.max_parts)
+            .map_err(|_| s3_error!(InternalError, "the ListParts page size is outside the response range"))?,
+        part_number_marker: Some(page.part_number_marker.to_string()),
+        storage_class: Some(dto::StorageClass::custom(
+            effective_class(Some(page.storage_class.as_str()), None).to_owned(),
+        )),
+        ..Default::default()
+    })
 }
 
 impl Served for dto::CreateMultipartUpload {

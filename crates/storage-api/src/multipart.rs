@@ -73,8 +73,18 @@ pub struct ListMultipartsInfo {
     pub common_prefixes: Vec<String>,
 }
 
+/// The owner found in the upload metadata used to read a ListParts page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPartsOwner {
+    pub bucket: String,
+    /// The recorded object after decoding the storage namespace spelling.
+    pub object: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListPartsInfo {
+    /// Present when the recorded bucket and encoded object agree with the storage namespace.
+    pub recorded_owner: Option<ListPartsOwner>,
     pub bucket: String,
     pub object: String,
     pub upload_id: String,
