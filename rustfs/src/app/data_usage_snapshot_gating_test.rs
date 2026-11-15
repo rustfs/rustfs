@@ -104,6 +104,17 @@ async fn persist_scanner_snapshot(ecstore: Arc<ECStore>, info: DataUsageInfo) {
     rustfs_scanner::scanner::store_data_usage_in_backend(CancellationToken::new(), ecstore, receiver).await;
 }
 
+async fn bind_current_bucket_incarnations(ecstore: &ECStore, info: &mut DataUsageInfo) {
+    for (bucket, usage) in &mut info.buckets_usage {
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("load the current incarnation for the covered snapshot");
+        assert!(!incarnation.is_nil(), "covered snapshot must bind a non-nil bucket identity");
+        usage.bucket_incarnation = Some(incarnation.to_string());
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
@@ -170,6 +181,7 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
     seeded_info.bucket_sizes.insert(overlay_bucket.clone(), 0);
     seeded_info.buckets_count = u64::try_from(seeded_info.buckets_usage.len()).expect("test bucket count should fit into u64");
     seeded_info.calculate_totals();
+    bind_current_bucket_incarnations(&ecstore, &mut seeded_info).await;
     persist_scanner_snapshot(ecstore.clone(), seeded_info).await;
 
     record_bucket_object_write_memory(&overlay_bucket, None, 512).await;
@@ -337,6 +349,7 @@ async fn data_usage_endpoint_treats_legacy_partial_stats_as_unknown_until_covere
     completed.bucket_sizes.insert(small_bucket.clone(), 57_344);
     completed.buckets_count = u64::try_from(completed.buckets_usage.len()).expect("test bucket count should fit into u64");
     completed.calculate_totals();
+    bind_current_bucket_incarnations(&ecstore, &mut completed).await;
     store_data_usage_in_backend(completed, ecstore.clone())
         .await
         .expect("persist complete covered snapshot");
