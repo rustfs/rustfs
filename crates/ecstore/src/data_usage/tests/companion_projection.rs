@@ -221,7 +221,7 @@ async fn companion_admin_cache_isolated_from_quota_memory_and_persistence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buckets() {
+async fn blocked_companion_identity_stays_unknown_without_delaying_healthy_buckets() {
     use crate::bucket::metadata_sys::{
         acquire_metadata_transaction_guard, init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks,
     };
@@ -280,8 +280,11 @@ async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buc
     .await
     .expect("optional projection must return before the blocked metadata lock's long timeout")
     .expect("canonical admin response stays available");
-    assert_eq!(response.buckets_usage[blocked].size, 100);
-    assert_eq!(response.buckets_usage[blocked].usage_value_state, Some(BucketUsageValueState::Carried));
+    assert!(
+        !response.buckets_usage.contains_key(blocked),
+        "an unavailable current identity cannot bind the canonical value"
+    );
+    assert!(!response.bucket_sizes.contains_key(blocked));
     assert_eq!(response.buckets_usage[healthy].size, 250);
     assert_eq!(response.buckets_usage[healthy].usage_value_state, Some(BucketUsageValueState::Observed));
     assert!(response.usage_snapshot_admin_projection);
@@ -293,13 +296,12 @@ async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buc
             .is_ok()
     );
     drop(blocked_guard);
-    invalidate_data_usage_snapshot_cache().await;
     let recovered = load_admin_data_usage_from_backend_cached(store.clone())
         .await
         .expect("refresh after lock recovery");
     assert_eq!(
         recovered.buckets_usage[blocked].size, 250,
-        "unavailable identity can recover on the next refresh"
+        "unavailable identity can recover on a cache hit"
     );
     assert_eq!(recovered.buckets_usage[healthy].size, 250);
     let quota = load_data_usage_from_backend_cached(store)
@@ -307,4 +309,202 @@ async fn blocked_companion_identity_keeps_canonical_without_delaying_healthy_buc
         .expect("separate canonical quota read");
     assert_eq!(quota.buckets_usage[blocked].size, 100);
     assert_eq!(quota.buckets_usage[healthy].size, 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cached_canonical_admin_usage_rechecks_current_identity_without_peer_invalidation() {
+    use crate::bucket::metadata::{load_bucket_incarnation, save_bucket_incarnation};
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::config::com::save_config;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let bucket = "usage-recreated-cache";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create identity fixture");
+    let old_identity = store
+        .bucket_incarnation_id_from_disk(bucket)
+        .await
+        .expect("original identity");
+    let mut canonical = companion_snapshot(bucket, old_identity);
+    canonical.usage_snapshot_bucket_observations.clear();
+    canonical.usage_snapshot_converged = Some(true);
+    canonical.usage_snapshot_pending_buckets.clear();
+    canonical.usage_snapshot_pending_bucket_count = 0;
+    canonical
+        .buckets_usage
+        .get_mut(bucket)
+        .expect("canonical bucket")
+        .objects_count = 107;
+    canonical.calculate_totals();
+    let original_bytes = serde_json::to_vec(&canonical).expect("encode canonical old bucket");
+    save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), original_bytes.clone())
+        .await
+        .expect("persist canonical root");
+    invalidate_data_usage_snapshot_cache().await;
+    let first = load_admin_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("prime raw admin cache");
+    assert_eq!(first.buckets_usage[bucket].objects_count, 107);
+    assert!(first.is_complete_bucket_usage_snapshot());
+    let cache_generation = admin_data_usage_snapshot_generation();
+    let new_identity = uuid::Uuid::new_v4();
+    // Simulate the storage-owned identity changing on another node while this
+    // process has not received its invalidation notice. Do not clear the cache.
+    save_bucket_incarnation(store.clone(), bucket, new_identity)
+        .await
+        .expect("publish changed disk identity");
+    assert_eq!(
+        load_bucket_incarnation(store.clone(), bucket)
+            .await
+            .expect("read new sidecar"),
+        Some(new_identity)
+    );
+    let second = load_admin_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("read raw cache with fresh identity");
+    assert_eq!(admin_data_usage_snapshot_generation(), cache_generation);
+    assert!(
+        !second.buckets_usage.contains_key(bucket),
+        "same name cannot retain the predecessor's 107"
+    );
+    assert!(!second.bucket_sizes.contains_key(bucket));
+    assert_eq!(second.usage_snapshot_converged, Some(false));
+    assert!(second.usage_snapshot_admin_projection);
+    assert!(reject_admin_usage_projection(&second).is_err());
+    assert!(certified_bucket_usage(&second, bucket, new_identity).is_none());
+    assert!(parse_usage_snapshot(&serde_json::to_vec(&second).expect("encode display response")).is_err());
+    let quota = load_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("independent quota baseline");
+    assert_eq!(quota.buckets_usage[bucket].objects_count, 107);
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("unchanged persisted root"),
+        original_bytes
+    );
+    // Rebinding a cached raw baseline is transient: recovery does not need to
+    // reload or permanently blank a healthy bucket's statistics.
+    save_bucket_incarnation(store.clone(), bucket, old_identity)
+        .await
+        .expect("restore fixture identity");
+    let recovered = load_admin_data_usage_from_backend_cached(store)
+        .await
+        .expect("recover on another cache hit");
+    assert_eq!(recovered.buckets_usage[bucket].objects_count, 107);
+    assert!(recovered.is_complete_bucket_usage_snapshot());
+    assert_eq!(admin_data_usage_snapshot_generation(), cache_generation);
+    invalidate_data_usage_snapshot_cache().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn admin_memory_overlay_cannot_reintroduce_a_predecessor_identity() {
+    use crate::bucket::metadata::save_bucket_incarnation;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::config::com::save_config;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let bucket = "usage-recreated-overlay";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create overlay identity fixture");
+    let old_identity = store
+        .bucket_incarnation_id_from_disk(bucket)
+        .await
+        .expect("original identity");
+    let mut canonical = companion_snapshot(bucket, old_identity);
+    canonical.usage_snapshot_bucket_observations.clear();
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&canonical).expect("encode canonical root"),
+    )
+    .await
+    .expect("persist overlay fixture");
+    invalidate_data_usage_snapshot_cache().await;
+    let cached_usage = canonical.buckets_usage[bucket].clone();
+    replace_bucket_usage_memory_from_authoritative(bucket, cached_usage, SystemTime::now()).await;
+    let new_identity = uuid::Uuid::new_v4();
+    save_bucket_incarnation(store.clone(), bucket, new_identity)
+        .await
+        .expect("publish a replacement identity");
+    let response = load_admin_data_usage_with_memory_overlay(store.clone())
+        .await
+        .expect("project after memory overlay");
+    assert!(!response.buckets_usage.contains_key(bucket));
+    assert_eq!(response.usage_snapshot_converged, Some(false));
+    assert!(response.usage_snapshot_admin_projection);
+    clear_usage_memory_cache_for_test().await;
+    invalidate_data_usage_snapshot_cache().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn admin_overlay_flags_only_change_keeps_identity_bound_cold_usage() {
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::config::com::save_config;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    assert!(
+        !runtime_sources::setup_is_dist_erasure().await,
+        "exercise the production single-process overlay"
+    );
+    let cold = "usage-overlay-cold";
+    let unverified = "usage-overlay-unverified";
+    for bucket in [cold, unverified] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create overlay fixture bucket");
+    }
+    let identity = store
+        .bucket_incarnation_id_from_disk(cold)
+        .await
+        .expect("cold bucket identity");
+    let mut canonical = companion_snapshot(cold, identity);
+    canonical.usage_snapshot_bucket_observations.clear();
+    canonical.usage_snapshot_converged = Some(true);
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&canonical).expect("encode cold canonical value"),
+    )
+    .await
+    .expect("persist cold baseline");
+    clear_usage_memory_cache_for_test().await;
+    invalidate_data_usage_snapshot_cache().await;
+    memory_cache().write().await.insert(
+        unverified.to_string(),
+        cached_bucket_usage_from_backend(BucketUsageInfo::default(), SystemTime::UNIX_EPOCH, false),
+    );
+    record_bucket_object_write_memory(unverified, None, 42).await;
+    {
+        let cache = memory_cache().read().await;
+        assert!(cache[unverified].dirty);
+        assert!(!cache[unverified].authoritative);
+    }
+    let response = load_admin_data_usage_with_memory_overlay(store)
+        .await
+        .expect("identity-filtered flags-only overlay");
+    assert_eq!(response.buckets_usage[cold].size, 100);
+    assert_eq!(response.objects_total_size, 100);
+    assert_eq!(response.bucket_sizes[cold], 100);
+    assert!(!response.buckets_usage.contains_key(unverified));
+    assert!(response.usage_snapshot_admin_projection);
+    assert_eq!(response.usage_snapshot_converged, Some(false));
+    assert!(!response.is_complete_bucket_usage_snapshot());
+    assert!(!response.is_valid_partial_snapshot());
+    clear_usage_memory_cache_for_test().await;
+    invalidate_data_usage_snapshot_cache().await;
 }
