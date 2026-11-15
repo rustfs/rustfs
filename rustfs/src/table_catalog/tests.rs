@@ -14420,8 +14420,21 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             "fn execute_put_object_inner(",
             "self.execute_put_object_extract_owned(envelope, input)",
         ),
-        (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
-        (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
+        (
+            legacy_delete,
+            "fn execute_copy_object(",
+            "self.execute_copy_object_owned(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_owned(",
+            "self.execute_copy_object_body_boxed(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_body_boxed(",
+            "self.execute_copy_object_body(envelope, input)",
+        ),
         (
             delete,
             "fn execute_delete_object(",

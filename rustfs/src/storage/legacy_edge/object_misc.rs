@@ -20,10 +20,14 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
+use crate::app::RequestEnvelope;
+use crate::storage::access::legacy_copy_source;
 use crate::storage::ecfs::*;
 use crate::storage::ecfs_extend::validate_new_object_key;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
+use crate::storage::s3_api::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase};
+use crate::storage::storage_api::to_s3s_xml_etag;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::delete_object;
@@ -150,6 +154,7 @@ impl FS {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        record_s3_op(S3Operation::CopyObject);
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_copy_object(req).await
     }
@@ -215,4 +220,86 @@ impl FS {
         let usecase = s3_api::multipart_usecase_for(self);
         audit_only_operation(req, S3Operation::UploadPartCopy, |req| Box::pin(usecase.execute_upload_part_copy(req))).await
     }
+}
+
+impl DefaultObjectUsecase {
+    /// Projects a legacy CopyObject request onto the shared copy path.
+    pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = copy_input_from_legacy(req.input);
+        self.execute_copy_object_owned(envelope, input)
+            .await
+            .map(copy_output_to_legacy)
+            .map_err(Into::into)
+    }
+}
+
+fn copy_input_from_legacy(input: CopyObjectInput) -> CopyObjectWriteInput {
+    let condition = |value: ETagCondition| match value {
+        ETagCondition::Any => CopySourceCondition::Any,
+        ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+        ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+    };
+    let copy_source = legacy_copy_source(&input.copy_source)
+        .map(|(bucket, key, version_id)| rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id });
+    CopyObjectWriteInput {
+        copy_source,
+        bucket: input.bucket,
+        key: input.key,
+        version_id: input.version_id,
+        specific_if_none_match: matches!(input.if_none_match, Some(ETagCondition::ETag(_))),
+        server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
+        ssekms_key_id: input.ssekms_key_id,
+        sse_customer_algorithm: input.sse_customer_algorithm,
+        sse_customer_key: input.sse_customer_key,
+        sse_customer_key_md5: input.sse_customer_key_md5,
+        copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+        copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+        copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+        metadata_directive: input.metadata_directive.map(|value| value.as_str().to_owned()),
+        metadata: input.metadata,
+        tagging: input.tagging,
+        tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
+        copy_source_if_match: input.copy_source_if_match.map(condition),
+        copy_source_if_none_match: input.copy_source_if_none_match.map(condition),
+        cache_control: input.cache_control,
+        content_disposition: input.content_disposition,
+        content_encoding: input.content_encoding,
+        content_language: input.content_language,
+        content_type: input.content_type,
+        expires: input.expires,
+        website_redirect_location: input.website_redirect_location,
+        object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+        object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
+        object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
+        storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
+        checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
+    }
+}
+
+fn copy_output_to_legacy(output: CopyObjectWriteOutput) -> S3Response<CopyObjectOutput> {
+    S3Response::new(CopyObjectOutput {
+        copy_object_result: Some(CopyObjectResult {
+            e_tag: output.e_tag.as_deref().map(to_s3s_xml_etag),
+            last_modified: output.last_modified.map(Timestamp::from),
+            checksum_crc32: output.checksum_crc32,
+            checksum_crc32c: output.checksum_crc32c,
+            checksum_sha1: output.checksum_sha1,
+            checksum_sha256: output.checksum_sha256,
+            checksum_crc64nvme: output.checksum_crc64nvme,
+            checksum_md5: output.checksum_md5,
+            checksum_sha512: output.checksum_sha512,
+            checksum_xxhash3: output.checksum_xxhash3,
+            checksum_xxhash64: output.checksum_xxhash64,
+            checksum_xxhash128: output.checksum_xxhash128,
+            checksum_type: output.checksum_type.map(ChecksumType::from),
+        }),
+        copy_source_version_id: output.copy_source_version_id,
+        server_side_encryption: output.server_side_encryption.map(Into::into),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        version_id: output.version_id,
+        ..Default::default()
+    })
 }

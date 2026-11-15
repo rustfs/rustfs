@@ -155,6 +155,7 @@ pub(crate) mod access_consumer {
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::access_owned;
     pub(crate) use super::super::access::access_owned::bucket_core::requested_bucket_force_delete;
+    pub(crate) use super::super::access::access_owned::object_commit::CopySourceObject;
     #[cfg(feature = "gateway-stack")]
     pub(crate) use super::super::access::{
         AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,

@@ -334,11 +334,11 @@ pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        AuthorizationRequest, RequestedObjectLegalHold, RequestedObjectLockRetention, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
-        TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards,
-        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_copy_object_tags, authorize_request,
-        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        AuthorizationRequest, CopySourceObject, RequestedObjectLegalHold, RequestedObjectLockRetention,
+        TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_copy_object_tags, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
         set_requested_object_lock_retain_until,
@@ -1859,6 +1859,8 @@ pub(crate) mod multipart_usecase {
             pub(crate) use super::super::super::storage_contracts::{
                 CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::{MultipartAbortAuthorization, MultipartOwner};
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 

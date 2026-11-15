@@ -664,6 +664,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
         self.requested_object_tags()
     }
+    fn take_requested_object_tags(&mut self) -> Option<RequestedObjectTags> {
+        self.requested_object_tags.take()
+    }
     fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention) {
         self.requested_object_lock_retention = Some(retention);
     }
@@ -690,6 +693,9 @@ impl AuthorizationRequest for RequestEnvelope {
     }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions()
+    }
+    fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions> {
+        self.object_tag_conditions.take()
     }
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
         self.install_object_tag_conditions(conditions);

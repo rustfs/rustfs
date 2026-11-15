@@ -17,9 +17,9 @@
 use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
-};
+use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat};
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
@@ -838,7 +838,8 @@ pub(super) fn response_storage_class_for_object_attributes(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
-pub(crate) fn build_put_like_object_lock_metadata(
+#[cfg(test)]
+fn build_put_like_object_lock_metadata(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,

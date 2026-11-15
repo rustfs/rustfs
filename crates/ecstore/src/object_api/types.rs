@@ -1388,6 +1388,10 @@ pub struct ObjectOptions {
     #[doc(hidden)]
     pub multipart_completion_authorization:
         Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartCompletionAuthorization<Error = Error>>>,
+    /// In-process authorization against the selected upload, while Abort holds its write lock.
+    #[doc(hidden)]
+    pub multipart_abort_authorization:
+        Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartAbortAuthorization<Error = Error>>>,
     pub eval_metadata: Option<HashMap<String, String>>,
     /// Internal compare-and-set condition for replication workers publishing
     /// terminal status after remote I/O. Storage validates it while holding
