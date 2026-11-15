@@ -130,7 +130,7 @@ their issue closes.
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
-| `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark with optional server-only image build | `docker/compose/README.md`; internode runbook |
+| `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark with configurable host ports and optional server-only image build | `docker/compose/README.md`; internode runbook |
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner with PUT-specific Warp summary extraction | internode + scanner runbooks |
 | `test_object_batch_bench.sh` | dev-tool | Regression test for Warp PUT summary extraction | `scripts/test_object_batch_bench.sh` |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
