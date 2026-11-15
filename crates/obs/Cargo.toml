@@ -29,6 +29,9 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 default = []
 # Default-off JSON isolation for sampled local-batch diagnostic root events.
 diagnostic-local-batch = []
+# Exact HTTP/2 PING ACK timeout observation. The root feature also enables
+# Hyper's unstable tracing event in rustfs-protos.
+diagnostic-internode-http2-ping = ["rustfs-io-metrics/diagnostic-internode-http2-ping"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

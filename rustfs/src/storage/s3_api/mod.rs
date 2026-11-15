@@ -18,7 +18,10 @@
 //! until each helper is moved with dedicated small refactor steps.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::multipart_usecase::DefaultMultipartUsecase;
+pub(crate) use crate::app::bucket_usecase::{PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
+pub(crate) use crate::app::multipart_usecase::{
+    CreateMultipartUploadFields, DefaultMultipartUsecase, UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput,
+};
 pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
 pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 pub(crate) use crate::app::object::{PutObjectWriteInput, PutObjectWriteOutput, legacy_put_body};

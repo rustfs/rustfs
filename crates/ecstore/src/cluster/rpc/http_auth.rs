@@ -78,6 +78,9 @@ pub const RPC_BOOT_EPOCH_CHALLENGE_HEADER: &str = "x-rustfs-rpc-boot-epoch-chall
 pub const RPC_BOOT_EPOCH_PROOF_HEADER: &str = "x-rustfs-rpc-boot-epoch-proof";
 pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_HEADER: &str = "x-rustfs-rpc-replay-cache-capability";
 pub(crate) const RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-replay-cache-capability-proof";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-request";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-capability";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER: &str = "x-rustfs-rpc-msgpack-manifest-capability-proof";
 const RPC_REPLAY_SCOPE_VERSION_V3: &str = "3";
 const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 
@@ -124,6 +127,8 @@ const RPC_REPLAY_SCOPE_DOMAIN: &[u8] = b"rustfs-rpc-replay-scope-v3\0";
 const RPC_BOOT_EPOCH_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-boot-epoch-proof-v1\0";
 const RPC_REPLAY_CACHE_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-replay-cache-capability-proof-v1\0";
 const RPC_REPLAY_CACHE_CAPABILITY_V1: &str = "dynamic-replay-cache-v1";
+const RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-msgpack-manifest-capability-proof-v1\0";
+pub(crate) const RPC_MSGPACK_MANIFEST_CAPABILITY_V1: &str = "msgpack-compat-manifest-v1";
 const HTTP_PUT_FILE_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-auth-v1\0";
 const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capability-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -1238,6 +1243,50 @@ fn verify_replay_cache_capability_proof(
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC replay cache capability proof"))
 }
 
+fn update_msgpack_manifest_capability_proof(mac: &mut HmacSha256, audience: &str, challenge: Uuid, boot_epoch: Uuid) {
+    mac.update(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_DOMAIN);
+    for part in [
+        audience.as_bytes(),
+        b"|",
+        challenge.as_bytes(),
+        b"|",
+        boot_epoch.as_bytes(),
+        b"|",
+        RPC_MSGPACK_MANIFEST_CAPABILITY_V1.as_bytes(),
+    ] {
+        mac.update(part);
+    }
+}
+
+fn generate_msgpack_manifest_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+) -> std::io::Result<String> {
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_msgpack_manifest_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
+}
+
+fn verify_msgpack_manifest_capability_proof(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    proof: &str,
+) -> std::io::Result<()> {
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC msgpack manifest capability proof"))?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_msgpack_manifest_capability_proof(&mut mac, audience, challenge, boot_epoch);
+    mac.verify_slice(&proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid RPC msgpack manifest capability proof"))
+}
+
 fn non_nil_uuid(value: &str, name: &str) -> std::io::Result<Uuid> {
     let value = Uuid::parse_str(value).map_err(|_| std::io::Error::other(format!("Invalid {name}")))?;
     (!value.is_nil())
@@ -1337,8 +1386,24 @@ pub fn tonic_boot_epoch_challenge(headers: &HeaderMap) -> std::io::Result<Option
         .transpose()
 }
 
+/// Whether the request opts into the optional msgpack manifest capability proof.
+pub fn tonic_msgpack_manifest_capability_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER)
+        .is_some_and(|value| value == RPC_MSGPACK_MANIFEST_CAPABILITY_V1)
+}
+
 /// Build the authenticated response headers for a client boot-epoch challenge.
 pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std::io::Result<HeaderMap> {
+    tonic_boot_epoch_response_headers_with_msgpack_capability(audience, challenge, false)
+}
+
+/// Build authenticated boot-epoch headers and, when requested, the msgpack manifest capability.
+pub fn tonic_boot_epoch_response_headers_with_msgpack_capability(
+    audience: &str,
+    challenge: Uuid,
+    include_msgpack_manifest: bool,
+) -> std::io::Result<HeaderMap> {
     let boot_epoch = tonic_rpc_boot_epoch();
     let secret = get_shared_secret()?;
     let proof = generate_boot_epoch_proof(&secret, audience, challenge, boot_epoch)?;
@@ -1354,6 +1419,17 @@ pub fn tonic_boot_epoch_response_headers(audience: &str, challenge: Uuid) -> std
         RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
         header_value(&capability_proof, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)?,
     );
+    if include_msgpack_manifest {
+        let msgpack_capability_proof = generate_msgpack_manifest_capability_proof(&secret, audience, challenge, boot_epoch)?;
+        headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER,
+            HeaderValue::from_static(RPC_MSGPACK_MANIFEST_CAPABILITY_V1),
+        );
+        headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER,
+            header_value(&msgpack_capability_proof, RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER)?,
+        );
+    }
     Ok(headers)
 }
 
@@ -1387,6 +1463,12 @@ pub(crate) struct AuthenticatedPeerReplayCapabilities {
     pub(crate) dynamic_replay_cache: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPeerMsgpackCapabilities {
+    pub(crate) boot_epoch: Uuid,
+    pub(crate) msgpack_compat_manifest: bool,
+}
+
 pub(crate) fn verify_tonic_peer_replay_capabilities_response(
     audience: &str,
     challenge: Uuid,
@@ -1415,6 +1497,57 @@ pub(crate) fn verify_tonic_peer_replay_capabilities_response(
     Ok(AuthenticatedPeerReplayCapabilities {
         boot_epoch,
         dynamic_replay_cache: true,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn verify_tonic_peer_msgpack_capabilities_response(
+    audience: &str,
+    challenge: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    let secret = get_shared_secret()?;
+    let boot_epoch = verify_tonic_boot_epoch_response_with_secret(&secret, audience, challenge, headers)?;
+    verify_tonic_peer_msgpack_capability_for_epoch_with_secret(&secret, audience, challenge, boot_epoch, headers)
+}
+
+pub(crate) fn verify_tonic_peer_msgpack_capability_for_authenticated_epoch(
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    verify_tonic_peer_msgpack_capability_for_epoch_with_secret(&get_shared_secret()?, audience, challenge, boot_epoch, headers)
+}
+
+fn verify_tonic_peer_msgpack_capability_for_epoch_with_secret(
+    secret: &str,
+    audience: &str,
+    challenge: Uuid,
+    boot_epoch: Uuid,
+    headers: &HeaderMap,
+) -> std::io::Result<AuthenticatedPeerMsgpackCapabilities> {
+    let capability = headers.get(RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER);
+    let proof = headers.get(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER);
+    if capability.is_none() && proof.is_none() {
+        return Ok(AuthenticatedPeerMsgpackCapabilities {
+            boot_epoch,
+            msgpack_compat_manifest: false,
+        });
+    }
+    let capability = capability
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC msgpack manifest capability"))?;
+    if capability != RPC_MSGPACK_MANIFEST_CAPABILITY_V1 {
+        return Err(std::io::Error::other("Unsupported RPC msgpack manifest capability"));
+    }
+    let proof = proof
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| std::io::Error::other("Missing RPC msgpack manifest capability proof"))?;
+    verify_msgpack_manifest_capability_proof(secret, audience, challenge, boot_epoch, proof)?;
+    Ok(AuthenticatedPeerMsgpackCapabilities {
+        boot_epoch,
+        msgpack_compat_manifest: true,
     })
 }
 
@@ -3145,6 +3278,55 @@ mod tests {
         let mut changed_capability = headers;
         changed_capability.insert(RPC_REPLAY_CACHE_CAPABILITY_HEADER, HeaderValue::from_static("dynamic-replay-cache-v2"));
         assert!(verify_tonic_peer_replay_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
+    }
+
+    #[test]
+    fn msgpack_manifest_capability_is_requested_explicitly_and_proved_for_one_epoch() {
+        ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let mut request_headers = HeaderMap::new();
+        assert!(!tonic_msgpack_manifest_capability_requested(&request_headers));
+        request_headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+            HeaderValue::from_static(RPC_MSGPACK_MANIFEST_CAPABILITY_V1),
+        );
+        assert!(tonic_msgpack_manifest_capability_requested(&request_headers));
+        request_headers.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+            HeaderValue::from_static("msgpack-compat-manifest-v2"),
+        );
+        assert!(!tonic_msgpack_manifest_capability_requested(&request_headers));
+
+        let legacy_headers = tonic_boot_epoch_response_headers("node-a:9000", challenge).expect("legacy capability headers");
+        let legacy = verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &legacy_headers)
+            .expect("authenticated response without msgpack capability");
+        assert_eq!(legacy.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(!legacy.msgpack_compat_manifest);
+
+        let headers = tonic_boot_epoch_response_headers_with_msgpack_capability("node-a:9000", challenge, true)
+            .expect("msgpack capability headers");
+        let capability = verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &headers)
+            .expect("matching msgpack capability proof");
+        assert_eq!(capability.boot_epoch, tonic_rpc_boot_epoch());
+        assert!(capability.msgpack_compat_manifest);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-b:9000", challenge, &headers).is_err());
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", Uuid::new_v4(), &headers).is_err());
+
+        let mut changed_capability = headers.clone();
+        changed_capability.insert(
+            RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER,
+            HeaderValue::from_static("msgpack-compat-manifest-v2"),
+        );
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &changed_capability).is_err());
+        let mut forged_proof = headers;
+        forged_proof.insert(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER, HeaderValue::from_static("forged"));
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &forged_proof).is_err());
+        let mut missing_proof = forged_proof.clone();
+        missing_proof.remove(RPC_MSGPACK_MANIFEST_CAPABILITY_PROOF_HEADER);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &missing_proof).is_err());
+        let mut missing_value = forged_proof;
+        missing_value.remove(RPC_MSGPACK_MANIFEST_CAPABILITY_HEADER);
+        assert!(verify_tonic_peer_msgpack_capabilities_response("node-a:9000", challenge, &missing_value).is_err());
     }
 
     #[test]

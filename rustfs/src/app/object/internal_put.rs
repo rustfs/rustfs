@@ -337,7 +337,7 @@ impl DefaultObjectUsecase {
             },
         };
         let committed = self
-            .put_object_core(write, super::native_body::from_io_stream(body), start_time)
+            .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
             .map_err(|error| ApiError {
                 code: error.code().clone().into(),
