@@ -241,6 +241,21 @@ pub(crate) mod server {
                 AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
                 authorize_object_request, resolve_req_info,
             };
+
+            #[cfg(test)]
+            pub(crate) mod test_support {
+                pub(crate) use crate::storage::storage_api::access_consumer::{AuthorizationRequest, ReqInfo};
+                pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+                pub(crate) use crate::storage::storage_api::contract::object::ObjectOperations;
+                pub(crate) use crate::storage::storage_api::{
+                    FS, StorageObjectOptions as ObjectOptions, get_bucket_metadata, set_bucket_metadata,
+                };
+                pub(crate) use s3s::{
+                    S3Request,
+                    access::S3Access,
+                    dto::{ETag, ETagCondition, PutObjectInput},
+                };
+            }
         }
 
         pub(crate) mod rpc {

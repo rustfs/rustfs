@@ -13,14 +13,15 @@
 // limitations under the License.
 
 //! The gateway operations of migration batch A2 (rustfs/backlog#2765): bucket policy, policy status, versioning, notification and ACL.
-//! None is served yet; the batch appends its rows here.
 
+use super::access::authorize_bucket_config_mutation;
 use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
+use rustfs_gateway_types::persistence::{parse_versioning, serialize_versioning_dto};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -28,9 +29,11 @@ use std::sync::Arc;
 
 pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketVersioning>(),
+    row::<dto::PutBucketVersioning>(),
     row::<dto::GetBucketPolicy>(),
     row::<dto::GetBucketPolicyStatus>(),
     row::<dto::GetBucketAcl>(),
+    row::<dto::GetBucketNotificationConfiguration>(),
 ];
 
 impl Served for dto::GetBucketVersioning {
@@ -44,6 +47,25 @@ impl Served for dto::GetBucketVersioning {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_get_bucket_versioning(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::PutBucketVersioning {
+    const METRIC: S3Operation = S3Operation::PutBucketVersioning;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketVersioningAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let prepared = parse_versioning(&serialize_versioning_dto(&input.versioning_configuration))
+            .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"));
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_versioning(envelope, input.bucket.as_str(), prepared)
             .await?;
         Ok(Resp::new(output))
     }
@@ -92,6 +114,22 @@ impl Served for dto::GetBucketAcl {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_get_bucket_acl(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketNotificationConfiguration {
+    const METRIC: S3Operation = S3Operation::GetBucketNotificationConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketNotificationAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_notification_configuration(request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

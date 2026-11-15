@@ -13,19 +13,21 @@
 // limitations under the License.
 
 //! The gateway operations of migration batch C (rustfs/backlog#2765): GetObject, HeadObject and GetObjectAttributes.
-//! HeadObject is served; the batch appends the remaining rows here.
+//! GetObject and HeadObject are served; the batch appends the remaining rows here.
 
 use super::{OpRow, Served, resp, row};
-use crate::app::object_usecase::{DefaultObjectUsecase, HeadObjectOutputFacts, ResponseEtag};
+use crate::app::object_usecase::{
+    DefaultObjectUsecase, GetObjectBody, GetObjectOutputFacts, HeadObjectOutputFacts, ResponseEtag,
+};
 use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::object_read::authorize_head_object;
+use crate::storage_api::server::http::access::access_owned::object_read::{authorize_get_object, authorize_head_object};
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3ErrorCode, S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::HeadObject>()];
+pub(super) const ROWS: &[OpRow] = &[row::<dto::GetObject>(), row::<dto::HeadObject>()];
 
 impl Served for dto::HeadObject {
     const METRIC: S3Operation = S3Operation::HeadObject;
@@ -52,14 +54,91 @@ impl Served for dto::HeadObject {
     }
 }
 
+impl Served for dto::GetObject {
+    const METRIC: S3Operation = S3Operation::GetObject;
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        let server_ctx = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| s3_error!(InternalError, "server context is missing"))?;
+        Ok(authorize_get_object(
+            &server_ctx,
+            envelope,
+            input.bucket.as_str(),
+            input.key.as_str(),
+            input.version_id.as_deref(),
+        )
+        .await?)
+    }
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        get_result(
+            DefaultObjectUsecase::with_context(context)
+                .execute_get_object(envelope, request.into_input())
+                .await,
+        )
+    }
+}
+
+fn get_result(result: S3Result<Answered<GetObjectOutputFacts>>) -> S3Result<Resp<dto::GetObject>> {
+    match result {
+        Ok(answered) => get_response(answered),
+        Err(error) if is_not_modified(&error) => Ok(Resp::with_status(dto::GetObjectOutput::default(), 304)
+            .with_extra_headers(error.into_parts().headers.unwrap_or_default())),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_not_modified(error: &rustfs_s3_types::S3Error) -> bool {
+    error.code() == &S3ErrorCode::NotModified && error.status_code() == Some(http::StatusCode::NOT_MODIFIED)
+}
+
+pub(super) fn get_response(answered: Answered<GetObjectOutputFacts>) -> S3Result<Resp<dto::GetObject>> {
+    let Answered {
+        mut output,
+        status,
+        mut headers,
+    } = answered;
+    insert_etag(&mut headers, output.etag)
+        .map_err(|_| s3_error!(InternalError, "We encountered an internal error. Please try again."))?;
+    output.dto.body = output
+        .body
+        .map(|body| match body {
+            GetObjectBody::Bytes(bytes) => Ok(rustfs_gateway_stream::ByteStream::from_bytes(bytes)),
+            GetObjectBody::Stream(stream) => rustfs_gateway_stream::ByteStream::new(stream)
+                .map_err(|_| s3_error!(InternalError, "Invalid GetObject body capabilities")),
+        })
+        .transpose()?;
+    // Range encoding follows use-case completion; the legacy typed answer has no override.
+    let status = status.or_else(|| output.dto.content_range.as_ref().map(|_| http::StatusCode::PARTIAL_CONTENT));
+    Ok(resp::<dto::GetObject>(Answered {
+        output: output.dto,
+        status,
+        headers,
+    }))
+}
+
+fn insert_etag(headers: &mut http::HeaderMap, etag: Option<ResponseEtag>) -> S3Result<()> {
+    if let Some(ResponseEtag { opaque, weak }) = etag {
+        let value = if weak {
+            format!("W/\"{}\"", opaque)
+        } else {
+            format!("\"{}\"", opaque)
+        };
+        headers.insert(
+            http::header::ETAG,
+            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
+        );
+    }
+    Ok(())
+}
+
 /// The use case has already recorded this conditional refusal as an error. Preserve its
 /// completed response without re-parsing the stored headers through the generic error codec.
 fn head_result(result: S3Result<Answered<HeadObjectOutputFacts>>) -> S3Result<Resp<dto::HeadObject>> {
     match result {
         Ok(answered) => head_response(answered),
-        Err(error)
-            if error.code() == &S3ErrorCode::NotModified && error.status_code() == Some(http::StatusCode::NOT_MODIFIED) =>
-        {
+        Err(error) if is_not_modified(&error) => {
             let parts = error.into_parts();
             Ok(Resp::with_status(dto::HeadObjectOutput::default(), 304).with_extra_headers(parts.headers.unwrap_or_default()))
         }
@@ -74,17 +153,7 @@ pub(super) fn head_response(answered: Answered<HeadObjectOutputFacts>) -> S3Resu
         status,
         mut headers,
     } = answered;
-    if let Some(ResponseEtag { opaque, weak }) = output.etag {
-        let value = if weak {
-            format!("W/\"{}\"", opaque)
-        } else {
-            format!("\"{}\"", opaque)
-        };
-        headers.insert(
-            http::header::ETAG,
-            http::HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "Invalid stored ETag header"))?,
-        );
-    }
+    insert_etag(&mut headers, output.etag)?;
     Ok(resp::<dto::HeadObject>(Answered {
         output: output.dto,
         status,
@@ -95,6 +164,93 @@ pub(super) fn head_response(answered: Answered<HeadObjectOutputFacts>) -> S3Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_terminal_304_settles_without_a_body() {
+        for status in [None, Some(http::StatusCode::NOT_MODIFIED)] {
+            let mut error = rustfs_s3_types::S3Error::new(S3ErrorCode::NotModified);
+            if let Some(status) = status {
+                error.set_status_code(status);
+            }
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::ETAG, http::HeaderValue::from_static("\"stored\""));
+            error.set_headers(headers.clone());
+            let (answer, status, actual) = get_result(Err(error)).unwrap().into_parts();
+            let rustfs_gateway::Answer::Settled(output) = answer else {
+                panic!("a conditional GET must settle before body handoff");
+            };
+            assert_eq!(status, 304);
+            assert_eq!(actual, headers);
+            assert!(output.body.is_none());
+        }
+    }
+
+    #[test]
+    fn get_terminal_304_requires_both_code_and_status() {
+        for (code, status) in [
+            (S3ErrorCode::NotModified, http::StatusCode::BAD_REQUEST),
+            (S3ErrorCode::AccessDenied, http::StatusCode::NOT_MODIFIED),
+            (S3ErrorCode::InternalError, http::StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let mut error = rustfs_s3_types::S3Error::new(code.clone());
+            error.set_status_code(status);
+            let Err(error) = get_result(Err(error)) else {
+                panic!("unrelated refusal stays an error");
+            };
+            assert_eq!(error.code(), &code);
+            assert_eq!(error.status_code(), Some(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_response_handoff_retains_bytes_for_both_body_shapes() {
+        use http_body_util::BodyExt as _;
+        use rustfs_gateway_stream::ByteStream;
+        for streaming in [false, true] {
+            let bytes = bytes::Bytes::from(vec![b'x'; 8193]);
+            let address = bytes.as_ptr();
+            let body = if streaming {
+                GetObjectBody::Stream(Box::pin(ByteStream::from_bytes(bytes.clone())))
+            } else {
+                GetObjectBody::Bytes(bytes.clone())
+            };
+            let response = get_response(Answered::new(GetObjectOutputFacts {
+                dto: dto::GetObjectOutput {
+                    content_length: Some(bytes.len() as i64),
+                    ..Default::default()
+                },
+                body: Some(body),
+                ..Default::default()
+            }))
+            .unwrap();
+            let (output, status, _) = response.into_parts();
+            assert_eq!(status, 200);
+            let rustfs_gateway::Answer::Settled(output) = output else {
+                panic!("GET must settle its response before body handoff");
+            };
+            let mut body = output.body.unwrap().into_body();
+            let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(frame.as_ptr(), address);
+            assert_eq!(frame, bytes);
+            assert!(body.frame().await.is_none());
+        }
+    }
+
+    #[test]
+    fn get_range_status_changes_only_at_the_wire_edge() {
+        for status in [None, Some(http::StatusCode::ACCEPTED)] {
+            let mut answered = Answered::new(GetObjectOutputFacts {
+                dto: dto::GetObjectOutput {
+                    content_range: Some("bytes 1-3/7".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            answered.status = status;
+            let (_, actual, _) = get_response(answered).unwrap().into_parts();
+            assert_eq!(actual, status.map_or(206, |status| status.as_u16()));
+        }
+    }
 
     #[test]
     fn head_terminal_304_uses_the_resolved_status() {

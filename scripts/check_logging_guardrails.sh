@@ -1091,7 +1091,7 @@ trace_hot_spans=(
   # directly (backlog#1821). Sets and SetDisks no longer paginate; ECStore is
   # the only listing entry point.
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
-  "rustfs/src/app/object:execute_get_object"
+  "rustfs/src/app/object:execute_get_object_fields"
 )
 
 # A hot span in a file that is due for a mechanical split (rustfs/backlog#2765)
