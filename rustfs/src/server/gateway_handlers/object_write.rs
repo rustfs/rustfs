@@ -180,14 +180,14 @@ fn native_part_output(output: UploadPartWriteOutput) -> S3Result<Resp<dto::Uploa
     Ok(Resp::new(dto).with_extra_headers(headers))
 }
 
-// PutObject's destination version is a RustFS replication extension, absent from the AWS DTO.
-fn request_version_id(envelope: &RequestEnvelope) -> Option<String> {
+// The destination version is a RustFS replication extension absent from the AWS DTOs.
+pub(super) fn request_version_id(envelope: &RequestEnvelope) -> Option<String> {
     url::form_urlencoded::parse(envelope.uri().query()?.as_bytes())
         .find(|(name, _)| name == "versionId")
         .map(|(_, value)| value.into_owned())
 }
 
-fn retain_until(value: Option<&Timestamp>) -> S3Result<Option<time::OffsetDateTime>> {
+pub(super) fn retain_until(value: Option<&Timestamp>) -> S3Result<Option<time::OffsetDateTime>> {
     value
         .map(|value| {
             time::OffsetDateTime::from_unix_timestamp_nanos(

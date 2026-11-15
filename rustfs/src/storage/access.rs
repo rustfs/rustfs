@@ -3441,28 +3441,21 @@ impl S3Access for FS {
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+        use access_owned::listing_multipart::{CreateMultipartAuthorization, authorize_create_multipart_upload};
+
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
-
-        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-
-        authorize_replication_only_put_headers(req).await?;
-
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-        }
-
-        req.install_bucket_generation(bucket_generation?);
+        let key = req.input.key.clone();
+        let query_version = req.input.version_id.clone();
+        let retain_until = req.input.object_lock_retain_until_date.clone().map(OffsetDateTime::from);
+        let facts = CreateMultipartAuthorization {
+            bucket: &bucket,
+            key: &key,
+            query_version: query_version.as_deref(),
+            retain_until,
+            legal_hold_present: req.input.object_lock_legal_hold_status.is_some(),
+            retention_present: req.input.object_lock_mode.is_some() || retain_until.is_some(),
+        };
+        authorize_create_multipart_upload(self.server_ctx(), req, facts).await?;
         Ok(())
     }
 

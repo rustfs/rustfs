@@ -84,8 +84,7 @@ use crate::app::object_data_cache::{
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
-    validate_existing_object_lock_for_write,
+    apply_quota_admission, map_quota_check_outcome, s3s_body_error_to_io, validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -130,6 +129,8 @@ use uuid::Uuid;
 mod abort;
 mod complete;
 mod create;
+mod create_values;
+pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
 #[cfg(test)]
 mod test_support;
@@ -538,7 +539,7 @@ mod tests {
                 .build()
                 .expect("valid create request DTO");
             let error = make_usecase()
-                .execute_create_multipart_upload(build_request(create, Method::POST))
+                .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
                 .await
                 .expect_err("reserved key must be rejected before accessing storage");
             assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
