@@ -6058,14 +6058,28 @@ fn inline_body_fits_buffer(size: usize, block_size: usize) -> bool {
         && size.div_ceil(block_size) <= INLINE_FAST_PATH_MAX_BLOCKS
 }
 
-fn inline_put_fits_buffer(stored_size: i64, actual_size: i64, block_size: usize, protected: bool) -> bool {
-    let admission_size = if stored_size >= 0 || protected {
+fn should_inline_put(
+    storage_class: &crate::config::storageclass::Config,
+    erasure: &coding::Erasure,
+    stored_size: i64,
+    actual_size: i64,
+    versioned: bool,
+    protected: bool,
+) -> bool {
+    let admission_size = if stored_size >= 0 {
         stored_size
-    } else {
+    } else if !protected && actual_size > 0 {
         actual_size
+    } else {
+        return false;
     };
-    usize::try_from(admission_size)
-        .is_ok_and(|size| size <= block_size || (stored_size >= 0 && !protected && inline_body_fits_buffer(size, block_size)))
+    let Ok(size) = usize::try_from(admission_size) else {
+        return false;
+    };
+    if size > erasure.block_size && (stored_size < 0 || protected || !inline_body_fits_buffer(size, erasure.block_size)) {
+        return false;
+    }
+    storage_class.should_inline(erasure.shard_file_size(admission_size), erasure.data_shards, versioned)
 }
 
 fn inline_body_buffering_miss_reason(fi: &FileInfo) -> Option<&'static str> {
@@ -6187,24 +6201,6 @@ fn known_put_object_storage_size(data_size: i64) -> i64 {
     }
 }
 
-/// Shard size the inline admission check evaluates for a single PUT.
-///
-/// A compressed or encrypted stream reports `SIZE_PRESERVE_LAYER` as its
-/// stored size because the transformed length is only known after the write.
-/// MinIO's `putObject` sizes such objects for inline admission by their
-/// plaintext `ActualSize`; without that fallback every transformed object,
-/// however small, lands in `part.1` files. A stream with neither size known
-/// yields a negative shard size, which `should_inline` rejects.
-fn inline_admission_shard_size(erasure: &coding::Erasure, stored_size: i64, actual_size: i64) -> i64 {
-    if stored_size >= 0 {
-        return erasure.shard_file_size(stored_size);
-    }
-    if actual_size > 0 {
-        return erasure.shard_file_size(actual_size);
-    }
-    HashReader::SIZE_PRESERVE_LAYER
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers(
     files: &[FileInfo],
@@ -6274,6 +6270,76 @@ async fn build_inline_bitrot_readers_from_refs(
     Ok(readers)
 }
 
+/// Resolve the bitrot checksum algorithm for one part, honoring the legacy
+/// HighwayHash flag.
+fn part_checksum_algorithm(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
+    let checksum_info = fi.erasure.get_checksum_info(part_number);
+    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    }
+}
+
+/// Decode already identity-checked data shards without reader wrappers or RS.
+/// A failed frame leaves recovery to the caller's ordinary erasure reader.
+fn try_decode_inline_data_shards(
+    _object: &str,
+    fi: &FileInfo,
+    data_files: &[&FileInfo],
+    skip_verify_bitrot: bool,
+) -> Option<Bytes> {
+    if inline_body_buffering_miss_reason(fi).is_some() {
+        return None;
+    }
+    let object_size = usize::try_from(fi.size).ok()?;
+    let part = fi.parts.first()?;
+    let data_shards = fi.erasure.data_blocks;
+    if fi.parts.len() != 1 || part.size != object_size || data_files.len() < data_shards {
+        return None;
+    }
+    let shard_size = inline_erasure_shard_size(fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+    if shard_size == 0 {
+        return None;
+    }
+    let checksum_algo = part_checksum_algorithm(fi, part.number);
+    let hash_size = checksum_algo.size();
+    let stride = shard_size.checked_add(hash_size)?;
+    #[cfg(test)]
+    {
+        for _ in data_files.iter().take(data_shards) {
+            disk_call_counters::record_shard_open(_object, true);
+        }
+        disk_call_counters::record(_object, disk_call_counters::KIND_BODY_DECODE, 0);
+    }
+    let mut body = Vec::with_capacity(object_size);
+    for (frame, offset) in (0..object_size).step_by(fi.erasure.block_size).enumerate() {
+        let block_length = fi.erasure.block_size.min(object_size - offset);
+        let read_length =
+            inline_erasure_shard_file_size(block_length, fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+        if read_length == 0 || read_length > shard_size {
+            return None;
+        }
+        let start = frame.checked_mul(stride)?;
+        let end = start.checked_add(hash_size)?.checked_add(read_length)?;
+        let mut remaining = block_length;
+        for file in data_files.iter().take(block_length.div_ceil(read_length)) {
+            let block = file.data.as_deref()?.get(start..end)?;
+            let (hash, data) = block.split_at(hash_size);
+            if hash_size > 0 && !skip_verify_bitrot && checksum_algo.hash_encode(data).as_ref() != hash {
+                return None;
+            }
+            let take = remaining.min(data.len());
+            body.extend_from_slice(&data[..take]);
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return None;
+        }
+    }
+    Some(Bytes::from(body))
+}
+
 async fn try_read_inline_data_shards_direct(
     readers: &mut [Option<InlineBitrotReader>],
     data_shards: usize,
@@ -6312,10 +6378,6 @@ async fn try_read_inline_data_shards_direct(
     None
 }
 
-fn can_try_inline_data_shards_direct(object_size: usize, block_size: usize) -> bool {
-    object_size > 0 && object_size <= block_size
-}
-
 fn inline_erasure_shard_size(block_size: usize, data_shards: usize, uses_legacy: bool) -> usize {
     if block_size == 0 || data_shards == 0 {
         return 0;
@@ -6344,31 +6406,14 @@ fn inline_erasure_shard_file_size(total_length: usize, block_size: usize, data_s
     num_shards * shard_size + last_shard_size
 }
 
-fn inline_erasure_shard_file_offset(
-    start_offset: usize,
-    length: usize,
-    total_length: usize,
-    block_size: usize,
-    data_shards: usize,
-    uses_legacy: bool,
-) -> usize {
-    if block_size == 0 || data_shards == 0 {
-        return 0;
-    }
-
-    let shard_size = inline_erasure_shard_size(block_size, data_shards, uses_legacy);
-    let shard_file_size = inline_erasure_shard_file_size(total_length, block_size, data_shards, uses_legacy);
-    let end_shard = (start_offset + length) / block_size;
-    let till_offset = end_shard * shard_size + shard_size;
-    till_offset.min(shard_file_size)
-}
+type InlineDataShardFiles<'a> = smallvec::SmallVec<[&'a FileInfo; shard_source::INLINE_SHARD_SLOTS]>;
 
 fn collect_inline_data_shard_fileinfos_by_index<'a>(
     parts_metadata: &'a [FileInfo],
     fi: &FileInfo,
     data_shards: usize,
     disk_is_online: impl FnMut(usize) -> bool,
-) -> Option<Vec<&'a FileInfo>> {
+) -> Option<InlineDataShardFiles<'a>> {
     collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, fi, data_shards, disk_is_online).ok()
 }
 
@@ -6377,7 +6422,7 @@ fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
     fi: &FileInfo,
     data_shards: usize,
     disk_is_online: impl FnMut(usize) -> bool,
-) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
+) -> std::result::Result<InlineDataShardFiles<'a>, &'static str> {
     collect_inline_data_shard_fileinfos_from_observations(
         parts_metadata
             .iter()
@@ -6394,9 +6439,13 @@ fn collect_inline_data_shard_fileinfos_from_observations<'a>(
     fi: &FileInfo,
     data_shards: usize,
     mut disk_is_online: impl FnMut(usize) -> bool,
-) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
+) -> std::result::Result<InlineDataShardFiles<'a>, &'static str> {
     let distribution = &fi.erasure.distribution;
-    let mut data_files = vec![None; data_shards];
+    if data_shards == 0 || data_shards != fi.erasure.data_blocks || data_shards > distribution.len() {
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+    }
+    let mut data_files: smallvec::SmallVec<[Option<&FileInfo>; shard_source::INLINE_SHARD_SLOTS]> =
+        smallvec::smallvec![None; data_shards];
 
     for (disk_index, file_info) in observations {
         if !disk_is_online(disk_index) {
@@ -6429,7 +6478,7 @@ fn collect_inline_data_shard_fileinfos_from_observations<'a>(
 
     data_files
         .into_iter()
-        .collect::<Option<Vec<_>>>()
+        .collect::<Option<InlineDataShardFiles<'_>>>()
         .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD)
 }
 
@@ -7401,12 +7450,10 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
         return Err(DiskError::FileCorrupt);
     };
     let data = meta.data.as_deref().ok_or(DiskError::FileCorrupt)?;
-    let checksum = meta.erasure.get_checksum_info(part.number);
-    let algo = match checksum.algorithm {
-        HashAlgorithm::HighwayHash256S if meta.uses_legacy_checksum => HashAlgorithm::HighwayHash256SLegacy,
-        algo @ (HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy) => algo,
-        _ => return Err(DiskError::BitrotHashAlgoInvalid),
-    };
+    let algo = part_checksum_algorithm(meta, part.number);
+    if !matches!(algo, HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy) {
+        return Err(DiskError::BitrotHashAlgoInvalid);
+    }
     let shard_size = inline_erasure_shard_size(meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
     let part_size =
         inline_erasure_shard_file_size(part.size, meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
@@ -15151,15 +15198,23 @@ mod tests {
     #[test]
     fn inline_put_admission_bounds_only_the_multi_block_extension() {
         let block = 1024 * 1024;
-        assert!(inline_put_fits_buffer(1280 * 1024, 1280 * 1024, block, false));
-        assert!(!inline_put_fits_buffer(1280 * 1024, 1280 * 1024, block, true));
-        assert!(!inline_put_fits_buffer(-1, 1280 * 1024, block, false));
-        assert!(inline_put_fits_buffer(-1, block as i64, block, false));
-        assert!(!inline_put_fits_buffer(-1, block as i64, block, true));
-        assert!(!inline_put_fits_buffer(2 * 1024 * 1024 + 1, 0, block, false));
-        assert!(inline_put_fits_buffer(32 * 4096, 0, 4096, false));
-        assert!(!inline_put_fits_buffer(32 * 4096 + 1, 0, 4096, false));
-        assert!(inline_put_fits_buffer(0, 0, block, false));
+        let config = crate::config::storageclass::Config::default();
+        let erasure = coding::Erasure::new(12, 4, block);
+        let admits = |stored, actual, protected| should_inline_put(&config, &erasure, stored, actual, false, protected);
+        assert!(admits(1280 * 1024, 1280 * 1024, false));
+        assert!(!admits(1280 * 1024, 1280 * 1024, true));
+        assert!(!admits(-1, 1280 * 1024, false));
+        assert!(admits(-1, block as i64, false));
+        assert!(!admits(-1, block as i64, true));
+        assert!(!admits(2 * 1024 * 1024 + 1, 0, false));
+        assert!(admits(0, 0, false));
+        assert!(admits(1_572_856, 0, false));
+        assert!(!admits(1_572_857, 0, false));
+        assert!(should_inline_put(&config, &erasure, 196_608, 0, true, false));
+        assert!(!should_inline_put(&config, &erasure, 196_609, 0, true, false));
+        let small_blocks = coding::Erasure::new(12, 4, 4096);
+        assert!(should_inline_put(&config, &small_blocks, 32 * 4096, 0, false, false));
+        assert!(!should_inline_put(&config, &small_blocks, 32 * 4096 + 1, 0, false, false));
     }
 
     #[test]
@@ -15223,6 +15278,72 @@ mod tests {
         ];
 
         assert!(collect_inline_data_shard_fileinfos_by_index(&files, &fi, 2, |_| true).is_none());
+        assert_eq!(
+            collect_inline_data_shard_fileinfos_by_index_or_reason(&files, &fi, usize::MAX, |_| true).expect_err("invalid count"),
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_frame_decoder_handles_legacy_padding_hashes_and_unhashed_parts() {
+        let payload = b"abcdefghijk";
+        for (legacy, algorithm) in [
+            (false, HashAlgorithm::HighwayHash256S),
+            (true, HashAlgorithm::HighwayHash256SLegacy),
+            (false, HashAlgorithm::None),
+        ] {
+            let erasure = coding::Erasure::new_with_options(2, 2, 8, legacy);
+            let mut writers: Vec<_> = (0..4)
+                .map(|_| {
+                    coding::BitrotWriterWrapper::new(
+                        coding::CustomWriter::new_inline_buffer(),
+                        erasure.shard_size(),
+                        algorithm.clone(),
+                    )
+                })
+                .collect();
+            for block in payload.chunks(8) {
+                let shards = erasure.encode_data(block).expect("encode golden frame");
+                for (writer, shard) in writers.iter_mut().zip(shards) {
+                    writer.write(&shard).await.expect("write golden frame");
+                }
+            }
+            let mut info = FileInfo::new("bucket/object", 2, 2);
+            info.size = payload.len() as i64;
+            info.erasure.block_size = 8;
+            info.uses_legacy_checksum = legacy;
+            info.add_object_part(1, "etag".to_owned(), payload.len(), None, info.size, None, None);
+            info.erasure.checksums = vec![rustfs_filemeta::ChecksumInfo {
+                part_number: 1,
+                algorithm: algorithm.clone(),
+                ..Default::default()
+            }];
+            let mut files: Vec<_> = writers
+                .into_iter()
+                .enumerate()
+                .map(|(index, writer)| {
+                    let mut file = info.clone();
+                    file.erasure.index = index + 1;
+                    file.data = writer.into_inline_data();
+                    file
+                })
+                .collect();
+            let refs = [&files[0], &files[1]];
+            let body = try_decode_inline_data_shards("golden", &info, &refs, false).expect("decode every golden frame");
+            assert_eq!(body.as_ref(), payload);
+            let original = files[0].data.as_ref().expect("first data shard").clone();
+            let mut truncated = original.to_vec();
+            truncated.pop();
+            files[0].data = Some(Bytes::from(truncated));
+            assert!(try_decode_inline_data_shards("truncated", &info, &[&files[0], &files[1]], false).is_none());
+            if algorithm.size() > 0 {
+                let mut corrupt = original.to_vec();
+                corrupt[erasure.shard_size() + 2 * algorithm.size()] ^= 1;
+                files[0].data = Some(Bytes::from(corrupt));
+                assert!(try_decode_inline_data_shards("corrupt", &info, &[&files[0], &files[1]], false).is_none());
+                assert!(try_decode_inline_data_shards("diagnostic", &info, &[&files[0], &files[1]], true).is_some());
+            }
+        }
     }
 
     #[tokio::test]
@@ -15305,31 +15426,17 @@ mod tests {
     }
 
     #[test]
-    fn inline_data_shards_direct_read_requires_single_block() {
-        assert!(can_try_inline_data_shards_direct(1024, 1024));
-        assert!(!can_try_inline_data_shards_direct(0, 1024));
-        assert!(!can_try_inline_data_shards_direct(1025, 1024));
-    }
-
-    #[test]
-    fn inline_erasure_offset_helpers_match_erasure_methods() {
+    fn inline_erasure_size_helpers_match_erasure_methods() {
         for uses_legacy in [false, true] {
             let erasure = coding::Erasure::new_with_options(4, 2, 1024 * 1024, uses_legacy);
-            for object_size in [1usize, 1024, 100 * 1024, 1024 * 1024] {
+            for object_size in [1usize, 1024, 100 * 1024, 1024 * 1024, 1024 * 1024 + 1, 2 * 1024 * 1024 + 1] {
                 assert_eq!(
                     inline_erasure_shard_size(erasure.block_size, erasure.data_shards, uses_legacy),
                     erasure.shard_size()
                 );
                 assert_eq!(
-                    inline_erasure_shard_file_offset(
-                        0,
-                        object_size,
-                        object_size,
-                        erasure.block_size,
-                        erasure.data_shards,
-                        uses_legacy,
-                    ),
-                    erasure.shard_file_offset(0, object_size, object_size)
+                    inline_erasure_shard_file_size(object_size, erasure.block_size, erasure.data_shards, uses_legacy),
+                    usize::try_from(erasure.shard_file_size(object_size as i64)).expect("test shard size")
                 );
             }
         }
@@ -15850,25 +15957,14 @@ mod tests {
 
     #[test]
     fn inline_admission_falls_back_to_actual_size_for_transformed_streams() {
+        let config = crate::config::storageclass::Config::default();
         let erasure = coding::Erasure::new(2, 2, 1024 * 1024);
         let unknown = HashReader::SIZE_PRESERVE_LAYER;
-
-        // A known stored size is authoritative, whatever the plaintext size says.
-        assert_eq!(
-            inline_admission_shard_size(&erasure, 16 * 1024, 4 * 1024 * 1024),
-            erasure.shard_file_size(16 * 1024)
-        );
-        assert_eq!(inline_admission_shard_size(&erasure, 0, 4 * 1024), 0);
-
-        // A transformed stream is sized by its plaintext length (MinIO parity).
-        assert_eq!(
-            inline_admission_shard_size(&erasure, unknown, 16 * 1024),
-            erasure.shard_file_size(16 * 1024)
-        );
-
-        // Neither size known, or an empty transformed stream, cannot be admitted.
-        assert!(inline_admission_shard_size(&erasure, unknown, 0) < 0);
-        assert!(inline_admission_shard_size(&erasure, unknown, unknown) < 0);
+        assert!(should_inline_put(&config, &erasure, 16 * 1024, 4 * 1024 * 1024, false, false));
+        assert!(should_inline_put(&config, &erasure, 0, 4 * 1024, false, false));
+        assert!(should_inline_put(&config, &erasure, unknown, 16 * 1024, false, false));
+        assert!(!should_inline_put(&config, &erasure, unknown, 0, false, false));
+        assert!(!should_inline_put(&config, &erasure, unknown, unknown, false, false));
     }
 
     #[test]

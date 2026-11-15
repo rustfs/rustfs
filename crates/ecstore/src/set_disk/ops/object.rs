@@ -43,28 +43,26 @@ use super::super::{
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID,
     SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
-    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers,
-    build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct, check_object_lock_delete,
+    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers, check_object_lock_delete,
     check_object_lock_for_deletion_with_state, check_object_lock_retention_update, classify_get_codec_streaming_object_class,
     classify_put_write_path, classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
     create_bitrot_writer_with_orig_volume, debug, delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error,
     explicit_delete_removed_marker, finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan,
     get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
     get_small_object_direct_memory_threshold, get_stage_timer_if_enabled, get_str,
-    get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, inline_put_fits_buffer, insert_str, is_deadlock_detection_enabled, is_err_object_not_found,
+    get_transitioned_object_reader_with_tier_manager, insert_str, is_deadlock_detection_enabled, is_err_object_not_found,
     is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
     is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
+    known_put_object_storage_size, part_checksum_algorithm, path_join_buf, put_restore_opts, record_compression_total_memory,
     record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
     record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
     republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
     resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
     restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
-    should_force_delete_marker_for_missing_version, should_persist_encryption_original_size,
+    should_force_delete_marker_for_missing_version, should_inline_put, should_persist_encryption_original_size,
     should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan, take_prepared_get_object_metadata,
-    to_object_err, try_read_inline_data_shards_direct, warn,
+    to_object_err, try_decode_inline_data_shards, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::delete_recovery::DeleteRecoveryContext;
@@ -3096,116 +3094,109 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // requests do not pay for part and transform scans they cannot use.
         let read_path_plan = ReadPathPlan::new(&object_info, fi);
 
-        // Inline data fast path: skip duplex pipe for small inline objects.
-        // Uses the shared predicate from ObjectInfo; additionally checks that
-        // inline data is actually present and neither range nor partNumber is
-        // in flight.
-        let use_inline_fast_path = object_info.is_inline_fast_path_eligible()
-            && fi.data.is_some()
-            && range.is_none()
-            && opts.part_number.is_none()
-            && should_use_inline_fast_path_with_plan(&range, &object_info, fi, opts, read_path_plan);
-        if use_inline_fast_path {
-            let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        // A verified snapshot and a full metadata fanout share one bounded
+        // systematic decoder. Recovery keeps the normal erasure reader.
+        if should_use_inline_fast_path_with_plan(&range, &object_info, fi, opts, read_path_plan) {
             let data_shards = fi.erasure.data_blocks;
-
             let object_size = usize::try_from(fi.size)
                 .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
-
-            if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
-                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_INLINE_PREPARE,
-                        object_class.as_str(),
-                        size_bucket,
-                        inline_prepare_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
-                if rustfs_io_metrics::get_stage_metrics_enabled() {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_READER_SETUP,
-                        object_class.as_str(),
-                        size_bucket,
-                        0.0,
-                    );
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_DECODE,
-                        object_class.as_str(),
-                        size_bucket,
-                        0.0,
-                    );
-                }
-                record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                let reader = GetObjectReader {
-                    stream: Box::new(Cursor::new(body.clone())),
-                    object_info,
-                    buffered_body: Some(body),
-                    body_source: GetObjectBodySource::Unprobed,
-                };
-                return Ok(reader);
-            }
-
-            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
-            let checksum_algo =
-                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
-
-            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
-                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
+            let inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let verified_body = verified_inline_body.filter(|body| body.len() == object_size);
+            let reused_verified_body = verified_body.is_some();
+            let data_files = if reused_verified_body {
+                None
+            } else {
+                collect_inline_data_shard_fileinfos_by_index(files, fi, data_shards, |index| {
                     disks.get(index).is_some_and(Option::is_some)
                 })
-            {
-                let read_length = inline_erasure_shard_file_offset(
-                    0,
-                    object_size,
-                    object_size,
-                    fi.erasure.block_size,
-                    data_shards,
-                    fi.uses_legacy_checksum,
+            };
+            if let Some(start) = inline_prepare_stage_start {
+                rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                    GET_OBJECT_PATH_INLINE_DIRECT,
+                    GET_STAGE_INLINE_PREPARE,
+                    object_class.as_str(),
+                    size_bucket,
+                    start.elapsed().as_secs_f64(),
                 );
-                let shard_size = inline_erasure_shard_size(fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
-                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_INLINE_PREPARE,
-                        object_class.as_str(),
-                        size_bucket,
-                        inline_prepare_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
-                let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let mut readers = build_inline_bitrot_readers_from_refs(
-                    &data_files,
-                    bucket,
-                    object,
-                    read_length,
-                    shard_size,
-                    &checksum_algo,
-                    opts.skip_verify_bitrot,
-                )
-                .await?;
-                if let Some(reader_setup_stage_start) = reader_setup_stage_start {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_READER_SETUP,
-                        object_class.as_str(),
-                        size_bucket,
-                        reader_setup_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
+            }
+            let attempted_systematic_decode = data_files.is_some();
+            let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let mut body = verified_body.or_else(|| {
+                data_files.and_then(|files| try_decode_inline_data_shards(object, fi, &files, opts.skip_verify_bitrot))
+            });
+            if (reused_verified_body || attempted_systematic_decode)
+                && let Some(start) = decode_stage_start
+            {
+                rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                    GET_OBJECT_PATH_INLINE_DIRECT,
+                    GET_STAGE_READER_SETUP,
+                    object_class.as_str(),
+                    size_bucket,
+                    0.0,
+                );
+                rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                    GET_OBJECT_PATH_INLINE_DIRECT,
+                    GET_STAGE_DECODE,
+                    object_class.as_str(),
+                    size_bucket,
+                    if reused_verified_body {
+                        0.0
+                    } else {
+                        start.elapsed().as_secs_f64()
+                    },
+                );
+            }
+            if body.is_none() {
+                let checksum_algo = part_checksum_algorithm(fi, fi.parts[0].number);
+                let erasure = self.erasure_cache.get_for_file_info(fi)?;
+                let read_length = erasure.shard_file_offset(0, object_size, object_size);
+                let total_shards = data_shards + fi.erasure.parity_blocks;
+                let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
-                // Decode directly
-                let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                #[cfg(test)]
-                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
-                if let Some(body) = try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
-                {
+                // Check if we have enough inline data shards
+                let inline_count = files
+                    .iter()
+                    .take(data_shards)
+                    .filter(|f| f.data.as_ref().is_some_and(|d| !d.is_empty()))
+                    .count();
+
+                if inline_count >= data_shards {
+                    let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                    let readers = build_inline_bitrot_readers(
+                        &files,
+                        total_shards,
+                        bucket,
+                        object,
+                        read_length,
+                        erasure.shard_size(),
+                        &checksum_algo,
+                        opts.skip_verify_bitrot,
+                    )
+                    .await?;
+                    if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_READER_SETUP,
+                            object_class.as_str(),
+                            size_bucket,
+                            reader_setup_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
+
+                    let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                    let mut output = Cursor::new(Vec::with_capacity(object_size));
+                    #[cfg(test)]
+                    crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
+                    let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+                    if let Some(e) = err {
+                        return Err(to_object_err(e.into(), vec![bucket, object]));
+                    }
+                    if written != object_size {
+                        return Err(to_object_err(
+                            Error::other("inline fast path: erasure decode returned an unexpected body length"),
+                            vec![bucket, object],
+                        ));
+                    }
                     if let Some(decode_stage_start) = decode_stage_start {
                         rustfs_io_metrics::record_get_object_stage_duration_by_size(
                             GET_OBJECT_PATH_INLINE_DIRECT,
@@ -3216,94 +3207,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         );
                     }
 
-                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                    let reader = GetObjectReader {
-                        stream: Box::new(Cursor::new(body.clone())),
-                        object_info,
-                        buffered_body: Some(body),
-                        body_source: GetObjectBodySource::Unprobed,
-                    };
-                    return Ok(reader);
+                    body = Some(Bytes::from(output.into_inner()));
                 }
             }
-
-            let erasure = self.erasure_cache.get_for_file_info(fi)?;
-            let read_length = erasure.shard_file_offset(0, object_size, object_size);
-            let total_shards = data_shards + fi.erasure.parity_blocks;
-            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
-
-            // Check if we have enough inline data shards
-            let inline_count = files
-                .iter()
-                .take(data_shards)
-                .filter(|f| f.data.as_ref().is_some_and(|d| !d.is_empty()))
-                .count();
-
-            if inline_count >= data_shards {
-                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_INLINE_PREPARE,
-                        object_class.as_str(),
-                        size_bucket,
-                        inline_prepare_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
-                let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let readers = build_inline_bitrot_readers(
-                    &files,
-                    total_shards,
-                    bucket,
-                    object,
-                    read_length,
-                    erasure.shard_size(),
-                    &checksum_algo,
-                    opts.skip_verify_bitrot,
-                )
-                .await?;
-                if let Some(reader_setup_stage_start) = reader_setup_stage_start {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_READER_SETUP,
-                        object_class.as_str(),
-                        size_bucket,
-                        reader_setup_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
-
-                let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let mut output = Cursor::new(Vec::with_capacity(object_size));
-                #[cfg(test)]
-                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
-                let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
-                if let Some(e) = err {
-                    return Err(to_object_err(e.into(), vec![bucket, object]));
-                }
-                if written == 0 && fi.size > 0 {
-                    return Err(to_object_err(
-                        Error::other("inline fast path: erasure decode returned 0 bytes"),
-                        vec![bucket, object],
-                    ));
-                }
-                let body = Bytes::from(output.into_inner());
-                if let Some(decode_stage_start) = decode_stage_start {
-                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
-                        GET_OBJECT_PATH_INLINE_DIRECT,
-                        GET_STAGE_DECODE,
-                        object_class.as_str(),
-                        size_bucket,
-                        decode_stage_start.elapsed().as_secs_f64(),
-                    );
-                }
-
+            if let Some(body) = body {
                 record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                let reader = GetObjectReader {
+                return Ok(GetObjectReader {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
                     buffered_body: Some(body),
                     body_source: GetObjectBodySource::Unprobed,
-                };
-                return Ok(reader);
+                });
             }
         }
 
@@ -4785,12 +4699,14 @@ impl SetDisks {
             // Known unprotected streams may span bounded inline frames. The
             // direct encoder remains single-block, and transformed/protected
             // writes keep their existing admission contract.
-            let is_inline_buffer =
-                storage_class_config.should_inline(
-                    inline_admission_shard_size(&erasure, put_object_size, data.actual_size()),
-                    erasure.data_shards,
-                    opts.versioned,
-                ) && inline_put_fits_buffer(put_object_size, data.actual_size(), erasure.block_size, protect_write);
+            let is_inline_buffer = should_inline_put(
+                &storage_class_config,
+                &erasure,
+                put_object_size,
+                data.actual_size(),
+                opts.versioned,
+                protect_write,
+            );
             let multi_block_inline =
                 is_inline_buffer && usize::try_from(put_object_size).is_ok_and(|size| size > erasure.block_size);
 
@@ -15573,6 +15489,51 @@ mod inline_put_commit_path_tests {
                 assert_eq!(restored, payload[block - 7..(block + 8).min(length)]);
             }
         })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multi_block_inline_without_metadata_early_stop_uses_only_data_shards() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_ERASURE_SHARD_BYTES, Some("0")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("false")),
+            ],
+            async {
+                let (_directories, disks, set) = hermetic_set_disks(16).await;
+                set.set_test_storage_class_config(
+                    lookup_config_for_pools_without_env(&KVS::new(), &[16]).expect("EC12+4 configuration"),
+                );
+                let bucket = "inline-full-fanout-systematic";
+                let object = "object.bin";
+                make_bucket(&disks, bucket).await;
+                let payload: Vec<u8> = (0..1280 * 1024).map(|index| (index % 251) as u8).collect();
+                let mut input = PutObjReader::from_vec(payload.clone());
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut input,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write multi-block inline object");
+                let calls = disk_call_counters::observe(object);
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read without a preverified metadata body");
+                assert_eq!(reader.buffered_body.as_ref().map(Bytes::len), Some(payload.len()));
+                let mut restored = Vec::new();
+                reader.stream.read_to_end(&mut restored).await.expect("read every frame");
+                assert_eq!(restored, payload);
+                assert_eq!(calls.total(disk_call_counters::KIND_BODY_DECODE), 1);
+                assert_eq!(calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN), 12);
+            },
+        )
         .await;
     }
 

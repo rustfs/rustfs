@@ -245,8 +245,10 @@ impl Config {
             return false;
         }
 
-        let shard_size = shard_size as usize;
-        let inline_block = self.effective_inline_block(data_shards);
+        let Ok(shard_size) = usize::try_from(shard_size) else {
+            return false;
+        };
+        let inline_block = self.inline_block();
 
         if versioned {
             shard_size <= inline_block / 8
@@ -255,19 +257,7 @@ impl Config {
         }
     }
 
-    /// Returns the per-shard inline budget used by both write admission and
-    /// legacy read fallback.
-    ///
-    /// The default is a fixed 128 KiB per shard, matching MinIO. Explicit
-    /// `inline_block` settings retain the same per-shard interpretation.
-    pub(crate) fn effective_inline_block(&self, data_shards: usize) -> usize {
-        if data_shards == 0 {
-            return 0;
-        }
-
-        self.inline_block()
-    }
-
+    /// Per-shard inline data budget, defaulting to 128 KiB across EC layouts.
     pub fn inline_block(&self) -> usize {
         if !self.initialized {
             DEFAULT_INLINE_BLOCK
@@ -623,7 +613,7 @@ mod tests {
                 let inline = config.should_inline(shard_size, data_shards, false);
 
                 // The per-shard budget stays monotonic across object sizes.
-                // PUT separately enforces the single-block admission bound.
+                // PUT separately bounds inline body materialization.
                 assert!(!inline || previous, "inline decision must not re-enable at {object_size} bytes");
                 previous = inline;
             }
@@ -636,11 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn effective_inline_block_preserves_fixed_default_and_explicit_limits() {
+    fn inline_block_preserves_fixed_default_and_explicit_limits() {
         let config = Config::default();
-        assert_eq!(config.effective_inline_block(8), 128 * 1024);
-        assert_eq!(config.effective_inline_block(12), 128 * 1024);
-        assert_eq!(config.effective_inline_block(0), 0);
+        assert_eq!(config.inline_block(), 128 * 1024);
+        assert!(!config.should_inline(0, 0, false));
 
         let explicit = lookup_config_for_pools_with_env(
             &KVS::new(),
@@ -651,7 +640,7 @@ mod tests {
             },
         )
         .expect("explicit inline block should resolve");
-        assert_eq!(explicit.effective_inline_block(12), 32 * 1024);
+        assert_eq!(explicit.inline_block(), 32 * 1024);
     }
 
     #[test]
