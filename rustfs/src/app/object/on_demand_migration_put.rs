@@ -428,7 +428,7 @@ mod tests {
             .expect("GET input must build");
         let req = build_request(input, Method::GET);
         let mut response = DefaultObjectUsecase::from_global()
-            .execute_get_object(req)
+            .execute_get_object_from_s3s(req)
             .await
             .expect("app-layer GET must succeed");
         let mut body = response.output.body.take().expect("GET response must include a body");

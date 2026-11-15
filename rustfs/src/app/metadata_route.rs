@@ -15,7 +15,6 @@
 //! MinIO-compatible metadata listing extension routes.
 
 use super::bucket_usecase::DefaultBucketUsecase;
-use super::object_usecase::DefaultObjectUsecase;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::access_owned::listing_multipart::authorize_bucket_listing;
@@ -376,9 +375,7 @@ async fn website_get_object(
     req_info.is_owner = false;
     request.extensions.insert(WebsiteRead);
     S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), &mut request).await?;
-    DefaultObjectUsecase::with_context(server_ctx.installed_app_context())
-        .execute_get_object(request)
-        .await
+    s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(Arc::clone(server_ctx)), request).await
 }
 
 async fn website_head_redirect(

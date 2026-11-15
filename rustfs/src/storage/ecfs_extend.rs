@@ -35,7 +35,7 @@ use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
     ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
 };
-use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -923,13 +923,6 @@ pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str)
     Ok(())
 }
 
-/// Quick check if CORS processing is needed (lightweight check for Origin header)
-/// This avoids unnecessary function calls for non-CORS requests
-#[inline]
-pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
-    headers.contains_key(cors::standard::ORIGIN)
-}
-
 /// Apply CORS headers to response based on bucket CORS configuration and request origin
 ///
 /// This function:
@@ -941,9 +934,6 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 ///    - `None`: bucket has no CORS config (or request has no valid `Origin`)
 ///    - `Some(empty headers)`: bucket CORS exists but request is denied / no rule matched
 ///    - `Some(non-empty headers)`: bucket CORS exists and request matched
-///
-/// Note: This function should only be called if `needs_cors_processing()` returns true
-/// to avoid unnecessary overhead for non-CORS requests.
 pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, request: &cors::CorsRequest) -> Option<HeaderMap> {
     use http::HeaderValue;
 
@@ -1112,25 +1102,6 @@ pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
         }
     } else {
         pattern == origin
-    }
-}
-
-/// Wrap S3Response with CORS grants if needed. Cache variation is applied by
-/// `ConditionalCorsService` to all responses, including originless requests.
-/// This function performs a lightweight check first to avoid unnecessary CORS processing
-/// for non-CORS requests (requests without Origin header)
-pub(crate) async fn wrap_response_with_cors<T>(
-    bucket: &str,
-    method: &http::Method,
-    headers: &HeaderMap,
-    output: T,
-) -> S3Response<T> {
-    if needs_cors_processing(headers)
-        && let Some(cors_headers) = apply_cors_headers(bucket, method, &cors::CorsRequest::from_headers(headers)).await
-    {
-        S3Response::with_headers(output, cors_headers)
-    } else {
-        S3Response::new(output)
     }
 }
 

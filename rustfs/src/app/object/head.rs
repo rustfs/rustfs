@@ -46,7 +46,7 @@ pub(crate) struct ResponseEtag {
 }
 
 impl ResponseEtag {
-    fn from_stored(value: &str) -> Self {
+    pub(super) fn from_stored(value: &str) -> Self {
         let weak = value.starts_with("W/\"");
         let etag = stored_etag(value);
         Self {
@@ -55,7 +55,7 @@ impl ResponseEtag {
         }
     }
 
-    fn from_proxy(value: &str) -> Option<Self> {
+    pub(super) fn from_proxy(value: &str) -> Option<Self> {
         let (opaque, weak) = if let Some(rest) = value.strip_prefix("W/\"") {
             (rest.strip_suffix('"')?, true)
         } else if let Some(rest) = value.strip_prefix('"') {
@@ -87,30 +87,6 @@ pub(crate) struct HeadObjectFields {
     pub(crate) range: Option<ByteRange>,
     pub(crate) sse_customer_key: Option<String>,
     pub(crate) sse_customer_key_md5: Option<String>,
-}
-
-async fn head_answer(
-    bucket: &str,
-    method: &http::Method,
-    headers: &HeaderMap,
-    output: HeadObjectOutputFacts,
-) -> Answered<HeadObjectOutputFacts> {
-    let mut answer = Answered::new(output);
-    if headers.contains_key(http::header::ORIGIN)
-        && let Some(cors) = crate::app::storage_api::object_usecase::head_cors_headers(bucket, method, headers).await
-    {
-        answer.headers = cors;
-    }
-    answer
-}
-
-fn complete_head(helper: OperationHelper, result: &S3Result<Answered<HeadObjectOutputFacts>>) {
-    let headers = HeaderMap::new();
-    let (status, headers) = match result {
-        Ok(answer) => (answer.status.unwrap_or(StatusCode::OK), &answer.headers),
-        Err(_) => (StatusCode::OK, &headers),
-    };
-    let _ = helper.complete_owned(result, status, headers);
 }
 
 /// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
@@ -331,10 +307,10 @@ impl DefaultObjectUsecase {
         helper: OperationHelper,
         output: HeadObjectOutputFacts,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
-        let mut response = head_answer(bucket, req.method(), req.headers(), output).await;
+        let mut response = read_answer(bucket, req.method(), req.headers(), output).await;
         mark_on_demand_migration_response(&mut response.headers);
         let result = Ok(response);
-        complete_head(helper, &result);
+        complete_read(helper, &result);
         result
     }
 
@@ -462,7 +438,7 @@ impl DefaultObjectUsecase {
             dto,
             etag: Some(ResponseEtag::from_stored(&representation.etag_hex)),
         };
-        let mut response = head_answer(bucket, req.method(), req.headers(), output).await;
+        let mut response = read_answer(bucket, req.method(), req.headers(), output).await;
         if let Some(content_range) = content_range {
             response.headers.insert(
                 http::header::CONTENT_RANGE,
@@ -546,7 +522,7 @@ impl DefaultObjectUsecase {
                 .serve_veeam_sosapi_head(&req, &bucket, &store, kind, part_number, rs.as_ref())
                 .await?;
             let result = Ok(response);
-            complete_head(helper, &result);
+            complete_read(helper, &result);
             return result;
         }
 
@@ -590,9 +566,9 @@ impl DefaultObjectUsecase {
                         && let Some(output) =
                             Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts, input.part_number).await
                     {
-                        let response = head_answer(&bucket, req.method(), req.headers(), output).await;
+                        let response = read_answer(&bucket, req.method(), req.headers(), output).await;
                         let result = Ok(response);
-                        complete_head(helper.version_id(input.version_id.clone().unwrap_or_default()), &result);
+                        complete_read(helper.version_id(input.version_id.clone().unwrap_or_default()), &result);
                         return result;
                     }
                     if let Some(miss) = odm_miss
@@ -764,11 +740,11 @@ impl DefaultObjectUsecase {
 
         // NOTE ON CORS:
         // Bucket-level CORS headers are intentionally applied only for object retrieval
-        // operations (GET/HEAD) via `wrap_response_with_cors`. Other S3 operations that
+        // operations (GET/HEAD) via `read_answer`. Other S3 operations that
         // interact with objects (PUT/POST/DELETE/LIST, etc.) rely on the system-level
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
-        let mut response = head_answer(&bucket, req.method(), req.headers(), output).await;
+        let mut response = read_answer(&bucket, req.method(), req.headers(), output).await;
 
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
         // carry on the typed HeadObjectOutput (#1257).
@@ -878,7 +854,7 @@ impl DefaultObjectUsecase {
         }
 
         let result = Ok(response);
-        complete_head(helper, &result);
+        complete_read(helper, &result);
 
         result
     }

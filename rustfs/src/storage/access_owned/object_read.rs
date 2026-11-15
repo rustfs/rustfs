@@ -22,11 +22,25 @@
 //! Downstream: the shared shapes in `storage/access.rs`.
 
 use crate::storage::access::{
-    AuthorizationRequest, S3Result, ServerContextSlot, authorize_request, capture_odm_read_generation, req_info_mut,
-    versioned_read_action,
+    AuthorizationRequest, S3Result, ServerContextSlot, authorize_object_request, authorize_request, capture_odm_read_generation,
+    req_info_mut, versioned_read_action,
 };
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_utils::http::{SUFFIX_SOURCE_REPLICATION_CHECK, get_header};
+
+/// GET uses the same versioned read decision and ODM snapshot on both edges.
+pub(crate) async fn authorize_get_object<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    let source_generation = capture_odm_read_generation(server_ctx, req, bucket).await;
+    authorize_object_request(req, bucket, key, version_id, versioned_read_action(version_id)).await?;
+    req.install_odm_read_generation(source_generation);
+    Ok(())
+}
 
 /// Both HEAD edges retain the captured ODM generation and the additional replication decision.
 pub(crate) async fn authorize_head_object<R: AuthorizationRequest + ?Sized>(
