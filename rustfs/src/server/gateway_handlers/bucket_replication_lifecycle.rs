@@ -14,6 +14,8 @@
 
 //! The gateway operations of migration batch A3 (rustfs/backlog#2765): bucket lifecycle, replication and object lock configuration.
 
+use super::access::authorize_bucket_config_mutation;
+use super::lifecycle_input::prepare_lifecycle_configuration;
 use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
@@ -27,6 +29,8 @@ use std::sync::Arc;
 
 pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketLifecycleConfiguration>(),
+    row::<dto::PutBucketLifecycleConfiguration>(),
+    row::<dto::DeleteBucketLifecycle>(),
     row::<dto::GetBucketReplication>(),
     row::<dto::GetObjectLockConfiguration>(),
 ];
@@ -74,6 +78,42 @@ impl Served for dto::GetObjectLockConfiguration {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_get_object_lock_configuration(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::PutBucketLifecycleConfiguration {
+    const METRIC: S3Operation = S3Operation::PutBucketLifecycleConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketLifecycleAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let dates = request.context().lifecycle_request_dates().cloned();
+        let input = request.into_input();
+        let prepared = prepare_lifecycle_configuration(input.lifecycle_configuration, dates.as_deref());
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_lifecycle_configuration(envelope, input.bucket.as_str(), prepared)
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::DeleteBucketLifecycle {
+    const METRIC: S3Operation = S3Operation::DeleteBucketLifecycle;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketLifecycleAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let bucket = request.input().bucket.as_str();
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_delete_bucket_lifecycle(envelope, bucket)
             .await?;
         Ok(Resp::new(output))
     }

@@ -14371,6 +14371,8 @@ fn table_metadata_pointer_json_round_trips() {
     assert_eq!(pointer.metadata_location, location);
 }
 
+const PUT_OBJECT_MUTATION_BOUNDARY: &str = "self.put_object_core(write, body, input.frame_trailers, start_time).await?;";
+
 fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &str) {
     assert_object_mutation_reserved_prefix_sources(
         delete,
@@ -14460,7 +14462,7 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             put,
             "fn execute_put_object_inner(",
             "validate_new_object_key(&key, request_method_name)?;",
-            "self.put_object_core(write, body, start_time).await?;",
+            PUT_OBJECT_MUTATION_BOUNDARY,
         ),
         (
             copy,
@@ -16635,6 +16637,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
             "self.unchecked_put(envelope, input)",
         ),
         ("put", "validate_new_object_key(&key, request_method_name)?;", "unchecked_key();"),
+        ("put", PUT_OBJECT_MUTATION_BOUNDARY, "unchecked_put_core();"),
         (
             "put",
             "validate_table_catalog_object_mutation(&bucket, &key).await?;",
@@ -16662,7 +16665,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
                 if surface == "extract" { &broken } else { extract },
             );
         });
-        let expected = if from.starts_with("validate_") {
+        let expected = if from.starts_with("validate_") || from == PUT_OBJECT_MUTATION_BOUNDARY {
             format!("missing or out-of-order object mutation guard: {from}")
         } else {
             let signature = match surface {

@@ -15,10 +15,16 @@
 #[cfg(test)]
 use crate::cluster::rpc::http_auth::RPC_REPLAY_SCOPE_VERSION_HEADER;
 use crate::cluster::rpc::http_auth::{
-    AuthenticatedPeerReplayCapabilities, RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2, RPC_BOOT_EPOCH_CHALLENGE_HEADER,
-    RPC_CONTENT_SHA256_HEADER, RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
+    AuthenticatedPeerMsgpackCapabilities, AuthenticatedPeerReplayCapabilities, RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2,
+    RPC_BOOT_EPOCH_CHALLENGE_HEADER, RPC_CONTENT_SHA256_HEADER, RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+    RPC_MSGPACK_MANIFEST_CAPABILITY_V1, RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
     RollingMutationBodyDigest, TIMESTAMP_HEADER, gen_tonic_replay_scope_headers_with_admission, internode_rpc_body_digest_strict,
-    rpc_background_admission, verify_tonic_peer_replay_capabilities_response,
+    rpc_background_admission, verify_tonic_peer_msgpack_capability_for_authenticated_epoch,
+    verify_tonic_peer_replay_capabilities_response,
+};
+#[cfg(test)]
+use crate::cluster::rpc::http_auth::{
+    tonic_boot_epoch_response_headers_with_msgpack_capability, tonic_msgpack_manifest_capability_requested,
 };
 use crate::cluster::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
 #[cfg(test)]
@@ -27,8 +33,9 @@ use crate::disk::error::{DiskError, Error as DiskErrorType, RpcStatusError};
 #[cfg(test)]
 use crate::runtime::sources as runtime_sources;
 use http::{Request as HttpRequest, Response as HttpResponse, Uri};
+use rustfs_common::{GrpcConnectionSnapshot, GrpcConnectionState};
 use rustfs_protos::{
-    ChannelClass, get_channel_for_class,
+    ChannelClass, InternodeChannel, get_internode_channel_for_class,
     proto_gen::node_service::{
         heal_control_service_client::HealControlServiceClient, node_service_client::NodeServiceClient,
         scanner_control_service_client::ScannerControlServiceClient,
@@ -48,7 +55,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tonic::{service::interceptor::InterceptedService, transport::Channel};
+use tonic::service::interceptor::InterceptedService;
 use tower::Service;
 use tracing::debug;
 use uuid::Uuid;
@@ -71,10 +78,16 @@ pub(crate) async fn scanner_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> crate::error::Result<ScannerControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = get_channel_for_class(addr, ChannelClass::Control)
+    let channel = get_internode_channel_for_class(addr, ChannelClass::Control)
         .await
         .map_err(|err| crate::error::Error::other(err.to_string()))?;
-    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
+    let connection_state = channel.connection_state();
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
+    let channel = ReplayScopeChannel::new(
+        BatchLockDeadlineChannel::new(channel),
+        interceptor.replay_scope_audience(),
+        connection_state,
+    );
     let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
     Ok(ScannerControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(limit)
@@ -86,9 +99,15 @@ pub async fn heal_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> Result<HealControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
+    let channel = get_internode_channel_for_class(addr, ChannelClass::Control).await?;
+    let connection_state = channel.connection_state();
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
     let max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
-    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(
+        BatchLockDeadlineChannel::new(channel),
+        interceptor.replay_scope_audience(),
+        connection_state,
+    );
     Ok(HealControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -99,9 +118,15 @@ pub async fn tier_mutation_control_time_out_client(
     interceptor: TonicInterceptor,
 ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
+    let channel = get_internode_channel_for_class(addr, ChannelClass::Control).await?;
+    let connection_state = channel.connection_state();
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
     let max_message_size = rustfs_protos::TIER_MUTATION_RPC_MAX_MESSAGE_SIZE;
-    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(
+        BatchLockDeadlineChannel::new(channel),
+        interceptor.replay_scope_audience(),
+        connection_state,
+    );
     Ok(TierMutationControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -119,10 +144,16 @@ pub async fn node_service_time_out_client_for_class(
     class: ChannelClass,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, Box<dyn Error>> {
     let interceptor = interceptor.with_rpc_audience(addr)?;
-    let channel = get_channel_for_class(addr, class).await?;
+    let channel = get_internode_channel_for_class(addr, class).await?;
+    let connection_state = channel.connection_state();
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
 
     let max_message_size = rustfs_protos::internode_rpc_max_message_size();
-    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(
+        BatchLockDeadlineChannel::new(channel),
+        interceptor.replay_scope_audience(),
+        connection_state,
+    );
     Ok(NodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -134,10 +165,16 @@ pub(crate) async fn node_service_delete_recovery_client(
     timeout: std::time::Duration,
 ) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>, DiskError> {
     let interceptor = interceptor.with_rpc_audience(addr).map_err(DiskError::from)?;
-    let channel = rustfs_protos::create_channel_with_timeout(addr, timeout)
+    let channel = rustfs_protos::create_internode_channel_with_timeout(addr, timeout)
         .await
         .map_err(|error| DiskError::RemoteClientUnavailable(error.to_string()))?;
-    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
+    let connection_state = channel.connection_state();
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
+    let channel = ReplayScopeChannel::new(
+        BatchLockDeadlineChannel::new(channel),
+        interceptor.replay_scope_audience(),
+        connection_state,
+    );
     let max_message_size = rustfs_protos::internode_rpc_max_message_size();
     Ok(NodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
@@ -250,10 +287,11 @@ pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
 pub struct ReplayScopeChannel<S> {
     inner: S,
     audience: Option<String>,
+    connection_state: Option<GrpcConnectionState>,
 }
 
 /// The channel type used by internode clients after v2 authentication and replay-scope handling.
-pub type AuthenticatedChannel = ReplayScopeChannel<BatchLockDeadlineChannel<Channel>>;
+pub type AuthenticatedChannel = ReplayScopeChannel<BatchLockDeadlineChannel<InternodeChannel>>;
 
 /// Gate lock-batch payloads after the transport's internal readiness queues.
 /// Other RPC bodies pass through without an additional wrapper.
@@ -349,20 +387,98 @@ enum PeerReplayCapability {
     Revoked,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerMsgpackCapability {
+    Capable { boot_epoch: Uuid, connection_generation: u64 },
+    Unsupported { boot_epoch: Uuid, connection_generation: u64 },
+    Revoked { connection_generation: u64 },
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PeerReplayState {
     boot_epoch: Option<Uuid>,
     cache_capability: Option<PeerReplayCapability>,
+    // Compatibility state for unit services and externally injected untracked channels. Production
+    // channels use the per-channel map in `PeerReplayRegistry`.
+    msgpack_capability: Option<PeerMsgpackCapability>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PeerReplayStateSnapshot(PeerReplayState);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PeerReplayStateSnapshot {
+    replay: PeerReplayState,
+    connection: Option<GrpcConnectionSnapshot>,
+    msgpack_capability: Option<PeerMsgpackCapability>,
+}
 
-static PEER_REPLAY_STATES: LazyLock<Mutex<HashMap<String, PeerReplayState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+impl PeerReplayStateSnapshot {
+    #[cfg(test)]
+    fn untracked(replay: PeerReplayState) -> Self {
+        Self {
+            msgpack_capability: replay.msgpack_capability,
+            replay,
+            connection: None,
+        }
+    }
+}
+
+// Bounds state left by explicitly rebuilt channel IDs. Eviction only forces that connection to
+// request another proof; it cannot enable msgpack sending.
+const MSGPACK_CONNECTION_STATES_PER_PEER: usize = 64;
+
+#[derive(Default)]
+struct PeerReplayRegistry {
+    replay: HashMap<String, PeerReplayState>,
+    msgpack_by_channel: HashMap<String, HashMap<u64, PeerMsgpackCapability>>,
+}
+
+impl PeerReplayRegistry {
+    fn snapshot(&self, audience: &str, connection: Option<GrpcConnectionSnapshot>) -> PeerReplayStateSnapshot {
+        let replay = self.replay.get(audience).copied().unwrap_or_default();
+        let msgpack_capability = match connection {
+            Some(connection) => self
+                .msgpack_by_channel
+                .get(audience)
+                .and_then(|channels| channels.get(&connection.channel_id))
+                .copied(),
+            None => replay.msgpack_capability,
+        };
+        PeerReplayStateSnapshot {
+            replay,
+            connection,
+            msgpack_capability,
+        }
+    }
+
+    fn set_msgpack_capability(
+        &mut self,
+        audience: &str,
+        connection: Option<GrpcConnectionSnapshot>,
+        capability: PeerMsgpackCapability,
+    ) {
+        let Some(connection) = connection else {
+            self.replay.entry(audience.to_owned()).or_default().msgpack_capability = Some(capability);
+            return;
+        };
+        let channels = self.msgpack_by_channel.entry(audience.to_owned()).or_default();
+        if channels.len() >= MSGPACK_CONNECTION_STATES_PER_PEER
+            && !channels.contains_key(&connection.channel_id)
+            && let Some(victim) = channels.keys().next().copied()
+        {
+            channels.remove(&victim);
+        }
+        channels.insert(connection.channel_id, capability);
+    }
+}
+
+static PEER_REPLAY_STATES: LazyLock<Mutex<PeerReplayRegistry>> = LazyLock::new(|| Mutex::new(PeerReplayRegistry::default()));
 
 impl<S> ReplayScopeChannel<S> {
-    fn new(inner: S, audience: Option<String>) -> Self {
-        Self { inner, audience }
+    fn new(inner: S, audience: Option<String>, connection_state: Option<GrpcConnectionState>) -> Self {
+        Self {
+            inner,
+            audience,
+            connection_state,
+        }
     }
 }
 
@@ -371,8 +487,32 @@ fn peer_replay_state(audience: &str) -> PeerReplayState {
     PEER_REPLAY_STATES
         .lock()
         .ok()
-        .and_then(|states| states.get(audience).copied())
+        .and_then(|states| states.replay.get(audience).copied())
         .unwrap_or_default()
+}
+
+/// Whether the next authenticated response should carry a fresh capability proof.
+///
+/// This state remains observational until the encoder captures this generation and the transport
+/// rejects a stale generation before dispatch; it must not by itself authorize omitting JSON.
+fn should_request_msgpack_capability(state: PeerReplayStateSnapshot) -> bool {
+    let expected_generation = state.connection.map_or(0, |connection| connection.generation);
+    match (state.replay.boot_epoch, state.msgpack_capability) {
+        (
+            Some(boot_epoch),
+            Some(
+                PeerMsgpackCapability::Capable {
+                    boot_epoch: capability_epoch,
+                    connection_generation,
+                }
+                | PeerMsgpackCapability::Unsupported {
+                    boot_epoch: capability_epoch,
+                    connection_generation,
+                },
+            ),
+        ) => boot_epoch != capability_epoch || expected_generation != connection_generation,
+        _ => true,
+    }
 }
 
 pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()> {
@@ -384,32 +524,61 @@ pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()
         .map(|authority| normalize_tonic_rpc_audience(authority.as_str()))
         .ok_or_else(|| std::io::Error::other("Missing gRPC peer authority"))??;
     if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
-        states.remove(&audience);
+        states.replay.remove(&audience);
+        states.msgpack_by_channel.remove(&audience);
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn apply_peer_replay_response(
     audience: String,
     sent_state: PeerReplayState,
     response: std::io::Result<AuthenticatedPeerReplayCapabilities>,
 ) {
+    apply_peer_capabilities_response(audience, sent_state, response, None);
+}
+
+#[cfg(test)]
+fn apply_peer_capabilities_response(
+    audience: String,
+    sent_state: PeerReplayState,
+    replay_response: std::io::Result<AuthenticatedPeerReplayCapabilities>,
+    msgpack_response: Option<std::io::Result<AuthenticatedPeerMsgpackCapabilities>>,
+) {
+    apply_peer_capabilities_response_for_connection(
+        audience,
+        PeerReplayStateSnapshot::untracked(sent_state),
+        replay_response,
+        msgpack_response,
+        None,
+    );
+}
+
+fn apply_peer_capabilities_response_for_connection(
+    audience: String,
+    sent_state: PeerReplayStateSnapshot,
+    replay_response: std::io::Result<AuthenticatedPeerReplayCapabilities>,
+    msgpack_response: Option<std::io::Result<AuthenticatedPeerMsgpackCapabilities>>,
+    current_connection: Option<GrpcConnectionSnapshot>,
+) {
     if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
-        let current_state = states.get(&audience).copied().unwrap_or_default();
+        let current_snapshot = states.snapshot(&audience, sent_state.connection);
+        let current_state = current_snapshot.replay;
         let mut next_state = current_state;
-        if let Ok(response) = &response
-            && sent_state.boot_epoch == current_state.boot_epoch
+        if let Ok(response) = &replay_response
+            && sent_state.replay.boot_epoch == current_state.boot_epoch
         {
             next_state.boot_epoch = Some(response.boot_epoch);
         }
 
-        if sent_state.boot_epoch == current_state.boot_epoch {
-            let response_capability = response
+        if sent_state.replay.boot_epoch == current_state.boot_epoch {
+            let response_capability = replay_response
                 .as_ref()
                 .ok()
                 .filter(|response| response.dynamic_replay_cache)
                 .map(|response| response.boot_epoch);
-            match (sent_state.cache_capability, current_state.cache_capability, response_capability) {
+            match (sent_state.replay.cache_capability, current_state.cache_capability, response_capability) {
                 (None, None, Some(boot_epoch))
                 | (Some(PeerReplayCapability::Revoked), Some(PeerReplayCapability::Revoked), Some(boot_epoch)) => {
                     next_state.cache_capability = Some(PeerReplayCapability::Capable { boot_epoch });
@@ -440,8 +609,34 @@ fn apply_peer_replay_response(
                 }
                 _ => {}
             }
+
+            if current_state.boot_epoch != next_state.boot_epoch {
+                states.msgpack_by_channel.remove(&audience);
+            }
+            if sent_state.msgpack_capability == current_snapshot.msgpack_capability
+                && sent_state.connection == current_connection
+                && let Some(response) = msgpack_response
+            {
+                let connection_generation = sent_state.connection.map_or(0, |connection| connection.generation);
+                let capability = match response {
+                    Ok(response) if response.msgpack_compat_manifest => PeerMsgpackCapability::Capable {
+                        boot_epoch: response.boot_epoch,
+                        connection_generation,
+                    },
+                    Ok(response) => PeerMsgpackCapability::Unsupported {
+                        boot_epoch: response.boot_epoch,
+                        connection_generation,
+                    },
+                    Err(_) => PeerMsgpackCapability::Revoked { connection_generation },
+                };
+                if sent_state.connection.is_some() {
+                    states.set_msgpack_capability(&audience, sent_state.connection, capability);
+                } else {
+                    next_state.msgpack_capability = Some(capability);
+                }
+            }
         }
-        states.insert(audience, next_state);
+        states.replay.insert(audience, next_state);
     }
 }
 
@@ -490,8 +685,9 @@ where
         let sent_state = request
             .extensions()
             .get::<PeerReplayStateSnapshot>()
-            .map(|snapshot| snapshot.0)
+            .copied()
             .unwrap_or_default();
+        let msgpack_capability_requested = authenticated && should_request_msgpack_capability(sent_state);
         if let (Some(audience), Some(challenge)) = (self.audience.as_deref(), challenge) {
             // The challenge is independently HMAC-authenticated by the response proof. It is not
             // part of v2 so old peers ignore it, while a new peer can safely advertise its epoch.
@@ -499,8 +695,16 @@ where
                 RPC_BOOT_EPOCH_CHALLENGE_HEADER,
                 challenge.to_string().parse().expect("UUID must be a valid header value"),
             );
+            if msgpack_capability_requested {
+                request.headers_mut().insert(
+                    RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER,
+                    RPC_MSGPACK_MANIFEST_CAPABILITY_V1
+                        .parse()
+                        .expect("static msgpack capability must be a valid header value"),
+                );
+            }
             if let (Some(boot_epoch), Some(timestamp), Some(content_sha256)) = (
-                sent_state.boot_epoch,
+                sent_state.replay.boot_epoch,
                 request.headers().get(TIMESTAMP_HEADER).and_then(|value| value.to_str().ok()),
                 request
                     .headers()
@@ -530,6 +734,7 @@ where
         );
 
         let audience = self.audience.clone();
+        let connection_state = self.connection_state.clone();
         let future = self.inner.call(request);
         Box::pin(async move {
             let response = if observe_rename_data {
@@ -550,10 +755,19 @@ where
             };
             if let (Some(audience), Some(challenge)) = (audience, challenge) {
                 let response_state = verify_tonic_peer_replay_capabilities_response(&audience, challenge, response.headers());
+                let msgpack_response = msgpack_capability_requested.then(|| match &response_state {
+                    Ok(authenticated) => verify_tonic_peer_msgpack_capability_for_authenticated_epoch(
+                        &audience,
+                        challenge,
+                        authenticated.boot_epoch,
+                        response.headers(),
+                    ),
+                    Err(_) => Err(std::io::Error::other("RPC boot epoch capability verification failed")),
+                });
                 if let Err(error) = &response_state
                     && (response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_HEADER)
                         || response.headers().contains_key(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER)
-                        || matches!(sent_state.cache_capability, Some(PeerReplayCapability::Capable { .. })))
+                        || matches!(sent_state.replay.cache_capability, Some(PeerReplayCapability::Capable { .. })))
                 {
                     debug!(
                         event = "internode_rpc_capability_proof_rejected",
@@ -571,7 +785,14 @@ where
                         "internode RPC capability proof rejected"
                     )
                 }
-                apply_peer_replay_response(audience, sent_state, response_state);
+                let current_connection = connection_state.as_ref().and_then(GrpcConnectionState::snapshot);
+                apply_peer_capabilities_response_for_connection(
+                    audience,
+                    sent_state,
+                    response_state,
+                    msgpack_response,
+                    current_connection,
+                );
             }
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
@@ -661,6 +882,7 @@ impl BatchLockRpcDeadline {
 pub struct TonicSignatureInterceptor {
     audience: Option<String>,
     body_digest_strict: bool,
+    connection_state: Option<GrpcConnectionState>,
 }
 
 impl tonic::service::Interceptor for TonicSignatureInterceptor {
@@ -680,12 +902,12 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
         // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): use cache-free v2 for peers without an authenticated boot epoch. Remove after every supported peer advertises the authenticated dynamic replay-cache capability and body-digest strict mode is the default.
         // beta.11 verifies v2 body digests but stores their nonces in a fixed-size cache.
         let rolling_mutation = req.extensions().get::<RollingMutationBodyDigest>().is_some();
-        let peer_state = PEER_REPLAY_STATES
+        let connection = self.connection_state.as_ref().and_then(GrpcConnectionState::snapshot);
+        let peer_snapshot = PEER_REPLAY_STATES
             .lock()
             .map_err(|_| tonic::Status::unauthenticated("RPC peer capability state unavailable"))?
-            .get(audience)
-            .copied()
-            .unwrap_or_default();
+            .snapshot(audience, connection);
+        let peer_state = peer_snapshot.replay;
         let content_sha256 = if content_sha256.is_some() {
             if peer_state.cache_capability == Some(PeerReplayCapability::Revoked) {
                 return Err(tonic::Status::unauthenticated("RPC peer replay capability changed"));
@@ -701,7 +923,7 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
         let headers = gen_tonic_signature_headers(audience, method.service(), method.method(), content_sha256)
             .map_err(|_| tonic::Status::unauthenticated("No valid auth token"))?;
         req.metadata_mut().as_mut().extend(headers);
-        req.extensions_mut().insert(PeerReplayStateSnapshot(peer_state));
+        req.extensions_mut().insert(peer_snapshot);
         inject_trace_context_into_metadata(req.metadata_mut());
         inject_request_id_into_metadata(req.metadata_mut());
         Ok(req)
@@ -712,6 +934,7 @@ pub fn gen_tonic_signature_interceptor() -> TonicSignatureInterceptor {
     TonicSignatureInterceptor {
         audience: None,
         body_digest_strict: internode_rpc_body_digest_strict(),
+        connection_state: None,
     }
 }
 
@@ -741,6 +964,13 @@ impl TonicInterceptor {
             interceptor.audience = Some(audience?);
         }
         Ok(self)
+    }
+
+    fn with_connection_state(mut self, connection_state: Option<GrpcConnectionState>) -> Self {
+        if let Self::Signature(interceptor) = &mut self {
+            interceptor.connection_state = connection_state;
+        }
+        self
     }
 
     fn replay_scope_audience(&self) -> Option<String> {
@@ -925,9 +1155,14 @@ mod tests {
             let challenge = tonic_boot_epoch_challenge(request.headers())
                 .expect("client challenge must be syntactically valid")
                 .expect("authenticated client request must carry a boot epoch challenge");
+            let msgpack_capability_requested = tonic_msgpack_manifest_capability_requested(request.headers());
             let mut response = HttpResponse::new(());
-            let mut headers = tonic_boot_epoch_response_headers(&self.audience, challenge)
-                .expect("test server must be able to sign an epoch proof");
+            let mut headers = tonic_boot_epoch_response_headers_with_msgpack_capability(
+                &self.audience,
+                challenge,
+                self.include_capability && msgpack_capability_requested,
+            )
+            .expect("test server must be able to sign an epoch proof");
             if !self.include_capability {
                 headers.remove(RPC_REPLAY_CACHE_CAPABILITY_HEADER);
                 headers.remove(RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER);
@@ -1108,20 +1343,23 @@ mod tests {
         TonicSignatureInterceptor {
             audience: Some(audience.to_string()),
             body_digest_strict,
+            connection_state: None,
         }
     }
 
     fn clear_peer_capability(audience: &str) {
-        PEER_REPLAY_STATES
+        let mut states = PEER_REPLAY_STATES
             .lock()
-            .expect("peer capability cache lock must not be poisoned")
-            .remove(audience);
+            .expect("peer capability cache lock must not be poisoned");
+        states.replay.remove(audience);
+        states.msgpack_by_channel.remove(audience);
     }
 
     fn set_peer_capability(audience: &str, state: PeerReplayState) {
         PEER_REPLAY_STATES
             .lock()
             .expect("peer capability cache lock must not be poisoned")
+            .replay
             .insert(audience.to_string(), state);
     }
 
@@ -1146,7 +1384,7 @@ mod tests {
         );
         request
             .extensions_mut()
-            .insert(PeerReplayStateSnapshot(peer_replay_state(audience)));
+            .insert(PeerReplayStateSnapshot::untracked(peer_replay_state(audience)));
         request
     }
 
@@ -1154,6 +1392,13 @@ mod tests {
         AuthenticatedPeerReplayCapabilities {
             boot_epoch,
             dynamic_replay_cache,
+        }
+    }
+
+    fn authenticated_msgpack_response(boot_epoch: Uuid, msgpack_compat_manifest: bool) -> AuthenticatedPeerMsgpackCapabilities {
+        AuthenticatedPeerMsgpackCapabilities {
+            boot_epoch,
+            msgpack_compat_manifest,
         }
     }
 
@@ -1404,7 +1649,7 @@ mod tests {
             include_capability: true,
             seen_headers,
         };
-        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()), None);
         futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
             .expect("authenticated capability probe must complete");
 
@@ -1455,7 +1700,7 @@ mod tests {
             include_capability: true,
             seen_headers: std::sync::Arc::new(Mutex::new(Vec::new())),
         };
-        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()), None);
         futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
             .expect("invalid capability response must still complete");
 
@@ -1484,13 +1729,20 @@ mod tests {
             include_capability: false,
             seen_headers: seen_headers.clone(),
         };
-        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()), None);
         futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
             .expect("legacy boot proof response must complete");
 
         let state = peer_replay_state(audience);
         assert!(state.boot_epoch.is_some(), "authenticated legacy proof must enable replay-scoped v3");
         assert_eq!(state.cache_capability, None);
+        assert_eq!(
+            state.msgpack_capability,
+            state.boot_epoch.map(|boot_epoch| PeerMsgpackCapability::Unsupported {
+                boot_epoch,
+                connection_generation: 0,
+            })
+        );
 
         let mut interceptor = test_interceptor_for(audience, false);
         let request = rolling_mutation_request("Lock");
@@ -1520,6 +1772,10 @@ mod tests {
             headers[1].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "authenticated legacy boot proof must enable v3 on a non-Ping request"
         );
+        assert!(
+            !headers[1].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "an unsupported capability bound to the current epoch must not be probed per request"
+        );
     }
 
     #[test]
@@ -1535,6 +1791,7 @@ mod tests {
         let epoch_one_state = PeerReplayState {
             boot_epoch: Some(epoch_one),
             cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: epoch_one }),
+            msgpack_capability: None,
         };
         assert_eq!(peer_replay_state(audience), epoch_one_state);
 
@@ -1545,6 +1802,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_one),
                 cache_capability: Some(PeerReplayCapability::Revoked),
+                msgpack_capability: None,
             }
         );
 
@@ -1556,6 +1814,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_two),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: epoch_two }),
+                msgpack_capability: None,
             }
         );
         clear_peer_capability(audience);
@@ -1572,10 +1831,12 @@ mod tests {
         let revoked_epoch_one = PeerReplayState {
             boot_epoch: Some(epoch_one),
             cache_capability: Some(PeerReplayCapability::Revoked),
+            msgpack_capability: None,
         };
         PEER_REPLAY_STATES
             .lock()
             .expect("peer replay state lock must not be poisoned")
+            .replay
             .insert(audience.to_string(), revoked_epoch_one);
 
         apply_peer_replay_response(
@@ -1590,9 +1851,208 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(epoch_three),
                 cache_capability: Some(PeerReplayCapability::Revoked),
+                msgpack_capability: None,
             },
             "a stale dynamic-cache proof must not cross a newer authenticated boot epoch"
         );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn msgpack_capability_is_epoch_bound_and_reordered_responses_cannot_restore_it() {
+        let audience = "msgpack-capability-epoch-test:9000";
+        let epoch_one = Uuid::new_v4();
+        let epoch_two = Uuid::new_v4();
+        clear_peer_capability(audience);
+
+        let unknown = PeerReplayState::default();
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            unknown,
+            Ok(authenticated_peer_response(epoch_one, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_one, true))),
+        );
+        let epoch_one_state = peer_replay_state(audience);
+        assert_eq!(
+            epoch_one_state.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch: epoch_one,
+                connection_generation: 0,
+            })
+        );
+        assert!(!should_request_msgpack_capability(PeerReplayStateSnapshot::untracked(epoch_one_state)));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            epoch_one_state,
+            Ok(authenticated_peer_response(epoch_two, true)),
+            None,
+        );
+        let needs_epoch_two_probe = peer_replay_state(audience);
+        assert_eq!(needs_epoch_two_probe.boot_epoch, Some(epoch_two));
+        assert_eq!(
+            needs_epoch_two_probe.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch: epoch_one,
+                connection_generation: 0,
+            })
+        );
+        assert!(
+            should_request_msgpack_capability(PeerReplayStateSnapshot::untracked(needs_epoch_two_probe)),
+            "a new boot epoch must require a fresh capability proof"
+        );
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            needs_epoch_two_probe,
+            Ok(authenticated_peer_response(epoch_two, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_two, false))),
+        );
+        let epoch_two_state = peer_replay_state(audience);
+        assert_eq!(
+            epoch_two_state.msgpack_capability,
+            Some(PeerMsgpackCapability::Unsupported {
+                boot_epoch: epoch_two,
+                connection_generation: 0,
+            })
+        );
+        assert!(!should_request_msgpack_capability(PeerReplayStateSnapshot::untracked(epoch_two_state)));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            epoch_one_state,
+            Ok(authenticated_peer_response(epoch_one, true)),
+            Some(Ok(authenticated_msgpack_response(epoch_one, true))),
+        );
+        assert_eq!(
+            peer_replay_state(audience),
+            epoch_two_state,
+            "a delayed capability proof must not cross a newer boot epoch"
+        );
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn invalid_msgpack_capability_proof_remains_retryable_without_enabling_send_policy() {
+        let audience = "msgpack-capability-retry-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        clear_peer_capability(audience);
+
+        let unknown = PeerReplayState::default();
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            unknown,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Err(std::io::Error::other("forged msgpack capability proof"))),
+        );
+        let revoked = peer_replay_state(audience);
+        assert_eq!(
+            revoked.msgpack_capability,
+            Some(PeerMsgpackCapability::Revoked {
+                connection_generation: 0,
+            })
+        );
+        assert!(should_request_msgpack_capability(PeerReplayStateSnapshot::untracked(revoked)));
+
+        apply_peer_capabilities_response(
+            audience.to_string(),
+            revoked,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+        );
+        let recovered = peer_replay_state(audience);
+        assert_eq!(
+            recovered.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch,
+                connection_generation: 0,
+            })
+        );
+        assert!(!should_request_msgpack_capability(PeerReplayStateSnapshot::untracked(recovered)));
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn msgpack_capability_is_scoped_to_channel_and_physical_connection_generation() {
+        let audience = "msgpack-connection-generation-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        let control_one = GrpcConnectionSnapshot {
+            channel_id: 11,
+            generation: 101,
+        };
+        let bulk = GrpcConnectionSnapshot {
+            channel_id: 12,
+            generation: 102,
+        };
+        clear_peer_capability(audience);
+
+        let control_unknown = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(control_one));
+        apply_peer_capabilities_response_for_connection(
+            audience.to_string(),
+            control_unknown,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+            Some(control_one),
+        );
+        let (control_capable, bulk_unknown) = {
+            let states = PEER_REPLAY_STATES.lock().expect("peer replay registry");
+            (states.snapshot(audience, Some(control_one)), states.snapshot(audience, Some(bulk)))
+        };
+        assert!(!should_request_msgpack_capability(control_capable));
+        assert!(should_request_msgpack_capability(bulk_unknown));
+
+        apply_peer_capabilities_response_for_connection(
+            audience.to_string(),
+            bulk_unknown,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, false))),
+            Some(bulk),
+        );
+        let (control_still_capable, bulk_unsupported) = {
+            let states = PEER_REPLAY_STATES.lock().expect("peer replay registry");
+            (states.snapshot(audience, Some(control_one)), states.snapshot(audience, Some(bulk)))
+        };
+        assert!(!should_request_msgpack_capability(control_still_capable));
+        assert!(!should_request_msgpack_capability(bulk_unsupported));
+
+        let control_two = GrpcConnectionSnapshot {
+            channel_id: control_one.channel_id,
+            generation: 103,
+        };
+        let reconnected = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(control_two));
+        assert!(should_request_msgpack_capability(reconnected));
+        apply_peer_capabilities_response_for_connection(
+            audience.to_string(),
+            reconnected,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+            Some(control_two),
+        );
+        apply_peer_capabilities_response_for_connection(
+            audience.to_string(),
+            control_capable,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+            Some(control_two),
+        );
+        let current = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(control_two));
+        assert_eq!(
+            current.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch,
+                connection_generation: control_two.generation,
+            })
+        );
+        assert!(!should_request_msgpack_capability(current));
         clear_peer_capability(audience);
     }
 
@@ -1605,6 +2065,7 @@ mod tests {
             PeerReplayState {
                 boot_epoch: Some(boot_epoch),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+                msgpack_capability: None,
             },
         );
 
@@ -1627,7 +2088,7 @@ mod tests {
             request
                 .extensions()
                 .get::<PeerReplayStateSnapshot>()
-                .map(|snapshot| snapshot.0),
+                .map(|snapshot| snapshot.replay),
             Some(PeerReplayState::default()),
             "interceptor must preserve its unknown-state admission snapshot"
         );
@@ -1635,17 +2096,19 @@ mod tests {
         let capable_state = PeerReplayState {
             boot_epoch: Some(boot_epoch),
             cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+            msgpack_capability: None,
         };
         PEER_REPLAY_STATES
             .lock()
             .expect("peer capability cache lock must not be poisoned")
+            .replay
             .insert(audience.to_string(), capable_state);
         let (metadata, extensions, body) = request.into_parts();
         let mut request = HttpRequest::new(body);
         *request.uri_mut() = "/node_service.NodeService/Lock".parse().expect("test RPC URI must parse");
         *request.headers_mut() = metadata.into_headers();
         *request.extensions_mut() = extensions;
-        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()));
+        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()), None);
 
         futures::executor::block_on(channel.call(request)).expect("in-flight request response must complete");
 
@@ -1701,14 +2164,16 @@ mod tests {
         PEER_REPLAY_STATES
             .lock()
             .expect("peer capability cache lock must not be poisoned")
+            .replay
             .insert(
                 audience.to_string(),
                 PeerReplayState {
                     boot_epoch: Some(boot_epoch),
                     cache_capability: Some(PeerReplayCapability::Capable { boot_epoch }),
+                    msgpack_capability: None,
                 },
             );
-        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()));
+        let mut channel = ReplayScopeChannel::new(MissingProofService, Some(audience.to_string()), None);
         futures::executor::block_on(channel.call(replay_scope_request(audience, "Ping")))
             .expect("legacy response must complete before capability rejection");
 
@@ -1763,6 +2228,7 @@ mod tests {
             let pinned = PeerReplayState {
                 boot_epoch: Some(old_epoch),
                 cache_capability: Some(PeerReplayCapability::Capable { boot_epoch: old_epoch }),
+                msgpack_capability: None,
             };
             set_peer_capability(&audience, pinned);
             apply_peer_replay_response(audience.clone(), pinned, Err(std::io::Error::other("startup response omitted proof")));
@@ -1934,15 +2400,31 @@ mod tests {
             include_capability: true,
             seen_headers: seen_headers.clone(),
         };
-        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()));
-        let make_request = || replay_scope_request(audience, "Ping");
+        let connection_state = GrpcConnectionState::new();
+        let first_connection = connection_state.record_connected();
+        let mut channel = ReplayScopeChannel::new(service, Some(audience.to_string()), Some(connection_state.clone()));
+        let make_request = || {
+            let mut request = replay_scope_request(audience, "Ping");
+            let snapshot = PEER_REPLAY_STATES
+                .lock()
+                .expect("peer replay registry")
+                .snapshot(audience, connection_state.snapshot());
+            request.extensions_mut().insert(snapshot);
+            request
+        };
 
         futures::executor::block_on(channel.call(make_request())).expect("first request must complete");
         futures::executor::block_on(channel.call(make_request())).expect("second request must complete");
+        let second_connection = connection_state.record_connected();
+        futures::executor::block_on(channel.call(make_request())).expect("reconnected request must complete");
 
         let headers = seen_headers.lock().expect("test header capture lock must not be poisoned");
-        assert_eq!(headers.len(), 2);
+        assert_eq!(headers.len(), 3);
         assert!(headers[0].contains_key(RPC_BOOT_EPOCH_CHALLENGE_HEADER));
+        assert!(
+            headers[0].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "the first authenticated request must probe an unknown peer capability"
+        );
         assert!(
             !headers[0].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "the first request must remain v2-compatible until the peer proves its epoch"
@@ -1950,6 +2432,27 @@ mod tests {
         assert!(
             headers[1].contains_key(RPC_REPLAY_SCOPE_VERSION_HEADER),
             "the second request must carry the replay-scoped v3 signature"
+        );
+        assert!(
+            !headers[1].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "a capability proved for the current boot epoch must not be probed per request"
+        );
+        assert!(
+            headers[2].contains_key(RPC_MSGPACK_MANIFEST_CAPABILITY_REQUEST_HEADER),
+            "a transparent reconnect must request a proof for its new physical generation"
+        );
+        assert_eq!(first_connection.channel_id, second_connection.channel_id);
+        assert_ne!(first_connection.generation, second_connection.generation);
+        let state = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(second_connection));
+        assert_eq!(
+            state.msgpack_capability,
+            state.replay.boot_epoch.map(|boot_epoch| PeerMsgpackCapability::Capable {
+                boot_epoch,
+                connection_generation: second_connection.generation,
+            })
         );
         clear_peer_capability(audience);
     }

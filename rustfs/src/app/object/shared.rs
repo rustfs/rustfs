@@ -18,8 +18,7 @@ use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
 use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, Range, ServerSideEncryption, StorageClass, Timestamp,
-    TimestampFormat,
+    ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
 };
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
@@ -28,6 +27,30 @@ use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy,
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
 pub(super) type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+pub(super) async fn read_answer<T>(
+    bucket: &str,
+    method: &http::Method,
+    headers: &HeaderMap,
+    output: T,
+) -> crate::app::Answered<T> {
+    let mut answer = crate::app::Answered::new(output);
+    if headers.contains_key(http::header::ORIGIN)
+        && let Some(cors) = crate::app::storage_api::object_usecase::head_cors_headers(bucket, method, headers).await
+    {
+        answer.headers = cors;
+    }
+    answer
+}
+
+pub(super) fn complete_read<T>(helper: OperationHelper, result: &rustfs_s3_types::S3Result<crate::app::Answered<T>>) {
+    let headers = HeaderMap::new();
+    let (status, headers) = match result {
+        Ok(answer) => (answer.status.unwrap_or(StatusCode::OK), &answer.headers),
+        Err(_) => (StatusCode::OK, &headers),
+    };
+    let _ = helper.complete_owned(result, status, headers);
+}
 
 pub(crate) fn s3s_body_error_to_io(err: StdError) -> io::Error {
     io::Error::other(err)
@@ -144,33 +167,8 @@ pub(super) fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Resu
     }
 }
 
-/// Losslessly convert an s3s [`Range`] into the internal [`HTTPRangeSpec`].
-///
-/// Shared by GET and HEAD so both apply identical range semantics. s3s parses
-/// `first`/`last` as `u64`, but its own parser already rejects any value greater
-/// than `i64::MAX`, so the int branch is a checked cast that never truncates.
-///
-/// The suffix length, however, is an unchecked `u64`. A naive `length as i64`
-/// truncates deterministically: `bytes=-18446744073709551615` wraps to `-1` and
-/// is then read as "last 1 byte", and `bytes=-0` yields a 0-length 206 instead
-/// of a 416. This function instead mirrors s3s [`Range::check`] semantics:
-///   * a zero-length suffix is rejected with `InvalidRange` (416), matching AWS
-///     S3 and MinIO;
-///   * a suffix larger than `i64::MAX` is clamped to `i64::MAX`. Object sizes in
-///     this system are bounded by `i64::MAX`, so such a suffix always covers the
-///     whole object, and [`HTTPRangeSpec::get_length`] clamps it to the real
-///     size once the object is known.
-pub(super) fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
-    use rustfs_gateway_types::ByteRange;
-    let range = match range {
-        Range::Int { first, last: Some(last) } => ByteRange::FromTo { first, last },
-        Range::Int { first, last: None } => ByteRange::From { first },
-        Range::Suffix { length } => ByteRange::Suffix { length },
-    };
-    Ok(byte_range_to_http_range_spec(range)?)
-}
-
-/// The range rules shared by native HEAD requests and the remaining legacy adapters.
+/// Converts a native range to storage's signed range representation.
+/// Zero suffixes are unsatisfiable; suffixes larger than `i64::MAX` cover the whole object.
 pub(super) fn byte_range_to_http_range_spec(range: rustfs_gateway_types::ByteRange) -> rustfs_s3_types::S3Result<HTTPRangeSpec> {
     use rustfs_gateway_types::ByteRange;
     let (start, end, suffix) = match range {
@@ -811,10 +809,6 @@ pub(super) fn response_storage_class_name(info: &ObjectInfo, metadata: &HashMap<
     let effective_class = storageclass::effective_class(stored_class, transitioned_tier);
 
     (effective_class != storageclass::STANDARD).then(|| effective_class.to_string())
-}
-
-pub(super) fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
-    response_storage_class_name(info, metadata).map(StorageClass::from)
 }
 
 pub(super) fn response_storage_class_for_object_attributes(
@@ -1903,7 +1897,7 @@ mod tests {
             user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
-        assert!(response_storage_class(&standard_info, &metadata).is_none());
+        assert!(response_storage_class_name(&standard_info, &metadata).is_none());
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
@@ -1913,7 +1907,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            response_storage_class(&label_only_info, &metadata).is_none(),
+            response_storage_class_name(&label_only_info, &metadata).is_none(),
             "historical STANDARD_IA labels must report the effective implicit STANDARD layout"
         );
 
@@ -1922,25 +1916,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            response_storage_class(&rrs_info, &HashMap::new())
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_name(&rrs_info, &HashMap::new()).as_deref(),
             Some(storageclass::RRS)
         );
 
         let mut transitioned_info = label_only_info;
         transitioned_info.transitioned_object.tier = "WARM-TIER".to_string();
         assert!(
-            response_storage_class(&transitioned_info, &metadata).is_none(),
+            response_storage_class_name(&transitioned_info, &metadata).is_none(),
             "a tier name without a completed transition must not override the effective local class"
         );
         transitioned_info.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
-        assert_eq!(
-            response_storage_class(&transitioned_info, &metadata)
-                .as_ref()
-                .map(StorageClass::as_str),
-            Some("WARM-TIER")
-        );
+        assert_eq!(response_storage_class_name(&transitioned_info, &metadata).as_deref(), Some("WARM-TIER"));
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
@@ -1950,7 +1937,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            response_storage_class(&standard_metadata_info, &metadata).is_none(),
+            response_storage_class_name(&standard_metadata_info, &metadata).is_none(),
             "STANDARD must be omitted even when it only arrives via metadata fallback"
         );
     }
@@ -2107,7 +2094,7 @@ mod tests {
 
     const I64_MAX_AS_U64: u64 = i64::MAX as u64;
 
-    /// The conversion itself: s3s `Range` (u64) -> internal `HTTPRangeSpec`
+    /// The conversion itself: native `ByteRange` (u64) -> internal `HTTPRangeSpec`
     /// (i64). This directly guards the suffix truncation fix. Reverting to
     /// `length as i64` regresses the zero-suffix, `i64::MAX + 1` and `u64::MAX`
     /// rows below.
@@ -2115,10 +2102,10 @@ mod tests {
     fn range_to_http_range_spec_is_lossless() {
         // Zero-length suffix (`bytes=-0`) is unsatisfiable -> InvalidRange (416),
         // never a 0-length 206.
-        let zero_suffix = range_to_http_range_spec(Range::Suffix { length: 0 });
+        let zero_suffix = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::Suffix { length: 0 });
         assert_eq!(
             zero_suffix.as_ref().err().map(|e| e.code()),
-            Some(&S3ErrorCode::InvalidRange),
+            Some(&rustfs_s3_types::S3ErrorCode::InvalidRange),
             "bytes=-0 must map to InvalidRange (416)"
         );
 
@@ -2131,7 +2118,7 @@ mod tests {
             (u64::MAX, i64::MAX),           // was -1 under `as i64` -> read as "last 1 byte"
         ];
         for (length, expected_start) in suffix_cases {
-            let spec = range_to_http_range_spec(Range::Suffix { length })
+            let spec = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::Suffix { length })
                 .unwrap_or_else(|_| panic!("suffix {length} must convert losslessly"));
             assert!(spec.is_suffix_length, "suffix {length} must stay a suffix spec");
             assert_eq!(spec.start, expected_start, "suffix {length} start");
@@ -2140,20 +2127,18 @@ mod tests {
 
         // Int ranges: s3s already rejects first/last > i64::MAX, so the checked
         // cast never truncates. first-last and open-ended must not regress.
-        let int_first_last = range_to_http_range_spec(Range::Int {
-            first: 10,
-            last: Some(20),
-        })
-        .expect("first-last converts");
+        let int_first_last = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::FromTo { first: 10, last: 20 })
+            .expect("first-last converts");
         assert!(!int_first_last.is_suffix_length);
         assert_eq!((int_first_last.start, int_first_last.end), (10, 20));
 
-        let int_open = range_to_http_range_spec(Range::Int { first: 5, last: None }).expect("open-ended converts");
+        let int_open =
+            byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::From { first: 5 }).expect("open-ended converts");
         assert_eq!((int_open.start, int_open.end), (5, -1));
 
-        let int_max = range_to_http_range_spec(Range::Int {
+        let int_max = byte_range_to_http_range_spec(rustfs_gateway_types::ByteRange::FromTo {
             first: I64_MAX_AS_U64,
-            last: Some(I64_MAX_AS_U64),
+            last: I64_MAX_AS_U64,
         })
         .expect("i64::MAX int converts");
         assert_eq!((int_max.start, int_max.end), (i64::MAX, i64::MAX));
@@ -2173,8 +2158,8 @@ mod tests {
             Unsatisfiable,
         }
 
-        fn derive(range: Range, size: i64) -> Outcome {
-            let spec = match range_to_http_range_spec(range) {
+        fn derive(range: rustfs_gateway_types::ByteRange, size: i64) -> Outcome {
+            let spec = match byte_range_to_http_range_spec(range) {
                 Ok(spec) => spec,
                 Err(_) => return Outcome::Unsatisfiable,
             };
@@ -2187,7 +2172,7 @@ mod tests {
             }
         }
 
-        let suffix = |length: u64| Range::Suffix { length };
+        let suffix = |length: u64| rustfs_gateway_types::ByteRange::Suffix { length };
 
         // size, range, expected
         let normal = 100_i64;
@@ -2212,15 +2197,12 @@ mod tests {
             // Normal first-last and open-ended int ranges must not regress.
             (
                 normal,
-                Range::Int {
-                    first: 10,
-                    last: Some(19),
-                },
+                rustfs_gateway_types::ByteRange::FromTo { first: 10, last: 19 },
                 Outcome::Partial(10, 10, "bytes 10-19/100".into()),
             ),
             (
                 normal,
-                Range::Int { first: 90, last: None },
+                rustfs_gateway_types::ByteRange::From { first: 90 },
                 Outcome::Partial(90, 10, "bytes 90-99/100".into()),
             ),
         ];

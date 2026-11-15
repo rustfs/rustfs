@@ -38,6 +38,11 @@ trap cleanup EXIT
   --node-ssh-identity-file /tmp/nonexistent-key \
   --node-ssh-timeout-secs 7 \
   --require-node-telemetry \
+  --storage-quiescence-container rustfs-bench-1 \
+  --storage-quiescence-docker-context test-context \
+  --storage-quiescence-consecutive 3 \
+  --storage-quiescence-timeout-secs 9 \
+  --storage-quiescence-interval-secs 2 \
   --node-docker-container node1=rustfs-bench-1 >/dev/null
 
 rg -qx 'server_image_ref=rustfs/rustfs:bench' "${OUT_DIR}/run_manifest.env"
@@ -53,6 +58,11 @@ rg -qx 'after_probe=true' "${OUT_DIR}/run_manifest.env"
 rg -qx 'node_ssh_identity_file=/tmp/nonexistent-key' "${OUT_DIR}/run_manifest.env"
 rg -qx 'node_ssh_timeout_secs=7' "${OUT_DIR}/run_manifest.env"
 rg -qx 'require_node_telemetry=true' "${OUT_DIR}/run_manifest.env"
+rg -qx 'storage_quiescence_container=rustfs-bench-1' "${OUT_DIR}/run_manifest.env"
+rg -qx 'storage_quiescence_docker_context=test-context' "${OUT_DIR}/run_manifest.env"
+rg -qx 'storage_quiescence_consecutive=3' "${OUT_DIR}/run_manifest.env"
+rg -qx 'storage_quiescence_timeout_secs=9' "${OUT_DIR}/run_manifest.env"
+rg -qx 'storage_quiescence_interval_secs=2' "${OUT_DIR}/run_manifest.env"
 rg -q '^1MiB,warp,1,1,before,node1,localhost,not_run_dry_run,' "${OUT_DIR}/node_telemetry_captures.csv"
 rg -q '^1MiB,warp,1,1,not_run_dry_run,rustfs-bench,N/A,1048576,N/A,N/A,N/A,N/A,N/A,dry_run$' "${OUT_DIR}/after_probe.csv"
 
@@ -99,6 +109,18 @@ fi
   --dry-run >/dev/null
 
 rg -qx 'run_label_count=0' "${TMP_DIR}/default/run_manifest.env"
+
+if "$RUNNER" \
+  --tool warp \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key test-access \
+  --secret-key test-secret \
+  --warp-bin true \
+  --dry-run \
+  --storage-quiescence-container rustfs-bench-1 >/dev/null 2>&1; then
+  echo "expected incomplete quiescence configuration to fail" >&2
+  exit 1
+fi
 
 FAKE_WARP="${TMP_DIR}/fake-warp"
 cat >"$FAKE_WARP" <<'EOF'

@@ -29,7 +29,7 @@ use rustfs_protos::proto_gen::node_service::{
     LockAcquireStatus, LockReleaseStatus, PingRequest,
 };
 use rustfs_protos::{
-    ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
+    ChannelRebuildReason, ConnectionEvictionLogLevel, evict_failed_connection_with_reason, models::PingBodyBuilder,
     proto_gen::node_service::node_service_client::NodeServiceClient,
 };
 use std::collections::HashMap;
@@ -498,7 +498,7 @@ impl RemoteClient {
                 ))
     }
 
-    async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
+    async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str, trigger: EvictionTrigger) {
         let log_level = if Self::is_scanner_leader_lock(resource_summary) {
             debug!(
                 addr = %self.addr,
@@ -518,7 +518,11 @@ impl RemoteClient {
             );
             ConnectionEvictionLogLevel::Warn
         };
-        evict_failed_connection_with_log_level(&self.addr, log_level).await;
+        let rebuild_reason = match trigger {
+            EvictionTrigger::Timeout => ChannelRebuildReason::LockTimeout,
+            EvictionTrigger::Transport => ChannelRebuildReason::LockTransport,
+        };
+        evict_failed_connection_with_reason(&self.addr, rebuild_reason, log_level).await;
     }
 
     fn summarize_resources(requests: &[LockRequest]) -> String {
@@ -772,7 +776,7 @@ impl RemoteClient {
         });
         if verdict == EvictionVerdict::Evict {
             rustfs_io_metrics::lock_metrics::record_remote_lock_channel_eviction(&self.addr, trigger.as_str());
-            self.evict_connection(op, reason, resource_summary).await;
+            self.evict_connection(op, reason, resource_summary, trigger).await;
             return;
         }
         rustfs_io_metrics::lock_metrics::record_remote_lock_channel_eviction_suppressed(&self.addr, verdict.as_str());

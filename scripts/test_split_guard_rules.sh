@@ -301,6 +301,25 @@ checked=$((checked + 1))
 if ! (cd "$FX" && ./scripts/check_logging_guardrails.sh) >"$LOG_OUT" 2>&1; then
   fail "logging guardrails failed with the TRACE hot span in $LISTING: $(tail -3 "$LOG_OUT")"
 fi
+GET_SOURCE="rustfs/src/app/object/get.rs"
+cp "$FX/$GET_SOURCE" "$FX/.get-source.saved"
+"$PYTHON" - "$FX/$GET_SOURCE" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = '#[instrument(name = "execute_get_object", level = "trace", skip(self, envelope, input))]'
+if text.count(marker) != 1:
+    sys.exit("split probe: native GET must carry exactly one TRACE span")
+path.write_text(text.replace(marker, marker.replace('"trace"', '"debug"')))
+PY
+checked=$((checked + 1))
+if (cd "$FX" && ./scripts/check_logging_guardrails.sh) >"$LOG_OUT" 2>&1; then
+  fail "logging guardrails passed after the native GET hot span lost TRACE"
+elif ! grep -qF "execute_get_object_fields must remain TRACE-only" "$LOG_OUT"; then
+  fail "native GET logging guardrails failed for another reason: $(tail -3 "$LOG_OUT")"
+fi
+mv "$FX/.get-source.saved" "$FX/$GET_SOURCE"
 "$PYTHON" - "$FX/$LISTING" <<'PY'
 import sys
 from pathlib import Path

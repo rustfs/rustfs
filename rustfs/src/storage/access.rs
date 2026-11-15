@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use self::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
+    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
@@ -3441,28 +3441,21 @@ impl S3Access for FS {
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
     async fn create_multipart_upload(&self, req: &mut S3Request<CreateMultipartUploadInput>) -> S3Result<()> {
+        use access_owned::listing_multipart::{CreateMultipartAuthorization, authorize_create_multipart_upload};
+
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
-
-        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-
-        authorize_replication_only_put_headers(req).await?;
-
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-        }
-
-        req.install_bucket_generation(bucket_generation?);
+        let key = req.input.key.clone();
+        let query_version = req.input.version_id.clone();
+        let retain_until = req.input.object_lock_retain_until_date.clone().map(OffsetDateTime::from);
+        let facts = CreateMultipartAuthorization {
+            bucket: &bucket,
+            key: &key,
+            query_version: query_version.as_deref(),
+            retain_until,
+            legal_hold_present: req.input.object_lock_legal_hold_status.is_some(),
+            retention_present: req.input.object_lock_mode.is_some() || retain_until.is_some(),
+        };
+        authorize_create_multipart_upload(self.server_ctx(), req, facts).await?;
         Ok(())
     }
 
@@ -3835,18 +3828,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
-        // s3:GetObjectVersion, not s3:GetObject.
-        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
-        req.install_odm_read_generation(source_generation);
-        Ok(())
+        let (bucket, key, version) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_read::authorize_get_object(self.server_ctx(), req, &bucket, &key, version.as_deref()).await
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
@@ -4056,14 +4039,8 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, list_parts_authorize_action()).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        Ok(authorize_list_parts(self.server_ctx(), req, &bucket, &key).await?)
     }
 
     /// Checks whether the PostObject request has accesses to the resources.
@@ -4252,52 +4229,24 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         crate::hp_guard!("S3Access::put_object");
-        async {
-            let req_info = ext_req_info_mut(&mut req.extensions)?;
-            req_info.bucket = Some(req.input.bucket.clone());
-            req_info.object = Some(req.input.key.clone());
-            req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
-
-            if has_write_offset_bytes_header(&req.headers) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::NotImplemented,
-                    ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
-                ));
-            }
-
-            let bucket = req.input.bucket.clone();
-            // Snapshot before authorization, but preserve AccessDenied precedence
-            // by exposing any bucket-state error only after authorization succeeds.
-            let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-            #[cfg(test)]
-            let bucket_generation = if PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
-                Err(ApiError::from(StorageError::ErasureReadQuorum).into())
-            } else {
-                bucket_generation
-            };
-            let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-            set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
-            set_post_object_policy_headers(req)?;
-            authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-            let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
-            authorize_write_etag_condition(req, specific_etag).await?;
-            req.install_bucket_generation(bucket_generation?);
-
-            if req.method != http::Method::POST {
-                authorize_replication_only_put_headers(req).await?;
-            }
-
-            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-            }
-
-            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-            }
-
-            Ok(())
-        }
-        .await
+        use access_owned::object_write::{PutObjectAuthorization, authorize_put_object};
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        let input = PutObjectAuthorization {
+            bucket: &bucket,
+            key: &key,
+            version_id: version_id.as_deref(),
+            retain_until: req.input.object_lock_retain_until_date.clone().map(OffsetDateTime::from),
+            specific_etag: req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any()),
+            legal_hold: legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()),
+            retention: retention_write_requested(
+                req.input.object_lock_mode.as_ref(),
+                req.input.object_lock_retain_until_date.as_ref(),
+            ),
+            post: req.method == http::Method::POST,
+        };
+        authorize_put_object(req, self.server_ctx(), input, set_post_object_policy_headers).await
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -4431,14 +4380,8 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn upload_part(&self, req: &mut S3Request<UploadPartInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_staged_multipart_part(req).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        access_owned::object_write::authorize_upload_part(req, self.server_ctx(), &bucket, &key).await
     }
 
     /// Checks whether the UploadPartCopy request has accesses to the resources.
@@ -4475,6 +4418,7 @@ impl S3Access for FS {
 /// parity tests, which live next to the envelope's facts impl.
 #[cfg(test)]
 pub(crate) mod parity_test_support {
+    pub(crate) use super::envelope_payloads::bucket_config_mutation;
     use super::{Action, Arc, CreateBucketInput, S3Request, S3Result};
     use super::{AuthorizationRequest, AuthzFacts, AuthzPrincipal, AuthzTarget, ECStore, HashMap};
 

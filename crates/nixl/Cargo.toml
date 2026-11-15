@@ -22,7 +22,7 @@ workspace = true
 base64-simd = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
-nixl-sys = { git = "https://github.com/ai-dynamo/nixl", tag = "v1.5.2", optional = true }
+nixl-sys = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"], optional = true }

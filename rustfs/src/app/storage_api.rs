@@ -28,7 +28,9 @@ pub(crate) fn EndpointServerPools(
 pub(crate) mod request_body {
     pub(crate) use s3s::StdError;
     pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+    pub(crate) use s3s::stream::ByteStream;
+    #[cfg(test)]
+    pub(crate) use s3s::stream::{DynByteStream, RemainingLength};
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -338,8 +340,8 @@ pub(crate) mod access {
         bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
-        retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -1707,8 +1709,7 @@ pub(crate) mod s3_api {
 
     pub(crate) mod multipart {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::{
-            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-            parse_upload_part_number,
+            ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
         };
     }
 
@@ -1827,7 +1828,6 @@ pub(crate) mod object_usecase {
         parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
         remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
         validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        wrap_response_with_cors,
     };
     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) use crate::storage::storage_api::{
@@ -1854,8 +1854,10 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::multipart::ListPartsOwner;
             pub(crate) use super::super::super::storage_contracts::{
-                CompletePart, ListMultipartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
+                CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }

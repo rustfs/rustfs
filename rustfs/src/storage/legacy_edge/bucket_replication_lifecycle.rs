@@ -20,6 +20,7 @@
 //! owns this file and is the only one that edits it.
 
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
+use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::bucket::replication::OperatorRuleContract;
 use crate::error::ApiError;
 use crate::storage::StorageVersioningConfigExt as _;
@@ -27,7 +28,7 @@ use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::persisted_from_s3s;
-use crate::storage::s3_api;
+use crate::storage::s3_api::{self, PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
 use crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s;
 use crate::storage::s3_compat::replication::replication_configuration_from_s3s;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
@@ -260,11 +261,13 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketLifecycle, |req| {
-            usecase.execute_delete_bucket_lifecycle(req)
-        })
-        .await
+        record_s3_op(S3Operation::DeleteBucketLifecycle);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let bucket = req.input.bucket;
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_lifecycle(envelope, &bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn delete_bucket_replication_edge(
@@ -327,16 +330,27 @@ impl FS {
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        let prepared = req
-            .input
-            .lifecycle_configuration
-            .clone()
-            .map(lifecycle_configuration_from_s3s)
-            .transpose();
-        audit_only_operation(req, S3Operation::PutBucketLifecycleConfiguration, |req| {
-            usecase.execute_put_bucket_lifecycle_configuration(req, prepared)
-        })
-        .await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let PutBucketLifecycleConfigurationInput {
+            bucket,
+            lifecycle_configuration,
+            ..
+        } = req.input;
+        let prepared = match lifecycle_configuration {
+            None => PreparedLifecycleConfiguration::Missing,
+            Some(configuration) => {
+                if validate_lifecycle_rule_status(configuration.rules.iter().map(|rule| rule.status.as_str())).is_err() {
+                    PreparedLifecycleConfiguration::InvalidStatus
+                } else {
+                    PreparedLifecycleConfiguration::Prepared(lifecycle_configuration_from_s3s(configuration))
+                }
+            }
+        };
+        record_s3_op(S3Operation::PutBucketLifecycleConfiguration);
+        usecase
+            .execute_put_bucket_lifecycle_configuration(envelope, &bucket, prepared)
+            .await?;
+        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_replication_edge(

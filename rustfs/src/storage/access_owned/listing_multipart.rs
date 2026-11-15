@@ -23,6 +23,7 @@
 
 // The table snapshot reads the access module's private table-catalog state.
 use super::super::*;
+use crate::storage::options::destination_version_id;
 use rustfs_s3_types::S3Result;
 use rustfs_utils::http::SUFFIX_INCLUDE_DELETED;
 
@@ -69,6 +70,60 @@ pub(crate) async fn authorize_list_multipart_uploads<R: AuthorizationRequest + ?
     let action = S3Action::ListBucketMultipartUploadsAction;
     authorize_bucket_request(req, bucket, Action::S3Action(action)).await?;
     prepare_table_data_plane_list_access(req, bucket, action).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
+/// Checks ListMultipartUploadParts on the object and hands its bucket generation to the use case.
+pub(crate) async fn authorize_list_parts<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+
+    authorize_request(req, list_parts_authorize_action()).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
+
+/// Decoded request facts used by both multipart initiation access hooks.
+pub(crate) struct CreateMultipartAuthorization<'a> {
+    pub(crate) bucket: &'a str,
+    pub(crate) key: &'a str,
+    pub(crate) query_version: Option<&'a str>,
+    pub(crate) retain_until: Option<OffsetDateTime>,
+    pub(crate) legal_hold_present: bool,
+    pub(crate) retention_present: bool,
+}
+
+/// Binds authorization to the requested object and captures its bucket incarnation before
+/// checking write, replication and Object Lock permissions.
+pub(crate) async fn authorize_create_multipart_upload<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    facts: CreateMultipartAuthorization<'_>,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, facts.bucket).await;
+    let version = destination_version_id(facts.query_version, req.headers());
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(facts.bucket.to_owned());
+    req_info.object = Some(facts.key.to_owned());
+    req_info.version_id = version;
+
+    set_requested_object_lock_retain_until(req, facts.retain_until);
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+    authorize_replication_only_put_headers(req).await?;
+    if facts.legal_hold_present {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+    }
+    if facts.retention_present {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+    }
     req.install_bucket_generation(bucket_generation?);
     Ok(())
 }
@@ -231,3 +286,7 @@ async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     req.install_table_list_access(access);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "listing_multipart_test.rs"]
+mod tests;
