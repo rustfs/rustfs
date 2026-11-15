@@ -28,6 +28,7 @@ ARTIFACTS = ("decisions", "fallback", "decode_errors", "rpc_errors")
 DECISIONS = {"msgpack_only", "dual_write"}
 REASONS = {"manual_fleet", "peer_capable", "peer_unknown", "peer_revoked", "not_requested"}
 REVISION = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_DOCUMENT_BYTES = 1024 * 1024
 
 
@@ -56,6 +57,13 @@ def load_json(path: Path) -> tuple[dict[str, Any], str]:
     document = json.loads(raw, object_pairs_hook=unique_object)
     require(isinstance(document, dict), f"evidence artifact must be an object: {path}")
     return document, hashlib.sha256(raw).hexdigest()
+
+
+def load_raw(path: Path) -> str:
+    require(path.is_file(), f"missing evidence artifact: {path}")
+    size = path.stat().st_size
+    require(0 < size <= MAX_DOCUMENT_BYTES, f"invalid evidence artifact size: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def bounded_number(value: Any, name: str) -> float:
@@ -210,6 +218,9 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         require(queries == expected_queries(end - start), f"{expected_name} PromQL does not match its exact window")
         workload_path = artifact_path(root, phase.get("workload"), used, f"{expected_name}.workload")
         workload, workload_digest = load_json(workload_path)
+        summary_path = artifact_path(root, workload.get("summary"), used, f"{expected_name}.workload-summary")
+        summary_digest = load_raw(summary_path)
+        require(workload.get("summary_sha256") == summary_digest, f"{expected_name} workload summary hash mismatch")
         workload_success = workload.get("status") == "success"
         requests = uint(workload.get("requests"), f"{expected_name} workload requests")
         require(requests > 0, f"{expected_name} workload has no requests")
@@ -220,8 +231,19 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             require(not rollback_readback, f"{expected_name} cannot claim rollback readback")
         if expected_name == "rollback-old-peer" and not rollback_readback:
             violations.append(f"{expected_name}: rollback readback failed")
+        source_digest = workload.get("readback_source_sha256")
+        downloaded_digest = workload.get("readback_download_sha256")
+        if expected_name == "rollback-old-peer":
+            require(isinstance(source_digest, str) and SHA256.fullmatch(source_digest) is not None,
+                    "rollback source digest is invalid")
+            require(source_digest == downloaded_digest, "rollback readback digest mismatch")
+        else:
+            require(source_digest is None and downloaded_digest is None,
+                    f"{expected_name} cannot claim rollback content digests")
         receipts.append({"phase": expected_name, "kind": "workload", "path": phase["workload"],
                          "sha256": workload_digest})
+        receipts.append({"phase": expected_name, "kind": "workload-summary", "path": workload["summary"],
+                         "sha256": summary_digest})
 
         artifacts = phase.get("artifacts")
         require(isinstance(artifacts, dict) and set(artifacts) == set(ARTIFACTS), f"{expected_name} artifact set is incomplete")
@@ -286,11 +308,7 @@ def main() -> int:
         root = args.manifest.resolve().parent
         manifest, digest = load_json(args.manifest.resolve())
         result = check(manifest, root)
-        inputs = {args.manifest.resolve()}
-        for phase in manifest["phases"]:
-            inputs.add((root / phase["workload"]).resolve())
-            for relative in phase["artifacts"].values():
-                inputs.add((root / relative).resolve())
+        inputs = {args.manifest.resolve()} | {(root / item["path"]).resolve() for item in result["artifacts"]}
         require(args.out.resolve() not in inputs, "output would overwrite raw canary evidence")
         result["manifest_sha256"] = digest
         args.out.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
