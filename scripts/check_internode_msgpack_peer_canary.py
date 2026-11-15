@@ -156,6 +156,11 @@ def exact_env(document: Any, name: str, old: bool) -> None:
 
 def expected_queries(window: int, cluster_id: str) -> dict[str, str]:
     selector = f'{{rustfs_cluster_id="{cluster_id}"}}'
+    grpc_selector = f'{{rustfs_cluster_id="{cluster_id}",backend="grpc",operation!="grpc_read_version"}}'
+    read_version_selector = (
+        f'{{rustfs_cluster_id="{cluster_id}",backend="grpc",operation="grpc_read_version",'
+        'classification!="remote_response"}'
+    )
     return {
         "decisions": (
             "sum by (decision, reason) "
@@ -165,7 +170,12 @@ def expected_queries(window: int, cluster_id: str) -> dict[str, str]:
         "decode_errors": (
             f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{selector}[{window}s])) or vector(0)"
         ),
-        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total{selector}[{window}s])) or vector(0)",
+        "rpc_errors": (
+            f"(sum(increase(rustfs_system_network_internode_operation_errors_total{grpc_selector}[{window}s])) "
+            "or vector(0)) + "
+            "(sum(increase(rustfs_system_network_internode_operation_classified_errors_total"
+            f"{read_version_selector}[{window}s])) or vector(0))"
+        ),
     }
 
 

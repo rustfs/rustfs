@@ -60,7 +60,7 @@ for arg in "$@"; do
     time=*) at="${arg#time=}" ;;
   esac
 done
-if [[ "$query" != "vector(0)" && "$query" != *"{rustfs_cluster_id=\"$(cat "$FAKE_CLUSTER_STATE")\"}"* ]]; then
+if [[ "$query" != "vector(0)" && "$query" != *"{rustfs_cluster_id=\"$(cat "$FAKE_CLUSTER_STATE")\""* ]]; then
   echo 'query lacks canary selector' >&2
   exit 1
 fi
