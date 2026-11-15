@@ -13394,6 +13394,13 @@ mod tests {
         drop(permit);
         drop(receivers);
         assert_eq!(retained, [1, 1, 0], "native owners survive, queued producer is released");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while resources.each_ref().map(|gate| gate.snapshot().active) != [0; 3] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native producer resource units must be released after blocking work finishes");
         assert_eq!(resources.each_ref().map(|gate| gate.snapshot().active), [0; 3]);
         assert_eq!(counts, (0, 0, 0), "cancelled worker clears its registry budget");
         assert_eq!((pending, running), (0, false));
