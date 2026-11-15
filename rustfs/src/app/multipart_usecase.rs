@@ -49,7 +49,9 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{
     EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
 };
-use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
+#[cfg(test)]
+use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
+use super::storage_api::multipart_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
@@ -73,7 +75,6 @@ use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
     validate_new_object_key,
 };
-use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
     reject_non_wildcard_write_if_none_match, reject_oversize_single_upload, reject_veeam_sosapi_mutation,
@@ -83,8 +84,7 @@ use crate::app::object_data_cache::{
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
-    validate_existing_object_lock_for_write,
+    apply_quota_admission, map_quota_check_outcome, s3s_body_error_to_io, validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -129,11 +129,15 @@ use uuid::Uuid;
 mod abort;
 mod complete;
 mod create;
+mod create_values;
+pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
 #[cfg(test)]
 mod test_support;
 mod upload_part;
 mod upload_part_copy;
+mod upload_values;
+pub(crate) use upload_values::{UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
 
 #[cfg(test)]
 fn merge_part_encryption_metadata(
@@ -535,7 +539,7 @@ mod tests {
                 .build()
                 .expect("valid create request DTO");
             let error = make_usecase()
-                .execute_create_multipart_upload(build_request(create, Method::POST))
+                .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
                 .await
                 .expect_err("reserved key must be rejected before accessing storage");
             assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);

@@ -34,6 +34,7 @@ mod bucket_access;
 mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
+mod lifecycle_input;
 mod listing_multipart;
 mod object_commit;
 mod object_meta;

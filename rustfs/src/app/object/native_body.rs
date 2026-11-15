@@ -108,7 +108,7 @@ impl TrailerSource for FrameTrailers {
 }
 
 /// Sync is needed only by RIO's reader trait; polling owns this mutex exclusively.
-pub(super) struct BodyChunks {
+pub(crate) struct BodyChunks {
     body: Mutex<Body>,
     trailers: Arc<FrameTrailers>,
     ended: bool,
@@ -120,7 +120,7 @@ impl BodyChunks {
         Self::with_trailers(body, None)
     }
 
-    pub(super) fn with_trailers(body: Body, trailers: Option<Arc<FrameTrailers>>) -> (Self, SharedTrailerSource) {
+    pub(crate) fn with_trailers(body: Body, trailers: Option<Arc<FrameTrailers>>) -> (Self, SharedTrailerSource) {
         let trailers = trailers.unwrap_or_default();
         (
             Self {

@@ -23,9 +23,24 @@
 
 use super::super::{
     Action, ApiError, AuthorizationRequest, S3Action, S3Error, S3ErrorCode, S3Result, ServerContextSlot,
-    authorize_replication_only_put_headers, authorize_request, authorize_write_etag_condition, has_write_offset_bytes_header,
-    load_bucket_generation, missing_req_info_error, set_requested_object_lock_retain_until,
+    authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition,
+    has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, set_requested_object_lock_retain_until,
 };
+
+pub(crate) async fn authorize_upload_part<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    server: &ServerContextSlot,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let generation = load_bucket_generation(server, req, bucket).await;
+    let info = req.req_info_mut().ok_or_else(missing_req_info_error)?;
+    info.bucket = Some(bucket.to_owned());
+    info.object = Some(key.to_owned());
+    authorize_staged_multipart_part(req).await?;
+    req.install_bucket_generation(generation?);
+    Ok(())
+}
 
 /// Request facts needed by both PutObject authorization edges.
 pub(crate) struct PutObjectAuthorization<'a> {
