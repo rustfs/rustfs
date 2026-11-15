@@ -3758,10 +3758,8 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketNotificationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketNotificationAction)).await
     }
 
     /// Checks whether the GetBucketOwnershipControls request has accesses to the resources.

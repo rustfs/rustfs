@@ -31,6 +31,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketPolicy>(),
     row::<dto::GetBucketPolicyStatus>(),
     row::<dto::GetBucketAcl>(),
+    row::<dto::GetBucketNotificationConfiguration>(),
 ];
 
 impl Served for dto::GetBucketVersioning {
@@ -92,6 +93,22 @@ impl Served for dto::GetBucketAcl {
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let output = DefaultBucketUsecase::with_context(context)
             .execute_get_bucket_acl(request.into_input())
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketNotificationConfiguration {
+    const METRIC: S3Operation = S3Operation::GetBucketNotificationConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketNotificationAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_notification_configuration(request.into_input())
             .await?;
         Ok(Resp::new(output))
     }

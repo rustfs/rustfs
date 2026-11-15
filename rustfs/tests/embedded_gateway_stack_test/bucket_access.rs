@@ -47,6 +47,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: get_bucket_acl,
     },
+    MatrixRow {
+        operation: "GetBucketNotificationConfiguration",
+        metric: S3Operation::GetBucketNotificationConfiguration,
+        has_error_body: true,
+        call: get_bucket_notification,
+    },
 ];
 
 fn get_bucket_versioning<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -70,6 +76,10 @@ fn get_bucket_policy_status<'a>(client: &'a Client, bucket: &'a str) -> BoxFutur
 
 fn get_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_acl().bucket(bucket).send().await) })
+}
+
+fn get_bucket_notification<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_notification_configuration().bucket(bucket).send().await) })
 }
 
 /// Stores a bucket configuration document the way the metadata system holds it, so a read is
@@ -238,4 +248,134 @@ fn the_gateway_stack_answers_the_bucket_acl() {
 #[test]
 fn the_legacy_stack_answers_the_bucket_acl() {
     with_stack(LEGACY, get_bucket_acl_answers_the_owner_with_full_control);
+}
+
+const QUEUE_NOTIFICATION: &str = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><QueueConfiguration><Id>a2-queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#;
+
+/// GetBucketNotificationConfiguration answers an empty configuration when none is stored, the
+/// stored queue rule (event, filter and id) when one is, for any bucket name the store holds, and
+/// refuses a bucket the store does not hold.
+async fn get_bucket_notification_answers_the_stored_configuration(server: RustFSServer) {
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    for name in ["a2-notification", "sthree-x", "a-s3alias"] {
+        create_bucket_in_the_store(name).await;
+        let empty = client
+            .get_bucket_notification_configuration()
+            .bucket(name)
+            .send()
+            .await
+            .expect(name);
+        assert!(
+            empty.queue_configurations().is_empty() && empty.topic_configurations().is_empty(),
+            "{name}"
+        );
+    }
+
+    store_bucket_config(SDK_REACHABLE_NAMES[1], "notification.xml", QUEUE_NOTIFICATION).await;
+    let stored = client
+        .get_bucket_notification_configuration()
+        .bucket(SDK_REACHABLE_NAMES[1])
+        .send()
+        .await
+        .expect("stored configuration");
+    let [queue] = stored.queue_configurations() else { panic!("one queue rule: {stored:?}") };
+    assert_eq!((queue.id(), queue.queue_arn()), (Some("a2-queue"), "arn:rustfs:sqs:us-east-1:1:webhook"));
+    assert_eq!(queue.events(), &[aws_sdk_s3::types::Event::S3ObjectCreated]);
+    let rules = queue.filter().and_then(|filter| filter.key()).map(|key| key.filter_rules());
+    let [rule] = rules.expect("stored filter") else { panic!("one filter rule") };
+    assert_eq!(rule.name(), Some(&aws_sdk_s3::types::FilterRuleName::Prefix));
+    assert_eq!(rule.value(), Some("logs/"));
+
+    let extended =
+        QUEUE_NOTIFICATION.replace("<QueueConfiguration>", "<Future><Nested>ignored</Nested></Future><QueueConfiguration>");
+    store_bucket_config("a2-notification", "notification.xml", &extended).await;
+    let unknown = client
+        .get_bucket_notification_configuration()
+        .bucket("a2-notification")
+        .send()
+        .await
+        .expect("unknown stored element");
+    assert_eq!(unknown.queue_configurations(), stored.queue_configurations());
+
+    let missing = client
+        .get_bucket_notification_configuration()
+        .bucket("a2-no-such-bucket")
+        .send()
+        .await;
+    let missing = missing.expect_err("a missing bucket");
+    assert_eq!(refusal(&missing), (Some("NoSuchBucket".to_owned()), Some(404)), "{missing:?}");
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_answers_the_stored_notification_configuration() {
+    with_stack(GATEWAY, get_bucket_notification_answers_the_stored_configuration);
+}
+
+#[test]
+fn the_legacy_stack_answers_the_stored_notification_configuration() {
+    with_stack(LEGACY, get_bucket_notification_answers_the_stored_configuration);
+}
+
+async fn notification_authorization_is_bound_to_the_requested_bucket(server: RustFSServer) {
+    const USER: &str = "notification-reader";
+    const BUCKET: &str = "notification-allowed";
+    const OTHER: &str = "notification-other";
+    create_bucket_in_the_store(BUCKET).await;
+    create_bucket_in_the_store(OTHER).await;
+    super::create_user_allowed_on_one_bucket(USER, "s3:GetBucketNotification", BUCKET).await;
+    let client = s3_client(&server.endpoint(), USER, super::USER_SECRET_KEY);
+    let handled_count = || {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|metric| metric.op == S3Operation::GetBucketNotificationConfiguration.as_str())
+            .map_or(0, |metric| metric.total)
+    };
+    let before = handled_count();
+    client
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("allowed read");
+    assert_eq!(handled_count() - before, 1, "the admitted edge counts once");
+    let wrong = client
+        .get_bucket_notification_configuration()
+        .bucket(OTHER)
+        .send()
+        .await
+        .expect_err("wrong bucket");
+    assert_eq!(refusal(&wrong), (Some("AccessDenied".into()), Some(403)));
+    super::create_user_without_a_policy("notification-no-policy").await;
+    let unprivileged = s3_client(&server.endpoint(), "notification-no-policy", super::USER_SECRET_KEY);
+    let implicit = unprivileged
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect_err("implicit deny");
+    assert_eq!(refusal(&implicit), (Some("AccessDenied".into()), Some(403)));
+    let deny = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":["*"]}},"Action":["s3:GetBucketNotification"],"Resource":["arn:aws:s3:::{BUCKET}"]}}]}}"#
+    );
+    store_bucket_config(BUCKET, "policy.json", &deny).await;
+    let explicit = client
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect_err("explicit deny overrides user allow");
+    assert_eq!(refusal(&explicit), (Some("AccessDenied".into()), Some(403)));
+    assert_eq!(handled_count() - before, 1, "authorization refusals do not reach the edge counter");
+    server.shutdown().await;
+}
+
+#[test]
+fn notification_authorization_binds_the_bucket_on_the_gateway_stack() {
+    with_stack(GATEWAY, notification_authorization_is_bound_to_the_requested_bucket);
+}
+
+#[test]
+fn notification_authorization_binds_the_bucket_on_the_legacy_stack() {
+    with_stack(LEGACY, notification_authorization_is_bound_to_the_requested_bucket);
 }
