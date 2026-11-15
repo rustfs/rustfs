@@ -425,7 +425,10 @@ impl ScannerIOCache for SetDisks {
                 .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
         };
         let mut old_cache = DataUsageCache::default();
-        let initial_revisions = match old_cache.load_with_revisions(self.clone(), DATA_USAGE_CACHE_NAME).await {
+        let initial_revisions = match old_cache
+            .load_with_baseline_revisions(self.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+        {
             Ok(revisions) => Some(revisions),
             Err(e) => {
                 warn!(
