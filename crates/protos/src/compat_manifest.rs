@@ -73,7 +73,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "batch_read_version_req",
             bin_field: "batch_read_version_req_bin",
         },
-        json_encoder: "let batch_read_version_req = compat_json(&req, &policy)?;",
+        json_encoder: "let batch_read_version_req = compat_json(batch_rpc_req.as_ref(), &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
