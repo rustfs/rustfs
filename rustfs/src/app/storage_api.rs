@@ -1752,8 +1752,7 @@ pub(crate) mod bucket_usecase {
 
     pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
-        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, process_lambda_configurations,
-        process_queue_configurations, process_topic_configurations, validate_list_object_unordered_with_delimiter,
+        ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
     };
 }
 

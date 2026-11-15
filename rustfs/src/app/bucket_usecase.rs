@@ -61,10 +61,7 @@ use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
 };
-use super::storage_api::bucket_usecase::{
-    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    request_context, validate_list_object_unordered_with_delimiter,
-};
+use super::storage_api::bucket_usecase::{get_validated_store, request_context, validate_list_object_unordered_with_delimiter};
 #[cfg(feature = "diagnostic-read-version-caller")]
 use super::storage_api::diagnostic;
 use crate::app::RequestEnvelope;
@@ -138,6 +135,7 @@ pub(crate) mod list_objects;
 mod listing;
 mod logging;
 mod notification;
+pub(crate) use notification::NotificationDestination;
 mod object_lock;
 mod policy;
 mod public_access_block;
@@ -275,6 +273,23 @@ pub(crate) async fn notify_table_bucket_metadata_reload(
     notify_bucket_metadata_reload_with_context(bucket, operation, None, false, app_context).await;
 }
 
+#[cfg(test)]
+type BucketMetadataReloadObserver = Box<dyn Fn(bool, &'static str, bool) + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BUCKET_METADATA_RELOAD_PROBE: (String, BucketMetadataReloadObserver);
+}
+
+#[cfg(test)]
+fn record_bucket_metadata_reload(bucket: &str, completed: bool, operation: &'static str, scanner_maintenance_change: bool) {
+    let _ = BUCKET_METADATA_RELOAD_PROBE.try_with(|(observed_bucket, record)| {
+        if observed_bucket == bucket {
+            record(completed, operation, scanner_maintenance_change);
+        }
+    });
+}
+
 async fn notify_bucket_metadata_reload_with_context(
     bucket: String,
     operation: &'static str,
@@ -282,6 +297,11 @@ async fn notify_bucket_metadata_reload_with_context(
     scanner_maintenance_change: bool,
     app_context: Option<Arc<AppContext>>,
 ) {
+    #[cfg(test)]
+    record_bucket_metadata_reload(&bucket, false, operation, scanner_maintenance_change);
+    #[cfg(test)]
+    let observed_bucket = bucket.clone();
+
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
     // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
@@ -303,7 +323,12 @@ async fn notify_bucket_metadata_reload_with_context(
         }
         let _ = completed_tx.send(());
     });
-    let _ = completed_rx.await;
+    let completed = completed_rx.await;
+    #[cfg(test)]
+    if completed.is_ok() {
+        record_bucket_metadata_reload(&observed_bucket, true, operation, scanner_maintenance_change);
+    }
+    let _ = completed;
 }
 
 fn record_local_scanner_maintenance_reload(bucket: &str, scanner_maintenance_change: bool) {

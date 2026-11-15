@@ -18,7 +18,9 @@
 //! until each helper is moved with dedicated small refactor steps.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-pub(crate) use crate::app::bucket_usecase::{PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
+pub(crate) use crate::app::bucket_usecase::{
+    NotificationDestination, PreparedLifecycleConfiguration, validate_lifecycle_rule_status,
+};
 pub(crate) use crate::app::multipart_usecase::{
     AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
     UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput, reject_abort_capabilities,
