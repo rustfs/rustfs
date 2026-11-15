@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use percent_encoding::percent_decode_str;
-use s3s::dto::{Tag, TaggingDirective};
+use s3s::dto::Tag;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use url::form_urlencoded;
 
@@ -97,12 +97,9 @@ pub(crate) fn parse_copy_object_tags(tagging: &str) -> S3Result<String> {
     parse_object_tag_header(tagging).map(encode_tags)
 }
 
-pub(crate) fn resolve_copy_object_tags(
-    tagging: Option<&str>,
-    tagging_directive: Option<&TaggingDirective>,
-) -> S3Result<Option<String>> {
-    match tagging_directive.map(TaggingDirective::as_str) {
-        None | Some(TaggingDirective::COPY) => {
+pub(crate) fn resolve_copy_object_tags(tagging: Option<&str>, tagging_directive: Option<&str>) -> S3Result<Option<String>> {
+    match tagging_directive {
+        None | Some("COPY") => {
             if tagging.is_some() {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidRequest,
@@ -111,7 +108,7 @@ pub(crate) fn resolve_copy_object_tags(
             }
             Ok(None)
         }
-        Some(TaggingDirective::REPLACE) => parse_copy_object_tags(tagging.unwrap_or_default()).map(Some),
+        Some("REPLACE") => parse_copy_object_tags(tagging.unwrap_or_default()).map(Some),
         Some(_) => Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "The TaggingDirective header is invalid".to_string(),
@@ -121,9 +118,13 @@ pub(crate) fn resolve_copy_object_tags(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_copy_object_tags, resolve_copy_object_tags, validate_object_tag_set};
+    use super::{parse_copy_object_tags, validate_object_tag_set};
     use s3s::S3ErrorCode;
     use s3s::dto::{Tag, TaggingDirective};
+
+    fn resolve_copy_object_tags(tagging: Option<&str>, directive: Option<&TaggingDirective>) -> s3s::S3Result<Option<String>> {
+        super::resolve_copy_object_tags(tagging, directive.map(TaggingDirective::as_str))
+    }
 
     fn tag(key: Option<&str>, value: Option<&str>) -> Tag {
         Tag {
