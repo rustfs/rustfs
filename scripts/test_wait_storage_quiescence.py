@@ -63,6 +63,58 @@ class QuiescenceGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("counter reset", result.stderr)
 
+    def run_live_gate(self, delay_stage):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_docker = Path(directory) / "docker"
+            fake_docker.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                f'if [ "{delay_stage}" = "context" ] && [ "$1 $2" = "context show" ]; then sleep 2; fi\n'
+                'if [ "$1 $2" = "context show" ]; then printf "test-context\\n"; exit 0; fi\n'
+                f'if [ "{delay_stage}" = "exec" ] && [ "$3" = "exec" ]; then sleep 2; fi\n'
+                'if [ "$3" = "inspect" ]; then printf "container-id\\n"; exit 0; fi\n'
+                'if [ "$3" = "exec" ]; then\n'
+                '  printf "mem_total_kib=8388608\\ndirty_kib=4096\\nwriteback_kib=0\\n"\n'
+                '  printf "io_psi_total_us=1000\\ncpu_psi_total_us=1000\\n"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 64\n"
+            )
+            fake_docker.chmod(0o755)
+            return subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--docker-bin",
+                    str(fake_docker),
+                    "--docker-context",
+                    "test-context",
+                    "--container",
+                    "target",
+                    "--timeout-secs",
+                    "1",
+                    "--consecutive",
+                    "1",
+                    "--interval-secs",
+                    "0.01",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+    def test_initial_docker_lookup_uses_gate_deadline(self):
+        result = self.run_live_gate("context")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("deadline expired", result.stderr)
+        self.assertNotIn('"status": "pass"', result.stdout)
+
+    def test_docker_exec_uses_remaining_gate_deadline(self):
+        result = self.run_live_gate("exec")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("deadline expired", result.stderr)
+        self.assertNotIn('"status": "pass"', result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
