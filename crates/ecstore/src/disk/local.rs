@@ -2306,6 +2306,11 @@ impl DurabilityMode {
         matches!(self, Self::Strict)
     }
 
+    /// A rollback directory's entry in the object directory is recovery state.
+    fn syncs_metadata_commit_directory(self, has_recovery_backup: bool) -> bool {
+        self.syncs_commit_directories() || (has_recovery_backup && self.syncs_recovery_protocol_state())
+    }
+
     /// Whether a target has the complete file-and-directory durability proof
     /// required by recovery protocols that may otherwise resync it.
     fn fully_syncs_commit_target(self) -> bool {
@@ -22898,6 +22903,7 @@ mod test {
                 let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
                 let bucket_syncs = os::fsync_dir_recorder::count_under(&bucket_dir);
                 let tmp_syncs = os::fsync_dir_recorder::count_under(&tmp_dir);
+                let submitted_jobs = disk.blocking_queue.submitted_jobs_for_test();
                 let payload = Bytes::from_static(b"inline payload");
                 let mut info = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(payload.clone()));
                 info.set_inline_data();
@@ -22905,6 +22911,13 @@ mod test {
                     .await
                     .expect("fresh inline commit");
 
+                if force_fallback && mode == DurabilityMode::FileSync {
+                    assert_eq!(
+                        disk.blocking_queue.submitted_jobs_for_test() - submitted_jobs,
+                        1 + usize::from(cfg!(target_os = "linux")),
+                        "file-sync must publish within preparation when directory grouping has no work"
+                    );
+                }
                 assert_eq!(
                     os::take_prepared_metadata_sync_count(&metadata_path),
                     1,
@@ -22985,6 +22998,65 @@ mod test {
                     .await
                     .expect("read committed inline object");
                 assert_eq!(stored.data, Some(replacement_payload), "overwrite must publish the replacement payload");
+
+                std::fs::remove_dir_all(&rollback_dir).expect("finalize the preceding inline overwrite");
+                let predecessor = std::fs::read(&metadata_path).expect("inline predecessor metadata");
+                let external_data_dir = Uuid::new_v4();
+                let external_payload = b"external replacement payload";
+                let staged_data = tmp_dir.join("external-stage").join(external_data_dir.to_string());
+                std::fs::create_dir_all(&staged_data).expect("external staging directory");
+                std::fs::write(staged_data.join("part.1"), external_payload).expect("staged external payload");
+                let mut external = test_file_info(object, Uuid::nil(), Some(external_data_dir), None);
+                let external_size = i64::try_from(external_payload.len()).expect("fixture size fits i64");
+                external.size = external_size;
+                external.parts[0].size = external_payload.len();
+                external.parts[0].actual_size = external_size;
+                if mode == DurabilityMode::FileSync {
+                    if force_fallback {
+                        os::fsync_dir_recorder::set_grouped_failure(&object_dir, ErrorKind::PermissionDenied);
+                    } else {
+                        os::fsync_dir_recorder::set_failure(&object_dir, ErrorKind::PermissionDenied);
+                    }
+                    let error = disk
+                        .rename_data(RUSTFS_META_TMP_BUCKET, "external-stage", external.clone(), bucket, object)
+                        .await
+                        .expect_err("failed recovery publication barrier must reject the overwrite");
+                    assert_eq!(error, DiskError::FileAccessDenied);
+                    assert_eq!(std::fs::read(&metadata_path).expect("restored predecessor metadata"), predecessor);
+                    assert!(
+                        !object_dir.join(external_data_dir.to_string()).exists(),
+                        "failed publication must remove the new external data directory"
+                    );
+                    std::fs::create_dir_all(&staged_data).expect("retry staging directory");
+                    std::fs::write(staged_data.join("part.1"), external_payload).expect("retry payload");
+                }
+                let object_syncs = os::fsync_dir_recorder::count_at(&object_dir);
+                let recovery_syncs = os::fsync_dir_recorder::count_under(&bucket_dir);
+                let response = disk
+                    .rename_data(RUSTFS_META_TMP_BUCKET, "external-stage", external, bucket, object)
+                    .await
+                    .expect("inline to external overwrite");
+                let rollback_dir = object_dir.join(response.rollback_data_dir.expect("external rollback owner").to_string());
+                assert_eq!(
+                    os::fsync_dir_recorder::count_at(&object_dir) - object_syncs,
+                    1,
+                    "{mode:?}, fallback={force_fallback}: external overwrite must publish its recovery directory durably"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_under(&bucket_dir) - recovery_syncs,
+                    2,
+                    "external overwrite must synchronize its backup and its entry in the object directory"
+                );
+                assert_eq!(
+                    std::fs::read(rollback_dir.join(STORAGE_FORMAT_FILE_BACKUP)).expect("external rollback metadata"),
+                    predecessor,
+                    "external overwrite must preserve its inline predecessor"
+                );
+                assert_eq!(
+                    std::fs::read(object_dir.join(external_data_dir.to_string()).join("part.1"))
+                        .expect("committed external payload"),
+                    external_payload
+                );
                 bucket_durability::set(bucket, None);
             }
         }
@@ -24767,6 +24839,8 @@ mod test {
         assert!(DurabilityMode::Strict.syncs_data_shards());
         assert!(DurabilityMode::Strict.syncs_metadata_files());
         assert!(DurabilityMode::Strict.syncs_commit_directories());
+        assert!(DurabilityMode::Strict.syncs_metadata_commit_directory(false));
+        assert!(DurabilityMode::Strict.syncs_metadata_commit_directory(true));
         assert!(DurabilityMode::Strict.fully_syncs_commit_target());
         assert!(DurabilityMode::Strict.syncs_recovery_protocol_state());
         assert_eq!(DurabilityMode::Strict.metadata_sync_mode(), SyncMode::FileAndDir);
@@ -24776,6 +24850,8 @@ mod test {
         assert!(DurabilityMode::FileSync.syncs_data_shards());
         assert!(DurabilityMode::FileSync.syncs_metadata_files());
         assert!(!DurabilityMode::FileSync.syncs_commit_directories());
+        assert!(!DurabilityMode::FileSync.syncs_metadata_commit_directory(false));
+        assert!(DurabilityMode::FileSync.syncs_metadata_commit_directory(true));
         assert!(!DurabilityMode::FileSync.fully_syncs_commit_target());
         assert!(DurabilityMode::FileSync.syncs_recovery_protocol_state());
         assert_eq!(DurabilityMode::FileSync.metadata_sync_mode(), SyncMode::FileOnly);
@@ -24784,6 +24860,8 @@ mod test {
         assert!(DurabilityMode::Relaxed.syncs_data_shards());
         assert!(!DurabilityMode::Relaxed.syncs_metadata_files());
         assert!(!DurabilityMode::Relaxed.syncs_commit_directories());
+        assert!(!DurabilityMode::Relaxed.syncs_metadata_commit_directory(false));
+        assert!(!DurabilityMode::Relaxed.syncs_metadata_commit_directory(true));
         assert!(!DurabilityMode::Relaxed.fully_syncs_commit_target());
         assert!(!DurabilityMode::Relaxed.syncs_recovery_protocol_state());
         assert_eq!(DurabilityMode::Relaxed.metadata_sync_mode(), SyncMode::None);
@@ -24792,10 +24870,14 @@ mod test {
         assert!(!DurabilityMode::None.syncs_data_shards());
         assert!(!DurabilityMode::None.syncs_metadata_files());
         assert!(!DurabilityMode::None.syncs_commit_directories());
+        assert!(!DurabilityMode::None.syncs_metadata_commit_directory(false));
+        assert!(!DurabilityMode::None.syncs_metadata_commit_directory(true));
         assert!(!DurabilityMode::None.syncs_recovery_protocol_state());
         assert!(!DurabilityMode::LegacyOff.syncs_data_shards());
         assert!(!DurabilityMode::LegacyOff.syncs_metadata_files());
         assert!(!DurabilityMode::LegacyOff.syncs_commit_directories());
+        assert!(!DurabilityMode::LegacyOff.syncs_metadata_commit_directory(false));
+        assert!(!DurabilityMode::LegacyOff.syncs_metadata_commit_directory(true));
         assert!(!DurabilityMode::LegacyOff.syncs_recovery_protocol_state());
     }
 

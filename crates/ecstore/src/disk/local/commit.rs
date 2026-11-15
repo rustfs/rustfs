@@ -1210,7 +1210,7 @@ impl LocalDisk {
                     return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
                 }
 
-                if sync_commit_directories {
+                if durability.syncs_metadata_commit_directory(rollback_data_dir.is_some()) {
                     if staged_rollback_path.is_none()
                         && rollback_data_dir.is_none()
                         && let Some(ref old_metadata) = has_dst_buf
@@ -1911,9 +1911,10 @@ impl LocalDisk {
             // durable. It is part of the metadata commit machinery, so relaxed
             // tiers leave it to the page cache like the xl.meta it mirrors.
             let backup_sync = durability.recovery_sync_mode();
-            if let (Some(old_data_dir), Some(dst_buf)) = (rollback_data_dir, has_dst_buf.as_ref())
-                && multipart_publication.as_ref().is_none_or(|publication| publication.legacy)
-            {
+            let recovery_backup = rollback_data_dir
+                .zip(has_dst_buf.as_ref())
+                .filter(|_| multipart_publication.as_ref().is_none_or(|publication| publication.legacy));
+            if let Some((old_data_dir, dst_buf)) = recovery_backup {
                 let backup_parent = dst_file_parent.join(old_data_dir.to_string());
                 #[cfg(not(windows))]
                 if let Err(err) = os::make_dir_all(&backup_parent, &skip_parent).await {
@@ -2027,7 +2028,7 @@ impl LocalDisk {
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
-            if durability.syncs_commit_directories()
+            if durability.syncs_metadata_commit_directory(recovery_backup.is_some())
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
@@ -2359,7 +2360,7 @@ impl LocalDisk {
                 let destination_was_absent = has_dst_buf.is_none();
                 if !is_cancelled()
                     && rollback_data_dir.is_none()
-                    && !os::dst_dir_fsync_group_commit_enabled()
+                    && (!sync_commit_directories || !os::dst_dir_fsync_group_commit_enabled())
                     && !has_inline_commit_test_failpoints(&dst_path_for_failpoint)
                 {
                     let rename_res = if should_fail_commit_rename(&dst_path_for_failpoint) {
@@ -2650,7 +2651,7 @@ impl LocalDisk {
 
                 // The object directory also publishes the recovery backup's
                 // directory entry, which file-sync must keep durable.
-                if (sync_commit_directories || (sync_recovery_protocol && rollback_data_dir.is_some()))
+                if durability.syncs_metadata_commit_directory(rollback_data_dir.is_some())
                     && let Some(admission) = file_sync_admission.as_ref()
                     && let Some(dst_parent) = dst_file_path.parent()
                 {

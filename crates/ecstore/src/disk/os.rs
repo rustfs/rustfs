@@ -2665,6 +2665,8 @@ impl DiskBlockingLane {
 #[derive(Default)]
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    submitted_jobs: usize,
     active_workers: usize,
     idle_workers: usize,
     #[cfg(any(test, feature = "test-util"))]
@@ -2791,6 +2793,10 @@ impl DiskBlockingQueue {
         let should_spawn = {
             let mut state = self.lane(lane).state.lock();
             state.jobs.push_back(job);
+            #[cfg(test)]
+            {
+                state.submitted_jobs += 1;
+            }
             self.lane(lane).ready.store(true, std::sync::atomic::Ordering::Relaxed);
             if state.jobs.len() > state.idle_workers && state.active_workers < self.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
@@ -2803,6 +2809,11 @@ impl DiskBlockingQueue {
         if should_spawn {
             Self::spawn_worker(Arc::clone(self), lane);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_jobs_for_test(&self) -> usize {
+        self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
     }
 
     #[inline]
