@@ -935,12 +935,6 @@ pub(crate) mod envelope_payloads {
     }
 }
 
-/// Local tag evidence cannot authorize an object that only exists on a replica.
-/// Keep the local miss whenever authorization needed existing-object tags.
-pub(crate) fn replication_proxy_allowed(extensions: &http::Extensions) -> bool {
-    extensions.get::<ObjectTagConditions>().is_none()
-}
-
 const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
 
 fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
@@ -4247,17 +4241,10 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
-        req.install_requested_object_tags(RequestedObjectTags::from(&req.input.tagging));
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
-            req,
-            versioned_tagging_action(S3Action::PutObjectTaggingAction, req.input.version_id.as_deref()),
-        )
-        .await
+        let input = &req.input;
+        let tags = RequestedObjectTags::from(&input.tagging);
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        access_owned::object_meta::authorize_put_object_tagging(req, &bucket, &key, version_id.as_deref(), tags).await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -6468,21 +6455,28 @@ mod tests {
         assert!(!conditions.contains_key("RequestObjectTagKeys"));
     }
 
+    fn tagging_proxy_allowed<T>(request: &S3Request<T>) -> bool {
+        let envelope = crate::app::RequestEnvelope::from_s3s(request);
+        crate::app::object_meta::tagging::proxy_allowed(&envelope)
+    }
+
     #[test]
     fn replication_proxy_requires_authorization_independent_of_local_tags() {
-        let mut extensions = http::Extensions::new();
-        assert!(super::replication_proxy_allowed(&extensions));
+        let mut request = build_request((), Method::PUT);
+        assert!(tagging_proxy_allowed(&request));
         // A local miss produces an empty tag map, but still establishes that the
         // policy needs tags. Neither anonymous nor authenticated callers may proxy.
-        extensions.insert(ObjectTagConditions::new("bucket", "missing", None, HashMap::new()));
-        assert!(!super::replication_proxy_allowed(&extensions));
-        extensions.insert(ObjectTagConditions::new(
+        request
+            .extensions
+            .insert(ObjectTagConditions::new("bucket", "missing", None, HashMap::new()));
+        assert!(!tagging_proxy_allowed(&request));
+        request.extensions.insert(ObjectTagConditions::new(
             "bucket",
             "missing",
             Some("version"),
             HashMap::from([("ExistingObjectTag/protected".to_string(), vec!["yes".to_string()])]),
         ));
-        assert!(!super::replication_proxy_allowed(&extensions));
+        assert!(!tagging_proxy_allowed(&request));
     }
 
     #[tokio::test]
@@ -6517,7 +6511,7 @@ mod tests {
         .expect("merge required existing object tags into authorization conditions");
 
         assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["restricted".to_string()]));
-        assert!(!super::replication_proxy_allowed(&request.extensions));
+        assert!(!tagging_proxy_allowed(&request));
         assert_eq!(conditions.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
@@ -7463,10 +7457,7 @@ mod tests {
                     .get::<ObjectTagConditions>()
                     .expect("authorization must retain tag dependency");
                 assert!(evidence.values.is_empty(), "missing local object has no tags");
-                assert!(
-                    !super::replication_proxy_allowed(&req.extensions),
-                    "local absence cannot authorize a tagged replica"
-                );
+                assert!(!tagging_proxy_allowed(&req), "local absence cannot authorize a tagged replica");
             }};
         }
         check_hook!(

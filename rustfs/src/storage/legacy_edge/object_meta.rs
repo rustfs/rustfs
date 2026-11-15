@@ -20,13 +20,13 @@
 //! owns this file and is the only one that edits it.
 
 use crate::app::object_meta::ObjectMetaUsecase;
-use crate::app::object_meta::tagging_proxy::proxy_put_object_tagging;
 use crate::app::object_meta::torrent::answer_get_object_torrent;
 use crate::app::storage_api::object_usecase::bucket::replication::{
     ReplicateDecision, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::error::ApiError;
-use crate::storage::access::{apply_bucket_generation_guard, has_bypass_governance_header, replication_proxy_allowed};
+use crate::storage::access::{apply_bucket_generation_guard, has_bypass_governance_header};
+use crate::storage::check_retention_for_modification;
 use crate::storage::ecfs::*;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
@@ -39,9 +39,7 @@ use crate::storage::storage_api::ecfs_consumer::contract::{
 use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
-use crate::storage::{check_retention_for_modification, encode_tags, is_err_object_not_found, is_err_version_not_found};
 use crate::table_catalog;
-use metrics::{counter, histogram};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
     delete_object_tagging, get_object_acl, get_object_legal_hold, get_object_retention, get_object_tagging, get_object_torrent,
     put_object_acl,
@@ -49,15 +47,12 @@ use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
-use rustfs_utils::http::{
-    SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, insert_str,
-};
-use std::collections::HashMap;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{debug, error, instrument};
+use rustfs_utils::http::{SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
+use time::OffsetDateTime;
+use tracing::{error, instrument};
 use uuid::Uuid;
 
-/// The legacy PutObjectTagging tag set as the tagging proxy takes it, until that operation moves.
+/// Preserve every tag and its optional fields for validation by the shared use case.
 fn gateway_tags(tag_set: &TagSet) -> Vec<rustfs_gateway_types::dto::Tag> {
     tag_set
         .iter()
@@ -410,125 +405,20 @@ impl FS {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
+        record_s3_op(S3Operation::PutObjectTagging);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
         let PutObjectTaggingInput {
             bucket,
-            key: object,
+            key,
+            version_id,
             tagging,
             ..
-        } = req.input.clone();
-
-        reject_veeam_sosapi_mutation(self, &bucket, &object).await?;
-        validate_table_catalog_object_mutation(&bucket, &object).await?;
-
-        crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let tags = encode_tags(tagging.tag_set.clone());
-        debug!("Encoded tags: {}", tags);
-
-        let version_id = req.input.version_id.clone();
-        let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        let existing_object_info = match store.get_object_info(&bucket, &object, &opts).await {
-            Ok(info) => info,
-            Err(e) => {
-                // Replication lag window: apply the tagging update on a
-                // replication target that already has the object
-                // (backlog#1675 P1-5). No local object exists, so no bucket
-                // notification event is emitted for the proxied write.
-                if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
-                    && replication_proxy_allowed(&req.extensions)
-                    && proxy_put_object_tagging(
-                        &bucket,
-                        &object,
-                        version_id.clone(),
-                        &req.headers,
-                        &gateway_tags(&tagging.tag_set),
-                    )
-                    .await
-                    .is_some()
-                {
-                    counter!("rustfs_put_object_tagging_success").increment(1);
-                    let duration = start_time.elapsed();
-                    histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put")
-                        .record(duration.as_secs_f64());
-                    return Ok(S3Response::new(PutObjectTaggingOutput {
-                        version_id: req.input.version_id.clone(),
-                    }));
-                }
-                return Err(ApiError::from(e).into());
-            }
-        };
-        let dsc = must_replicate_metadata(
-            &bucket,
-            &object,
-            &existing_object_info.user_defined,
-            tags.clone(),
-            existing_object_info.replication_status.clone(),
-            opts.clone(),
-        )
-        .await;
-        if dsc.replicate_any() {
-            let mut eval_metadata = HashMap::new();
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
-            insert_str(
-                &mut eval_metadata,
-                SUFFIX_TAGGING_TIMESTAMP,
-                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
-            );
-            opts.eval_metadata = Some(eval_metadata);
-        }
-
-        let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
-        let object_info = put_tags_result.map_err(|e| {
-            error!("Failed to put object tags: {}", e);
-            counter!("rustfs_put_object_tagging_failure").increment(1);
-            ApiError::from(e)
-        })?;
-
-        let event_object_info = Some(object_info.clone());
-        if dsc.replicate_any() {
-            schedule_metadata_replication(object_info, store.clone(), dsc).await;
-        }
-
-        counter!("rustfs_put_object_tagging_success").increment(1);
-
-        let event_version_id = req
-            .input
-            .version_id
-            .as_deref()
-            .filter(|version_id| !version_id.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                event_object_info
-                    .as_ref()
-                    .and_then(|info| info.version_id.map(|version_id| version_id.to_string()))
-            })
-            .unwrap_or_default();
-        if let Some(event_object_info) = event_object_info {
-            helper = helper.object(event_object_info);
-        }
-        helper = helper.version_id(event_version_id);
-
-        let result = Ok(S3Response::new(PutObjectTaggingOutput {
-            version_id: req.input.version_id.clone(),
-        }));
-        let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_object_from_producer(
-            &bucket,
-            &object,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::ObjectMetadata,
-        );
-        let duration = start_time.elapsed();
-        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
-        result
+        } = req.input;
+        let output = object_meta_usecase(self)
+            .put_object_tagging_fields(envelope, &bucket, &key, version_id, gateway_tags(&tagging.tag_set))
+            .await?;
+        Ok(S3Response::new(PutObjectTaggingOutput {
+            version_id: output.version_id,
+        }))
     }
 }

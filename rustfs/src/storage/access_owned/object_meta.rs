@@ -21,6 +21,7 @@
 //! Upstream: the legacy hook in `storage/access.rs` and the batch's `server/gateway_handlers/object_meta.rs`.
 //! Downstream: the shared shapes in `storage/access.rs`.
 
+pub(crate) use super::super::RequestedObjectTags;
 use super::super::{AuthorizationRequest, S3Result, authorize_object_request, versioned_tagging_action};
 use rustfs_policy::policy::action::S3Action;
 
@@ -34,4 +35,16 @@ pub(crate) async fn authorize_object_tagging_request<R: AuthorizationRequest + ?
     action: S3Action,
 ) -> S3Result<()> {
     authorize_object_request(req, bucket, key, version_id, versioned_tagging_action(action, version_id)).await
+}
+
+/// Authorize the version and tag conditions using the original query and XML tag set.
+pub(crate) async fn authorize_put_object_tagging<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    tags: RequestedObjectTags,
+) -> S3Result<()> {
+    req.install_requested_object_tags(tags);
+    authorize_object_tagging_request(req, bucket, key, version_id, S3Action::PutObjectTaggingAction).await
 }

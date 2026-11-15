@@ -23,7 +23,7 @@ use super::{
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::types::{AccessControlPolicy, Grant, Grantee, ObjectCannedAcl, Owner, Permission, Type};
+use aws_sdk_s3::types::{AccessControlPolicy, Grant, Grantee, ObjectCannedAcl, Owner, Permission, Tag, Tagging, Type};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
@@ -65,6 +65,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::GetObjectTagging,
         has_error_body: true,
         call: get_object_tagging,
+    },
+    MatrixRow {
+        operation: "PutObjectTagging",
+        metric: S3Operation::PutObjectTagging,
+        has_error_body: true,
+        call: put_object_tagging,
     },
     MatrixRow {
         operation: "DeleteObjectTagging",
@@ -116,6 +122,13 @@ fn get_object_tagging<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a,
     Box::pin(async move {
         put_object_in_the_store(bucket, KEY, HashMap::new()).await;
         outcome(client.get_object_tagging().bucket(bucket).key(KEY).send().await)
+    })
+}
+
+fn put_object_tagging<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        put_object_in_the_store(MATRIX_BUCKET, KEY, HashMap::new()).await;
+        outcome(put_tags(client, MATRIX_BUCKET, KEY, None, &[]).send().await)
     })
 }
 
@@ -341,6 +354,335 @@ fn the_gateway_stack_answers_object_metadata_as_stored() {
 #[test]
 fn the_legacy_stack_answers_object_metadata_as_stored() {
     with_stack(LEGACY, object_metadata_answers_as_stored);
+}
+
+fn put_tags(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version: Option<&str>,
+    pairs: &[(&str, &str)],
+) -> aws_sdk_s3::operation::put_object_tagging::builders::PutObjectTaggingFluentBuilder {
+    let tag_set = pairs
+        .iter()
+        .map(|(key, value)| Tag::builder().key(*key).value(*value).build().unwrap())
+        .collect();
+    let tagging = Tagging::builder().set_tag_set(Some(tag_set)).build().unwrap();
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(version.map(str::to_owned))
+        .tagging(tagging)
+}
+
+async fn tagged_object(client: &Client, bucket: &str, key: &str, payload: &'static [u8], tagging: &str) -> Option<String> {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .tagging(tagging)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(payload))
+        .send()
+        .await
+        .unwrap()
+        .version_id()
+        .map(str::to_owned)
+}
+
+async fn object_payload(client: &Client, bucket: &str, key: &str, version: Option<&str>) -> (Option<String>, Vec<u8>) {
+    let output = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(version.map(str::to_owned))
+        .send()
+        .await
+        .unwrap();
+    (
+        output.version_id().map(str::to_owned),
+        output.body.collect().await.unwrap().into_bytes().to_vec(),
+    )
+}
+
+fn tagging_operation_count() -> u64 {
+    rustfs_io_metrics::s3_op_metrics_snapshot()
+        .into_iter()
+        .find(|row| row.op == S3Operation::PutObjectTagging.as_str())
+        .map_or(0, |row| row.total)
+}
+
+async fn read_tags(client: &Client, bucket: &str, key: &str, version: Option<&str>) -> Vec<(String, String)> {
+    client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(version.map(str::to_owned))
+        .send()
+        .await
+        .unwrap()
+        .tag_set()
+        .iter()
+        .map(|tag| (tag.key().to_owned(), tag.value().to_owned()))
+        .collect()
+}
+
+async fn attach_tagging_policy(user: &str, action: &str, resource: &str, condition: serde_json::Value) {
+    super::create_user_without_a_policy(user).await;
+    let document = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": [action], "Resource": [resource], "Condition": condition}]
+    })
+    .to_string();
+    let policy = rustfs_policy::policy::Policy::parse_config(document.as_bytes()).unwrap();
+    let iam = get_global_app_context().unwrap().iam().handle();
+    iam.set_policy(user, policy).await.unwrap();
+    iam.policy_db_set(user, rustfs_iam::store::UserType::Reg, false, user)
+        .await
+        .unwrap();
+}
+
+async fn put_object_tagging_authorization(server: rustfs::embedded::RustFSServer) {
+    const BUCKET: &str = "put-object-tagging-policy";
+    const OTHER: &str = "alternate";
+    const CURRENT: &str = "tagging-current";
+    const KEYS: &str = "tagging-keys";
+    const VERSION: &str = "tagging-version";
+    const WRONG: &str = "tagging-wrong-action";
+
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    create_bucket_in_the_store(BUCKET).await;
+    for key in [KEY, OTHER] {
+        tagged_object(&root, BUCKET, key, b"preserved", "old=before").await;
+    }
+    let resource = format!("arn:aws:s3:::{BUCKET}/{KEY}");
+    attach_tagging_policy(
+        CURRENT,
+        "s3:PutObjectTagging",
+        &resource,
+        serde_json::json!({
+            "StringEquals": {"s3:RequestObjectTag/project": "approved"}
+        }),
+    )
+    .await;
+    attach_tagging_policy(
+        KEYS,
+        "s3:PutObjectTagging",
+        &resource,
+        serde_json::json!({
+            "ForAllValues:StringLike": {"s3:RequestObjectTagKeys": ["project"]}
+        }),
+    )
+    .await;
+    create_user_allowed_on_one_bucket(VERSION, "s3:PutObjectVersionTagging", &format!("{BUCKET}/{KEY}")).await;
+    create_user_allowed_on_one_bucket(WRONG, "s3:GetObjectTagging", &format!("{BUCKET}/{KEY}")).await;
+    let current = s3_client(&endpoint, CURRENT, USER_SECRET_KEY);
+    let keys = s3_client(&endpoint, KEYS, USER_SECRET_KEY);
+    let version = s3_client(&endpoint, VERSION, USER_SECRET_KEY);
+    let wrong = s3_client(&endpoint, WRONG, USER_SECRET_KEY);
+    let anonymous = super::anonymous_client(&endpoint).await;
+
+    let approved = [("project", "approved")];
+    let denied = [("project", "denied")];
+    let unexpected = [("forbidden", "approved")];
+    let old = [("old".to_owned(), "before".to_owned())];
+    let stored = [("project".to_owned(), "approved".to_owned())];
+    assert_eq!(read_tags(&root, BUCKET, KEY, None).await, old);
+    let grant = "project=approved";
+    let refuse = "project=denied";
+    for (label, client, key, named_version, pairs, header, allowed) in [
+        ("XML value", &current, KEY, None, approved.as_slice(), refuse, true),
+        ("spoofed value", &current, KEY, None, &denied, grant, false),
+        ("empty XML set", &current, KEY, None, &[], grant, false),
+        ("empty version", &current, KEY, Some(""), &approved, grant, false),
+        ("null version", &current, KEY, Some("null"), &approved, grant, false),
+        ("wrong resource", &current, OTHER, None, &approved, grant, false),
+        ("XML key", &keys, KEY, None, &approved, "forbidden=approved", true),
+        ("spoofed key", &keys, KEY, None, &unexpected, grant, false),
+        ("version-only policy", &version, KEY, None, &denied, refuse, false),
+        ("null version allowed", &version, KEY, Some("null"), &approved, refuse, true),
+        ("wrong action", &wrong, KEY, None, &denied, refuse, false),
+        ("anonymous", &anonymous, KEY, None, &denied, refuse, false),
+    ] {
+        let before = tagging_operation_count();
+        let result = put_tags(client, BUCKET, key, named_version, pairs)
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert("x-amz-tagging", header);
+            })
+            .send()
+            .await;
+        if allowed {
+            assert_eq!(
+                result.unwrap_or_else(|error| panic!("{label}: {error:?}")).version_id(),
+                named_version,
+                "{label}"
+            );
+        } else {
+            assert_eq!(
+                refusal(&result.expect_err(label)),
+                (Some("AccessDenied".to_owned()), Some(403)),
+                "{label}"
+            );
+        }
+        assert_eq!(tagging_operation_count() - before, u64::from(allowed), "{label}");
+        for (key, expected) in [(KEY, &stored), (OTHER, &old)] {
+            assert_eq!(&read_tags(&root, BUCKET, key, None).await, expected, "{label}: {key}");
+            assert_eq!(
+                object_payload(&root, BUCKET, key, None).await,
+                (None, b"preserved".to_vec()),
+                "{label}: {key}"
+            );
+        }
+    }
+    server.shutdown().await;
+}
+
+#[test]
+fn gateway_put_object_tagging_authorizes_body_version_and_resource() {
+    with_stack(GATEWAY, put_object_tagging_authorization);
+}
+
+#[test]
+fn legacy_put_object_tagging_authorizes_body_version_and_resource() {
+    with_stack(LEGACY, put_object_tagging_authorization);
+}
+
+async fn put_object_tagging_validation(server: rustfs::embedded::RustFSServer) {
+    const BUCKET: &str = "put-object-tagging-validation";
+    create_bucket_in_the_store(BUCKET).await;
+    put_object_in_the_store(BUCKET, KEY, HashMap::new()).await;
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let keys: Vec<_> = (0..11).map(|key| key.to_string()).collect();
+    let too_many: Vec<_> = keys.iter().map(|key| (key.as_str(), "")).collect();
+    let (long_key, long_value) = ("𐐀".repeat(65), "𐐀".repeat(129));
+    let duplicates = [("same", "one"), ("same", "two")];
+    for (pairs, version, code) in [
+        (too_many.as_slice(), None, "InvalidTag"),
+        (&[("", "value")], None, "InvalidTag"),
+        (&[("tag", "invalid?")], None, "InvalidTag"),
+        (&[(long_key.as_str(), "value")], None, "InvalidTag"),
+        (&[("tag", long_value.as_str())], None, "InvalidTag"),
+        (&duplicates, Some("bad"), "InvalidTag"),
+        (&[("tag", "value")], Some("bad"), "InvalidArgument"),
+        (&[("tag", "value")], Some(""), "InvalidArgument"),
+    ] {
+        let result = put_tags(&client, BUCKET, KEY, version, pairs).send().await;
+        assert_eq!(refusal(&result.unwrap_err()), (Some(code.to_owned()), Some(400)), "{pairs:?} {version:?}");
+        assert!(read_tags(&client, BUCKET, KEY, None).await.is_empty(), "{pairs:?}");
+    }
+    let (key, value) = ("𐐀".repeat(64), "𐐀".repeat(128));
+    put_tags(&client, BUCKET, KEY, None, &[(&key, &value)]).send().await.unwrap();
+    assert_eq!(read_tags(&client, BUCKET, KEY, None).await, [(key, value)]);
+    server.shutdown().await;
+}
+
+#[test]
+fn gateway_put_object_tagging_validates_tags_before_version() {
+    with_stack(GATEWAY, put_object_tagging_validation);
+}
+
+#[test]
+fn legacy_put_object_tagging_validates_tags_before_version() {
+    with_stack(LEGACY, put_object_tagging_validation);
+}
+
+fn put_object_tagging_survives_restart(stack: Option<&'static str>) {
+    temp_env::with_var(super::ENV_S3_STACK, stack, || {
+        super::common::run_embedded_test(|| async {
+            use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+            use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+
+            const BUCKET: &str = "put-object-tagging-history";
+            let volume = tempfile::tempdir().unwrap();
+            let start = || {
+                RustFSServerBuilder::new()
+                    .address(format!("127.0.0.1:{}", find_available_port().unwrap()))
+                    .access_key(super::ROOT_ACCESS_KEY)
+                    .secret_key(super::ROOT_SECRET_KEY)
+                    .volume(volume.path().to_string_lossy())
+                    .build()
+            };
+            let server = start().await.unwrap();
+            let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+            create_bucket_in_the_store(BUCKET).await;
+            root.put_bucket_versioning()
+                .bucket(BUCKET)
+                .versioning_configuration(
+                    VersioningConfiguration::builder()
+                        .status(BucketVersioningStatus::Enabled)
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap();
+            let first = tagged_object(&root, BUCKET, KEY, b"first", "old=first").await.unwrap();
+            let second = tagged_object(&root, BUCKET, KEY, b"second", "old=second").await.unwrap();
+            let first_tags = [
+                ("project".to_owned(), "approved".to_owned()),
+                ("with space".to_owned(), String::new()),
+            ];
+            let current_tags = [("old".to_owned(), "second".to_owned())];
+            let notify = rustfs_notify::notification_system().expect("embedded notification runtime");
+            let mut events = notify.subscribe_live_events();
+            let resource = format!("arn:aws:s3:::{BUCKET}/{KEY}");
+            attach_tagging_policy(
+                "history-writer",
+                "s3:PutObjectVersionTagging",
+                &resource,
+                serde_json::json!({"StringEquals":{"s3:VersionId": first}}),
+            )
+            .await;
+            let writer = s3_client(&server.endpoint(), "history-writer", USER_SECRET_KEY);
+            let result = put_tags(&writer, BUCKET, KEY, Some(&first), &[("project", "approved"), ("with space", "")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(result.version_id(), Some(first.as_str()));
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if event.event_name == rustfs_s3_types::EventName::ObjectTaggingPut {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("committed tagging event");
+            assert_eq!(event.s3.bucket.name, BUCKET);
+            assert_eq!(event.s3.object.key, KEY);
+            assert_eq!(event.s3.object.version_id.as_deref(), Some(first.as_str()));
+            server.shutdown().await;
+
+            let server = start().await.unwrap();
+            let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+            for (version, payload, expected) in [
+                (Some(first.as_str()), b"first".as_slice(), first_tags.as_slice()),
+                (None, b"second".as_slice(), current_tags.as_slice()),
+            ] {
+                assert_eq!(read_tags(&root, BUCKET, KEY, version).await, expected);
+                let (seen_version, seen_payload) = object_payload(&root, BUCKET, KEY, version).await;
+                assert_eq!(seen_version.as_deref(), version.or(Some(second.as_str())));
+                assert_eq!(seen_payload, payload);
+            }
+            let cleared = put_tags(&root, BUCKET, KEY, None, &[]).send().await.unwrap();
+            assert!(cleared.version_id().is_none());
+            assert!(read_tags(&root, BUCKET, KEY, None).await.is_empty());
+            assert_eq!(read_tags(&root, BUCKET, KEY, Some(&first)).await, first_tags);
+            server.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn gateway_put_object_tagging_replaces_stored_tags() {
+    put_object_tagging_survives_restart(GATEWAY);
+}
+
+#[test]
+fn legacy_put_object_tagging_replaces_stored_tags() {
+    put_object_tagging_survives_restart(LEGACY);
 }
 
 /// The tagging actions swap to their version actions when a version is named: a user allowed only
