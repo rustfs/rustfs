@@ -17,11 +17,13 @@
 use super::access::authorize_bucket_config_mutation;
 use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
-use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::bucket_usecase::{DefaultBucketUsecase, NotificationDestination};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
-use rustfs_gateway_types::persistence::{parse_versioning, serialize_versioning_dto};
+use rustfs_gateway_types::persistence::{
+    parse_notification, parse_versioning, serialize_notification_dto, serialize_versioning_dto,
+};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -34,6 +36,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketPolicyStatus>(),
     row::<dto::GetBucketAcl>(),
     row::<dto::GetBucketNotificationConfiguration>(),
+    row::<dto::PutBucketNotificationConfiguration>(),
 ];
 
 impl Served for dto::GetBucketVersioning {
@@ -133,4 +136,65 @@ impl Served for dto::GetBucketNotificationConfiguration {
             .await?;
         Ok(Resp::new(output))
     }
+}
+
+impl Served for dto::PutBucketNotificationConfiguration {
+    const METRIC: S3Operation = S3Operation::PutBucketNotificationConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketNotificationAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let prepared = parse_notification(&serialize_notification_dto(&input.notification_configuration))
+            .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"));
+        let destinations = notification_destinations(input.notification_configuration);
+        let output = DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_notification_configuration(envelope, input.bucket.as_str(), destinations, prepared)
+            .await?;
+        Ok(Resp::new(output))
+    }
+}
+
+fn notification_destinations(configuration: dto::NotificationConfiguration) -> Vec<NotificationDestination> {
+    let mut destinations = Vec::new();
+    for cfg in configuration.queue_configurations {
+        destinations.push(NotificationDestination {
+            kind: "QueueConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_str().to_owned()).collect(),
+            target_arn: cfg.queue_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    for cfg in configuration.topic_configurations {
+        destinations.push(NotificationDestination {
+            kind: "TopicConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_str().to_owned()).collect(),
+            target_arn: cfg.topic_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    for cfg in configuration.lambda_function_configurations {
+        destinations.push(NotificationDestination {
+            kind: "LambdaFunctionConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_str().to_owned()).collect(),
+            target_arn: cfg.lambda_function_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    destinations
+}
+
+fn notification_filters(filter: Option<dto::NotificationConfigurationFilter>) -> Vec<(Option<String>, Option<String>)> {
+    filter
+        .and_then(|filter| filter.key)
+        .into_iter()
+        .flat_map(|key| key.filter_rules)
+        .map(|rule| (rule.name.map(|name| name.as_str().to_owned()), rule.value))
+        .collect()
 }

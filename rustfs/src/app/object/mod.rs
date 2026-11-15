@@ -97,6 +97,7 @@ use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
+#[cfg(test)]
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
@@ -204,8 +205,12 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
     }
 }
 
+mod attributes;
+#[cfg(test)]
+mod attributes_completion_test;
 #[cfg(test)]
 mod conditional_read_bench;
+pub(crate) use attributes::{GetObjectAttributesFields, GetObjectAttributesOutputFacts};
 mod copy;
 mod copy_input;
 pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition};
