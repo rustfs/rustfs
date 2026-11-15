@@ -401,12 +401,6 @@ fn the_legacy_stack_lists_every_stored_entity_tag() {
 async fn listings_keep_stored_names_and_page_boundaries(server: RustFSServer) {
     let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
     for bucket in ["listing-boundaries", "sthree-listing-boundaries"] {
-        // Capability probes may create uploads that would alter the pagination fixture.
-        let matrix_bucket = format!("{bucket}-matrix");
-        create_bucket_in_the_store(&matrix_bucket).await;
-        for row in MATRIX {
-            assert_eq!((row.call)(&client, &matrix_bucket).await, Ok(()), "{} {matrix_bucket}", row.operation);
-        }
         create_bucket_in_the_store(bucket).await;
         for key in ["a &b", "c/d"] {
             put_in_the_store(bucket, key, Some("a&b")).await;
@@ -416,6 +410,9 @@ async fn listings_keep_stored_names_and_page_boundaries(server: RustFSServer) {
                 .new_multipart_upload(bucket, key, &ObjectOptions::default())
                 .await
                 .expect("create stored multipart upload");
+        }
+        for row in MATRIX {
+            assert_eq!((row.call)(&client, bucket).await, Ok(()), "{} {bucket}", row.operation);
         }
         for max in [0, 1, 2, 3] {
             let page = client
