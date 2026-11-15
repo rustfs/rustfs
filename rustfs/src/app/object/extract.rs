@@ -474,7 +474,9 @@ where
     let mut buffer = pool
         .try_acquire_buffer(size)
         .unwrap_or_else(|| rustfs_io_core::PooledBuffer::unpooled(size));
-    super::put::read_small_put_body_into(body, &mut *buffer, size).await?;
+    super::put::read_small_put_body_into(body, &mut *buffer, size)
+        .await
+        .map_err(S3Error::from)?;
     Ok(ExtractStagedBody {
         reader: Some(super::put::PooledBufferReader::new(buffer, size)),
     })
@@ -2094,7 +2096,7 @@ impl DefaultObjectUsecase {
         let Some(body) = body else {
             return Err(Into::into(s3_error!(IncompleteBody)));
         };
-        let (chunks, _) = super::native_body::BodyChunks::new(body);
+        let (chunks, _) = super::native_body::BodyChunks::with_trailers(body, input.frame_trailers);
         let body: super::request_body::UploadChunks = Box::new(chunks);
         let (body, progress_control) = if let Some(control) = envelope.body_read_control() {
             control.activate_upload(
