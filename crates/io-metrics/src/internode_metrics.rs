@@ -433,6 +433,13 @@ const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_o
 const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_internode_operation_server_duration_ms";
 const INTERNODE_RPC_ACTIVE: &str = "rustfs_system_network_internode_rpc_active";
 const INTERNODE_RPC_COMPLETIONS_TOTAL: &str = "rustfs_system_network_internode_rpc_completions_total";
+const INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL: &str = "rustfs_system_network_internode_channel_rebuild_attempts_total";
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+const INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_http2_ping_timeouts_total";
+const INTERNODE_BULK_BODY_WAIT_DURATION_MS: &str = "rustfs_system_network_internode_bulk_body_wait_duration_ms";
+const INTERNODE_BULK_BODY_WAITERS: &str = "rustfs_system_network_internode_bulk_body_waiters";
+const INTERNODE_BULK_BODY_ACTIVE: &str = "rustfs_system_network_internode_bulk_body_active";
+const INTERNODE_BULK_BODY_ADMISSIONS_TOTAL: &str = "rustfs_system_network_internode_bulk_body_admissions_total";
 const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
@@ -449,6 +456,23 @@ const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_inter
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
 const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+tokio::task_local! {
+    static INTERNODE_HTTP2_CLIENT_TASK: ();
+}
+
+/// Scope a tonic/Hyper background task as an internode HTTP/2 client task.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub async fn scope_internode_http2_client_task<T>(future: impl std::future::Future<Output = T>) -> T {
+    INTERNODE_HTTP2_CLIENT_TASK.scope((), future).await
+}
+
+/// Whether the current task belongs to an internode tonic/Hyper client.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn is_internode_http2_client_task() -> bool {
+    INTERNODE_HTTP2_CLIENT_TASK.try_with(|()| ()).is_ok()
+}
 const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_replay_scope_fallback_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
@@ -468,6 +492,8 @@ pub struct InternodeOperationMetricDescriptor {
 const SERVER_OPERATION_BACKEND_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL];
 const SERVER_OPERATION_BACKEND_SIDE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "side"];
 const SERVER_OPERATION_BACKEND_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "outcome"];
+const SERVER_CLASS_REASON_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, "class", REASON_LABEL, "outcome"];
+const SERVER_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, "outcome"];
 const SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] =
     &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
 const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
@@ -579,6 +605,26 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: INTERNODE_RPC_COMPLETIONS_TOTAL,
         labels: SERVER_OPERATION_BACKEND_OUTCOME_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL,
+        labels: SERVER_CLASS_REASON_OUTCOME_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_WAIT_DURATION_MS,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_WAITERS,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_ACTIVE,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+        labels: SERVER_OUTCOME_LABELS,
     },
 ];
 
@@ -750,6 +796,169 @@ pub async fn measure_client_rpc<T, E>(
         RpcOutcome::Error
     };
     result
+}
+
+/// Record one attempt to publish a replacement after a bounded cached-channel eviction.
+pub fn record_channel_rebuild_attempt(class: &'static str, reason: &'static str, connected: bool) {
+    if !crate::metrics_enabled() {
+        return;
+    }
+    let class = match class {
+        "control" | "bulk" | "recovery" => class,
+        _ => "unknown",
+    };
+    let reason = match reason {
+        "rpc_failure"
+        | "operation_timeout"
+        | "transport_failure"
+        | "lock_timeout"
+        | "lock_transport"
+        | "peer_probe"
+        | "tls_generation_changed"
+        | "manual" => reason,
+        _ => "unknown",
+    };
+    metrics::counter!(
+        INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL,
+        SERVER_LABEL => current_server_label(),
+        "class" => class,
+        REASON_LABEL => reason,
+        "outcome" => if connected { "connected" } else { "failed_or_cancelled" }
+    )
+    .increment(1);
+}
+
+/// Record one Hyper-confirmed HTTP/2 keepalive PING ACK timeout.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn record_http2_ping_timeout() {
+    if !crate::metrics_enabled() {
+        return;
+    }
+    metrics::counter!(
+        INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL,
+        SERVER_LABEL => current_server_label()
+    )
+    .increment(1);
+}
+
+#[derive(Clone)]
+struct BulkBodyAdmissionMetricHandles {
+    wait_duration: metrics::Histogram,
+    waiters: metrics::Gauge,
+    active: metrics::Gauge,
+    admitted: metrics::Counter,
+    cancelled: metrics::Counter,
+    timed_out: metrics::Counter,
+}
+
+impl BulkBodyAdmissionMetricHandles {
+    fn new() -> Self {
+        let server = current_server_label();
+        Self {
+            wait_duration: metrics::histogram!(INTERNODE_BULK_BODY_WAIT_DURATION_MS, SERVER_LABEL => server),
+            waiters: metrics::gauge!(INTERNODE_BULK_BODY_WAITERS, SERVER_LABEL => server),
+            active: metrics::gauge!(INTERNODE_BULK_BODY_ACTIVE, SERVER_LABEL => server),
+            admitted: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "admitted"
+            ),
+            cancelled: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "cancelled"
+            ),
+            timed_out: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "timeout"
+            ),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static BULK_BODY_ADMISSION_METRICS: LazyLock<BulkBodyAdmissionMetricHandles> = LazyLock::new(BulkBodyAdmissionMetricHandles::new);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BulkBodyAdmissionState {
+    Waiting,
+    Active,
+    Finished,
+}
+
+/// Tracks one wait for complete-unary admission and, after admission, keeps the active gauge
+/// elevated until the decoded and validated response is released.
+pub struct InternodeBulkBodyAdmissionGuard {
+    started_at: Option<Instant>,
+    handles: Option<BulkBodyAdmissionMetricHandles>,
+    state: BulkBodyAdmissionState,
+}
+
+impl InternodeBulkBodyAdmissionGuard {
+    pub fn waiting() -> Self {
+        #[cfg(not(test))]
+        let handles =
+            (crate::metrics_enabled() && STABLE_SERVER_LABEL.get().is_some()).then(|| BULK_BODY_ADMISSION_METRICS.clone());
+        #[cfg(test)]
+        let handles = crate::metrics_enabled().then(BulkBodyAdmissionMetricHandles::new);
+        if let Some(handles) = &handles {
+            handles.waiters.increment(1.0);
+        }
+        Self {
+            started_at: handles.as_ref().map(|_| Instant::now()),
+            handles,
+            state: BulkBodyAdmissionState::Waiting,
+        }
+    }
+
+    pub fn admitted(&mut self) {
+        if self.state == BulkBodyAdmissionState::Active {
+            return;
+        }
+        if let Some(handles) = &self.handles {
+            handles.waiters.decrement(1.0);
+            handles.active.increment(1.0);
+            handles.admitted.increment(1);
+            if let Some(started_at) = self.started_at.take() {
+                handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        self.state = BulkBodyAdmissionState::Active;
+    }
+
+    pub fn timed_out(&mut self) {
+        if self.state != BulkBodyAdmissionState::Waiting {
+            return;
+        }
+        if let Some(handles) = &self.handles {
+            handles.waiters.decrement(1.0);
+            handles.timed_out.increment(1);
+            if let Some(started_at) = self.started_at.take() {
+                handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        self.state = BulkBodyAdmissionState::Finished;
+    }
+}
+
+impl Drop for InternodeBulkBodyAdmissionGuard {
+    fn drop(&mut self) {
+        let Some(handles) = &self.handles else {
+            return;
+        };
+        match self.state {
+            BulkBodyAdmissionState::Waiting => {
+                handles.waiters.decrement(1.0);
+                handles.cancelled.increment(1);
+                if let Some(started_at) = self.started_at.take() {
+                    handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            BulkBodyAdmissionState::Active => handles.active.decrement(1.0),
+            BulkBodyAdmissionState::Finished => {}
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -1850,6 +2059,80 @@ mod tests {
     }
 
     #[test]
+    fn transport_lifecycle_metrics_use_bounded_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            record_channel_rebuild_attempt("bulk", "tls_generation_changed", true);
+            record_channel_rebuild_attempt("control", "transport_failure", false);
+            record_channel_rebuild_attempt("untrusted-class", "untrusted-reason", false);
+            #[cfg(feature = "diagnostic-internode-http2-ping")]
+            record_http2_ping_timeout();
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let rebuild = entries
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL)
+            .count();
+        assert_eq!(rebuild, 3);
+        assert!(entries.iter().any(|(key, _, _, _)| {
+            key.key().name() == INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL
+                && key.key().labels().filter(|label| label.value() == "unknown").count() == 2
+        }));
+        #[cfg(feature = "diagnostic-internode-http2-ping")]
+        assert!(entries.iter().any(|(key, _, _, value)| {
+            key.key().name() == INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL && matches!(value, DebugValue::Counter(1))
+        }));
+    }
+
+    #[test]
+    fn bulk_body_admission_metrics_balance_wait_cancel_and_active() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            drop(InternodeBulkBodyAdmissionGuard::waiting());
+            let mut active = InternodeBulkBodyAdmissionGuard::waiting();
+            active.admitted();
+            drop(active);
+            let mut timed_out = InternodeBulkBodyAdmissionGuard::waiting();
+            timed_out.timed_out();
+            drop(timed_out);
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        for name in [INTERNODE_BULK_BODY_WAITERS, INTERNODE_BULK_BODY_ACTIVE] {
+            let value = entries
+                .iter()
+                .find(|(key, _, _, _)| key.key().name() == name)
+                .map(|(_, _, _, value)| value)
+                .expect("admission gauge");
+            assert!(matches!(value, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+        }
+        let outcomes = entries
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == INTERNODE_BULK_BODY_ADMISSIONS_TOTAL)
+            .map(|(key, _, _, value)| {
+                assert!(matches!(value, DebugValue::Counter(1)));
+                key.key()
+                    .labels()
+                    .find(|label| label.key() == "outcome")
+                    .expect("outcome")
+                    .value()
+                    .to_owned()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            outcomes,
+            HashSet::from(["admitted".to_owned(), "cancelled".to_owned(), "timeout".to_owned()])
+        );
+    }
+
+    #[test]
     fn snapshot_reports_recorded_values() {
         let metrics = global_internode_metrics();
         metrics.reset_for_test();
@@ -2019,11 +2302,21 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 25);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 30);
         assert_eq!(INTERNODE_OPERATION_METRICS[23].name, INTERNODE_RPC_ACTIVE);
         assert_eq!(INTERNODE_OPERATION_METRICS[23].labels, SERVER_OPERATION_BACKEND_SIDE_LABELS);
         assert_eq!(INTERNODE_OPERATION_METRICS[24].name, INTERNODE_RPC_COMPLETIONS_TOTAL);
         assert_eq!(INTERNODE_OPERATION_METRICS[24].labels, SERVER_OPERATION_BACKEND_OUTCOME_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[25].name, INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[25].labels, SERVER_CLASS_REASON_OUTCOME_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[26].name, INTERNODE_BULK_BODY_WAIT_DURATION_MS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[26].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[27].name, INTERNODE_BULK_BODY_WAITERS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[27].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[28].name, INTERNODE_BULK_BODY_ACTIVE);
+        assert_eq!(INTERNODE_OPERATION_METRICS[28].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[29].name, INTERNODE_BULK_BODY_ADMISSIONS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[29].labels, SERVER_OUTCOME_LABELS);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }

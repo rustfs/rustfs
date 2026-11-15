@@ -28,7 +28,9 @@ pub(crate) fn EndpointServerPools(
 pub(crate) mod request_body {
     pub(crate) use s3s::StdError;
     pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+    pub(crate) use s3s::stream::ByteStream;
+    #[cfg(test)]
+    pub(crate) use s3s::stream::{DynByteStream, RemainingLength};
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]

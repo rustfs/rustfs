@@ -132,6 +132,7 @@ mod encryption;
 #[cfg(test)]
 mod guards;
 mod lifecycle;
+pub(crate) use lifecycle::{PreparedLifecycleConfiguration, validate_lifecycle_rule_status};
 mod list_object_versions;
 pub(crate) mod list_objects;
 mod listing;

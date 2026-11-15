@@ -435,6 +435,7 @@ pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER: &str = "follower";
+pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT: &str = "follower_timeout";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS: &str = "enqueue_waiters";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES: &str = "enqueue_files";
 pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS: &str = "batch_waiters";
@@ -4422,6 +4423,7 @@ mod tests {
             set_put_stage_metrics_enabled(false);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, 2);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST, 3.0);
             record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
@@ -4429,6 +4431,7 @@ mod tests {
             set_put_stage_metrics_enabled(true);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER, 2.0);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
             record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES, 4);
@@ -4464,7 +4467,7 @@ mod tests {
         assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_wait_ms"),
-            vec![1.0, 2.0]
+            vec![1.0, 2.0, 3.0]
         );
         assert_eq!(
             histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_outstanding"),
@@ -4494,6 +4497,7 @@ mod tests {
             HashSet::from([
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER.to_string(),
                 PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT.to_string(),
             ])
         );
         let group_outstanding_states = rows

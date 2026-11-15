@@ -19,11 +19,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # NIXL 1.5.2 depends on bincode 1.x for descriptor serialization. RustSec
-    # classifies this as unmaintained, with no patched release. Keep the wire
-    # format while tracking replacement separately; other advisories remain denied.
-    # owner: GatewayJ  review: 2026-12
-    { id = "RUSTSEC-2025-0141", reason = "NIXL 1.5.2 descriptor serialization requires bincode 1.x; unmaintained advisory with no patched release" },
     # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
     # `openidconnect` (transitive) and historically used directly. No upstream
     # fix is available yet. Tracked separately for follow-up; remove this
@@ -48,6 +43,9 @@ allow-git = [
     # Completion ownership patch fixed to rustfs/uring#20.
     # owner: overtrue  review: 2026-10
     "https://github.com/rustfs/uring.git",
+    # NIXL bindings fork pinned for the optional RustFS RDMA transport.
+    # owner: houseme  review: 2027-02
+    "https://github.com/houseme/nixl",
 ]
 
 [bans]

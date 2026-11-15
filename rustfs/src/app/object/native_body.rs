@@ -93,7 +93,7 @@ impl PayloadStream for LegacyPayload {
 }
 
 #[derive(Default)]
-struct FrameTrailers(Mutex<Option<HeaderMap>>);
+pub(crate) struct FrameTrailers(Mutex<Option<HeaderMap>>);
 
 impl TrailerSource for FrameTrailers {
     fn lookup(&self, name: &str) -> TrailerValue {
@@ -108,15 +108,20 @@ impl TrailerSource for FrameTrailers {
 }
 
 /// Sync is needed only by RIO's reader trait; polling owns this mutex exclusively.
-pub(super) struct BodyChunks {
+pub(crate) struct BodyChunks {
     body: Mutex<Body>,
     trailers: Arc<FrameTrailers>,
     ended: bool,
 }
 
 impl BodyChunks {
+    #[cfg(test)]
     pub(super) fn new(body: Body) -> (Self, SharedTrailerSource) {
-        let trailers = Arc::new(FrameTrailers::default());
+        Self::with_trailers(body, None)
+    }
+
+    pub(crate) fn with_trailers(body: Body, trailers: Option<Arc<FrameTrailers>>) -> (Self, SharedTrailerSource) {
+        let trailers = trailers.unwrap_or_default();
         (
             Self {
                 body: Mutex::new(body),
