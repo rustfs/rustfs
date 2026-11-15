@@ -352,6 +352,9 @@ fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
 /// each caller it cannot admit with the code the legacy stack answers, counted once.
 async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer) {
     create_bucket_in_the_store(MATRIX_BUCKET).await;
+    // Default encryption would change the object writes in the matrix bucket.
+    create_bucket_in_the_store(bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
+    bucket_configs::store_read_configs(MATRIX_BUCKET, bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_read::MATRIX_BUCKET).await;

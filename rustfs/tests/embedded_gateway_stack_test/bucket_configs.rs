@@ -26,14 +26,42 @@ use aws_sdk_s3::config::interceptors::{
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::operation::put_bucket_cors::builders::PutBucketCorsFluentBuilder;
-use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
+use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ServerSideEncryption};
 use futures::future::BoxFuture;
+use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
 use rustfs_ecstore::api::bucket::metadata_sys;
 use rustfs_s3_ops::S3Operation;
 use std::sync::{Arc, Mutex};
 
+const GET_CORS: MatrixRow = MatrixRow {
+    operation: "GetBucketCors",
+    metric: S3Operation::GetBucketCors,
+    has_error_body: true,
+    call: get_bucket_cors,
+};
+const GET_ENCRYPTION: MatrixRow = MatrixRow {
+    operation: "GetBucketEncryption",
+    metric: S3Operation::GetBucketEncryption,
+    has_error_body: true,
+    call: get_bucket_encryption,
+};
+const GET_TAGGING: MatrixRow = MatrixRow {
+    operation: "GetBucketTagging",
+    metric: S3Operation::GetBucketTagging,
+    has_error_body: true,
+    call: get_bucket_tagging,
+};
+
+pub(super) const ENCRYPTION_MATRIX_BUCKET: &str = "config-read-encryption-matrix";
+
 pub(crate) const MATRIX: &[MatrixRow] = &[
+    GET_CORS,
+    MatrixRow {
+        call: get_bucket_encryption_in_matrix,
+        ..GET_ENCRYPTION
+    },
+    GET_TAGGING,
     MatrixRow {
         operation: "PutBucketCors",
         metric: S3Operation::PutBucketCors,
@@ -184,6 +212,183 @@ const PERSISTED_CORS: &str = concat!(
     "<ExposeHeader>ETag</ExposeHeader><ID>full</ID><MaxAgeSeconds>300</MaxAgeSeconds></CORSRule>",
     "<CORSRule><AllowedMethod>HEAD</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>",
 );
+
+const PERSISTED_ENCRYPTION: &str = concat!(
+    "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>",
+    "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>",
+    "<BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>",
+);
+const PERSISTED_TAGS: &str = concat!(
+    "<Tagging><TagSet><Tag><Key>alpha</Key><Value>blue team</Value></Tag>",
+    "<Tag><Key>empty</Key><Value></Value></Tag></TagSet></Tagging>",
+);
+
+pub(super) async fn store_read_configs(bucket: &str, encryption_bucket: &str) {
+    let metadata = get_global_app_context()
+        .expect("embedded server context")
+        .bucket_metadata()
+        .handle()
+        .expect("bucket metadata system");
+    for (bucket, file, document) in [
+        (bucket, "cors.xml", PERSISTED_CORS),
+        (encryption_bucket, "bucket-encryption.xml", PERSISTED_ENCRYPTION),
+        (bucket, "tagging.xml", PERSISTED_TAGS),
+    ] {
+        metadata
+            .read()
+            .await
+            .update(bucket, file, document.as_bytes().to_vec())
+            .await
+            .expect("store the bucket configuration");
+    }
+}
+
+fn get_bucket_cors<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(client.get_bucket_cors().bucket(bucket).send().await.map(|config| {
+            assert_eq!(config.cors_rules(), cors_document().cors_rules(), "stored CORS rules");
+        }))
+    })
+}
+
+fn get_bucket_encryption<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(client.get_bucket_encryption().bucket(bucket).send().await.map(|output| {
+            let config = output.server_side_encryption_configuration().expect("stored encryption");
+            let [rule] = config.rules() else { panic!("expected one rule: {:?}", config.rules()) };
+            let default = rule.apply_server_side_encryption_by_default().expect("stored algorithm");
+            assert_eq!(default.sse_algorithm(), &ServerSideEncryption::Aes256);
+            assert_eq!(default.kms_master_key_id(), None);
+            assert_eq!(rule.bucket_key_enabled(), Some(false));
+        }))
+    })
+}
+
+fn get_bucket_encryption_in_matrix<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    get_bucket_encryption(client, ENCRYPTION_MATRIX_BUCKET)
+}
+
+fn get_bucket_tagging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(client.get_bucket_tagging().bucket(bucket).send().await.map(|output| {
+            let tags: Vec<_> = output.tag_set().iter().map(|tag| (tag.key(), tag.value())).collect();
+            assert_eq!(tags, [("alpha", "blue team"), ("empty", "")], "stored tag keys and values");
+        }))
+    })
+}
+
+const READ_GRANTED: &str = "config-read-granted";
+const READ_OTHER: &str = "config-read-other";
+const READ_EMPTY: &str = "config-read-empty";
+const READ_MISSING: &str = "config-read-missing";
+const READ_RESERVED: &str = "config-read-stored-s3alias";
+
+fn assert_read_error(result: Outcome, code: &str, status: u16, case: &str) {
+    let error = result.expect_err(case);
+    assert_eq!((error.code.as_deref(), error.status), (Some(code), Some(status)), "{case}");
+}
+
+async fn configuration_read(
+    server: RustFSServer,
+    operation: MatrixRow,
+    action: &str,
+    other_action: &str,
+    missing_config: (&str, u16),
+) {
+    for bucket in [READ_GRANTED, READ_OTHER, READ_EMPTY, READ_RESERVED] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    for bucket in [READ_GRANTED, READ_OTHER, READ_RESERVED] {
+        store_read_configs(bucket, bucket).await;
+    }
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let call = operation.call;
+    assert_eq!(call(&root, READ_RESERVED).await, Ok(()), "stored reserved-shaped bucket");
+    assert_read_error(call(&root, READ_MISSING).await, "NoSuchBucket", 404, "missing bucket");
+    assert_read_error(call(&root, READ_EMPTY).await, missing_config.0, missing_config.1, "missing configuration");
+
+    create_user_allowed_on_one_bucket("config-reader", action, READ_GRANTED).await;
+    create_user_allowed_on_one_bucket("config-other-reader", other_action, READ_GRANTED).await;
+    let reader = s3_client(&endpoint, "config-reader", USER_SECRET_KEY);
+    let other_reader = s3_client(&endpoint, "config-other-reader", USER_SECRET_KEY);
+    let handled_count = || {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|metric| metric.op == operation.metric.as_str())
+            .map_or(0, |metric| metric.total)
+    };
+    let before = handled_count();
+    assert_read_error(call(&other_reader, READ_GRANTED).await, "AccessDenied", 403, "wrong IAM action");
+    assert_read_error(call(&reader, READ_OTHER).await, "AccessDenied", 403, "wrong IAM resource");
+    assert_eq!(handled_count(), before, "authorization refusals do not reach the edge counter");
+    assert_eq!(call(&reader, READ_GRANTED).await, Ok(()), "allowed IAM action and resource");
+    assert_eq!(handled_count() - before, 1, "the admitted edge counts once");
+    server.shutdown().await;
+}
+
+async fn cors_read(server: RustFSServer) {
+    configuration_read(
+        server,
+        GET_CORS,
+        "s3:GetBucketCors",
+        "s3:GetBucketTagging",
+        ("NoSuchCORSConfiguration", 404),
+    )
+    .await;
+}
+
+async fn encryption_read(server: RustFSServer) {
+    configuration_read(
+        server,
+        GET_ENCRYPTION,
+        "s3:GetBucketEncryption",
+        "s3:GetBucketCors",
+        ("ServerSideEncryptionConfigurationNotFoundError", 400),
+    )
+    .await;
+}
+
+async fn tagging_read(server: RustFSServer) {
+    configuration_read(
+        server,
+        GET_TAGGING,
+        "s3:GetBucketTagging",
+        "s3:GetBucketEncryption",
+        ("NoSuchTagSet", 404),
+    )
+    .await;
+}
+
+#[test]
+fn the_gateway_stack_reads_bucket_cors() {
+    with_stack(GATEWAY, cors_read);
+}
+
+#[test]
+fn the_legacy_stack_reads_bucket_cors() {
+    with_stack(LEGACY, cors_read);
+}
+
+#[test]
+fn the_gateway_stack_reads_bucket_encryption() {
+    with_stack(GATEWAY, encryption_read);
+}
+
+#[test]
+fn the_legacy_stack_reads_bucket_encryption() {
+    with_stack(LEGACY, encryption_read);
+}
+
+#[test]
+fn the_gateway_stack_reads_bucket_tagging() {
+    with_stack(GATEWAY, tagging_read);
+}
+
+#[test]
+fn the_legacy_stack_reads_bucket_tagging() {
+    with_stack(LEGACY, tagging_read);
+}
 
 const CORS_BUCKET: &str = "gateway-stack-cors";
 const CORS_GRANTED_BUCKET: &str = "gateway-stack-cors-granted";
