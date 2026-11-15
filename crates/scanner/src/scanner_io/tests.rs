@@ -3950,6 +3950,10 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
         .checked_flatten("stable")
         .expect("selected bucket placeholder should exist");
     assert_eq!((stable.size, stable.objects), (0, 0));
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    prepared.record_cold_bucket_reuse(&observation);
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 0);
+
     assert!(prepared.cache.find("stable/prefix").is_none());
     assert_eq!(prepared.cache.find("dirty").map(|entry| (entry.size, entry.objects)), Some((0, 0)));
     assert!(prepared.cache.find("deleted").is_none());
@@ -3959,6 +3963,124 @@ fn scoped_set_scan_rebuilds_selected_buckets_and_drops_deleted_buckets() {
     assert!(prepared.cache.info.lkg_snapshot_complete);
     assert_eq!(prepared.cache.info.lkg_next_cycle, Some(7));
     assert_eq!(prepared.cache.info.lkg_scan_plan_digest, Some(baseline_digest));
+}
+
+#[test]
+fn cold_bucket_reuse_observation_rejects_unbound_or_failed_preparation() {
+    let baseline_digest = DataUsageScanPlanDigest([1; 32]);
+    let mut old_cache = complete_set_usage_cache(&[("stable", 10), ("dirty", 20)], baseline_digest);
+    old_cache.info.scan_bucket_incarnations = test_bucket_incarnations(&["stable", "dirty"]);
+    let incarnations = old_cache.info.scan_bucket_incarnations.clone();
+    let buckets = vec![
+        bucket_info_with_created_time("stable"),
+        bucket_info_with_created_time("dirty"),
+    ];
+    let scope = ScannerBucketScanScope {
+        selected_buckets: Some(Arc::new(HashSet::from(["dirty".to_string()]))),
+        selected_bucket_prefixes: None,
+        baseline_scan_plan_digest: Some(baseline_digest),
+    };
+    let generation = ScannerSetCacheGeneration {
+        want_cycle: 8,
+        leader_epoch: 11,
+        tier_registry_generation: 13,
+        source: DataUsageCacheSource::new(1, 2),
+        scan_plan_digest: DataUsageScanPlanDigest([2; 32]),
+    };
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    let prepared = prepare_scoped_set_scan(&old_cache, &buckets, &buckets, &scope, generation, Some(&incarnations))
+        .expect("bound complete cache permits a cold bucket copy");
+    prepared.record_cold_bucket_reuse(&observation);
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 1);
+
+    for case in ["incomplete", "duplicate", "nil_incarnation"] {
+        let mut invalid_cache = old_cache.clone();
+        let mut invalid_buckets = buckets.clone();
+        let mut invalid_incarnations = incarnations.clone();
+        match case {
+            "incomplete" => invalid_cache.info.snapshot_complete = false,
+            "duplicate" => invalid_buckets.push(buckets[0].clone()),
+            "nil_incarnation" => {
+                invalid_incarnations.insert("stable".to_string(), Uuid::nil());
+            }
+            _ => unreachable!("fixed test cases"),
+        }
+        let prepared = prepare_scoped_set_scan(
+            &invalid_cache,
+            &invalid_buckets,
+            &invalid_buckets,
+            &scope,
+            generation,
+            Some(&invalid_incarnations),
+        );
+        assert!(prepared.is_none(), "{case} must not return a reusable prepared cache");
+        if let Some(prepared) = prepared {
+            prepared.record_cold_bucket_reuse(&observation);
+        }
+        assert_eq!(
+            observation.snapshot().bucket_reuse["scoped_cold_bucket"].count,
+            1,
+            "{case} does not count completed reuse"
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_root_reuse_counts_only_successful_collector_delivery() {
+    use rustfs_scanner_metrics::scan_observation::ScannerScanObservation;
+
+    let observation = ScannerScanObservation::default();
+    let cache = DataUsageCache::default();
+    let pending = AtomicBool::new(false);
+    let root = || DataUsageEntryInfo {
+        name: "bucket".to_string(),
+        parent: DATA_USAGE_ROOT.to_string(),
+        entry: DataUsageEntry {
+            size: 10,
+            objects: 2,
+            ..Default::default()
+        },
+        bucket_incarnation: Some(Uuid::from_u128(7)),
+        tier_registry_generation: None,
+        value_origin: None,
+    };
+    let (sender, mut receiver) = mpsc::channel(1);
+    super::io_cache::send_current_cache_root_entry(&sender, root(), &cache, &pending, &observation)
+        .await
+        .expect("current root is delivered to the collector");
+    let delivered = receiver.recv().await.expect("collector received the root");
+    assert_eq!((delivered.entry.size, delivered.entry.objects), (10, 2));
+    assert_eq!(observation.snapshot().bucket_reuse["current_root"].count, 1);
+    drop(receiver);
+    assert!(
+        super::io_cache::send_current_cache_root_entry(&sender, root(), &cache, &pending, &observation)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        observation.snapshot().bucket_reuse["current_root"].count,
+        1,
+        "closed collector is not completed reuse"
+    );
+
+    let (sender, _receiver) = mpsc::channel(1);
+    sender.send(root()).await.expect("fill bounded collector channel");
+    {
+        let mut send = Box::pin(super::io_cache::send_current_cache_root_entry(
+            &sender,
+            root(),
+            &cache,
+            &pending,
+            &observation,
+        ));
+        assert!(futures::poll!(send.as_mut()).is_pending(), "full collector keeps reuse unfinished");
+    }
+    assert_eq!(
+        observation.snapshot().bucket_reuse["current_root"].count,
+        1,
+        "dropping unfinished delivery is not reuse"
+    );
+    assert_eq!(observation.snapshot().bucket_reuse["scoped_cold_bucket"].count, 0);
 }
 
 #[test]
@@ -4002,6 +4124,12 @@ fn scoped_set_scan_reuses_unselected_buckets_with_matching_incarnations() {
     )
     .expect("matching bucket incarnations should authorize cold bucket reuse");
 
+    let observation = rustfs_scanner_metrics::scan_observation::ScannerScanObservation::default();
+    prepared.record_cold_bucket_reuse(&observation);
+    let observed = observation.snapshot();
+    assert_eq!(observed.bucket_reuse["scoped_cold_bucket"].count, 1);
+    assert_eq!(observed.bucket_reuse["current_root"].count, 0);
+    assert!(observed.cache_reuse.values().all(|reuse| reuse.count == 0));
     assert_eq!(prepared.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(), ["dirty"]);
     let stable = prepared
         .cache

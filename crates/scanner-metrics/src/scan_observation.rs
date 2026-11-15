@@ -80,6 +80,114 @@ impl ScannerCacheReuseKind {
     }
 }
 
+/// Completed bucket-level reuse work, independent of durable publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerBucketReuseKind {
+    ScopedColdBucket,
+    CurrentRoot,
+}
+
+impl ScannerBucketReuseKind {
+    const ALL: [Self; 2] = [Self::ScopedColdBucket, Self::CurrentRoot];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ScopedColdBucket => "scoped_cold_bucket",
+            Self::CurrentRoot => "current_root",
+        }
+    }
+}
+
+/// A production folder gate, not a diagnostic preflight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerCacheReuseGate {
+    CleanPrefix,
+    CoveredNamespace,
+    NamespaceSampling,
+}
+
+impl ScannerCacheReuseGate {
+    const ALL: [Self; 3] = [Self::CleanPrefix, Self::CoveredNamespace, Self::NamespaceSampling];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CleanPrefix => "clean_prefix",
+            Self::CoveredNamespace => "covered_namespace",
+            Self::NamespaceSampling => "namespace_sampling",
+        }
+    }
+}
+
+/// The first existing condition reached by a folder reuse gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerCacheReuseDecision {
+    MissingScope,
+    NoResumeSweep,
+    DeepScan,
+    ForwardSweep,
+    ActiveReplication,
+    NotRoot,
+    CompactedParent,
+    MissingCachedChild,
+    InvalidPrefix,
+    DirtyPrefix,
+    ErasureHealthRequired,
+    MissingCoverage,
+    CachedFailures,
+    UncompactedChild,
+    SelectedForWalk,
+    Eligible,
+}
+
+impl ScannerCacheReuseDecision {
+    const ALL: [Self; 16] = [
+        Self::MissingScope,
+        Self::NoResumeSweep,
+        Self::DeepScan,
+        Self::ForwardSweep,
+        Self::ActiveReplication,
+        Self::NotRoot,
+        Self::CompactedParent,
+        Self::MissingCachedChild,
+        Self::InvalidPrefix,
+        Self::DirtyPrefix,
+        Self::ErasureHealthRequired,
+        Self::MissingCoverage,
+        Self::CachedFailures,
+        Self::UncompactedChild,
+        Self::SelectedForWalk,
+        Self::Eligible,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MissingScope => "missing_scope",
+            Self::NoResumeSweep => "no_resume_sweep",
+            Self::DeepScan => "deep_scan",
+            Self::ForwardSweep => "forward_sweep",
+            Self::ActiveReplication => "active_replication",
+            Self::NotRoot => "not_root",
+            Self::CompactedParent => "compacted_parent",
+            Self::MissingCachedChild => "missing_cached_child",
+            Self::InvalidPrefix => "invalid_prefix",
+            Self::DirtyPrefix => "dirty_prefix",
+            Self::ErasureHealthRequired => "erasure_health_required",
+            Self::MissingCoverage => "missing_coverage",
+            Self::CachedFailures => "cached_failures",
+            Self::UncompactedChild => "uncompacted_child",
+            Self::SelectedForWalk => "selected_for_walk",
+            Self::Eligible => "eligible",
+        }
+    }
+
+    fn not_evaluated(self) -> bool {
+        matches!(
+            self,
+            Self::MissingScope | Self::NoResumeSweep | Self::DeepScan | Self::ForwardSweep | Self::ActiveReplication
+        )
+    }
+}
+
 /// Scope admission and end-of-cycle evidence are separate observations. An
 /// activated completion proof does not mean this cycle used prefix reuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +296,26 @@ pub struct ScannerCacheReuseSnapshot {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ScannerBucketReuseSnapshot {
+    /// Cold bucket copies or current roots successfully handed to the collector.
+    pub count: u64,
+    /// Cold copy/attachment time or current-root channel-send time; excludes validation.
+    pub elapsed_nanos: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScannerCacheReuseDecisionSnapshot {
+    /// Policy prerequisites that stopped the gate before cache proof checks.
+    pub not_evaluated: BTreeMap<String, u64>,
+    /// First failed cache/work condition; later conditions are not evaluated.
+    pub blocked: BTreeMap<String, u64>,
+    /// Admitted candidates, which may still need EC classification before copying.
+    pub eligible: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScannerPrefixReuseSnapshot {
     pub evaluated: u64,
     pub activated: u64,
@@ -201,6 +329,8 @@ pub struct ScannerPrefixReuseSnapshot {
 pub struct ScannerScanObservationSnapshot {
     pub metadata_reads: ScannerMetadataReadSnapshot,
     pub cache_reuse: BTreeMap<String, ScannerCacheReuseSnapshot>,
+    pub bucket_reuse: BTreeMap<String, ScannerBucketReuseSnapshot>,
+    pub reuse_decisions: BTreeMap<String, ScannerCacheReuseDecisionSnapshot>,
     /// Clean root children still walked because EC scans also check health.
     pub erasure_clean_prefix_walks: u64,
     pub prefix_scope_resolution: ScannerPrefixReuseSnapshot,
@@ -216,6 +346,9 @@ pub struct ScannerScanObservation {
     metadata: [AtomicU64; 7],
     cache_count: [AtomicU64; 4],
     cache_nanos: [AtomicU64; 4],
+    bucket_count: [AtomicU64; 2],
+    bucket_nanos: [AtomicU64; 2],
+    reuse_decisions: [[AtomicU64; ScannerCacheReuseDecision::ALL.len()]; 3],
     erasure_clean_prefix_walks: AtomicU64,
     prefix_evaluated: [AtomicU64; 2],
     prefix_activated: [AtomicU64; 2],
@@ -252,6 +385,17 @@ impl ScannerScanObservation {
     pub fn record_cache_reuse(&self, kind: ScannerCacheReuseKind, elapsed: Duration) {
         self.cache_count[kind as usize].fetch_add(1, Ordering::Relaxed);
         self.cache_nanos[kind as usize].fetch_add(duration_nanos(elapsed), Ordering::Relaxed);
+    }
+
+    /// Records completed reuse work only; it grants no publication authority.
+    pub fn record_bucket_reuse(&self, kind: ScannerBucketReuseKind, count: u64, elapsed: Duration) {
+        self.bucket_count[kind as usize].fetch_add(count, Ordering::Relaxed);
+        self.bucket_nanos[kind as usize].fetch_add(duration_nanos(elapsed), Ordering::Relaxed);
+    }
+
+    /// Records one first-condition decision without inspecting later prerequisites.
+    pub fn record_cache_reuse_decision(&self, gate: ScannerCacheReuseGate, decision: ScannerCacheReuseDecision) {
+        self.reuse_decisions[gate as usize][decision as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_erasure_clean_prefix_walk(&self) {
@@ -308,6 +452,41 @@ impl ScannerScanObservation {
                         ScannerCacheReuseSnapshot {
                             count: self.cache_count[kind as usize].load(Ordering::Relaxed),
                             elapsed_nanos: self.cache_nanos[kind as usize].load(Ordering::Relaxed),
+                        },
+                    )
+                })
+                .collect(),
+            bucket_reuse: ScannerBucketReuseKind::ALL
+                .into_iter()
+                .map(|kind| {
+                    (
+                        kind.label().to_owned(),
+                        ScannerBucketReuseSnapshot {
+                            count: self.bucket_count[kind as usize].load(Ordering::Relaxed),
+                            elapsed_nanos: self.bucket_nanos[kind as usize].load(Ordering::Relaxed),
+                        },
+                    )
+                })
+                .collect(),
+            reuse_decisions: ScannerCacheReuseGate::ALL
+                .into_iter()
+                .map(|gate| {
+                    let counts = &self.reuse_decisions[gate as usize];
+                    let decisions = |not_evaluated| {
+                        ScannerCacheReuseDecision::ALL
+                            .into_iter()
+                            .filter(|decision| {
+                                *decision != ScannerCacheReuseDecision::Eligible && decision.not_evaluated() == not_evaluated
+                            })
+                            .map(|decision| (decision.label().to_owned(), counts[decision as usize].load(Ordering::Relaxed)))
+                            .collect()
+                    };
+                    (
+                        gate.label().to_owned(),
+                        ScannerCacheReuseDecisionSnapshot {
+                            not_evaluated: decisions(true),
+                            blocked: decisions(false),
+                            eligible: counts[ScannerCacheReuseDecision::Eligible as usize].load(Ordering::Relaxed),
                         },
                     )
                 })
@@ -419,6 +598,12 @@ mod tests {
         let metrics = Metrics::new();
         let observation = metrics.scan_observation();
         observation.record_cache_reuse(ScannerCacheReuseKind::CleanPrefix, Duration::from_nanos(321));
+        observation.record_bucket_reuse(ScannerBucketReuseKind::ScopedColdBucket, 2, Duration::from_nanos(654));
+        observation.record_bucket_reuse(ScannerBucketReuseKind::CurrentRoot, 1, Duration::from_nanos(987));
+        observation.record_cache_reuse_decision(ScannerCacheReuseGate::CleanPrefix, ScannerCacheReuseDecision::MissingScope);
+        observation
+            .record_cache_reuse_decision(ScannerCacheReuseGate::CleanPrefix, ScannerCacheReuseDecision::ErasureHealthRequired);
+        observation.record_cache_reuse_decision(ScannerCacheReuseGate::CoveredNamespace, ScannerCacheReuseDecision::Eligible);
         observation.record_erasure_clean_prefix_walk();
         observation.record_prefix_reuse(
             ScannerPrefixReuseStage::ScopeResolution,
@@ -442,6 +627,24 @@ mod tests {
         assert_eq!(snapshot.cache_reuse["clean_prefix"].count, 1);
         assert_eq!(snapshot.cache_reuse["clean_prefix"].elapsed_nanos, 321);
         assert_eq!(snapshot.cache_reuse["sampled_namespace"].count, 0);
+        assert_eq!(snapshot.bucket_reuse["scoped_cold_bucket"].count, 2);
+        assert_eq!(snapshot.bucket_reuse["scoped_cold_bucket"].elapsed_nanos, 654);
+        assert_eq!(snapshot.bucket_reuse["current_root"].count, 1);
+        assert_eq!(snapshot.bucket_reuse["current_root"].elapsed_nanos, 987);
+        assert_eq!(snapshot.reuse_decisions["clean_prefix"].not_evaluated["missing_scope"], 1);
+        assert_eq!(snapshot.reuse_decisions["clean_prefix"].blocked["erasure_health_required"], 1);
+        assert_eq!(snapshot.reuse_decisions["covered_namespace"].eligible, 1);
+
+        let mut prior_observations = serde_json::to_value(snapshot).expect("encode observations");
+        let fields = prior_observations.as_object_mut().expect("observation object");
+        fields.remove("bucket_reuse");
+        fields.remove("reuse_decisions");
+        let prior: ScannerScanObservationSnapshot =
+            serde_json::from_value(prior_observations).expect("read earlier observations");
+        assert!(prior.bucket_reuse.is_empty());
+        assert!(prior.reuse_decisions.is_empty());
+        assert_eq!(prior.cache_reuse["clean_prefix"].count, 1);
+
         assert_eq!(snapshot.erasure_clean_prefix_walks, 1);
         assert_eq!(
             (snapshot.prefix_scope_resolution.evaluated, snapshot.prefix_scope_resolution.activated),
