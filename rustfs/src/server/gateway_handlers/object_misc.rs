@@ -13,23 +13,29 @@
 // limitations under the License.
 
 //! The gateway operations of migration batch E2 (rustfs/backlog#2765): DeleteObject, DeleteObjects, RestoreObject and SelectObjectContent.
-//! DeleteObject and RestoreObject are served here.
+//! DeleteObject, RestoreObject and SelectObjectContent are served here.
 
-use super::{OpRow, Served, row};
+use super::{OpRow, Served, resp, row};
 use crate::app::RequestEnvelope;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::app::storage_api::object_usecase::bucket::{
     RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
 };
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::object_misc::{authorize_delete_object, authorize_restore_object};
+use crate::storage_api::server::http::access::access_owned::object_misc::{
+    authorize_delete_object, authorize_restore_object, authorize_select_object_content,
+};
 use http::StatusCode;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::DeleteObject>(), row::<dto::RestoreObject>()];
+pub(super) const ROWS: &[OpRow] = &[
+    row::<dto::DeleteObject>(),
+    row::<dto::RestoreObject>(),
+    row::<dto::SelectObjectContent>(),
+];
 
 impl Served for dto::DeleteObject {
     const METRIC: S3Operation = S3Operation::DeleteObject;
@@ -117,5 +123,22 @@ fn restore_request(request: dto::RestoreRequest) -> RestoreRequest {
         select_parameters: request.select_parameters,
         tier: request.tier,
         type_: request.r#type.map(|value| value.as_str().to_owned()),
+    }
+}
+
+impl Served for dto::SelectObjectContent {
+    const METRIC: S3Operation = S3Operation::SelectObjectContent;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        Ok(authorize_select_object_content(envelope, input.bucket.as_str(), input.key.as_str()).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = crate::app::select_request::select_input_from_gateway(request.into_input());
+        let answered = DefaultObjectUsecase::with_context(context)
+            .execute_select_object_content_owned(envelope, input)
+            .await?;
+        Ok(resp::<Self>(answered))
     }
 }

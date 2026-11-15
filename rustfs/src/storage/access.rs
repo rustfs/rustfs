@@ -4279,11 +4279,9 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        access_owned::object_misc::authorize_select_object_content(req, &bucket, &key).await
     }
 
     /// Checks whether the UploadPart request has accesses to the resources.

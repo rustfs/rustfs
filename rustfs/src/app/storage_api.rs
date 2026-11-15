@@ -1902,8 +1902,8 @@ pub(crate) mod select_object {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::StorageError;
     pub(crate) use crate::storage::storage_api::{
-        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
-        validate_ssec_for_read,
+        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store_owned,
+        validate_sse_headers_for_read, validate_ssec_for_read,
     };
 }
 

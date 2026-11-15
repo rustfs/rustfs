@@ -144,6 +144,18 @@ async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
     Ok(PendingDeleteBucketGenerationGuard::from_result(bucket_generation))
 }
 
+/// Select reads the current object and needs the same GetObject permission on either edge.
+pub(crate) async fn authorize_select_object_content<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+    authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+}
+
 #[cfg(test)]
 #[path = "object_misc_test.rs"]
 mod tests;

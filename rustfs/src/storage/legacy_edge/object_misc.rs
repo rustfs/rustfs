@@ -224,6 +224,23 @@ impl FS {
 }
 
 impl DefaultObjectUsecase {
+    /// Projects a legacy SelectObjectContent request onto the shared Select query path.
+    pub async fn execute_select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = crate::app::select_request::select_input_from_s3s(req.input).map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("convert the SelectObjectContent request: {err}"))
+        })?;
+        let answer = self.execute_select_object_content_owned(envelope, input).await?;
+        let output = rustfs_gateway_types::compat::s3s_5761ddfe::select::output_to_s3s(answer.output);
+        let mut response = S3Response::new(output);
+        response.status = answer.status;
+        response.headers = answer.headers;
+        Ok(response)
+    }
+
     /// Projects a legacy RestoreObject request onto the shared restore path.
     pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
         let envelope = RequestEnvelope::from_s3s(&req);
