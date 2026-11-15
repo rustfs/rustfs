@@ -133,6 +133,7 @@ their issue closes.
 | `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark with configurable host ports and optional server-only image build | `docker/compose/README.md`; internode runbook |
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner with PUT-specific Warp summary extraction | internode + scanner runbooks |
 | `test_object_batch_bench.sh` | dev-tool | Regression test for Warp PUT summary extraction | `scripts/test_object_batch_bench.sh` |
+| `wait_storage_quiescence.py` | dev-tool | Fail-closed dirty/writeback and PSI stability gate before storage benchmarks | `python3 -m unittest scripts/test_wait_storage_quiescence.py` |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `prepare_conditional_read_baseline.py` | dev-tool | Installs only the matching conditional-read benchmark harness in a clean detached baseline | `docs/testing/conditional-read-benchmark.md` |
