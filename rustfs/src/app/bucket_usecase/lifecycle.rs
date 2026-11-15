@@ -15,8 +15,7 @@
 //! Bucket lifecycle configuration use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, s3_error};
 use rustfs_gateway_types::persistence::{PersistedLifecycleRule, parse_lifecycle_dto};
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
@@ -128,36 +127,44 @@ fn lifecycle_has_abort_multipart_rules(config: &PersistedLifecycleConfiguration)
 }
 
 impl DefaultBucketUsecase {
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_bucket_lifecycle(
+    #[instrument(level = "debug", skip(self, envelope, bucket))]
+    pub(crate) async fn execute_delete_bucket_lifecycle(
         &self,
-        req: S3Request<DeleteBucketLifecycleInput>,
-    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketLifecycleInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::DeleteBucketLifecycleOutput> {
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::DeleteBucketLifecycle,
+            StatusCode::OK,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+                let Some(store) = self.object_store() else {
+                    return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
+                };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+                delete_bucket_config_for_incarnation(bucket, BUCKET_LIFECYCLE_CONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true).await;
+                notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket lifecycle", request_context, true).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
-        }
+                let item = sr_bucket_meta_item(bucket.to_owned(), "lc-config");
+                if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                    warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
+                }
 
-        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+                Ok(gateway_dto::DeleteBucketLifecycleOutput::default())
+            },
+        )
+        .await
     }
 
     /// The stored lifecycle configuration as the gateway's answer holds it.
@@ -353,12 +360,201 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
+    use crate::app::runtime_sources::ServerContextSlot;
+    use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
+    use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
     use crate::app::storage_api::s3::dto;
     use crate::app::storage_api::s3::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
         PutBucketLifecycleConfigurationInput, Transition, TransitionStorageClass,
     };
+    use crate::site_replication::hooks::{BUCKET_META_HOOK_CALLS, BucketMetaHookCall};
     use http::Method;
+    use rustfs_credentials::Credentials;
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use serial_test::serial;
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    const DELETE_LIFECYCLE_XML: &[u8] = b"<LifecycleConfiguration><Rule><ID>kept</ID><Status>Disabled</Status>\
+<Filter/><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
+    const DELETE_REQUEST_ID: &str = "lifecycle-delete-context";
+
+    fn delete_envelope(context: &Arc<AppContext>, bucket: &str) -> (Arc<ServerContextSlot>, RequestEnvelope) {
+        let server = ServerContextSlot::new();
+        assert!(server.install(Arc::clone(context)));
+        let mut request = build_request((), Method::DELETE);
+        request.uri = format!("/{bucket}?lifecycle").parse().expect("bucket request URI");
+        request.extensions.insert(Arc::clone(&server));
+        request.extensions.insert(ReqInfo {
+            cred: Some(Credentials {
+                access_key: "lifecycle-delete-owner".to_owned(),
+                ..Default::default()
+            }),
+            is_owner: true,
+            ..Default::default()
+        });
+        request.extensions.insert(request_context::RequestContext {
+            request_id: DELETE_REQUEST_ID.to_owned(),
+            x_amz_request_id: DELETE_REQUEST_ID.to_owned(),
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        });
+        (server, RequestEnvelope::from_s3s(&request))
+    }
+
+    async fn authorized_lifecycle_envelope(context: &Arc<AppContext>, bucket: &str) -> RequestEnvelope {
+        let (server, mut envelope) = delete_envelope(context, bucket);
+        authorize_bucket_config_mutation(&server, &mut envelope, bucket, Action::S3Action(S3Action::PutBucketLifecycleAction))
+            .await
+            .expect("bucket owner authorization installs the incarnation snapshot");
+        envelope
+    }
+
+    async fn seed_lifecycle(bucket: &str) {
+        metadata_sys::update(bucket, BUCKET_LIFECYCLE_CONFIG, DELETE_LIFECYCLE_XML.to_vec())
+            .await
+            .expect("store lifecycle configuration");
+    }
+
+    async fn persisted_lifecycle(bucket: &str) -> Vec<u8> {
+        metadata_sys::get_global_bucket_metadata_sys()
+            .expect("initialized metadata system")
+            .read()
+            .await
+            .get_config_from_disk(bucket)
+            .await
+            .expect("persisted bucket metadata")
+            .lifecycle_config_xml
+    }
+
+    async fn observed_delete(
+        usecase: &DefaultBucketUsecase,
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> (
+        rustfs_s3_types::S3Result<gateway_dto::DeleteBucketLifecycleOutput>,
+        Vec<BucketMetaHookCall>,
+    ) {
+        BUCKET_META_HOOK_CALLS
+            .scope(RefCell::default(), async move {
+                let result = usecase.execute_delete_bucket_lifecycle(envelope, bucket).await;
+                (result, BUCKET_META_HOOK_CALLS.with(RefCell::take))
+            })
+            .await
+    }
+
+    #[test]
+    #[serial]
+    fn delete_lifecycle_rejects_a_stale_bucket_incarnation() {
+        run_large_stack_test("delete-lifecycle-stale", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let bucket = format!("lifecycle-delete-stale-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create original bucket");
+            let envelope = authorized_lifecycle_envelope(&ambient, &bucket).await;
+
+            store
+                .delete_bucket(&bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("delete original bucket");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("recreate bucket");
+            seed_lifecycle(&bucket).await;
+
+            let before = rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket);
+            let usecase = DefaultBucketUsecase::with_context(Some(ambient));
+            let (result, calls) = observed_delete(&usecase, envelope, &bucket).await;
+            let error = result.expect_err("a stale bucket incarnation cannot delete replacement configuration");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NoSuchBucket);
+            assert_eq!(persisted_lifecycle(&bucket).await, DELETE_LIFECYCLE_XML);
+            assert!(calls.is_empty());
+            assert_eq!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket), before);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_lifecycle_rejects_misbound_or_missing_bucket_snapshots() {
+        run_large_stack_test("delete-lifecycle-unbound", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let authorized = format!("lifecycle-delete-authorized-{}", uuid::Uuid::new_v4().simple());
+            let target = format!("lifecycle-delete-target-{}", uuid::Uuid::new_v4().simple());
+            for bucket in [&authorized, &target] {
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+            }
+            seed_lifecycle(&target).await;
+            let misbound = authorized_lifecycle_envelope(&ambient, &authorized).await;
+            let (_, missing) = delete_envelope(&ambient, &target);
+            let usecase = DefaultBucketUsecase::with_context(Some(ambient));
+
+            for (envelope, message) in [
+                (misbound, "bucket config mutation snapshot does not match request bucket"),
+                (missing, "bucket config mutation snapshot is missing"),
+            ] {
+                let before = rustfs_scanner::scanner_dirty_usage_bucket_generation(&target);
+                let (result, calls) = observed_delete(&usecase, envelope, &target).await;
+                let error = result.expect_err("an unbound snapshot cannot delete lifecycle configuration");
+                assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+                assert_eq!(error.message(), Some(message));
+                assert_eq!(persisted_lifecycle(&target).await, DELETE_LIFECYCLE_XML);
+                assert!(calls.is_empty());
+                assert_eq!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&target), before);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_lifecycle_reloads_scanner_and_audits_success_once() {
+        run_large_stack_test("delete-lifecycle-completion", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let bucket = format!("lifecycle-delete-audit-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            seed_lifecycle(&bucket).await;
+            let envelope = authorized_lifecycle_envelope(&ambient, &bucket).await;
+            let before = rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket);
+            let maintenance_before = rustfs_scanner::scanner_maintenance_generation();
+            let audit = MutationCompletionProbe::install(&bucket);
+
+            let usecase = DefaultBucketUsecase::with_context(Some(ambient));
+            let (result, calls) = observed_delete(&usecase, envelope, &bucket).await;
+            result.expect("delete lifecycle configuration");
+
+            assert!(persisted_lifecycle(&bucket).await.is_empty());
+            let [call] = calls.as_slice() else { panic!("expected one site replication hook call") };
+            assert_eq!(call.bucket, bucket);
+            assert_eq!(call.item_type, "lc-config");
+            // Persistence and the local lifecycle reload each advance the maintenance generation.
+            assert_eq!(
+                call.scanner_maintenance_generation,
+                maintenance_before.saturating_add(2),
+                "lifecycle reload advances maintenance before the site hook"
+            );
+            assert_eq!(rustfs_scanner::scanner_maintenance_generation(), call.scanner_maintenance_generation);
+            assert!(call.scanner_generation > before, "scanner reload precedes site replication");
+            assert_eq!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket), call.scanner_generation);
+            let audits = audit.audits.lock().expect("audit entries");
+            assert_eq!(audits.len(), 1, "one audit entry");
+            assert_eq!(audits[0].request_id.as_deref(), Some(DELETE_REQUEST_ID));
+            assert_eq!(audits[0].api.status_code, Some(200), "audit status uses 200");
+        });
+    }
 
     #[tokio::test]
     async fn execute_get_bucket_lifecycle_configuration_returns_internal_error_when_store_uninitialized() {

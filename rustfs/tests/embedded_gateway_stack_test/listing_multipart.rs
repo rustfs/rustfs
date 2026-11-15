@@ -33,7 +33,24 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::CreateMultipartUpload,
         has_error_body: true,
         call: |client, bucket| {
-            Box::pin(async move { outcome(client.create_multipart_upload().bucket(bucket).key("matrix").send().await) })
+            Box::pin(async move {
+                let key = "matrix";
+                let response = client.create_multipart_upload().bucket(bucket).key(key).send().await;
+                if let Ok(upload) = &response {
+                    get_global_app_context()
+                        .expect("embedded context")
+                        .object_store()
+                        .abort_multipart_upload(
+                            bucket,
+                            key,
+                            upload.upload_id().expect("matrix upload ID"),
+                            &ObjectOptions::default(),
+                        )
+                        .await
+                        .expect("remove the matrix upload");
+                }
+                outcome(response)
+            })
         },
     },
     MatrixRow {

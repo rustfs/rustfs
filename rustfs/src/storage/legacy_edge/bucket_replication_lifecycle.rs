@@ -261,11 +261,13 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketLifecycle, |req| {
-            usecase.execute_delete_bucket_lifecycle(req)
-        })
-        .await
+        record_s3_op(S3Operation::DeleteBucketLifecycle);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let bucket = req.input.bucket;
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_lifecycle(envelope, &bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn delete_bucket_replication_edge(

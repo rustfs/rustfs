@@ -18,11 +18,13 @@
 //! Configurations are stored through the bucket metadata, not through their Put operations, so
 //! these tests do not depend on another increment being served.
 
+use super::bucket_configs::StatusCapture;
 use super::{
     GATEWAY, LEGACY, MatrixRow, Outcome, Refusal, USER_SECRET_KEY, create_bucket_in_the_store, create_user_allowed_on_one_bucket,
     outcome, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata as _;
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -31,6 +33,14 @@ use rustfs_ecstore::api::bucket::metadata_sys;
 use rustfs_iam::store::UserType;
 use rustfs_policy::policy::Policy;
 use rustfs_s3_ops::S3Operation;
+
+fn lifecycle_delete_metric_total() -> u64 {
+    rustfs_io_metrics::s3_op_metrics_snapshot()
+        .into_iter()
+        .find(|snapshot| snapshot.op == S3Operation::DeleteBucketLifecycle.as_str())
+        .map(|snapshot| snapshot.total)
+        .unwrap_or_default()
+}
 
 pub(crate) const MATRIX: &[MatrixRow] = &[
     MatrixRow {
@@ -480,6 +490,93 @@ async fn lifecycle_put_authorization_uses_action_and_bucket(server: RustFSServer
     );
     assert!(stored_lifecycle(MUTATED_BUCKETS[0]).await.is_empty());
     server.shutdown().await;
+}
+
+async fn lifecycle_xml_on_disk(bucket: &str) -> Vec<u8> {
+    metadata_sys::get_config_from_disk(bucket)
+        .await
+        .expect("persisted bucket metadata")
+        .lifecycle_config_xml
+}
+
+async fn lifecycle_delete_preserves_responses_and_storage(server: RustFSServer) {
+    let configured = "a3-delete-configured";
+    let unconfigured = "a3-delete-empty";
+    let alias = "sthree-a3-delete";
+    let no_action_bucket = "a3-delete-no-action";
+    for bucket in [
+        configured,
+        unconfigured,
+        alias,
+        WRITER_BUCKET,
+        MUTATED_BUCKETS[0],
+        no_action_bucket,
+    ] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    for bucket in [configured, alias, MUTATED_BUCKETS[0], WRITER_BUCKET, no_action_bucket] {
+        metadata_sys::update(bucket, BUCKET_LIFECYCLE_CONFIG, LIFECYCLE.to_vec())
+            .await
+            .expect("store lifecycle configuration");
+    }
+    create_user_allowed_on_one_bucket(WRITER_USER, "s3:PutBucketLifecycle", WRITER_BUCKET).await;
+    let reader_user = "gatewaystacka3lifecyclereader";
+    create_user_allowed_on_one_bucket(reader_user, "s3:GetBucketLifecycle", no_action_bucket).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER_USER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, reader_user, USER_SECRET_KEY);
+
+    for (client, bucket) in [
+        (&root, configured),
+        (&root, unconfigured),
+        (&root, alias),
+        (&writer, WRITER_BUCKET),
+    ] {
+        let before = lifecycle_delete_metric_total();
+        let status = StatusCapture::default();
+        let result = client
+            .delete_bucket_lifecycle()
+            .bucket(bucket)
+            .customize()
+            .interceptor(status.clone())
+            .send()
+            .await;
+        assert_eq!(outcome(result), Ok(()), "{bucket} delete with granted lifecycle action");
+        assert_eq!(status.take(), Some(204), "{bucket} wire status");
+        assert!(lifecycle_xml_on_disk(bucket).await.is_empty(), "{bucket} stored bytes");
+        assert_eq!(lifecycle_delete_metric_total(), before + 1, "{bucket} operation metric count");
+    }
+
+    for (client, bucket, label) in [
+        (&writer, MUTATED_BUCKETS[0], "writer policy names a different bucket"),
+        (&reader, no_action_bucket, "reader policy lacks the lifecycle write action"),
+    ] {
+        let error = client.delete_bucket_lifecycle().bucket(bucket).send().await.expect_err(label);
+        assert_eq!((error.code(), error.message()), (Some("AccessDenied"), Some("Access Denied")), "{label}");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(403), "{label}");
+        assert_eq!(lifecycle_xml_on_disk(bucket).await, LIFECYCLE, "{label} preserves bytes");
+    }
+
+    let missing = root.delete_bucket_lifecycle().bucket("a3-delete-missing").send().await;
+    let error = missing.expect_err("missing bucket is refused");
+    assert_eq!(
+        (error.code(), error.message()),
+        (Some("NoSuchBucket"), Some("The specified bucket does not exist"))
+    );
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404));
+
+    server.shutdown().await;
+}
+
+#[test]
+fn legacy_lifecycle_delete_preserves_responses_and_storage() {
+    with_stack(LEGACY, lifecycle_delete_preserves_responses_and_storage);
+}
+
+#[test]
+fn gateway_lifecycle_delete_preserves_responses_and_storage() {
+    with_stack(GATEWAY, lifecycle_delete_preserves_responses_and_storage);
 }
 
 #[test]
