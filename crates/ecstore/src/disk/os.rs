@@ -4759,6 +4759,153 @@ pub(crate) fn read_destination_file_with_commit_guard(
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
+    dst_file_path: &Path,
+    backup_parent: &Path,
+    backup_path: &Path,
+    old_metadata: &[u8],
+    sync_backup: bool,
+    allow_hardlink: bool,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
+    use rustix::io::Errno;
+
+    record_native_publication(backup_path);
+    let directories = &commit_guard.directories;
+    let dst_file_name = directories.file_name(dst_file_path, false)?;
+    if backup_parent.parent() != Some(directories.destination_path.as_path()) || backup_path.parent() != Some(backup_parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rollback backup parent does not match commit guard",
+        ));
+    }
+    let rollback_dir_name = backup_parent
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rollback directory name is missing"))?;
+    let backup_name = backup_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rollback backup file name is missing"))?;
+    let dst_dir = directories
+        .destination
+        .get()
+        .ok_or_else(|| io::Error::other("missing destination commit directory"))?;
+
+    let mut last_err = None;
+    for attempt in 0..=2 {
+        let mut created_dir = false;
+        match mkdirat(&*dst_dir.file, rollback_dir_name, Mode::from_raw_mode(0o777)) {
+            Ok(()) => created_dir = true,
+            Err(Errno::EXIST) => {}
+            Err(err) => return Err(io::Error::from(err)),
+        }
+        let rollback_dir_file = match open_linux_relative(
+            &dst_dir.file,
+            Path::new(rollback_dir_name),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(dir_file) => dir_file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound && attempt < 2 => {
+                last_err = Some(err);
+                continue;
+            }
+            Err(err) => {
+                if created_dir {
+                    let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+                }
+                return Err(err);
+            }
+        };
+
+        let stage_res = (|| -> io::Result<()> {
+            let linked = if allow_hardlink {
+                match linkat(&*dst_dir.file, dst_file_name, &rollback_dir_file, backup_name, AtFlags::empty()) {
+                    Ok(()) => true,
+                    Err(Errno::EXIST) => {
+                        match unlinkat(&rollback_dir_file, backup_name, AtFlags::empty()) {
+                            Ok(()) | Err(Errno::NOENT) => {}
+                            Err(err) => return Err(io::Error::from(err)),
+                        }
+                        linkat(&*dst_dir.file, dst_file_name, &rollback_dir_file, backup_name, AtFlags::empty()).is_ok()
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if linked {
+                if cfg!(test) && sync_backup && !old_metadata.is_empty() {
+                    open_linux_relative(&rollback_dir_file, Path::new(backup_name), OFlags::RDONLY, Mode::empty())?
+                        .sync_data()?;
+                }
+            } else {
+                match unlinkat(&rollback_dir_file, backup_name, AtFlags::empty()) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(err) => return Err(io::Error::from(err)),
+                }
+                let mut file = std::fs::File::from(openat(
+                    &rollback_dir_file,
+                    backup_name,
+                    OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o666),
+                )?);
+                std::io::Write::write_all(&mut file, old_metadata)?;
+                if sync_backup && !old_metadata.is_empty() {
+                    file.sync_data()?;
+                }
+            }
+            if sync_backup {
+                #[cfg(test)]
+                fsync_dir_recorder::record_limited(backup_parent);
+                fsync_directory_handle_std(backup_parent, Some(&rollback_dir_file))?;
+            }
+            Ok(())
+        })();
+        match stage_res {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let _ = unlinkat(&rollback_dir_file, backup_name, AtFlags::empty());
+                drop(rollback_dir_file);
+                if created_dir {
+                    let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+                }
+                if err.kind() == io::ErrorKind::NotFound && attempt < 2 {
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn discard_inline_rollback_backup_with_commit_guard_std(
+    rollback_dir_name: &str,
+    remove_empty_dir: bool,
+    commit_guard: &RenameCommitGuard,
+) {
+    use rustix::fs::{AtFlags, Mode, OFlags, unlinkat};
+
+    let Some(dst_dir) = commit_guard.directories.destination.get() else {
+        return;
+    };
+    if let Ok(rollback_dir_file) = open_linux_relative(
+        &dst_dir.file,
+        Path::new(rollback_dir_name),
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) {
+        let _ = unlinkat(&rollback_dir_file, crate::disk::STORAGE_FORMAT_FILE_BACKUP, AtFlags::empty());
+    }
+    if remove_empty_dir {
+        let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+    }
+}
+
 fn rename_prepared_source_std(
     prepared_source: &PreparedRenameSource,
     src_file_path: &Path,
