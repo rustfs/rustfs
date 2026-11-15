@@ -645,6 +645,58 @@ mod test {
     use crate::policy::action::{AdminAction, KmsAction, S3Action};
 
     #[tokio::test]
+    async fn delegated_service_account_obeys_admin_wildcards_and_target_conditions() -> Result<()> {
+        let conditions = HashMap::from([("TargetUser".into(), vec!["backup".into()])]);
+        let args = Args {
+            account: "operator",
+            groups: &None,
+            action: Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction),
+            bucket: "",
+            object: "",
+            conditions: &conditions,
+            claims: &HashMap::new(),
+            is_owner: false,
+            deny_only: false,
+        };
+        for (statement, allowed) in [
+            (serde_json::json!({"Effect":"Allow","Action":"admin:*"}), true),
+            (serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccount"}), false),
+            (serde_json::json!({"Effect":"Allow","NotAction":"admin:DeleteUser","Resource":"*"}), true),
+            (
+                serde_json::json!({"Effect":"Allow","NotAction":"admin:CreateServiceAccountForUser","Resource":"*"}),
+                false,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"backup"}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":"archive"}}}),
+                false,
+            ),
+        ] {
+            let policy = Policy::parse_config(
+                &serde_json::to_vec(&serde_json::json!({"Version":DEFAULT_VERSION,"Statement":[statement]}))
+                    .expect("encode policy"),
+            )?;
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{statement}");
+        }
+        let admin = default::DEFAULT_POLICIES
+            .iter()
+            .find(|(name, _)| *name == "consoleAdmin")
+            .expect("built-in admin policy");
+        assert!(admin.1.is_allowed(&args).await);
+        for denied_action in ["admin:*", "admin:CreateServiceAccountForUser"] {
+            let deny = Policy::parse_config(&serde_json::to_vec(&serde_json::json!({
+                "Version": DEFAULT_VERSION,
+                "Statement": [{"Effect": "Deny", "Action": denied_action}]
+            }))?)?;
+            assert!(!Policy::merge_policies(vec![admin.1.clone(), deny]).is_allowed(&args).await);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_parse_policy() -> Result<()> {
         let data = r#"
 {

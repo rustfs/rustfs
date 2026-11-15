@@ -11083,6 +11083,104 @@ impl LocalDisk {
                 return Ok(());
             }
 
+            if !recursive
+                && staging_cleanup.is_none()
+                && delete_path.file_name().and_then(|n| n.to_str()) == Some(STORAGE_FORMAT_FILE_BACKUP)
+                && self.multipart_delete_check(delete_path, false)?.is_none()
+            {
+                let target_path = delete_path.clone();
+                let root_base = base_path.to_path_buf();
+                let prune_op = move |is_cancelled: &dyn Fn() -> bool, check_cancel: bool| -> Result<()> {
+                    if check_cancel && is_cancelled() {
+                        return Err(DiskError::Io(std::io::Error::other("blocking namespace operation cancelled")));
+                    }
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &target_path);
+                    #[cfg(not(target_os = "linux"))]
+                    let start_as_dir = target_path.is_dir();
+                    #[cfg(target_os = "linux")]
+                    let start_as_dir = false;
+                    let mut current = if start_as_dir {
+                        Some(target_path.as_path())
+                    } else {
+                        match std::fs::remove_file(&target_path) {
+                            Ok(()) => target_path.parent(),
+                            Err(err) if err.kind() == ErrorKind::NotFound => target_path.parent(),
+                            Err(err)
+                                if err.kind() == ErrorKind::IsADirectory
+                                    || (cfg!(not(target_os = "linux"))
+                                        && err.kind() == ErrorKind::PermissionDenied
+                                        && target_path.is_dir()) =>
+                            {
+                                Some(target_path.as_path())
+                            }
+                            Err(err) => {
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    path = ?target_path,
+                                    operation = "remove_file",
+                                    error = ?err,
+                                    "Disk local delete failed"
+                                );
+                                return Err(Error::other(FileAccessDeniedWithContext {
+                                    path: target_path.clone(),
+                                    source: err,
+                                }));
+                            }
+                        }
+                    };
+                    let first_dir = current;
+                    while let Some(dir_path) = current.filter(|parent| *parent != root_base && parent.starts_with(&root_base)) {
+                        if Some(dir_path) != first_dir && std::fs::symlink_metadata(dir_path.join(STORAGE_FORMAT_FILE)).is_ok() {
+                            return Ok(());
+                        }
+                        if dir_path != target_path.as_path() {
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::Remove,
+                                dir_path,
+                            );
+                        }
+                        match std::fs::remove_dir(dir_path) {
+                            Ok(()) => current = dir_path.parent(),
+                            Err(err) if is_dir_not_empty_error(&err) => return Ok(()),
+                            Err(err) if is_benign_object_rmdir_error(&err) => current = dir_path.parent(),
+                            Err(err) => {
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    path = ?dir_path,
+                                    operation = "remove_dir",
+                                    error_kind = %err.kind(),
+                                    "Disk local delete failed"
+                                );
+                                return Err(Error::other(FileAccessDeniedWithContext {
+                                    path: dir_path.to_path_buf(),
+                                    source: err,
+                                }));
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+                return match namespace_owner {
+                    Some(owner) => {
+                        let lease = os::acquire_namespace_mutation_lease_with_owner(delete_path, Some(owner)).await;
+                        os::run_blocking_namespace_operation(lease, move || Ok(prune_op(&|| false, false)))
+                            .await
+                            .map_err(to_file_error)?
+                    }
+                    None => self
+                        .blocking_queue
+                        .run_cancellable(move |is_cancelled| Ok(prune_op(is_cancelled, true)))
+                        .await
+                        .map_err(to_file_error)?,
+                };
+            }
+
             if recursive {
                 self.move_to_trash_with_namespace_owner(delete_path, recursive, immediate_purge, namespace_owner.clone())
                     .await?;
@@ -24572,6 +24670,20 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial(file_fdatasync_group_commit)]
+    fn test_file_fdatasync_grouping_only_blocks_non_inline_fused_commit() {
+        let _grouping = os::set_file_fdatasync_group_commit_for_test(true);
+        assert!(
+            !commit::file_fdatasync_grouping_requires_async_shard_sync(false),
+            "inline metadata has no shard directory and must keep the fused path"
+        );
+        assert!(
+            commit::file_fdatasync_grouping_requires_async_shard_sync(true),
+            "non-inline shard sync must remain on the grouping-aware async path"
+        );
+    }
+
+    #[test]
     fn test_system_critical_volume_classification() {
         // System namespaces are pinned.
         assert!(is_system_critical_volume(RUSTFS_META_BUCKET));
@@ -25403,14 +25515,223 @@ mod test {
                 .join(STORAGE_FORMAT_FILE_BACKUP)
                 .is_file()
         );
+        use std::os::unix::fs::MetadataExt;
+        let v3_meta_bytes = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read v3 xl.meta");
+        let v3_meta_ino = std::fs::metadata(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .expect("stat v3 xl.meta")
+            .ino();
+        let synthetic_rollback = inline_metadata_rollback_dir(version_id, &FileMeta::new());
+        let synthetic_backup_parent = dst_object_dir.join(synthetic_rollback.to_string());
+        let synthetic_backup_path = synthetic_backup_parent.join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(&synthetic_backup_parent)
+            .await
+            .expect("create stale synthetic dir");
+        fs::write(&synthetic_backup_path, b"stale-bkp")
+            .await
+            .expect("write stale xl.meta.bkp");
+
+        let fi_v4 = test_file_info(object, version_id, None, Some(Bytes::from_static(b"v4-inline")));
+        let resp4 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v4", fi_v4, bucket, object)
+            .await
+            .expect("fused inline overwrite v4 over inline v3");
+        assert_eq!(
+            (resp4.old_data_dir, resp4.rollback_data_dir, resp4.cleanup_data_dir),
+            (None, Some(synthetic_rollback), None)
+        );
+        assert_eq!(fs::read(&synthetic_backup_path).await.expect("read v3 synthetic backup"), v3_meta_bytes);
+        assert_eq!(
+            std::fs::metadata(&synthetic_backup_path).expect("stat v3 backup").ino(),
+            v3_meta_ino,
+            "linkat path must hardlink the previous xl.meta inode"
+        );
+        assert!(os::fsync_dir_recorder::was_fsynced(&synthetic_backup_parent));
+        assert!(os::fsync_dir_recorder::was_limited(&synthetic_backup_parent));
+        disk.delete(
+            bucket,
+            &format!("{object}/{synthetic_rollback}/{STORAGE_FORMAT_FILE_BACKUP}"),
+            DeleteOptions::default(),
+        )
+        .await
+        .expect("reclaim synthetic inline rollback backup");
+        assert!(!synthetic_backup_parent.exists(), "empty synthetic rollback dir must be pruned");
+        assert!(dst_object_dir.join(STORAGE_FORMAT_FILE).is_file());
+
+        let open_dst_meta = disk
+            .io_get_object_open_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("open dst meta path");
+        let v4_meta_bytes = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read v4 xl.meta");
+        let v4_meta_ino = std::fs::metadata(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .expect("stat v4 xl.meta")
+            .ino();
+        set_local_inline_rollback_hardlink_failure(&open_dst_meta);
+        fs::create_dir_all(&synthetic_backup_parent)
+            .await
+            .expect("create synthetic dir with child");
+        fs::write(synthetic_backup_parent.join("child-marker"), b"keep")
+            .await
+            .expect("write child marker");
+        let fi_v5 = test_file_info(object, version_id, None, Some(Bytes::from_static(b"v5-inline")));
+        let resp5 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v5", fi_v5, bucket, object)
+            .await
+            .expect("fused inline overwrite v5 copy fallback");
+        assert_eq!(resp5.rollback_data_dir, Some(synthetic_rollback));
+        assert_eq!(
+            fs::read(&synthetic_backup_path).await.expect("read v4 copy-fallback backup"),
+            v4_meta_bytes
+        );
+        assert_ne!(
+            std::fs::metadata(&synthetic_backup_path).expect("stat v4 backup").ino(),
+            v4_meta_ino,
+            "copy-fallback path must allocate a new backup inode"
+        );
+        disk.delete(
+            bucket,
+            &format!("{object}/{synthetic_rollback}/{STORAGE_FORMAT_FILE_BACKUP}"),
+            DeleteOptions::default(),
+        )
+        .await
+        .expect("reclaim synthetic backup while child exists");
+        assert!(!synthetic_backup_path.exists());
+        assert!(
+            synthetic_backup_parent.join("child-marker").is_file(),
+            "non-empty synthetic rollback dir must preserve child entries"
+        );
+        fs::remove_file(synthetic_backup_parent.join("child-marker"))
+            .await
+            .expect("remove child marker");
+        fs::remove_dir(&synthetic_backup_parent)
+            .await
+            .expect("remove empty synthetic dir");
+
+        let legacy_key = "parent/xl.meta.bkp";
+        let legacy_fi = test_file_info(legacy_key, version_id, None, Some(Bytes::from_static(b"legacy-inline")));
+        let legacy_dir = disk.io_get_object_path(bucket, legacy_key).expect("legacy object dir");
+        fs::create_dir_all(&legacy_dir).await.expect("create legacy dir");
+        fs::write(legacy_dir.join(STORAGE_FORMAT_FILE), test_meta(legacy_fi.clone()))
+            .await
+            .expect("write legacy xl.meta");
+        disk.delete_version(bucket, legacy_key, legacy_fi, false, DeleteOptions::default())
+            .await
+            .expect("delete legacy key named xl.meta.bkp");
+        assert!(!disk.io_get_object_path(bucket, "parent").expect("parent path").exists());
 
         let dst_meta_path = dst_object_dir.join(STORAGE_FORMAT_FILE);
+        let v5_meta_bytes = fs::read(&dst_meta_path).await.expect("read v5 xl.meta");
         let dst_vol_dir = disk.io_get_bucket_path(bucket).expect("bucket path");
         let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_meta_path, None).await;
         let guard =
             commit::lock_rename_commit_directories(&dst_object_dir, &dst_object_dir, &dst_vol_dir, &disk.publication_root, lease)
                 .await
                 .expect("lock commit guard");
+        fs::create_dir_all(synthetic_backup_path.join("nested-child"))
+            .await
+            .expect("create conflicting directory at xl.meta.bkp");
+        assert!(
+            os::stage_inline_rollback_backup_with_commit_guard_std(
+                &dst_meta_path,
+                &synthetic_backup_parent,
+                &synthetic_backup_path,
+                &v5_meta_bytes,
+                true,
+                true,
+                &guard,
+            )
+            .is_err(),
+            "directory at xl.meta.bkp must fail staging without removing child"
+        );
+        assert!(synthetic_backup_path.join("nested-child").is_dir());
+        fs::remove_dir_all(&synthetic_backup_parent)
+            .await
+            .expect("remove conflicting synthetic dir");
+
+        os::fsync_dir_recorder::set_failure(&synthetic_backup_parent, std::io::ErrorKind::Other);
+        assert!(
+            os::stage_inline_rollback_backup_with_commit_guard_std(
+                &dst_meta_path,
+                &synthetic_backup_parent,
+                &synthetic_backup_path,
+                &v5_meta_bytes,
+                true,
+                true,
+                &guard,
+            )
+            .is_err()
+        );
+        assert!(!synthetic_backup_parent.exists(), "staging fsync failure must clean up created dir");
+
+        os::stage_inline_rollback_backup_with_commit_guard_std(
+            &dst_meta_path,
+            &synthetic_backup_parent,
+            &synthetic_backup_path,
+            &v5_meta_bytes,
+            true,
+            true,
+            &guard,
+        )
+        .expect("stage direct inline rollback backup");
+        assert!(synthetic_backup_path.is_file());
+        let displaced_object_dir = dst_object_dir.with_file_name("fused-object-displaced");
+        fs::rename(&dst_object_dir, &displaced_object_dir)
+            .await
+            .expect("displace dst_object_dir");
+        fs::create_dir_all(&synthetic_backup_parent)
+            .await
+            .expect("create replacement synthetic dir");
+        fs::write(&synthetic_backup_path, b"replacement-bkp")
+            .await
+            .expect("write replacement backup");
+        commit::discard_staged_inline_rollback_backup_std(synthetic_rollback, None, &guard);
+        assert_eq!(
+            fs::read(&synthetic_backup_path)
+                .await
+                .expect("replacement backup must survive"),
+            b"replacement-bkp",
+            "discard must operate on the pinned guard directory, not the replacement path"
+        );
+        assert!(
+            !displaced_object_dir.join(synthetic_rollback.to_string()).exists(),
+            "discard must remove the backup and synthetic dir from the pinned directory"
+        );
+        fs::remove_dir_all(&dst_object_dir)
+            .await
+            .expect("remove replacement object dir");
+        fs::rename(&displaced_object_dir, &dst_object_dir)
+            .await
+            .expect("restore original object dir");
+
+        os::stage_inline_rollback_backup_with_commit_guard_std(
+            &dst_meta_path,
+            &synthetic_backup_parent,
+            &synthetic_backup_path,
+            &v5_meta_bytes,
+            true,
+            true,
+            &guard,
+        )
+        .expect("stage direct inline rollback backup for fsync rollback");
+        let staged_new_meta = dst_object_dir.join("staged-new.xl.meta");
+        fs::write(&staged_new_meta, b"uncommitted-meta")
+            .await
+            .expect("write staged new meta");
+        fs::rename(&staged_new_meta, &dst_meta_path)
+            .await
+            .expect("replace dst_meta_path before fsync failure");
+        os::fsync_dir_recorder::set_failure(&dst_object_dir, std::io::ErrorKind::Other);
+        assert!(
+            commit::fsync_inline_commit_std(&dst_meta_path, &dst_vol_dir, false, Some(synthetic_rollback), None, None, &guard,)
+                .is_err()
+        );
+        assert!(
+            !synthetic_backup_parent.exists(),
+            "fsync rollback must remove consumed synthetic rollback dir"
+        );
+        assert_eq!(fs::read(&dst_meta_path).await.expect("restored v5"), v5_meta_bytes);
         let replacement_dir = dst_object_dir.join(Uuid::new_v4().to_string());
         fs::create_dir_all(&replacement_dir).await.expect("create replacement_dir");
         fs::write(replacement_dir.join("part.1"), b"live").await.expect("write part");
@@ -37582,12 +37903,12 @@ mod test {
                     .expect("truncate behind cached descriptor");
                 assert!(read().await.is_err(), "native short data must not be accepted");
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while backend.driver.stats().in_flight != 0 {
+                    while backend.driver.stats().in_flight != 0 || memory.snapshot().used != 0 {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("failed native read retired");
+                .expect("failed native read retired and released its memory");
                 assert!(backend.driver.stats().submitted > submitted, "short read must reach the native driver");
                 assert_eq!(memory.snapshot().used, 0, "errors free native and assembled storage");
                 std::fs::write(dir.path().join("bucket/part.1"), &content).expect("restore fixture");

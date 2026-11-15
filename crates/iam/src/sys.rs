@@ -960,6 +960,19 @@ impl<T: Store> IamSys<T> {
         opts: NewServiceAccountOpts,
         updated_at: OffsetDateTime,
     ) -> Result<(Credentials, OffsetDateTime)> {
+        let cred = Self::service_account_credentials(parent_user, groups, opts)?;
+        let create_at = self.store.add_service_account_at(cred.clone(), updated_at).await?;
+
+        self.notify_for_service_account(&cred.access_key).await;
+
+        Ok((cred, create_at))
+    }
+
+    fn service_account_credentials(
+        parent_user: &str,
+        groups: Option<Vec<String>>,
+        opts: NewServiceAccountOpts,
+    ) -> Result<Credentials> {
         if !opts.access_key.is_empty()
             && (opts.access_key.trim() == "."
                 || opts.access_key.trim() == ".."
@@ -1046,11 +1059,7 @@ impl<T: Store> IamSys<T> {
         cred.name = opts.name;
         cred.description = opts.description;
 
-        let create_at = self.store.add_service_account_at(cred.clone(), updated_at).await?;
-
-        self.notify_for_service_account(&cred.access_key).await;
-
-        Ok((cred, create_at))
+        Ok(cred)
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
@@ -1689,6 +1698,80 @@ impl<T: Store> IamSys<T> {
         Ok(Some(verified_claims))
     }
 
+    /// Issue a credential for a different local user. Both actions must allow the
+    /// authenticated caller and the same resolved target. Once admitted, the
+    /// write continues if the caller stops waiting.
+    ///
+    /// Returns an error if the caller lacks either grant, the target is missing
+    /// or ineligible, the caller has been revoked, or the key cannot be saved.
+    pub async fn new_service_account_for_user(
+        &self,
+        target: &str,
+        opts: NewServiceAccountOpts,
+        caller: &Credentials,
+        conditions: &HashMap<String, Vec<String>>,
+        authenticated_owner: bool,
+    ) -> Result<(Credentials, OffsetDateTime, HashMap<String, Value>)> {
+        use rustfs_policy::policy::{
+            SVC_TARGET_USER,
+            action::{Action, AdminAction},
+        };
+
+        if target.is_empty() || crate::is_root_access_key(target) || target == caller.access_key || target == caller.parent_user {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        // Bind the policy decision to the identity that will be written.
+        if !conditions
+            .get(SVC_TARGET_USER)
+            .is_some_and(|values| values.len() == 1 && values[0] == target)
+        {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        let mut args = Args {
+            account: &caller.access_key,
+            groups: &caller.groups,
+            action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
+            bucket: "",
+            conditions,
+            is_owner: authenticated_owner,
+            object: "",
+            claims: caller.claims_or_empty(),
+            deny_only: false,
+        };
+        // Both built-in decisions must use the same identity and policy revision.
+        let prepared = self.prepare_auth(&args).await;
+        if !self.eval_prepared(&prepared, &args).await {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        args.action = Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction);
+        if !self.eval_prepared(&prepared, &args).await {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        if self.check_key(target).await?.0.is_none() {
+            return Err(IamError::NoSuchUser(target.to_owned()));
+        }
+
+        // A delegated credential belongs entirely to its local target. Only
+        // its requested session policy and expiration constrain that identity.
+        let opts = NewServiceAccountOpts {
+            claims: None,
+            allow_site_replicator_account: false,
+            ..opts
+        };
+        let cred = Self::service_account_credentials(target, None, opts)?;
+        let iam = self.clone();
+        let caller = caller.clone();
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        runtime
+            .spawn(async move {
+                let updated_at = iam.store.add_delegated_service_account(&cred, &caller).await?;
+                iam.notify_for_service_account(&cred.access_key).await;
+                Ok((cred, updated_at, HashMap::new()))
+            })
+            .await
+            .map_err(Error::other)?
+    }
+
     /// Create within the authenticated caller's scope and current parent revision.
     /// An admitted write owns its parent lock until publication even if the caller
     /// stops waiting; errors never publish a credential from a changed parent.
@@ -1719,8 +1802,7 @@ impl<T: Store> IamSys<T> {
         mut opts: NewServiceAccountOpts,
         caller: &Credentials,
     ) -> Result<(Credentials, OffsetDateTime, HashMap<String, Value>)> {
-        if parent_user != caller.access_key && parent_user != caller.parent_user && !crate::is_root_access_key(&caller.access_key)
-        {
+        if parent_user != caller.access_key && parent_user != caller.parent_user {
             return Err(IamError::IAMActionNotAllowed);
         }
 
@@ -3347,6 +3429,7 @@ mod tests {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
         bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
+        policy_load_barrier: Option<Arc<tokio::sync::Barrier>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
@@ -3369,6 +3452,7 @@ mod tests {
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
+                policy_load_barrier: None,
                 bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
@@ -3561,7 +3645,14 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+        async fn load_policy_doc(&self, name: &str, docs: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            if let Some(barrier) = &self.policy_load_barrier {
+                // merge_policies has already captured the cached policy documents.
+                barrier.wait().await;
+                barrier.wait().await;
+                docs.insert(name.to_owned(), PolicyDoc::new(Policy::default()));
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -4389,6 +4480,67 @@ mod tests {
                 Err(Error::IAMActionNotAllowed)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_holds_both_parents_and_session_through_publication() {
+        use std::sync::atomic::Ordering;
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(false);
+        let iam = IamSys::new(IamCache::new(store.clone()).await.expect("initialize IAM"));
+        let caller_parent = "operator";
+        let target = "backup";
+        for user in [caller_parent, target] {
+            iam.create_user(
+                user,
+                &AddOrUpdateUserReq {
+                    secret_key: "originalSecret123".into(),
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                    policy: None,
+                },
+            )
+            .await
+            .expect("create local user");
+        }
+        let session = rotation_test_session(caller_parent, "operator-console-session");
+        iam.set_temp_user(&session.access_key, &session, None)
+            .await
+            .expect("publish STS session");
+        store.block_derived_save.store(true, Ordering::SeqCst);
+        let pending = IamSys::<StsTestMockStore>::service_account_credentials(target, None, NewServiceAccountOpts::default())
+            .expect("prepare credential");
+        let creation = {
+            let iam = iam.clone();
+            let session = session.clone();
+            tokio::spawn(async move { iam.store.add_delegated_service_account(&pending, &session).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.derived_save_started.notified())
+            .await
+            .expect("credential write started");
+        for principal in [caller_parent, target] {
+            assert!(iam.store.cache.parent_mutation_lock(principal).try_lock().is_err());
+        }
+        assert!(
+            iam.store
+                .cache
+                .sts_account_mutation_lock(&session.access_key)
+                .try_lock()
+                .is_err()
+        );
+        store.block_derived_save.store(false, Ordering::SeqCst);
+        store.release_derived_save.notify_one();
+        creation.await.expect("join writer").expect("publish credential");
+
+        iam.set_user_status(target, rustfs_madmin::AccountStatus::Disabled)
+            .await
+            .expect("disable target");
+        let pending = IamSys::<StsTestMockStore>::service_account_credentials(target, None, NewServiceAccountOpts::default())
+            .expect("prepare credential for disabled user");
+        assert!(matches!(
+            iam.store.add_delegated_service_account(&pending, &session).await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+        assert_eq!(store.saved_service_account_count(), 1);
     }
 
     #[tokio::test]
@@ -5330,6 +5482,167 @@ mod tests {
             iam_sys.eval_prepared(&prepared, &args).await,
             "STS temp credentials should resolve custom canned policy names carried in JWT policy claims"
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_requires_both_actions_in_one_policy_revision() {
+        use rustfs_policy::policy::SVC_TARGET_USER;
+
+        ensure_test_global_credentials();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut store = StsTestMockStore::new(true);
+        store.policy_load_barrier = Some(barrier.clone());
+        let cache = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], IamCache::new(store.clone()))
+            .await
+            .expect("initialize IAM");
+        let iam = IamSys::new(cache);
+        let operator = "backup-operator";
+        let target = "backup-user";
+        for name in [operator, target] {
+            iam.create_user(
+                name,
+                &AddOrUpdateUserReq {
+                    secret_key: "testSecret123".into(),
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                    policy: None,
+                },
+            )
+            .await
+            .expect("create local user");
+        }
+        let caller = iam.get_user(operator).await.expect("operator exists").credentials;
+        let set_grant = |action: &str| {
+            let policy = serde_json::json!({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": action}]});
+            let policy = Policy::parse_config(policy.to_string().as_bytes()).expect("parse administrator policy");
+            iam.store
+                .cache
+                .add_or_update_policy_doc("operator-grant", &PolicyDoc::new(policy), OffsetDateTime::now_utc());
+        };
+        set_grant("admin:CreateServiceAccount");
+        iam.store.cache.add_or_update_user_policy(
+            operator,
+            &MappedPolicy::new("operator-grant,uncached-policy"),
+            OffsetDateTime::now_utc(),
+        );
+        let conditions = HashMap::from([(SVC_TARGET_USER.to_owned(), vec![target.to_owned()])]);
+        let create = iam.new_service_account_for_user(target, NewServiceAccountOpts::default(), &caller, &conditions, false);
+        let replace = async {
+            barrier.wait().await;
+            set_grant("admin:CreateServiceAccountForUser");
+            barrier.wait().await;
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(create, replace) })
+            .await
+            .expect("finish lookup and concurrent policy replacement");
+        assert!(matches!(result, Err(Error::IAMActionNotAllowed)));
+        assert_eq!(store.saved_service_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_distinguishes_missing_target_from_storage_failure() {
+        use rustfs_policy::policy::SVC_TARGET_USER;
+
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(true);
+        let iam = IamSys::new(IamCache::new(store.clone()).await.expect("initialize IAM"));
+        let caller = crate::root_credentials::credentials().expect("root credentials");
+        for target in ["missing-target", "load-failure-user"] {
+            let conditions = HashMap::from([(SVC_TARGET_USER.to_owned(), vec![target.to_owned()])]);
+            let error = iam
+                .new_service_account_for_user(target, NewServiceAccountOpts::default(), &caller, &conditions, true)
+                .await
+                .expect_err("cannot publish without a target");
+            match target {
+                "missing-target" => assert!(matches!(error, Error::NoSuchUser(name) if name == target)),
+                _ => assert!(matches!(error, Error::Io(_))),
+            }
+        }
+        assert_eq!(store.saved_service_account_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_service_account_uses_local_target_permissions_and_requires_live_oidc_session() {
+        use rustfs_policy::policy::{
+            SVC_TARGET_USER,
+            action::{Action, AdminAction, S3Action},
+        };
+
+        ensure_test_global_credentials();
+        // This fixture seeds a policy mapping in memory. Its mock reload only
+        // persists identities and would replace the mapping with its seed data.
+        let cache =
+            temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], IamCache::new(StsTestMockStore::new(true)))
+                .await
+                .expect("initialize IAM");
+        let iam = IamSys::new(cache);
+        let target = "backup-user";
+        iam.create_user(
+            target,
+            &AddOrUpdateUserReq {
+                secret_key: "backupUserSecret123".into(),
+                status: rustfs_madmin::AccountStatus::Enabled,
+                policy: None,
+            },
+        )
+        .await
+        .expect("create backup user");
+        iam.store
+            .cache
+            .add_or_update_user_policy(target, &MappedPolicy::new("readonly"), OffsetDateTime::now_utc());
+
+        let mut caller = rotation_test_session("oidc-admin-parent", "oidc-console-session");
+        caller.claims = Some(HashMap::from([
+            ("iss".into(), Value::from("rustfs-oidc")),
+            ("oidc_provider".into(), Value::from("default")),
+            ("sub".into(), Value::from("operator")),
+            ("parent".into(), Value::from(caller.parent_user.clone())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.into(), Value::from(caller.parent_user.clone())),
+            (POLICYNAME.into(), Value::from("consoleAdmin")),
+        ]));
+        iam.set_temp_user(&caller.access_key, &caller, None)
+            .await
+            .expect("publish OIDC session");
+        let conditions = HashMap::from([(SVC_TARGET_USER.to_owned(), vec![target.to_owned()])]);
+        let (created, _, replicated_claims) = iam
+            .new_service_account_for_user(target, NewServiceAccountOpts::default(), &caller, &conditions, false)
+            .await
+            .expect("delegate to local user");
+        assert_eq!(created.parent_user, target);
+        assert!(replicated_claims.is_empty());
+        let key = iam
+            .get_user(&created.access_key)
+            .await
+            .expect("published service account")
+            .credentials;
+        assert!(!is_rustfs_oidc_claims(key.claims_or_empty()));
+        let mut args = Args {
+            account: &key.access_key,
+            groups: &key.groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "backups",
+            object: "archive",
+            conditions: &HashMap::new(),
+            claims: key.claims_or_empty(),
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(iam.is_allowed(&args).await);
+        args.action = Action::S3Action(S3Action::PutObjectAction);
+        assert!(!iam.is_allowed(&args).await);
+        args.action = Action::AdminAction(AdminAction::CreateServiceAccountForUserAdminAction);
+        assert!(!iam.is_allowed(&args).await);
+
+        iam.store
+            .delete_user(&caller.access_key, UserType::Sts)
+            .await
+            .expect("revoke session");
+        let pending = IamSys::<StsTestMockStore>::service_account_credentials(target, None, NewServiceAccountOpts::default())
+            .expect("prepare credential");
+        assert!(matches!(
+            iam.store.add_delegated_service_account(&pending, &caller).await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+        assert!(iam.store.get_user(&pending.access_key).await.is_none());
     }
 
     #[tokio::test]
