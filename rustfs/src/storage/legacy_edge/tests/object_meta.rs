@@ -167,6 +167,31 @@ async fn test_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
 }
 
 #[tokio::test]
+async fn test_put_object_tagging_preserves_missing_tag_fields_before_version_validation() {
+    let fs = FS::new();
+    for (key, value, message) in [
+        (None, Some("value"), "Tag key cannot be empty"),
+        (Some("key"), None, "Tag value cannot be null"),
+    ] {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_owned())
+            .key("test-key".to_owned())
+            .version_id(Some("invalid".to_owned()))
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: key.map(str::to_owned),
+                    value: value.map(str::to_owned),
+                }],
+            })
+            .build()
+            .unwrap();
+        let error = fs.put_object_tagging(build_request(input, Method::PUT)).await.unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::InvalidTag);
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn test_put_object_tagging_returns_internal_error_when_store_uninitialized() {
     if !store_uninitialized_premise_holds() {
         return;
@@ -205,4 +230,73 @@ async fn test_delete_object_tagging_returns_internal_error_when_store_uninitiali
         .await
         .unwrap_err();
     assert_eq!(err.code(), &S3ErrorCode::InternalError);
+}
+
+#[test]
+#[serial_test::serial]
+fn put_object_tagging_completes_once_for_committed_metadata() {
+    use crate::app::{RequestEnvelope, gating_test_env, object_meta::ObjectMetaUsecase};
+    use crate::storage::helper::MutationCompletionProbe;
+    use crate::storage::storage_api::StoragePutObjReader;
+    use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage::storage_api::contract::object::ObjectIO;
+    use rustfs_scanner::{SegmentInvalidationProducerIdentity, set_scanner_dirty_usage_mutation_observer};
+    use std::sync::{Arc, Mutex};
+
+    gating_test_env::run_large_stack_test("put-tagging-completion", || async {
+        let context = gating_test_env::shared_gating_ambient().await;
+        let store = context.object_store();
+        let usecase = ObjectMetaUsecase::with_context(Some(context));
+        let bucket = format!("put-tagging-{}", uuid::Uuid::new_v4().simple());
+        store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+        let mut body = StoragePutObjReader::from_vec(b"preserved".to_vec());
+        store
+            .put_object(&bucket, "present", &mut body, &Default::default())
+            .await
+            .unwrap();
+
+        let probe = MutationCompletionProbe::install(&bucket);
+        let dirty = Arc::new(Mutex::new(Vec::new()));
+        let observe = {
+            let dirty = Arc::clone(&dirty);
+            let bucket = bucket.clone();
+            Arc::new(move |observed_bucket: &str, key: &str, producer| {
+                if observed_bucket == bucket && producer == SegmentInvalidationProducerIdentity::ObjectMetadata {
+                    dirty.lock().unwrap().push(key.to_owned());
+                }
+            })
+        };
+        struct RestoreObserver(Option<rustfs_scanner::ScannerDirtyUsageMutationObserver>);
+        impl Drop for RestoreObserver {
+            fn drop(&mut self) {
+                set_scanner_dirty_usage_mutation_observer(self.0.take());
+            }
+        }
+        let _observer = RestoreObserver(set_scanner_dirty_usage_mutation_observer(Some(observe)));
+
+        let put = |key: &'static str| {
+            let mut req = build_request((), Method::PUT);
+            req.uri = format!("/{bucket}/{key}?tagging").parse().unwrap();
+            usecase.put_object_tagging_fields(
+                RequestEnvelope::from_s3s(&req),
+                &bucket,
+                key,
+                None,
+                vec![rustfs_gateway_types::dto::Tag {
+                    key: Some("project".into()),
+                    value: Some("approved".into()),
+                }],
+            )
+        };
+        let missing = put("missing").await.unwrap_err();
+        assert_eq!(missing.code(), &rustfs_s3_types::S3ErrorCode::NoSuchKey);
+        assert!(probe.events.lock().unwrap().is_empty(), "missing object emitted a tagging event");
+        assert!(dirty.lock().unwrap().is_empty(), "missing object marked usage dirty");
+        put("present").await.unwrap();
+        let events = probe.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one committed tagging event");
+        assert_eq!(events[0].event_name, rustfs_s3_types::EventName::ObjectTaggingPut);
+        assert_eq!(events[0].object.name, "present");
+        assert_eq!(*dirty.lock().unwrap(), ["present"], "one committed dirty marker");
+    });
 }

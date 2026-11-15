@@ -20,7 +20,9 @@ use crate::app::RequestEnvelope;
 use crate::app::object_meta::ObjectMetaUsecase;
 use crate::app::object_meta::torrent::execute_get_object_torrent;
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::object_meta::authorize_object_tagging_request;
+use crate::storage_api::server::http::access::access_owned::object_meta::{
+    RequestedObjectTags, authorize_object_tagging_request, authorize_put_object_tagging,
+};
 use crate::storage_api::server::http::access::authorize_object_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_gateway_types::{BucketName, ObjectKey};
@@ -37,6 +39,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetObjectRetention>(),
     row::<dto::GetObjectTagging>(),
     row::<dto::DeleteObjectTagging>(),
+    row::<dto::PutObjectTagging>(),
 ];
 
 /// What the legacy hooks of the ACL, legal-hold and retention reads make: the decoded object, its
@@ -165,6 +168,34 @@ impl Served for dto::DeleteObjectTagging {
         let usecase = ObjectMetaUsecase::with_context(context);
         usecase
             .execute_delete_object_tagging(envelope, request.into_input())
+            .await
+            .map(Resp::new)
+    }
+}
+
+impl Served for dto::PutObjectTagging {
+    const METRIC: S3Operation = S3Operation::PutObjectTagging;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        let tags = RequestedObjectTags(
+            input
+                .tagging
+                .tag_set
+                .iter()
+                .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone()?)))
+                .collect(),
+        );
+        Ok(
+            authorize_put_object_tagging(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id.as_deref(), tags)
+                .await?,
+        )
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let usecase = ObjectMetaUsecase::with_context(context);
+        usecase
+            .execute_put_object_tagging(envelope, request.into_input())
             .await
             .map(Resp::new)
     }
