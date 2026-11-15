@@ -27,10 +27,10 @@ use crate::storage_api::owner::{
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
-    DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
-    ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests,
-    init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
-    save_config,
+    BUCKET_META_PREFIX, DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
+    InstanceContext, PoolEndpoints, ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER,
+    init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
+    new_disk, path2_bucket_object_with_base_path, save_config,
 };
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
@@ -2392,6 +2392,254 @@ async fn set_cache_send_failure_logs_receiver_and_snapshot_without_changing_retu
 
 #[tokio::test]
 #[serial]
+async fn set_snapshot_accepts_backup_catchup_to_the_same_decoded_primary() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+    let backup_path = format!("{primary_path}.bkp");
+    let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+        .await
+        .expect("read decoded primary bytes");
+    let primary_body = primary_body.expect("primary exists");
+    let mut older = cache.clone();
+    older.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+    save_config(Arc::clone(&set), &backup_path, older.marshal_msg().expect("encode older backup"))
+        .await
+        .expect("seed a lagging backup");
+    let mut loaded = DataUsageCache::default();
+    let initial = loaded
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture primary with lagging backup");
+    save_config(Arc::clone(&set), &backup_path, primary_body)
+        .await
+        .expect("backup catches up without changing primary");
+    let current = loaded
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("capture the reconciled backup");
+    assert_ne!(initial.revisions(), current.revisions());
+    assert!(current.permits_unchanged_baseline_since(&initial));
+
+    let mut candidate = cache;
+    candidate.info.next_cycle += 1;
+    candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+    candidate.replace(
+        "photos",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            size: 20,
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    let cycle = candidate.info.next_cycle;
+    let cycle_floor = AtomicU64::new(cycle);
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(
+        persist_and_publish_cache_snapshot(Arc::clone(&set), &tx, candidate, Some(&initial), &cycle_floor, epoch)
+            .await
+            .is_some(),
+        "content-preserving backup catchup must not veto the new snapshot"
+    );
+    let published = rx.try_recv().expect("new snapshot reached the collector");
+    assert_eq!(published.info.next_cycle, cycle);
+    assert_eq!(published.find("photos").expect("new bucket entry").size, 20);
+    let (primary, primary_revision) = read_config_with_revision(Arc::clone(&set), &primary_path)
+        .await
+        .expect("read new primary");
+    let (backup, backup_revision) = read_config_with_revision(set, &backup_path).await.expect("read new backup");
+    assert_eq!(primary, backup, "backup CAS must use the reconciled current revision");
+    assert_eq!(primary_revision, backup_revision);
+    let persisted = DataUsageCache::unmarshal(&primary.expect("new primary body")).expect("decode new primary");
+    assert_eq!(persisted.info.next_cycle, cycle);
+    assert_eq!(persisted.find("photos").expect("persisted new entry").size, 20);
+}
+
+#[tokio::test]
+#[serial]
+async fn set_snapshot_backup_catchup_keeps_revision_provenance_and_epoch_fences() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    for case in ["different_backup", "different_primary", "corrupt_primary", "changed_epoch"] {
+        let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+        let set = Arc::clone(&store.pools[0].disk_set[0]);
+        let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{primary_path}.bkp");
+        let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("read original primary");
+        let primary_body = primary_body.expect("original primary exists");
+        let mut older = cache.clone();
+        older.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+        save_config(Arc::clone(&set), &backup_path, older.marshal_msg().expect("encode lagging backup"))
+            .await
+            .expect("seed lagging backup");
+        if case == "corrupt_primary" {
+            save_config(Arc::clone(&set), &primary_path, b"corrupt-primary".to_vec())
+                .await
+                .expect("inject primary corruption before the initial load");
+        }
+        let mut loaded = DataUsageCache::default();
+        let initial = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("capture original baseline source and revisions");
+        let mut replacement = cache.clone();
+        replacement.info.scan_execution_digest = Some(DataUsageScanPlanDigest([9; 32]));
+        match case {
+            "different_backup" => {
+                save_config(Arc::clone(&set), &backup_path, replacement.marshal_msg().expect("encode changed backup"))
+                    .await
+                    .expect("backup changes to different contents");
+            }
+            "different_primary" => {
+                let body = replacement.marshal_msg().expect("encode changed primary");
+                save_config(Arc::clone(&set), &primary_path, body.clone())
+                    .await
+                    .expect("primary advances");
+                save_config(Arc::clone(&set), &backup_path, body)
+                    .await
+                    .expect("backup follows changed primary");
+            }
+            "corrupt_primary" => {
+                save_config(Arc::clone(&set), &backup_path, b"corrupt-primary".to_vec())
+                    .await
+                    .expect("backup matches the corrupt primary ETag without a decoded primary proof");
+            }
+            "changed_epoch" => {
+                save_config(Arc::clone(&set), &backup_path, primary_body)
+                    .await
+                    .expect("backup catches up before epoch refusal");
+            }
+            _ => unreachable!("fixed test cases"),
+        }
+        let before_primary = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("current primary");
+        let before_backup = read_config_with_revision(Arc::clone(&set), &backup_path)
+            .await
+            .expect("current backup");
+        let mut candidate = cache;
+        candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+        let cycle_floor = AtomicU64::new(candidate.info.next_cycle);
+        let requested_epoch = if case == "changed_epoch" {
+            epoch.checked_add(1).expect("fixture epoch can advance")
+        } else {
+            epoch
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        let (result, events) = capture_set_cache_logs(persist_and_publish_cache_snapshot(
+            Arc::clone(&set),
+            &tx,
+            candidate,
+            Some(&initial),
+            &cycle_floor,
+            requested_epoch,
+        ))
+        .await;
+        assert!(result.is_none(), "{case} must still refuse publication");
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "{case} forwards no snapshot"
+        );
+        let expected_state = if case == "changed_epoch" {
+            "save_failed"
+        } else {
+            "scan_baseline_revision_changed"
+        };
+        assert_set_cache_context(set_cache_event(&events, expected_state), Some((0, 0)));
+        assert_eq!(
+            read_config_with_revision(Arc::clone(&set), &primary_path)
+                .await
+                .expect("protected primary"),
+            before_primary,
+            "{case} does not overwrite primary"
+        );
+        assert_eq!(
+            read_config_with_revision(set, &backup_path).await.expect("protected backup"),
+            before_backup,
+            "{case} does not overwrite backup"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn set_cache_cas_preserves_updates_after_backup_catchup_validation() {
+    use crate::data_usage_define::read_config_with_revision;
+
+    for changed_copy in ["primary", "backup"] {
+        let (_temp_dir, store, cache, epoch) = set_cache_log_fixture().await;
+        let set = Arc::clone(&store.pools[0].disk_set[0]);
+        let primary_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{primary_path}.bkp");
+        let (primary_body, _) = read_config_with_revision(Arc::clone(&set), &primary_path)
+            .await
+            .expect("read initial primary");
+        let mut lagging = cache.clone();
+        lagging.info.scan_execution_digest = Some(DataUsageScanPlanDigest([8; 32]));
+        save_config(Arc::clone(&set), &backup_path, lagging.marshal_msg().expect("lagging backup bytes"))
+            .await
+            .expect("seed backup lag");
+        let mut loaded = DataUsageCache::default();
+        let initial = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("read initial baseline");
+        save_config(Arc::clone(&set), &backup_path, primary_body.expect("initial primary exists"))
+            .await
+            .expect("finish backup catchup");
+        let current = loaded
+            .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("read reconciled baseline");
+        assert!(current.permits_unchanged_baseline_since(&initial));
+        let changed_path = if changed_copy == "primary" {
+            &primary_path
+        } else {
+            &backup_path
+        };
+        let mut concurrent = cache.clone();
+        concurrent.info.scan_execution_digest = Some(DataUsageScanPlanDigest([9; 32]));
+        let concurrent_body = concurrent.marshal_msg().expect("encode concurrent update");
+        save_config(Arc::clone(&set), changed_path, concurrent_body.clone())
+            .await
+            .expect("copy changes after the baseline validation");
+        let mut candidate = cache;
+        candidate.info.next_cycle += 1;
+        candidate.info.scan_execution_digest = Some(DataUsageScanPlanDigest([3; 32]));
+        let result = candidate
+            .save_with_revisions_for_epoch(Arc::clone(&set), DATA_USAGE_CACHE_NAME, current.revisions(), epoch)
+            .await;
+        if changed_copy == "primary" {
+            assert!(result.is_err(), "primary CAS refuses the intervening update");
+        } else {
+            result.expect("primary remains durable when the best-effort backup CAS refuses an update");
+        }
+        let (protected, _) = read_config_with_revision(Arc::clone(&set), changed_path)
+            .await
+            .expect("read protected concurrent copy");
+        assert_eq!(
+            protected,
+            Some(concurrent_body),
+            "{changed_copy} CAS must not overwrite the concurrent update"
+        );
+        let (primary, _) = read_config_with_revision(set, &primary_path)
+            .await
+            .expect("read resulting primary");
+        let primary = DataUsageCache::unmarshal(&primary.expect("primary exists")).expect("primary remains decodable");
+        assert_eq!(
+            primary.info.scan_execution_digest,
+            Some(DataUsageScanPlanDigest([if changed_copy == "primary" { 9 } else { 3 }; 32])),
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let set = Arc::clone(&store.pools[0].disk_set[0]);
@@ -2404,7 +2652,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
         .expect("seed legacy set cache");
     let mut persisted = DataUsageCache::default();
     let initial = persisted
-        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
         .await
         .expect("capture the shared starting revision");
     let mut fresh = legacy.clone();
@@ -2430,7 +2678,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
     assert_eq!(published.find("photos").expect("published bucket").size, 20);
     assert_eq!(published.info.scan_execution_digest, fresh.info.scan_execution_digest);
     let current = persisted
-        .load_with_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
+        .load_with_baseline_revisions(Arc::clone(&set), DATA_USAGE_CACHE_NAME)
         .await
         .expect("capture the current revision for the unidentified execution");
 
