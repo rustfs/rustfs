@@ -43,6 +43,8 @@
 pub mod dial9;
 mod filter;
 mod guard;
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+mod http2_ping;
 mod local;
 mod otel;
 mod recorder;
@@ -53,11 +55,18 @@ use crate::TelemetryError;
 use crate::config::OtelConfig;
 pub use filter::HTTP_SERVER_LOG_TARGET;
 pub use guard::OtelGuard;
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub(super) use http2_ping::http2_ping_timeout_layer;
 pub(crate) use recorder::process_global_meter;
 pub use recorder::{Recorder, retire_metric_series};
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
 use rustfs_config::{DEFAULT_LOG_LEVEL, ENVIRONMENT, observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION};
 use rustfs_utils::get_env_opt_str;
+
+#[cfg(not(feature = "diagnostic-internode-http2-ping"))]
+pub(super) const fn http2_ping_timeout_layer() -> Option<tracing_subscriber::layer::Identity> {
+    None
+}
 
 /// Initialize the telemetry subsystem according to the provided configuration.
 ///
