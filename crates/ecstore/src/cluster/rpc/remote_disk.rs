@@ -2533,7 +2533,7 @@ fn encode_file_info_versions_msgpack(value: &FileInfoVersions) -> Result<Vec<u8>
 }
 
 fn encode_delete_versions_request(
-    disk: &str,
+    disk: String,
     volume: &str,
     versions: &[FileInfoVersions],
     opts: &DeleteOptions,
@@ -2558,7 +2558,7 @@ fn encode_delete_versions_request(
         versions_bin.push(encode_file_info_versions_msgpack(version)?.into());
     }
     Ok(DeleteVersionsRequest {
-        disk: disk.to_owned(),
+        disk,
         volume: volume.to_owned(),
         versions: versions_json,
         opts: opts_json,
@@ -3551,7 +3551,7 @@ impl DiskAPI for RemoteDisk {
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
-        let request = match encode_delete_versions_request(&self.endpoint.to_string(), volume, &versions, &opts) {
+        let request = match encode_delete_versions_request(self.endpoint.to_string(), volume, &versions, &opts) {
             Ok(request) => request,
             Err(err) => return vec![Some(Error::other(err.to_string())); versions.len()],
         };
@@ -6273,8 +6273,11 @@ mod tests {
                 ],
                 || {
                     for batch in [&groups[..], &[]] {
-                        let request = encode_delete_versions_request("disk", "bucket", batch, &opts).expect("encode batch");
+                        let disk = "disk".to_owned();
+                        let disk_buffer = disk.as_ptr();
+                        let request = encode_delete_versions_request(disk, "bucket", batch, &opts).expect("encode batch");
                         assert_eq!(request.disk, "disk");
+                        assert_eq!(request.disk.as_ptr(), disk_buffer, "move the prepared endpoint into the request");
                         assert_eq!(request.volume, "bucket");
                         assert_eq!(request.versions_bin.len(), batch.len());
                         assert_eq!(request.opts.is_empty(), binary_only);
