@@ -1,7 +1,7 @@
 # Internode msgpack/JSON convergence runbook
 
 **Use this when:** operating or changing the staged retirement of the JSON compatibility fields on internode gRPC metadata RPCs, deciding whether a fleet may enable `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, or adding a new `*_bin` proto field.
-**Source of truth:** `crates/config/src/constants/internode.rs` (`ENV_INTERNODE_RPC_MSGPACK_ONLY`, `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` and their compile-time default-off asserts), `crates/protos/src/node.proto` (`*_bin` fields), `decode_msgpack_or_json` in `rustfs/src/storage/rpc/node_service/disk.rs` (server side) and `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client side), `crates/io-metrics/src/internode_metrics.rs` (counters).
+**Source of truth:** `crates/config/src/constants/internode.rs` (`ENV_INTERNODE_RPC_MSGPACK_ONLY`, `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED`, `ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY` and their compile-time default-off asserts), `crates/protos/src/node.proto` (`*_bin` fields), `decode_msgpack_or_json` in `rustfs/src/storage/rpc/node_service/disk.rs` (server side) and `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client side), `crates/io-metrics/src/internode_metrics.rs` (counters).
 
 This is a cross-version change and proceeds by observation-gated stages, never in one step.
 
@@ -16,6 +16,7 @@ Internode RPCs dual-encode each metadata value as a msgpack binary field (`*_bin
 | `rustfs_system_network_internode_msgpack_json_decode_total` | `direction`, `message`, `codec` | a msgpack or JSON decode succeeded |
 | `rustfs_system_network_internode_msgpack_json_fallback_total` | `direction`, `message` | a decode fell back to JSON because `_bin` was empty |
 | `rustfs_system_network_internode_msgpack_json_decode_error_total` | `direction`, `message`, `codec` | either codec failed to decode (`codec` = the failed codec) |
+| `rustfs_system_network_internode_msgpack_send_decisions_total` | `decision`, `reason` | an eligible RPC selected `msgpack_only` or `dual_write`; reasons are fixed to `manual_fleet`, `peer_capable`, `peer_unknown`, `peer_revoked`, or `not_requested` |
 
 `direction="request"` is a server decoding a peer's request (`node_service/disk.rs`); `direction="response"` is a client decoding a peer's response (`cluster/rpc/remote_disk.rs`), including the list-level `ReadMultiple` / `BatchReadVersion` fallbacks. `message` is the value name (`FileInfo`, `RawFileInfo`, `ReadMultipleResp`, ...).
 
@@ -92,12 +93,14 @@ Run the fleet with both flags at their default (`false`) for at least one full o
 
 ## Stage 1 — Stop writing JSON (env-gated)
 
-Flag semantics are defined on `ENV_INTERNODE_RPC_MSGPACK_ONLY` and `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` in `crates/config/src/constants/internode.rs`; both default off and only their conjunction stops the JSON write for convergence-ready fields. Decoders keep the JSON fallback in every state.
+Flag semantics are defined in `crates/config/src/constants/internode.rs`; all three flags default off. `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` requests msgpack-only, and JSON stops only when either fleet confirmation is true or the peer-capability gate is true and the exact current peer boot epoch plus physical connection generation has an authenticated capability proof. Unknown, unsupported, revoked, stale, or reconnecting peers continue dual-write. Decoders keep the JSON fallback in every state.
 
 1. Rehearse `request-only`: `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`, `..._FLEET_CONFIRMED=false`. Behaviour is unchanged (still dual-write) and safe with old peers; any fallback or decode-error increment still blocks.
 2. Canary: set both flags `true` on one node, restart that node only, and watch the fallback and decode-error counters for a soak period with real internode traffic.
 3. Fleet: if the counters stay zero, enable both flags fleet-wide with a rolling restart.
 4. Rollback: set either flag to `false` (or unset it) and restart; no wire format changed, so rollback is immediate.
+
+An alternative per-peer canary keeps `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false`, sets `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY=true`, and confirms `reason="peer_capable"` only for proved peers while every `peer_unknown` or `peer_revoked` decision remains `dual_write`. Enable this mode only when one client HTTP/2 connection has stable affinity to one RustFS peer process; an L7 proxy that routes streams from one connection to different backend versions invalidates the connection-generation proof. A connection-generation change may rebuild one request as dual-write only when the retained local guard proves rejection before the first payload frame; remote status text, a dispatched request, or an ordinary transport error never authorizes that compatibility retry. Disable either the base request flag or peer-capability flag to roll back immediately.
 
 The benchmark driver pins these operator states as dry-run phases (`before`, `request-only`, `canary`, `after`, `rollback`); see [internode-grpc-benchmark-runbook.md](internode-grpc-benchmark-runbook.md).
 
@@ -113,7 +116,7 @@ Only after Stage 1 has been stable fleet-wide for a full window with the counter
 | Stage | Wire format broken? | Rollback |
 | --- | --- | --- |
 | 0 Observe | no | n/a (metrics only) |
-| 1 msgpack-only send | no | unset either flag and restart |
+| 1 msgpack-only send | no | unset the base request flag, or unset the selected fleet/peer gate, and restart |
 | 2 remove fields | yes | redeploy the prior release; field numbers stay `reserved` |
 
 ## Related
