@@ -49,7 +49,9 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{
     EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
 };
-use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
+#[cfg(test)]
+use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
+use super::storage_api::multipart_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
@@ -73,7 +75,6 @@ use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
     validate_new_object_key,
 };
-use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
     reject_non_wildcard_write_if_none_match, reject_oversize_single_upload, reject_veeam_sosapi_mutation,
@@ -134,6 +135,8 @@ mod list;
 mod test_support;
 mod upload_part;
 mod upload_part_copy;
+mod upload_values;
+pub(crate) use upload_values::{UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
 
 #[cfg(test)]
 fn merge_part_encryption_metadata(

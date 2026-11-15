@@ -16,16 +16,20 @@
 
 use super::{OpRow, Served, row};
 use crate::app::RequestEnvelope;
+use crate::app::multipart_usecase::{DefaultMultipartUsecase, UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
+use crate::app::object::FrameTrailers;
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput, PutObjectWriteOutput};
 use crate::runtime_sources::AppContext;
-use crate::storage_api::server::http::access::access_owned::object_write::{PutObjectAuthorization, authorize_put_object};
+use crate::storage_api::server::http::access::access_owned::object_write::{
+    PutObjectAuthorization, authorize_put_object, authorize_upload_part,
+};
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_gateway_types::{ChecksumAlgorithm, Timestamp};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
-pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>()];
+pub(super) const ROWS: &[OpRow] = &[row::<dto::PutObject>(), row::<dto::UploadPart>()];
 
 impl Served for dto::PutObject {
     const METRIC: S3Operation = S3Operation::PutObject;
@@ -61,13 +65,7 @@ impl Served for dto::PutObject {
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let mut input = native_input(request.into_input())?;
         input.version_id = request_version_id(&envelope);
-        if let Some(declaration) = envelope.headers().get("x-amz-trailer").filter(|value| !value.is_empty()) {
-            // The gateway verifies the declared trailer independently of the SDK algorithm.
-            let algorithm = declaration
-                .to_str()
-                .ok()
-                .and_then(|name| ChecksumAlgorithm::from_header_name(name.trim_matches([' ', '\t'])))
-                .ok_or_else(|| s3_error!(InvalidRequest, "Invalid checksum trailer declaration"))?;
+        if let Some(algorithm) = trailer_checksum_algorithm(&envelope)? {
             input.checksum_algorithm = Some(algorithm.wire_name().to_owned());
             input.capture_frame_trailers();
         }
@@ -76,6 +74,110 @@ impl Served for dto::PutObject {
             .await?;
         native_output(output)
     }
+}
+
+impl Served for dto::UploadPart {
+    const METRIC: S3Operation = S3Operation::UploadPart;
+
+    fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> impl std::future::Future<Output = S3Result<()>> + Send {
+        let input = request.input();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        async move {
+            let server = envelope
+                .server_context()
+                .cloned()
+                .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
+            Ok(authorize_upload_part(envelope, &server, &bucket, &key).await?)
+        }
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = native_part_input(request.into_input(), trailer_checksum_algorithm(&envelope)?);
+        let output = DefaultMultipartUsecase::with_context(context)
+            .execute_upload_part_owned(envelope, input)
+            .await?;
+        native_part_output(output)
+    }
+}
+
+fn trailer_checksum_algorithm(envelope: &RequestEnvelope) -> S3Result<Option<ChecksumAlgorithm>> {
+    envelope
+        .headers()
+        .get("x-amz-trailer")
+        .filter(|value| !value.is_empty())
+        .map(|declaration| {
+            // The gateway verifies the declared trailer independently of the SDK algorithm.
+            declaration
+                .to_str()
+                .ok()
+                .and_then(|name| ChecksumAlgorithm::from_header_name(name.trim_matches([' ', '\t'])))
+                .ok_or_else(|| s3_error!(InvalidRequest, "Invalid checksum trailer declaration"))
+        })
+        .transpose()
+}
+
+fn native_part_input(input: dto::UploadPartInput, trailer_algorithm: Option<ChecksumAlgorithm>) -> UploadPartWriteInput {
+    let checksum = |algorithm| {
+        input
+            .checksum_spec
+            .as_ref()
+            .filter(|value| value.algorithm() == algorithm)
+            .map(|value| value.render_base64().to_owned())
+    };
+    let frame_trailers = trailer_algorithm.map(|_| Arc::new(FrameTrailers::default()));
+    UploadPartWriteInput {
+        checksum_crc32: checksum(ChecksumAlgorithm::Crc32),
+        checksum_crc32c: checksum(ChecksumAlgorithm::Crc32c),
+        checksum_crc64nvme: checksum(ChecksumAlgorithm::Crc64Nvme),
+        checksum_sha1: checksum(ChecksumAlgorithm::Sha1),
+        checksum_sha256: checksum(ChecksumAlgorithm::Sha256),
+        target: UploadPartTarget::Gateway {
+            bucket: input.bucket,
+            key: input.key,
+            upload_id: input.upload_id,
+        },
+        part_number: input.part_number,
+        content_length: Some(input.content_length),
+        body: input.body.map(|body| body.into_body()),
+        trailing_headers: frame_trailers.clone().map(|source| source as rustfs_rio::SharedTrailerSource),
+        frame_trailers,
+        content_md5: input.content_md5,
+        checksum_algorithm: trailer_algorithm
+            .map(|value| value.wire_name().to_owned())
+            .or_else(|| input.checksum_algorithm.map(|value| value.as_str().to_owned())),
+        sse_customer_algorithm: input.sse_customer_algorithm,
+        sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
+        sse_customer_key_md5: input.sse_customer_key_md5,
+    }
+}
+
+fn native_part_output(output: UploadPartWriteOutput) -> S3Result<Resp<dto::UploadPart>> {
+    let mut headers = output.headers;
+    insert_checksum_headers(
+        &mut headers,
+        [
+            output.checksum_crc32,
+            output.checksum_crc32c,
+            output.checksum_sha1,
+            output.checksum_sha256,
+            output.checksum_crc64nvme,
+        ],
+    )?;
+    let dto = dto::UploadPartOutput {
+        e_tag: crate::app::dto_values::stored_etag(
+            output
+                .e_tag
+                .as_deref()
+                .ok_or_else(|| s3_error!(InternalError, "UploadPart completed without an ETag"))?,
+        ),
+        server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        ssekms_key_id: output.ssekms_key_id,
+        ..Default::default()
+    };
+    Ok(Resp::new(dto).with_extra_headers(headers))
 }
 
 // PutObject's destination version is a RustFS replication extension, absent from the AWS DTO.
@@ -143,22 +245,16 @@ fn native_input(input: dto::PutObjectInput) -> S3Result<PutObjectWriteInput> {
 
 fn native_output(output: PutObjectWriteOutput) -> S3Result<Resp<dto::PutObject>> {
     let mut headers = output.headers;
-    for (name, value) in [
-        ("x-amz-checksum-crc32", output.checksum_crc32),
-        ("x-amz-checksum-crc32c", output.checksum_crc32c),
-        ("x-amz-checksum-sha1", output.checksum_sha1),
-        ("x-amz-checksum-sha256", output.checksum_sha256),
-        ("x-amz-checksum-crc64nvme", output.checksum_crc64nvme),
-    ] {
-        if let Some(value) = value {
-            headers.insert(
-                name,
-                value
-                    .parse()
-                    .map_err(|_| s3_error!(InternalError, "Invalid stored checksum"))?,
-            );
-        }
-    }
+    insert_checksum_headers(
+        &mut headers,
+        [
+            output.checksum_crc32,
+            output.checksum_crc32c,
+            output.checksum_sha1,
+            output.checksum_sha256,
+            output.checksum_crc64nvme,
+        ],
+    )?;
     let dto = dto::PutObjectOutput {
         e_tag: crate::app::dto_values::stored_etag(
             output
@@ -179,6 +275,29 @@ fn native_output(output: PutObjectWriteOutput) -> S3Result<Resp<dto::PutObject>>
         None => Resp::new(dto),
     }
     .with_extra_headers(headers))
+}
+
+fn insert_checksum_headers(
+    headers: &mut http::HeaderMap,
+    [crc32, crc32c, sha1, sha256, crc64nvme]: [Option<String>; 5],
+) -> S3Result<()> {
+    for (name, value) in [
+        ("x-amz-checksum-crc32", crc32),
+        ("x-amz-checksum-crc32c", crc32c),
+        ("x-amz-checksum-sha1", sha1),
+        ("x-amz-checksum-sha256", sha256),
+        ("x-amz-checksum-crc64nvme", crc64nvme),
+    ] {
+        if let Some(value) = value {
+            headers.insert(
+                name,
+                value
+                    .parse()
+                    .map_err(|_| s3_error!(InternalError, "Invalid stored checksum"))?,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
