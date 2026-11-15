@@ -966,7 +966,8 @@ impl ECStore {
         bucket_lifecycle_guard: Option<super::BucketIncarnationFenceGuard>,
     ) -> Result<()> {
         let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
-        if self.ctx.lock_manager().is_disabled() {
+        // Without upload metadata this path has no recorded owner to authorize.
+        if opts.multipart_abort_authorization.is_some() || self.ctx.lock_manager().is_disabled() {
             return Err(invalid_upload());
         }
         let Some(bucket_lifecycle_guard) = bucket_lifecycle_guard else {

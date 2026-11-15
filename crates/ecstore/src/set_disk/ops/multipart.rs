@@ -684,6 +684,22 @@ fn fence_commit_on_lock_loss(guard: Option<&ObjectLockDiagGuard>, mode: &'static
     Ok(())
 }
 
+fn recorded_multipart_owner(
+    metadata: &HashMap<String, String>,
+    bucket: &str,
+    encoded_object: &str,
+) -> Option<crate::storage_api_contracts::multipart::MultipartOwner> {
+    let recorded_bucket = get_consistent_str(metadata, "multipart-bucket")?;
+    let recorded_object = get_consistent_str(metadata, "multipart-object")?;
+    if recorded_bucket != bucket || recorded_object != encoded_object {
+        return None;
+    }
+    Some(crate::storage_api_contracts::multipart::MultipartOwner {
+        bucket: recorded_bucket.to_owned(),
+        object: decode_dir_object(recorded_object),
+    })
+}
+
 fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) {
@@ -3612,6 +3628,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+        if let Some(authorization) = &opts.multipart_abort_authorization {
+            let owner = recorded_multipart_owner(&fi.metadata, bucket, object);
+            authorization.authorize(owner.as_ref())?;
+        }
         let disks = self.get_disks_internal().await;
         let cleanup = prepare_source_cleanup(
             &disks,

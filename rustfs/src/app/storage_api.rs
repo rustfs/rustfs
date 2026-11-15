@@ -1859,6 +1859,8 @@ pub(crate) mod multipart_usecase {
             pub(crate) use super::super::super::storage_contracts::{
                 CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::{MultipartAbortAuthorization, MultipartOwner};
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 

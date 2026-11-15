@@ -102,7 +102,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
 use metrics::counter;
-use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -126,6 +125,7 @@ use urlencoding::encode;
 use uuid::Uuid;
 
 mod abort;
+pub(crate) use abort::{AbortMultipartUploadTarget, reject_abort_capabilities};
 mod complete;
 mod create;
 mod create_values;
