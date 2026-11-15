@@ -12,26 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PutObject refusal rows and legacy/gateway wire behavior. UploadPart remains unserved.
+//! PutObject and UploadPart refusal rows and legacy/gateway wire behavior.
 
-pub(crate) const MATRIX: &[super::MatrixRow] = &[super::MatrixRow {
-    operation: "PutObject",
-    metric: rustfs_s3_ops::S3Operation::PutObject,
-    has_error_body: true,
-    call: |client, bucket| {
-        Box::pin(async move {
-            super::outcome(
-                client
-                    .put_object()
-                    .bucket(bucket)
-                    .key("put-matrix")
-                    .body(aws_sdk_s3::primitives::ByteStream::from_static(b"matrix"))
-                    .send()
-                    .await,
-            )
-        })
+pub(crate) const MATRIX: &[super::MatrixRow] = &[
+    super::MatrixRow {
+        operation: "PutObject",
+        metric: rustfs_s3_ops::S3Operation::PutObject,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                super::outcome(
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key("put-matrix")
+                        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"matrix"))
+                        .send()
+                        .await,
+                )
+            })
+        },
     },
-}];
+    super::MatrixRow {
+        operation: "UploadPart",
+        metric: rustfs_s3_ops::S3Operation::UploadPart,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                use rustfs_storage_api::MultipartOperations as _;
+                let store = super::get_global_app_context().expect("embedded context").object_store();
+                let upload = store
+                    .new_multipart_upload(bucket, "part-matrix", &Default::default())
+                    .await
+                    .expect("matrix upload");
+                super::outcome(
+                    client
+                        .upload_part()
+                        .bucket(bucket)
+                        .key("part-matrix")
+                        .upload_id(upload.upload_id)
+                        .part_number(1)
+                        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"matrix"))
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
+];
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -632,3 +660,6 @@ impl WireClient<'_> {
             .await
     }
 }
+
+#[path = "upload_part.rs"]
+mod upload_part;

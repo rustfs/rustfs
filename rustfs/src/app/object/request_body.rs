@@ -17,7 +17,9 @@
 //! after its input returned Pending, so the transport cannot infer read demand.
 
 use super::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
-use crate::app::storage_api::request_body::{ByteStream, DynByteStream, RemainingLength, StdError, StreamingBlob};
+use crate::app::storage_api::request_body::StdError;
+#[cfg(test)]
+use crate::app::storage_api::request_body::{ByteStream, DynByteStream, RemainingLength, StreamingBlob};
 use crate::error::ClientBodyReadTimeout;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -421,13 +423,13 @@ impl<R: TryGetIndex> TryGetIndex for DemandReader<R> {
 /// Establish demand for eager reads and archive sniffing before the final
 /// transformed reader exists. Pending demand is subsequently paused by the
 /// outer DemandReader when a transform returns buffered output.
-pub(super) type UploadChunks = Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin>;
+pub(crate) type UploadChunks = Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin>;
 
 pub(super) fn demand_native_upload(body: UploadChunks, control: BodyReadControl) -> UploadChunks {
     Box::new(DemandStream { inner: body, control })
 }
 
-pub(super) fn guard_native_upload_progress(
+pub(crate) fn guard_native_upload_progress(
     body: UploadChunks,
     timeout: Duration,
     bucket: &str,
@@ -464,10 +466,8 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for DemandStream<
         self.inner.size_hint()
     }
 }
-/// Fallback for direct protocol callers without the raw HTTP observation.
-/// HTTP uses ObservedBody because a signed chunk may not yield decoded output
-/// until its full payload has arrived and its signature has been verified.
-/// The final DemandReader pauses pending reads when transforms return output.
+/// Supplies the read-progress guard to tests using a legacy body.
+#[cfg(test)]
 pub(crate) fn guard_upload_progress(
     body: StreamingBlob,
     timeout: Duration,
@@ -554,6 +554,7 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for UploadProgres
         self.inner.size_hint()
     }
 }
+#[cfg(test)]
 impl ByteStream for UploadProgressStream<DynByteStream> {
     fn remaining_length(&self) -> RemainingLength {
         self.inner.remaining_length()

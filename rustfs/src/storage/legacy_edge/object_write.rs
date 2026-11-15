@@ -50,7 +50,10 @@ impl FS {
 }
 
 use crate::app::RequestEnvelope;
-use crate::storage::s3_api::{DefaultObjectUsecase, PutObjectWriteInput, PutObjectWriteOutput};
+use crate::storage::s3_api::{
+    DefaultMultipartUsecase, DefaultObjectUsecase, PutObjectWriteInput, PutObjectWriteOutput, UploadPartTarget,
+    UploadPartWriteInput, UploadPartWriteOutput,
+};
 
 impl PutObjectWriteInput {
     pub(crate) fn from_legacy(input: PutObjectInput, trailing_headers: Option<TrailingHeaders>) -> Self {
@@ -133,6 +136,62 @@ impl DefaultObjectUsecase {
         self.execute_put_object_extract_owned(envelope, input)
             .await
             .map(put_output_to_legacy)
+            .map_err(Into::into)
+    }
+}
+
+impl UploadPartWriteInput {
+    pub(crate) fn from_legacy(input: UploadPartInput, trailers: Option<TrailingHeaders>) -> Self {
+        Self {
+            target: UploadPartTarget::Legacy {
+                bucket: input.bucket,
+                key: input.key,
+                upload_id: input.upload_id,
+            },
+            part_number: input.part_number,
+            content_length: input.content_length,
+            body: input.body.map(s3_api::legacy_put_body),
+            trailing_headers: crate::app::trailer_adapter::trailer_source(trailers),
+            frame_trailers: None,
+            content_md5: input.content_md5,
+            checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
+            checksum_crc32: input.checksum_crc32,
+            checksum_crc32c: input.checksum_crc32c,
+            checksum_crc64nvme: input.checksum_crc64nvme,
+            checksum_sha1: input.checksum_sha1,
+            checksum_sha256: input.checksum_sha256,
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
+fn upload_part_output_to_legacy(output: UploadPartWriteOutput) -> S3Response<UploadPartOutput> {
+    let mut response = S3Response::new(UploadPartOutput {
+        e_tag: output.e_tag.map(|tag| crate::storage::storage_api::to_s3s_etag(&tag)),
+        checksum_crc32: output.checksum_crc32,
+        checksum_crc32c: output.checksum_crc32c,
+        checksum_crc64nvme: output.checksum_crc64nvme,
+        checksum_sha1: output.checksum_sha1,
+        checksum_sha256: output.checksum_sha256,
+        server_side_encryption: output.server_side_encryption.map(ServerSideEncryption::from),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        ..Default::default()
+    });
+    response.headers = output.headers;
+    response
+}
+
+impl DefaultMultipartUsecase {
+    pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
+        self.execute_upload_part_owned(envelope, input)
+            .await
+            .map(upload_part_output_to_legacy)
             .map_err(Into::into)
     }
 }

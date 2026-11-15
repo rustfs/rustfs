@@ -224,6 +224,7 @@ mod on_demand_migration_put;
 mod put;
 mod put_input;
 pub(crate) use native_body::from_legacy as legacy_put_body;
+pub(crate) use native_body::{BodyChunks, FrameTrailers};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
