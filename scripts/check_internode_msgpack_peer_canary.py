@@ -29,8 +29,6 @@ DECISIONS = {"msgpack_only", "dual_write"}
 REASONS = {"manual_fleet", "peer_capable", "peer_unknown", "peer_revoked", "not_requested"}
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
-CLUSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
 MAX_DOCUMENT_BYTES = 1024 * 1024
 
 
@@ -103,13 +101,12 @@ def prometheus_rows(document: dict[str, Any], name: str) -> list[dict[str, Any]]
     return rows
 
 
-def decision_values(document: dict[str, Any], start: float, end: float, lag: float, cluster_id: str) -> dict[tuple[str, str], float]:
+def decision_values(document: dict[str, Any], start: float, end: float, lag: float) -> dict[tuple[str, str], float]:
     result: dict[tuple[str, str], float] = {}
     for index, row in enumerate(prometheus_rows(document, "decisions")):
         labels = row.get("metric")
-        require(isinstance(labels, dict) and set(labels) == {"decision", "reason", "rustfs_cluster_id"},
-                "decision evidence must contain only decision/reason/cluster labels")
-        require(labels.get("rustfs_cluster_id") == cluster_id, "decision evidence belongs to a foreign cluster")
+        require(isinstance(labels, dict) and set(labels) == {"decision", "reason"},
+                "decision evidence must contain only decision/reason labels")
         decision = labels.get("decision")
         reason = labels.get("reason")
         require(decision in DECISIONS and reason in REASONS, "decision evidence contains an unbounded label")
@@ -119,13 +116,13 @@ def decision_values(document: dict[str, Any], start: float, end: float, lag: flo
     return result
 
 
-def scalar_sum(document: dict[str, Any], start: float, end: float, lag: float, name: str, cluster_id: str) -> float:
+def scalar_sum(document: dict[str, Any], start: float, end: float, lag: float, name: str) -> float:
     total = 0.0
     rows = prometheus_rows(document, name)
     require(len(rows) == 1, f"{name} scalar query must return exactly one row")
     for index, row in enumerate(rows):
         labels = row.get("metric")
-        require(labels == {"rustfs_cluster_id": cluster_id}, f"{name} scalar query must retain only the canary cluster label")
+        require(labels == {}, f"{name} scalar query must not retain labels")
         total += timestamped_value(row, start, end, lag, f"{name}[{index}]")
     return total
 
@@ -158,35 +155,18 @@ def exact_env(document: Any, name: str, old: bool) -> None:
 
 
 def expected_queries(window: int, cluster_id: str) -> dict[str, str]:
-    selector = f'rustfs_cluster_id="{cluster_id}"'
-    zero = f'label_replace(vector(0), "rustfs_cluster_id", "{cluster_id}", "", "")'
+    selector = f'{{rustfs_cluster_id="{cluster_id}"}}'
     return {
         "decisions": (
-            "sum by (decision, reason, rustfs_cluster_id) "
-            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total{{{selector}}}[{window}s]))"
+            "sum by (decision, reason) "
+            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total{selector}[{window}s]))"
         ),
-        "fallback": (
-            "sum by (rustfs_cluster_id) "
-            f"(increase(rustfs_system_network_internode_msgpack_json_fallback_total{{{selector}}}[{window}s])) or {zero}"
-        ),
+        "fallback": f"sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total{selector}[{window}s])) or vector(0)",
         "decode_errors": (
-            "sum by (rustfs_cluster_id) "
-            f"(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{{{selector}}}[{window}s])) or {zero}"
+            f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{selector}[{window}s])) or vector(0)"
         ),
-        "rpc_errors": (
-            "sum by (rustfs_cluster_id) "
-            f"(increase(rustfs_system_network_internode_operation_errors_total{{{selector}}}[{window}s])) or {zero}"
-        ),
+        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total{selector}[{window}s])) or vector(0)",
     }
-
-
-def image_identity(value: Any, name: str, revision: str) -> dict[str, str]:
-    require(isinstance(value, dict) and set(value) == {"ref", "id", "revision"}, f"{name} image identity is invalid")
-    require(isinstance(value.get("ref"), str) and value["ref"], f"{name} image ref is invalid")
-    require(isinstance(value.get("id"), str) and IMAGE_ID.fullmatch(value["id"]) is not None,
-            f"{name} image ID is invalid")
-    require(value.get("revision") == revision, f"{name} image revision does not match the requested revision")
-    return value
 
 
 def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -198,15 +178,11 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     require(isinstance(source, str) and REVISION.fullmatch(source) is not None, "invalid source revision")
     require(isinstance(baseline, str) and REVISION.fullmatch(baseline) is not None, "invalid baseline revision")
     require(source != baseline, "candidate and baseline revisions must differ")
-    cluster_id = manifest.get("telemetry_cluster_id")
-    require(isinstance(cluster_id, str) and CLUSTER_ID.fullmatch(cluster_id) is not None, "invalid telemetry cluster ID")
-    images = manifest.get("images")
-    require(isinstance(images, dict) and set(images) == {"candidate", "baseline"}, "candidate/baseline image identities are required")
-    candidate_image = image_identity(images["candidate"], "candidate", source)
-    baseline_image = image_identity(images["baseline"], "baseline", baseline)
-    require(candidate_image["id"] != baseline_image["id"], "candidate and baseline image IDs must differ")
     require(bool_value(manifest.get("stable_connection_affinity"), "stable_connection_affinity"),
             "stable connection-to-peer affinity is required")
+    cluster_id = manifest.get("cluster_id")
+    require(isinstance(cluster_id, str) and re.fullmatch(r"msgpack-[0-9a-f]{32}", cluster_id) is not None,
+            "invalid canary cluster identity")
     lag = bounded_number(manifest.get("max_metric_lag_secs"), "max_metric_lag_secs")
     require(0 <= lag <= 300, "max_metric_lag_secs exceeds the bounded limit")
     phases = manifest.get("phases")
@@ -216,6 +192,22 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     receipts: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     violations: list[str] = []
+    image_path = artifact_path(root, manifest.get("images"), used, "images")
+    image_digest = load_raw(image_path)
+    images = json.loads(image_path.read_bytes(), object_pairs_hook=unique_object)
+    require(isinstance(images, list) and len(images) == 2, "expected candidate and baseline image inspections")
+    image_ids = []
+    for image, revision in zip(images, (source, baseline)):
+        require(isinstance(image, dict), "invalid image inspection")
+        image_id = image.get("Id")
+        require(isinstance(image_id, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None,
+                "invalid immutable image ID")
+        labels = image.get("Config", {}).get("Labels") or {}
+        observed = [labels[key] for key in ("vcs-ref", "org.opencontainers.image.revision") if key in labels]
+        require(bool(observed) and all(value == revision for value in observed), "image revision mismatch")
+        image_ids.append(image_id)
+    require(image_ids[0] != image_ids[1], "candidate and baseline resolve to the same image")
+    receipts.append({"kind": "images", "path": manifest["images"], "sha256": image_digest})
     previous_end = 0.0
     for expected_name, phase in zip(PHASES, phases):
         require(isinstance(phase, dict) and phase.get("name") == expected_name, "canary phases are missing or out of order")
@@ -234,14 +226,15 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             for node in ("node1", "node2", "node3", "node4")
         }
         require(nodes == expected_nodes, f"{expected_name} node revisions do not match the mixed-version matrix")
-        phase_images = phase.get("images")
-        require(isinstance(phase_images, dict) and set(phase_images) == {"node1", "node2", "node3", "node4"},
-                f"{expected_name} running image inventory is incomplete")
+        running_path = artifact_path(root, phase.get("images"), used, f"{expected_name}.images")
+        running, running_digest = load_json(running_path)
         expected_images = {
-            node: (baseline_image if node in OLD_NODES[expected_name] else candidate_image)
-            for node in ("node1", "node2", "node3", "node4")
+            node: {"image_id": image_ids[1] if node in OLD_NODES[expected_name] else image_ids[0], "revision": revision}
+            for node, revision in expected_nodes.items()
         }
-        require(phase_images == expected_images, f"{expected_name} running image inventory does not match the phase")
+        require(running == expected_images, f"{expected_name} running images do not match verified identities")
+        receipts.append({"phase": expected_name, "kind": "running-images", "path": phase["images"],
+                         "sha256": running_digest})
         new_nodes = uint(topology.get("new_nodes"), f"{expected_name} new_nodes")
         old_nodes = uint(topology.get("old_nodes"), f"{expected_name} old_nodes")
         require(new_nodes == expected_new and old_nodes == expected_old,
@@ -290,7 +283,7 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             documents[artifact] = document
             receipts.append({"phase": expected_name, "kind": artifact, "path": artifacts[artifact], "sha256": digest})
 
-        decisions = decision_values(documents["decisions"], start, end, lag, cluster_id)
+        decisions = decision_values(documents["decisions"], start, end, lag)
         peer_capable = decisions.get(("msgpack_only", "peer_capable"), 0.0)
         compatibility = decisions.get(("dual_write", "peer_unknown"), 0.0) + decisions.get(
             ("dual_write", "peer_revoked"), 0.0
@@ -305,9 +298,9 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             violations.append(f"{expected_name}: peer gate was not active on an eligible new-node request")
 
         errors = {
-            "fallback": scalar_sum(documents["fallback"], start, end, lag, "fallback", cluster_id),
-            "decode_errors": scalar_sum(documents["decode_errors"], start, end, lag, "decode_errors", cluster_id),
-            "rpc_errors": scalar_sum(documents["rpc_errors"], start, end, lag, "rpc_errors", cluster_id),
+            "fallback": scalar_sum(documents["fallback"], start, end, lag, "fallback"),
+            "decode_errors": scalar_sum(documents["decode_errors"], start, end, lag, "decode_errors"),
+            "rpc_errors": scalar_sum(documents["rpc_errors"], start, end, lag, "rpc_errors"),
         }
         for name, value in errors.items():
             if value != 0:
@@ -317,7 +310,6 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             "start_unix": start,
             "end_unix": end,
             "topology": topology,
-            "images": phase_images,
             "workload_requests": requests,
             "peer_capable_decisions": peer_capable,
             "compatibility_decisions": compatibility,
@@ -329,8 +321,6 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         "scope": manifest["scope"],
         "source_revision": source,
         "baseline_revision": baseline,
-        "telemetry_cluster_id": cluster_id,
-        "images": images,
         "phases": summaries,
         "violations": violations,
         "artifacts": receipts,
