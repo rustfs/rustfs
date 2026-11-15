@@ -84,7 +84,7 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketCorsOutput>> {
         record_s3_op(S3Operation::GetBucketCors);
         let usecase = s3_api::bucket_usecase_for(self);
-        let cors_configuration = usecase.execute_get_bucket_cors(req).await?;
+        let cors_configuration = usecase.execute_get_bucket_cors(&req.input.bucket).await?;
         let cors_configuration: CORSConfiguration = persisted_to_s3s(&cors_configuration)?;
         Ok(S3Response::new(GetBucketCorsOutput {
             cors_rules: Some(cors_configuration.cors_rules),
@@ -97,14 +97,9 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
         record_s3_op(S3Operation::GetBucketEncryption);
         let usecase = s3_api::bucket_usecase_for(self);
-        let server_side_encryption_configuration = usecase
-            .execute_get_bucket_encryption(req)
-            .await?
-            .as_ref()
-            .map(persisted_to_s3s::<_, ServerSideEncryptionConfiguration>)
-            .transpose()?;
+        let config = usecase.execute_get_bucket_encryption(&req.input.bucket).await?;
         Ok(S3Response::new(GetBucketEncryptionOutput {
-            server_side_encryption_configuration,
+            server_side_encryption_configuration: Some(persisted_to_s3s(&config)?),
         }))
     }
 
@@ -115,7 +110,7 @@ impl FS {
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         record_s3_op(S3Operation::GetBucketTagging);
         let usecase = s3_api::bucket_usecase_for(self);
-        let tagging = usecase.execute_get_bucket_tagging(req).await?;
+        let tagging = usecase.execute_get_bucket_tagging(&req.input.bucket).await?;
         Ok(S3Response::new(GetBucketTaggingOutput {
             tag_set: tagging_to_s3s(&tagging).tag_set,
         }))

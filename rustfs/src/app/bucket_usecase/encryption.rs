@@ -16,10 +16,10 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto::{
-    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, GetBucketEncryptionInput, PutBucketEncryptionInput,
-    PutBucketEncryptionOutput, ServerSideEncryption,
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+    ServerSideEncryption,
 };
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 /// Refuse a default-encryption configuration the write path could not honour
 /// as written. `bucket_default_write_sse` falls back to AES256 for any
@@ -93,26 +93,33 @@ impl DefaultBucketUsecase {
         Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
+    /// Returns the stored bucket encryption configuration after checking the bucket exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InternalError` if the store is uninitialized, `ServerSideEncryptionConfigurationNotFoundError`
+    /// if the configuration is absent, or the storage error from either lookup.
     pub async fn execute_get_bucket_encryption(
         &self,
-        req: S3Request<GetBucketEncryptionInput>,
-    ) -> S3Result<Option<PersistedBucketEncryptionConfiguration>> {
-        let GetBucketEncryptionInput { bucket, .. } = req.input;
-
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<PersistedBucketEncryptionConfiguration> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let server_side_encryption_configuration = match metadata_sys::get_sse_config(&bucket).await {
-            Ok((cfg, _)) => Some(cfg),
+        let server_side_encryption_configuration = match metadata_sys::get_sse_config(bucket).await {
+            Ok((cfg, _)) => cfg,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
-                    return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
+                    return Err(rustfs_s3_types::s3_error!(
+                        ServerSideEncryptionConfigurationNotFoundError,
+                        "The server-side encryption configuration was not found."
+                    ));
                 }
                 warn!(
                     component = LOG_COMPONENT_APP,
@@ -257,16 +264,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_encryption_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketEncryptionInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_encryption(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_encryption("test-bucket").await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

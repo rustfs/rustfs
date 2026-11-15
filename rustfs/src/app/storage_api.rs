@@ -963,6 +963,9 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            get_accelerate_config, get_logging_config, get_request_payment_config, get_website_config,
+        };
         use std::sync::Arc;
 
         use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};

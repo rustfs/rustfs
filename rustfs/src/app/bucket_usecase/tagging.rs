@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::s3::dto;
 use crate::app::storage_api::s3::dto::{
-    DeleteBucketTaggingInput, DeleteBucketTaggingOutput, GetBucketTaggingInput, PutBucketTaggingInput, PutBucketTaggingOutput,
+    DeleteBucketTaggingInput, DeleteBucketTaggingOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
 };
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
@@ -49,24 +49,28 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<PersistedTagging> {
-        let GetBucketTaggingInput { bucket, .. } = req.input;
-
+    /// Returns the stored bucket tagging configuration after checking the bucket exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InternalError` if the store is uninitialized, `NoSuchTagSet`
+    /// if the configuration is absent, or the storage error from either lookup.
+    #[instrument(level = "debug", skip(self, bucket))]
+    pub async fn execute_get_bucket_tagging(&self, bucket: &str) -> rustfs_s3_types::S3Result<PersistedTagging> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let tagging = match metadata_sys::get_tagging_config(&bucket).await {
+        let tagging = match metadata_sys::get_tagging_config(bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(S3ErrorCode::NoSuchTagSet, "The TagSet does not exist".to_string()));
+                    return Err(rustfs_s3_types::s3_error!(NoSuchTagSet, "The TagSet does not exist"));
                 }
                 warn!(
                     component = LOG_COMPONENT_APP,
@@ -140,16 +144,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_tagging_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_tagging(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_tagging("test-bucket").await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[test]

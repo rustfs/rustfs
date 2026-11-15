@@ -12,4 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bucket accelerate configuration use-case operations (reserved for the next batch).
+//! Bucket accelerate configuration reads shared by the S3 edges.
+
+use super::{ApiError, DefaultBucketUsecase, StorageError, metadata_sys};
+use rustfs_gateway_types::persistence::PersistedAccelerateConfiguration;
+use rustfs_s3_types::S3Result;
+
+impl DefaultBucketUsecase {
+    pub(crate) async fn execute_get_bucket_accelerate_configuration(
+        &self,
+        bucket: &str,
+    ) -> S3Result<PersistedAccelerateConfiguration> {
+        self.ensure_config_read_bucket(bucket).await?;
+        match metadata_sys::get_accelerate_config(bucket).await {
+            Ok((config, _)) => Ok(config),
+            Err(StorageError::ConfigNotFound) => Ok(PersistedAccelerateConfiguration::default()),
+            Err(err) => Err(ApiError::from(err).into()),
+        }
+    }
+}

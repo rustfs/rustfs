@@ -16,12 +16,13 @@
 //! head and location, website, accelerate, logging and request payment; and ListBuckets.
 
 use super::{OpRow, Served, row};
-use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::{DefaultBucketUsecase, requested_location_constraint};
+use crate::app::{RequestEnvelope, dto_values};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
+use rustfs_gateway_types::persistence::{parse_bucket_logging_dto, parse_website_dto};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -33,6 +34,10 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::CreateBucket>(),
     row::<dto::DeleteBucket>(),
     row::<dto::GetBucketLocation>(),
+    row::<dto::GetBucketAccelerateConfiguration>(),
+    row::<dto::GetBucketRequestPayment>(),
+    row::<dto::GetBucketWebsite>(),
+    row::<dto::GetBucketLogging>(),
 ];
 
 impl Served for dto::ListBuckets {
@@ -113,5 +118,83 @@ impl Served for dto::GetBucketLocation {
             .execute_get_bucket_location(request.into_input())
             .await?;
         Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetBucketAccelerateConfiguration {
+    const METRIC: S3Operation = S3Operation::GetBucketAccelerateConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPolicyAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let config = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_accelerate_configuration(request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::GetBucketAccelerateConfigurationOutput {
+            status: config.status.map(dto::Status::custom),
+            ..Default::default()
+        }))
+    }
+}
+
+impl Served for dto::GetBucketRequestPayment {
+    const METRIC: S3Operation = S3Operation::GetBucketRequestPayment;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPolicyAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let config = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_request_payment(request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::GetBucketRequestPaymentOutput {
+            payer: Some(dto::Payer::custom(config.payer)),
+        }))
+    }
+}
+
+impl Served for dto::GetBucketWebsite {
+    const METRIC: S3Operation = S3Operation::GetBucketWebsite;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPolicyAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let config = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_website(request.input().bucket.as_str())
+            .await?;
+        let config = dto_values::stored_config(&config, parse_website_dto)?;
+        Ok(Resp::new(dto::GetBucketWebsiteOutput {
+            error_document: config.error_document,
+            index_document: config.index_document,
+            redirect_all_requests_to: config.redirect_all_requests_to,
+            routing_rules: config.routing_rules,
+        }))
+    }
+}
+
+impl Served for dto::GetBucketLogging {
+    const METRIC: S3Operation = S3Operation::GetBucketLogging;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketLoggingAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let config = DefaultBucketUsecase::with_context(context)
+            .execute_get_bucket_logging(request.input().bucket.as_str())
+            .await?;
+        let config = dto_values::stored_config(&config, parse_bucket_logging_dto)?;
+        Ok(Resp::new(dto::GetBucketLoggingOutput {
+            logging_enabled: config.logging_enabled,
+        }))
     }
 }
