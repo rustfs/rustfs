@@ -37895,12 +37895,12 @@ mod test {
                     .expect("truncate behind cached descriptor");
                 assert!(read().await.is_err(), "native short data must not be accepted");
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while backend.driver.stats().in_flight != 0 {
+                    while backend.driver.stats().in_flight != 0 || memory.snapshot().used != 0 {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
-                .expect("failed native read retired");
+                .expect("failed native read retired and released its memory");
                 assert!(backend.driver.stats().submitted > submitted, "short read must reach the native driver");
                 assert_eq!(memory.snapshot().used, 0, "errors free native and assembled storage");
                 std::fs::write(dir.path().join("bucket/part.1"), &content).expect("restore fixture");
