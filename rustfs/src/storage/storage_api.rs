@@ -141,7 +141,7 @@ pub(crate) use super::ecfs_extend::{
     parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
     process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
-    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key, wrap_response_with_cors,
+    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -170,9 +170,8 @@ pub(crate) mod access_consumer {
         authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
         delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
-        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
+        req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};

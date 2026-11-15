@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Head authorization tests for the legacy request and owned envelope.
+//! Read authorization tests for the legacy request and owned envelope.
 
 use super::authorize_head_object;
 use crate::app::RequestEnvelope;
@@ -88,5 +88,81 @@ fn head_replication_marker_requires_its_own_permission() {
                 assert_eq!(envelope.req_info().unwrap().replication_request_authorized, header.is_some() && permitted);
             }
         }
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn get_authorization_binds_version_and_explicit_denial() {
+    crate::app::gating_test_env::run_large_stack_test("get-owned-authorization", || async {
+        let context = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = context.object_store();
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let mut failures = Vec::new();
+        for (actions, explicit_deny, current_allowed, version_allowed) in [
+            (&["s3:PutObject"][..], false, false, false),
+            (&["s3:GetObject"][..], false, true, false),
+            (&["s3:GetObjectVersion"][..], false, true, true),
+            (&["s3:GetObject", "s3:GetObjectVersion"][..], true, false, false),
+        ] {
+            let bucket = format!("get-auth-{}", uuid::Uuid::new_v4().simple());
+            store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+            let resource = format!("arn:aws:s3:::{bucket}/key");
+            let mut statements =
+                vec![serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":actions,"Resource":resource})];
+            if explicit_deny {
+                statements
+                    .push(serde_json::json!({"Effect":"Deny","Principal":{"AWS":"*"},"Action":actions,"Resource":resource}));
+            }
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                )
+                .await
+                .unwrap();
+            for (version, key) in [None, Some("null"), Some("selected-version")]
+                .into_iter()
+                .flat_map(|version| ["key", "other"].map(|key| (version, key)))
+            {
+                let mut request = S3Request {
+                    input: (),
+                    method: Method::GET,
+                    uri: Uri::from_static("/bucket/key"),
+                    headers: HeaderMap::new(),
+                    extensions: Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                request.extensions.insert(ReqInfo::default());
+                request.extensions.insert(Arc::clone(&slot));
+                let mut envelope = RequestEnvelope::from_s3s(&request);
+                let legacy = super::authorize_get_object(&slot, &mut request, &bucket, key, version).await;
+                let native = super::authorize_get_object(&slot, &mut envelope, &bucket, key, version).await;
+                let allowed = key == "key" && if version.is_some() { version_allowed } else { current_allowed };
+                for (edge, result) in [("legacy", legacy), ("native", native)] {
+                    let label = format!("actions={actions:?} deny={explicit_deny} version={version:?} key={key} edge={edge}");
+                    let expected = if allowed { None } else { Some(&S3ErrorCode::AccessDenied) };
+                    if result.as_ref().err().map(|error| error.code()) != expected {
+                        failures.push(format!("{label}: expected {expected:?}, got {result:?}"));
+                    }
+                }
+                for (edge, info) in [
+                    ("legacy", request.extensions.get::<ReqInfo>().unwrap()),
+                    ("native", envelope.req_info().unwrap()),
+                ] {
+                    let actual = (info.bucket.as_deref(), info.object.as_deref(), info.version_id.as_deref());
+                    let expected = (Some(bucket.as_str()), Some(key), version);
+                    if actual != expected {
+                        failures.push(format!("{edge}: expected resource {expected:?}, got {actual:?}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     });
 }

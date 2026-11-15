@@ -12,14 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HeadObject wire checks and refusal-matrix row for migration batch C (rustfs/backlog#2767).
+//! Object read wire checks and refusal-matrix rows for migration batch C (rustfs/backlog#2767).
 
-pub(crate) const MATRIX: &[super::MatrixRow] = &[super::MatrixRow {
-    operation: "HeadObject",
-    metric: rustfs_s3_ops::S3Operation::HeadObject,
-    has_error_body: false,
-    call: head_object,
-}];
+pub(crate) const MATRIX: &[super::MatrixRow] = &[
+    super::MatrixRow {
+        operation: "HeadObject",
+        metric: rustfs_s3_ops::S3Operation::HeadObject,
+        has_error_body: false,
+        call: head_object,
+    },
+    super::MatrixRow {
+        operation: "GetObject",
+        metric: rustfs_s3_ops::S3Operation::GetObject,
+        has_error_body: true,
+        call: get_object,
+    },
+];
+
+fn get_object<'a>(client: &'a aws_sdk_s3::Client, _bucket: &'a str) -> futures::future::BoxFuture<'a, super::Outcome> {
+    Box::pin(async move {
+        super::put_object_in_the_store(MATRIX_BUCKET, "get-matrix").await;
+        super::outcome(client.get_object().bucket(MATRIX_BUCKET).key("get-matrix").send().await)
+    })
+}
 
 pub(super) const MATRIX_BUCKET: &str = "object-read-matrix";
 

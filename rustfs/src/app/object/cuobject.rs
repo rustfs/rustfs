@@ -1417,21 +1417,6 @@ impl StagingSinkHandle {
     }
 }
 
-/// Request-extension slot carrying the sink handle from request setup to the
-/// body build; taken exactly once.
-#[derive(Clone)]
-pub(crate) struct RdmaSinkSlot(Arc<std::sync::Mutex<Option<StagingSinkHandle>>>);
-
-impl RdmaSinkSlot {
-    pub(crate) fn new(handle: StagingSinkHandle) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(handle))))
-    }
-
-    pub(crate) fn take(&self) -> Option<StagingSinkHandle> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
-    }
-}
-
 /// Completes a GET whose body went through the sink: drains the reader (which
 /// only yields the producer's completion), then flushes the sink and reports
 /// the bytes moved. A producer error aborts the sink first.
