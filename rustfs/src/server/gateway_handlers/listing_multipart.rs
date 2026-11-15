@@ -24,13 +24,14 @@ use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::dto_values;
 use crate::app::multipart_usecase::{
-    CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsInfo, ListPartsTarget,
+    AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsInfo,
+    ListPartsTarget, reject_abort_capabilities,
 };
 use crate::app::storage_api::storage_class::effective_class;
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::storage_api::server::http::access::access_owned::listing_multipart::{
-    CreateMultipartAuthorization, authorize_bucket_listing, authorize_create_multipart_upload, authorize_list_multipart_uploads,
-    authorize_list_objects_v2, authorize_list_parts,
+    CreateMultipartAuthorization, authorize_abort_multipart_upload, authorize_bucket_listing, authorize_create_multipart_upload,
+    authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_policy::policy::action::S3Action;
@@ -45,6 +46,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListMultipartUploads>(),
     row::<dto::ListParts>(),
     row::<dto::CreateMultipartUpload>(),
+    row::<dto::AbortMultipartUpload>(),
 ];
 
 impl Served for dto::ListObjectsV2 {
@@ -242,6 +244,29 @@ impl Served for dto::CreateMultipartUpload {
             checksum_type: output.checksum_type.map(dto::ChecksumType::custom),
             ..Default::default()
         }))
+    }
+}
+
+impl Served for dto::AbortMultipartUpload {
+    const METRIC: S3Operation = S3Operation::AbortMultipartUpload;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let server = server_context(envelope)?;
+        let input = request.input();
+        authorize_abort_multipart_upload(&server, envelope, input.bucket.as_str(), input.key.as_str()).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let target = reject_abort_capabilities(&envelope).map(|()| AbortMultipartUploadTarget::Gateway {
+            bucket: input.bucket,
+            key: input.key,
+            upload_id: input.upload_id,
+        });
+        DefaultMultipartUsecase::with_context(context)
+            .execute_abort_multipart_upload(envelope, target)
+            .await?;
+        Ok(Resp::new(dto::AbortMultipartUploadOutput::default()))
     }
 }
 

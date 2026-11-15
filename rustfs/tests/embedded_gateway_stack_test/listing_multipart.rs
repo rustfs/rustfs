@@ -25,10 +25,17 @@ use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{MultipartOperations as _, ObjectIO as _};
 
+mod abort;
 mod create;
 mod parts;
 
 pub(crate) const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        operation: "AbortMultipartUpload",
+        metric: S3Operation::AbortMultipartUpload,
+        has_error_body: true,
+        call: abort::matrix_abort,
+    },
     MatrixRow {
         operation: "CreateMultipartUpload",
         metric: S3Operation::CreateMultipartUpload,
