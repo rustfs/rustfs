@@ -92,7 +92,6 @@ use rustfs_gateway_types::persistence::{
     PersistedVersioningConfiguration,
 };
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
-use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},

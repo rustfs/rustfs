@@ -944,6 +944,7 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod metadata {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
         pub(crate) use crate::storage::storage_api::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
         };
@@ -1723,7 +1724,7 @@ pub(crate) mod s3_api {
 
     pub(crate) mod tagging {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::tagging::{
-            parse_copy_object_tags, resolve_copy_object_tags, validate_bucket_tag_set,
+            parse_copy_object_tags, resolve_copy_object_tags,
         };
     }
 }

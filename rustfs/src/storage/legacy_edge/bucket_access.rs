@@ -21,7 +21,6 @@
 
 use crate::app::RequestEnvelope;
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::persisted_from_s3s;
 use crate::storage::s3_api::{self, NotificationDestination};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
@@ -143,8 +142,11 @@ impl FS {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketPolicy, |req| usecase.execute_put_bucket_policy(req)).await
+        record_s3_op(S3Operation::PutBucketPolicy);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_policy(RequestEnvelope::from_s3s(&req), &req.input.bucket, &req.input.policy)
+            .await?;
+        Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
 
     #[instrument(name = "put_bucket_versioning", level = "debug", skip(self, req))]

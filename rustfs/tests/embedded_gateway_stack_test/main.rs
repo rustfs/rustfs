@@ -400,6 +400,8 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                     | S3Operation::PutBucketRequestPayment
                     | S3Operation::PutBucketWebsite
                     | S3Operation::DeleteBucketWebsite
+                    | S3Operation::PutBucketEncryption
+                    | S3Operation::PutBucketTagging
                     | S3Operation::DeleteBucketEncryption
                     | S3Operation::DeleteBucketTagging
             ) {

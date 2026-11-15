@@ -76,12 +76,39 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: put_empty_bucket_notification,
     },
     MatrixRow {
+        operation: "PutBucketPolicy",
+        metric: S3Operation::PutBucketPolicy,
+        has_error_body: true,
+        call: put_bucket_policy,
+    },
+    MatrixRow {
         operation: "DeleteBucketPolicy",
         metric: S3Operation::DeleteBucketPolicy,
         has_error_body: true,
         call: delete_bucket_policy,
     },
 ];
+
+fn put_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use md5::{Digest as _, Md5};
+
+    Box::pin(async move {
+        let status = super::bucket_configs::StatusCapture::default();
+        let content_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(INERT_POLICY.as_bytes()));
+        outcome(
+            client
+                .put_bucket_policy()
+                .bucket(bucket)
+                .policy(INERT_POLICY)
+                .content_md5(content_md5)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(204))),
+        )
+    })
+}
 
 pub(super) fn delete_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move {

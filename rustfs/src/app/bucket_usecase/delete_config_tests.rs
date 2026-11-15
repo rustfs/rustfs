@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bucket configuration delete tests over the shared use case and durable metadata.
+//! Bucket configuration mutation tests over the shared use case and durable metadata.
 
 use super::*;
 use crate::app::bucket_usecase::test_support::build_request;
@@ -76,6 +76,20 @@ impl Config {
         }
     }
 
+    async fn put(self, usecase: &DefaultBucketUsecase, envelope: RequestEnvelope, bucket: &str) -> S3Result<()> {
+        match self {
+            Self::Encryption => {
+                let config = rustfs_gateway_types::persistence::parse_bucket_encryption(ENCRYPTION_WRITE).unwrap();
+                usecase.execute_put_bucket_encryption(envelope, bucket, Ok(config)).await
+            }
+            Self::Policy => usecase.execute_put_bucket_policy(envelope, bucket, POLICY_WRITE).await,
+            Self::Tagging => {
+                let tags = rustfs_gateway_types::cors_tagging::parse_tagging(TAGGING_WRITE).unwrap();
+                usecase.execute_put_bucket_tagging(envelope, bucket, tags).await
+            }
+        }
+    }
+
     async fn execute(self, usecase: &DefaultBucketUsecase, envelope: RequestEnvelope, bucket: &str) -> S3Result<()> {
         match self {
             Self::Encryption => usecase.execute_delete_bucket_encryption(envelope, bucket).await,
@@ -85,9 +99,13 @@ impl Config {
     }
 }
 
-async fn check_delete(config: Config, stale: bool) {
-    let (subresource, action, operation, reload, replicated, audit_status) = match config {
-        Config::Encryption => (
+const ENCRYPTION_WRITE: &[u8] = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>fixture-key</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+const POLICY_WRITE: &str = "{ \"Version\": \"2012-10-17\", \"Statement\": [] }  ";
+const TAGGING_WRITE: &[u8] = b"<Tagging><TagSet><Tag><Key>team</Key><Value>gateway</Value></Tag></TagSet></Tagging>";
+
+async fn check_mutation(config: Config, stale: bool, write: bool) {
+    let (subresource, action, operation, reload, replicated, audit_status) = match (config, write) {
+        (Config::Encryption, false) => (
             "encryption",
             S3Action::PutBucketEncryptionAction,
             S3Operation::DeleteBucketEncryption,
@@ -95,7 +113,7 @@ async fn check_delete(config: Config, stale: bool) {
             "sse-config",
             204,
         ),
-        Config::Policy => (
+        (Config::Policy, false) => (
             "policy",
             S3Action::DeleteBucketPolicyAction,
             S3Operation::DeleteBucketPolicy,
@@ -103,7 +121,7 @@ async fn check_delete(config: Config, stale: bool) {
             "policy",
             200,
         ),
-        Config::Tagging => (
+        (Config::Tagging, false) => (
             "tagging",
             S3Action::PutBucketTaggingAction,
             S3Operation::DeleteBucketTagging,
@@ -111,17 +129,41 @@ async fn check_delete(config: Config, stale: bool) {
             "tags",
             200,
         ),
+        (Config::Encryption, true) => (
+            "encryption",
+            S3Action::PutBucketEncryptionAction,
+            S3Operation::PutBucketEncryption,
+            "put bucket encryption",
+            "sse-config",
+            200,
+        ),
+        (Config::Policy, true) => (
+            "policy",
+            S3Action::PutBucketPolicyAction,
+            S3Operation::PutBucketPolicy,
+            "put bucket policy",
+            "policy",
+            200,
+        ),
+        (Config::Tagging, true) => (
+            "tagging",
+            S3Action::PutBucketTaggingAction,
+            S3Operation::PutBucketTagging,
+            "put bucket tagging",
+            "tags",
+            200,
+        ),
     };
     let context = shared_gating_ambient().await;
     let store = context.object_store();
-    let bucket = format!("config-delete-{}", uuid::Uuid::new_v4().simple());
+    let bucket = format!("config-mutation-{}", uuid::Uuid::new_v4().simple());
     store
         .make_bucket(&bucket, &MakeBucketOptions::default())
         .await
         .expect("create bucket");
     let server = ServerContextSlot::new();
     assert!(server.install(Arc::clone(&context)));
-    let mut request = build_request((), Method::DELETE);
+    let mut request = build_request((), if write { Method::PUT } else { Method::DELETE });
     request.uri = format!("/{bucket}?{subresource}").parse().expect("request URI");
     request.extensions.insert(Arc::clone(&server));
     request.extensions.insert(ReqInfo {
@@ -177,7 +219,13 @@ async fn check_delete(config: Config, stale: bool) {
                                 .push((completed, label, maintenance, replication_calls));
                         }),
                     ),
-                    config.execute(&usecase, envelope, &bucket),
+                    async {
+                        if write {
+                            config.put(&usecase, envelope, &bucket).await
+                        } else {
+                            config.execute(&usecase, envelope, &bucket).await
+                        }
+                    },
                 )
                 .await;
             (result, BUCKET_META_HOOK_CALLS.with(RefCell::take))
@@ -214,8 +262,24 @@ async fn check_delete(config: Config, stale: bool) {
             "{operation:?} must refuse the stale authorization and preserve replacement bytes"
         );
     } else {
-        result.expect("authorized delete");
-        assert!(stored.is_empty(), "{operation:?} must remove the durable configuration");
+        result.expect("authorized mutation");
+        if write {
+            match config {
+                Config::Encryption => {
+                    let actual = rustfs_gateway_types::persistence::parse_bucket_encryption(&stored).unwrap();
+                    let expected = rustfs_gateway_types::persistence::parse_bucket_encryption(ENCRYPTION_WRITE).unwrap();
+                    assert_eq!(actual, expected);
+                }
+                Config::Policy => assert_eq!(stored, POLICY_WRITE.as_bytes()),
+                Config::Tagging => {
+                    let actual = rustfs_gateway_types::cors_tagging::parse_tagging(&stored).unwrap();
+                    let expected = rustfs_gateway_types::cors_tagging::parse_tagging(TAGGING_WRITE).unwrap();
+                    assert_eq!(actual, expected);
+                }
+            }
+        } else {
+            assert!(stored.is_empty(), "{operation:?} must remove the durable configuration");
+        }
         assert_eq!(*reloads, [(false, reload, false, 0), (true, reload, false, 0)]);
         let [hook] = hooks.as_slice() else { panic!("{operation:?}: expected one replication call") };
         assert_eq!((&hook.bucket, hook.item_type.as_str()), (&bucket, replicated));
@@ -235,8 +299,8 @@ async fn check_delete(config: Config, stale: bool) {
 #[serial]
 fn encryption_delete_fences_recreated_bucket_and_orders_callbacks() {
     run_large_stack_test("delete-encryption", || async {
-        check_delete(Config::Encryption, false).await;
-        check_delete(Config::Encryption, true).await;
+        check_mutation(Config::Encryption, false, false).await;
+        check_mutation(Config::Encryption, true, false).await;
     });
 }
 
@@ -244,8 +308,8 @@ fn encryption_delete_fences_recreated_bucket_and_orders_callbacks() {
 #[serial]
 fn policy_delete_fences_recreated_bucket_and_orders_callbacks() {
     run_large_stack_test("delete-policy", || async {
-        check_delete(Config::Policy, false).await;
-        check_delete(Config::Policy, true).await;
+        check_mutation(Config::Policy, false, false).await;
+        check_mutation(Config::Policy, true, false).await;
     });
 }
 
@@ -253,7 +317,34 @@ fn policy_delete_fences_recreated_bucket_and_orders_callbacks() {
 #[serial]
 fn tagging_delete_fences_recreated_bucket_and_orders_callbacks() {
     run_large_stack_test("delete-tagging", || async {
-        check_delete(Config::Tagging, false).await;
-        check_delete(Config::Tagging, true).await;
+        check_mutation(Config::Tagging, false, false).await;
+        check_mutation(Config::Tagging, true, false).await;
+    });
+}
+
+#[test]
+#[serial]
+fn encryption_put_fences_recreated_bucket_and_orders_callbacks() {
+    run_large_stack_test("put-encryption", || async {
+        check_mutation(Config::Encryption, false, true).await;
+        check_mutation(Config::Encryption, true, true).await;
+    });
+}
+
+#[test]
+#[serial]
+fn policy_put_fences_recreated_bucket_and_orders_callbacks() {
+    run_large_stack_test("put-policy", || async {
+        check_mutation(Config::Policy, false, true).await;
+        check_mutation(Config::Policy, true, true).await;
+    });
+}
+
+#[test]
+#[serial]
+fn tagging_put_fences_recreated_bucket_and_orders_callbacks() {
+    run_large_stack_test("put-tagging", || async {
+        check_mutation(Config::Tagging, false, true).await;
+        check_mutation(Config::Tagging, true, true).await;
     });
 }

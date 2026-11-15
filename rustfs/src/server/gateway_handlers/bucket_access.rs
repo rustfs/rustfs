@@ -33,6 +33,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketVersioning>(),
     row::<dto::PutBucketVersioning>(),
     row::<dto::GetBucketPolicy>(),
+    row::<dto::PutBucketPolicy>(),
     row::<dto::DeleteBucketPolicy>(),
     row::<dto::GetBucketPolicyStatus>(),
     row::<dto::GetBucketAcl>(),
@@ -89,6 +90,23 @@ impl Served for dto::DeleteBucketPolicy {
             .execute_delete_bucket_policy(envelope, request.input().bucket.as_str())
             .await?;
         Ok(Resp::new(dto::DeleteBucketPolicyOutput::default()))
+    }
+}
+
+impl Served for dto::PutBucketPolicy {
+    const METRIC: S3Operation = S3Operation::PutBucketPolicy;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPolicyAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_policy(envelope, input.bucket.as_str(), &input.policy)
+            .await?;
+        Ok(Resp::new(dto::PutBucketPolicyOutput::default()))
     }
 }
 

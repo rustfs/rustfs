@@ -93,6 +93,18 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: delete_bucket_cors,
     },
     MatrixRow {
+        operation: "PutBucketEncryption",
+        metric: S3Operation::PutBucketEncryption,
+        has_error_body: true,
+        call: put_bucket_encryption,
+    },
+    MatrixRow {
+        operation: "PutBucketTagging",
+        metric: S3Operation::PutBucketTagging,
+        has_error_body: true,
+        call: put_bucket_tagging,
+    },
+    MatrixRow {
         operation: "DeleteBucketEncryption",
         metric: S3Operation::DeleteBucketEncryption,
         has_error_body: true,
@@ -105,6 +117,60 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: delete_bucket_tagging,
     },
 ];
+
+fn put_bucket_encryption<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use aws_sdk_s3::types::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
+
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        let rule = ServerSideEncryptionRule::builder()
+            .apply_server_side_encryption_by_default(
+                ServerSideEncryptionByDefault::builder()
+                    .sse_algorithm(ServerSideEncryption::Aes256)
+                    .build()
+                    .expect("encryption algorithm"),
+            )
+            .build();
+        let config = ServerSideEncryptionConfiguration::builder()
+            .rules(rule)
+            .build()
+            .expect("encryption rule");
+        outcome(
+            client
+                .put_bucket_encryption()
+                .bucket(ENCRYPTION_MATRIX_BUCKET)
+                .server_side_encryption_configuration(config)
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(200))),
+        )
+    })
+}
+
+fn put_bucket_tagging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use aws_sdk_s3::types::{Tag, Tagging};
+
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        let tag = Tag::builder().key("team").value("gateway").build().expect("tag");
+        let tagging = Tagging::builder().tag_set(tag).build().expect("tag set");
+        outcome(
+            client
+                .put_bucket_tagging()
+                .bucket(bucket)
+                .tagging(tagging)
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(200))),
+        )
+    })
+}
 
 fn delete_bucket_encryption<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move {
