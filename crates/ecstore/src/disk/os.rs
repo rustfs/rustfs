@@ -177,6 +177,30 @@ pub(crate) mod fsync_dir_recorder {
         contains_path(&RECORDED.lock().expect("fsync dir recorder poisoned"), dir)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn count_at(dir: &Path) -> usize {
+        let canonical = dir.canonicalize().expect("sync count directory must exist");
+        RECORDED
+            .lock()
+            .expect("fsync dir recorder poisoned")
+            .iter()
+            .filter(|recorded| **recorded == canonical)
+            .count()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn count_under(dir: &Path) -> usize {
+        // Each invocation records its canonical path once, including when the
+        // syscall used a procfs mount-lease alias or a symlinked temporary root.
+        let canonical = dir.canonicalize().expect("sync count root must exist");
+        RECORDED
+            .lock()
+            .expect("fsync dir recorder poisoned")
+            .iter()
+            .filter(|recorded| recorded.starts_with(&canonical))
+            .count()
+    }
+
     pub(crate) fn set_failure(dir: &Path, kind: io::ErrorKind) {
         super::dir_fsync_failures::set(dir, kind);
     }
@@ -4765,6 +4789,14 @@ pub(crate) mod multipart_source_syscall_failures {
     }
 }
 
+#[cfg(all(test, unix))]
+static PREPARED_METADATA_SYNCS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_prepared_metadata_sync_count(destination: &Path) -> usize {
+    PREPARED_METADATA_SYNCS.lock().remove(destination).unwrap_or(0)
+}
+
 pub(crate) struct PreparedRenameSource {
     path: PathBuf,
     #[cfg(test)]
@@ -4798,6 +4830,13 @@ impl PreparedRenameSource {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         #[cfg(test)]
         multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
+        #[cfg(all(test, unix))]
+        {
+            *PREPARED_METADATA_SYNCS
+                .lock()
+                .entry(self.test_destination.clone())
+                .or_default() += 1;
+        }
         let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
         #[cfg(windows)]
         self.source.as_file().sync_data()?;

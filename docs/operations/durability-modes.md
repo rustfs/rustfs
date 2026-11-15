@@ -92,6 +92,28 @@ power simultaneously, `relaxed` can lose recently acknowledged objects
 cluster-wide. Single-node
 deployments must stay on `strict`.
 
+## Small-object I/O profile
+
+Small-object cost scales with object count, key depth, and the selected durability mode. Each inline object retains its own object directory and `xl.meta`, which contains both metadata and inline payload. Non-inline objects also have a data directory and shard files. Compression can reduce stored bytes while retaining this per-object namespace. The default single-drive inline admission budget is 128 KiB per shard. Versioned writes use a smaller budget. Explicit storage-class configuration, stream transformations, the single-erasure-block bound, and the erasure layout affect admission. See `StorageClassConfig::should_inline` in `crates/ecstore/src/config/storageclass.rs` and its PUT caller in `crates/ecstore/src/set_disk/ops/object.rs`.
+
+The following application-level synchronization budget covers a successful ordinary Linux inline commit to a fresh key in an existing bucket. It assumes directory group commit is disabled and excludes multipart, healing, system metadata, retries, and background work. Let `d` be the number of prefix components before the final key component, so `object` has `d = 0` and `a/b/object` has `d = 2`.
+
+| Write shape | Metadata file synchronization | Directory synchronization |
+| --- | --- | --- |
+| Fresh inline key, `strict` | One metadata `sync_data`, including inline payload | One object-directory sync plus one per ancestor through the bucket, totaling `d + 2` |
+| Fresh inline key, `file-sync` | One metadata `sync_data`, including inline payload | Zero ordinary commit-directory syncs |
+| Fresh inline key, `relaxed` or `none` | Zero | Zero ordinary commit-directory syncs |
+
+Linux stages ordinary inline metadata in a flat temporary file and publishes it by rename. The temporary name is removed by publication, so synchronizing that temporary directory entry would add work without protecting the acknowledged object. Strict mode synchronizes the final object directory and its ancestors. Even an existing shared prefix can have been created by another writer whose directory synchronization is still pending. Keeping the ancestor barriers protects that concurrent creation case. `rename_data_fresh_inline_sync_budget` tests exercise the real disk commit and pin the directory-call budget for flat and nested keys.
+
+Overwrites and versioned writes can retain predecessor metadata for rollback and add backup, recovery, and cleanup work. Non-inline writes also synchronize shard contents under `strict`, `file-sync`, and `relaxed`. Their budgets depend on object shape and recovery state. A normal inline GET reads `xl.meta`. Non-inline GET also reads the required shard data and verifies integrity. Delete work depends on versioning, delete markers, retained versions, recovery state, and deferred trash cleanup. LIST, scanner, and heal perform additional directory and metadata reads, and repairs can perform writes. Measure each workload separately.
+
+Application synchronization counts and device IOPS measure different layers. Filesystem journals, page-cache hits, writeback, request merging, and device behavior determine the physical operations and latency. For a reproducible profile, record the exact server revision, effective bucket durability mode, storage-class configuration, object-size distribution, key depth, versioning, concurrency, filesystem, and physical device mapping. Use an isolated test bucket with separate fresh-key PUT, overwrite, GET, and DELETE phases. Collect a background-only interval as well as each foreground interval, keeping scanner and heal state explicit. Pair application syscall traces with device telemetry over the same interval, then normalize counts by completed requests.
+
+On Linux, an instrumented run can use `strace -f -c -p <pid> -e trace=openat,openat2,close,newfstatat,fstat,statx,getdents64,mkdir,mkdirat,rmdir,rename,renameat,renameat2,unlink,unlinkat,read,pread64,write,pwrite64,fsync,fdatasync` together with `iostat -x 1`. Tracing adds overhead and includes other server activity, so retain an untraced run for latency and throughput comparison. The [scanner benchmark runbook](scanner-benchmark-runbook.md) covers background-pressure measurement.
+
+Server-side packing of multiple S3 keys into shared containers requires a persistent index, atomic publication, per-key version/delete semantics, garbage collection, and heal/recovery support. These requirements also apply when compacting historical objects. Current inline storage keeps each object's directory and metadata entry independently addressable.
+
 ## Recovery from corrupt object metadata
 
 A zero-length or unreadable `xl.meta` is corruption, not an absent object.

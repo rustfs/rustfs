@@ -22853,6 +22853,144 @@ mod test {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_data_fresh_inline_sync_budget() {
+        const CHILD: &str = "RUSTFS_TEST_INLINE_SYNC_BUDGET_CHILD";
+        const TEST: &str = "disk::local::test::rename_data_fresh_inline_sync_budget";
+
+        // Process-wide hooks can select a different commit implementation.
+        // Grouping selects the fallback path even for a fresh Linux object.
+        if std::env::var_os(CHILD).is_none() {
+            for grouping in ["false", "true"] {
+                let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, grouping)
+                    .env("RUSTFS_DURABILITY_MODE", "strict")
+                    .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", grouping)
+                    .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                    .output()
+                    .expect("inline sync budget subprocess");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "grouping={grouping}: {stdout}{stderr}");
+                assert!(stdout.contains("INLINE_SYNC_BUDGET_OK"), "budget test must execute every case: {stdout}");
+            }
+            return;
+        }
+
+        let force_fallback = std::env::var(CHILD).expect("child mode") == "true";
+        assert_eq!(os::dst_dir_fsync_group_commit_enabled(), force_fallback);
+        assert!(!os::file_fdatasync_group_commit_enabled());
+        for mode in [DurabilityMode::Strict, DurabilityMode::FileSync] {
+            for object in ["object", "prefix/nested/object"] {
+                let dir = tempfile::tempdir().expect("disk directory");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                let bucket = "inline-sync-budget";
+                ensure_test_volume(&disk, bucket).await;
+                ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+                bucket_durability::set(bucket, Some(mode));
+
+                let bucket_dir = disk.io_root().join(bucket);
+                let tmp_dir = disk.io_root().join(RUSTFS_META_TMP_BUCKET);
+                let object_dir = bucket_dir.join(object);
+                let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+                let bucket_syncs = os::fsync_dir_recorder::count_under(&bucket_dir);
+                let tmp_syncs = os::fsync_dir_recorder::count_under(&tmp_dir);
+                let payload = Bytes::from_static(b"inline payload");
+                let mut info = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(payload.clone()));
+                info.set_inline_data();
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "fresh-inline-stage", info, bucket, object)
+                    .await
+                    .expect("fresh inline commit");
+
+                assert_eq!(
+                    os::take_prepared_metadata_sync_count(&metadata_path),
+                    1,
+                    "{mode:?}, fallback={force_fallback}: metadata must be synchronized once"
+                );
+                let expected_directory_syncs = if mode == DurabilityMode::Strict {
+                    object.split('/').count() + 1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs,
+                    expected_directory_syncs,
+                    "{mode:?}, {object}, fallback={force_fallback}: fresh commit directory budget"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_under(&tmp_dir),
+                    tmp_syncs,
+                    "staging directories need no sync"
+                );
+                assert_eq!(
+                    std::fs::read_dir(&object_dir).expect("committed object entries").count(),
+                    1,
+                    "a fresh inline object must contain only xl.meta"
+                );
+                assert!(
+                    !tmp_dir.join("fresh-inline-stage").exists(),
+                    "staging directory must be absent after commit"
+                );
+
+                let ordinary_syncs = os::fsync_dir_recorder::count_at(&object_dir);
+                let bucket_syncs = os::fsync_dir_recorder::count_under(&bucket_dir);
+                let replacement_payload = Bytes::from_static(b"replacement inline payload");
+                let mut replacement =
+                    test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(replacement_payload.clone()));
+                replacement.set_inline_data();
+                let response = disk
+                    .rename_data(RUSTFS_META_TMP_BUCKET, "overwrite-inline-stage", replacement, bucket, object)
+                    .await
+                    .expect("inline overwrite");
+                let rollback_dir = object_dir.join(response.rollback_data_dir.expect("overwrite rollback owner").to_string());
+                assert_eq!(
+                    os::take_prepared_metadata_sync_count(&metadata_path),
+                    1,
+                    "overwrite metadata must be synchronized once"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_at(&rollback_dir),
+                    1,
+                    "rollback directory must stay synchronized"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_at(&object_dir) - ordinary_syncs,
+                    1,
+                    "{mode:?}, fallback={force_fallback}: the rollback directory entry must stay durable"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs,
+                    2,
+                    "overwrite synchronizes the rollback directory and its entry in the object directory"
+                );
+                assert_eq!(
+                    os::fsync_dir_recorder::count_under(&tmp_dir),
+                    tmp_syncs,
+                    "overwrite staging directories need no sync"
+                );
+                let stored = disk
+                    .read_version(
+                        "",
+                        bucket,
+                        object,
+                        "",
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read committed inline object");
+                assert_eq!(stored.data, Some(replacement_payload), "overwrite must publish the replacement payload");
+                bucket_durability::set(bucket, None);
+            }
+        }
+        println!("INLINE_SYNC_BUDGET_OK");
+    }
+
     #[tokio::test]
     async fn test_rename_data_new_object_fsyncs_new_ancestor_dirs() {
         // A first PUT under a new prefix must fsync every newly created ancestor
@@ -26299,7 +26437,12 @@ mod test {
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn inline_heal_staged_backup_restores_metadata_after_commit_failure() {
         let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
-        for mode in [DurabilityMode::None, DurabilityMode::Relaxed, DurabilityMode::Strict] {
+        for mode in [
+            DurabilityMode::None,
+            DurabilityMode::Relaxed,
+            DurabilityMode::FileSync,
+            DurabilityMode::Strict,
+        ] {
             let _mode = durability_mode_override::set(mode);
             for version in [Uuid::nil(), Uuid::new_v4()] {
                 for old_inline in [true, false] {
