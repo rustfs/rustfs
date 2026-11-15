@@ -19,6 +19,7 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
+use crate::app::RequestEnvelope;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
@@ -70,11 +71,11 @@ impl FS {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeletePublicAccessBlock, |req| {
-            usecase.execute_delete_public_access_block(req)
-        })
-        .await
+        record_s3_op(S3Operation::DeletePublicAccessBlock);
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_public_access_block(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(name = "get_bucket_cors", level = "debug", skip(self, req))]
@@ -123,7 +124,7 @@ impl FS {
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
         record_s3_op(S3Operation::GetPublicAccessBlock);
         let usecase = s3_api::bucket_usecase_for(self);
-        let config = usecase.execute_get_public_access_block(req).await?;
+        let config = usecase.execute_get_public_access_block(&req.input.bucket).await?;
         Ok(S3Response::new(GetPublicAccessBlockOutput {
             public_access_block_configuration: Some(persisted_to_s3s(&config)?),
         }))
@@ -159,12 +160,12 @@ impl FS {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
-        let prepared = persisted_from_s3s(&req.input.public_access_block_configuration);
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutPublicAccessBlock, |req| {
-            usecase.execute_put_public_access_block(req, prepared)
-        })
-        .await
+        record_s3_op(S3Operation::PutPublicAccessBlock);
+        let prepared = persisted_from_s3s(&req.input.public_access_block_configuration).map_err(Into::into);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_public_access_block(RequestEnvelope::from_s3s(&req), &req.input.bucket, prepared)
+            .await?;
+        Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
 
     #[instrument(name = "put_bucket_tagging", level = "debug", skip(self, req))]

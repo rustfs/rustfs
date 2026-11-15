@@ -3846,10 +3846,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_public_access_block(&self, req: &mut S3Request<GetPublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPublicAccessBlockAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPublicAccessBlockAction)).await
     }
 
     /// Checks whether the HeadBucket request has accesses to the resources.

@@ -24,9 +24,9 @@ use aws_sdk_s3::config::interceptors::{
     BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef,
 };
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
-use aws_sdk_s3::error::BoxError;
+use aws_sdk_s3::error::{BoxError, ProvideErrorMetadata};
 use aws_sdk_s3::operation::put_bucket_cors::builders::PutBucketCorsFluentBuilder;
-use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ServerSideEncryption};
+use aws_sdk_s3::types::{CorsConfiguration, CorsRule, PublicAccessBlockConfiguration, ServerSideEncryption};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -62,6 +62,24 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         ..GET_ENCRYPTION
     },
     GET_TAGGING,
+    MatrixRow {
+        operation: "PutPublicAccessBlock",
+        metric: S3Operation::PutPublicAccessBlock,
+        has_error_body: true,
+        call: put_public_access_block,
+    },
+    MatrixRow {
+        operation: "GetPublicAccessBlock",
+        metric: S3Operation::GetPublicAccessBlock,
+        has_error_body: true,
+        call: get_public_access_block,
+    },
+    MatrixRow {
+        operation: "DeletePublicAccessBlock",
+        metric: S3Operation::DeletePublicAccessBlock,
+        has_error_body: true,
+        call: delete_public_access_block,
+    },
     MatrixRow {
         operation: "PutBucketCors",
         metric: S3Operation::PutBucketCors,
@@ -471,4 +489,175 @@ fn the_gateway_stack_stores_and_removes_the_cors_document() {
 #[test]
 fn the_legacy_stack_stores_and_removes_the_cors_document() {
     with_stack(LEGACY, the_cors_document_is_stored_and_removed);
+}
+
+const PUBLIC_ACCESS_BLOCK_XML: &str = concat!(
+    "<PublicAccessBlockConfiguration><BlockPublicPolicy>false</BlockPublicPolicy>",
+    "<IgnorePublicAcls>true</IgnorePublicAcls><RestrictPublicBuckets>true</RestrictPublicBuckets>",
+    "</PublicAccessBlockConfiguration>",
+);
+
+fn public_access_block_document() -> PublicAccessBlockConfiguration {
+    PublicAccessBlockConfiguration::builder()
+        .ignore_public_acls(true)
+        .block_public_policy(false)
+        .restrict_public_buckets(true)
+        .build()
+}
+
+fn put_public_access_block<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(
+            client
+                .put_public_access_block()
+                .bucket(bucket)
+                .public_access_block_configuration(public_access_block_document())
+                .send()
+                .await,
+        )
+    })
+}
+
+fn get_public_access_block<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(client.get_public_access_block().bucket(bucket).send().await.map(|output| {
+            assert_eq!(
+                output.public_access_block_configuration(),
+                Some(&public_access_block_document()),
+                "persisted switches, including the omitted field"
+            );
+        }))
+    })
+}
+
+fn delete_public_access_block<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.delete_public_access_block().bucket(bucket).send().await) })
+}
+
+async fn stored_public_access_block(bucket: &str) -> Vec<u8> {
+    metadata_sys::get(bucket)
+        .await
+        .expect("bucket metadata")
+        .public_access_block_config_xml
+        .clone()
+}
+
+async fn public_access_block_configuration(server: RustFSServer, checks_expected_owner: bool) {
+    const GRANTED: &str = "public-access-block-granted";
+    const OTHER: &str = "public-access-block-other";
+    const RESERVED: &str = "public-access-block-s3alias";
+    const MISSING: &str = "public-access-block-missing";
+    const WRITER: &str = "publicaccessblockwriter";
+    const READER: &str = "publicaccessblockreader";
+    const DELETER: &str = "publicaccessblockdeleter";
+
+    for bucket in [GRANTED, OTHER, RESERVED] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketPublicAccessBlock", GRANTED).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetBucketPublicAccessBlock", GRANTED).await;
+    create_user_allowed_on_one_bucket(DELETER, "s3:DeleteBucketPublicAccessBlock", GRANTED).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    let deleter = s3_client(&endpoint, DELETER, USER_SECRET_KEY);
+
+    assert_read_error(put_public_access_block(&writer, OTHER).await, "AccessDenied", 403, "write outside grant");
+    assert!(stored_public_access_block(OTHER).await.is_empty());
+    assert_read_error(get_public_access_block(&reader, OTHER).await, "AccessDenied", 403, "read outside grant");
+    assert_read_error(
+        delete_public_access_block(&deleter, OTHER).await,
+        "AccessDenied",
+        403,
+        "delete outside grant",
+    );
+    assert_read_error(
+        get_public_access_block(&writer, GRANTED).await,
+        "AccessDenied",
+        403,
+        "put grant cannot read",
+    );
+    assert_read_error(
+        put_public_access_block(&reader, GRANTED).await,
+        "AccessDenied",
+        403,
+        "get grant cannot write",
+    );
+    assert_read_error(
+        delete_public_access_block(&writer, GRANTED).await,
+        "AccessDenied",
+        403,
+        "put grant cannot delete",
+    );
+    assert_read_error(get_public_access_block(&root, MISSING).await, "NoSuchBucket", 404, "read missing bucket");
+    assert_read_error(put_public_access_block(&root, MISSING).await, "NoSuchBucket", 404, "write missing bucket");
+    assert_read_error(
+        delete_public_access_block(&root, MISSING).await,
+        "NoSuchBucket",
+        404,
+        "delete missing bucket",
+    );
+
+    assert_eq!(
+        put_public_access_block(&writer, GRANTED).await,
+        Ok(()),
+        "writer on matching action and resource"
+    );
+    assert_eq!(stored_public_access_block(GRANTED).await, PUBLIC_ACCESS_BLOCK_XML.as_bytes());
+    assert_eq!(
+        get_public_access_block(&reader, GRANTED).await,
+        Ok(()),
+        "reader on matching action and resource"
+    );
+
+    let wrong_owner = outcome(
+        root.get_public_access_block()
+            .bucket(GRANTED)
+            .expected_bucket_owner("123456789012")
+            .send()
+            .await,
+    );
+    if checks_expected_owner {
+        assert_read_error(wrong_owner, "AccessDenied", 403, "expected owner mismatch");
+    } else {
+        assert_eq!(wrong_owner, Ok(()), "legacy expected owner header handling");
+    }
+
+    for attempt in ["configured", "unconfigured"] {
+        let status = StatusCapture::default();
+        let deleted = deleter
+            .delete_public_access_block()
+            .bucket(GRANTED)
+            .customize()
+            .interceptor(status.clone())
+            .send()
+            .await;
+        assert_eq!((outcome(deleted), status.take()), (Ok(()), Some(204)), "{attempt}");
+        assert!(stored_public_access_block(GRANTED).await.is_empty(), "{attempt}");
+        let error = reader
+            .get_public_access_block()
+            .bucket(GRANTED)
+            .send()
+            .await
+            .expect_err(attempt);
+        assert_eq!(error.message(), Some("Public access block configuration does not exist"), "{attempt}");
+        assert_read_error(outcome(Err::<(), _>(error)), "NoSuchPublicAccessBlockConfiguration", 500, attempt);
+    }
+
+    assert_eq!(put_public_access_block(&root, RESERVED).await, Ok(()));
+    assert_eq!(get_public_access_block(&root, RESERVED).await, Ok(()));
+    assert_eq!(delete_public_access_block(&root, RESERVED).await, Ok(()));
+    assert!(stored_public_access_block(RESERVED).await.is_empty());
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_serves_public_access_block_configuration() {
+    with_stack(GATEWAY, |server| public_access_block_configuration(server, true));
+}
+
+#[test]
+fn the_legacy_stack_serves_public_access_block_configuration() {
+    with_stack(LEGACY, |server| public_access_block_configuration(server, false));
 }

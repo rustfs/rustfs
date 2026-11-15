@@ -22,7 +22,9 @@ use crate::app::{RequestEnvelope, dto_values};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
-use rustfs_gateway_types::persistence::{parse_bucket_encryption_dto, parse_cors_dto, parse_tagging_dto};
+use rustfs_gateway_types::persistence::{
+    PersistedPublicAccessBlockConfiguration, parse_bucket_encryption_dto, parse_cors_dto, parse_tagging_dto,
+};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -34,6 +36,9 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketTagging>(),
     row::<dto::PutBucketCors>(),
     row::<dto::DeleteBucketCors>(),
+    row::<dto::GetPublicAccessBlock>(),
+    row::<dto::PutPublicAccessBlock>(),
+    row::<dto::DeletePublicAccessBlock>(),
 ];
 
 impl Served for dto::GetBucketCors {
@@ -120,5 +125,68 @@ impl Served for dto::DeleteBucketCors {
             .execute_delete_bucket_cors(envelope, request.into_input())
             .await?;
         Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::GetPublicAccessBlock {
+    const METRIC: S3Operation = S3Operation::GetPublicAccessBlock;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::GetBucketPublicAccessBlockAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let stored = DefaultBucketUsecase::with_context(context)
+            .execute_get_public_access_block(request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::GetPublicAccessBlockOutput {
+            public_access_block_configuration: Some(dto::PublicAccessBlockConfiguration {
+                block_public_acls: stored.block_public_acls,
+                ignore_public_acls: stored.ignore_public_acls,
+                block_public_policy: stored.block_public_policy,
+                restrict_public_buckets: stored.restrict_public_buckets,
+            }),
+        }))
+    }
+}
+
+impl Served for dto::PutPublicAccessBlock {
+    const METRIC: S3Operation = S3Operation::PutPublicAccessBlock;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPublicAccessBlockAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let config = input.public_access_block_configuration;
+        let prepared = PersistedPublicAccessBlockConfiguration {
+            block_public_acls: config.block_public_acls,
+            ignore_public_acls: config.ignore_public_acls,
+            block_public_policy: config.block_public_policy,
+            restrict_public_buckets: config.restrict_public_buckets,
+        };
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_public_access_block(envelope, input.bucket.as_str(), Ok(prepared))
+            .await?;
+        Ok(Resp::new(dto::PutPublicAccessBlockOutput::default()))
+    }
+}
+
+impl Served for dto::DeletePublicAccessBlock {
+    const METRIC: S3Operation = S3Operation::DeletePublicAccessBlock;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::DeleteBucketPublicAccessBlockAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        DefaultBucketUsecase::with_context(context)
+            .execute_delete_public_access_block(envelope, request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::DeletePublicAccessBlockOutput::default()))
     }
 }
