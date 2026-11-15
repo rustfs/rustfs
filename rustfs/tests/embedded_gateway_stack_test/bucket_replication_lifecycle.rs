@@ -56,6 +56,19 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: stored::<0>,
     },
     MatrixRow {
+        operation: "DeleteBucketLifecycle",
+        metric: S3Operation::DeleteBucketLifecycle,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                metadata_sys::update(bucket, BUCKET_LIFECYCLE_CONFIG, LIFECYCLE.to_vec())
+                    .await
+                    .expect("seed lifecycle for deletion");
+                outcome(client.delete_bucket_lifecycle().bucket(bucket).send().await)
+            })
+        },
+    },
+    MatrixRow {
         operation: "GetBucketReplication",
         metric: S3Operation::GetBucketReplication,
         has_error_body: true,
