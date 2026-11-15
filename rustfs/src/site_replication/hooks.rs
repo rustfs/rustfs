@@ -1002,7 +1002,29 @@ pub(crate) async fn commit_site_replication_delete_bucket(intent: &SiteReplicati
     }
 }
 
+#[cfg(test)]
+pub(crate) struct BucketMetaHookCall {
+    pub(crate) bucket: String,
+    pub(crate) item_type: String,
+    pub(crate) scanner_generation: Option<u64>,
+    pub(crate) scanner_maintenance_generation: u64,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static BUCKET_META_HOOK_CALLS: std::cell::RefCell<Vec<BucketMetaHookCall>>;
+}
+
 pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Result<()> {
+    #[cfg(test)]
+    let _ = BUCKET_META_HOOK_CALLS.try_with(|calls| {
+        calls.borrow_mut().push(BucketMetaHookCall {
+            bucket: item.bucket.clone(),
+            item_type: item.r#type.clone(),
+            scanner_generation: rustfs_scanner::scanner_dirty_usage_bucket_generation(&item.bucket),
+            scanner_maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        });
+    });
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };

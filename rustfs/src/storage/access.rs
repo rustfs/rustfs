@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use self::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
+    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
 use self::access_owned::object_misc::authorize_delete_object;
 use super::ObjectOptions;
@@ -742,7 +742,7 @@ pub(crate) fn odm_read_generation<R: AuthorizationRequest + ?Sized>(req: &R, buc
 }
 
 /// The legacy decoder's copy source as owned parts; `None` for an access-point or Outposts ARN.
-fn legacy_copy_source(source: &CopySource) -> Option<(String, String, Option<String>)> {
+pub(crate) fn legacy_copy_source(source: &CopySource) -> Option<(String, String, Option<String>)> {
     match source {
         CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => None,
         CopySource::Bucket { bucket, key, version_id } => {
@@ -1124,6 +1124,7 @@ pub(crate) trait AuthorizationRequest {
     fn requested_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil>;
     fn requested_legal_hold(&self) -> Option<&RequestedObjectLegalHold>;
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags>;
+    fn take_requested_object_tags(&mut self) -> Option<RequestedObjectTags>;
     fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention);
     fn install_requested_retain_until(&mut self, retain_until: Option<RequestedObjectLockRetainUntil>);
     fn install_requested_legal_hold(&mut self, legal_hold: RequestedObjectLegalHold);
@@ -1135,6 +1136,7 @@ pub(crate) trait AuthorizationRequest {
     /// fields when present, otherwise the request headers.
     fn policy_headers(&self) -> &HeaderMap;
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions>;
+    fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions>;
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions);
     fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards>;
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards);
@@ -1231,6 +1233,9 @@ impl<T> AuthorizationRequest for S3Request<T> {
     fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
         self.extensions.get::<RequestedObjectTags>()
     }
+    fn take_requested_object_tags(&mut self) -> Option<RequestedObjectTags> {
+        self.extensions.remove::<RequestedObjectTags>()
+    }
     fn install_requested_retention(&mut self, retention: RequestedObjectLockRetention) {
         self.extensions.insert(retention);
     }
@@ -1266,6 +1271,9 @@ impl<T> AuthorizationRequest for S3Request<T> {
     }
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.extensions.get::<ObjectTagConditions>()
+    }
+    fn take_object_tag_conditions(&mut self) -> Option<ObjectTagConditions> {
+        self.extensions.remove::<ObjectTagConditions>()
     }
     fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
         self.extensions.insert(conditions);
@@ -2296,46 +2304,51 @@ pub(crate) async fn authorize_object_request<R: AuthorizationRequest + ?Sized>(
 /// Authorize the exact tag set selected by CopyObject's source reader before publication.
 /// The access hook also calls this with a preliminary snapshot, so tag-dependent
 /// destination Allow statements can be evaluated before opening either object.
-pub(crate) async fn authorize_copy_object_tags(
-    req: &mut S3Request<CopyObjectInput>,
+pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    source: access_owned::object_commit::CopySourceObject<'_>,
+    copies_tags: bool,
     source_tags: &str,
     effective_tags: &str,
 ) -> S3Result<()> {
     // Direct internal use-case calls with no tags retain their existing contract.
     // Public CopyObject requests always carry the access hook's requested-tag snapshot.
-    if effective_tags.is_empty() && req.extensions.get::<RequestedObjectTags>().is_none() {
+    if effective_tags.is_empty() && req.requested_object_tags().is_none() {
         return Ok(());
     }
     let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
-    let copies_tags = req.input.tagging_directive.as_ref().map(TaggingDirective::as_str) != Some(TaggingDirective::REPLACE);
     if copies_tags && !tag_set.is_empty() {
-        let CopySource::Bucket { bucket, key, version_id } = &req.input.copy_source else {
-            return Err(s3_error!(NotImplemented));
-        };
-        let (bucket, key, version_id) = (bucket.to_string(), key.to_string(), version_id.as_ref().map(ToString::to_string));
         let destination = req_info_ref(req)?.clone();
-        let destination_tags = req.extensions.remove::<ObjectTagConditions>();
-        req.extensions.remove::<RequestedObjectTags>();
         // Reuse the reader's metadata instead of reopening the source under its
         // read guard (or the self-copy write guard). These are the tags being copied.
         let source_conditions = crate::storage::s3_api::tagging::parse_object_tag_header(source_tags)?
             .into_iter()
             .filter_map(|tag| Some((format!("ExistingObjectTag/{}", tag.key?), vec![tag.value?])))
             .collect();
-        req.extensions
-            .insert(ObjectTagConditions::new(&bucket, &key, version_id.as_deref(), source_conditions));
+        let destination_tags = req.take_object_tag_conditions();
+        let destination_requested_tags = req.take_requested_object_tags();
+        req.install_object_tag_conditions(ObjectTagConditions::new(
+            source.bucket,
+            source.key,
+            source.version_id,
+            source_conditions,
+        ));
         let info = req_info_mut(req)?;
-        info.bucket = Some(bucket);
-        info.object = Some(key);
-        info.version_id = version_id.clone();
-        let result =
-            authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, version_id.as_deref())).await;
-        req.extensions.insert(destination);
-        req.extensions.remove::<ObjectTagConditions>();
+        info.bucket = Some(source.bucket.to_owned());
+        info.object = Some(source.key.to_owned());
+        info.version_id = source.version_id.map(str::to_owned);
+        let result = authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, source.version_id)).await;
+        *req_info_mut(req)? = destination;
+        req.take_object_tag_conditions();
         if let Some(tags) = destination_tags {
-            req.extensions.insert(tags);
+            req.install_object_tag_conditions(tags);
         }
-        result?;
+        if let Err(error) = result {
+            if let Some(tags) = destination_requested_tags {
+                req.install_requested_object_tags(tags);
+            }
+            return Err(error);
+        }
     }
     req.install_requested_object_tags(RequestedObjectTags::from(&Tagging { tag_set }));
     authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
@@ -3333,14 +3346,10 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn abort_multipart_upload(&self, req: &mut S3Request<AbortMultipartUploadInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::AbortMultipartUploadAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        access_owned::listing_multipart::authorize_abort_multipart_upload(self.server_ctx(), req, &bucket, &key)
+            .await
+            .map_err(Into::into)
     }
 
     /// Checks whether the CompleteMultipartUpload request has accesses to the resources.
@@ -3358,85 +3367,30 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let Some((src_bucket, src_key, version_id)) = legacy_copy_source(&req.input.copy_source) else {
-            return access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), None).await;
+        use access_owned::object_commit::{CopyObjectAuthorization, authorize_copy_object};
+
+        let input = &req.input;
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let source = legacy_copy_source(&input.copy_source);
+        let source = source
+            .as_ref()
+            .map(|(bucket, key, version_id)| copy_source_object(bucket, key, version_id.as_deref()));
+        let query_version = input.version_id.clone();
+        let tagging = input.tagging.clone();
+        let tagging_directive = input.tagging_directive.as_ref().map(|value| value.as_str().to_owned());
+        let facts = CopyObjectAuthorization {
+            bucket: &bucket,
+            key: &key,
+            source,
+            query_version: query_version.as_deref(),
+            tagging: tagging.as_deref(),
+            tagging_directive: tagging_directive.as_deref(),
+            retain_until: input.object_lock_retain_until_date.clone().map(OffsetDateTime::from),
+            legal_hold: legal_hold_write_requested(input.object_lock_legal_hold_status.as_ref()),
+            retention: retention_write_requested(input.object_lock_mode.as_ref(), input.object_lock_retain_until_date.as_ref()),
         };
-        let source = copy_source_object(&src_bucket, &src_key, version_id.as_deref());
-        access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), Some(source)).await?;
-
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
-
-        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
-        let replacement = crate::storage::s3_api::tagging::resolve_copy_object_tags(
-            req.input.tagging.as_deref(),
-            req.input.tagging_directive.as_ref(),
-        )?;
-        let store = request_object_store(req)?;
-        let source_tags = if replacement.is_none() {
-            use crate::storage::storage_api::contract::object::ObjectOperations as _;
-            match store
-                .get_object_tags(
-                    &src_bucket,
-                    &src_key,
-                    &ObjectOptions {
-                        // Keep the explicit version in the policy context, but
-                        // address its storage representation just like COPY's reader.
-                        version_id: version_id.as_deref().map(|version| {
-                            let version = version.trim();
-                            if version.eq_ignore_ascii_case("null") {
-                                uuid::Uuid::nil().to_string()
-                            } else {
-                                version.to_owned()
-                            }
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(tags) => tags,
-                Err(error) if super::is_err_object_not_found(&error) || super::is_err_version_not_found(&error) => String::new(),
-                Err(error) => return Err(ApiError::from(error).into()),
-            }
-        } else {
-            String::new()
-        };
-        // Self-copy later holds the destination write lock. Capture its existing
-        // tags now, including when only the final requested tags activate a policy.
-        if src_bucket == req.input.bucket && src_key == req.input.key {
-            let destination_version = req_info_ref(req)?.version_id.clone();
-            get_or_fetch_object_tag_conditions(
-                req,
-                store.as_ref(),
-                &src_bucket,
-                &src_key,
-                destination_version.as_deref(),
-                Action::S3Action(S3Action::PutObjectAction),
-            )
-            .await?;
-        }
-        req.install_requested_object_tags(RequestedObjectTags::default());
-        authorize_copy_object_tags(req, &source_tags, replacement.as_deref().unwrap_or(&source_tags)).await?;
-
-        authorize_replication_only_put_headers(req).await?;
-
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-        }
-
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        authorize_copy_object(req, self.server_ctx(), facts).await
     }
 
     /// Checks whether the CreateMultipartUpload request has accesses to the resources.
@@ -4039,14 +3993,8 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn list_parts(&self, req: &mut S3Request<ListPartsInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, list_parts_authorize_action()).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        Ok(authorize_list_parts(self.server_ctx(), req, &bucket, &key).await?)
     }
 
     /// Checks whether the PostObject request has accesses to the resources.
@@ -8200,6 +8148,7 @@ mod tests {
                         .await
                         .expect("change source after access hook");
                 }
+                let probe = crate::storage::helper::MutationCompletionProbe::install(&bucket);
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(context.clone()))
@@ -8209,6 +8158,12 @@ mod tests {
                 .expect("copy authorization must not reacquire its own object lock");
                 if matches!(mode, "allowed-tags" | "self-copy") {
                     result.expect("unchanged allowed tags complete");
+                    {
+                        let events = probe.events.lock().unwrap();
+                        assert_eq!(events.len(), 1, "one committed copy event");
+                        assert_eq!(events[0].event_name, rustfs_s3_types::EventName::ObjectCreatedCopy);
+                        assert_eq!(events[0].object.name, destination);
+                    }
                     assert_eq!(
                         store
                             .get_object_tags(&bucket, destination, &crate::storage::ObjectOptions::default())
@@ -8228,6 +8183,7 @@ mod tests {
                             .is_err(),
                         "denial must precede destination publication"
                     );
+                    assert!(probe.events.lock().unwrap().is_empty(), "refused copy cannot emit a success event");
                 }
             }
         });
@@ -8360,6 +8316,88 @@ mod tests {
             .get_object_info(&dst_bucket, "copied", &crate::storage::ObjectOptions::default())
             .await
             .expect_err("the new-generation source object must not be copied");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn copy_object_rejects_recreated_destination_bucket_after_authorization() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let slot = ServerContextSlot::new();
+        let context = Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        assert!(slot.install(context.clone()));
+        let fs = FS::with_server_ctx(slot.clone());
+        let src = format!("copy-src-{}", uuid::Uuid::new_v4());
+        let dst = format!("copy-dst-{}", uuid::Uuid::new_v4());
+        let policy = |bucket: &str, action: &str| {
+            serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":[{
+                "Effect":"Allow","Principal":{"AWS":"*"},"Action":action,"Resource":format!("arn:aws:s3:::{bucket}/*")
+            }]}))
+            .unwrap()
+        };
+        for (bucket, action) in [(&src, "s3:GetObject"), (&dst, "s3:PutObject")] {
+            store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+            store
+                .update_bucket_metadata_config(
+                    bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    policy(bucket, action),
+                )
+                .await
+                .unwrap();
+        }
+        let opts = crate::storage::ObjectOptions::default();
+        let mut body = crate::storage::PutObjReader::from_vec(b"source contents".to_vec());
+        store.put_object(&src, "source", &mut body, &opts).await.unwrap();
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: src.into(),
+                key: "source".into(),
+                version_id: None,
+            })
+            .bucket(dst.clone())
+            .key("copied".to_owned())
+            .build()
+            .unwrap();
+        let mut request = build_request(input, Method::PUT);
+        ensure_req_info(&mut request);
+        request.extensions.insert(slot);
+        let captured_incarnation = store.bucket_incarnation_id(&dst).await.unwrap();
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        install_object_generation_test_hook(dst.clone(), loaded_tx, resume_rx);
+        let access = tokio::spawn(async move { (fs.copy_object(&mut request).await, request) });
+        tokio::time::timeout(std::time::Duration::from_secs(10), loaded_rx)
+            .await
+            .expect("destination generation capture must be reached")
+            .expect("copy access ended before capture");
+        store.delete_bucket(&dst, &DeleteBucketOptions::default()).await.unwrap();
+        store.make_bucket(&dst, &MakeBucketOptions::default()).await.unwrap();
+        store
+            .update_bucket_metadata_config(
+                &dst,
+                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                policy(&dst, "s3:PutObject"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(captured_incarnation, store.bucket_incarnation_id(&dst).await.unwrap());
+        resume_tx.send(()).expect("resume copy before admission");
+        let (result, request) = access.await.unwrap();
+        result.expect("the equivalent policy should admit the copy");
+        let mut captured = crate::storage::ObjectOptions::default();
+        apply_bucket_generation_guard(&request, &dst, &mut captured).expect("copy carries the destination snapshot");
+        assert_eq!(captured.expected_bucket_incarnation_id, Some(captured_incarnation));
+
+        let error = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object(request)
+            .await
+            .expect_err("must refuse before publishing to the recreated bucket");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchBucket);
+        let missing = store
+            .get_object_info(&dst, "copied", &opts)
+            .await
+            .expect_err("stale copy wrote an object");
+        assert!(crate::storage::is_err_object_not_found(&missing), "{missing}");
     }
 
     #[test]
