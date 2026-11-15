@@ -15,16 +15,19 @@
 //! Bucket lifecycle configuration use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, ExpirationStatus, LifecycleRule,
-    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
-};
+use crate::app::storage_api::s3::dto::{DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use rustfs_gateway_types::persistence::parse_lifecycle_dto;
+use rustfs_gateway_types::persistence::{PersistedLifecycleRule, parse_lifecycle_dto};
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
-fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
+pub(crate) enum PreparedLifecycleConfiguration {
+    Missing,
+    InvalidStatus,
+    Prepared(std::io::Result<PersistedLifecycleConfiguration>),
+}
+
+fn assign_lifecycle_rule_ids(rules: &mut [PersistedLifecycleRule]) {
     let mut rule_ids: HashSet<String> = HashSet::new();
 
     for rule in rules.iter() {
@@ -49,11 +52,11 @@ fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
     }
 }
 
-fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> std::result::Result<(), &'static str> {
-    for rule in rules {
-        if rule.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
-            && rule.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
-        {
+pub(crate) fn validate_lifecycle_rule_status<'a>(
+    statuses: impl IntoIterator<Item = &'a str>,
+) -> std::result::Result<(), &'static str> {
+    for status in statuses {
+        if status != "Enabled" && status != "Disabled" {
             return Err(ERR_LIFECYCLE_RULE_STATUS);
         }
     }
@@ -194,156 +197,155 @@ impl DefaultBucketUsecase {
         })
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_bucket_lifecycle_configuration(
+    /// Validates and persists a lifecycle configuration fenced to the authorized bucket incarnation.
+    ///
+    /// # Errors
+    /// Returns the original configuration validation or storage error. Missing configuration is
+    /// `InvalidArgument`; invalid status is `MalformedXML`; conversion errors are `InternalError`.
+    #[instrument(level = "debug", skip(self, envelope, bucket, prepared_configuration))]
+    pub(crate) async fn execute_put_bucket_lifecycle_configuration(
         &self,
-        req: S3Request<PutBucketLifecycleConfigurationInput>,
-        prepared_configuration: std::io::Result<Option<PersistedLifecycleConfiguration>>,
-    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketLifecycleConfigurationInput {
-            bucket,
-            lifecycle_configuration,
-            ..
-        } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+        prepared_configuration: PreparedLifecycleConfiguration,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::PutBucketLifecycleConfigurationOutput> {
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::PutBucketLifecycleConfiguration,
+            StatusCode::OK,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                let request_context = envelope.request_context().cloned();
+                let prepared_configuration = match prepared_configuration {
+                    PreparedLifecycleConfiguration::Missing => return Err(rustfs_s3_types::s3_error!(InvalidArgument)),
+                    PreparedLifecycleConfiguration::InvalidStatus => {
+                        return Err(rustfs_s3_types::s3_error!(MalformedXML, "Malformed XML: {ERR_LIFECYCLE_RULE_STATUS}"));
+                    }
+                    PreparedLifecycleConfiguration::Prepared(result) => result,
+                };
 
-        let Some(mut wire_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
-        assign_lifecycle_rule_ids(&mut wire_cfg.rules);
-        if let Err(err) = validate_lifecycle_rule_status(&wire_cfg.rules) {
-            return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
-        }
+                let rcfg = match metadata_sys::get_object_lock_config(bucket).await {
+                    Ok((cfg, _)) => cfg,
+                    Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
+                    Err(err) => {
+                        warn!(
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_BUCKET,
+                            event = "bucket_object_lock_config_load_failed",
+                            bucket = %bucket,
+                            error = ?err,
+                            "Failed to load bucket object lock configuration"
+                        );
+                        return Err(ApiError::from(err).into());
+                    }
+                };
 
-        let rcfg = match metadata_sys::get_object_lock_config(&bucket).await {
-            Ok((cfg, _)) => cfg,
-            Err(StorageError::ConfigNotFound) => ObjectLockConfiguration::default(),
-            Err(err) => {
-                warn!(
-                    component = LOG_COMPONENT_APP,
-                    subsystem = LOG_SUBSYSTEM_BUCKET,
-                    event = "bucket_object_lock_config_load_failed",
-                    bucket = %bucket,
-                    error = ?err,
-                    "Failed to load bucket object lock configuration"
-                );
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        // Keep conversion failures behind the request-boundary status and Object Lock checks.
-        let Some(mut input_cfg) = prepared_configuration.map_err(to_internal_error)? else {
-            return Err(rustfs_s3_types::s3_error!(InvalidArgument).into());
-        };
-        if input_cfg.rules.len() != wire_cfg.rules.len() {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                "lifecycle conversion changed the rule count",
-            ));
-        }
-        for (rule, wire_rule) in input_cfg.rules.iter_mut().zip(&wire_cfg.rules) {
-            rule.id.clone_from(&wire_rule.id);
-        }
-
-        if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
-            return Err(lifecycle_validation_error(&err));
-        }
-
-        if let Err(err) = validate_transition_tier(&input_cfg).await {
-            return Err(s3_error!(InvalidArgument, "{err}"));
-        }
-
-        // Stamp the expiry axis only when the expiry subset can have changed
-        // (MinIO: HasExpiry() || expiryRuleRemoved). Site-replication peers
-        // judge lc-config staleness on this axis; a transition-only edit that
-        // advanced it would let this site's stale expiry subset shadow — and
-        // roll back — a newer peer expiry edit fleet-wide.
-        let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((previous, _)) => {
-                if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
-                    Some(
-                        time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .map_err(to_internal_error)?,
-                    )
-                } else {
-                    previous.expiry_updated_at
+                // Keep conversion failures behind the request-boundary status and Object Lock checks.
+                let mut input_cfg = prepared_configuration.map_err(to_internal_error)?;
+                assign_lifecycle_rule_ids(&mut input_cfg.rules);
+                if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
+                    return Err(lifecycle_validation_error(&err).into());
                 }
-            }
-            // No previous config (or unreadable): stamping is the
-            // conservative pre-existing behavior.
-            Err(_) => {
-                if lifecycle_rules_have_expiry(&input_cfg) {
-                    Some(
-                        time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .map_err(to_internal_error)?,
-                    )
-                } else {
-                    None
+
+                if let Err(err) = validate_transition_tier(&input_cfg).await {
+                    return Err(rustfs_s3_types::s3_error!(InvalidArgument, "{err}"));
                 }
-            }
-        };
-        input_cfg.expiry_updated_at = previous_expiry_updated_at;
-        let data = serialize_config(&input_cfg)?;
-        update_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true).await;
+                // Stamp the expiry axis only when the expiry subset can have changed
+                // (MinIO: HasExpiry() || expiryRuleRemoved). Site-replication peers
+                // judge lc-config staleness on this axis; a transition-only edit that
+                // advanced it would let this site's stale expiry subset shadow — and
+                // roll back — a newer peer expiry edit fleet-wide.
+                let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(bucket).await {
+                    Ok((previous, _)) => {
+                        if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
+                            Some(
+                                time::OffsetDateTime::now_utc()
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .map_err(to_internal_error)?,
+                            )
+                        } else {
+                            previous.expiry_updated_at
+                        }
+                    }
+                    // No previous config (or unreadable): stamping is the
+                    // conservative pre-existing behavior.
+                    Err(_) => {
+                        if lifecycle_rules_have_expiry(&input_cfg) {
+                            Some(
+                                time::OffsetDateTime::now_utc()
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .map_err(to_internal_error)?,
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                };
+                input_cfg.expiry_updated_at = previous_expiry_updated_at;
+                let data = serialize_config(&input_cfg)?;
+                update_bucket_config_for_incarnation(bucket, BUCKET_LIFECYCLE_CONFIG, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
-        item.expiry_lc_config =
-            Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
-        // The item travels with the expiry axis, not the wall clock: a site
-        // whose expiry knowledge is old (or absent — UNIX_EPOCH) must not
-        // out-rank newer peer expiry state at the receivers.
-        item.expiry_updated_at = input_cfg
-            .expiry_updated_at
-            .as_deref()
-            .map(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339))
-            .transpose()
-            .map_err(to_internal_error)?
-            .or(Some(time::OffsetDateTime::UNIX_EPOCH));
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
-        }
+                notify_bucket_metadata_reload(bucket.to_owned(), "put bucket lifecycle", request_context, true).await;
 
-        if lifecycle_has_transition_rules(&input_cfg)
-            && let Some(store) = self.object_store()
-        {
-            let bucket_name = bucket.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
-                if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
-                    warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
+                let mut item = sr_bucket_meta_item(bucket.to_owned(), "lc-config");
+                item.expiry_lc_config =
+                    Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
+                // The item travels with the expiry axis, not the wall clock: a site
+                // whose expiry knowledge is old (or absent — UNIX_EPOCH) must not
+                // out-rank newer peer expiry state at the receivers.
+                item.expiry_updated_at = input_cfg
+                    .expiry_updated_at
+                    .as_deref()
+                    .map(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339))
+                    .transpose()
+                    .map_err(to_internal_error)?
+                    .or(Some(time::OffsetDateTime::UNIX_EPOCH));
+                if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                    warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
                 }
-            });
-        }
 
-        if lifecycle_has_expiry_rules(&input_cfg)
-            && let Some(store) = self.object_store()
-        {
-            let bucket_name = bucket.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
-                if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
-                    warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
+                if lifecycle_has_transition_rules(&input_cfg)
+                    && let Some(store) = self.object_store()
+                {
+                    let bucket_name = bucket.to_owned();
+                    let request_context = envelope.request_context().cloned();
+                    spawn_background_with_context(request_context, async move {
+                        if let Err(err) = enqueue_transition_for_existing_objects(store, &bucket_name).await {
+                            warn!(bucket = %bucket_name, error = ?err, "failed to enqueue transition for existing objects");
+                        }
+                    });
                 }
-            });
-        }
 
-        if lifecycle_has_abort_multipart_rules(&input_cfg)
-            && let Some(store) = self.object_store()
-        {
-            let bucket_name = bucket.clone();
-            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-            spawn_background_with_context(request_context, async move {
-                let deleted = run_stale_multipart_upload_cleanup_once(store).await;
-                debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
-            });
-        }
+                if lifecycle_has_expiry_rules(&input_cfg)
+                    && let Some(store) = self.object_store()
+                {
+                    let bucket_name = bucket.to_owned();
+                    let request_context = envelope.request_context().cloned();
+                    spawn_background_with_context(request_context, async move {
+                        if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
+                            warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
+                        }
+                    });
+                }
 
-        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
+                if lifecycle_has_abort_multipart_rules(&input_cfg)
+                    && let Some(store) = self.object_store()
+                {
+                    let bucket_name = bucket.to_owned();
+                    let request_context = envelope.request_context().cloned();
+                    spawn_background_with_context(request_context, async move {
+                        let deleted = run_stale_multipart_upload_cleanup_once(store).await;
+                        debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
+                    });
+                }
+
+                Ok(gateway_dto::PutBucketLifecycleConfigurationOutput::default())
+            },
+        )
+        .await
     }
 }
 
@@ -353,7 +355,8 @@ mod tests {
     use crate::app::bucket_usecase::test_support::build_request;
     use crate::app::storage_api::s3::dto;
     use crate::app::storage_api::s3::dto::{
-        BucketLifecycleConfiguration, LifecycleExpiration, NoncurrentVersionTransition, Transition, TransitionStorageClass,
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionTransition,
+        PutBucketLifecycleConfigurationInput, Transition, TransitionStorageClass,
     };
     use http::Method;
 
@@ -371,7 +374,7 @@ mod tests {
 
     #[test]
     fn normalize_lifecycle_rules_generate_rule_ids_for_missing_values() {
-        let mut rules = vec![
+        let rules = vec![
             LifecycleRule {
                 status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: Some(LifecycleExpiration {
@@ -419,6 +422,12 @@ mod tests {
             },
         ];
 
+        let mut rules = crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(BucketLifecycleConfiguration {
+            rules,
+            ..Default::default()
+        })
+        .unwrap()
+        .rules;
         assign_lifecycle_rule_ids(&mut rules);
 
         assert_eq!(rules[0].id.as_deref(), Some("rule-0"));
@@ -492,24 +501,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_lifecycle_rule_status_rejects_invalid_status() {
-        let rules = vec![LifecycleRule {
-            status: ExpirationStatus::from_static("enabled"),
-            expiration: Some(LifecycleExpiration {
-                days: Some(30),
-                ..Default::default()
-            }),
-            abort_incomplete_multipart_upload: None,
-            del_marker_expiration: None,
-            filter: None,
-            id: None,
-            noncurrent_version_expiration: None,
-            noncurrent_version_transitions: None,
-            prefix: None,
-            transitions: None,
-        }];
-
-        assert_eq!(validate_lifecycle_rule_status(&rules).unwrap_err(), ERR_LIFECYCLE_RULE_STATUS);
+    fn validate_lifecycle_rule_status_checks_exact_values() {
+        assert!(validate_lifecycle_rule_status(["Enabled", "Disabled"]).is_ok());
+        for invalid in ["enabled", "unknown"] {
+            assert_eq!(
+                validate_lifecycle_rule_status(["Enabled", invalid]),
+                Err(ERR_LIFECYCLE_RULE_STATUS),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -604,16 +604,14 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let prepared = req
-            .input
-            .lifecycle_configuration
-            .clone()
-            .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
-            .transpose();
         let err = usecase
-            .execute_put_bucket_lifecycle_configuration(req, prepared)
+            .execute_put_bucket_lifecycle_configuration(
+                RequestEnvelope::from_s3s(&req),
+                &req.input.bucket,
+                PreparedLifecycleConfiguration::Missing,
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     }
 }
