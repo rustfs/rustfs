@@ -4242,52 +4242,24 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         crate::hp_guard!("S3Access::put_object");
-        async {
-            let req_info = ext_req_info_mut(&mut req.extensions)?;
-            req_info.bucket = Some(req.input.bucket.clone());
-            req_info.object = Some(req.input.key.clone());
-            req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
-
-            if has_write_offset_bytes_header(&req.headers) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::NotImplemented,
-                    ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
-                ));
-            }
-
-            let bucket = req.input.bucket.clone();
-            // Snapshot before authorization, but preserve AccessDenied precedence
-            // by exposing any bucket-state error only after authorization succeeds.
-            let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-            #[cfg(test)]
-            let bucket_generation = if PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
-                Err(ApiError::from(StorageError::ErasureReadQuorum).into())
-            } else {
-                bucket_generation
-            };
-            let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-            set_requested_object_lock_retain_until(req, requested_retain_until.map(OffsetDateTime::from));
-            set_post_object_policy_headers(req)?;
-            authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-            let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
-            authorize_write_etag_condition(req, specific_etag).await?;
-            req.install_bucket_generation(bucket_generation?);
-
-            if req.method != http::Method::POST {
-                authorize_replication_only_put_headers(req).await?;
-            }
-
-            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-            }
-
-            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-            }
-
-            Ok(())
-        }
-        .await
+        use access_owned::object_write::{PutObjectAuthorization, authorize_put_object};
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        let input = PutObjectAuthorization {
+            bucket: &bucket,
+            key: &key,
+            version_id: version_id.as_deref(),
+            retain_until: req.input.object_lock_retain_until_date.clone().map(OffsetDateTime::from),
+            specific_etag: req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any()),
+            legal_hold: legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()),
+            retention: retention_write_requested(
+                req.input.object_lock_mode.as_ref(),
+                req.input.object_lock_retain_until_date.as_ref(),
+            ),
+            post: req.method == http::Method::POST,
+        };
+        authorize_put_object(req, self.server_ctx(), input, set_post_object_policy_headers).await
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
