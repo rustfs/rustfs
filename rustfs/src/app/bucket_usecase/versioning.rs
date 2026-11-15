@@ -16,8 +16,7 @@
 
 use super::*;
 use crate::app::storage_api::bucket_usecase::bucket::{ObjectLockConfigExt as _, VersioningConfigExt as _};
-use crate::app::storage_api::s3::dto::{PutBucketVersioningInput, PutBucketVersioningOutput};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
     config.suspended()
@@ -96,40 +95,44 @@ impl DefaultBucketUsecase {
         })
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_bucket_versioning(
+    /// Stores the versioning configuration prepared by the request edge.
+    #[instrument(level = "debug", skip(self, envelope, prepared))]
+    pub(crate) async fn execute_put_bucket_versioning(
         &self,
-        req: S3Request<PutBucketVersioningInput>,
+        envelope: RequestEnvelope,
+        bucket: &str,
         prepared: S3Result<PersistedVersioningConfiguration>,
-    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketVersioningInput { bucket, .. } = req.input;
+    ) -> S3Result<gateway_dto::PutBucketVersioningOutput> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketVersioning, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let versioning_configuration = prepared?;
-        validate_bucket_versioning_update(&bucket, &versioning_configuration).await?;
+            let versioning_configuration = prepared?;
+            validate_bucket_versioning_update(bucket, &versioning_configuration).await?;
 
-        let data = serialize_config(&versioning_configuration)?;
+            let data = serialize_config(&versioning_configuration)?;
+            update_bucket_config_for_incarnation(bucket, BUCKET_VERSIONING_CONFIG, data, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        update_bucket_config_for_incarnation(&bucket, BUCKET_VERSIONING_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            notify_bucket_metadata_reload(bucket.to_owned(), "put bucket versioning", request_context, false).await;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false).await;
+            let mut item = sr_bucket_meta_item(bucket.to_owned(), "version-config");
+            item.versioning = Some(
+                serialize_config(&versioning_configuration)
+                    .and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+            );
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
+            }
 
-        let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
-        item.versioning = Some(
-            serialize_config(&versioning_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
-        );
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
-        }
-
-        rustfs_scanner::record_dirty_usage_bucket_from_producer(
-            &bucket,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
-        );
-        Ok(S3Response::new(PutBucketVersioningOutput {}))
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+            );
+            Ok(gateway_dto::PutBucketVersioningOutput::default())
+        })
+        .await
     }
 }
 
