@@ -24,8 +24,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, decode_object_name,
-        is_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_event_key, build_queued_payload, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -297,8 +297,7 @@ fn build_kafka_record<'a>(
     meta: &QueuedPayloadMeta,
 ) -> Result<Record<'a, String, &'a [u8]>, TargetError> {
     // Queue metadata carries the form-encoded S3 key, including on replay.
-    let object_name = decode_object_name(&meta.object_name)?;
-    let key = format!("{}/{}", meta.bucket_name, object_name);
+    let key = build_event_key(&meta.bucket_name, &meta.object_name)?;
     Ok(Record::from_key_value(topic, key, body))
 }
 
