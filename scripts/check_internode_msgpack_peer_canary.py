@@ -207,15 +207,22 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     images = json.loads(image_path.read_bytes(), object_pairs_hook=unique_object)
     require(isinstance(images, list) and len(images) == 2, "expected candidate and baseline image inspections")
     image_ids = []
+    revision_evidence = []
     for image, revision in zip(images, (source, baseline)):
         require(isinstance(image, dict), "invalid image inspection")
         image_id = image.get("Id")
         require(isinstance(image_id, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None,
                 "invalid immutable image ID")
-        labels = image.get("Config", {}).get("Labels") or {}
+        require(image.get("RevisionEvidence") in {"config-labels", "immutable-history"},
+                "invalid image revision evidence source")
+        config = image.get("Config")
+        require(isinstance(config, dict), "invalid image config")
+        labels = config.get("Labels")
+        require(isinstance(labels, dict), "invalid image labels")
         observed = [labels[key] for key in ("vcs-ref", "org.opencontainers.image.revision") if key in labels]
         require(bool(observed) and all(value == revision for value in observed), "image revision mismatch")
         image_ids.append(image_id)
+        revision_evidence.append(image["RevisionEvidence"])
     require(image_ids[0] != image_ids[1], "candidate and baseline resolve to the same image")
     receipts.append({"kind": "images", "path": manifest["images"], "sha256": image_digest})
     previous_end = 0.0
@@ -331,6 +338,11 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         "scope": manifest["scope"],
         "source_revision": source,
         "baseline_revision": baseline,
+        "cluster_id": cluster_id,
+        "image_revision_evidence": {
+            "candidate": revision_evidence[0],
+            "baseline": revision_evidence[1],
+        },
         "phases": summaries,
         "violations": violations,
         "artifacts": receipts,
