@@ -22,7 +22,6 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
-use crate::app::storage_api::s3::dto::StreamingBlob;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
@@ -216,16 +215,22 @@ impl InternalPutObjectEvent {
 
     /// Publish the event when `result` is a success; failures publish nothing.
     pub(super) fn complete<T>(self, result: &S3Result<S3Response<T>>) {
-        let Ok(response) = result else {
+        if let Ok(response) = result {
+            self.complete_owned(&Ok(()), &response.headers);
+        }
+    }
+
+    pub(super) fn complete_owned<T>(self, result: &rustfs_s3_types::S3Result<T>, headers: &HeaderMap) {
+        if result.is_err() {
             return;
-        };
+        }
         let Self {
             builder,
             notify,
             request_context,
         } = self;
         let event_args = builder
-            .resp_elements(build_event_resp_elements(response, &request_context.request_id))
+            .resp_elements(build_owned_event_resp_elements(headers, &request_context.request_id))
             .build();
         spawn_background_with_context(Some(request_context), async move {
             notify.notify(event_args).await;
@@ -304,6 +309,7 @@ impl DefaultObjectUsecase {
             headers: &headers,
             query: None,
             trailing_headers: None,
+            max_content_length: None,
             version_id: None,
             sse: PutObjectSseInput {
                 server_side_encryption: None,
@@ -331,13 +337,17 @@ impl DefaultObjectUsecase {
             },
         };
         let committed = self
-            .put_object_core(write, StreamingBlob::wrap(body), start_time)
+            .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
-            .map_err(api_error_from_s3)?;
+            .map_err(|error| ApiError {
+                code: error.code().clone().into(),
+                message: error.message().unwrap_or_default().to_owned(),
+                source: None,
+            })?;
 
         let obj_info = committed.obj_info.clone();
-        let result: S3Result<S3Response<()>> = Ok(S3Response::new(()));
-        committed.finish(&result);
+        let result = Ok(());
+        committed.finish(&result, http::StatusCode::OK, &HeaderMap::new());
         Ok(obj_info)
     }
 

@@ -174,10 +174,10 @@ where
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    event_resp_elements(&response.headers, request_id)
+    build_owned_event_resp_elements(&response.headers, request_id)
 }
 
-fn event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
+pub(crate) fn build_owned_event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
     let mut resp_elements = extract_params_header(response_headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
     resp_elements
@@ -674,7 +674,8 @@ impl OperationHelper {
         if state.notify_enabled
             && let (Some(builder), OperationOutcome::Success { headers, .. }) = (state.event_builder.take(), outcome)
         {
-            state.event_builder = Some(builder.resp_elements(event_resp_elements(headers, &state.request_context.request_id)));
+            state.event_builder =
+                Some(builder.resp_elements(build_owned_event_resp_elements(headers, &state.request_context.request_id)));
         }
 
         self

@@ -14361,7 +14361,19 @@ fn table_metadata_pointer_json_round_trips() {
     assert_eq!(pointer.metadata_location, location);
 }
 
+const PUT_OBJECT_MUTATION_BOUNDARY: &str = "self.put_object_core(write, body, input.frame_trailers, start_time).await?;";
+
 fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &str) {
+    assert_object_mutation_reserved_prefix_sources(
+        delete,
+        legacy_delete,
+        include_str!("../app/object/put.rs"),
+        include_str!("../storage/legacy_edge/object_write.rs"),
+        include_str!("../app/object/extract.rs"),
+    );
+}
+
+fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &str, put: &str, legacy_put: &str, extract: &str) {
     // Scope every assertion to one implementation method: a guard in a sibling
     // method (or its tests) must not satisfy another entrypoint's contract.
     fn method<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -14387,15 +14399,17 @@ fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &s
         }
     }
 
-    let put = include_str!("../app/object/put.rs");
     let copy = include_str!("../app/object/copy.rs");
-    let extract = include_str!("../app/object/extract.rs");
     let restore = include_str!("../app/object/restore.rs");
 
     for (source, signature, delegate) in [
-        (put, "fn execute_put_object(", "self.execute_put_object_boxed(_fs, req)"),
-        (put, "fn execute_put_object_boxed<'a>(", "self.execute_put_object_inner(_fs, req)"),
-        (put, "fn execute_put_object_inner(", "self.execute_put_object_extract(req)"),
+        (legacy_put, "fn execute_put_object(", "self.execute_put_object_owned(envelope, input)"),
+        (put, "fn execute_put_object_owned(", "self.execute_put_object_inner(envelope, input)"),
+        (
+            put,
+            "fn execute_put_object_inner(",
+            "self.execute_put_object_extract_owned(envelope, input)",
+        ),
         (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
         (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
         (
@@ -14414,11 +14428,15 @@ fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &s
             "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
         ),
         (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
-        (extract, "fn execute_put_object_extract(", "self.execute_put_object_extract_boxed(req)"),
+        (
+            legacy_put,
+            "fn execute_put_object_extract(",
+            "self.execute_put_object_extract_owned(envelope, input)",
+        ),
         (
             extract,
-            "fn execute_put_object_extract_boxed(",
-            "self.execute_put_object_extract_inner(req)",
+            "fn execute_put_object_extract_owned(",
+            "self.execute_put_object_extract_inner(envelope, input)",
         ),
     ] {
         assert!(
@@ -14434,7 +14452,7 @@ fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &s
             put,
             "fn execute_put_object_inner(",
             "validate_new_object_key(&key, request_method_name)?;",
-            "self.put_object_core(write, body, start_time).await?;",
+            PUT_OBJECT_MUTATION_BOUNDARY,
         ),
         (
             copy,
@@ -16574,4 +16592,63 @@ async fn compaction_planner_stats_data_files_without_reading_their_bodies() {
     assert_eq!(report.candidate_file_count, 2);
     assert_eq!(backend.metadata_call_count().await, 2);
     assert_eq!(backend.read_call_count().await, 2, "only the manifest list and manifest may be read");
+}
+
+#[test]
+fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
+    let put = include_str!("../app/object/put.rs");
+    let edge = include_str!("../storage/legacy_edge/object_write.rs");
+    let extract = include_str!("../app/object/extract.rs");
+    for (surface, from, to) in [
+        (
+            "edge",
+            "self.execute_put_object_owned(envelope, input)",
+            "self.unchecked_put(envelope, input)",
+        ),
+        (
+            "put",
+            "self.execute_put_object_inner(envelope, input)",
+            "self.unchecked_put(envelope, input)",
+        ),
+        ("put", "validate_new_object_key(&key, request_method_name)?;", "unchecked_key();"),
+        ("put", PUT_OBJECT_MUTATION_BOUNDARY, "unchecked_put_core();"),
+        (
+            "put",
+            "validate_table_catalog_object_mutation(&bucket, &key).await?;",
+            "unchecked_table();",
+        ),
+        (
+            "extract",
+            "self.execute_put_object_extract_inner(envelope, input)",
+            "self.unchecked_extract(envelope, input)",
+        ),
+    ] {
+        let source = match surface {
+            "edge" => edge,
+            "put" => put,
+            _ => extract,
+        };
+        assert!(source.contains(from), "mutation target missing: {surface}");
+        let broken = source.replacen(from, to, 1);
+        let failure = crate::guard_sources::panic_message(|| {
+            assert_object_mutation_reserved_prefix_sources(
+                include_str!("../app/object/delete.rs"),
+                include_str!("../storage/legacy_edge/object_misc.rs"),
+                if surface == "put" { &broken } else { put },
+                if surface == "edge" { &broken } else { edge },
+                if surface == "extract" { &broken } else { extract },
+            );
+        });
+        let expected = if from.starts_with("validate_") || from == PUT_OBJECT_MUTATION_BOUNDARY {
+            format!("missing or out-of-order object mutation guard: {from}")
+        } else {
+            let signature = match surface {
+                "edge" => "fn execute_put_object(",
+                "put" => "fn execute_put_object_owned(",
+                _ => "fn execute_put_object_extract_owned(",
+            };
+            format!("{signature} must call its guarded implementation")
+        };
+        assert!(failure.contains(&expected), "{surface}: expected {expected}, got {failure}");
+    }
 }

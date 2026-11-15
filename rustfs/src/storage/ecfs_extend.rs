@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::access::{RequestedObjectLegalHold, RequestedObjectLockRetention};
 use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
@@ -34,7 +35,7 @@ use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
     ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
 };
-use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -431,6 +432,12 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
 }
 
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
+}
+
+pub(crate) fn parse_object_lock_retention_native(
+    retention: Option<RequestedObjectLockRetention>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
@@ -450,8 +457,7 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         let now = OffsetDateTime::now_utc();
         // Validate retain_until_date is in the future (S3 requirement)
         // Only validate when both mode and date are provided (not clearing retention)
-        let retain_until_date = if let Some(date) = v.retain_until_date {
-            let retain_until = OffsetDateTime::from(date);
+        let retain_until_date = if let Some(retain_until) = v.retain_until {
             // Only validate future date when mode is set (not clearing retention)
             if !mode.is_empty() && retain_until <= now {
                 return Err(S3Error::with_message(
@@ -482,9 +488,15 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
 }
 
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
+}
+
+pub(crate) fn parse_object_lock_legal_hold_native(
+    legal_hold: Option<RequestedObjectLegalHold>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.status {
+        let status = match v.0 {
             Some(status) => match status.as_str() {
                 ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
                 _ => {
@@ -911,13 +923,6 @@ pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str)
     Ok(())
 }
 
-/// Quick check if CORS processing is needed (lightweight check for Origin header)
-/// This avoids unnecessary function calls for non-CORS requests
-#[inline]
-pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
-    headers.contains_key(cors::standard::ORIGIN)
-}
-
 /// Apply CORS headers to response based on bucket CORS configuration and request origin
 ///
 /// This function:
@@ -929,9 +934,6 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 ///    - `None`: bucket has no CORS config (or request has no valid `Origin`)
 ///    - `Some(empty headers)`: bucket CORS exists but request is denied / no rule matched
 ///    - `Some(non-empty headers)`: bucket CORS exists and request matched
-///
-/// Note: This function should only be called if `needs_cors_processing()` returns true
-/// to avoid unnecessary overhead for non-CORS requests.
 pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, request: &cors::CorsRequest) -> Option<HeaderMap> {
     use http::HeaderValue;
 
@@ -1100,25 +1102,6 @@ pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
         }
     } else {
         pattern == origin
-    }
-}
-
-/// Wrap S3Response with CORS grants if needed. Cache variation is applied by
-/// `ConditionalCorsService` to all responses, including originless requests.
-/// This function performs a lightweight check first to avoid unnecessary CORS processing
-/// for non-CORS requests (requests without Origin header)
-pub(crate) async fn wrap_response_with_cors<T>(
-    bucket: &str,
-    method: &http::Method,
-    headers: &HeaderMap,
-    output: T,
-) -> S3Response<T> {
-    if needs_cors_processing(headers)
-        && let Some(cors_headers) = apply_cors_headers(bucket, method, &cors::CorsRequest::from_headers(headers)).await
-    {
-        S3Response::with_headers(output, cors_headers)
-    } else {
-        S3Response::new(output)
     }
 }
 

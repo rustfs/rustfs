@@ -16,7 +16,11 @@
 
 use super::{GATEWAY, LEGACY, MatrixRow, Outcome, create_bucket_in_the_store, outcome, refusal, s3_client, with_stack};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::types::BucketVersioningStatus;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::put_bucket_versioning::{
+    PutBucketVersioningError, PutBucketVersioningOutput, builders::PutBucketVersioningFluentBuilder,
+};
+use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -28,6 +32,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::GetBucketVersioning,
         has_error_body: true,
         call: get_bucket_versioning,
+    },
+    MatrixRow {
+        operation: "PutBucketVersioning",
+        metric: S3Operation::PutBucketVersioning,
+        has_error_body: true,
+        call: put_enabled_bucket_versioning,
     },
     MatrixRow {
         operation: "GetBucketPolicy",
@@ -47,10 +57,20 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: get_bucket_acl,
     },
+    MatrixRow {
+        operation: "GetBucketNotificationConfiguration",
+        metric: S3Operation::GetBucketNotificationConfiguration,
+        has_error_body: true,
+        call: get_bucket_notification,
+    },
 ];
 
 fn get_bucket_versioning<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_versioning().bucket(bucket).send().await) })
+}
+
+fn put_enabled_bucket_versioning<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(put_versioning(client, bucket, BucketVersioningStatus::Enabled).send().await) })
 }
 
 /// A policy that grants nobody anything the matrix exercises, so GetBucketPolicy has a document to
@@ -70,6 +90,10 @@ fn get_bucket_policy_status<'a>(client: &'a Client, bucket: &'a str) -> BoxFutur
 
 fn get_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_acl().bucket(bucket).send().await) })
+}
+
+fn get_bucket_notification<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_notification_configuration().bucket(bucket).send().await) })
 }
 
 /// Stores a bucket configuration document the way the metadata system holds it, so a read is
@@ -238,4 +262,306 @@ fn the_gateway_stack_answers_the_bucket_acl() {
 #[test]
 fn the_legacy_stack_answers_the_bucket_acl() {
     with_stack(LEGACY, get_bucket_acl_answers_the_owner_with_full_control);
+}
+
+const QUEUE_NOTIFICATION: &str = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><QueueConfiguration><Id>a2-queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#;
+
+/// GetBucketNotificationConfiguration answers an empty configuration when none is stored, the
+/// stored queue rule (event, filter and id) when one is, for any bucket name the store holds, and
+/// refuses a bucket the store does not hold.
+async fn get_bucket_notification_answers_the_stored_configuration(server: RustFSServer) {
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    for name in ["a2-notification", "sthree-x", "a-s3alias"] {
+        create_bucket_in_the_store(name).await;
+        let empty = client
+            .get_bucket_notification_configuration()
+            .bucket(name)
+            .send()
+            .await
+            .expect(name);
+        assert!(
+            empty.queue_configurations().is_empty() && empty.topic_configurations().is_empty(),
+            "{name}"
+        );
+    }
+
+    store_bucket_config(SDK_REACHABLE_NAMES[1], "notification.xml", QUEUE_NOTIFICATION).await;
+    let stored = client
+        .get_bucket_notification_configuration()
+        .bucket(SDK_REACHABLE_NAMES[1])
+        .send()
+        .await
+        .expect("stored configuration");
+    let [queue] = stored.queue_configurations() else { panic!("one queue rule: {stored:?}") };
+    assert_eq!((queue.id(), queue.queue_arn()), (Some("a2-queue"), "arn:rustfs:sqs:us-east-1:1:webhook"));
+    assert_eq!(queue.events(), &[aws_sdk_s3::types::Event::S3ObjectCreated]);
+    let rules = queue.filter().and_then(|filter| filter.key()).map(|key| key.filter_rules());
+    let [rule] = rules.expect("stored filter") else { panic!("one filter rule") };
+    assert_eq!(rule.name(), Some(&aws_sdk_s3::types::FilterRuleName::Prefix));
+    assert_eq!(rule.value(), Some("logs/"));
+
+    let extended =
+        QUEUE_NOTIFICATION.replace("<QueueConfiguration>", "<Future><Nested>ignored</Nested></Future><QueueConfiguration>");
+    store_bucket_config("a2-notification", "notification.xml", &extended).await;
+    let unknown = client
+        .get_bucket_notification_configuration()
+        .bucket("a2-notification")
+        .send()
+        .await
+        .expect("unknown stored element");
+    assert_eq!(unknown.queue_configurations(), stored.queue_configurations());
+
+    let missing = client
+        .get_bucket_notification_configuration()
+        .bucket("a2-no-such-bucket")
+        .send()
+        .await;
+    let missing = missing.expect_err("a missing bucket");
+    assert_eq!(refusal(&missing), (Some("NoSuchBucket".to_owned()), Some(404)), "{missing:?}");
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_answers_the_stored_notification_configuration() {
+    with_stack(GATEWAY, get_bucket_notification_answers_the_stored_configuration);
+}
+
+#[test]
+fn the_legacy_stack_answers_the_stored_notification_configuration() {
+    with_stack(LEGACY, get_bucket_notification_answers_the_stored_configuration);
+}
+
+async fn notification_authorization_is_bound_to_the_requested_bucket(server: RustFSServer) {
+    const USER: &str = "notification-reader";
+    const BUCKET: &str = "notification-allowed";
+    const OTHER: &str = "notification-other";
+    create_bucket_in_the_store(BUCKET).await;
+    create_bucket_in_the_store(OTHER).await;
+    super::create_user_allowed_on_one_bucket(USER, "s3:GetBucketNotification", BUCKET).await;
+    let client = s3_client(&server.endpoint(), USER, super::USER_SECRET_KEY);
+    let handled_count = || {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|metric| metric.op == S3Operation::GetBucketNotificationConfiguration.as_str())
+            .map_or(0, |metric| metric.total)
+    };
+    let before = handled_count();
+    client
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("allowed read");
+    assert_eq!(handled_count() - before, 1, "the admitted edge counts once");
+    let wrong = client
+        .get_bucket_notification_configuration()
+        .bucket(OTHER)
+        .send()
+        .await
+        .expect_err("wrong bucket");
+    assert_eq!(refusal(&wrong), (Some("AccessDenied".into()), Some(403)));
+    super::create_user_without_a_policy("notification-no-policy").await;
+    let unprivileged = s3_client(&server.endpoint(), "notification-no-policy", super::USER_SECRET_KEY);
+    let implicit = unprivileged
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect_err("implicit deny");
+    assert_eq!(refusal(&implicit), (Some("AccessDenied".into()), Some(403)));
+    let deny = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":["*"]}},"Action":["s3:GetBucketNotification"],"Resource":["arn:aws:s3:::{BUCKET}"]}}]}}"#
+    );
+    store_bucket_config(BUCKET, "policy.json", &deny).await;
+    let explicit = client
+        .get_bucket_notification_configuration()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect_err("explicit deny overrides user allow");
+    assert_eq!(refusal(&explicit), (Some("AccessDenied".into()), Some(403)));
+    assert_eq!(handled_count() - before, 1, "authorization refusals do not reach the edge counter");
+    server.shutdown().await;
+}
+
+#[test]
+fn notification_authorization_binds_the_bucket_on_the_gateway_stack() {
+    with_stack(GATEWAY, notification_authorization_is_bound_to_the_requested_bucket);
+}
+
+#[test]
+fn notification_authorization_binds_the_bucket_on_the_legacy_stack() {
+    with_stack(LEGACY, notification_authorization_is_bound_to_the_requested_bucket);
+}
+
+const VERSIONING_ENABLED: &str = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+const VERSIONING_SUSPENDED_BYTES: &[u8] = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+
+fn put_versioning(client: &Client, bucket: &str, status: BucketVersioningStatus) -> PutBucketVersioningFluentBuilder {
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(VersioningConfiguration::builder().status(status).build())
+}
+
+async fn put_versioning_document(
+    client: &Client,
+    bucket: &str,
+    document: &'static str,
+) -> Result<PutBucketVersioningOutput, Box<SdkError<PutBucketVersioningError>>> {
+    use md5::{Digest as _, Md5};
+
+    let content_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(document.as_bytes()));
+    put_versioning(client, bucket, BucketVersioningStatus::Enabled)
+        .content_md5(content_md5)
+        .customize()
+        .mutate_request(move |request| {
+            *request.body_mut() = aws_smithy_types::body::SdkBody::from(document);
+            let headers = request.headers_mut();
+            headers.remove("content-length");
+            headers.remove("x-amz-sdk-checksum-algorithm");
+            headers.remove("x-amz-checksum-crc32");
+        })
+        .send()
+        .await
+        .map_err(Box::new)
+}
+
+async fn stored_versioning(bucket: &str) -> Vec<u8> {
+    rustfs_ecstore::api::bucket::metadata_sys::get_config_from_disk(bucket)
+        .await
+        .expect("bucket metadata on disk")
+        .versioning_config_xml
+}
+
+async fn versioning_writes_preserve_refusal_order_and_stored_bytes(server: RustFSServer) {
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+
+    const WRITER: &str = "versioningwriter";
+    const BUCKET: &str = "versioning-allowed";
+    const OTHER: &str = "versioning-other";
+    const LOCKED: &str = "versioning-locked";
+    const REPLICATED: &str = "versioning-replicated";
+    const MISSING: &str = "versioning-missing";
+    for bucket in [BUCKET, OTHER, LOCKED, REPLICATED, "xn--abc"]
+        .into_iter()
+        .chain(SDK_REACHABLE_NAMES)
+    {
+        create_bucket_in_the_store(bucket).await;
+        store_bucket_config(bucket, "versioning.xml", VERSIONING_ENABLED).await;
+    }
+    const LOCK: &str = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>";
+    const REPLICATION: &str = "<ReplicationConfiguration><Role>arn:aws:s3:::target-bucket</Role><Rule><ID>rule1</ID><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::target-bucket</Bucket></Destination></Rule></ReplicationConfiguration>";
+    store_bucket_config(LOCKED, "replication.xml", REPLICATION).await;
+    store_bucket_config(LOCKED, "object-lock.xml", LOCK).await;
+    store_bucket_config(REPLICATED, "replication.xml", REPLICATION).await;
+
+    super::create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketVersioning", BUCKET).await;
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let writer = s3_client(&server.endpoint(), WRITER, super::USER_SECRET_KEY);
+    let handled = || {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|metric| metric.op == S3Operation::PutBucketVersioning.as_str())
+            .map_or(0, |metric| metric.total)
+    };
+    let before = handled();
+    let status = super::bucket_configs::StatusCapture::default();
+    put_versioning(&writer, BUCKET, BucketVersioningStatus::Suspended)
+        .customize()
+        .interceptor(status.clone())
+        .send()
+        .await
+        .expect("authorized versioning update");
+    assert_eq!(status.take(), Some(200));
+    assert_eq!(stored_versioning(BUCKET).await, VERSIONING_SUSPENDED_BYTES);
+    assert_eq!(handled() - before, 1, "the admitted edge counts once");
+
+    let denied = put_versioning(&writer, OTHER, BucketVersioningStatus::Suspended)
+        .send()
+        .await
+        .expect_err("bucket outside the writer's policy");
+    assert_eq!(refusal(&denied), (Some("AccessDenied".into()), Some(403)));
+    assert_eq!(stored_versioning(OTHER).await, VERSIONING_ENABLED.as_bytes());
+    assert_eq!(handled() - before, 1, "authorization refusals do not reach the edge counter");
+
+    for (bucket, code, http, message) in [
+        (MISSING, "NoSuchBucket", 404, None),
+        ("xn--abc", "InvalidBucketName", 400, None),
+        (
+            LOCKED,
+            "InvalidBucketState",
+            409,
+            Some("An Object Lock configuration is present on this bucket, versioning cannot be suspended."),
+        ),
+        (
+            REPLICATED,
+            "InvalidBucketState",
+            409,
+            Some("A replication configuration is present on this bucket, bucket wide versioning cannot be suspended."),
+        ),
+    ] {
+        let error = put_versioning(&root, bucket, BucketVersioningStatus::Suspended)
+            .send()
+            .await
+            .expect_err(bucket);
+        assert_eq!(refusal(&error), (Some(code.into()), Some(http)), "{bucket}");
+        if let Some(message) = message {
+            assert_eq!(error.message(), Some(message), "{bucket}");
+        }
+        if bucket != MISSING {
+            assert_eq!(stored_versioning(bucket).await, VERSIONING_ENABLED.as_bytes(), "{bucket}");
+        }
+    }
+
+    for bucket in SDK_REACHABLE_NAMES {
+        put_versioning(&root, bucket, BucketVersioningStatus::Suspended)
+            .send()
+            .await
+            .expect(bucket);
+        assert_eq!(stored_versioning(bucket).await, VERSIONING_SUSPENDED_BYTES, "{bucket}");
+    }
+
+    for (client, bucket, code, http) in [
+        (&root, OTHER, "InvalidArgument", 400),
+        (&root, MISSING, "NoSuchBucket", 404),
+        (&writer, OTHER, "AccessDenied", 403),
+    ] {
+        let invalid = put_versioning(client, bucket, BucketVersioningStatus::from("FutureStatus"))
+            .send()
+            .await
+            .expect_err("invalid versioning status");
+        assert_eq!(refusal(&invalid), (Some(code.into()), Some(http)), "{bucket}");
+        if code == "InvalidArgument" {
+            assert_eq!(invalid.message(), Some("bucket versioning configuration has an invalid status"));
+        }
+    }
+
+    let malformed = put_versioning_document(&root, OTHER, "<VersioningConfiguration>")
+        .await
+        .expect_err("incomplete versioning document");
+    assert_eq!(refusal(malformed.as_ref()), (Some("MalformedXML".into()), Some(400)));
+    assert_eq!(stored_versioning(OTHER).await, VERSIONING_ENABLED.as_bytes());
+
+    const EXTENSIONS: &str = "<VersioningConfiguration><Status>Enabled</Status><ExcludeFolders>true</ExcludeFolders><ExcludedPrefixes><Prefix>archive/</Prefix></ExcludedPrefixes><ExcludedPrefixes/></VersioningConfiguration>";
+    const STORED_EXTENSIONS: &[u8] = b"<VersioningConfiguration><ExcludeFolders>true</ExcludeFolders><ExcludedPrefixes><Prefix>archive/</Prefix></ExcludedPrefixes><ExcludedPrefixes></ExcludedPrefixes><Status>Enabled</Status></VersioningConfiguration>";
+    put_versioning_document(&root, OTHER, EXTENSIONS)
+        .await
+        .expect("versioning extensions");
+    assert_eq!(stored_versioning(OTHER).await, STORED_EXTENSIONS);
+    put_versioning_document(&root, OTHER, "Enabled")
+        .await
+        .expect("bare versioning status");
+    assert_eq!(stored_versioning(OTHER).await, VERSIONING_ENABLED.as_bytes());
+    server.shutdown().await;
+}
+
+#[test]
+fn legacy_put_versioning_preserves_refusal_order_and_stored_bytes() {
+    with_stack(LEGACY, versioning_writes_preserve_refusal_order_and_stored_bytes);
+}
+
+#[test]
+fn gateway_put_versioning_preserves_refusal_order_and_stored_bytes() {
+    with_stack(GATEWAY, versioning_writes_preserve_refusal_order_and_stored_bytes);
 }
