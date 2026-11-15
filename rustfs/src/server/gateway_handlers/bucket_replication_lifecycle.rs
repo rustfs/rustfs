@@ -24,7 +24,10 @@ use crate::storage_api::server::http::access::{
     access_owned::bucket_replication_lifecycle::prepare_replication_config_edit, authorize_bucket_request,
 };
 use rustfs_gateway::{Req, Resp, dto};
-use rustfs_gateway_types::persistence::{parse_replication, serialize_replication_dto};
+use rustfs_gateway_types::persistence::{
+    PersistedDefaultRetention, PersistedObjectLockConfiguration, PersistedObjectLockRule, parse_replication,
+    serialize_replication_dto,
+};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -38,6 +41,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::PutBucketReplication>(),
     row::<dto::DeleteBucketReplication>(),
     row::<dto::GetObjectLockConfiguration>(),
+    row::<dto::PutObjectLockConfiguration>(),
 ];
 
 impl Served for dto::GetBucketLifecycleConfiguration {
@@ -110,6 +114,34 @@ impl Served for dto::DeleteBucketReplication {
             .execute_delete_bucket_replication(envelope, request.input().bucket.as_str(), prepare)
             .await?;
         Ok(Resp::new(dto::DeleteBucketReplicationOutput::default()))
+    }
+}
+
+impl Served for dto::PutObjectLockConfiguration {
+    const METRIC: S3Operation = S3Operation::PutObjectLockConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        let config = input.object_lock_configuration;
+        let config = PersistedObjectLockConfiguration {
+            object_lock_enabled: config.object_lock_enabled.map(|enabled| enabled.as_str().to_owned()),
+            rule: config.rule.map(|rule| PersistedObjectLockRule {
+                default_retention: rule.default_retention.map(|retention| PersistedDefaultRetention {
+                    mode: retention.mode.map(|mode| mode.as_str().to_owned()),
+                    days: retention.days,
+                    years: retention.years,
+                }),
+            }),
+        };
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_object_lock_configuration(envelope, input.bucket.as_str(), Some(config))
+            .await?;
+        Ok(Resp::new(dto::PutObjectLockConfigurationOutput::default()))
     }
 }
 

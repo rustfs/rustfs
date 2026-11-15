@@ -111,6 +111,19 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         },
     },
     MatrixRow {
+        operation: "PutObjectLockConfiguration",
+        metric: S3Operation::PutObjectLockConfiguration,
+        has_error_body: true,
+        call: |client, _| {
+            Box::pin(async move {
+                metadata_sys::update(LOCK_CONFIGURATION_MATRIX_BUCKET, OBJECT_LOCK_CONFIG, OBJECT_LOCK.to_vec())
+                    .await
+                    .expect("seed bucket lock configuration");
+                outcome(put_lock(client, LOCK_CONFIGURATION_MATRIX_BUCKET, LOCK_UPDATE).send().await)
+            })
+        },
+    },
+    MatrixRow {
         operation: "GetObjectLockConfiguration",
         metric: S3Operation::GetObjectLockConfiguration,
         has_error_body: true,
@@ -665,6 +678,7 @@ fn gateway_lifecycle_put_rejects_submillisecond_date() {
     });
 }
 
+pub(super) const LOCK_CONFIGURATION_MATRIX_BUCKET: &str = "lock-configuration-matrix";
 pub(super) const REPLICATION_MATRIX_BUCKET: &str = "replication-matrix";
 const REPLICATION_ARN: &str = "arn:rustfs:replication:us-east-1:operator:replica";
 const REPLICATION_WRITE: &str = concat!(
@@ -905,4 +919,144 @@ fn owned_replication_gateway_writes_and_removes_the_config_and_targets() {
 #[test]
 fn owned_replication_legacy_writes_and_removes_the_config_and_targets() {
     with_stack(LEGACY, owned_replication_wire_and_disk);
+}
+
+const LOCK_UPDATE: &str = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>2</Years></DefaultRetention></Rule></ObjectLockConfiguration>";
+const LOCK_ENABLED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+const LOCK_SUSPENDED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+
+fn put_lock(
+    client: &Client,
+    bucket: &str,
+    document: &'static str,
+) -> CustomizableOperation<
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationOutput,
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationError,
+    aws_sdk_s3::operation::put_object_lock_configuration::builders::PutObjectLockConfigurationFluentBuilder,
+> {
+    client
+        .put_object_lock_configuration()
+        .bucket(bucket)
+        .customize()
+        .mutate_request(move |request| send_document(request, document))
+}
+
+async fn lock_bytes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+    let metadata = metadata_sys::get_config_from_disk(bucket)
+        .await
+        .expect("durable bucket metadata");
+    (metadata.object_lock_config_xml, metadata.versioning_config_xml)
+}
+
+async fn put_lock_preserves_responses_and_storage(server: RustFSServer, native: bool) {
+    const BUCKET: &str = "lock-put-ordinary";
+    const RESERVED: &str = "sthree-lock-put-reserved";
+    const PLAIN: &str = "lock-put-plain";
+    const WRITER: &str = "lock-put-writer";
+    for bucket in [BUCKET, RESERVED, PLAIN] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    for bucket in [BUCKET, RESERVED] {
+        metadata_sys::update(bucket, OBJECT_LOCK_CONFIG, OBJECT_LOCK.to_vec())
+            .await
+            .unwrap();
+        metadata_sys::update(bucket, BUCKET_VERSIONING_CONFIG, LOCK_SUSPENDED_VERSIONING.to_vec())
+            .await
+            .unwrap();
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketObjectLockConfiguration", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+
+    let invalid = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
+    for (client, bucket, document, code, status, message) in [
+        (&writer, RESERVED, LOCK_UPDATE, "AccessDenied", 403, "Access Denied"),
+        (
+            &root,
+            "lock-put-missing",
+            invalid,
+            "NoSuchBucket",
+            404,
+            "The specified bucket does not exist",
+        ),
+        (
+            &root,
+            PLAIN,
+            LOCK_UPDATE,
+            "InvalidBucketState",
+            409,
+            "Object Lock configuration cannot be enabled on existing buckets",
+        ),
+        (
+            &root,
+            BUCKET,
+            invalid,
+            "InvalidRetentionPeriod",
+            400,
+            "Default retention period must be a positive integer value for 'Days'",
+        ),
+    ] {
+        let before = if bucket == "lock-put-missing" {
+            None
+        } else {
+            Some(lock_bytes(bucket).await)
+        };
+        let refused = put_lock(client, bucket, document)
+            .send()
+            .await
+            .expect_err("refused Object Lock change");
+        let actual = refused.as_service_error().expect("service error");
+        let bytes = if before.is_some() {
+            Some(lock_bytes(bucket).await)
+        } else {
+            None
+        };
+        assert_eq!(
+            (
+                actual.code(),
+                refused.raw_response().map(|response| response.status().as_u16()),
+                actual.message(),
+                bytes
+            ),
+            (Some(code), Some(status), Some(message), before),
+            "{bucket}",
+        );
+    }
+
+    for (client, bucket) in [(&writer, BUCKET), (&root, RESERVED)] {
+        let before = rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == S3Operation::PutObjectLockConfiguration.as_str())
+            .map(|row| row.total);
+        let scanner_before = rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket);
+        let status = StatusCapture::default();
+        let result = put_lock(client, bucket, LOCK_UPDATE).interceptor(status.clone()).send().await;
+        let counts = rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == S3Operation::PutObjectLockConfiguration.as_str())
+            .map(|row| row.total);
+        assert_eq!(
+            (outcome(result), status.take(), lock_bytes(bucket).await, counts),
+            (
+                Ok(()),
+                Some(200),
+                (LOCK_UPDATE.as_bytes().to_vec(), LOCK_ENABLED_VERSIONING.to_vec()),
+                if native { Some(before.unwrap_or_default() + 1) } else { None }
+            ),
+            "{bucket}",
+        );
+        assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket) > scanner_before);
+    }
+    server.shutdown().await;
+}
+
+#[test]
+fn legacy_put_object_lock_preserves_responses_and_storage() {
+    with_stack(LEGACY, |server| put_lock_preserves_responses_and_storage(server, false));
+}
+
+#[test]
+fn gateway_put_object_lock_preserves_responses_and_storage() {
+    with_stack(GATEWAY, |server| put_lock_preserves_responses_and_storage(server, true));
 }

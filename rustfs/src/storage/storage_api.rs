@@ -765,10 +765,8 @@ pub(crate) const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str =
     ecstore_bucket::metadata::BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 pub(crate) const BUCKET_TABLE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_TABLE_CONFIG;
 pub(crate) const BUCKET_TABLE_RESERVED_PREFIX: &str = ecstore_bucket::metadata::BUCKET_TABLE_RESERVED_PREFIX;
-pub(crate) const BUCKET_VERSIONING_CONFIG: &str = ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
 pub(crate) const BUCKET_WEBSITE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG;
 pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = ecstore_set_disk::DEFAULT_READ_BUFFER_SIZE;
-pub(crate) const OBJECT_LOCK_CONFIG: &str = ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
 pub(crate) const PEER_RESTDRY_RUN: &str = ecstore_rpc::PEER_RESTDRY_RUN;
 pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
@@ -2088,12 +2086,6 @@ pub(crate) async fn get_bucket_cors_config(
     ecstore_bucket::metadata_sys::get_cors_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_object_lock_config(
-    bucket: &str,
-) -> Result<(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
-}
-
 pub(crate) async fn persist_force_delete_intent(
     api: Arc<ECStore>,
     entry: ecstore_bucket::replication::MrfReplicateEntry,
@@ -2675,16 +2667,6 @@ pub(crate) use ecstore_storage::find_local_disk_by_ref;
 
 pub(crate) async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
     ecstore_storage::find_local_disk_by_ref_for_rpc(disk_ref).await
-}
-
-pub(crate) trait StorageVersioningConfigExt {
-    fn enabled(&self) -> bool;
-}
-
-impl StorageVersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
-    fn enabled(&self) -> bool {
-        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
-    }
 }
 
 pub(crate) type GetObjectReader = <ECStore as contract::object::ObjectIO>::GetObjectReader;

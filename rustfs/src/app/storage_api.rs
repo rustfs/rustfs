@@ -962,7 +962,6 @@ pub(crate) mod bucket {
         pub(crate) const BUCKET_TARGETS_FILE: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
         pub(crate) const BUCKET_VERSIONING_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
-        #[cfg(test)]
         pub(crate) const OBJECT_LOCK_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
     }
 
