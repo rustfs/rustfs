@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
+//! GetObject read path: cold fill, resume, stream tuning.
 
 use super::get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 use super::head::ResponseEtag;
@@ -29,16 +29,12 @@ use crate::app::storage_api::object_usecase::object_cache::{
 };
 #[cfg(test)]
 use crate::app::storage_api::s3::Body;
-use crate::app::storage_api::s3::dto::{
-    Checksum, ChecksumType, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts, ObjectAttributes,
-    ObjectPart, Timestamp,
-};
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{GetObjectInput, GetObjectOutput, StreamingBlob};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 #[cfg(test)]
 use crate::app::storage_api::s3::stream::ByteStream;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, s3_error};
 use crate::on_demand_migration::WriteBackBody;
 
 struct ConditionalRead {
@@ -4950,221 +4946,6 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_FINALIZE, response_finalize_start);
         response
     }
-
-    pub async fn execute_get_object_attributes(
-        &self,
-        req: S3Request<GetObjectAttributesInput>,
-    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
-        let mut helper =
-            OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes).suppress_event();
-        let GetObjectAttributesInput {
-            bucket,
-            key,
-            max_parts,
-            object_attributes,
-            part_number_marker,
-            version_id,
-            sse_customer_key,
-            sse_customer_key_md5,
-            ..
-        } = req.input;
-
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
-        opts.include_part_checksums = object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS);
-
-        let info = match store.get_object_info(&bucket, &key, &opts).await {
-            Ok(info) => info,
-            Err(err) => {
-                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                    if is_dir_object(&key) {
-                        let has_children = match probe_prefix_has_children(store, &bucket, &key, false).await {
-                            Ok(has_children) => has_children,
-                            Err(e) => {
-                                error!(
-                                    "Failed to probe children for object attributes (bucket: {}, key: {}): {}",
-                                    bucket, key, e
-                                );
-                                false
-                            }
-                        };
-                        let msg = head_prefix_not_found_message(&bucket, &key, has_children);
-                        return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
-                    }
-                    return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-                }
-                return Err(ApiError::from(err).into());
-            }
-        };
-
-        if info.delete_marker {
-            if opts.version_id.is_none() {
-                return Err(S3Error::new(S3ErrorCode::NoSuchKey));
-            }
-            return Err(S3Error::new(S3ErrorCode::MethodNotAllowed));
-        }
-
-        validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
-
-        let metadata_map = info.user_defined.clone();
-        debug!(
-            "GetObjectAttributes raw object_attributes={:?}",
-            object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
-        );
-
-        let requested = |name: &'static str| -> bool { object_attributes_requested(&object_attributes, name) };
-        let storage_class =
-            response_storage_class_for_object_attributes(&info, &metadata_map, requested(ObjectAttributes::STORAGE_CLASS));
-
-        let e_tag = if requested(ObjectAttributes::ETAG) {
-            info.etag.as_ref().map(|etag| to_s3s_etag(etag))
-        } else {
-            None
-        };
-
-        let object_size = if requested(ObjectAttributes::OBJECT_SIZE) {
-            Some(info.get_actual_size().map_err(ApiError::from)?)
-        } else {
-            None
-        };
-
-        let checksum = if requested(ObjectAttributes::CHECKSUM) {
-            let (checksums, is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
-            // GetObjectAttributes returns checksums in the XML body, and s3s's Checksum
-            // type has no field for the additional algorithms, so `extra` cannot be
-            // surfaced here (unlike the header-based GET/HEAD paths) — an s3s limitation
-            // tracked for when it gains typed fields.
-            let ResponseChecksums {
-                crc32: checksum_crc32,
-                crc32c: checksum_crc32c,
-                sha1: checksum_sha1,
-                sha256: checksum_sha256,
-                crc64nvme: checksum_crc64nvme,
-                checksum_type,
-                ..
-            } = classify_response_checksums(checksums, is_multipart);
-
-            Some(Checksum {
-                checksum_crc32,
-                checksum_crc32c,
-                checksum_sha1,
-                checksum_sha256,
-                checksum_crc64nvme,
-                checksum_type: checksum_type.map(ChecksumType::from),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
-        let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
-            let params = parse_list_parts_params(part_number_marker, max_parts)?;
-            let mut parts = Vec::new();
-            let mut marker = params.part_number_marker;
-            let max_parts = params.max_parts;
-            let mut start_at = 0usize;
-
-            if let Some(marker_value) = marker {
-                if let Some(index) = info.parts.iter().position(|part| part.number == marker_value) {
-                    start_at = index + 1;
-                } else {
-                    marker = None;
-                }
-            }
-
-            let max_parts: i32 = max_parts.try_into().map_err(|_| {
-                S3Error::with_message(S3ErrorCode::InvalidArgument, "max-parts value is out of range".to_string())
-            })?;
-            let end = (start_at + params.max_parts).min(info.parts.len());
-            let is_truncated = end < info.parts.len();
-
-            for part in &info.parts[start_at..end] {
-                let (checksums, is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
-                // Additional algorithms cannot be surfaced in the ObjectPart XML body
-                // (s3s has no field); same limitation as the object-level attributes above.
-                let ResponseChecksums {
-                    crc32: checksum_crc32,
-                    crc32c: checksum_crc32c,
-                    sha1: checksum_sha1,
-                    sha256: checksum_sha256,
-                    crc64nvme: checksum_crc64nvme,
-                    ..
-                } = classify_response_checksums(checksums, is_multipart);
-
-                let part_size = if part.actual_size > 0 {
-                    part.actual_size
-                } else {
-                    part.size.try_into().map_err(|_| {
-                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Part size value is out of range".to_string())
-                    })?
-                };
-
-                parts.push(ObjectPart {
-                    checksum_crc32,
-                    checksum_crc32c,
-                    checksum_sha1,
-                    checksum_sha256,
-                    checksum_crc64nvme,
-                    part_number: i32::try_from(part.number).ok(),
-                    size: Some(part_size),
-                    ..Default::default()
-                });
-            }
-
-            let part_number_marker = marker.and_then(|v| i32::try_from(v).ok());
-            let next_part_number_marker = parts.last().and_then(|part| part.part_number);
-
-            Some(GetObjectAttributesParts {
-                is_truncated: Some(is_truncated),
-                max_parts: Some(max_parts),
-                next_part_number_marker,
-                part_number_marker,
-                parts: Some(parts),
-                total_parts_count: Some(i32::try_from(info.parts.len()).map_err(|_| {
-                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Part count is out of range".to_string())
-                })?),
-            })
-        } else {
-            None
-        };
-
-        let version_id = s3_response_version_id(info.version_id);
-
-        let output = GetObjectAttributesOutput {
-            checksum,
-            delete_marker: if info.delete_marker { Some(true) } else { None },
-            e_tag,
-            last_modified: info.mod_time.map(Timestamp::from),
-            object_parts,
-            object_size,
-            storage_class,
-            version_id: version_id.clone(),
-            ..Default::default()
-        };
-
-        helper = helper.object(info).version_id(version_id.unwrap_or_default());
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
-        result
-    }
-}
-
-fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'static str) -> bool {
-    object_attributes.iter().any(|value| {
-        value.as_str().split(',').any(|part| {
-            part.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                .eq_ignore_ascii_case(name)
-        })
-    })
 }
 
 /// Bytes the inline tee may queue for the write-back ahead of the client.
@@ -12597,57 +12378,6 @@ mod tests {
 
         let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
-    }
-
-    #[tokio::test]
-    async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
-        let input = GetObjectAttributesInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultObjectUsecase::without_context();
-
-        let err = usecase.execute_get_object_attributes(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[test]
-    fn object_attributes_requested_with_single_value() {
-        let object_attributes = vec![ObjectAttributes::from_static(ObjectAttributes::ETAG)];
-
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
-        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
-    }
-
-    #[test]
-    fn object_attributes_requested_with_comma_separated_values() {
-        let object_attributes = vec![
-            ObjectAttributes::from_static("ObjectParts,etag"),
-            ObjectAttributes::from_static("StorageClass"),
-        ];
-
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS));
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
-        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
-    }
-
-    #[test]
-    fn object_attributes_requested_with_quotes_and_spaces() {
-        let object_attributes = vec![ObjectAttributes::from_static("'ObjectSize', \"Checksum\" , \"Etag\"")];
-
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::CHECKSUM));
-        assert!(object_attributes_requested(&object_attributes, ObjectAttributes::ETAG));
-    }
-
-    #[test]
-    fn object_attributes_requested_returns_false_for_missing_name() {
-        let object_attributes = vec![ObjectAttributes::from_static("Checksum")];
-
-        assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
     }
 }
 

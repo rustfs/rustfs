@@ -27,6 +27,7 @@ mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
 mod listing_multipart;
+mod object_attributes;
 mod object_commit;
 mod object_meta;
 mod object_misc;
@@ -430,12 +431,12 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
 
 #[test]
 fn the_refusal_matrix_holds_on_the_gateway_stack() {
-    with_stack(GATEWAY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
+    bucket_access::with_notification_stack(GATEWAY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
 }
 
 #[test]
 fn the_refusal_matrix_holds_on_the_legacy_stack() {
-    with_stack(LEGACY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
+    bucket_access::with_notification_stack(LEGACY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
 }
 
 /// Names RustFS creates and the AWS bucket grammar refuses. An IP-shaped name such as `256.1.1.1`
