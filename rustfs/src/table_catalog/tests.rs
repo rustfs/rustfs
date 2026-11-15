@@ -14684,16 +14684,13 @@ fn object_mutation_guard_rejects_wrong_delete_input_forwarding() {
 }
 
 const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+const MULTIPART_BORROWED_KEY_GUARD: &str = "validate_table_catalog_object_mutation(bucket, key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
 
 fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
-    assert_eq!(
-        source.count(MULTIPART_KEY_GUARD),
-        4,
-        "reserved-prefix guard calls across {}",
-        source.describe()
-    );
+    let guard_calls = source.count(MULTIPART_KEY_GUARD) + source.count(MULTIPART_BORROWED_KEY_GUARD);
+    assert_eq!(guard_calls, 4, "reserved-prefix guard calls across {}", source.describe());
 }
 
 fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
