@@ -125,7 +125,22 @@ python3 scripts/check_internode_msgpack_peer_canary.py \
   --out /path/to/evidence/verification.json
 ```
 
-The verifier rejects reused/escaping/overwritten artifacts, duplicate or non-exact decision labels, labeled scalar queries, mismatched PromQL windows, wrong per-node revisions, missing peer-capable traffic, missing mixed/rollback dual-write traffic, manual-fleet or not-requested leakage, failed workload/readback, non-zero fallback/decode/RPC errors, stale timestamps, invalid topology, and candidate/baseline identity reuse. Its output includes SHA-256 receipts for every raw query response and workload artifact. Passing this gate is compatibility evidence only; production soak and ABBA performance drift gates remain separate.
+The verifier rejects reused/escaping/overwritten artifacts, duplicate or non-exact decision labels, labeled scalar queries, mismatched PromQL windows, wrong per-node revisions, missing peer-capable traffic, missing mixed/rollback dual-write traffic, manual-fleet or not-requested leakage, failed workload/readback, non-zero fallback/decode/RPC errors, stale timestamps, invalid topology, and candidate/baseline identity reuse. The workload artifact binds its raw benchmark `summary.csv` by relative path and SHA-256; rollback also records equal source/download content hashes. Verifier output includes SHA-256 receipts for every raw query, workload, and summary artifact. Passing this gate is compatibility evidence only; production soak and ABBA performance drift gates remain separate.
+
+Use the orchestration runner to create the isolated Compose project, execute the three phases, preserve a known object across node2 rollback, capture the four raw Prometheus responses, build the manifest, and invoke the verifier. Without `--execute` it prints a redacted plan and makes no external changes. Execution refuses an existing Compose project/volume set and removes its isolated containers and volumes on exit unless `--keep-up` is explicit.
+
+```bash
+scripts/run_internode_msgpack_peer_canary.sh \
+  --candidate-image rustfs/rustfs:candidate \
+  --baseline-image rustfs/rustfs:previous \
+  --candidate-revision <40-hex-candidate-commit> \
+  --baseline-revision <40-hex-previous-commit> \
+  --prometheus-query-url http://127.0.0.1:9090/api/v1/query \
+  --out-dir /path/to/evidence \
+  --execute
+```
+
+The runner requires Docker Compose, AWS CLI, curl, Warp through `run_object_batch_bench.sh`, Python, the four-node local cluster compose file, prebuilt candidate/baseline images, and an already reachable Prometheus/OTLP pipeline. It never builds, pulls, or starts observability images implicitly. Execution rejects reused Compose resources or a non-empty evidence directory and performs a Prometheus vector preflight before starting the cluster. The workload summary must contain only successful zero-error rows with parseable request rates; the rollback phase must read byte-identical object data written before the version replacement.
 
 ## Stage 2 — Remove the proto JSON fields
 

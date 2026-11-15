@@ -40,6 +40,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_internode_grpc_ab_bench.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_grpc_window.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_msgpack_peer_canary.py
+	./scripts/test_internode_msgpack_peer_canary_runner.sh
 	./scripts/test_object_batch_bench_enhanced.sh
 	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh

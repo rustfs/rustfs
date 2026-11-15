@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -54,11 +55,21 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
                 path.write_text(json.dumps(document), encoding="utf-8")
                 artifacts[kind] = relative
             workload_relative = f"{name}/workload.json"
+            summary_relative = f"{name}/workload-bench/summary.csv"
+            summary_path = root / summary_relative
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_bytes = b"size,status,requests_per_sec,error_count\n4KiB,ok,10 req/s,0\n"
+            summary_path.write_bytes(summary_bytes)
+            readback_digest = "c" * 64 if name == "rollback-old-peer" else None
             (root / workload_relative).write_text(
                 json.dumps({
                     "status": "success",
                     "requests": 100,
                     "rollback_readback": name == "rollback-old-peer",
+                    "summary": summary_relative,
+                    "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+                    "readback_source_sha256": readback_digest,
+                    "readback_download_sha256": readback_digest,
                 }),
                 encoding="utf-8",
             )
@@ -92,7 +103,7 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         result = canary.check(manifest, root)
         self.assertTrue(result["observed_pass"])
         self.assertEqual(result["violations"], [])
-        self.assertEqual(len(result["artifacts"]), 15)
+        self.assertEqual(len(result["artifacts"]), 18)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in result["artifacts"]))
 
     def test_nonzero_decode_error_is_valid_evidence_but_fails_gate(self):
@@ -188,6 +199,25 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         with self.assertRaisesRegex(canary.EvidenceError, "exactly one row"):
             canary.check(manifest, root)
 
+    def test_workload_summary_and_rollback_hashes_are_bound(self):
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        mixed_workload_path = root / manifest["phases"][0]["workload"]
+        mixed_workload = json.loads(mixed_workload_path.read_text(encoding="utf-8"))
+        (root / mixed_workload["summary"]).write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(canary.EvidenceError, "summary hash mismatch"):
+            canary.check(manifest, root)
+
+        temp.cleanup()
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        rollback_path = root / manifest["phases"][2]["workload"]
+        rollback = json.loads(rollback_path.read_text(encoding="utf-8"))
+        rollback["readback_download_sha256"] = "d" * 64
+        rollback_path.write_text(json.dumps(rollback), encoding="utf-8")
+        with self.assertRaisesRegex(canary.EvidenceError, "readback digest mismatch"):
+            canary.check(manifest, root)
+
     def test_cli_exit_codes_distinguish_pass_gate_failure_and_invalid_input(self):
         temp, root, manifest = self.fixture()
         self.addCleanup(temp.cleanup)
@@ -217,10 +247,9 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         self.assertIn("overwrite raw canary evidence", overwrite.stderr)
 
         rollback_workload = root / manifest["phases"][2]["workload"]
-        rollback_workload.write_text(
-            json.dumps({"status": "success", "requests": 100, "rollback_readback": False}),
-            encoding="utf-8",
-        )
+        rollback_payload = json.loads(rollback_workload.read_text(encoding="utf-8"))
+        rollback_payload["rollback_readback"] = False
+        rollback_workload.write_text(json.dumps(rollback_payload), encoding="utf-8")
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         failed = subprocess.run(
             [sys.executable, str(SCRIPT), "--manifest", str(manifest_path), "--out", str(out)],
