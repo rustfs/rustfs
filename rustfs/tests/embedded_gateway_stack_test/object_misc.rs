@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Refusal-matrix rows and behaviour of migration batch E2 (rustfs/backlog#2765): DeleteObject.
+//! Refusal-matrix rows and behaviour of DeleteObject and RestoreObject.
 
 use super::bucket_configs::StatusCapture;
 use super::{
@@ -21,25 +21,259 @@ use super::{
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata as _;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{BucketVersioningStatus, RestoreRequest, VersioningConfiguration};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
 use rustfs_ecstore::api::error::is_err_object_not_found;
 use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
+use rustfs_ecstore::api::runtime::global_tier_config_mgr;
+use rustfs_ecstore::api::tier::test_util::{MockWarmBackend, register_mock_tier};
 use rustfs_s3_ops::S3Operation;
 use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 
-pub(crate) const MATRIX: &[MatrixRow] = &[MatrixRow {
-    operation: "DeleteObject",
-    metric: S3Operation::DeleteObject,
-    has_error_body: true,
-    call: delete_object,
-}];
+pub(crate) const MATRIX: &[MatrixRow] = &[
+    MatrixRow {
+        operation: "DeleteObject",
+        metric: S3Operation::DeleteObject,
+        has_error_body: true,
+        call: delete_object,
+    },
+    MatrixRow {
+        operation: "RestoreObject",
+        metric: S3Operation::RestoreObject,
+        has_error_body: true,
+        call: restore_object,
+    },
+];
 
 pub(super) const MATRIX_BUCKET: &str = "e2-delete-matrix";
 
 fn delete_object<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.delete_object().bucket(MATRIX_BUCKET).key("matrix-absent").send().await) })
+}
+
+const RESTORE_KEY: &str = "archive";
+const RESTORE_TIER: &str = "RESTORETIER";
+
+fn restore_object<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(
+            client
+                .restore_object()
+                .bucket(MATRIX_BUCKET)
+                .key(RESTORE_KEY)
+                .restore_request(RestoreRequest::builder().days(1).build())
+                .send()
+                .await,
+        )
+    })
+}
+
+pub(super) async fn seed_restore_object(bucket: &str, versioned: bool) -> (MockWarmBackend, Option<String>) {
+    let backend = register_mock_tier(&global_tier_config_mgr(), RESTORE_TIER).await;
+    let store = get_global_app_context().expect("embedded server context").object_store();
+    let uploaded = store
+        .put_object(
+            bucket,
+            RESTORE_KEY,
+            &mut PutObjReader::from_vec(b"archived bytes".to_vec()),
+            &ObjectOptions {
+                versioned,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write restore fixture");
+    let mut opts = ObjectOptions {
+        version_id: uploaded.version_id.map(|version| version.to_string()),
+        versioned,
+        mod_time: uploaded.mod_time,
+        ..Default::default()
+    };
+    opts.transition.status = "pending".to_owned();
+    opts.transition.tier = RESTORE_TIER.to_owned();
+    opts.transition.etag = uploaded.etag.unwrap_or_default();
+    store
+        .transition_object(bucket, RESTORE_KEY, &opts)
+        .await
+        .expect("transition restore fixture");
+    let archived = store
+        .get_object_info(bucket, RESTORE_KEY, &ObjectOptions::default())
+        .await
+        .expect("read transitioned fixture");
+    assert_eq!(archived.transitioned_object.status, "complete");
+    (backend, opts.version_id)
+}
+
+async fn restore_admits_once_and_renews_in_place(server: RustFSServer) {
+    const BUCKET: &str = "e2-restore";
+    create_bucket_in_the_store(BUCKET).await;
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    client
+        .put_bucket_versioning()
+        .bucket(BUCKET)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable fixture versioning");
+    let (backend, version) = seed_restore_object(BUCKET, true).await;
+    let version = version.expect("archive has a UUID version");
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(RESTORE_KEY)
+        .body(ByteStream::from_static(b"current before restore"))
+        .send()
+        .await
+        .expect("create a distinct current version before restore");
+    let restore = |days| {
+        client
+            .restore_object()
+            .bucket(BUCKET)
+            .key(RESTORE_KEY)
+            .version_id(&version)
+            .restore_request(RestoreRequest::builder().days(days).build())
+    };
+    client.put_bucket_policy().bucket(BUCKET).policy(format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3:RestoreObject","Resource":"arn:aws:s3:::{BUCKET}/{RESTORE_KEY}"}}]}}"#
+    )).send().await.expect("set explicit RestoreObject deny");
+    let denied = outcome(restore(1).send().await);
+    let untouched = client
+        .head_object()
+        .bucket(BUCKET)
+        .key(RESTORE_KEY)
+        .version_id(&version)
+        .send()
+        .await
+        .expect("head denied fixture");
+    assert_eq!(
+        (denied.err().map(|error| (error.status, error.code)), untouched.restore()),
+        (Some((Some(403), Some("AccessDenied".to_owned()))), None),
+        "denied restore changed admission"
+    );
+    assert_eq!(backend.get_count().await, 0, "denial triggered a tier read");
+    client
+        .delete_bucket_policy()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("remove explicit deny");
+
+    let get_barrier = backend.arm_get_barrier().await;
+    let status = StatusCapture::default();
+    let admitted = restore(1)
+        .customize()
+        .interceptor(status.clone())
+        .send()
+        .await
+        .expect("restore admission");
+    assert_eq!(status.take(), Some(200));
+    assert_eq!(admitted.request_charged().map(|value| value.as_str()), Some("requester"));
+    assert_eq!(admitted.restore_output_path(), None);
+    get_barrier.wait_until_paused().await;
+    let conflict = restore(1).send().await.expect_err("duplicate ongoing restore");
+    assert_eq!(refusal(&conflict), (Some("RestoreAlreadyInProgress".to_owned()), Some(409)));
+    let current = client
+        .put_object()
+        .bucket(BUCKET)
+        .key(RESTORE_KEY)
+        .body(ByteStream::from_static(b"intervening PUT"))
+        .send()
+        .await
+        .expect("PUT while copy-back is reading the tier");
+    let replacement_version = current.version_id().expect("replacement UUID version");
+    get_barrier.release();
+
+    let before = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let head = client
+                .head_object()
+                .bucket(BUCKET)
+                .key(RESTORE_KEY)
+                .version_id(&version)
+                .send()
+                .await
+                .expect("head restoring object");
+            if let Some(header) = head
+                .restore()
+                .filter(|header| header.starts_with("ongoing-request=\"false\""))
+            {
+                break header.to_owned();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("wait for restored copy");
+    let renewed = restore(2)
+        .customize()
+        .interceptor(status.clone())
+        .send()
+        .await
+        .expect("restore renewal");
+    assert_eq!(status.take(), Some(200));
+    assert_eq!(renewed.request_charged().map(|value| value.as_str()), Some("requester"));
+    assert_eq!(renewed.restore_output_path(), None);
+    let output = client
+        .get_object()
+        .bucket(BUCKET)
+        .key(RESTORE_KEY)
+        .version_id(&version)
+        .send()
+        .await
+        .expect("read renewed copy");
+    assert!(
+        output
+            .restore()
+            .is_some_and(|header| header.starts_with("ongoing-request=\"false\"") && header != before)
+    );
+    assert_eq!(
+        output
+            .body
+            .collect()
+            .await
+            .expect("collect renewed copy")
+            .into_bytes()
+            .as_ref(),
+        b"archived bytes"
+    );
+    assert_eq!(backend.get_count().await, 1, "renewal must reuse the local copy");
+    let current = client
+        .get_object()
+        .bucket(BUCKET)
+        .key(RESTORE_KEY)
+        .send()
+        .await
+        .expect("read intervening PUT");
+    assert_eq!(current.version_id(), Some(replacement_version));
+    assert_eq!(current.restore(), None);
+    assert_eq!(
+        current
+            .body
+            .collect()
+            .await
+            .expect("collect intervening PUT")
+            .into_bytes()
+            .as_ref(),
+        b"intervening PUT"
+    );
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_admits_and_renews_restore_object() {
+    with_stack(GATEWAY, restore_admits_once_and_renews_in_place);
+}
+
+#[test]
+fn the_legacy_stack_admits_and_renews_restore_object() {
+    with_stack(LEGACY, restore_admits_once_and_renews_in_place);
 }
 
 const DELETE_BUCKET: &str = "e2-delete-object";

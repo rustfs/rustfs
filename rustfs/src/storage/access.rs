@@ -4270,17 +4270,9 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        #[cfg(test)]
-        wait_for_object_generation_test_hook(&bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        access_owned::object_misc::authorize_restore_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
@@ -8459,6 +8451,16 @@ mod tests {
             .await
             .expect("read the recreated bucket incarnation");
         assert_ne!(authorized_incarnation_id, recreated_incarnation_id);
+        let replacement = b"recreated bucket object";
+        store
+            .put_object(
+                &bucket,
+                "object",
+                &mut crate::storage::PutObjReader::from_vec(replacement.to_vec()),
+                &crate::storage::ObjectOptions::default(),
+            )
+            .await
+            .expect("write the recreated bucket's object");
         resume_tx
             .send(())
             .expect("RestoreObject access should still be waiting at the test hook");
@@ -8467,20 +8469,46 @@ mod tests {
         result.expect("the equivalent policy should authorize RestoreObject without refreshing its snapshot");
         let mut opts = crate::storage::ObjectOptions::default();
         apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("apply the RestoreObject authorization guard");
-        assert_eq!(opts.expected_bucket_incarnation_id, Some(authorized_incarnation_id));
 
         // The RestoreObject usecase future is large enough that heap-pinning a
         // single future was not enough on Linux: the whole scenario runs on a
         // dedicated large stack (see the `#[test]` wrapper above) so unrelated
         // growth in bucket metadata futures cannot tip the test over.
-        let err = Box::pin(
+        let result = Box::pin(
             crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context)).execute_restore_object(req),
         )
-        .await
-        .expect_err("the old RestoreObject authorization must not reach the recreated bucket");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        .await;
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = store
+            .get_object_reader(&bucket, "object", None, HeaderMap::new(), &crate::storage::ObjectOptions::default())
+            .await
+            .expect("read the recreated bucket's object");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("read replacement bytes");
+        assert_eq!(
+            (
+                opts.expected_bucket_incarnation_id,
+                result.as_ref().err().map(|error| error.code()),
+                bytes.as_slice(),
+                reader.object_info.restore_ongoing
+            ),
+            (
+                Some(authorized_incarnation_id),
+                Some(&S3ErrorCode::NoSuchBucket),
+                replacement.as_slice(),
+                false
+            ),
+            "stale RestoreObject must refuse and preserve the recreated bucket's object"
+        );
+        drop(reader);
         store
-            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("clean up the recreated bucket");
     }

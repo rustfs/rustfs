@@ -346,7 +346,7 @@ pub(crate) mod access {
 }
 
 pub(crate) mod bucket {
-    use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
         RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
     };
     use std::sync::Arc;
@@ -393,7 +393,7 @@ pub(crate) mod bucket {
         crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
     }
 
-    // Remove this conversion when RestoreObject receives Gateway inputs.
+    // The legacy edge keeps values that its decoder permits before domain validation.
     pub(crate) fn restore_request_from_wire(request: s3s::dto::RestoreRequest) -> RestoreRequest {
         use rustfs_gateway_types::dto;
 
