@@ -23,6 +23,8 @@ members = [
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
+    "crates/cuobject", # NVIDIA cuObject S3-over-RDMA staging and transfers (optional)
+    "crates/nixl", # NIXL/UCX S3-over-RDMA server side (optional)
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
@@ -104,6 +106,8 @@ rustfs-config = { path = "./crates/config", version = "1.0.5" }
 rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.5" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.5" }
+rustfs-cuobject = { path = "crates/cuobject", version = "1.0.5" }
+rustfs-nixl = { path = "crates/nixl", version = "1.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.5" }
 rustfs-iam = { path = "crates/iam", version = "1.0.5" }
@@ -304,6 +308,7 @@ hostname = "0.4.2"
 ipnetwork = { version = "0.21.1" }
 lazy_static = "1.5.1"
 libc = "0.2.191"
+cuobject = "0.1.0"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"

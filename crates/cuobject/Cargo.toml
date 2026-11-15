@@ -1,0 +1,26 @@
+[package]
+name = "rustfs-cuobject"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "RustFS staging pool and transfers for NVIDIA cuObject S3-over-RDMA (GPUDirect object loading)"
+keywords = ["rdma", "cuobject", "gpudirect", "s3"]
+categories = ["network-programming"]
+documentation = "https://docs.rs/rustfs-cuobject/latest/rustfs_cuobject/"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true, optional = true }
+cuobject = { workspace = true, default-features = false, optional = true }
+parking_lot = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"], optional = true }
+
+[features]
+# Compiles the cuObject server bindings (needs the NVIDIA cuObject SDK).
+server = ["dep:bytes", "dep:cuobject", "cuobject/server", "dep:parking_lot", "dep:thiserror", "dep:tokio"]

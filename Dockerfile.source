@@ -170,10 +170,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ;; \
     esac
 
+# `RC_RELEASE=disabled` is reserved for local server-only validation when the
+# GitHub release asset is unavailable. The placeholder fails if invoked, so a
+# production image that needs the CLI must keep the default release download.
 # TARGETARCH is only provided by BuildKit. Fall back to TARGETPLATFORM (for
 # example set by docker-compose) and then to the build host, like the cargo
 # step above, so every path that builds this file passes a real architecture.
 RUN set -eu; \
+    if [ "${RC_RELEASE}" = "disabled" ]; then \
+    install -m 0755 /bin/false /usr/local/bin/rc; \
+    exit 0; \
+    fi; \
     rc_arch="${TARGETARCH:-}"; \
     if [ -z "${rc_arch}" ]; then \
     case "${TARGETPLATFORM:-}" in \

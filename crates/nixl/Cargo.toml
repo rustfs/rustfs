@@ -1,0 +1,34 @@
+[package]
+name = "rustfs-nixl"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "Server side of RustFS S3-over-RDMA GETs and PUTs on NIXL (UCX backend): GPU-side and CPU-side NICs by GID, no IPoIB"
+keywords = ["rdma", "nixl", "ucx", "gpudirect", "s3"]
+categories = ["network-programming"]
+documentation = "https://docs.rs/rustfs-nixl/latest/rustfs_nixl/"
+
+[lints]
+workspace = true
+
+# NIXL/UCX only exists on Linux, and nixl-sys needs a C++ compiler and libclang
+# to build. Everything is behind the `sys` feature (enabled by the rustfs `nixl`
+# feature) and Linux: without both the crate is empty, so no default or
+# workspace build touches vendor C/C++ tooling.
+[target.'cfg(target_os = "linux")'.dependencies]
+base64-simd = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+nixl-sys = { git = "https://github.com/ai-dynamo/nixl", tag = "v1.5.2", optional = true }
+parking_lot = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"], optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+# Compiles the NIXL bindings (nixl-sys: C++ compiler and libclang; the NIXL
+# libraries are optional, nixl-sys falls back to a dlopen stub without them).
+sys = ["dep:base64-simd", "dep:bytes", "dep:memmap2", "dep:nixl-sys", "dep:parking_lot", "dep:thiserror", "dep:tokio", "dep:tracing"]

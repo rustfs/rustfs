@@ -38,6 +38,9 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
             ..Default::default()
         },
     );
+    // These cycles persist real bucket checkpoints and source caches. Keep
+    // CI storage latency inside the production drain window after a count stop.
+    budget.use_production_drain_grace_for_tests();
     let (updates, mut receiver) = mpsc::channel(1);
     let result = tokio::time::timeout(
         Duration::from_secs(60),
@@ -123,13 +126,14 @@ async fn partial_bucket_with_a_certified_value_completes_the_cycle_as_pending() 
     assert!(dirty_usage_buckets_for_tests().is_empty());
 
     // Cycle 3: the object budget stops the hot bucket's walk and leaves a
-    // checkpoint under this cycle's plan; the cycle itself is incomplete.
+    // checkpoint under this cycle's plan. Its certified value is carried, so
+    // budget exhaustion leaves the bucket pending without blocking the cycle.
     for object in ["p4/third", "p5/third"] {
         put_fixture_object(&store, "hot-bucket", object).await;
     }
     record_dirty_usage_bucket("hot-bucket");
     wait_for_namespace_commit_tails(store.as_ref()).await;
-    let (result, _) = run_cycle(
+    let (result, third) = run_cycle(
         &store,
         3,
         CycleOptions {
@@ -140,7 +144,12 @@ async fn partial_bucket_with_a_certified_value_completes_the_cycle_as_pending() 
         },
     )
     .await;
-    assert_eq!(result.status, ScannerCycleStatus::Incomplete, "an exhausted budget stays incomplete");
+    let third = third.expect("a carried partial cycle publishes");
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(result.pending_dirty_usage_buckets(), 1);
+    assert_eq!(third.usage_snapshot_converged, Some(false));
+    assert_eq!(third.usage_snapshot_pending_buckets, vec!["hot-bucket".to_string()]);
+    assert_eq!(third.buckets_usage["hot-bucket"].objects_count, 4);
     let set = Arc::clone(&store.pools[0].disk_set[0]);
     let mut interrupted = DataUsageCache::default();
     interrupted
@@ -154,7 +163,7 @@ async fn partial_bucket_with_a_certified_value_completes_the_cycle_as_pending() 
     // is mixed coverage and returns Partial without exhausting any budget.
     // The set stands in with the last certified value and the cycle
     // completes with the bucket pending instead of being incomplete.
-    let (result, fourth) = run_cycle(&store, 4, complete_cycle(true, Some(&second))).await;
+    let (result, fourth) = run_cycle(&store, 4, complete_cycle(true, Some(&third))).await;
     let fourth = fourth.expect("a complete cycle publishes");
     assert_eq!(
         result.status,

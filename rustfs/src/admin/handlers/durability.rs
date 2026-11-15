@@ -15,7 +15,7 @@
 //! Per-bucket durability tier admin handlers (HP-5 phase 2, rustfs/backlog#938).
 //!
 //! A bucket can override the process-wide durability mode
-//! (`RUSTFS_DURABILITY_MODE`) with its own `strict` | `relaxed` | `none`
+//! (`RUSTFS_DURABILITY_MODE`) with its own `strict` | `file-sync` | `relaxed` | `none`
 //! tier. The override is stored in the bucket metadata (`durability.json`
 //! entry) and consumed by the disk layer at commit points. System buckets
 //! can never carry an override. See docs/operations/durability-modes.md.
@@ -94,7 +94,7 @@ fn normalize_mode(mode: &str) -> Result<String, rustfs_s3_types::S3Error> {
     } else {
         Err(s3_error!(
             InvalidArgument,
-            "invalid durability mode {:?}: expected strict|relaxed|none",
+            "invalid durability mode {:?}: expected strict|file-sync|relaxed|none",
             mode
         ))
     }
@@ -262,6 +262,7 @@ mod tests {
     #[test]
     fn normalize_mode_accepts_tiers_and_rejects_everything_else() {
         assert_eq!(normalize_mode("strict").unwrap(), "strict");
+        assert_eq!(normalize_mode(" FILE-SYNC ").unwrap(), "file-sync");
         assert_eq!(normalize_mode(" RELAXED ").unwrap(), "relaxed");
         assert_eq!(normalize_mode("none").unwrap(), "none");
         assert!(normalize_mode("").is_err());

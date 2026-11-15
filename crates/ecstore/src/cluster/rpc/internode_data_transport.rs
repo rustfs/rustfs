@@ -32,8 +32,8 @@ use crate::storage_api_contracts::internode::{
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
-    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
-    KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_NIXL,
+    INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{
     ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
@@ -65,7 +65,7 @@ const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
 const PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
 const PUT_FILE_LEGACY_CAPABILITY_TTL: Duration = Duration::from_secs(30);
-const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+pub(super) const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 const PUT_FILE_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_MSGPACK: &str = "application/msgpack";
@@ -91,7 +91,7 @@ fn unsupported_transport_message(transport: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PutFileCapabilityState {
+pub(super) enum PutFileCapabilityState {
     LegacyUntil(Instant),
     V1 { server_epoch: Uuid, revalidate_after: Instant },
 }
@@ -120,8 +120,8 @@ struct PutFileCapabilityFlight {
 }
 
 #[derive(Debug, Default)]
-struct PutFileCapabilityCacheState {
-    cached: Option<PutFileCapabilityState>,
+pub(super) struct PutFileCapabilityCacheState {
+    pub(super) cached: Option<PutFileCapabilityState>,
     generation: u64,
     in_flight: Option<PutFileCapabilityFlight>,
     rejected_server_epoch: Option<Uuid>,
@@ -130,12 +130,12 @@ struct PutFileCapabilityCacheState {
 // The registry lock is released before taking an entry lock. Entry guards cover
 // only cache transitions, never a probe or await; poll-based writers must be
 // able to reject an epoch atomically with those transitions.
-type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCapabilityCacheState>>;
+pub(super) type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCapabilityCacheState>>;
 
 static PUT_FILE_CAPABILITY_CACHE: LazyLock<parking_lot::RwLock<HashMap<String, PutFileCapabilityCacheEntry>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
-fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
+pub(super) fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
     if let Some(entry) = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned() {
         return entry;
     }
@@ -157,7 +157,7 @@ fn fresh_put_file_capability(state: Option<PutFileCapabilityState>, now: Instant
     }
 }
 
-fn reject_put_file_server_epoch(endpoint: &str, server_epoch: Uuid) {
+pub(super) fn reject_put_file_server_epoch(endpoint: &str, server_epoch: Uuid) {
     let entry = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned();
     if let Some(entry) = entry {
         let mut state = entry.write();
@@ -647,7 +647,7 @@ impl TcpHttpInternodeDataTransport {
         Ok(response)
     }
 
-    async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
+    pub(super) async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
         resolve_put_file_auth_capability(endpoint, || async {
             tokio::time::timeout(PUT_FILE_CAPABILITY_PROBE_TIMEOUT, self.probe_put_file_auth(endpoint))
                 .await
@@ -777,7 +777,7 @@ fn verify_put_file_capability_response(challenge: Uuid, body: &[u8]) -> Result<U
     Ok(response.server_epoch)
 }
 
-fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
+pub(super) fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
     format!(
         "{}{}?disk={}&volume={}&path={}&offset={}&length={}",
         request.endpoint,
@@ -827,7 +827,7 @@ fn build_put_file_capability_url(endpoint: &str, challenge: Uuid) -> String {
     )
 }
 
-struct PutFileAuthWriter<W> {
+pub(super) struct PutFileAuthWriter<W> {
     inner: W,
     url: String,
     nonce: Uuid,
@@ -840,7 +840,7 @@ struct PutFileAuthWriter<W> {
 }
 
 impl<W> PutFileAuthWriter<W> {
-    fn new(inner: W, url: String, nonce: Uuid, endpoint: String, server_epoch: Uuid) -> Self {
+    pub(super) fn new(inner: W, url: String, nonce: Uuid, endpoint: String, server_epoch: Uuid) -> Self {
         Self {
             inner,
             url,
@@ -1051,7 +1051,7 @@ fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challen
     )
 }
 
-fn json_headers() -> HeaderMap {
+pub(super) fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
     headers
@@ -1073,6 +1073,9 @@ fn build_internode_data_transport_result(
                 || transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_TCP) =>
         {
             Ok(Arc::new(TcpHttpInternodeDataTransport))
+        }
+        Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_NIXL) => {
+            Ok(Arc::new(super::nixl_internode::NixlInternodeDataTransport::from_env()))
         }
         Some(transport) => Err(unsupported_transport_message(transport)),
     }
@@ -2732,13 +2735,24 @@ mod tests {
     fn transport_config_known_backends_are_current_oss_values() {
         assert_eq!(
             KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
-            &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP]
+            &[
+                DEFAULT_INTERNODE_DATA_TRANSPORT,
+                INTERNODE_DATA_TRANSPORT_TCP,
+                INTERNODE_DATA_TRANSPORT_NIXL
+            ]
         );
 
         for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
             let transport = build_internode_data_transport(Some(configured)).unwrap();
+            // NIXL builds everywhere and serves reads over TCP/HTTP until a node
+            // installs its receive pool; every other known name is the TCP transport.
+            let expected = if *configured == INTERNODE_DATA_TRANSPORT_NIXL {
+                INTERNODE_DATA_TRANSPORT_NIXL
+            } else {
+                DEFAULT_INTERNODE_DATA_TRANSPORT
+            };
 
-            assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+            assert_eq!(transport.name(), expected);
         }
     }
 

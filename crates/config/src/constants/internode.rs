@@ -333,8 +333,130 @@ pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 /// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
 pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 
+/// Internode reads whose data moves over NIXL/UCX (InfiniBand rails or RoCE by
+/// LID/GID, no IP needed); requests, writes and walks stay on TCP/HTTP. Requires
+/// a binary built with the `nixl` feature and `RUSTFS_NIXL_ENABLE`; until the
+/// NIXL agent is up, and for any read it cannot serve, it uses TCP/HTTP.
+pub const INTERNODE_DATA_TRANSPORT_NIXL: &str = "nixl";
+
 /// Known internode transport backend names accepted by the config parser.
-pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP];
+pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[
+    DEFAULT_INTERNODE_DATA_TRANSPORT,
+    INTERNODE_DATA_TRANSPORT_TCP,
+    INTERNODE_DATA_TRANSPORT_NIXL,
+];
+
+/// Check the configured RDMA devices at startup and leave out any that is down,
+/// slower than its peers, or loses its link during a short watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_CHECK: &str = "RUSTFS_NIXL_DEVICE_CHECK";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_CHECK: bool = true;
+/// Leave out a device whose link dropped this many times more since boot than
+/// the quietest device of its link layer; 0 skips this test.
+pub const ENV_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: &str = "RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: u64 = 16;
+/// How long the startup device check watches the link counters; 0 skips the watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: &str = "RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: u64 = 3_000;
+
+/// NIXL internode reads in flight per remote shard stream.
+pub const ENV_RUSTFS_NIXL_INTERNODE_DEPTH: &str = "RUSTFS_NIXL_INTERNODE_DEPTH";
+pub const DEFAULT_RUSTFS_NIXL_INTERNODE_DEPTH: usize = 4;
+
+/// Whether S3 GETs and PUTs carrying the NIXL headers are served over NIXL/UCX
+/// S3-over-RDMA (requires a build with the `nixl` feature and libnixl). The
+/// pipeline settings below (`RUSTFS_CUOBJECT_GET_FANOUT*`, `_INFLIGHT_WRITES`,
+/// `_SHARD_ARENA_BYTES`) apply to this transport as well.
+pub const ENV_RUSTFS_NIXL_ENABLE: &str = "RUSTFS_NIXL_ENABLE";
+pub const DEFAULT_RUSTFS_NIXL_ENABLE: bool = false;
+/// This node's NIXL agent name; defaults to `rustfs-<first local endpoint host>`.
+pub const ENV_RUSTFS_NIXL_AGENT_NAME: &str = "RUSTFS_NIXL_AGENT_NAME";
+/// Comma-separated UCX device names (`mlx5_9,mlx5_10`; NIXL adds the port); empty lets UCX use every device.
+pub const ENV_RUSTFS_NIXL_UCX_DEVICES: &str = "RUSTFS_NIXL_UCX_DEVICES";
+/// UCX progress workers of the agent.
+pub const ENV_RUSTFS_NIXL_NUM_WORKERS: &str = "RUSTFS_NIXL_NUM_WORKERS";
+pub const DEFAULT_RUSTFS_NIXL_NUM_WORKERS: u32 = 1;
+/// Staging chunk size per transfer descriptor to a client.
+pub const ENV_RUSTFS_NIXL_CHUNK_BYTES: &str = "RUSTFS_NIXL_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Registered staging memory of the agent.
+pub const ENV_RUSTFS_NIXL_POOL_BYTES: &str = "RUSTFS_NIXL_POOL_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_POOL_BYTES: usize = 1024 * 1024 * 1024;
+/// Transfers in flight per node at most.
+pub const ENV_RUSTFS_NIXL_MAX_INFLIGHT: &str = "RUSTFS_NIXL_MAX_INFLIGHT";
+pub const DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT: usize = 256;
+/// A transfer that has not completed after this many seconds fails the request.
+pub const ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: &str = "RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS";
+pub const DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: u64 = 60;
+
+/// Whether S3 GETs carrying an `x-amz-rdma-token` are served over cuObject S3-over-RDMA
+/// (requires a build with the `cuobject` feature and libcuobjserver).
+pub const ENV_RUSTFS_CUOBJECT_ENABLE: &str = "RUSTFS_CUOBJECT_ENABLE";
+pub const DEFAULT_RUSTFS_CUOBJECT_ENABLE: bool = false;
+
+/// Comma-separated RDMA-capable IP addresses that get a cuObject server each.
+/// Defaults to the hosts of this node's own endpoints.
+pub const ENV_RUSTFS_CUOBJECT_ADDRS: &str = "RUSTFS_CUOBJECT_ADDRS";
+
+/// UDP/RDMA control port of the cuObject servers.
+pub const ENV_RUSTFS_CUOBJECT_PORT: &str = "RUSTFS_CUOBJECT_PORT";
+pub const DEFAULT_RUSTFS_CUOBJECT_PORT: u16 = 18515;
+
+/// Staging chunk size per RDMA write to a client.
+pub const ENV_RUSTFS_CUOBJECT_CHUNK_BYTES: &str = "RUSTFS_CUOBJECT_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Registered staging memory per cuObject server.
+pub const ENV_RUSTFS_CUOBJECT_POOL_BYTES: &str = "RUSTFS_CUOBJECT_POOL_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Dynamically connected initiators per cuObject server (concurrent client connections).
+/// Staging chunks (RDMA writes) kept in flight per GET, so decoding never waits
+/// for the write of the previous chunk; each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES: &str = "RUSTFS_CUOBJECT_INFLIGHT_WRITES";
+pub const DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES: usize = 3;
+
+/// Staging chunks (RDMA reads from the client buffer) kept in flight per
+/// RDMA PUT body, so ingest never waits on one chunk's round trip at a time;
+/// each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_PUT_READ_AHEAD: &str = "RUSTFS_CUOBJECT_PUT_READ_AHEAD";
+pub const DEFAULT_RUSTFS_CUOBJECT_PUT_READ_AHEAD: usize = 4;
+
+/// Concurrent erasure-block-aligned segments one cuObject GET is split into
+/// on the server (each segment decodes and RDMA-writes its own stripes), so a
+/// single stream keeps several stripes in flight. 1 disables the fan-out.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT: &str = "RUSTFS_CUOBJECT_GET_FANOUT";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT: usize = 8;
+
+/// Smallest segment worth its own producer (rounded up to whole erasure
+/// blocks): each segment pays a reader setup per part it touches, so short
+/// requests stay sequential.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: &str = "RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: u64 = 192 * 1024 * 1024;
+
+/// Segment producers a node runs across all its cuObject GETs: each new GET
+/// gets a fair share (budget / open GETs, at least 1, at most the fan-out)
+/// and never waits for one, so many-stream load degrades to sequential GETs
+/// instead of a reader-setup storm.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: &str = "RUSTFS_CUOBJECT_GET_FANOUT_BUDGET";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: usize = 16;
+
+/// Registered host memory the erasure decoder reads shards into so a
+/// cuObject GET can RDMA-write data shards straight from those buffers
+/// (zero-copy emit); 0 keeps the staging copy. Blocks are
+/// `RUSTFS_ERASURE_SHARD_BYTES` (4 MiB when unset); objects with larger
+/// shards fall back to heap buffers and the staging copy.
+pub const ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: &str = "RUSTFS_CUOBJECT_SHARD_ARENA_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: usize = 0;
+
+pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
+pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
+
+/// Complete cuObject transfers through the library's asynchronous mode: the
+/// write is submitted with a handle and the task waits on the channel's
+/// completion descriptor instead of holding a blocking thread for the whole
+/// transfer. `false` keeps one blocking library call per transfer.
+pub const ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: &str = "RUSTFS_CUOBJECT_ASYNC_TRANSFERS";
+pub const DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: bool = true;
 
 #[cfg(test)]
 mod tests {
@@ -465,6 +587,6 @@ mod tests {
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
-        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp"]);
+        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "nixl"]);
     }
 }

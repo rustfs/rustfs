@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::access::{RequestedObjectLegalHold, RequestedObjectLockRetention};
 use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
@@ -431,6 +432,12 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
 }
 
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
+}
+
+pub(crate) fn parse_object_lock_retention_native(
+    retention: Option<RequestedObjectLockRetention>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
@@ -450,8 +457,7 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         let now = OffsetDateTime::now_utc();
         // Validate retain_until_date is in the future (S3 requirement)
         // Only validate when both mode and date are provided (not clearing retention)
-        let retain_until_date = if let Some(date) = v.retain_until_date {
-            let retain_until = OffsetDateTime::from(date);
+        let retain_until_date = if let Some(retain_until) = v.retain_until {
             // Only validate future date when mode is set (not clearing retention)
             if !mode.is_empty() && retain_until <= now {
                 return Err(S3Error::with_message(
@@ -482,9 +488,15 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
 }
 
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
+}
+
+pub(crate) fn parse_object_lock_legal_hold_native(
+    legal_hold: Option<RequestedObjectLegalHold>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.status {
+        let status = match v.0 {
             Some(status) => match status.as_str() {
                 ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
                 _ => {

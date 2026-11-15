@@ -60,7 +60,7 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const SIGNATURE_HEADER: &str = "x-rustfs-signature";
+pub(crate) const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 pub const RPC_BACKGROUND_ADMISSION_HEADER: &str = "x-rustfs-rpc-background-admission";
 const RPC_BACKGROUND_ADMISSION_V1: &str = "v1";
 const RPC_BACKGROUND_ADMISSION_DOMAIN: &[u8] = b"rustfs-rpc-background-admission-v1\0";

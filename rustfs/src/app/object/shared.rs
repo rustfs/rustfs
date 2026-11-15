@@ -15,9 +15,11 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
 use crate::app::storage_api::s3::dto::{
-    ChecksumAlgorithm, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
-    ObjectLockRetentionMode, Range, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat,
+    ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, Range, ServerSideEncryption, StorageClass, Timestamp,
+    TimestampFormat,
 };
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
@@ -608,28 +610,25 @@ pub(crate) fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>
 }
 
 /// Extract trailing-header checksum values, overriding the corresponding input fields.
-pub(super) fn apply_trailing_checksums(
+pub(super) fn apply_trailing_checksums_native(
     algorithm: Option<&str>,
-    trailing_headers: &Option<s3s::TrailingHeaders>,
+    trailing_headers: &Option<rustfs_rio::SharedTrailerSource>,
     checksums: &mut PutObjectChecksums,
 ) {
     let Some(alg) = algorithm else { return };
-    let Some(checksum_str) = trailing_headers.as_ref().and_then(|trailer| {
-        let key = match alg {
-            ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-            ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-            ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-            ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-            ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
-            _ => return None,
-        };
-        trailer.read(|headers| {
-            headers
-                .get(key.unwrap_or_default())
-                .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
-        })
-    }) else {
-        return;
+    let Some(trailer) = trailing_headers.as_ref() else { return };
+    let key = match alg {
+        ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+        ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+        ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+        ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+        ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+        _ => return,
+    };
+    let checksum_str = match trailer.lookup(key.unwrap_or_default()) {
+        rustfs_rio::TrailerValue::Pending => return,
+        rustfs_rio::TrailerValue::Missing => None,
+        rustfs_rio::TrailerValue::Present(value) => Some(value),
     };
 
     match alg {
@@ -852,15 +851,33 @@ pub(crate) fn build_put_like_object_lock_metadata(
     object_lock_mode: Option<ObjectLockMode>,
     object_lock_retain_until_date: Option<Timestamp>,
 ) -> S3Result<Option<HashMap<String, String>>> {
+    build_put_like_object_lock_metadata_native(
+        bucket,
+        object_lock_config_state,
+        object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+        object_lock_mode.map(|value| value.as_str().to_owned()),
+        object_lock_retain_until_date.map(time::OffsetDateTime::from),
+    )
+}
+
+pub(crate) fn build_put_like_object_lock_metadata_native(
+    bucket: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
+    object_lock_legal_hold_status: Option<String>,
+    object_lock_mode: Option<String>,
+    object_lock_retain_until_date: Option<time::OffsetDateTime>,
+) -> S3Result<Option<HashMap<String, String>>> {
     if object_lock_legal_hold_status.is_none() && object_lock_mode.is_none() && object_lock_retain_until_date.is_none() {
         return Ok(None);
     }
 
     let retention = match (object_lock_mode, object_lock_retain_until_date) {
-        (Some(mode), Some(retain_until_date)) => Some(ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
-            retain_until_date: Some(retain_until_date),
-        }),
+        (Some(mode), Some(retain_until_date)) => {
+            Some(crate::app::storage_api::object_usecase::access::RequestedObjectLockRetention {
+                mode: Some(mode),
+                retain_until: Some(retain_until_date),
+            })
+        }
         (Some(_), None) | (None, Some(_)) => {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -872,10 +889,11 @@ pub(crate) fn build_put_like_object_lock_metadata(
 
     validate_bucket_object_lock_enabled_state(bucket, object_lock_config_state)?;
 
-    let mut eval_metadata = parse_object_lock_retention(retention)?;
-    eval_metadata.extend(parse_object_lock_legal_hold(
-        object_lock_legal_hold_status.map(|status| ObjectLockLegalHold { status: Some(status) }),
-    )?);
+    let mut eval_metadata = parse_object_lock_retention_native(retention)?;
+    eval_metadata
+        .extend(parse_object_lock_legal_hold_native(object_lock_legal_hold_status.map(|status| {
+            crate::app::storage_api::object_usecase::access::RequestedObjectLegalHold(Some(status))
+        }))?);
 
     if eval_metadata.is_empty() {
         return Ok(None);
@@ -1148,8 +1166,12 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(
     if_none_match: Option<&s3s::dto::ETagCondition>,
     headers: &HeaderMap,
 ) -> S3Result<()> {
+    reject_non_wildcard_write_if_none_match_native(matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_))), headers)
+}
+
+pub(crate) fn reject_non_wildcard_write_if_none_match_native(specific_if_none_match: bool, headers: &HeaderMap) -> S3Result<()> {
     // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
-    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+    if specific_if_none_match
         || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
             value.to_str().map_or(true, |value| {
                 let value = value.trim();

@@ -994,7 +994,7 @@ async fn write_delete_rollback_files(
     else {
         return Ok(None);
     };
-    let sync = effective_durability(volume).syncs_commit_metadata();
+    let sync = effective_durability(volume).syncs_recovery_protocol_state();
     let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
     let io_root = io_root.to_path_buf();
     let object_dir_buf = object_dir.to_path_buf();
@@ -1249,7 +1249,7 @@ async fn restore_delete_rollback_with_namespace_owner(
                     Err(err) => return Err(to_file_error(err).into()),
                 }
             }
-            if effective_durability(volume).syncs_commit_metadata() {
+            if effective_durability(volume).syncs_recovery_protocol_state() {
                 os::fsync_dir_with_owner(&dst, namespace_owner.clone())
                     .await
                     .map_err(to_file_error)?;
@@ -1306,7 +1306,7 @@ async fn restore_delete_rollback_with_namespace_owner(
     }
     delete_recovery::restore_barrier(volume, object_dir, rollback_dir).await?;
     // Persist both sides of the restore rename before discarding its evidence.
-    if effective_durability(volume).syncs_commit_metadata() {
+    if effective_durability(volume).syncs_recovery_protocol_state() {
         os::fsync_dir_with_owner(object_dir, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;
@@ -1319,7 +1319,7 @@ async fn restore_delete_rollback_with_namespace_owner(
             Err(err) => return Err(to_file_error(err).into()),
         }
     }
-    if effective_durability(volume).syncs_commit_metadata() {
+    if effective_durability(volume).syncs_recovery_protocol_state() {
         os::fsync_dir_with_owner(&rollback_path, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;
@@ -1371,7 +1371,7 @@ async fn remove_version_delete_markers(
         }
         // Also sync on retry: a previous unlink may have succeeded before its
         // directory sync failed. Keep the journal until those removals persist.
-        if effective_durability(volume).syncs_commit_metadata() {
+        if effective_durability(volume).syncs_recovery_protocol_state() {
             os::fsync_dir_with_owner(&entry.path(), namespace_owner.clone())
                 .await
                 .map_err(to_file_error)?;
@@ -2022,7 +2022,7 @@ const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy"
 const ENV_RUSTFS_DRIVE_SYNC_ENABLE: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
 const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
 
-/// Durability tier for object data-path writes: `strict` (default) | `relaxed` | `none`.
+/// Durability tier for object data-path writes: `strict` (default) | `file-sync` | `relaxed` | `none`.
 /// See docs/operations/durability-modes.md for the power-loss guarantee matrix.
 const ENV_RUSTFS_DURABILITY_MODE: &str = "RUSTFS_DURABILITY_MODE";
 
@@ -2248,10 +2248,15 @@ pub(crate) enum DurabilityMode {
     /// Every commit point is fsynced: shard/part contents, xl.meta contents,
     /// rollback backups, and the directory entries of commit renames.
     Strict,
+    /// Payload and metadata file contents are fdatasynced, while ordinary
+    /// object commit and newly created ancestor directory entries are left to
+    /// the filesystem. Recovery protocol state retains strict barriers.
+    FileSync,
     /// Object payload bytes (erasure shard files, multipart part files) are
     /// still fdatasynced before the commit rename, but metadata commits
     /// (xl.meta contents, rollback backups, directory entries) are left to
-    /// the page cache. Aligned with MinIO's default durability posture.
+    /// the page cache. This is weaker than MinIO's default for xl.meta, which
+    /// syncs the metadata file contents but not each commit parent directory.
     Relaxed,
     /// No fsync on the object data path at all. System-critical namespaces
     /// are still pinned to `Strict`.
@@ -2266,6 +2271,7 @@ impl DurabilityMode {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "strict" => Some(Self::Strict),
+            "file-sync" => Some(Self::FileSync),
             "relaxed" => Some(Self::Relaxed),
             "none" => Some(Self::None),
             _ => None,
@@ -2275,6 +2281,7 @@ impl DurabilityMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
+            Self::FileSync => "file-sync",
             Self::Relaxed => "relaxed",
             Self::None => "none",
             Self::LegacyOff => "legacy-off",
@@ -2284,13 +2291,50 @@ impl DurabilityMode {
     /// Whether object payload bytes (erasure shard files, multipart part
     /// files) must be fdatasynced at commit points.
     fn syncs_data_shards(self) -> bool {
-        matches!(self, Self::Strict | Self::Relaxed)
+        matches!(self, Self::Strict | Self::FileSync | Self::Relaxed)
     }
 
-    /// Whether metadata commits must be fsynced: xl.meta contents, rollback
-    /// backups, and the directory entries created by commit renames.
-    fn syncs_commit_metadata(self) -> bool {
+    /// Whether metadata file contents, including xl.meta and rollback
+    /// backups, must be fdatasynced before publication.
+    fn syncs_metadata_files(self) -> bool {
+        matches!(self, Self::Strict | Self::FileSync)
+    }
+
+    /// Whether ordinary commit rename directory entries and newly created
+    /// ancestor directories must be fsynced before acknowledgement.
+    fn syncs_commit_directories(self) -> bool {
         matches!(self, Self::Strict)
+    }
+
+    /// Whether a target has the complete file-and-directory durability proof
+    /// required by recovery protocols that may otherwise resync it.
+    fn fully_syncs_commit_target(self) -> bool {
+        self.syncs_metadata_files() && self.syncs_commit_directories()
+    }
+
+    /// Whether recovery journals, witnesses, and protocol state must retain
+    /// their complete barriers. This is independent from ordinary object
+    /// namespace publication so a future file-only tier cannot weaken
+    /// crash-recovery ordering.
+    fn syncs_recovery_protocol_state(self) -> bool {
+        matches!(self, Self::Strict | Self::FileSync)
+    }
+
+    fn recovery_sync_mode(self) -> SyncMode {
+        if self.syncs_recovery_protocol_state() {
+            SyncMode::FileAndDir
+        } else {
+            SyncMode::None
+        }
+    }
+
+    fn metadata_sync_mode(self) -> SyncMode {
+        match (self.syncs_metadata_files(), self.syncs_commit_directories()) {
+            (true, true) => SyncMode::FileAndDir,
+            (true, false) => SyncMode::FileOnly,
+            (false, false) => SyncMode::None,
+            (false, true) => SyncMode::FileAndDir,
+        }
     }
 }
 
@@ -2310,7 +2354,7 @@ fn resolve_durability_mode(mode_env: Option<String>, legacy_drive_sync_enabled: 
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
             value = %raw,
-            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|relaxed|none, falling back to the legacy drive-sync switch"
+            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|file-sync|relaxed|none, falling back to the legacy drive-sync switch"
         );
     }
     if legacy_drive_sync_enabled {
@@ -3912,23 +3956,19 @@ fn validate_format_control_publication(
 
 /// Durability mode for `write_all_internal`.
 ///
-/// `FileOnly` is reserved for tmp files the caller immediately renames away.
-/// The safe-rename recipe (file content fdatasync -> rename -> fsync of the
-/// destination parent directory) never needs the tmp directory entry to be
-/// durable: the rename removes it, and a crash before the rename means the
-/// operation was never acknowledged, so there is nothing to recover. Files
-/// that stay where they are written (format.json via `write_all_public`, the
-/// old-metadata rollback backup in `rename_data`, ...) must use `FileAndDir`
-/// so both the contents and the new directory entry survive power loss.
+/// For strict durability, `FileOnly` is used for tmp files the caller
+/// immediately renames away and follows with a destination-parent sync. The
+/// tmp directory entry need not be durable because the rename removes it and
+/// a crash before publication was never acknowledged. A file-only durability
+/// tier may also deliberately omit the later namespace barrier while still
+/// requiring the file inode contents to reach stable storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncMode {
     /// No fsync; durability is not required (or drive sync is disabled).
     None,
     /// fdatasync the file contents, then fsync its parent directory.
     FileAndDir,
-    /// fdatasync only the file contents. Only valid when the caller renames
-    /// the file away right after the write and fsyncs the rename
-    /// destination's parent directory before acknowledging.
+    /// fdatasync only the file contents.
     FileOnly,
 }
 
@@ -10720,7 +10760,7 @@ impl LocalDisk {
             // decision and also covers inline objects with no data directory.
             let receipt_path = transaction_path.join(DELETE_QUORUM_COMMITTED_FILE);
             let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, namespace_owner.clone()).await;
-            let sync = effective_durability(volume).syncs_commit_metadata();
+            let sync = effective_durability(volume).syncs_recovery_protocol_state();
             os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 let receipt = match std::fs::OpenOptions::new().write(true).create_new(true).open(&receipt_path) {
                     Ok(receipt) => receipt,
@@ -10754,7 +10794,7 @@ impl LocalDisk {
                     Err(err) => return Err(to_file_error(err).into()),
                 }
             }
-            if effective_durability(volume).syncs_commit_metadata() {
+            if effective_durability(volume).syncs_recovery_protocol_state() {
                 os::fsync_dir_with_owner(&self.io_get_object_path(volume, &path)?, namespace_owner.clone())
                     .await
                     .map_err(to_file_error)?;
@@ -10853,7 +10893,7 @@ impl LocalDisk {
             }
             let metadata_path = self.io_get_object_path(volume, &format!("{object}/{STORAGE_FORMAT_FILE}"))?;
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, Some(owner)).await;
-            let sync = effective_durability(volume).syncs_commit_metadata();
+            let sync = effective_durability(volume).syncs_recovery_protocol_state();
             let result = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 if let Some(check) = &multipart_check {
                     check.callback()()?;
@@ -10913,7 +10953,7 @@ impl LocalDisk {
             // after classification and must never be recursively removed.
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner.clone()).await;
             let data_path = file_path.clone();
-            let sync = effective_durability(volume).syncs_commit_metadata();
+            let sync = effective_durability(volume).syncs_recovery_protocol_state();
             let keep_rollback_witnesses = opt.recoverable_delete;
             let recovery_scope = delete_recovery::recovery_operation_scope();
             os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
@@ -12070,7 +12110,7 @@ impl LocalDisk {
         }
         // fsync_dir_std is a no-op outside Unix, so those platforms cannot
         // yet prove this repair's durable publication requirement.
-        if !cfg!(unix) || !effective_durability(volume).syncs_commit_metadata() {
+        if !cfg!(unix) || !effective_durability(volume).fully_syncs_commit_target() {
             return Err(DiskError::other(
                 "transition reconciliation requires Unix directory sync and enabled bucket metadata durability",
             ));
@@ -12176,7 +12216,9 @@ impl LocalDisk {
 
         let durability = effective_durability(volume);
 
-        let do_sync = sync && durability.syncs_commit_metadata();
+        let sync_file = sync && durability.syncs_metadata_files();
+        let sync_directory = sync && durability.syncs_commit_directories();
+        let uses_sync_lane = sync_file || sync_directory;
         if let Some(ref admission) = admission
             && !admission.is_initial()
         {
@@ -12186,7 +12228,7 @@ impl LocalDisk {
             let precondition = admission.as_ref().map(|a| a.precondition());
             let root = self.publication_root.clone();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
-            os::run_blocking_namespace_operation_with_sync(lease, do_sync, move || {
+            os::run_blocking_namespace_operation_with_sync(lease, uses_sync_lane, move || {
                 let _index_pin = prepared_index.map(|record| record.run_std()).transpose()?;
                 #[cfg(test)]
                 if let Some(pin) = &_index_pin {
@@ -12197,7 +12239,7 @@ impl LocalDisk {
                 run_owned_file_before_open(&tmp_file_path);
                 let mut file = root.create_truncate(&tmp_file_path)?;
                 std::io::Write::write_all(&mut file, buf.as_ref())?;
-                if do_sync {
+                if sync_file {
                     file.sync_data()?;
                 }
                 drop(file);
@@ -12207,7 +12249,7 @@ impl LocalDisk {
                     &volume_dir,
                     &root,
                     precondition.as_deref(),
-                    do_sync,
+                    sync_directory,
                 )
             })
             .await
@@ -12218,9 +12260,9 @@ impl LocalDisk {
         // The tmp file is renamed to its final location right below, so only
         // its contents must be durable here (SyncMode::FileOnly): the rename
         // drops the tmp directory entry, and the destination parent directory
-        // is fsynced after the rename. Both are metadata commits, so relaxed
-        // tiers skip them.
-        let tmp_sync = if do_sync { SyncMode::FileOnly } else { SyncMode::None };
+        // is fsynced after the rename when the selected durability tier
+        // requires namespace persistence.
+        let tmp_sync = if sync_file { SyncMode::FileOnly } else { SyncMode::None };
         self.write_all_internal(&tmp_file_path, buf, tmp_sync, &tmp_volume_dir)
             .await?;
 
@@ -12245,13 +12287,13 @@ impl LocalDisk {
             &self.publication_root,
             publication_owner,
             admission.as_ref().map(|admission| admission.precondition()),
-            admission.is_some() && sync && durability.syncs_commit_metadata(),
+            admission.is_some() && sync_directory,
         )
         .await?;
 
         if sync
             && admission.is_none()
-            && durability.syncs_commit_metadata()
+            && sync_directory
             && let Some(parent) = file_path.parent()
         {
             os::fsync_dir_with_owner(parent, namespace_owner)
@@ -12285,11 +12327,8 @@ impl LocalDisk {
         // rename follows — so the new directory entry must be fsynced too.
         // System-critical volumes are pinned to strict by effective_durability;
         // only the legacy full-off switch (historical semantics) skips this.
-        let sync = if effective_durability(volume).syncs_commit_metadata() {
-            SyncMode::FileAndDir
-        } else {
-            SyncMode::None
-        };
+        let durability = effective_durability(volume);
+        let sync = durability.metadata_sync_mode();
         self.write_all_private(volume, path, data, sync, &volume_dir).await?;
 
         Ok(())
@@ -14054,7 +14093,7 @@ impl LocalDisk {
                 #[cfg(test)]
                 run_owned_file_before_open(&marker_path);
                 let marker = std::fs::File::create(marker_path)?;
-                let sync = effective_durability(&volume).syncs_commit_metadata();
+                let sync = effective_durability(&volume).syncs_recovery_protocol_state();
                 if sync {
                     marker.sync_all()?;
                 }
@@ -14070,7 +14109,7 @@ impl LocalDisk {
             return Ok(true);
         }
         let marker = File::create(marker_path).await.map_err(to_file_error)?;
-        if effective_durability(volume).syncs_commit_metadata() {
+        if effective_durability(volume).syncs_recovery_protocol_state() {
             marker.sync_all().await.map_err(to_file_error)?;
             os::fsync_dir(&data_path).await.map_err(to_file_error)?;
         }
@@ -14143,7 +14182,7 @@ impl LocalDisk {
             DELETE_DATA_DIR_MARKER_PREFIX
         };
         let committed_name = format!("{prefix}{rollback_dir}");
-        let sync = effective_durability(volume).syncs_commit_metadata();
+        let sync = effective_durability(volume).syncs_recovery_protocol_state();
         for entry_path in matching_dirs {
             let reserved_path = entry_path.join(&reserved_name);
             match os::rename_with_namespace_owner(&reserved_path, &entry_path.join(&committed_name), namespace_owner.clone())
@@ -15062,7 +15101,7 @@ impl DiskAPI for LocalDisk {
 
             let file_path = self.io_get_object_path(volume, path)?;
             let path = path.to_string();
-            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            let sync_metadata = effective_durability(volume).syncs_recovery_protocol_state();
             os::record_native_publication(&file_path);
             #[cfg(target_os = "linux")]
             let mount_lease = self.mount_lease.clone();
@@ -15195,7 +15234,7 @@ impl DiskAPI for LocalDisk {
         #[cfg(windows)]
         {
             let file_path = self.io_get_object_path(volume, path)?;
-            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            let sync_metadata = effective_durability(volume).syncs_recovery_protocol_state();
             let publication_root = self.publication_root.clone();
             return Ok(spawn_blocking_with_disk_io_permit(None, move || {
                 #[cfg(test)]
@@ -15505,7 +15544,7 @@ impl DiskAPI for LocalDisk {
         } else {
             None
         };
-        let sync = durability.syncs_data_shards() || durability.syncs_commit_metadata();
+        let sync = durability.syncs_data_shards() || durability.syncs_metadata_files() || durability.syncs_commit_directories();
         let publication_root = self.publication_root.clone();
         let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         if let Some(ref source) = admission_source {
@@ -15712,7 +15751,7 @@ impl DiskAPI for LocalDisk {
                             &dst_volume_dir,
                             &publication_root,
                             precondition.as_deref(),
-                            durability.syncs_commit_metadata() && !same_parent,
+                            durability.syncs_commit_directories() && !same_parent,
                         )
                     {
                         return Ok(Err(to_file_error(err).into()));
@@ -15783,7 +15822,7 @@ impl DiskAPI for LocalDisk {
                     let new_meta_path = staging_path.join(PART_TRANSACTION_NEW_META);
                     let mut new_meta = create_new_in_dir_fd(txn_dir_fd.as_deref(), PART_TRANSACTION_NEW_META, &new_meta_path)?;
                     std::io::Write::write_all(&mut new_meta, &meta)?;
-                    if durability.syncs_commit_metadata() {
+                    if durability.syncs_metadata_files() {
                         new_meta.sync_data()?;
                     }
                     // Windows rejects renaming a directory while one of its children is
@@ -15796,7 +15835,7 @@ impl DiskAPI for LocalDisk {
                         PART_TRANSACTION_PUBLISH_META,
                         &staging_path.join(PART_TRANSACTION_PUBLISH_META),
                     );
-                    let sync_overwrite_backup = durability.syncs_commit_metadata() && (had_old_data || had_old_meta);
+                    let sync_overwrite_backup = durability.syncs_recovery_protocol_state() && (had_old_data || had_old_meta);
                     if sync_overwrite_backup {
                         os::fsync_directory_handle_std(&staging_path, txn_dir_fd.as_deref())?;
                     }
@@ -15901,7 +15940,7 @@ impl DiskAPI for LocalDisk {
             }
         };
         let durability = effective_durability(volume);
-        let sync = durability.syncs_commit_metadata();
+        let sync = durability.syncs_recovery_protocol_state();
         let part_number = current_data_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -15932,7 +15971,7 @@ impl DiskAPI for LocalDisk {
                 if let Err(err) = std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []) {
                     return Ok(Err(to_file_error(err).into()));
                 }
-                if durability.syncs_commit_metadata()
+                if durability.syncs_recovery_protocol_state()
                     && let Err(err) = os::fsync_directory_handle_std(&transaction_path, txn_dir_fd.as_deref())
                 {
                     return Ok(Err(to_file_error(err).into()));
@@ -15953,7 +15992,7 @@ impl DiskAPI for LocalDisk {
                 ) {
                     return Ok(Err(to_file_error(err).into()));
                 }
-                if durability.syncs_commit_metadata()
+                if durability.syncs_recovery_protocol_state()
                     && let Some(parent) = current_data_path.parent()
                     && let Err(err) = os::fsync_directory_handle_std(parent, txn_parent_fd.as_deref())
                 {
@@ -16006,7 +16045,7 @@ impl DiskAPI for LocalDisk {
             ) {
                 return Ok(Err(to_file_error(err).into()));
             }
-            if durability.syncs_commit_metadata()
+            if durability.syncs_recovery_protocol_state()
                 && let Err(err) = os::fsync_directory_handle_std(parent, txn_parent_fd.as_deref())
             {
                 return Ok(Err(to_file_error(err).into()));
@@ -16178,7 +16217,9 @@ impl DiskAPI for LocalDisk {
         // its directory entry must be durable before we return. Relaxed keeps the
         // part payload fdatasync but leaves the directory entry to the page cache.
         let durability = effective_durability(dst_volume);
-        let sync = (durability.syncs_data_shards() && !src_is_dir) || durability.syncs_commit_metadata();
+        let sync = (durability.syncs_data_shards() && !src_is_dir)
+            || durability.syncs_metadata_files()
+            || durability.syncs_commit_directories();
         let publication_root = self.publication_root.clone();
         let src_file_for_cleanup = src_file_path.clone();
         let src_volume_for_cleanup = src_volume_dir.clone();
@@ -16331,7 +16372,7 @@ impl DiskAPI for LocalDisk {
                         rename_started,
                     );
                     rename_res.map_err(to_file_error)?;
-                    if durability.syncs_commit_metadata() && transaction_publish_meta.is_none() {
+                    if durability.syncs_commit_directories() && transaction_publish_meta.is_none() {
                         let parent = dst_file_path
                             .parent()
                             .ok_or_else(|| std::io::Error::other("source metadata parent is missing"))
@@ -16352,7 +16393,7 @@ impl DiskAPI for LocalDisk {
                         &dst_volume_dir,
                         &publication_root,
                         precondition.as_deref(),
-                        durability.syncs_commit_metadata() && transaction_publish_meta.is_none(),
+                        durability.syncs_commit_directories() && transaction_publish_meta.is_none(),
                     )
                     .map_err(to_file_error)?;
                 }
@@ -16394,7 +16435,7 @@ impl DiskAPI for LocalDisk {
                             rename_started,
                         );
                         rename_res.map_err(to_file_error)?;
-                        if durability.syncs_commit_metadata() {
+                        if durability.syncs_commit_directories() {
                             let parent = dst_meta_path
                                 .parent()
                                 .ok_or_else(|| std::io::Error::other("source metadata parent is missing"))
@@ -16415,7 +16456,7 @@ impl DiskAPI for LocalDisk {
                             &dst_volume_dir,
                             &publication_root,
                             precondition.as_deref(),
-                            durability.syncs_commit_metadata(),
+                            durability.syncs_commit_directories(),
                         )
                         .map_err(to_file_error)?;
                     }
@@ -16714,7 +16755,7 @@ impl DiskAPI for LocalDisk {
             .map_err(to_file_error)?;
         }
         self.rename_file(src_volume, src_path, dst_volume, dst_path).await?;
-        if durability.syncs_commit_metadata() {
+        if durability.syncs_commit_directories() {
             os::fsync_dir_with_owner(destination.parent().ok_or(DiskError::InvalidPath)?, usage_owner.clone())
                 .await
                 .map_err(to_file_error)?;
@@ -17298,48 +17339,55 @@ impl DiskAPI for LocalDisk {
                 let xl_file_path = self.io_get_object_path(volume, &xl_rel_path)?;
                 check_path_length(xl_file_path.to_string_lossy().as_ref())?;
                 let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
-                let sync = !opts.no_persistence && effective_durability(volume).syncs_commit_metadata();
+                let durability = effective_durability(volume);
+                let sync_file = !opts.no_persistence && durability.syncs_metadata_files();
+                let sync_directory = !opts.no_persistence && durability.syncs_commit_directories();
+                let uses_sync_lane = sync_file || sync_directory;
                 let replace_user_metadata = opts.replace_user_metadata;
                 let has_version_id = fi.version_id.is_some();
                 let publication_root = self.publication_root.clone();
                 let lease = os::acquire_namespace_mutation_lease_with_owner(&xl_file_path, namespace_owner).await;
-                return os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
-                    let buf = match std::fs::read(&xl_file_path) {
-                        Ok(buf) => buf,
-                        Err(err) if err.kind() == ErrorKind::NotFound && has_version_id => {
+                return os::run_blocking_namespace_operation_with_sync(
+                    lease,
+                    uses_sync_lane,
+                    move || -> std::io::Result<Result<()>> {
+                        let buf = match std::fs::read(&xl_file_path) {
+                            Ok(buf) => buf,
+                            Err(err) if err.kind() == ErrorKind::NotFound && has_version_id => {
+                                return Ok(Err(DiskError::FileVersionNotFound));
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if !FileMeta::is_xl2_v1_format(&buf) {
                             return Ok(Err(DiskError::FileVersionNotFound));
                         }
-                        Err(err) => return Err(err),
-                    };
-                    if !FileMeta::is_xl2_v1_format(&buf) {
-                        return Ok(Err(DiskError::FileVersionNotFound));
-                    }
-                    let wbuf = match FileMeta::load(&buf).and_then(|mut xl_meta| {
-                        xl_meta.update_object_version_with_opts(fi, replace_user_metadata)?;
-                        xl_meta.marshal_msg()
-                    }) {
-                        Ok(wbuf) => wbuf,
-                        Err(err) => return Ok(Err(err.into())),
-                    };
-                    if let Some(parent) = tmp_file_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
-                    std::io::Write::write_all(&mut tmp_file, &wbuf)?;
-                    if sync && !wbuf.is_empty() {
-                        tmp_file.sync_data()?;
-                    }
-                    drop(tmp_file);
-                    os::rename_all_with_precondition_and_parent_sync_std(
-                        &tmp_file_path,
-                        &xl_file_path,
-                        &volume_dir,
-                        &publication_root,
-                        None,
-                        sync,
-                    )?;
-                    Ok(Ok(()))
-                })
+                        let wbuf = match FileMeta::load(&buf).and_then(|mut xl_meta| {
+                            xl_meta.update_object_version_with_opts(fi, replace_user_metadata)?;
+                            xl_meta.marshal_msg()
+                        }) {
+                            Ok(wbuf) => wbuf,
+                            Err(err) => return Ok(Err(err.into())),
+                        };
+                        if let Some(parent) = tmp_file_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
+                        std::io::Write::write_all(&mut tmp_file, &wbuf)?;
+                        if sync_file && !wbuf.is_empty() {
+                            tmp_file.sync_data()?;
+                        }
+                        drop(tmp_file);
+                        os::rename_all_with_precondition_and_parent_sync_std(
+                            &tmp_file_path,
+                            &xl_file_path,
+                            &volume_dir,
+                            &publication_root,
+                            None,
+                            sync_directory,
+                        )?;
+                        Ok(Ok(()))
+                    },
+                )
                 .await
                 .map_err(to_file_error)?;
             }
@@ -22742,6 +22790,23 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_rename_data_file_sync_new_object_skips_ancestor_fsync() {
+        let bucket = "new-object-bucket-file-sync";
+        let (disk, _dir) = commit_new_object(DurabilityMode::FileSync, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "file-sync must omit the ordinary prefix-directory barrier"
+        );
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "file-sync must omit the ordinary bucket-directory barrier"
+        );
+    }
+
+    #[tokio::test]
     async fn windows_and_unix_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
         // The inline commit path (fi.data present) has the same mkdir gap as the
         // non-inline path: a first PUT under a new prefix must fsync the newly
@@ -24449,6 +24514,7 @@ mod test {
         assert_eq!(resolve_durability_mode(None, false), DurabilityMode::LegacyOff);
         // Explicit mode wins over the legacy switch.
         assert_eq!(resolve_durability_mode(Some("strict".into()), false), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("file-sync".into()), false), DurabilityMode::FileSync);
         assert_eq!(resolve_durability_mode(Some("relaxed".into()), true), DurabilityMode::Relaxed);
         assert_eq!(resolve_durability_mode(Some("none".into()), true), DurabilityMode::None);
         // Case- and whitespace-tolerant.
@@ -24463,15 +24529,38 @@ mod test {
     fn test_durability_mode_sync_gates() {
         // Strict = current main behavior: every commit point synced.
         assert!(DurabilityMode::Strict.syncs_data_shards());
-        assert!(DurabilityMode::Strict.syncs_commit_metadata());
+        assert!(DurabilityMode::Strict.syncs_metadata_files());
+        assert!(DurabilityMode::Strict.syncs_commit_directories());
+        assert!(DurabilityMode::Strict.fully_syncs_commit_target());
+        assert!(DurabilityMode::Strict.syncs_recovery_protocol_state());
+        assert_eq!(DurabilityMode::Strict.metadata_sync_mode(), SyncMode::FileAndDir);
+        assert_eq!(DurabilityMode::Strict.recovery_sync_mode(), SyncMode::FileAndDir);
+        // FileSync matches MinIO's file-content boundary while preserving
+        // strict recovery-state ordering.
+        assert!(DurabilityMode::FileSync.syncs_data_shards());
+        assert!(DurabilityMode::FileSync.syncs_metadata_files());
+        assert!(!DurabilityMode::FileSync.syncs_commit_directories());
+        assert!(!DurabilityMode::FileSync.fully_syncs_commit_target());
+        assert!(DurabilityMode::FileSync.syncs_recovery_protocol_state());
+        assert_eq!(DurabilityMode::FileSync.metadata_sync_mode(), SyncMode::FileOnly);
+        assert_eq!(DurabilityMode::FileSync.recovery_sync_mode(), SyncMode::FileAndDir);
         // Relaxed keeps payload durability, drops metadata-commit fsyncs.
         assert!(DurabilityMode::Relaxed.syncs_data_shards());
-        assert!(!DurabilityMode::Relaxed.syncs_commit_metadata());
+        assert!(!DurabilityMode::Relaxed.syncs_metadata_files());
+        assert!(!DurabilityMode::Relaxed.syncs_commit_directories());
+        assert!(!DurabilityMode::Relaxed.fully_syncs_commit_target());
+        assert!(!DurabilityMode::Relaxed.syncs_recovery_protocol_state());
+        assert_eq!(DurabilityMode::Relaxed.metadata_sync_mode(), SyncMode::None);
+        assert_eq!(DurabilityMode::Relaxed.recovery_sync_mode(), SyncMode::None);
         // None and the legacy full-off switch sync nothing on the data path.
         assert!(!DurabilityMode::None.syncs_data_shards());
-        assert!(!DurabilityMode::None.syncs_commit_metadata());
+        assert!(!DurabilityMode::None.syncs_metadata_files());
+        assert!(!DurabilityMode::None.syncs_commit_directories());
+        assert!(!DurabilityMode::None.syncs_recovery_protocol_state());
         assert!(!DurabilityMode::LegacyOff.syncs_data_shards());
-        assert!(!DurabilityMode::LegacyOff.syncs_commit_metadata());
+        assert!(!DurabilityMode::LegacyOff.syncs_metadata_files());
+        assert!(!DurabilityMode::LegacyOff.syncs_commit_directories());
+        assert!(!DurabilityMode::LegacyOff.syncs_recovery_protocol_state());
     }
 
     #[test]
@@ -24492,6 +24581,11 @@ mod test {
 
     #[test]
     fn test_effective_durability_pins_system_volumes() {
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::FileSync);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::FileSync);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
         {
             let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
             assert_eq!(effective_durability("user-bucket"), DurabilityMode::Relaxed);
@@ -24532,6 +24626,14 @@ mod test {
 
     #[test]
     fn test_effective_durability_bucket_override() {
+        // The file-sync bucket tier can lower ordinary namespace durability
+        // without changing the process-wide strict default.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            let _guard = BucketOverrideGuard::set("hp5b-override-file-sync", DurabilityMode::FileSync);
+            assert_eq!(effective_durability("hp5b-override-file-sync"), DurabilityMode::FileSync);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Strict);
+        }
         // Global strict + per-bucket relaxed: only the named bucket drops.
         {
             let _mode = durability_mode_override::set(DurabilityMode::Strict);
@@ -24688,6 +24790,33 @@ mod test {
         assert!(
             !os::fsync_dir_recorder::was_fsynced(&dst_parent),
             "relaxed mode must skip the metadata-commit dir fsync on user volumes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_file_sync_writes_file_but_skips_dst_parent() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::FileSync);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "file-sync-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("file-sync metadata write should succeed");
+
+        assert_eq!(tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"), b"payload");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "file-sync must omit the ordinary destination-parent barrier"
         );
     }
 
@@ -25074,11 +25203,11 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
-    async fn test_rename_data_writes_old_metadata_backup_for_inline_overwrite() {
+    async fn test_rename_data_file_sync_keeps_recovery_backup_barrier() {
         use std::sync::mpsc;
         use tempfile::tempdir;
 
-        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let _mode = durability_mode_override::set(DurabilityMode::FileSync);
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
@@ -25141,7 +25270,7 @@ mod test {
         assert!(backup_path.exists());
         assert!(
             os::fsync_dir_recorder::was_fsynced(backup_path.parent().expect("backup must have a parent")),
-            "strict inline overwrite must persist the rollback backup directory entry"
+            "file-sync inline overwrite must persist the rollback backup directory entry"
         );
         assert_eq!(
             os::fsync_dir_recorder::was_limited(backup_path.parent().expect("backup must have a parent")),
@@ -25150,12 +25279,12 @@ mod test {
         );
         assert!(
             os::fsync_dir_recorder::was_fsynced(&dst_object_dir),
-            "strict inline overwrite must persist the committed xl.meta directory entry"
+            "file-sync overwrite must retain the recovery backup publication barrier"
         );
         assert_eq!(
             os::fsync_dir_recorder::was_limited(&dst_object_dir),
             cfg!(unix),
-            "only Unix inline commit fsyncs should use the disk file-sync limit"
+            "only Unix recovery backup fsyncs should use the disk file-sync limit"
         );
         // The rollback backup must contain the previous metadata bytes verbatim so
         // that undo_write can restore the prior committed object; guards the inline
