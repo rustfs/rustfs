@@ -10238,6 +10238,15 @@ mod tests {
             data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &corrupt, &disks).await,
             Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
         );
+
+        let mut trailing = parts_metadata.clone();
+        let mut inline_data = trailing[data_disk].data.as_ref().expect("fixture inline bytes").to_vec();
+        inline_data.push(0x7b);
+        trailing[data_disk].data = Some(Bytes::from(inline_data));
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &trailing, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
+        );
     }
 
     #[test]
