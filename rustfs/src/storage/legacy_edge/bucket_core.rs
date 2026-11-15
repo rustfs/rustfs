@@ -28,9 +28,8 @@ use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperati
 use crate::storage::storage_api::ecstore_bucket::utils::serialize as serialize_bucket_config;
 use crate::storage::validate_website_configuration;
 use crate::storage::{
-    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG, StorageError,
-    delete_bucket_metadata_config_if_incarnation, get_bucket_accelerate_config, get_bucket_logging_config,
-    get_bucket_request_payment_config, get_bucket_website_config, update_bucket_metadata_config_if_incarnation,
+    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
+    delete_bucket_metadata_config_if_incarnation, update_bucket_metadata_config_if_incarnation,
 };
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{create_bucket, delete_bucket, head_bucket};
@@ -138,23 +137,13 @@ impl FS {
         &self,
         req: S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_accelerate_config(&req.input.bucket).await {
-            Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
-                status: accelerate.status.map(BucketAccelerateStatus::from),
-                ..Default::default()
-            })),
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default())),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_accelerate_configuration(&req.input.bucket)
+            .await?;
+        Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
+            status: config.status.map(BucketAccelerateStatus::from),
+            ..Default::default()
+        }))
     }
 
     /// Get bucket location
@@ -178,52 +167,28 @@ impl FS {
         &self,
         req: S3Request<GetBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_request_payment_config(&req.input.bucket).await {
-            Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
-                payer: Some(Payer::from(payment.payer)),
-            })),
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
-                payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
-            })),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_request_payment(&req.input.bucket)
+            .await?;
+        Ok(S3Response::new(GetBucketRequestPaymentOutput {
+            payer: Some(Payer::from(config.payer)),
+        }))
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_website_edge(
         &self,
         req: S3Request<GetBucketWebsiteInput>,
     ) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_website_config(&req.input.bucket).await {
-            Ok((website, _)) => {
-                let website: WebsiteConfiguration = persisted_to_s3s(&website)?;
-                Ok(S3Response::new(GetBucketWebsiteOutput {
-                    error_document: website.error_document,
-                    index_document: website.index_document,
-                    redirect_all_requests_to: website.redirect_all_requests_to,
-                    routing_rules: website.routing_rules,
-                }))
-            }
-            Err(StorageError::ConfigNotFound) => Err(s3_error!(NoSuchWebsiteConfiguration)),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_website(&req.input.bucket)
+            .await?;
+        let config: WebsiteConfiguration = persisted_to_s3s(&config)?;
+        Ok(S3Response::new(GetBucketWebsiteOutput {
+            error_document: config.error_document,
+            index_document: config.index_document,
+            redirect_all_requests_to: config.redirect_all_requests_to,
+            routing_rules: config.routing_rules,
+        }))
     }
 
     #[instrument(name = "head_bucket", level = "debug", skip(self, req))]
@@ -287,24 +252,13 @@ impl FS {
         req: S3Request<GetBucketLoggingInput>,
     ) -> S3Result<S3Response<GetBucketLoggingOutput>> {
         record_s3_op(S3Operation::GetBucketLogging);
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_logging_config(&req.input.bucket).await {
-            Ok((logging, _)) => {
-                let logging: BucketLoggingStatus = persisted_to_s3s(&logging)?;
-                Ok(S3Response::new(GetBucketLoggingOutput {
-                    logging_enabled: logging.logging_enabled,
-                }))
-            }
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketLoggingOutput::default())),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_logging(&req.input.bucket)
+            .await?;
+        let config: BucketLoggingStatus = persisted_to_s3s(&config)?;
+        Ok(S3Response::new(GetBucketLoggingOutput {
+            logging_enabled: config.logging_enabled,
+        }))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_logging_edge(

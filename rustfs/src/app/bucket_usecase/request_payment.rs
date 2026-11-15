@@ -12,4 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bucket request-payment configuration use-case operations (reserved for the next batch).
+//! Bucket request-payment configuration reads shared by the S3 edges.
+
+use super::{ApiError, DefaultBucketUsecase, StorageError, metadata_sys};
+use rustfs_gateway_types::persistence::PersistedRequestPaymentConfiguration;
+use rustfs_s3_types::S3Result;
+
+impl DefaultBucketUsecase {
+    pub(crate) async fn execute_get_bucket_request_payment(
+        &self,
+        bucket: &str,
+    ) -> S3Result<PersistedRequestPaymentConfiguration> {
+        self.ensure_config_read_bucket(bucket).await?;
+        match metadata_sys::get_request_payment_config(bucket).await {
+            Ok((config, _)) => Ok(config),
+            Err(StorageError::ConfigNotFound) => Ok(PersistedRequestPaymentConfiguration {
+                payer: "BucketOwner".to_owned(),
+            }),
+            Err(err) => Err(ApiError::from(err).into()),
+        }
+    }
+}

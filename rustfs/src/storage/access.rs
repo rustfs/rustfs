@@ -3598,10 +3598,8 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketAcl request has accesses to the resources.
@@ -3626,20 +3624,16 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_cors(&self, req: &mut S3Request<GetBucketCorsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketCorsAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketCorsAction)).await
     }
 
     /// Checks whether the GetBucketEncryption request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_encryption(&self, req: &mut S3Request<GetBucketEncryptionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketEncryptionAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketEncryptionAction)).await
     }
 
     /// Checks whether the GetBucketIntelligentTieringConfiguration request has accesses to the resources.
@@ -3685,10 +3679,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_logging(&self, req: &mut S3Request<GetBucketLoggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketLoggingAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketLoggingAction)).await
     }
 
     /// Checks whether the GetBucketMetricsConfiguration request has accesses to the resources.
@@ -3744,20 +3736,16 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_request_payment(&self, req: &mut S3Request<GetBucketRequestPaymentInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetBucketTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_tagging(&self, req: &mut S3Request<GetBucketTaggingInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketTaggingAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketTaggingAction)).await
     }
 
     /// Checks whether the GetBucketVersioning request has accesses to the resources.
@@ -3772,10 +3760,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_bucket_website(&self, req: &mut S3Request<GetBucketWebsiteInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPolicyAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPolicyAction)).await
     }
 
     /// Checks whether the GetObject request has accesses to the resources.

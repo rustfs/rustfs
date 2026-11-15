@@ -2084,22 +2084,10 @@ pub(crate) async fn get_bucket_metadata(bucket: &str) -> Result<Arc<BucketMetada
     ecstore_bucket::metadata_sys::get(bucket).await
 }
 
-pub(crate) async fn get_bucket_accelerate_config(
-    bucket: &str,
-) -> Result<(rustfs_gateway_types::persistence::PersistedAccelerateConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_accelerate_config(bucket).await
-}
-
 pub(crate) async fn get_bucket_cors_config(
     bucket: &str,
 ) -> Result<(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_cors_config(bucket).await
-}
-
-pub(crate) async fn get_bucket_logging_config(
-    bucket: &str,
-) -> Result<(rustfs_gateway_types::persistence::PersistedBucketLoggingStatus, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_logging_config(bucket).await
 }
 
 pub(crate) async fn get_bucket_object_lock_config(
@@ -2123,15 +2111,6 @@ pub(crate) async fn complete_force_delete_intent(api: Arc<ECStore>, operation_id
     ecstore_bucket::replication::complete_force_delete_intent(api, operation_id).await
 }
 
-pub(crate) async fn get_bucket_request_payment_config(
-    bucket: &str,
-) -> Result<(
-    rustfs_gateway_types::persistence::PersistedRequestPaymentConfiguration,
-    time::OffsetDateTime,
-)> {
-    ecstore_bucket::metadata_sys::get_request_payment_config(bucket).await
-}
-
 pub(crate) async fn get_bucket_sse_config(
     bucket: &str,
 ) -> Result<(
@@ -2139,12 +2118,6 @@ pub(crate) async fn get_bucket_sse_config(
     time::OffsetDateTime,
 )> {
     ecstore_bucket::metadata_sys::get_sse_config(bucket).await
-}
-
-pub(crate) async fn get_bucket_website_config(
-    bucket: &str,
-) -> Result<(rustfs_gateway_types::persistence::PersistedWebsiteConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
 pub(crate) async fn get_bucket_website_config_for_store(
