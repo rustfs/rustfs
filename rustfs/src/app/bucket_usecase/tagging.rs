@@ -16,37 +16,39 @@
 
 use super::*;
 use crate::app::storage_api::s3::dto;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketTaggingInput, DeleteBucketTaggingOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
-};
+use crate::app::storage_api::s3::dto::{PutBucketTaggingInput, PutBucketTaggingOutput};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 impl DefaultBucketUsecase {
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_bucket_tagging(
+    #[instrument(level = "debug", skip(self, envelope))]
+    pub(crate) async fn execute_delete_bucket_tagging(
         &self,
-        req: S3Request<DeleteBucketTaggingInput>,
-    ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketTaggingInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketTagging, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        metadata_sys::update_s3_tagging_config(&bucket, None, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            metadata_sys::update_s3_tagging_config(bucket, None, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false).await;
+            notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket tagging", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "tags");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
-        }
+            let item = sr_bucket_meta_item(bucket.to_owned(), "tags");
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
+            }
 
-        rustfs_scanner::record_dirty_usage_bucket_from_producer(
-            &bucket,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
-        );
-        Ok(S3Response::new(DeleteBucketTaggingOutput {}))
+            rustfs_scanner::record_dirty_usage_bucket_from_producer(
+                bucket,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+            );
+
+            Ok(())
+        })
+        .await
     }
 
     /// Returns the stored bucket tagging configuration after checking the bucket exists.

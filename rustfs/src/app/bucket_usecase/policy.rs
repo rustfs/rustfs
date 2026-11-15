@@ -15,43 +15,43 @@
 //! Bucket policy and policy status use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketPolicyInput, DeleteBucketPolicyOutput, PutBucketPolicyInput, PutBucketPolicyOutput,
-};
+use crate::app::storage_api::s3::dto::{PutBucketPolicyInput, PutBucketPolicyOutput};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use rustfs_policy::policy::Validator;
 
 impl DefaultBucketUsecase {
-    pub async fn execute_delete_bucket_policy(
+    pub(crate) async fn execute_delete_bucket_policy(
         &self,
-        req: S3Request<DeleteBucketPolicyInput>,
-    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        record_s3_op(S3Operation::DeleteBucketPolicy);
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketPolicyInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketPolicy, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+            let Some(store) = self.object_store() else {
+                return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
+            };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            delete_bucket_config_for_incarnation(bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false).await;
+            notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket policy", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "policy");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
-        }
+            let item = sr_bucket_meta_item(bucket.to_owned(), "policy");
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
+            }
 
-        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
+            Ok(())
+        })
+        .await
     }
 
     /// The stored policy document, verbatim.
@@ -242,6 +242,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, s3_op_total};
+    use crate::app::storage_api::s3::dto::DeleteBucketPolicyInput;
     use http::Method;
 
     #[tokio::test]
@@ -252,10 +253,12 @@ mod tests {
             .unwrap();
 
         let req = build_request(input, Method::DELETE);
-        let usecase = DefaultBucketUsecase::without_context();
+        let fs = crate::storage::ecfs::FS::new();
         let before = s3_op_total(S3Operation::DeleteBucketPolicy);
 
-        let err = usecase.execute_delete_bucket_policy(req).await.unwrap_err();
+        let err = crate::app::storage_api::s3::S3::delete_bucket_policy(&fs, req)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(s3_op_total(S3Operation::DeleteBucketPolicy), before + 1);
     }

@@ -573,6 +573,21 @@ pub(crate) async fn authorize_bucket_config_mutation<R: AuthorizationRequest + ?
     Ok(())
 }
 
+/// Authorizes tag deletion under the IAM repair scope for unreadable stored tags.
+pub(crate) async fn authorize_bucket_tag_deletion<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+) -> S3Result<()> {
+    rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
+        server_ctx,
+        req,
+        bucket,
+        Action::S3Action(S3Action::PutBucketTaggingAction),
+    ))
+    .await
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CopySourceBucketGenerationGuard {
     bucket: String,
@@ -3519,13 +3534,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_tagging(&self, req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
-            self.server_ctx(),
-            req,
-            &bucket,
-            Action::S3Action(S3Action::PutBucketTaggingAction),
-        ))
-        .await
+        authorize_bucket_tag_deletion(self.server_ctx(), req, &bucket).await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.

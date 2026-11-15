@@ -15,7 +15,7 @@
 //! The gateway operations of migration batch A1 (rustfs/backlog#2765): bucket CORS, tagging, public access block and encryption.
 //! The stored CORS document is applied to requests by `ConditionalCorsLayer`, not by the gateway.
 
-use super::access::authorize_bucket_config_mutation;
+use super::access::{authorize_bucket_config_mutation, authorize_bucket_tag_deletion};
 use super::{OpRow, Served, row};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::{RequestEnvelope, dto_values};
@@ -33,7 +33,9 @@ use std::sync::Arc;
 pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketCors>(),
     row::<dto::GetBucketEncryption>(),
+    row::<dto::DeleteBucketEncryption>(),
     row::<dto::GetBucketTagging>(),
+    row::<dto::DeleteBucketTagging>(),
     row::<dto::PutBucketCors>(),
     row::<dto::DeleteBucketCors>(),
     row::<dto::GetPublicAccessBlock>(),
@@ -60,6 +62,22 @@ impl Served for dto::GetBucketCors {
     }
 }
 
+impl Served for dto::DeleteBucketEncryption {
+    const METRIC: S3Operation = S3Operation::DeleteBucketEncryption;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketEncryptionAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        DefaultBucketUsecase::with_context(context)
+            .execute_delete_bucket_encryption(envelope, request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::DeleteBucketEncryptionOutput::default()))
+    }
+}
+
 impl Served for dto::GetBucketEncryption {
     const METRIC: S3Operation = S3Operation::GetBucketEncryption;
 
@@ -76,6 +94,21 @@ impl Served for dto::GetBucketEncryption {
         Ok(Resp::new(dto::GetBucketEncryptionOutput {
             server_side_encryption_configuration: Some(config),
         }))
+    }
+}
+
+impl Served for dto::DeleteBucketTagging {
+    const METRIC: S3Operation = S3Operation::DeleteBucketTagging;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        authorize_bucket_tag_deletion(envelope, request.input().bucket.as_str()).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        DefaultBucketUsecase::with_context(context)
+            .execute_delete_bucket_tagging(envelope, request.input().bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::DeleteBucketTaggingOutput::default()))
     }
 }
 

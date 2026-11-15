@@ -125,6 +125,8 @@ mod core;
 #[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
+#[cfg(test)]
+mod delete_config_tests;
 mod encryption;
 #[cfg(test)]
 mod guards;

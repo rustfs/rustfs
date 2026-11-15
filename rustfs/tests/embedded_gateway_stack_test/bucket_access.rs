@@ -75,7 +75,31 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: put_empty_bucket_notification,
     },
+    MatrixRow {
+        operation: "DeleteBucketPolicy",
+        metric: S3Operation::DeleteBucketPolicy,
+        has_error_body: true,
+        call: delete_bucket_policy,
+    },
 ];
+
+pub(super) fn delete_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let status = super::bucket_configs::StatusCapture::default();
+        outcome(
+            client
+                .delete_bucket_policy()
+                .bucket(bucket)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| {
+                    assert_eq!(status.take(), Some(204));
+                }),
+        )
+    })
+}
 
 fn get_bucket_versioning<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_versioning().bucket(bucket).send().await) })

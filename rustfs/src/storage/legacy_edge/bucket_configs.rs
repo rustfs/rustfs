@@ -50,11 +50,10 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketEncryption, |req| {
-            usecase.execute_delete_bucket_encryption(req)
-        })
-        .await
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_encryption(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(name = "delete_bucket_tagging", level = "debug", skip(self, req))]
@@ -62,8 +61,10 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketTagging, |req| usecase.execute_delete_bucket_tagging(req)).await
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketTaggingOutput::default()))
     }
 
     #[instrument(name = "delete_public_access_block", level = "debug", skip(self, req))]

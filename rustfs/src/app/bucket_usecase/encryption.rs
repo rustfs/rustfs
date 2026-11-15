@@ -15,10 +15,7 @@
 //! Bucket default-encryption use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
-    ServerSideEncryption,
-};
+use crate::app::storage_api::s3::dto::{PutBucketEncryptionInput, PutBucketEncryptionOutput, ServerSideEncryption};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 /// Refuse a default-encryption configuration the write path could not honour
@@ -62,35 +59,43 @@ fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionCo
 }
 
 impl DefaultBucketUsecase {
-    pub async fn execute_delete_bucket_encryption(
+    pub(crate) async fn execute_delete_bucket_encryption(
         &self,
-        req: S3Request<DeleteBucketEncryptionInput>,
-    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketEncryptionInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::DeleteBucketEncryption,
+            StatusCode::NO_CONTENT,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+                let Some(store) = self.object_store() else {
+                    return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
+                };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+                delete_bucket_config_for_incarnation(bucket, BUCKET_SSECONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false).await;
+                notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket encryption", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
-        }
+                let item = sr_bucket_meta_item(bucket.to_owned(), "sse-config");
+                if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                    warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
+                }
 
-        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Returns the stored bucket encryption configuration after checking the bucket exists.

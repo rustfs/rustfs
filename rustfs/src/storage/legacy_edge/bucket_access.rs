@@ -19,6 +19,7 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
+use crate::app::RequestEnvelope;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
 use crate::storage::persisted_from_s3s;
@@ -35,8 +36,11 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketPolicy, |req| usecase.execute_delete_bucket_policy(req)).await
+        record_s3_op(S3Operation::DeleteBucketPolicy);
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_policy(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketPolicyOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_acl_edge(
