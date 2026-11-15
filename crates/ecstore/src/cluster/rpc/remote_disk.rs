@@ -2532,6 +2532,41 @@ fn encode_file_info_versions_msgpack(value: &FileInfoVersions) -> Result<Vec<u8>
     encode_msgpack_with_capacity(value, capacity)
 }
 
+fn encode_delete_versions_request(
+    disk: &str,
+    volume: &str,
+    versions: &[FileInfoVersions],
+    opts: &DeleteOptions,
+) -> Result<DeleteVersionsRequest> {
+    // Capture one policy for the complete batch, including its options.
+    let msgpack_only = rustfs_protos::internode_rpc_msgpack_only();
+    let opts_json = if msgpack_only {
+        String::new()
+    } else {
+        serde_json::to_string(opts)?
+    };
+    let mut versions_json = if msgpack_only {
+        Vec::new()
+    } else {
+        Vec::with_capacity(versions.len())
+    };
+    let mut versions_bin = Vec::with_capacity(versions.len());
+    for version in versions {
+        if !msgpack_only {
+            versions_json.push(serde_json::to_string(version)?);
+        }
+        versions_bin.push(encode_file_info_versions_msgpack(version)?.into());
+    }
+    Ok(DeleteVersionsRequest {
+        disk: disk.to_owned(),
+        volume: volume.to_owned(),
+        versions: versions_json,
+        opts: opts_json,
+        versions_bin,
+        opts_bin: encode_delete_options_msgpack(opts)?.into(),
+    })
+}
+
 /// JSON compatibility string for a dual-encoded (`_bin` + text) request field. Returns an empty
 /// string only when msgpack-only mode and its explicit fleet confirmation guard are both enabled;
 /// otherwise the legacy JSON encoding is retained for old peers.
@@ -3516,52 +3551,10 @@ impl DiskAPI for RemoteDisk {
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
-        // `_bin` support for DeleteVersions is new (grpc-optimization P2); always dual-write JSON +
-        // msgpack until its fallback counter has read zero across a release window.
-        let opts_bin = match encode_delete_options_msgpack(&opts) {
-            Ok(opts_bin) => opts_bin,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
-                }
-                return errors;
-            }
+        let request = match encode_delete_versions_request(&self.endpoint.to_string(), volume, &versions, &opts) {
+            Ok(request) => request,
+            Err(err) => return vec![Some(Error::other(err.to_string())); versions.len()],
         };
-        let opts = match serde_json::to_string(&opts) {
-            Ok(opts) => opts,
-            Err(err) => {
-                let mut errors = Vec::with_capacity(versions.len());
-                for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
-                }
-                return errors;
-            }
-        };
-        let mut versions_str = Vec::with_capacity(versions.len());
-        let mut versions_bin = Vec::with_capacity(versions.len());
-        for file_info_versions in versions.iter() {
-            versions_str.push(match serde_json::to_string(file_info_versions) {
-                Ok(versions_str) => versions_str,
-                Err(err) => {
-                    let mut errors = Vec::with_capacity(versions.len());
-                    for _ in 0..versions.len() {
-                        errors.push(Some(Error::other(err.to_string())));
-                    }
-                    return errors;
-                }
-            });
-            versions_bin.push(match encode_file_info_versions_msgpack(file_info_versions) {
-                Ok(versions_bin) => Bytes::from(versions_bin),
-                Err(err) => {
-                    let mut errors = Vec::with_capacity(versions.len());
-                    for _ in 0..versions.len() {
-                        errors.push(Some(Error::other(err.to_string())));
-                    }
-                    return errors;
-                }
-            });
-        }
         let mut client = match self.get_client().await {
             Ok(client) => client,
             Err(err) => {
@@ -3573,14 +3566,7 @@ impl DiskAPI for RemoteDisk {
             }
         };
 
-        let mut request = Request::new(DeleteVersionsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            versions: versions_str,
-            opts,
-            versions_bin,
-            opts_bin: opts_bin.into(),
-        });
+        let mut request = Request::new(request);
         let canonical_body = rustfs_protos::canonical_delete_versions_request_body(request.get_ref());
         if let Err(err) = attach_mutation_body_digest(&mut request, canonical_body, "delete_versions") {
             let mut errors = Vec::with_capacity(versions.len());
@@ -6252,6 +6238,87 @@ mod tests {
                 send_site.json_encoder
             );
         }
+    }
+
+    #[test]
+    fn delete_versions_request_encoding_preserves_batches_and_fleet_guards() {
+        use tonic_prost::prost::Message;
+        let groups: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| FileInfoVersions {
+                volume: "bucket".to_owned(),
+                name: name.to_owned(),
+                versions: vec![sample_rename_data_file_info()],
+                ..Default::default()
+            })
+            .collect();
+        let opts = DeleteOptions {
+            undo_write: true,
+            old_data_dir: Some(Uuid::from_u128(7)),
+            ..Default::default()
+        };
+        let mut binary_wire_size = 0;
+        let mut compat_wire_size = 0;
+        for (requested, confirmed, binary_only) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            with_internode_msgpack_env(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, confirmed),
+                ],
+                || {
+                    for batch in [&groups[..], &[]] {
+                        let request = encode_delete_versions_request("disk", "bucket", batch, &opts).expect("encode batch");
+                        assert_eq!(request.disk, "disk");
+                        assert_eq!(request.volume, "bucket");
+                        assert_eq!(request.versions_bin.len(), batch.len());
+                        assert_eq!(request.opts.is_empty(), binary_only);
+                        let decoded_opts: DeleteOptions = rmp_serde::from_slice(&request.opts_bin).expect("binary options");
+                        assert!(decoded_opts.undo_write);
+                        assert_eq!(decoded_opts.old_data_dir, opts.old_data_dir);
+                        for (encoded, expected) in request.versions_bin.iter().zip(batch) {
+                            let decoded: FileInfoVersions = rmp_serde::from_slice(encoded).expect("binary batch item");
+                            assert_eq!(decoded.name, expected.name);
+                            assert_eq!(decoded.versions, expected.versions);
+                        }
+                        if binary_only {
+                            assert!(request.versions.is_empty());
+                        } else {
+                            assert_eq!(request.opts, serde_json::to_string(&opts).expect("legacy options"));
+                            assert_eq!(request.versions.len(), batch.len());
+                            for (encoded, expected) in request.versions.iter().zip(batch) {
+                                let decoded: FileInfoVersions = serde_json::from_str(encoded).expect("legacy batch item");
+                                assert_eq!(decoded.name, expected.name);
+                                assert_eq!(decoded.versions, expected.versions);
+                            }
+                        }
+                        let canonical = rustfs_protos::canonical_delete_versions_request_body(&request).expect("bound batch");
+                        let mut modified = request.clone();
+                        modified.opts_bin = encode_delete_options_msgpack(&DeleteOptions::default())
+                            .expect("other options")
+                            .into();
+                        assert_ne!(
+                            canonical,
+                            rustfs_protos::canonical_delete_versions_request_body(&modified).expect("other bound batch")
+                        );
+                        if !batch.is_empty() {
+                            if binary_only {
+                                binary_wire_size = request.encoded_len();
+                            } else {
+                                compat_wire_size = request.encoded_len();
+                            }
+                        }
+                    }
+                },
+            );
+        }
+        assert!(binary_wire_size > 0 && binary_wire_size < compat_wire_size);
+        println!("delete batch encoded bytes compat={compat_wire_size} msgpack_only={binary_wire_size}");
     }
 
     #[test]

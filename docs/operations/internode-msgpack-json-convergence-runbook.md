@@ -65,22 +65,24 @@ Convergence-ready:
 | request | `ReadMultiple.read_multiple_req` | `ReadMultipleReq` |
 | request | `BatchReadVersion.batch_read_version_req` | `BatchReadVersionReq` |
 | request | `Read*.opts` | `ReadOptions` |
+| request | `DeleteVersions.versions` | binary-list-driven `FileInfoVersions` batch |
+| request | `DeleteVersions.opts` | named-map `DeleteOptions` |
 | response | `ReadVersion.file_info` | `FileInfo` (`cluster/rpc/remote_disk.rs`) |
 | response | `ReadXL.raw_file_info` | `RawFileInfo` |
 | response | `RenameData.rename_data_resp` | `RenameDataResp` |
 | response | `ReadMultiple` response list | per-item plus list fallback |
 | response | `BatchReadVersion` response list | per-item plus list fallback |
 
-Delete messages, kept on dual-write until their own window reads zero with `_bin`-first decoders deployed fleet-wide (the client always dual-writes these regardless of the flags):
+Single-version delete fields retain dual-write until their own observation window establishes fleet-wide readiness.
 
 | Direction | Message / field | Status |
 | --- | --- | --- |
 | request | `DeleteVersion.file_info` (`FileInfo`) | `_bin` present; dual-write; converge after its own window |
 | request | `DeleteVersion.opts` (`DeleteOptions`) | same |
-| request | `DeleteVersions.versions` (`FileInfoVersions`) | same |
-| request | `DeleteVersions.opts` (`DeleteOptions`) | same |
 
-`DeleteVersions` receivers select the binary list whenever `versions_bin` contains entries. That list supplies the batch length and every decoded item, including requests whose JSON `versions` list is empty or has a different length. Empty or corrupt binary items reject the complete request before disk mutation. A request with an empty binary list uses the legacy JSON list and its length. Options retain their independent binary-first decoder. Current delete senders continue dual-writing the JSON and binary lists for older peers. Enabling a binary-only delete sender requires the corrected receiver on every destination and its rollback target.
+`DeleteVersions` receivers select the binary list whenever `versions_bin` contains entries. That list supplies the batch length and every decoded item, including requests whose JSON `versions` list is empty or has a different length. Empty or corrupt binary items reject the complete request before disk mutation. A request with an empty binary list uses the legacy JSON list and its length. Options retain their independent binary-first decoder. The sender captures the codec policy once per complete batch. Default mode emits both lists and both option encodings. Setting both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true` emits the binary list and named-map options, with empty JSON fields. Before confirming the fleet, deploy the corrected binary-list-driven receiver to every destination and verify the observation counters and binary-only deletion results. Rolling upgrades and rollback to a receiver that traverses the JSON list require JSON compatibility mode before replacing nodes. These fields remain in the protobuf schema for older peers.
+
+User-object recoverable deletion uses `RecoverDeleteTransaction` and guarded mutation messages with their existing binary payloads. Measure those operations with transaction preparation, commit, rollback and cleanup stages. The `DeleteVersions` codec comparison covers the legacy/internal batch RPC and its consumers.
 
 Still JSON-only:
 
