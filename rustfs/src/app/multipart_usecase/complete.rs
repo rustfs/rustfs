@@ -1026,7 +1026,7 @@ mod tests {
             ..Default::default()
         });
         let upload_id = usecase
-            .execute_create_multipart_upload(create_request)
+            .execute_create_multipart_upload_from_s3s(create_request)
             .await
             .expect("authorized REPLICA-only create should succeed")
             .output
@@ -1124,7 +1124,7 @@ mod tests {
                 .headers
                 .insert("x-amz-checksum-type", HeaderValue::from_static("COMPOSITE"));
             let upload_id = usecase
-                .execute_create_multipart_upload(create)
+                .execute_create_multipart_upload_from_s3s(create)
                 .await
                 .expect("SSE-C create")
                 .output
@@ -1514,7 +1514,7 @@ mod tests {
             .headers
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         let first_upload_id = usecase
-            .execute_create_multipart_upload(initial_create_req)
+            .execute_create_multipart_upload_from_s3s(initial_create_req)
             .await
             .expect("initial conditional create multipart upload should succeed")
             .output
@@ -1561,13 +1561,13 @@ mod tests {
             .headers
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         let create_err = usecase
-            .execute_create_multipart_upload(second_create_req)
+            .execute_create_multipart_upload_from_s3s(second_create_req)
             .await
             .expect_err("create multipart upload with If-None-Match: * on existing key must fail");
         assert_eq!(create_err.code(), &crate::app::storage_api::s3::S3ErrorCode::PreconditionFailed);
 
         let second_upload_id = usecase
-            .execute_create_multipart_upload(build_request(create_input, Method::POST))
+            .execute_create_multipart_upload_from_s3s(build_request(create_input, Method::POST))
             .await
             .expect("unconditional create multipart upload should succeed")
             .output
@@ -1770,7 +1770,7 @@ mod tests {
             .headers
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         let dm_upload_id = usecase
-            .execute_create_multipart_upload(dm_create_req)
+            .execute_create_multipart_upload_from_s3s(dm_create_req)
             .await
             .expect("If-None-Match: * create must succeed past a delete marker")
             .output

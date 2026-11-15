@@ -186,6 +186,7 @@ memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
 rustfs-kafka-async = { version = "1.4.1" }
+slab = { version = "0.4.12" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.54.1" }
 tokio-rustls = { default-features = false, version = "0.26.6" }

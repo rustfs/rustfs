@@ -17,9 +17,9 @@
 use super::*;
 use crate::runtime_sources::ServerContextSlot;
 use crate::storage_api::server::http::access::test_support::{
-    AuthorizationRequest, BucketOperations as _, ETag, ETagCondition, FS, MakeBucketOptions, ObjectOperations as _,
-    ObjectOptions, PutObjectInput as LegacyPutObjectInput, ReqInfo, S3Access as _, S3Request, get_bucket_metadata,
-    set_bucket_metadata,
+    AuthorizationRequest, BucketOperations as _, CompletePart, DeleteBucketOptions, ETag, ETagCondition, FS, MakeBucketOptions,
+    MultipartOperations as _, ObjectIO as _, ObjectOperations as _, ObjectOptions, PutObjectInput as LegacyPutObjectInput,
+    ReqInfo, S3Access as _, S3Request, get_bucket_metadata, set_bucket_metadata,
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-fn request(input: dto::PutObjectInput) -> Req<dto::PutObject> {
+fn request<O: rustfs_gateway::Operation<DerivedResources = rustfs_gateway::NoDerived>>(input: O::Input) -> Req<O> {
     let wire = WireRequest::accept(
         http::Request::builder()
             .uri("/")
@@ -465,4 +465,182 @@ fn native_put_response_refuses_a_missing_etag() {
         Err(error) => error,
     };
     assert_eq!(error.code().as_str(), "InternalError");
+}
+
+fn part_input(bucket: &str, upload_id: &str, part_number: i32) -> dto::UploadPartInput {
+    dto::UploadPartInput {
+        bucket: rustfs_gateway_types::BucketName::new(bucket).unwrap(),
+        key: rustfs_gateway_types::ObjectKey::new("allowed").unwrap(),
+        upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload_id),
+        part_number,
+        content_length: 3,
+        body: Some(ByteStream::from_bytes(Bytes::from_static(b"abc"))),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn native_upload_part_rejects_missing_and_stale_generation() {
+    let (server, bucket) = fixture(&["s3:PutObject"]).await;
+    let store = server.object_store().unwrap();
+    let options = ObjectOptions::default();
+    let key = "allowed";
+
+    // The legitimate authorization captures an incarnation while the request is still being admitted.
+    let mut authorized = envelope(&server, HeaderMap::new());
+    let request_without_session = request::<dto::UploadPart>(part_input(&bucket, "not-yet-active", 1));
+    <dto::UploadPart as Served>::authorize(&mut authorized, &request_without_session)
+        .await
+        .unwrap();
+    let failed =
+        <dto::UploadPart as Served>::execute(server.app_context(), authorized.fork_for_authorization(), request_without_session)
+            .await
+            .err()
+            .unwrap();
+    assert_eq!(failed.code().as_str(), "NoSuchUpload");
+
+    store.delete_bucket(&bucket, &DeleteBucketOptions::default()).await.unwrap();
+    store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+    let session = store.new_multipart_upload(&bucket, key, &options).await.unwrap().upload_id;
+
+    let missing = envelope(&server, HeaderMap::new());
+    for (envelope, code) in [(missing, "InternalError"), (authorized, "NoSuchBucket")] {
+        let request = request::<dto::UploadPart>(part_input(&bucket, &session, 1));
+        let error = <dto::UploadPart as Served>::execute(server.app_context(), envelope, request)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code().as_str(), code);
+        assert!(
+            store
+                .list_object_parts(&bucket, key, &session, None, 20, &options)
+                .await
+                .unwrap()
+                .parts
+                .is_empty()
+        );
+    }
+
+    // The identical part is writable under a freshly captured generation.
+    set_policy(
+        &bucket,
+        serde_json::json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": "*"},
+            "Action": "s3:PutObject",
+            "Resource": format!("arn:aws:s3:::{bucket}/{key}"),
+        }),
+    )
+    .await;
+    let req = request::<dto::UploadPart>(part_input(&bucket, &session, 1));
+    let mut fresh = envelope(&server, HeaderMap::new());
+    <dto::UploadPart as Served>::authorize(&mut fresh, &req).await.unwrap();
+    <dto::UploadPart as Served>::execute(server.app_context(), fresh, req)
+        .await
+        .unwrap();
+    let parts = store
+        .list_object_parts(&bucket, key, &session, None, 20, &options)
+        .await
+        .unwrap()
+        .parts;
+    assert_eq!(
+        parts.first().and_then(|part| part.etag.as_deref()),
+        Some("900150983cd24fb0d6963f7d28e17f72")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn native_upload_part_uses_frames_and_leaves_the_prior_part_on_failure() {
+    use tokio::io::AsyncReadExt;
+
+    let (server, bucket) = fixture(&["s3:PutObject"]).await;
+    let store = server.object_store().unwrap();
+    let options = ObjectOptions::default();
+    let key = "allowed";
+    let upload_id = store.new_multipart_upload(&bucket, key, &options).await.unwrap().upload_id;
+    let etag = "900150983cd24fb0d6963f7d28e17f72";
+    for (label, payload, size, checksum, expected) in [
+        ("valid", b"abc", 3, Some("NSRBwg=="), None),
+        ("missing trailer", b"xyz", 3, None, Some("BadDigest")),
+        ("wrong checksum", b"xyz", 3, Some("AAAAAA=="), Some("BadDigest")),
+        ("short", b"xyz", 4, Some("6466Zw=="), Some("IncompleteBody")),
+        ("digest error", b"xyz", 3, None, Some("BadDigest")),
+        ("signature error", b"xyz", 3, None, Some("SignatureDoesNotMatch")),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
+        let mut trailers = HeaderMap::new();
+        if let Some(value) = checksum {
+            trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static(value));
+        }
+        let end = match label {
+            "digest error" => Err(StreamError::upstream(Box::new(rustfs_rio::BadDigest {
+                expected_md5: String::new(),
+                calculated_md5: String::new(),
+            }))),
+            "signature error" => Err(StreamError::upstream(Box::new(
+                crate::app::storage_api::s3::stream::aws_chunked_stream::AwsChunkedStreamError::SignatureMismatch,
+            ))),
+            _ => Ok(PayloadRead::Eof {
+                trailers: TrailingHeaders::from_header_map(trailers),
+            }),
+        };
+        let mut input = part_input(&bucket, &upload_id, 1);
+        input.content_length = size;
+        input.body = Some(
+            ByteStream::new(Box::pin(Frames(VecDeque::from([
+                Ok(PayloadRead::Chunk(Bytes::from_static(payload))),
+                end,
+            ]))))
+            .unwrap(),
+        );
+        // The decoded trailer declaration wins even with another SDK algorithm value.
+        input.checksum_algorithm = Some(dto::ChecksumAlgorithm::custom("SHA256"));
+        let request = request::<dto::UploadPart>(input);
+        let mut context = envelope(&server, headers);
+        <dto::UploadPart as Served>::authorize(&mut context, &request).await.unwrap();
+        let result = <dto::UploadPart as Served>::execute(server.app_context(), context, request).await;
+        assert_eq!(result.as_ref().err().map(|error| error.code().as_str()), expected, "{label}");
+        if let Ok(response) = result {
+            assert_eq!(response.output().unwrap().e_tag, crate::app::dto_values::stored_etag(etag));
+            let (_, status, headers) = response.into_parts();
+            assert_eq!(status, 200);
+            assert_eq!(headers["x-amz-checksum-crc32"], "NSRBwg==");
+        }
+        let parts = store
+            .list_object_parts(&bucket, key, &upload_id, None, 20, &options)
+            .await
+            .unwrap()
+            .parts;
+        assert_eq!(parts.len(), 1, "{label}");
+        assert_eq!(
+            (parts[0].part_num, parts[0].size, parts[0].etag.as_deref()),
+            (1, 3, Some(etag)),
+            "{label}"
+        );
+    }
+    store
+        .clone()
+        .complete_multipart_upload(
+            &bucket,
+            key,
+            &upload_id,
+            vec![CompletePart {
+                part_num: 1,
+                etag: Some(etag.to_owned()),
+                ..Default::default()
+            }],
+            &options,
+        )
+        .await
+        .unwrap();
+    let mut old = store
+        .get_object_reader(&bucket, key, None, HeaderMap::new(), &options)
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    old.stream.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"abc");
 }

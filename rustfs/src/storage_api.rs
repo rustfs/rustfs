@@ -245,8 +245,11 @@ pub(crate) mod server {
             #[cfg(test)]
             pub(crate) mod test_support {
                 pub(crate) use crate::storage::storage_api::access_consumer::{AuthorizationRequest, ReqInfo};
-                pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
-                pub(crate) use crate::storage::storage_api::contract::object::ObjectOperations;
+                pub(crate) use crate::storage::storage_api::contract::bucket::{
+                    BucketOperations, DeleteBucketOptions, MakeBucketOptions,
+                };
+                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
+                pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
                     FS, StorageObjectOptions as ObjectOptions, get_bucket_metadata, set_bucket_metadata,
                 };

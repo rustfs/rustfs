@@ -15,13 +15,18 @@
 //! The gateway operations of migration batch B2 (rustfs/backlog#2766): object listings, multipart
 //! listings, and multipart create and abort.
 
-use super::{OpRow, Served, row};
+use super::{
+    OpRow, Served,
+    object_write::{request_version_id, retain_until},
+    row,
+};
 use crate::app::RequestEnvelope;
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::multipart_usecase::DefaultMultipartUsecase;
+use crate::app::multipart_usecase::{CreateMultipartUploadFields, DefaultMultipartUsecase};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::storage_api::server::http::access::access_owned::listing_multipart::{
-    authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2,
+    CreateMultipartAuthorization, authorize_bucket_listing, authorize_create_multipart_upload, authorize_list_multipart_uploads,
+    authorize_list_objects_v2,
 };
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_policy::policy::action::S3Action;
@@ -34,6 +39,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListObjects>(),
     row::<dto::ListObjectVersions>(),
     row::<dto::ListMultipartUploads>(),
+    row::<dto::CreateMultipartUpload>(),
 ];
 
 impl Served for dto::ListObjectsV2 {
@@ -95,6 +101,60 @@ impl Served for dto::ListMultipartUploads {
             .execute_list_multipart_uploads(envelope, request.into_input())
             .await?;
         Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::CreateMultipartUpload {
+    const METRIC: S3Operation = S3Operation::CreateMultipartUpload;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let server = server_context(envelope)?;
+        let input = request.input();
+        let version = request_version_id(envelope);
+        let facts = CreateMultipartAuthorization {
+            bucket: input.bucket.as_str(),
+            key: input.key.as_str(),
+            query_version: version.as_deref(),
+            retain_until: retain_until(input.object_lock_retain_until_date.as_ref())?,
+            legal_hold_present: input.object_lock_legal_hold_status.is_some(),
+            retention_present: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
+        };
+        authorize_create_multipart_upload(&server, envelope, facts).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let version = request_version_id(&envelope);
+        let input = request.into_input();
+        let fields = CreateMultipartUploadFields {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            metadata: Some(input.metadata.into_iter().collect()),
+            tagging: input.tagging,
+            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
+            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+            ssekms_key_id: input.ssekms_key_id,
+            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
+            object_lock_retain_until_date: retain_until(input.object_lock_retain_until_date.as_ref())?,
+        };
+        let output = DefaultMultipartUsecase::with_context(context)
+            .execute_create_multipart_upload(envelope, fields, version)
+            .await?;
+        Ok(Resp::new(dto::CreateMultipartUploadOutput {
+            bucket: input.bucket,
+            key: input.key,
+            upload_id: output.upload_id,
+            server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            ssekms_key_id: output.ssekms_key_id,
+            checksum_algorithm: output.checksum_algorithm.map(dto::ChecksumAlgorithm::custom),
+            checksum_type: output.checksum_type.map(dto::ChecksumType::custom),
+            ..Default::default()
+        }))
     }
 }
 
