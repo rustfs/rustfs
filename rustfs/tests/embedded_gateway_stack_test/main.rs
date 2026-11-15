@@ -396,6 +396,10 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                 S3Operation::GetBucketAccelerateConfiguration
                     | S3Operation::GetBucketRequestPayment
                     | S3Operation::GetBucketWebsite
+                    | S3Operation::PutBucketAccelerateConfiguration
+                    | S3Operation::PutBucketRequestPayment
+                    | S3Operation::PutBucketWebsite
+                    | S3Operation::DeleteBucketWebsite
             ) {
             "unknown"
         } else {

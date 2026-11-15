@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bucket website configuration reads shared by the S3 edges.
+//! Bucket website configuration shared by the S3 edges.
 
-use super::{ApiError, DefaultBucketUsecase, StorageError, metadata_sys};
+use super::BUCKET_WEBSITE_CONFIG;
+use super::{
+    ApiError, DefaultBucketUsecase, StorageError, bucket_config_mutation_incarnation, delete_bucket_config_for_incarnation,
+    metadata_sys, serialize, update_bucket_config_for_incarnation,
+};
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::bucket_usecase::validate_website_configuration;
 use rustfs_gateway_types::persistence::PersistedWebsiteConfiguration;
 use rustfs_s3_types::S3Result;
 
 impl DefaultBucketUsecase {
     pub(crate) async fn execute_get_bucket_website(&self, bucket: &str) -> S3Result<PersistedWebsiteConfiguration> {
-        self.ensure_config_read_bucket(bucket).await?;
+        self.ensure_config_bucket(bucket).await?;
         match metadata_sys::get_website_config(bucket).await {
             Ok((config, _)) => Ok(config),
             Err(StorageError::ConfigNotFound) => Err(rustfs_s3_types::s3_error!(
@@ -29,5 +35,205 @@ impl DefaultBucketUsecase {
             )),
             Err(err) => Err(ApiError::from(err).into()),
         }
+    }
+
+    pub(crate) async fn execute_put_bucket_website(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        configuration: impl FnOnce() -> S3Result<PersistedWebsiteConfiguration> + Send,
+    ) -> S3Result<()> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+        self.ensure_config_bucket(bucket).await?;
+
+        let config = configuration()?;
+        validate_website_configuration(&config)?;
+        let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
+        update_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, data, expected_incarnation_id)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+
+    pub(crate) async fn execute_delete_bucket_website(&self, envelope: RequestEnvelope, bucket: &str) -> S3Result<()> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+        self.ensure_config_bucket(bucket).await?;
+
+        delete_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG};
+    use super::*;
+    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
+    use crate::app::runtime_sources::ServerContextSlot;
+    use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
+    use rustfs_credentials::Credentials;
+    use rustfs_gateway_types::persistence::{parse_accelerate, parse_request_payment, parse_website};
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use rustfs_s3_types::S3ErrorCode;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    #[test]
+    #[serial]
+    fn core_config_puts_defer_conversion_until_after_bucket_lookup() {
+        run_large_stack_test("core-config-lookup-before-conversion", || async {
+            let ambient = shared_gating_ambient().await;
+            let usecase = DefaultBucketUsecase::with_context(Some(ambient));
+            let bucket = format!("core-config-missing-{}", uuid::Uuid::new_v4().simple());
+            let request = build_request((), http::Method::PUT);
+            let mut converted = [false; 3];
+            let accelerate = usecase
+                .execute_put_bucket_accelerate_configuration(RequestEnvelope::from_s3s(&request), &bucket, || {
+                    converted[0] = true;
+                    Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid acceleration"))
+                })
+                .await;
+            let payment = usecase
+                .execute_put_bucket_request_payment(RequestEnvelope::from_s3s(&request), &bucket, || {
+                    converted[1] = true;
+                    Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid request payment"))
+                })
+                .await;
+            let website = usecase
+                .execute_put_bucket_website(RequestEnvelope::from_s3s(&request), &bucket, || {
+                    converted[2] = true;
+                    Err(rustfs_s3_types::s3_error!(MalformedXML, "invalid website"))
+                })
+                .await;
+            assert_eq!(
+                [accelerate, payment, website].map(|result| result.err().map(|error| error.code().clone())),
+                [
+                    Some(S3ErrorCode::NoSuchBucket),
+                    Some(S3ErrorCode::NoSuchBucket),
+                    Some(S3ErrorCode::NoSuchBucket)
+                ],
+            );
+            assert_eq!(converted, [false; 3]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn core_config_mutations_reject_stale_incarnations() {
+        use super::super::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+        const OLD_ACCELERATE: &[u8] = b"<AccelerateConfiguration><Status>Suspended</Status></AccelerateConfiguration>";
+        const NEW_ACCELERATE: &[u8] = b"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>";
+        const OLD_PAYMENT: &[u8] = b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>";
+        const NEW_PAYMENT: &[u8] = b"<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>";
+        const OLD_WEBSITE: &[u8] =
+            b"<WebsiteConfiguration><IndexDocument><Suffix>old.html</Suffix></IndexDocument></WebsiteConfiguration>";
+        const NEW_WEBSITE: &[u8] =
+            b"<WebsiteConfiguration><IndexDocument><Suffix>new.html</Suffix></IndexDocument></WebsiteConfiguration>";
+
+        run_large_stack_test("core-config-stale-incarnation", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let server = ServerContextSlot::new();
+            assert!(server.install(Arc::clone(&ambient)));
+            let usecase = DefaultBucketUsecase::with_context(Some(Arc::clone(&ambient)));
+
+            let mut results = Vec::new();
+            for (method, query, file, before) in [
+                (http::Method::PUT, "accelerate", BUCKET_ACCELERATE_CONFIG, OLD_ACCELERATE),
+                (http::Method::PUT, "requestPayment", BUCKET_REQUEST_PAYMENT_CONFIG, OLD_PAYMENT),
+                (http::Method::PUT, "website", BUCKET_WEBSITE_CONFIG, OLD_WEBSITE),
+                (http::Method::DELETE, "website", BUCKET_WEBSITE_CONFIG, OLD_WEBSITE),
+            ] {
+                let bucket = format!("core-config-stale-{}", uuid::Uuid::new_v4().simple());
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create original bucket");
+                let mut request = build_request((), method.clone());
+                request.uri = format!("/{bucket}?{query}").parse().expect("bucket request URI");
+                request.extensions.insert(Arc::clone(&server));
+                request.extensions.insert(ReqInfo {
+                    cred: Some(Credentials {
+                        access_key: "core-config-owner".to_owned(),
+                        ..Default::default()
+                    }),
+                    is_owner: true,
+                    ..Default::default()
+                });
+                let mut envelope = RequestEnvelope::from_s3s(&request);
+                authorize_bucket_config_mutation(
+                    &server,
+                    &mut envelope,
+                    &bucket,
+                    Action::S3Action(S3Action::PutBucketPolicyAction),
+                )
+                .await
+                .expect("owner authorization captures the original incarnation");
+                store
+                    .delete_bucket(&bucket, &DeleteBucketOptions::default())
+                    .await
+                    .expect("delete original bucket");
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create replacement bucket");
+                metadata_sys::update(&bucket, file, before.to_vec())
+                    .await
+                    .expect("seed replacement configuration");
+
+                let result = match (method, query) {
+                    (http::Method::PUT, "accelerate") => {
+                        usecase
+                            .execute_put_bucket_accelerate_configuration(envelope, &bucket, || {
+                                Ok(parse_accelerate(NEW_ACCELERATE).expect("changed accelerate document"))
+                            })
+                            .await
+                    }
+                    (http::Method::PUT, "requestPayment") => {
+                        usecase
+                            .execute_put_bucket_request_payment(envelope, &bucket, || {
+                                Ok(parse_request_payment(NEW_PAYMENT).expect("changed request payment document"))
+                            })
+                            .await
+                    }
+                    (http::Method::PUT, "website") => {
+                        usecase
+                            .execute_put_bucket_website(envelope, &bucket, || {
+                                Ok(parse_website(NEW_WEBSITE).expect("changed website document"))
+                            })
+                            .await
+                    }
+                    (http::Method::DELETE, "website") => usecase.execute_delete_bucket_website(envelope, &bucket).await,
+                    _ => unreachable!("only core bucket configuration mutations"),
+                };
+
+                let stored = metadata_sys::get_global_bucket_metadata_sys()
+                    .expect("initialized metadata system")
+                    .read()
+                    .await
+                    .get_config_from_disk(&bucket)
+                    .await
+                    .expect("replacement metadata");
+                let after = match file {
+                    BUCKET_ACCELERATE_CONFIG => stored.accelerate_config_xml,
+                    BUCKET_REQUEST_PAYMENT_CONFIG => stored.request_payment_config_xml,
+                    BUCKET_WEBSITE_CONFIG => stored.website_config_xml,
+                    _ => unreachable!("only core bucket configurations"),
+                };
+                results.push((query, result.err().map(|err| err.code().clone()), after == before));
+            }
+            assert_eq!(
+                results,
+                ["accelerate", "requestPayment", "website", "website"].map(|query| (
+                    query,
+                    Some(S3ErrorCode::NoSuchBucket),
+                    true
+                )),
+                "each operation must reject the stale authorization and preserve the replacement bytes"
+            );
+        });
     }
 }

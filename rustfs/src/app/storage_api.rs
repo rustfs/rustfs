@@ -944,6 +944,9 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod metadata {
+        pub(crate) use crate::storage::storage_api::{
+            BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
+        };
         pub(crate) const BUCKET_CORS_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_CORS_CONFIG;
         pub(crate) const BUCKET_LIFECYCLE_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -1758,6 +1761,7 @@ pub(crate) mod bucket_usecase {
     pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
+        validate_website_configuration,
     };
 }
 

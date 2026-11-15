@@ -20,7 +20,7 @@ use rustfs_s3_types::S3Result;
 
 impl DefaultBucketUsecase {
     pub(crate) async fn execute_get_bucket_logging(&self, bucket: &str) -> S3Result<PersistedBucketLoggingStatus> {
-        self.ensure_config_read_bucket(bucket).await?;
+        self.ensure_config_bucket(bucket).await?;
         match metadata_sys::get_logging_config(bucket).await {
             Ok((config, _)) => Ok(config),
             Err(StorageError::ConfigNotFound) => Ok(PersistedBucketLoggingStatus::default()),
