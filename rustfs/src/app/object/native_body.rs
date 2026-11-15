@@ -93,7 +93,7 @@ impl PayloadStream for LegacyPayload {
 }
 
 #[derive(Default)]
-struct FrameTrailers(Mutex<Option<HeaderMap>>);
+pub(crate) struct FrameTrailers(Mutex<Option<HeaderMap>>);
 
 impl TrailerSource for FrameTrailers {
     fn lookup(&self, name: &str) -> TrailerValue {
@@ -115,8 +115,13 @@ pub(super) struct BodyChunks {
 }
 
 impl BodyChunks {
+    #[cfg(test)]
     pub(super) fn new(body: Body) -> (Self, SharedTrailerSource) {
-        let trailers = Arc::new(FrameTrailers::default());
+        Self::with_trailers(body, None)
+    }
+
+    pub(super) fn with_trailers(body: Body, trailers: Option<Arc<FrameTrailers>>) -> (Self, SharedTrailerSource) {
+        let trailers = trailers.unwrap_or_default();
         (
             Self {
                 body: Mutex::new(body),

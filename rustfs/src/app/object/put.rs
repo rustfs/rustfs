@@ -541,7 +541,7 @@ fn select_put_path_with_concurrency(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-pub(super) async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
+pub(super) async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> rustfs_s3_types::S3Result<()>
 where
     R: AsyncRead + Unpin,
     B: bytes::BufMut,
@@ -554,7 +554,7 @@ where
             .await
             .map_err(ApiError::from)?;
         if read == 0 {
-            return Err(s3_error!(IncompleteBody));
+            return Err(rustfs_s3_types::s3_error!(IncompleteBody));
         }
         filled += read;
     }
@@ -564,13 +564,17 @@ where
         .await
         .map_err(ApiError::from)?;
     if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
+        return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
     }
 
     Ok(())
 }
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_exact_pooled<R>(
+    mut body: R,
+    size: usize,
+    pool: &BytesPool,
+) -> rustfs_s3_types::S3Result<PooledBuffer>
 where
     R: AsyncRead + Unpin,
 {
@@ -585,7 +589,7 @@ where
 /// Read small PUT body into a directly-allocated buffer, bypassing BytesPool.
 /// Used for objects ≤4KiB where pool contention under high concurrency
 /// outweighs the allocation cost.
-async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Result<std::io::Cursor<Vec<u8>>>
+async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> rustfs_s3_types::S3Result<std::io::Cursor<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -594,7 +598,7 @@ where
     Ok(std::io::Cursor::new(buf))
 }
 
-async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
+async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> rustfs_s3_types::S3Result<ChunkedBytesReader>
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
     E: Into<StdError>,
@@ -604,14 +608,14 @@ where
 
     while filled < size {
         let Some(chunk) = body.next().await else {
-            return Err(s3_error!(IncompleteBody));
+            return Err(rustfs_s3_types::s3_error!(IncompleteBody));
         };
         let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if chunk.is_empty() {
             continue;
         }
         if filled.saturating_add(chunk.len()) > size {
-            return Err(s3_error!(UnexpectedContent));
+            return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
         }
 
         rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
@@ -622,7 +626,7 @@ where
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if !chunk.is_empty() {
-            return Err(s3_error!(UnexpectedContent));
+            return Err(rustfs_s3_types::s3_error!(UnexpectedContent));
         }
     }
 
@@ -1387,7 +1391,7 @@ impl DefaultObjectUsecase {
             not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
             allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
         )]
-        let mut committed = self.put_object_core(write, body, start_time).await?;
+        let mut committed = self.put_object_core(write, body, input.frame_trailers, start_time).await?;
         #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
         let _ = rdma_put;
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
@@ -1461,6 +1465,7 @@ impl DefaultObjectUsecase {
         &self,
         write: PutObjectWriteRequest<'_>,
         body: NativeBody,
+        frame_trailers: Option<Arc<super::native_body::FrameTrailers>>,
         start_time: Instant,
     ) -> rustfs_s3_types::S3Result<PutObjectCommitted> {
         use rustfs_s3_types::{S3Error, S3ErrorCode};
@@ -1486,7 +1491,7 @@ impl DefaultObjectUsecase {
             preserve_etag,
             mut origin,
         } = write;
-        let (chunks, _) = super::native_body::BodyChunks::new(body);
+        let (chunks, _) = super::native_body::BodyChunks::with_trailers(body, frame_trailers);
         let body: UploadChunks = match max_content_length {
             Some(limit) => Box::new(MaxContentLengthStream {
                 inner: chunks,
@@ -2442,6 +2447,7 @@ mod tests {
     use crate::app::storage_api::s3::dto::{GetObjectInput, HeadObjectInput, ObjectLockRetentionMode};
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use rustfs_s3_types::S3ErrorCode as OwnedS3ErrorCode;
 
     #[tokio::test]
     #[serial_test::serial]
@@ -3650,6 +3656,55 @@ mod tests {
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
     }
 
+    #[tokio::test]
+    async fn eager_put_readers_preserve_typed_producer_failure() {
+        use rustfs_gateway_stream::StreamError;
+        use rustfs_io_core::BytesPoolConfig;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("fixture producer failure")]
+        struct ProducerFailure;
+
+        fn producer_error() -> StreamError {
+            StreamError::upstream(Box::new(ProducerFailure))
+        }
+
+        fn assert_producer_failure<T>(result: Result<T, impl Into<rustfs_s3_types::S3Error>>, path: &str) {
+            let Err(error) = result else {
+                panic!("{path} accepted a producer error");
+            };
+            let error = error.into();
+            assert_eq!(error.code().as_str(), "InternalError", "{path}");
+            let mut cause = std::error::Error::source(&error);
+            let mut stream = false;
+            let mut producer = false;
+            for _ in 0..8 {
+                let Some(error) = cause else { break };
+                stream |= error.is::<StreamError>();
+                producer |= error.is::<ProducerFailure>();
+                cause = error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .map(|inner| inner as &dyn std::error::Error)
+                    .or_else(|| error.source());
+            }
+            assert!(stream, "{path} lost the typed stream error");
+            assert!(producer, "{path} lost the typed producer failure");
+        }
+
+        let stream_reader = || {
+            StreamReader::new(futures::stream::iter([
+                Ok(Bytes::from_static(b"a")),
+                Err(std::io::Error::other(producer_error())),
+            ]))
+        };
+        assert_producer_failure(read_small_put_body_exact_direct(stream_reader(), 2).await, "direct");
+        let pool = BytesPool::with_config(BytesPoolConfig::default());
+        assert_producer_failure(read_small_put_body_exact_pooled(stream_reader(), 2, &pool).await, "pooled");
+        let zero_copy = futures::stream::iter([Ok(Bytes::from_static(b"a")), Err(producer_error())]);
+        assert_producer_failure(read_zero_copy_put_body_exact(zero_copy, 2).await, "zero-copy");
+    }
+
     struct FragmentedBody {
         data: std::io::Cursor<Vec<u8>>,
     }
@@ -3835,7 +3890,7 @@ mod tests {
             assert!(pool.try_acquire_buffer(8192).is_none());
         }
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(owner.await.err().expect("trickle must expire").code(), &S3ErrorCode::RequestTimeout);
+        assert_eq!(owner.await.err().expect("trickle must expire").code(), &OwnedS3ErrorCode::RequestTimeout);
         let healthy = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![1; 8192]), 8192, &pool)
             .await
             .expect("timed-out buffer must be reusable");
@@ -3879,7 +3934,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
@@ -3892,7 +3947,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -3911,12 +3966,12 @@ mod tests {
         let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
             .await
             .expect_err("short direct body should fail");
-        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+        assert_eq!(short.code(), &OwnedS3ErrorCode::IncompleteBody);
 
         let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
             .await
             .expect_err("extra direct body should fail");
-        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(extra.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -3958,7 +4013,7 @@ mod tests {
         let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
             .await
             .expect_err("non-empty body declared as empty should fail");
-        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(extra.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -3983,7 +4038,7 @@ mod tests {
             .await
             .expect_err("a partial body followed by an I/O error must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InternalError);
     }
 
     #[tokio::test]
@@ -4011,7 +4066,7 @@ mod tests {
         .await
         .expect_err("a fragmented body longer than declared must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
@@ -4069,7 +4124,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]

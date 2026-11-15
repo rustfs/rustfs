@@ -25,6 +25,7 @@ pub(crate) struct PutObjectWriteInput {
     pub(crate) bucket: String,
     pub(crate) key: String,
     pub(crate) body: Option<Body>,
+    pub(crate) frame_trailers: Option<std::sync::Arc<super::native_body::FrameTrailers>>,
     pub(crate) trailing_headers: Option<SharedTrailerSource>,
     pub(crate) content_length: Option<i64>,
     pub(crate) metadata: Option<HashMap<String, String>>,
@@ -72,4 +73,14 @@ pub(crate) struct PutObjectWriteOutput {
     pub(crate) checksum_crc64nvme: Option<String>,
     pub(crate) headers: http::HeaderMap,
     pub(crate) status: Option<http::StatusCode>,
+}
+
+impl PutObjectWriteInput {
+    /// Gateway frames publish to the same source that checksum readers observe.
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn capture_frame_trailers(&mut self) {
+        let trailers = std::sync::Arc::new(super::native_body::FrameTrailers::default());
+        self.frame_trailers = Some(trailers.clone());
+        self.trailing_headers = Some(trailers);
+    }
 }
