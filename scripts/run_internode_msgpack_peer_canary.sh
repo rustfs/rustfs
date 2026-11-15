@@ -12,6 +12,9 @@ CANDIDATE_IMAGE=""
 BASELINE_IMAGE=""
 CANDIDATE_REVISION=""
 BASELINE_REVISION=""
+CANDIDATE_IMAGE_ID=""
+BASELINE_IMAGE_ID=""
+TELEMETRY_CLUSTER_ID=""
 EXECUTE=false
 KEEP_UP=false
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
@@ -38,6 +41,7 @@ Options:
   --baseline-image IMAGE        Previous-version image lacking the peer capability.
   --candidate-revision 40HEX    Exact source revision used by the candidate image.
   --baseline-revision 40HEX     Exact source revision used by the baseline image.
+  --telemetry-cluster-id ID     Unique rustfs.cluster.id for this canary run.
   --cluster-compose PATH        Four-node compose file.
   --project-name NAME           Isolated Docker Compose project name.
   --prometheus-query-url URL    Prometheus /api/v1/query endpoint.
@@ -91,6 +95,7 @@ parse_args() {
       --baseline-image) BASELINE_IMAGE="${2:-}"; shift 2 ;;
       --candidate-revision) CANDIDATE_REVISION="${2:-}"; shift 2 ;;
       --baseline-revision) BASELINE_REVISION="${2:-}"; shift 2 ;;
+      --telemetry-cluster-id) TELEMETRY_CLUSTER_ID="${2:-}"; shift 2 ;;
       --cluster-compose) CLUSTER_COMPOSE="${2:-}"; shift 2 ;;
       --project-name) PROJECT_NAME="${2:-}"; shift 2 ;;
       --prometheus-query-url) PROMETHEUS_QUERY_URL="${2:-}"; shift 2 ;;
@@ -110,6 +115,10 @@ validate() {
   validate_token candidate-image "$CANDIDATE_IMAGE"
   validate_token baseline-image "$BASELINE_IMAGE"
   validate_token project-name "$PROJECT_NAME"
+  if [[ -z "$TELEMETRY_CLUSTER_ID" ]]; then
+    TELEMETRY_CLUSTER_ID="${PROJECT_NAME}-$(date -u +%Y%m%d%H%M%S)-$$"
+  fi
+  validate_token telemetry-cluster-id "$TELEMETRY_CLUSTER_ID"
   [[ "$CANARY_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "invalid S3 canary bucket: $CANARY_BUCKET"
   validate_revision candidate-revision "$CANDIDATE_REVISION"
   validate_revision baseline-revision "$BASELINE_REVISION"
@@ -158,6 +167,7 @@ write_override() {
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_ONLY: "%s"\n' "$requested"
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: "%s"\n' "$peer"
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: "false"\n'
+      printf '      OTEL_RESOURCE_ATTRIBUTES: "rustfs.cluster.id=%s"\n' "$TELEMETRY_CLUSTER_ID"
     done
   } >"$path"
 }
@@ -191,6 +201,21 @@ document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if document.get("status") != "success" or document.get("data", {}).get("resultType") != "vector":
     raise SystemExit("Prometheus preflight did not return a successful vector")
 PY
+}
+
+inspect_image_identity() {
+  local image="$1" expected_revision="$2" label="$3" inspected image_id revision
+  inspected="$(docker image inspect --format '{{.Id}}|{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
+  IFS='|' read -r image_id revision <<<"$inspected"
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || die "${label} image has no immutable sha256 ID: ${image}"
+  [[ "$revision" == "$expected_revision" ]] || die "${label} image revision mismatch: expected ${expected_revision}, observed ${revision:-missing}"
+  printf '%s\n' "$image_id"
+}
+
+preflight_images() {
+  CANDIDATE_IMAGE_ID="$(inspect_image_identity "$CANDIDATE_IMAGE" "$CANDIDATE_REVISION" candidate)"
+  BASELINE_IMAGE_ID="$(inspect_image_identity "$BASELINE_IMAGE" "$BASELINE_REVISION" baseline)"
+  [[ "$CANDIDATE_IMAGE_ID" != "$BASELINE_IMAGE_ID" ]] || die "candidate and baseline tags resolve to the same immutable image"
 }
 
 node_port() {
@@ -348,11 +373,13 @@ capture_metrics() {
   local start="$2"
   local end="$3"
   local window=$((end - start))
-  local decisions fallback decode_errors rpc_errors
-  decisions="sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total[${window}s]))"
-  fallback="sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[${window}s])) or vector(0)"
-  decode_errors="sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[${window}s])) or vector(0)"
-  rpc_errors="sum(increase(rustfs_system_network_internode_operation_errors_total[${window}s])) or vector(0)"
+  local decisions fallback decode_errors rpc_errors selector zero
+  selector="rustfs_cluster_id=\"${TELEMETRY_CLUSTER_ID}\""
+  zero="label_replace(vector(0), \"rustfs_cluster_id\", \"${TELEMETRY_CLUSTER_ID}\", \"\", \"\")"
+  decisions="sum by (decision, reason, rustfs_cluster_id) (increase(rustfs_system_network_internode_msgpack_send_decisions_total{${selector}}[${window}s]))"
+  fallback="sum by (rustfs_cluster_id) (increase(rustfs_system_network_internode_msgpack_json_fallback_total{${selector}}[${window}s])) or ${zero}"
+  decode_errors="sum by (rustfs_cluster_id) (increase(rustfs_system_network_internode_msgpack_json_decode_error_total{${selector}}[${window}s])) or ${zero}"
+  rpc_errors="sum by (rustfs_cluster_id) (increase(rustfs_system_network_internode_operation_errors_total{${selector}}[${window}s])) or ${zero}"
   prometheus_query "$decisions" "$end" "$phase_dir/decisions.json"
   prometheus_query "$fallback" "$end" "$phase_dir/fallback.json"
   prometheus_query "$decode_errors" "$end" "$phase_dir/decode_errors.json"
@@ -365,6 +392,29 @@ Path(sys.argv[1]).write_text(json.dumps({"decisions": sys.argv[2], "fallback": s
                                         "decode_errors": sys.argv[4], "rpc_errors": sys.argv[5]},
                                        sort_keys=True) + "\n", encoding="utf-8")
 PY
+}
+
+capture_phase_images() {
+  local phase="$1" phase_dir="$2" node container_id inspected image_id image_ref revision expected_ref expected_id expected_revision
+  : >"$phase_dir/images.tsv"
+  for node in node1 node2 node3 node4; do
+    container_id="$(compose ps -q "$node")"
+    [[ -n "$container_id" ]] || die "missing running container for ${phase}/${node}"
+    inspected="$(docker inspect --format '{{.Image}}|{{.Config.Image}}|{{index .Config.Labels "org.opencontainers.image.revision"}}' "$container_id")"
+    IFS='|' read -r image_id image_ref revision <<<"$inspected"
+    expected_ref="$(phase_image "$phase" "$node")"
+    if phase_is_old "$phase" "$node"; then
+      expected_id="$BASELINE_IMAGE_ID"
+      expected_revision="$BASELINE_REVISION"
+    else
+      expected_id="$CANDIDATE_IMAGE_ID"
+      expected_revision="$CANDIDATE_REVISION"
+    fi
+    [[ "$image_ref" == "$expected_ref" ]] || die "${phase}/${node} image ref mismatch: expected ${expected_ref}, observed ${image_ref}"
+    [[ "$image_id" == "$expected_id" ]] || die "${phase}/${node} image ID mismatch: expected ${expected_id}, observed ${image_id}"
+    [[ "$revision" == "$expected_revision" ]] || die "${phase}/${node} revision mismatch: expected ${expected_revision}, observed ${revision:-missing}"
+    printf '%s\t%s\t%s\t%s\n' "$node" "$image_ref" "$image_id" "$revision" >>"$phase_dir/images.tsv"
+  done
 }
 
 phase_nodes() {
@@ -389,6 +439,7 @@ run_phase() {
   log "applying ${phase}: ${nodes[*]}"
   compose up -d --no-build --force-recreate "${nodes[@]}"
   wait_cluster
+  capture_phase_images "$phase" "$phase_dir"
   if [[ "$phase" == "mixed-old-peer" ]]; then
     prepare_readback_object
   fi
@@ -409,19 +460,27 @@ run_phase() {
 
 write_manifest() {
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROJECT_ROOT/scripts" "$PYTHON_BIN" - \
-    "$OUT_DIR" "$CANDIDATE_REVISION" "$BASELINE_REVISION" <<'PY'
+    "$OUT_DIR" "$CANDIDATE_REVISION" "$BASELINE_REVISION" "$TELEMETRY_CLUSTER_ID" \
+    "$CANDIDATE_IMAGE" "$CANDIDATE_IMAGE_ID" "$BASELINE_IMAGE" "$BASELINE_IMAGE_ID" <<'PY'
 import json
 from pathlib import Path
 import sys
 from check_internode_msgpack_peer_canary import expected_queries, OLD_NODES
 
-root, candidate, baseline = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+root, candidate, baseline, cluster_id = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+candidate_ref, candidate_id, baseline_ref, baseline_id = sys.argv[5:9]
 phases = []
 for line in (root / "phases.tsv").read_text(encoding="utf-8").splitlines():
     name, start, end = line.split("\t")
     start, end = int(start), int(end)
     old = OLD_NODES[name]
     nodes = {node: (baseline if node in old else candidate) for node in ("node1", "node2", "node3", "node4")}
+    images = {}
+    for image_line in (root / name / "images.tsv").read_text(encoding="utf-8").splitlines():
+        node, image_ref, image_id, revision = image_line.split("\t")
+        if node in images:
+            raise SystemExit(f"duplicate image observation for {name}/{node}")
+        images[node] = {"ref": image_ref, "id": image_id, "revision": revision}
     phases.append({
         "name": name,
         "start_unix": start,
@@ -431,7 +490,8 @@ for line in (root / "phases.tsv").read_text(encoding="utf-8").splitlines():
             "new_nodes": {"msgpack_only": True, "peer_capability": True, "fleet_confirmed": False},
             "old_nodes": {"msgpack_only": False, "peer_capability": False, "fleet_confirmed": False},
         },
-        "queries": expected_queries(end - start),
+        "queries": expected_queries(end - start, cluster_id),
+        "images": images,
         "workload": f"{name}/workload.json",
         "artifacts": {kind: f"{name}/{kind}.json" for kind in
                       ("decisions", "fallback", "decode_errors", "rpc_errors")},
@@ -441,6 +501,11 @@ manifest = {
     "scope": "internode-msgpack-peer-canary",
     "source_revision": candidate,
     "baseline_revision": baseline,
+    "telemetry_cluster_id": cluster_id,
+    "images": {
+        "candidate": {"ref": candidate_ref, "id": candidate_id, "revision": candidate},
+        "baseline": {"ref": baseline_ref, "id": baseline_id, "revision": baseline},
+    },
     "stable_connection_affinity": True,
     "max_metric_lag_secs": 120,
     "phases": phases,
@@ -454,6 +519,7 @@ print_plan() {
   printf 'baseline_image=%s\n' "$BASELINE_IMAGE"
   printf 'candidate_revision=%s\n' "$CANDIDATE_REVISION"
   printf 'baseline_revision=%s\n' "$BASELINE_REVISION"
+  printf 'telemetry_cluster_id=%s\n' "$TELEMETRY_CLUSTER_ID"
   printf 'project_name=%s\n' "$PROJECT_NAME"
   printf 'out_dir=%s\n' "$OUT_DIR"
   printf 'phases=mixed-old-peer all-new rollback-old-peer\n'
@@ -474,7 +540,7 @@ main() {
   require_cmd cmp
   require_cmd "$PYTHON_BIN"
   docker info >/dev/null
-  docker image inspect "$CANDIDATE_IMAGE" "$BASELINE_IMAGE" >/dev/null
+  preflight_images
   preflight_isolated_project
   if [[ -d "$OUT_DIR" && -n "$(find "$OUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     die "evidence directory is not empty: $OUT_DIR"

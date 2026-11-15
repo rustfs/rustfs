@@ -29,13 +29,16 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
     def fixture(self):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
+        cluster_id = "canary-test-cluster"
+        candidate_image = {"ref": "rustfs/candidate:test", "id": "sha256:" + "1" * 64, "revision": "a" * 40}
+        baseline_image = {"ref": "rustfs/baseline:test", "id": "sha256:" + "2" * 64, "revision": "b" * 40}
         phases = []
         layouts = [
-            ("mixed-old-peer", 100, 110, 3, 1, [row(110, 4, decision="msgpack_only", reason="peer_capable"),
-                                                   row(110, 2, decision="dual_write", reason="peer_unknown")]),
-            ("all-new", 120, 130, 4, 0, [row(130, 8, decision="msgpack_only", reason="peer_capable")]),
-            ("rollback-old-peer", 140, 150, 3, 1, [row(150, 5, decision="msgpack_only", reason="peer_capable"),
-                                                    row(150, 3, decision="dual_write", reason="peer_revoked")]),
+            ("mixed-old-peer", 100, 110, 3, 1, [row(110, 4, decision="msgpack_only", reason="peer_capable", rustfs_cluster_id=cluster_id),
+                                                   row(110, 2, decision="dual_write", reason="peer_unknown", rustfs_cluster_id=cluster_id)]),
+            ("all-new", 120, 130, 4, 0, [row(130, 8, decision="msgpack_only", reason="peer_capable", rustfs_cluster_id=cluster_id)]),
+            ("rollback-old-peer", 140, 150, 3, 1, [row(150, 5, decision="msgpack_only", reason="peer_capable", rustfs_cluster_id=cluster_id),
+                                                    row(150, 3, decision="dual_write", reason="peer_revoked", rustfs_cluster_id=cluster_id)]),
         ]
         for name, start, end, new_nodes, old_nodes, decisions in layouts:
             nodes = {
@@ -45,9 +48,9 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
             artifacts = {}
             for kind, document in [
                 ("decisions", prometheus(decisions)),
-                ("fallback", prometheus([row(end, 0)])),
-                ("decode_errors", prometheus([row(end, 0)])),
-                ("rpc_errors", prometheus([row(end, 0)])),
+                ("fallback", prometheus([row(end, 0, rustfs_cluster_id=cluster_id)])),
+                ("decode_errors", prometheus([row(end, 0, rustfs_cluster_id=cluster_id)])),
+                ("rpc_errors", prometheus([row(end, 0, rustfs_cluster_id=cluster_id)])),
             ]:
                 relative = f"{name}/{kind}.json"
                 path = root / relative
@@ -78,11 +81,15 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
                 "start_unix": start,
                 "end_unix": end,
                 "topology": {"new_nodes": new_nodes, "old_nodes": old_nodes, "nodes": nodes},
+                "images": {
+                    node: (baseline_image.copy() if node in canary.OLD_NODES[name] else candidate_image.copy())
+                    for node in ("node1", "node2", "node3", "node4")
+                },
                 "environment": {
                     "new_nodes": {"msgpack_only": True, "peer_capability": True, "fleet_confirmed": False},
                     "old_nodes": {"msgpack_only": False, "peer_capability": False, "fleet_confirmed": False},
                 },
-                "queries": canary.expected_queries(end - start),
+                "queries": canary.expected_queries(end - start, cluster_id),
                 "workload": workload_relative,
                 "artifacts": artifacts,
             })
@@ -91,6 +98,8 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
             "scope": "internode-msgpack-peer-canary",
             "source_revision": "a" * 40,
             "baseline_revision": "b" * 40,
+            "telemetry_cluster_id": cluster_id,
+            "images": {"candidate": candidate_image, "baseline": baseline_image},
             "stable_connection_affinity": True,
             "max_metric_lag_secs": 30,
             "phases": phases,
@@ -111,7 +120,10 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         phase = manifest["phases"][1]
         path = root / phase["artifacts"]["decode_errors"]
-        path.write_text(json.dumps(prometheus([row(phase["end_unix"], 1)])), encoding="utf-8")
+        path.write_text(
+            json.dumps(prometheus([row(phase["end_unix"], 1, rustfs_cluster_id=manifest["telemetry_cluster_id"])])),
+            encoding="utf-8",
+        )
         result = canary.check(manifest, root)
         self.assertFalse(result["observed_pass"])
         self.assertIn("all-new: nonzero decode_errors (1.0)", result["violations"])
@@ -122,7 +134,8 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         phase = manifest["phases"][0]
         path = root / phase["artifacts"]["decisions"]
         path.write_text(
-            json.dumps(prometheus([row(phase["end_unix"], 4, decision="msgpack_only", reason="peer_capable")])),
+            json.dumps(prometheus([row(phase["end_unix"], 4, decision="msgpack_only", reason="peer_capable",
+                                            rustfs_cluster_id=manifest["telemetry_cluster_id"])])),
             encoding="utf-8",
         )
         result = canary.check(manifest, root)
@@ -136,9 +149,12 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         path = root / phase["artifacts"]["decisions"]
         path.write_text(
             json.dumps(prometheus([
-                row(phase["end_unix"], 4, decision="msgpack_only", reason="peer_capable"),
-                row(phase["end_unix"], 1, decision="msgpack_only", reason="manual_fleet"),
-                row(phase["end_unix"], 1, decision="dual_write", reason="not_requested"),
+                row(phase["end_unix"], 4, decision="msgpack_only", reason="peer_capable",
+                    rustfs_cluster_id=manifest["telemetry_cluster_id"]),
+                row(phase["end_unix"], 1, decision="msgpack_only", reason="manual_fleet",
+                    rustfs_cluster_id=manifest["telemetry_cluster_id"]),
+                row(phase["end_unix"], 1, decision="dual_write", reason="not_requested",
+                    rustfs_cluster_id=manifest["telemetry_cluster_id"]),
             ])),
             encoding="utf-8",
         )
@@ -169,7 +185,7 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         manifest["phases"][0]["queries"]["decisions"] = "sum(unrelated_metric)"
         with self.assertRaisesRegex(canary.EvidenceError, "PromQL"):
             canary.check(manifest, root)
-        manifest["phases"][0]["queries"] = canary.expected_queries(10)
+        manifest["phases"][0]["queries"] = canary.expected_queries(10, manifest["telemetry_cluster_id"])
         manifest["phases"][0]["artifacts"]["decisions"] = "../escape.json"
         with self.assertRaisesRegex(canary.EvidenceError, "escapes"):
             canary.check(manifest, root)
@@ -179,12 +195,14 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         phase = manifest["phases"][2]
         path = root / phase["artifacts"]["decisions"]
-        duplicate = row(phase["end_unix"], 1, decision="msgpack_only", reason="peer_capable")
+        duplicate = row(phase["end_unix"], 1, decision="msgpack_only", reason="peer_capable",
+                        rustfs_cluster_id=manifest["telemetry_cluster_id"])
         path.write_text(json.dumps(prometheus([duplicate, duplicate])), encoding="utf-8")
         with self.assertRaisesRegex(canary.EvidenceError, "duplicate decision series"):
             canary.check(manifest, root)
         path.write_text(
-            json.dumps(prometheus([row(phase["end_unix"], 1, decision="msgpack_only", reason="peer-address")])),
+            json.dumps(prometheus([row(phase["end_unix"], 1, decision="msgpack_only", reason="peer-address",
+                                            rustfs_cluster_id=manifest["telemetry_cluster_id"])])),
             encoding="utf-8",
         )
         with self.assertRaisesRegex(canary.EvidenceError, "unbounded label"):
@@ -197,6 +215,52 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         path = root / phase["artifacts"]["rpc_errors"]
         path.write_text(json.dumps(prometheus([])), encoding="utf-8")
         with self.assertRaisesRegex(canary.EvidenceError, "exactly one row"):
+            canary.check(manifest, root)
+
+    def test_foreign_cluster_samples_are_rejected(self):
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        phase = manifest["phases"][0]
+        decision_path = root / phase["artifacts"]["decisions"]
+        decision_path.write_text(
+            json.dumps(prometheus([row(phase["end_unix"], 9, decision="msgpack_only", reason="peer_capable",
+                                            rustfs_cluster_id="foreign-cluster")])),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(canary.EvidenceError, "foreign cluster"):
+            canary.check(manifest, root)
+
+        temp.cleanup()
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        phase = manifest["phases"][1]
+        error_path = root / phase["artifacts"]["rpc_errors"]
+        error_path.write_text(
+            json.dumps(prometheus([row(phase["end_unix"], 1, rustfs_cluster_id="foreign-cluster")])),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(canary.EvidenceError, "canary cluster label"):
+            canary.check(manifest, root)
+
+    def test_image_provenance_is_bound_to_requested_revisions_and_phases(self):
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        manifest["images"]["baseline"]["id"] = manifest["images"]["candidate"]["id"]
+        with self.assertRaisesRegex(canary.EvidenceError, "image IDs must differ"):
+            canary.check(manifest, root)
+
+        temp.cleanup()
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        manifest["images"]["candidate"]["revision"] = "c" * 40
+        with self.assertRaisesRegex(canary.EvidenceError, "requested revision"):
+            canary.check(manifest, root)
+
+        temp.cleanup()
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        manifest["phases"][0]["images"]["node4"] = manifest["images"]["candidate"].copy()
+        with self.assertRaisesRegex(canary.EvidenceError, "running image inventory"):
             canary.check(manifest, root)
 
     def test_workload_summary_and_rollback_hashes_are_bound(self):

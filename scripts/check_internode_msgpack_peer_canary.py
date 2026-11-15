@@ -29,6 +29,8 @@ DECISIONS = {"msgpack_only", "dual_write"}
 REASONS = {"manual_fleet", "peer_capable", "peer_unknown", "peer_revoked", "not_requested"}
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+CLUSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$")
 MAX_DOCUMENT_BYTES = 1024 * 1024
 
 
@@ -101,12 +103,13 @@ def prometheus_rows(document: dict[str, Any], name: str) -> list[dict[str, Any]]
     return rows
 
 
-def decision_values(document: dict[str, Any], start: float, end: float, lag: float) -> dict[tuple[str, str], float]:
+def decision_values(document: dict[str, Any], start: float, end: float, lag: float, cluster_id: str) -> dict[tuple[str, str], float]:
     result: dict[tuple[str, str], float] = {}
     for index, row in enumerate(prometheus_rows(document, "decisions")):
         labels = row.get("metric")
-        require(isinstance(labels, dict) and set(labels) == {"decision", "reason"},
-                "decision evidence must contain only decision/reason labels")
+        require(isinstance(labels, dict) and set(labels) == {"decision", "reason", "rustfs_cluster_id"},
+                "decision evidence must contain only decision/reason/cluster labels")
+        require(labels.get("rustfs_cluster_id") == cluster_id, "decision evidence belongs to a foreign cluster")
         decision = labels.get("decision")
         reason = labels.get("reason")
         require(decision in DECISIONS and reason in REASONS, "decision evidence contains an unbounded label")
@@ -116,13 +119,13 @@ def decision_values(document: dict[str, Any], start: float, end: float, lag: flo
     return result
 
 
-def scalar_sum(document: dict[str, Any], start: float, end: float, lag: float, name: str) -> float:
+def scalar_sum(document: dict[str, Any], start: float, end: float, lag: float, name: str, cluster_id: str) -> float:
     total = 0.0
     rows = prometheus_rows(document, name)
     require(len(rows) == 1, f"{name} scalar query must return exactly one row")
     for index, row in enumerate(rows):
         labels = row.get("metric")
-        require(labels == {}, f"{name} scalar query must not retain labels")
+        require(labels == {"rustfs_cluster_id": cluster_id}, f"{name} scalar query must retain only the canary cluster label")
         total += timestamped_value(row, start, end, lag, f"{name}[{index}]")
     return total
 
@@ -154,18 +157,36 @@ def exact_env(document: Any, name: str, old: bool) -> None:
     require(document == expected, f"{name} environment does not match the peer-gate canary contract")
 
 
-def expected_queries(window: int) -> dict[str, str]:
+def expected_queries(window: int, cluster_id: str) -> dict[str, str]:
+    selector = f'rustfs_cluster_id="{cluster_id}"'
+    zero = f'label_replace(vector(0), "rustfs_cluster_id", "{cluster_id}", "", "")'
     return {
         "decisions": (
-            "sum by (decision, reason) "
-            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total[{window}s]))"
+            "sum by (decision, reason, rustfs_cluster_id) "
+            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total{{{selector}}}[{window}s]))"
         ),
-        "fallback": f"sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[{window}s])) or vector(0)",
+        "fallback": (
+            "sum by (rustfs_cluster_id) "
+            f"(increase(rustfs_system_network_internode_msgpack_json_fallback_total{{{selector}}}[{window}s])) or {zero}"
+        ),
         "decode_errors": (
-            f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[{window}s])) or vector(0)"
+            "sum by (rustfs_cluster_id) "
+            f"(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{{{selector}}}[{window}s])) or {zero}"
         ),
-        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total[{window}s])) or vector(0)",
+        "rpc_errors": (
+            "sum by (rustfs_cluster_id) "
+            f"(increase(rustfs_system_network_internode_operation_errors_total{{{selector}}}[{window}s])) or {zero}"
+        ),
     }
+
+
+def image_identity(value: Any, name: str, revision: str) -> dict[str, str]:
+    require(isinstance(value, dict) and set(value) == {"ref", "id", "revision"}, f"{name} image identity is invalid")
+    require(isinstance(value.get("ref"), str) and value["ref"], f"{name} image ref is invalid")
+    require(isinstance(value.get("id"), str) and IMAGE_ID.fullmatch(value["id"]) is not None,
+            f"{name} image ID is invalid")
+    require(value.get("revision") == revision, f"{name} image revision does not match the requested revision")
+    return value
 
 
 def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -177,6 +198,13 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     require(isinstance(source, str) and REVISION.fullmatch(source) is not None, "invalid source revision")
     require(isinstance(baseline, str) and REVISION.fullmatch(baseline) is not None, "invalid baseline revision")
     require(source != baseline, "candidate and baseline revisions must differ")
+    cluster_id = manifest.get("telemetry_cluster_id")
+    require(isinstance(cluster_id, str) and CLUSTER_ID.fullmatch(cluster_id) is not None, "invalid telemetry cluster ID")
+    images = manifest.get("images")
+    require(isinstance(images, dict) and set(images) == {"candidate", "baseline"}, "candidate/baseline image identities are required")
+    candidate_image = image_identity(images["candidate"], "candidate", source)
+    baseline_image = image_identity(images["baseline"], "baseline", baseline)
+    require(candidate_image["id"] != baseline_image["id"], "candidate and baseline image IDs must differ")
     require(bool_value(manifest.get("stable_connection_affinity"), "stable_connection_affinity"),
             "stable connection-to-peer affinity is required")
     lag = bounded_number(manifest.get("max_metric_lag_secs"), "max_metric_lag_secs")
@@ -206,6 +234,14 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             for node in ("node1", "node2", "node3", "node4")
         }
         require(nodes == expected_nodes, f"{expected_name} node revisions do not match the mixed-version matrix")
+        phase_images = phase.get("images")
+        require(isinstance(phase_images, dict) and set(phase_images) == {"node1", "node2", "node3", "node4"},
+                f"{expected_name} running image inventory is incomplete")
+        expected_images = {
+            node: (baseline_image if node in OLD_NODES[expected_name] else candidate_image)
+            for node in ("node1", "node2", "node3", "node4")
+        }
+        require(phase_images == expected_images, f"{expected_name} running image inventory does not match the phase")
         new_nodes = uint(topology.get("new_nodes"), f"{expected_name} new_nodes")
         old_nodes = uint(topology.get("old_nodes"), f"{expected_name} old_nodes")
         require(new_nodes == expected_new and old_nodes == expected_old,
@@ -215,7 +251,7 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         exact_env(environments.get("new_nodes"), f"{expected_name} new_nodes", old=False)
         exact_env(environments.get("old_nodes"), f"{expected_name} old_nodes", old=True)
         queries = phase.get("queries")
-        require(queries == expected_queries(end - start), f"{expected_name} PromQL does not match its exact window")
+        require(queries == expected_queries(end - start, cluster_id), f"{expected_name} PromQL does not match its exact window")
         workload_path = artifact_path(root, phase.get("workload"), used, f"{expected_name}.workload")
         workload, workload_digest = load_json(workload_path)
         summary_path = artifact_path(root, workload.get("summary"), used, f"{expected_name}.workload-summary")
@@ -254,7 +290,7 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             documents[artifact] = document
             receipts.append({"phase": expected_name, "kind": artifact, "path": artifacts[artifact], "sha256": digest})
 
-        decisions = decision_values(documents["decisions"], start, end, lag)
+        decisions = decision_values(documents["decisions"], start, end, lag, cluster_id)
         peer_capable = decisions.get(("msgpack_only", "peer_capable"), 0.0)
         compatibility = decisions.get(("dual_write", "peer_unknown"), 0.0) + decisions.get(
             ("dual_write", "peer_revoked"), 0.0
@@ -269,9 +305,9 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             violations.append(f"{expected_name}: peer gate was not active on an eligible new-node request")
 
         errors = {
-            "fallback": scalar_sum(documents["fallback"], start, end, lag, "fallback"),
-            "decode_errors": scalar_sum(documents["decode_errors"], start, end, lag, "decode_errors"),
-            "rpc_errors": scalar_sum(documents["rpc_errors"], start, end, lag, "rpc_errors"),
+            "fallback": scalar_sum(documents["fallback"], start, end, lag, "fallback", cluster_id),
+            "decode_errors": scalar_sum(documents["decode_errors"], start, end, lag, "decode_errors", cluster_id),
+            "rpc_errors": scalar_sum(documents["rpc_errors"], start, end, lag, "rpc_errors", cluster_id),
         }
         for name, value in errors.items():
             if value != 0:
@@ -281,6 +317,7 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             "start_unix": start,
             "end_unix": end,
             "topology": topology,
+            "images": phase_images,
             "workload_requests": requests,
             "peer_capable_decisions": peer_capable,
             "compatibility_decisions": compatibility,
@@ -292,6 +329,8 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         "scope": manifest["scope"],
         "source_revision": source,
         "baseline_revision": baseline,
+        "telemetry_cluster_id": cluster_id,
+        "images": images,
         "phases": summaries,
         "violations": violations,
         "artifacts": receipts,
