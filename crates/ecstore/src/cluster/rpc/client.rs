@@ -159,6 +159,39 @@ pub async fn node_service_time_out_client_for_class(
         .max_encoding_message_size(max_message_size))
 }
 
+/// Build an eligible request client and capture its peer capability exactly once for this RPC.
+pub(crate) async fn node_service_time_out_client_for_class_with_msgpack_policy(
+    addr: &str,
+    interceptor: TonicInterceptor,
+    class: ChannelClass,
+) -> Result<
+    (
+        NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>,
+        MsgpackSendPolicy,
+    ),
+    Box<dyn Error>,
+> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let audience = interceptor.replay_scope_audience();
+    let channel = get_internode_channel_for_class(addr, class).await?;
+    let connection_state = channel.connection_state();
+    let policy =
+        prepare_msgpack_send_policy(audience.as_deref(), connection_state.as_ref().and_then(GrpcConnectionState::snapshot));
+    let interceptor = interceptor.with_connection_state(connection_state.clone());
+    let max_message_size = rustfs_protos::internode_rpc_max_message_size();
+    let channel = ReplayScopeChannel::new(
+        ConnectionGenerationChannel::new(BatchLockDeadlineChannel::new(channel), connection_state.clone()),
+        audience,
+        connection_state,
+    );
+    Ok((
+        NodeServiceClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size),
+        policy,
+    ))
+}
+
 pub(crate) async fn node_service_delete_recovery_client(
     addr: &str,
     interceptor: TonicInterceptor,
@@ -300,6 +333,7 @@ const CONNECTION_GENERATION_REJECTED: u8 = 2;
 #[derive(Debug)]
 struct ConnectionGenerationGuardInner {
     expected: GrpcConnectionSnapshot,
+    expected_boot_epoch: Option<Uuid>,
     outcome: AtomicU8,
 }
 
@@ -311,31 +345,43 @@ impl ConnectionGenerationGuard {
     pub(crate) fn new(expected: GrpcConnectionSnapshot) -> Self {
         Self(Arc::new(ConnectionGenerationGuardInner {
             expected,
+            expected_boot_epoch: None,
             outcome: AtomicU8::new(CONNECTION_GENERATION_PENDING),
         }))
     }
 
-    fn validate_before_call(&self, current: Option<GrpcConnectionSnapshot>) -> Result<(), StaleConnectionGenerationError> {
-        if self.0.outcome.load(Ordering::Acquire) == CONNECTION_GENERATION_PENDING && current == Some(self.0.expected) {
-            return Ok(());
-        }
+    fn for_peer_capability(expected: GrpcConnectionSnapshot, boot_epoch: Uuid) -> Self {
+        Self(Arc::new(ConnectionGenerationGuardInner {
+            expected,
+            expected_boot_epoch: Some(boot_epoch),
+            outcome: AtomicU8::new(CONNECTION_GENERATION_PENDING),
+        }))
+    }
+
+    fn expected_peer_capability(&self) -> Option<(GrpcConnectionSnapshot, Uuid)> {
+        self.0.expected_boot_epoch.map(|boot_epoch| (self.0.expected, boot_epoch))
+    }
+
+    fn reject_before_dispatch(&self) {
         let _ = self.0.outcome.compare_exchange(
             CONNECTION_GENERATION_PENDING,
             CONNECTION_GENERATION_REJECTED,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    fn validate_before_call(&self, current: Option<GrpcConnectionSnapshot>) -> Result<(), StaleConnectionGenerationError> {
+        if self.0.outcome.load(Ordering::Acquire) == CONNECTION_GENERATION_PENDING && current == Some(self.0.expected) {
+            return Ok(());
+        }
+        self.reject_before_dispatch();
         Err(StaleConnectionGenerationError::new(self.0.expected, current))
     }
 
     fn begin_payload(&self, current: Option<GrpcConnectionSnapshot>) -> Result<(), tonic::Status> {
         if current != Some(self.0.expected) {
-            let _ = self.0.outcome.compare_exchange(
-                CONNECTION_GENERATION_PENDING,
-                CONNECTION_GENERATION_REJECTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            self.reject_before_dispatch();
             return Err(stale_connection_generation_status());
         }
         self.0
@@ -350,7 +396,6 @@ impl ConnectionGenerationGuard {
             .map_err(|_| stale_connection_generation_status())
     }
 
-    #[cfg(test)]
     fn rejected_before_dispatch(&self) -> bool {
         self.0.outcome.load(Ordering::Acquire) == CONNECTION_GENERATION_REJECTED
     }
@@ -734,6 +779,149 @@ fn should_request_msgpack_capability(state: PeerReplayStateSnapshot) -> bool {
     }
 }
 
+fn validate_peer_capability_guard(guard: &ConnectionGenerationGuard, state: PeerReplayStateSnapshot) {
+    let Some((expected_connection, expected_boot_epoch)) = guard.expected_peer_capability() else {
+        return;
+    };
+    let capability_is_current = state.connection == Some(expected_connection)
+        && state.replay.boot_epoch == Some(expected_boot_epoch)
+        && matches!(
+            state.msgpack_capability,
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch,
+                connection_generation,
+            }) if boot_epoch == expected_boot_epoch
+                && connection_generation == expected_connection.generation
+        );
+    if !capability_is_current {
+        guard.reject_before_dispatch();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MsgpackSendMode {
+    DualWrite,
+    ManualFleet,
+    PeerCapable { guard: ConnectionGenerationGuard },
+}
+
+/// One eligible RPC's immutable JSON/msgpack decision and optional pre-dispatch guard.
+#[derive(Clone, Debug)]
+pub(crate) struct MsgpackSendPolicy {
+    mode: MsgpackSendMode,
+}
+
+impl MsgpackSendPolicy {
+    #[cfg(test)]
+    pub(crate) fn for_test(omit_eligible_json: bool) -> Self {
+        Self {
+            mode: if omit_eligible_json {
+                MsgpackSendMode::ManualFleet
+            } else {
+                MsgpackSendMode::DualWrite
+            },
+        }
+    }
+
+    fn dual_write(reason: &'static str) -> Self {
+        rustfs_io_metrics::internode_metrics::global_internode_metrics().record_msgpack_send_decision("dual_write", reason);
+        Self {
+            mode: MsgpackSendMode::DualWrite,
+        }
+    }
+
+    fn manual_fleet() -> Self {
+        rustfs_io_metrics::internode_metrics::global_internode_metrics()
+            .record_msgpack_send_decision("msgpack_only", "manual_fleet");
+        Self {
+            mode: MsgpackSendMode::ManualFleet,
+        }
+    }
+
+    fn peer_capable(connection: GrpcConnectionSnapshot, boot_epoch: Uuid) -> Self {
+        rustfs_io_metrics::internode_metrics::global_internode_metrics()
+            .record_msgpack_send_decision("msgpack_only", "peer_capable");
+        Self {
+            mode: MsgpackSendMode::PeerCapable {
+                guard: ConnectionGenerationGuard::for_peer_capability(connection, boot_epoch),
+            },
+        }
+    }
+
+    pub(crate) fn omit_eligible_json(&self) -> bool {
+        !matches!(self.mode, MsgpackSendMode::DualWrite)
+    }
+
+    pub(crate) fn guard_request<T>(&self, request: &mut tonic::Request<T>) {
+        if let MsgpackSendMode::PeerCapable { guard } = &self.mode {
+            request.extensions_mut().insert(guard.clone());
+        }
+    }
+
+    /// Switch one peer-capability attempt to dual-write only after a proven local rejection.
+    pub(crate) fn retry_dual_write_after_local_rejection(&mut self) -> bool {
+        let rejected = matches!(
+            &self.mode,
+            MsgpackSendMode::PeerCapable { guard } if guard.rejected_before_dispatch()
+        );
+        if rejected {
+            *self = Self::dual_write("peer_revoked");
+        }
+        rejected
+    }
+}
+
+fn prepare_msgpack_send_policy(audience: Option<&str>, connection: Option<GrpcConnectionSnapshot>) -> MsgpackSendPolicy {
+    prepare_msgpack_send_policy_with_gates(
+        audience,
+        connection,
+        rustfs_protos::internode_rpc_msgpack_only(),
+        rustfs_protos::internode_rpc_msgpack_peer_capability_enabled(),
+    )
+}
+
+fn prepare_msgpack_send_policy_with_gates(
+    audience: Option<&str>,
+    connection: Option<GrpcConnectionSnapshot>,
+    manual_fleet: bool,
+    peer_capability: bool,
+) -> MsgpackSendPolicy {
+    if manual_fleet {
+        return MsgpackSendPolicy::manual_fleet();
+    }
+    if !peer_capability {
+        return MsgpackSendPolicy::dual_write("not_requested");
+    }
+    let (Some(audience), Some(connection)) = (audience, connection) else {
+        return MsgpackSendPolicy::dual_write("peer_unknown");
+    };
+    let Ok(states) = PEER_REPLAY_STATES.lock() else {
+        return MsgpackSendPolicy::dual_write("peer_unknown");
+    };
+    let snapshot = states.snapshot(audience, Some(connection));
+    let (capable_epoch, revoked) = match (snapshot.replay.boot_epoch, snapshot.msgpack_capability) {
+        (
+            Some(boot_epoch),
+            Some(PeerMsgpackCapability::Capable {
+                boot_epoch: capability_epoch,
+                connection_generation,
+            }),
+        ) if boot_epoch == capability_epoch && connection.generation == connection_generation => (Some(boot_epoch), false),
+        (_, Some(PeerMsgpackCapability::Revoked { connection_generation })) if connection.generation == connection_generation => {
+            (None, true)
+        }
+        _ => (None, false),
+    };
+    drop(states);
+    if let Some(boot_epoch) = capable_epoch {
+        MsgpackSendPolicy::peer_capable(connection, boot_epoch)
+    } else if revoked {
+        MsgpackSendPolicy::dual_write("peer_revoked")
+    } else {
+        MsgpackSendPolicy::dual_write("peer_unknown")
+    }
+}
+
 pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()> {
     let uri = addr
         .parse::<Uri>()
@@ -906,6 +1094,9 @@ where
             .get::<PeerReplayStateSnapshot>()
             .copied()
             .unwrap_or_default();
+        if let Some(guard) = request.extensions().get::<ConnectionGenerationGuard>() {
+            validate_peer_capability_guard(guard, sent_state);
+        }
         let msgpack_capability_requested = authenticated && should_request_msgpack_capability(sent_state);
         if msgpack_capability_requested
             && request.uri().path() == "/node_service.NodeService/Ping"
@@ -2379,6 +2570,68 @@ mod tests {
             })
         );
         assert!(!should_request_msgpack_capability(current));
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn msgpack_send_policy_requires_exact_capability_and_retries_only_local_rejection() {
+        let audience = "msgpack-send-policy-test:9000";
+        let boot_epoch = Uuid::new_v4();
+        let connection = GrpcConnectionSnapshot {
+            channel_id: 21,
+            generation: 201,
+        };
+        clear_peer_capability(audience);
+        let unknown = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(connection));
+        apply_peer_capabilities_response_for_connection(
+            audience.to_string(),
+            unknown,
+            Ok(authenticated_peer_response(boot_epoch, true)),
+            Some(Ok(authenticated_msgpack_response(boot_epoch, true))),
+            Some(connection),
+        );
+
+        let mut peer_policy = prepare_msgpack_send_policy_with_gates(Some(audience), Some(connection), false, true);
+        assert!(peer_policy.omit_eligible_json());
+        let mut request = tonic::Request::new(());
+        peer_policy.guard_request(&mut request);
+        assert!(request.extensions().get::<ConnectionGenerationGuard>().is_some());
+        let MsgpackSendMode::PeerCapable { guard } = &peer_policy.mode else {
+            panic!("proved peer must use guarded msgpack-only policy");
+        };
+        let guard = guard.clone();
+        {
+            let mut states = PEER_REPLAY_STATES.lock().expect("peer replay registry");
+            states.set_msgpack_capability(
+                audience,
+                Some(connection),
+                PeerMsgpackCapability::Revoked {
+                    connection_generation: connection.generation,
+                },
+            );
+        }
+        let revoked = PEER_REPLAY_STATES
+            .lock()
+            .expect("peer replay registry")
+            .snapshot(audience, Some(connection));
+        validate_peer_capability_guard(&guard, revoked);
+        assert!(peer_policy.retry_dual_write_after_local_rejection());
+        assert!(!peer_policy.omit_eligible_json());
+        assert!(!peer_policy.retry_dual_write_after_local_rejection());
+
+        let replacement = GrpcConnectionSnapshot {
+            channel_id: connection.channel_id,
+            generation: connection.generation + 1,
+        };
+        let unknown_policy = prepare_msgpack_send_policy_with_gates(Some(audience), Some(replacement), false, true);
+        assert!(!unknown_policy.omit_eligible_json());
+        let manual_policy = prepare_msgpack_send_policy_with_gates(None, None, true, false);
+        assert!(manual_policy.omit_eligible_json());
+        let disabled_policy = prepare_msgpack_send_policy_with_gates(Some(audience), Some(connection), false, false);
+        assert!(!disabled_policy.omit_eligible_json());
         clear_peer_capability(audience);
     }
 
