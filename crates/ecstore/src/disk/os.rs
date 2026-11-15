@@ -1771,7 +1771,7 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             #[cfg(test)]
             file_sync_probe::record_group_batch(batch_file_count);
             rustfs_io_metrics::record_put_rename_fdatasync_batch(
-                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL,
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED,
                 batch_file_count,
             );
             let result = if let Some(disk_permits) = group.disk_permits.upgrade() {
