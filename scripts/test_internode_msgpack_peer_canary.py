@@ -30,6 +30,8 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         phases = []
+        images = [{"Id": "sha256:" + char * 64, "Config": {"Labels": {"vcs-ref": char * 40}}} for char in ("a", "b")]
+        (root / "images.json").write_text(json.dumps(images))
         layouts = [
             ("mixed-old-peer", 100, 110, 3, 1, [row(110, 4, decision="msgpack_only", reason="peer_capable"),
                                                    row(110, 2, decision="dual_write", reason="peer_unknown")]),
@@ -42,6 +44,9 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
                 node: ("b" * 40 if node in canary.OLD_NODES[name] else "a" * 40)
                 for node in ("node1", "node2", "node3", "node4")
             }
+            running = {node: {"image_id": "sha256:" + revision[0] * 64, "revision": revision} for node, revision in nodes.items()}
+            (root / name).mkdir(parents=True, exist_ok=True)
+            (root / name / "nodes.json").write_text(json.dumps(running))
             artifacts = {}
             for kind, document in [
                 ("decisions", prometheus(decisions)),
@@ -82,7 +87,8 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
                     "new_nodes": {"msgpack_only": True, "peer_capability": True, "fleet_confirmed": False},
                     "old_nodes": {"msgpack_only": False, "peer_capability": False, "fleet_confirmed": False},
                 },
-                "queries": canary.expected_queries(end - start),
+                "queries": canary.expected_queries(end - start, "msgpack-" + "c" * 32),
+                "images": f"{name}/nodes.json",
                 "workload": workload_relative,
                 "artifacts": artifacts,
             })
@@ -92,6 +98,8 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
             "source_revision": "a" * 40,
             "baseline_revision": "b" * 40,
             "stable_connection_affinity": True,
+            "cluster_id": "msgpack-" + "c" * 32,
+            "images": "images.json",
             "max_metric_lag_secs": 30,
             "phases": phases,
         }
@@ -103,7 +111,7 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         result = canary.check(manifest, root)
         self.assertTrue(result["observed_pass"])
         self.assertEqual(result["violations"], [])
-        self.assertEqual(len(result["artifacts"]), 18)
+        self.assertEqual(len(result["artifacts"]), 22)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in result["artifacts"]))
 
     def test_nonzero_decode_error_is_valid_evidence_but_fails_gate(self):
@@ -169,7 +177,7 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         manifest["phases"][0]["queries"]["decisions"] = "sum(unrelated_metric)"
         with self.assertRaisesRegex(canary.EvidenceError, "PromQL"):
             canary.check(manifest, root)
-        manifest["phases"][0]["queries"] = canary.expected_queries(10)
+        manifest["phases"][0]["queries"] = canary.expected_queries(10, "msgpack-" + "c" * 32)
         manifest["phases"][0]["artifacts"]["decisions"] = "../escape.json"
         with self.assertRaisesRegex(canary.EvidenceError, "escapes"):
             canary.check(manifest, root)
@@ -216,6 +224,24 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         rollback["readback_download_sha256"] = "d" * 64
         rollback_path.write_text(json.dumps(rollback), encoding="utf-8")
         with self.assertRaisesRegex(canary.EvidenceError, "readback digest mismatch"):
+            canary.check(manifest, root)
+
+    def test_foreign_queries_and_unverified_images_are_rejected(self):
+        temp, root, manifest = self.fixture()
+        self.addCleanup(temp.cleanup)
+        manifest["phases"][0]["queries"] = canary.expected_queries(10, "msgpack-" + "d" * 32)
+        with self.assertRaisesRegex(canary.EvidenceError, "PromQL"):
+            canary.check(manifest, root)
+        manifest["phases"][0]["queries"] = canary.expected_queries(10, manifest["cluster_id"])
+        images = json.loads((root / "images.json").read_text())
+        images[1]["Id"] = images[0]["Id"]
+        (root / "images.json").write_text(json.dumps(images))
+        with self.assertRaisesRegex(canary.EvidenceError, "same image"):
+            canary.check(manifest, root)
+        images[1]["Id"] = "sha256:" + "b" * 64
+        images[1]["Config"]["Labels"]["vcs-ref"] = "c" * 40
+        (root / "images.json").write_text(json.dumps(images))
+        with self.assertRaisesRegex(canary.EvidenceError, "revision mismatch"):
             canary.check(manifest, root)
 
     def test_cli_exit_codes_distinguish_pass_gate_failure_and_invalid_input(self):

@@ -108,16 +108,16 @@ The benchmark driver pins these operator states as dry-run phases (`before`, `re
 
 The per-peer gate is not qualified by a successful command transcript alone. Record three ordered four-node measurement phases: `mixed-old-peer` (three candidate nodes and one previous-version node), `all-new` (four candidate nodes), and `rollback-old-peer` (replace one candidate with the previous-version image and verify readback). Every candidate node uses `MSGPACK_ONLY=true`, `MSGPACK_PEER_CAPABILITY=true`, and `MSGPACK_ONLY_FLEET_CONFIRMED=false`; previous-version nodes use all three false. Each phase must run real PUT/GET/metadata traffic and retain the exact candidate/baseline revisions, topology, timestamps, workload result, environment, and raw Prometheus HTTP API JSON.
 
-Capture these PromQL vectors over each non-overlapping phase window and store the complete HTTP API response, not extracted numbers:
+Assign one unique `msgpack-<32-hex>` cluster ID for this run, set `OTEL_RESOURCE_ATTRIBUTES=rustfs.cluster.id=<id>` on every node, and retain the collector’s resource-to-telemetry conversion so Prometheus exposes `rustfs_cluster_id`. Capture these PromQL vectors over each non-overlapping phase window and store the complete HTTP API response, not extracted numbers:
 
 ```promql
-sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total[$WINDOW]))
-sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[$WINDOW])) or vector(0)
-sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[$WINDOW])) or vector(0)
-sum(increase(rustfs_system_network_internode_operation_errors_total[$WINDOW])) or vector(0)
+sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW]))
+sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_operation_errors_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
 ```
 
-Build a schema-1 manifest with `scope="internode-msgpack-peer-canary"`, `source_revision`, `baseline_revision`, `stable_connection_affinity=true`, `max_metric_lag_secs`, and the three phase records. Each phase records integer `start_unix`/`end_unix`, exact topology counts plus a `node1..node4` revision map, the new/old node environment maps, the exact four PromQL strings with a window equal to the phase duration, a relative workload JSON path, and relative paths for `decisions`, `fallback`, `decode_errors`, and `rpc_errors`. The workload artifact records `status`, a non-zero integer `requests`, and `rollback_readback` (true only for `rollback-old-peer`). Validate without rewriting raw evidence:
+Build a schema-1 manifest with `scope="internode-msgpack-peer-canary"`, `source_revision`, `baseline_revision`, `stable_connection_affinity=true`, `max_metric_lag_secs`, `cluster_id`, an `images` path to sanitized image inspections, and the three phase records. Each phase records integer `start_unix`/`end_unix`, exact topology counts plus a `node1..node4` revision map, the new/old node environment maps, the exact four PromQL strings with a window equal to the phase duration, an `images` path to the verified per-node image ID/revision map, a relative workload JSON path, and relative paths for `decisions`, `fallback`, `decode_errors`, and `rpc_errors`. The workload artifact records `status`, a non-zero integer `requests`, and `rollback_readback` (true only for `rollback-old-peer`). Validate without rewriting raw evidence:
 
 ```bash
 python3 scripts/check_internode_msgpack_peer_canary.py \
@@ -127,7 +127,7 @@ python3 scripts/check_internode_msgpack_peer_canary.py \
 
 The verifier rejects reused/escaping/overwritten artifacts, duplicate or non-exact decision labels, labeled scalar queries, mismatched PromQL windows, wrong per-node revisions, missing peer-capable traffic, missing mixed/rollback dual-write traffic, manual-fleet or not-requested leakage, failed workload/readback, non-zero fallback/decode/RPC errors, stale timestamps, invalid topology, and candidate/baseline identity reuse. The workload artifact binds its raw benchmark `summary.csv` by relative path and SHA-256; rollback also records equal source/download content hashes. Verifier output includes SHA-256 receipts for every raw query, workload, and summary artifact. Passing this gate is compatibility evidence only; production soak and ABBA performance drift gates remain separate.
 
-Use the orchestration runner to create the isolated Compose project, execute the three phases, preserve a known object across node2 rollback, capture the four raw Prometheus responses, build the manifest, and invoke the verifier. Without `--execute` it prints a redacted plan and makes no external changes. Execution refuses an existing Compose project/volume set and removes its isolated containers and volumes on exit unless `--keep-up` is explicit.
+Use the orchestration runner to create the isolated Compose project, execute the three phases, preserve a known object across node2 rollback, capture the four raw Prometheus responses, build the manifest, and invoke the verifier. Without `--execute` it prints a redacted plan and makes no external changes. The runner verifies distinct immutable image IDs and full `vcs-ref` or OCI revision labels against the requested revisions, pins Compose to those IDs, and checks each running container’s image and telemetry identity in every phase. Images without matching full revision labels are rejected. It retains sanitized identity receipts without container credentials. Execution refuses an existing Compose project/volume set and removes its isolated containers and volumes on exit unless `--keep-up` is explicit.
 
 ```bash
 scripts/run_internode_msgpack_peer_canary.sh \

@@ -8,12 +8,45 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 FAKE_BIN="$TMP_DIR/bin"
 mkdir -p "$FAKE_BIN"
 
-cat >"$FAKE_BIN/docker" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"$FAKE_DOCKER_LOG"
-exit 0
-SH
+cat >"$FAKE_BIN/docker" <<'PYTHON'
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import re
+import sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_DOCKER_LOG"], "a") as log:
+    log.write(" ".join(args) + "\n")
+mode = os.environ.get("FAKE_IDENTITY_FAILURE", "")
+if args[:2] == ["image", "inspect"]:
+    images = [{"Id": "sha256:" + char * 64, "Config": {"Labels": {"vcs-ref": char * 40}}} for char in ("a", "b")]
+    if mode == "same":
+        images[1]["Id"] = images[0]["Id"]
+    if mode == "revision":
+        images[1]["Config"]["Labels"]["vcs-ref"] = "c" * 40
+    for image in images:
+        image["Config"]["Env"] = ["RUSTFS_SECRET_KEY=identity-secret-sentinel"]
+    print(json.dumps(images))
+elif args[:1] == ["compose"]:
+    override = Path(args[args.index("-f", args.index("-f") + 1) + 1])
+    if "ps" in args:
+        print(str(override) + "@" + args[-1])
+    elif "up" in args:
+        text = override.read_text()
+        assert 'OTEL_RESOURCE_ATTRIBUTES: "rustfs.cluster.id=msgpack-' in text
+        assert 'image: "sha256:' in text
+        cluster = re.search(r'rustfs.cluster.id=(msgpack-[0-9a-f]{32})', text).group(1)
+        Path(os.environ["FAKE_CLUSTER_STATE"]).write_text(cluster)
+elif args[:1] == ["inspect"]:
+    override, node = args[1].rsplit("@", 1)
+    text = Path(override).read_text().split("  " + node + ":\n")[1].split("\n  node", 1)[0]
+    image_id = re.search(r'image: "([^"]+)"', text).group(1)
+    cluster = re.search(r'OTEL_RESOURCE_ATTRIBUTES: "([^"]+)"', text).group(1)
+    if mode == "running":
+        image_id = "sha256:" + "c" * 64
+    print(json.dumps([{"Image": image_id, "State": {"Running": True}, "Config": {"Env": ["RUSTFS_SECRET_KEY=identity-secret-sentinel", "OTEL_RESOURCE_ATTRIBUTES=" + cluster]}}]))
+PYTHON
 
 cat >"$FAKE_BIN/curl" <<'SH'
 #!/usr/bin/env bash
@@ -27,7 +60,16 @@ for arg in "$@"; do
     time=*) at="${arg#time=}" ;;
   esac
 done
+if [[ "$query" != "vector(0)" && "$query" != *"{rustfs_cluster_id=\"$(cat "$FAKE_CLUSTER_STATE")\"}"* ]]; then
+  echo 'query lacks canary selector' >&2
+  exit 1
+fi
 if [[ "$query" == *msgpack_send_decisions_total* ]]; then
+  if [[ "${FAKE_FOREIGN_METRICS:-false}" == true ]]; then
+    # Only foreign-cluster traffic exists; an exact canary selector returns no rows.
+    printf '{"status":"success","data":{"resultType":"vector","result":[]}}\n'
+    exit 0
+  fi
   index=0
   [[ -f "$FAKE_DECISION_INDEX" ]] && index="$(cat "$FAKE_DECISION_INDEX")"
   case "$index" in
@@ -112,9 +154,12 @@ run_once() {
   set +e
   PATH="$FAKE_BIN:$PATH" \
     FAKE_DOCKER_LOG="$TMP_DIR/docker.log" \
+    FAKE_CLUSTER_STATE="$TMP_DIR/cluster.id" \
     FAKE_DECISION_INDEX="$TMP_DIR/decision.index" \
     FAKE_AWS_STATE="$TMP_DIR/aws.object" \
     FAKE_NONZERO_ERRORS="$nonzero" \
+    FAKE_IDENTITY_FAILURE="${3:-}" \
+    FAKE_FOREIGN_METRICS="${4:-false}" \
     METRICS_SETTLE_SECS=0 \
     WORKLOAD_DURATION=1s \
     WORKLOAD_CONCURRENCY=2 \
@@ -140,11 +185,12 @@ import json
 import sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert data["observed_pass"] is True
-assert len(data["artifacts"]) == 18
+assert len(data["artifacts"]) == 22
 PY
 rg -q 'compose .*up -d --no-build --force-recreate node4' "$TMP_DIR/docker.log"
 rg -q 'compose .*up -d --no-build --force-recreate node2' "$TMP_DIR/docker.log"
 rg -q 'compose .*down --volumes --remove-orphans' "$TMP_DIR/docker.log"
+! rg -q 'identity-secret-sentinel' "$TMP_DIR/pass"
 
 run_once fail true
 [[ "$(cat "$TMP_DIR/fail.status")" == "1" ]]
@@ -154,6 +200,24 @@ import sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 assert data["observed_pass"] is False
 assert any("decode_errors" in item for item in data["violations"])
+PY
+
+run_once same-image false same
+[[ "$(cat "$TMP_DIR/same-image.status")" != 0 ]]
+! rg -q 'compose .*up ' "$TMP_DIR/docker.log"
+run_once stale-revision false revision
+[[ "$(cat "$TMP_DIR/stale-revision.status")" != 0 ]]
+! rg -q 'compose .*up ' "$TMP_DIR/docker.log"
+run_once wrong-running-image false running
+[[ "$(cat "$TMP_DIR/wrong-running-image.status")" != 0 ]]
+run_once foreign-metrics false "" true
+[[ "$(cat "$TMP_DIR/foreign-metrics.status")" == 1 ]]
+python3 - "$TMP_DIR/foreign-metrics/verification.json" <<'PY'
+import json
+import sys
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+assert not result["observed_pass"]
+assert any("no peer_capable" in violation for violation in result["violations"])
 PY
 
 bash -n "$RUNNER"

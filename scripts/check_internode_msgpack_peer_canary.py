@@ -154,17 +154,18 @@ def exact_env(document: Any, name: str, old: bool) -> None:
     require(document == expected, f"{name} environment does not match the peer-gate canary contract")
 
 
-def expected_queries(window: int) -> dict[str, str]:
+def expected_queries(window: int, cluster_id: str) -> dict[str, str]:
+    selector = f'{{rustfs_cluster_id="{cluster_id}"}}'
     return {
         "decisions": (
             "sum by (decision, reason) "
-            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total[{window}s]))"
+            f"(increase(rustfs_system_network_internode_msgpack_send_decisions_total{selector}[{window}s]))"
         ),
-        "fallback": f"sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[{window}s])) or vector(0)",
+        "fallback": f"sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total{selector}[{window}s])) or vector(0)",
         "decode_errors": (
-            f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[{window}s])) or vector(0)"
+            f"sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{selector}[{window}s])) or vector(0)"
         ),
-        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total[{window}s])) or vector(0)",
+        "rpc_errors": f"sum(increase(rustfs_system_network_internode_operation_errors_total{selector}[{window}s])) or vector(0)",
     }
 
 
@@ -179,6 +180,9 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     require(source != baseline, "candidate and baseline revisions must differ")
     require(bool_value(manifest.get("stable_connection_affinity"), "stable_connection_affinity"),
             "stable connection-to-peer affinity is required")
+    cluster_id = manifest.get("cluster_id")
+    require(isinstance(cluster_id, str) and re.fullmatch(r"msgpack-[0-9a-f]{32}", cluster_id) is not None,
+            "invalid canary cluster identity")
     lag = bounded_number(manifest.get("max_metric_lag_secs"), "max_metric_lag_secs")
     require(0 <= lag <= 300, "max_metric_lag_secs exceeds the bounded limit")
     phases = manifest.get("phases")
@@ -188,6 +192,22 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     receipts: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     violations: list[str] = []
+    image_path = artifact_path(root, manifest.get("images"), used, "images")
+    image_digest = load_raw(image_path)
+    images = json.loads(image_path.read_bytes(), object_pairs_hook=unique_object)
+    require(isinstance(images, list) and len(images) == 2, "expected candidate and baseline image inspections")
+    image_ids = []
+    for image, revision in zip(images, (source, baseline)):
+        require(isinstance(image, dict), "invalid image inspection")
+        image_id = image.get("Id")
+        require(isinstance(image_id, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None,
+                "invalid immutable image ID")
+        labels = image.get("Config", {}).get("Labels") or {}
+        observed = [labels[key] for key in ("vcs-ref", "org.opencontainers.image.revision") if key in labels]
+        require(bool(observed) and all(value == revision for value in observed), "image revision mismatch")
+        image_ids.append(image_id)
+    require(image_ids[0] != image_ids[1], "candidate and baseline resolve to the same image")
+    receipts.append({"kind": "images", "path": manifest["images"], "sha256": image_digest})
     previous_end = 0.0
     for expected_name, phase in zip(PHASES, phases):
         require(isinstance(phase, dict) and phase.get("name") == expected_name, "canary phases are missing or out of order")
@@ -206,6 +226,15 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
             for node in ("node1", "node2", "node3", "node4")
         }
         require(nodes == expected_nodes, f"{expected_name} node revisions do not match the mixed-version matrix")
+        running_path = artifact_path(root, phase.get("images"), used, f"{expected_name}.images")
+        running, running_digest = load_json(running_path)
+        expected_images = {
+            node: {"image_id": image_ids[1] if node in OLD_NODES[expected_name] else image_ids[0], "revision": revision}
+            for node, revision in expected_nodes.items()
+        }
+        require(running == expected_images, f"{expected_name} running images do not match verified identities")
+        receipts.append({"phase": expected_name, "kind": "running-images", "path": phase["images"],
+                         "sha256": running_digest})
         new_nodes = uint(topology.get("new_nodes"), f"{expected_name} new_nodes")
         old_nodes = uint(topology.get("old_nodes"), f"{expected_name} old_nodes")
         require(new_nodes == expected_new and old_nodes == expected_old,
@@ -215,7 +244,7 @@ def check(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
         exact_env(environments.get("new_nodes"), f"{expected_name} new_nodes", old=False)
         exact_env(environments.get("old_nodes"), f"{expected_name} old_nodes", old=True)
         queries = phase.get("queries")
-        require(queries == expected_queries(end - start), f"{expected_name} PromQL does not match its exact window")
+        require(queries == expected_queries(end - start, cluster_id), f"{expected_name} PromQL does not match its exact window")
         workload_path = artifact_path(root, phase.get("workload"), used, f"{expected_name}.workload")
         workload, workload_digest = load_json(workload_path)
         summary_path = artifact_path(root, workload.get("summary"), used, f"{expected_name}.workload-summary")

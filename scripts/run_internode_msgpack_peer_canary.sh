@@ -25,6 +25,9 @@ S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9000}"
 CANARY_BUCKET="${CANARY_BUCKET:-rustfs-msgpack-peer-canary}"
 LAST_PHASE_END=0
 ACTIVE_OVERRIDE=""
+CLUSTER_ID=""
+CANDIDATE_IMAGE_ID=""
+BASELINE_IMAGE_ID=""
 
 usage() {
   cat <<'USAGE'
@@ -131,9 +134,9 @@ phase_is_old() {
 
 phase_image() {
   if phase_is_old "$1" "$2"; then
-    printf '%s\n' "$BASELINE_IMAGE"
+    printf '%s\n' "$BASELINE_IMAGE_ID"
   else
-    printf '%s\n' "$CANDIDATE_IMAGE"
+    printf '%s\n' "$CANDIDATE_IMAGE_ID"
   fi
 }
 
@@ -155,6 +158,7 @@ write_override() {
       printf '  %s:\n' "$node"
       printf '    image: "%s"\n' "$image"
       printf '    environment:\n'
+      printf '      OTEL_RESOURCE_ATTRIBUTES: "rustfs.cluster.id=%s"\n' "$CLUSTER_ID"
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_ONLY: "%s"\n' "$requested"
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: "%s"\n' "$peer"
       printf '      RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: "false"\n'
@@ -178,6 +182,75 @@ preflight_isolated_project() {
   volumes="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT_NAME}")"
   [[ -z "$containers" ]] || die "Compose project already has containers: ${PROJECT_NAME}"
   [[ -z "$volumes" ]] || die "Compose project already has volumes: ${PROJECT_NAME}"
+}
+
+verify_images() {
+  docker image inspect "$CANDIDATE_IMAGE" "$BASELINE_IMAGE" | "$PYTHON_BIN" -c '
+import json, sys
+print(json.dumps([{"Id": image.get("Id"), "Config": {"Labels": {
+    key: value for key, value in (image.get("Config", {}).get("Labels") or {}).items()
+    if key in ("vcs-ref", "org.opencontainers.image.revision")
+}}} for image in json.load(sys.stdin)]))
+' >"$OUT_DIR/images.json"
+  local identities
+  identities="$("$PYTHON_BIN" - "$OUT_DIR/images.json" "$CANDIDATE_REVISION" "$BASELINE_REVISION" <<'PYTHON'
+import json
+import re
+import sys
+images = json.load(open(sys.argv[1], encoding="utf-8"))
+if len(images) != 2:
+    raise SystemExit("expected two inspected images")
+ids = []
+for image, revision in zip(images, sys.argv[2:]):
+    image_id = image.get("Id", "")
+    labels = image.get("Config", {}).get("Labels") or {}
+    observed = [labels[key] for key in ("vcs-ref", "org.opencontainers.image.revision") if key in labels]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) or not observed or any(value != revision for value in observed):
+        raise SystemExit("image identity/revision does not match requested revision")
+    ids.append(image_id)
+if ids[0] == ids[1]:
+    raise SystemExit("candidate and baseline resolve to the same image")
+print(*ids)
+PYTHON
+)"
+  read -r CANDIDATE_IMAGE_ID BASELINE_IMAGE_ID <<<"$identities"
+}
+
+record_running_images() {
+  local phase="$1" phase_dir="$2" node container
+  for node in node1 node2 node3 node4; do
+    container="$(compose ps -q "$node")"
+    [[ -n "$container" && "$container" != *$'\n'* ]] || die "expected one running container for ${node}"
+    docker inspect "$container" | "$PYTHON_BIN" -c '
+import json, sys
+print(json.dumps([{"Image": container.get("Image"), "State": {"Running": container.get("State", {}).get("Running")},
+    "Config": {"Env": [item for item in container.get("Config", {}).get("Env", [])
+                       if item.startswith("OTEL_RESOURCE_ATTRIBUTES=")]}}
+    for container in json.load(sys.stdin)]))
+' >"$phase_dir/${node}-container.json"
+  done
+  "$PYTHON_BIN" - "$phase_dir" "$phase" "$CANDIDATE_IMAGE_ID" "$BASELINE_IMAGE_ID" \
+    "$CANDIDATE_REVISION" "$BASELINE_REVISION" "$CLUSTER_ID" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+root, phase, candidate, baseline, candidate_revision, baseline_revision, cluster = sys.argv[1:]
+root = Path(root)
+nodes = {}
+for node in ("node1", "node2", "node3", "node4"):
+    old = (phase == "mixed-old-peer" and node == "node4") or (phase == "rollback-old-peer" and node == "node2")
+    expected = baseline if old else candidate
+    inspected = json.loads((root / f"{node}-container.json").read_text())
+    if len(inspected) != 1:
+        raise SystemExit(f"expected one inspected container for {node}")
+    container = inspected[0]
+    if container.get("Image") != expected or not container.get("State", {}).get("Running"):
+        raise SystemExit(f"running image mismatch for {node}")
+    if f"OTEL_RESOURCE_ATTRIBUTES=rustfs.cluster.id={cluster}" not in container.get("Config", {}).get("Env", []):
+        raise SystemExit(f"telemetry identity mismatch for {node}")
+    nodes[node] = {"image_id": container["Image"], "revision": baseline_revision if old else candidate_revision}
+(root / "nodes.json").write_text(json.dumps(nodes, sort_keys=True) + "\n")
+PYTHON
 }
 
 preflight_prometheus() {
@@ -349,10 +422,10 @@ capture_metrics() {
   local end="$3"
   local window=$((end - start))
   local decisions fallback decode_errors rpc_errors
-  decisions="sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total[${window}s]))"
-  fallback="sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total[${window}s])) or vector(0)"
-  decode_errors="sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total[${window}s])) or vector(0)"
-  rpc_errors="sum(increase(rustfs_system_network_internode_operation_errors_total[${window}s])) or vector(0)"
+  decisions="sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total{rustfs_cluster_id=\"${CLUSTER_ID}\"}[${window}s]))"
+  fallback="sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total{rustfs_cluster_id=\"${CLUSTER_ID}\"}[${window}s])) or vector(0)"
+  decode_errors="sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{rustfs_cluster_id=\"${CLUSTER_ID}\"}[${window}s])) or vector(0)"
+  rpc_errors="sum(increase(rustfs_system_network_internode_operation_errors_total{rustfs_cluster_id=\"${CLUSTER_ID}\"}[${window}s])) or vector(0)"
   prometheus_query "$decisions" "$end" "$phase_dir/decisions.json"
   prometheus_query "$fallback" "$end" "$phase_dir/fallback.json"
   prometheus_query "$decode_errors" "$end" "$phase_dir/decode_errors.json"
@@ -389,6 +462,7 @@ run_phase() {
   log "applying ${phase}: ${nodes[*]}"
   compose up -d --no-build --force-recreate "${nodes[@]}"
   wait_cluster
+  record_running_images "$phase" "$phase_dir"
   if [[ "$phase" == "mixed-old-peer" ]]; then
     prepare_readback_object
   fi
@@ -409,13 +483,13 @@ run_phase() {
 
 write_manifest() {
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROJECT_ROOT/scripts" "$PYTHON_BIN" - \
-    "$OUT_DIR" "$CANDIDATE_REVISION" "$BASELINE_REVISION" <<'PY'
+    "$OUT_DIR" "$CANDIDATE_REVISION" "$BASELINE_REVISION" "$CLUSTER_ID" <<'PY'
 import json
 from pathlib import Path
 import sys
 from check_internode_msgpack_peer_canary import expected_queries, OLD_NODES
 
-root, candidate, baseline = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+root, candidate, baseline, cluster = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 phases = []
 for line in (root / "phases.tsv").read_text(encoding="utf-8").splitlines():
     name, start, end = line.split("\t")
@@ -431,7 +505,8 @@ for line in (root / "phases.tsv").read_text(encoding="utf-8").splitlines():
             "new_nodes": {"msgpack_only": True, "peer_capability": True, "fleet_confirmed": False},
             "old_nodes": {"msgpack_only": False, "peer_capability": False, "fleet_confirmed": False},
         },
-        "queries": expected_queries(end - start),
+        "queries": expected_queries(end - start, cluster),
+        "images": f"{name}/nodes.json",
         "workload": f"{name}/workload.json",
         "artifacts": {kind: f"{name}/{kind}.json" for kind in
                       ("decisions", "fallback", "decode_errors", "rpc_errors")},
@@ -442,6 +517,8 @@ manifest = {
     "source_revision": candidate,
     "baseline_revision": baseline,
     "stable_connection_affinity": True,
+    "cluster_id": cluster,
+    "images": "images.json",
     "max_metric_lag_secs": 120,
     "phases": phases,
 }
@@ -474,12 +551,13 @@ main() {
   require_cmd cmp
   require_cmd "$PYTHON_BIN"
   docker info >/dev/null
-  docker image inspect "$CANDIDATE_IMAGE" "$BASELINE_IMAGE" >/dev/null
   preflight_isolated_project
   if [[ -d "$OUT_DIR" && -n "$(find "$OUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     die "evidence directory is not empty: $OUT_DIR"
   fi
   mkdir -p "$OUT_DIR"
+  CLUSTER_ID="$("$PYTHON_BIN" -c 'import uuid; print("msgpack-" + uuid.uuid4().hex)')"
+  verify_images
   preflight_prometheus
   : >"$OUT_DIR/phases.tsv"
   trap cleanup EXIT
