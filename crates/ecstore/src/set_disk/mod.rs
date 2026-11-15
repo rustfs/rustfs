@@ -6271,6 +6271,18 @@ fn try_decode_inline_data_shards(
     let checksum_algo = part_checksum_algorithm(fi, part.number);
     let hash_size = checksum_algo.size();
     let stride = shard_size.checked_add(hash_size)?;
+    let part_size = inline_erasure_shard_file_size(part.size, fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+    let encoded_size = part_size
+        .div_ceil(shard_size)
+        .checked_mul(hash_size)?
+        .checked_add(part_size)?;
+    // Metadata early-stop can cache this body, so require exact framing even
+    // when the caller explicitly skips bitrot digest verification.
+    for file in data_files.iter().take(data_shards) {
+        if file.data.as_ref()?.len() != encoded_size {
+            return None;
+        }
+    }
     #[cfg(test)]
     {
         for _ in data_files.iter().take(data_shards) {
@@ -15244,71 +15256,90 @@ mod tests {
 
     #[tokio::test]
     async fn inline_frame_decoder_handles_legacy_padding_hashes_and_unhashed_parts() {
-        let payload = b"abcdefghijk";
-        for (legacy, algorithm) in [
-            (false, HashAlgorithm::HighwayHash256S),
-            (true, HashAlgorithm::HighwayHash256SLegacy),
-            (false, HashAlgorithm::None),
-        ] {
-            let erasure = coding::Erasure::new_with_options(2, 2, 8, legacy);
-            let mut writers: Vec<_> = (0..4)
-                .map(|_| {
-                    coding::BitrotWriterWrapper::new(
-                        coding::CustomWriter::new_inline_buffer(),
-                        erasure.shard_size(),
-                        algorithm.clone(),
-                    )
-                })
-                .collect();
-            for block in payload.chunks(8) {
-                let shards = erasure.encode_data(block).expect("encode golden frame");
-                for (writer, shard) in writers.iter_mut().zip(shards) {
-                    writer.write(&shard).await.expect("write golden frame");
+        for size in [1, 3, 8, 11, 16] {
+            let payload = &b"abcdefghijklmnop"[..size];
+            for (legacy, algorithm) in [
+                (false, HashAlgorithm::HighwayHash256S),
+                (true, HashAlgorithm::HighwayHash256SLegacy),
+                (false, HashAlgorithm::None),
+            ] {
+                let erasure = coding::Erasure::new_with_options(2, 2, 8, legacy);
+                let mut writers: Vec<_> = (0..4)
+                    .map(|_| {
+                        coding::BitrotWriterWrapper::new(
+                            coding::CustomWriter::new_inline_buffer(),
+                            erasure.shard_size(),
+                            algorithm.clone(),
+                        )
+                    })
+                    .collect();
+                for block in payload.chunks(8) {
+                    let shards = erasure.encode_data(block).expect("encode golden frame");
+                    for (writer, shard) in writers.iter_mut().zip(shards) {
+                        writer.write(&shard).await.expect("write golden frame");
+                    }
                 }
-            }
-            let mut info = FileInfo::new("bucket/object", 2, 2);
-            info.size = payload.len() as i64;
-            info.erasure.block_size = 8;
-            info.uses_legacy_checksum = legacy;
-            info.add_object_part(1, "etag".to_owned(), payload.len(), None, info.size, None, None);
-            info.erasure.checksums = vec![rustfs_filemeta::ChecksumInfo {
-                part_number: 1,
-                algorithm: algorithm.clone(),
-                ..Default::default()
-            }];
-            let mut files: Vec<_> = writers
-                .into_iter()
-                .enumerate()
-                .map(|(index, writer)| {
-                    let mut file = info.clone();
-                    file.erasure.index = index + 1;
-                    file.data = writer.into_inline_data();
-                    file
-                })
-                .collect();
-            let refs = [&files[0], &files[1]];
-            let body = try_decode_inline_data_shards("golden", &info, &refs, false).expect("decode every golden frame");
-            assert_eq!(body.as_ref(), payload);
-            if algorithm.size() > 0 {
-                for file in &files {
-                    verify_inline_part_bitrot(file).expect("deep verification covers both padded frames");
+                let mut info = FileInfo::new("bucket/object", 2, 2);
+                info.size = i64::try_from(payload.len()).expect("test payload size fits i64");
+                info.erasure.block_size = 8;
+                info.uses_legacy_checksum = legacy;
+                info.add_object_part(1, "etag".to_owned(), payload.len(), None, info.size, None, None);
+                info.erasure.checksums = vec![rustfs_filemeta::ChecksumInfo {
+                    part_number: 1,
+                    algorithm: algorithm.clone(),
+                    ..Default::default()
+                }];
+                let mut files: Vec<_> = writers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, writer)| {
+                        let mut file = info.clone();
+                        file.erasure.index = index + 1;
+                        file.data = writer.into_inline_data();
+                        file
+                    })
+                    .collect();
+                let refs = [&files[0], &files[1]];
+                let body = try_decode_inline_data_shards("golden", &info, &refs, false).expect("decode every golden frame");
+                assert_eq!(body.as_ref(), payload);
+                if algorithm.size() > 0 {
+                    for file in &files {
+                        verify_inline_part_bitrot(file).expect("deep verification covers both padded frames");
+                    }
                 }
-            }
-            let original = files[0].data.as_ref().expect("first data shard").clone();
-            let mut truncated = original.to_vec();
-            truncated.pop();
-            files[0].data = Some(Bytes::from(truncated));
-            assert!(try_decode_inline_data_shards("truncated", &info, &[&files[0], &files[1]], false).is_none());
-            if algorithm.size() > 0 {
-                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
-                let mut corrupt = original.to_vec();
-                corrupt[erasure.shard_size() + 2 * algorithm.size()] ^= 1;
-                files[0].data = Some(Bytes::from(corrupt));
-                assert!(try_decode_inline_data_shards("corrupt", &info, &[&files[0], &files[1]], false).is_none());
-                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
-                assert!(try_decode_inline_data_shards("diagnostic", &info, &[&files[0], &files[1]], true).is_some());
-            } else {
-                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::BitrotHashAlgoInvalid));
+                for shard_index in 0..info.erasure.data_blocks {
+                    let original = files[shard_index].data.as_ref().expect("selected data shard").clone();
+                    let mut trailing = original.to_vec();
+                    trailing.push(0x7b);
+                    for malformed in [original[..original.len() - 1].to_vec(), trailing] {
+                        files[shard_index].data = Some(Bytes::from(malformed));
+                        for skip_verify_bitrot in [false, true] {
+                            assert!(
+                                try_decode_inline_data_shards("inexact", &info, &[&files[0], &files[1]], skip_verify_bitrot)
+                                    .is_none(),
+                                "reject inexact shard {shard_index}: legacy={legacy}, algorithm={algorithm:?}, size={}",
+                                payload.len()
+                            );
+                        }
+                    }
+                    files[shard_index].data = Some(original);
+                }
+                let original = files[0].data.as_ref().expect("first data shard").clone();
+                let mut truncated = original.to_vec();
+                truncated.pop();
+                files[0].data = Some(Bytes::from(truncated));
+                assert!(try_decode_inline_data_shards("truncated", &info, &[&files[0], &files[1]], false).is_none());
+                if algorithm.size() > 0 {
+                    assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
+                    let mut corrupt = original.to_vec();
+                    *corrupt.last_mut().expect("last frame payload") ^= 1;
+                    files[0].data = Some(Bytes::from(corrupt));
+                    assert!(try_decode_inline_data_shards("corrupt", &info, &[&files[0], &files[1]], false).is_none());
+                    assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
+                    assert!(try_decode_inline_data_shards("diagnostic", &info, &[&files[0], &files[1]], true).is_some());
+                } else {
+                    assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::BitrotHashAlgoInvalid));
+                }
             }
         }
     }

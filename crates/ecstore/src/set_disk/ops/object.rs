@@ -15548,8 +15548,7 @@ mod inline_put_commit_path_tests {
             let bucket = "multi-block-inline-recovery";
             make_bucket(&disks, bucket).await;
             let payload: Vec<u8> = (0..1280 * 1024).map(|index| (index % 251) as u8).collect();
-            for truncated in [false, true] {
-                let object = if truncated { "truncated" } else { "corrupt" };
+            for object in ["corrupt", "truncated", "trailing"] {
                 let mut input = PutObjReader::from_vec(payload.clone());
                 set.put_object(
                     bucket,
@@ -15582,10 +15581,10 @@ mod inline_put_commit_path_tests {
                     }
                     let mut raw = info.data.as_ref().expect("inline bytes").to_vec();
                     let second_frame = info.erasure.block_size.div_ceil(12) + 32;
-                    if truncated {
-                        raw.truncate(second_frame + 33);
-                    } else {
-                        raw[second_frame + 32] ^= 1;
+                    match object {
+                        "truncated" => raw.truncate(second_frame + 33),
+                        "trailing" => raw.push(0x7b),
+                        _ => raw[second_frame + 32] ^= 1,
                     }
                     info.data = Some(Bytes::from(raw));
                     disk.write_metadata("", bucket, object, info)
