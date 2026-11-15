@@ -21,9 +21,9 @@
 
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::app::RequestEnvelope;
-use crate::app::storage_api::object_usecase::bucket::replication::OperatorRuleContract;
 use crate::error::ApiError;
 use crate::storage::StorageVersioningConfigExt as _;
+use crate::storage::access::access_owned::bucket_replication_lifecycle::prepare_replication_config_edit;
 use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
 use crate::storage::helper::audit_only_operation;
@@ -38,7 +38,6 @@ use crate::storage::{
     BUCKET_VERSIONING_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, get_bucket_object_lock_config,
     update_bucket_metadata_config_if_incarnation,
 };
-use http::StatusCode;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
     get_bucket_lifecycle_configuration, get_bucket_replication, get_object_lock_configuration,
 };
@@ -49,102 +48,8 @@ use tracing::{instrument, warn};
 
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 
-#[cfg(test)]
-pub(super) static SITE_REPLICATION_GATE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(test)]
-pub(super) const SITE_REPLICATION_GATE_FORCE_DISABLED: u8 = 1;
-
-#[cfg(test)]
-pub(super) const SITE_REPLICATION_GATE_FORCE_ENABLED: u8 = 2;
-
-async fn site_replication_gate_enabled() -> S3Result<bool> {
-    #[cfg(test)]
-    match SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
-        SITE_REPLICATION_GATE_FORCE_DISABLED => return Ok(false),
-        SITE_REPLICATION_GATE_FORCE_ENABLED => return Ok(true),
-        _ => {}
-    }
-    crate::admin::handlers::site_replication::site_replication_enabled()
-        .await
-        .map_err(Into::into)
-}
-
-/// Remote site-replication peer deployment ids and the operator-rule contract
-/// the peers support, handed to the bucket usecase so an S3 replication-config
-/// edit keeps exactly the reconciler-owned rules and merges the way every
-/// peer will (issue #1948). Read here, in the interface layer, because the
-/// usecase must not import the admin handlers (layer guard); a state-read
-/// failure propagates so the edit fails closed.
-async fn site_replication_edit_context() -> S3Result<(std::collections::HashSet<String>, OperatorRuleContract)> {
-    // While the gate override is in effect the test exercises the deny/allow
-    // branch, not the peer set; there is no persisted state to read.
-    #[cfg(test)]
-    if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-        return Ok((std::collections::HashSet::new(), OperatorRuleContract::Derived));
-    }
-    crate::admin::handlers::site_replication::site_replication_edit_context()
-        .await
-        .map_err(Into::into)
-}
-
-/// MinIO `ErrReplicationDenyEditError`.
-fn replication_deny_edit_error() -> S3Error {
-    let mut err = S3Error::with_message(
-        S3ErrorCode::Custom("XMinioReplicationDenyEdit".into()),
-        "Sub-User is not allowed to edit Replication configuration",
-    );
-    err.set_status_code(StatusCode::BAD_REQUEST);
-    err
-}
-
-/// Site-replication gate for S3 replication-config edits (issue #1948).
-///
-/// On a site-replication deployment the bucket's replication config carries
-/// the operator-managed `site-repl-*` rules that keep every peer in sync, and
-/// a successful edit is broadcast to all peers — so a user holding only
-/// bucket-scoped `s3:PutReplicationConfiguration` could rewrite or erase
-/// replication net-wide. MinIO parity (`ErrReplicationDenyEditError`): only
-/// owner credentials (root or root-parented) may edit. Runs after the policy
-/// authorization in the access layer and only on the external S3 path — the
-/// reconciler and peer bucket-meta ingestion never route through these
-/// handlers.
-async fn deny_replication_config_edit_for_non_owner<T>(req: &S3Request<T>) -> S3Result<()> {
-    if crate::storage::access::req_info_ref(req)?.is_owner {
-        return Ok(());
-    }
-    if site_replication_gate_enabled().await? {
-        return Err(replication_deny_edit_error());
-    }
-    Ok(())
-}
-
-/// Handler bodies that [`S3`] runs through `audit_only_operation`.
+/// Handler body that runs through `audit_only_operation`.
 impl FS {
-    async fn delete_bucket_replication_inner(
-        &self,
-        req: S3Request<DeleteBucketReplicationInput>,
-    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        deny_replication_config_edit_for_non_owner(&req).await?;
-        let (site_peers, contract) = site_replication_edit_context().await?;
-        let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_replication(req, site_peers, contract).await
-    }
-
-    async fn put_bucket_replication_inner(
-        &self,
-        mut req: S3Request<PutBucketReplicationInput>,
-    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        deny_replication_config_edit_for_non_owner(&req).await?;
-        let (site_peers, contract) = site_replication_edit_context().await?;
-        let replication_configuration =
-            replication_configuration_from_s3s(std::mem::take(&mut req.input.replication_configuration));
-        let usecase = s3_api::bucket_usecase_for(self);
-        usecase
-            .execute_put_bucket_replication(req, replication_configuration, site_peers, contract)
-            .await
-    }
-
     async fn put_object_lock_configuration_inner(
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
@@ -274,7 +179,12 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        audit_only_operation(req, S3Operation::DeleteBucketReplication, |req| self.delete_bucket_replication_inner(req)).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let prepare = prepare_replication_config_edit(&envelope);
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_replication(envelope, &req.input.bucket, prepare)
+            .await?;
+        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
     #[instrument(name = "get_bucket_lifecycle_configuration", level = "debug", skip(self, req))]
@@ -357,7 +267,20 @@ impl FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        audit_only_operation(req, S3Operation::PutBucketReplication, |req| self.put_bucket_replication_inner(req)).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let prepare = prepare_replication_config_edit(&envelope);
+        let PutBucketReplicationInput {
+            bucket,
+            replication_configuration,
+            ..
+        } = req.input;
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_replication(envelope, &bucket, async move {
+                let (site_peers, contract) = prepare.await?;
+                Ok((replication_configuration_from_s3s(replication_configuration), site_peers, contract))
+            })
+            .await?;
+        Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
     #[instrument(name = "put_object_lock_configuration", level = "debug", skip(self, req))]
