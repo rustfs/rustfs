@@ -19,12 +19,13 @@ use rustfs_io_metrics::buffered_write;
 
 use crate::storage_api::table::get_bucket_metadata;
 
+#[cfg(test)]
+use super::storage_api::object_usecase::access::PostObjectRequestMarker;
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
-    apply_copy_source_bucket_generation_guard, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
-    load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
-    recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
-    retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+    TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
+    delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store, odm_read_generation,
+    prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut,
+    req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
 use super::storage_api::object_usecase::bucket::lockless_cache::is_lockless_cache_bucket;
 #[cfg(test)]
@@ -78,13 +79,15 @@ use super::storage_api::object_usecase::data_usage::{
     record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
+#[cfg(test)]
 use super::storage_api::object_usecase::ecfs::FS;
 use super::storage_api::object_usecase::error::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::object_usecase::helper::{
-    OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+    OperationHelper, build_event_resp_elements, build_owned_event_resp_elements, run_owned_mutation,
+    spawn_background_with_context,
 };
 use super::storage_api::object_usecase::io::{
     DynReader, EtagAlgorithm, HashReader, WritePlan, compression_metadata_value, wrap_reader,
@@ -117,10 +120,10 @@ use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
-    RFC1123, check_preconditions, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
-    validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-    wrap_response_with_cors,
+    RFC1123, check_preconditions, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
+    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
+    validate_bucket_exists, validate_new_object_key, validate_object_key, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,
@@ -204,16 +207,24 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
 #[cfg(test)]
 mod conditional_read_bench;
 mod copy;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) mod cuobject;
 mod delete;
 mod extract;
 mod get;
+mod get_response;
+pub(crate) use get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 mod head;
 #[cfg(feature = "gateway-stack")]
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
+mod native_body;
 mod on_demand_migration_put;
 mod put;
+mod put_input;
+pub(crate) use native_body::from_legacy as legacy_put_body;
+pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
 pub(crate) mod shared;

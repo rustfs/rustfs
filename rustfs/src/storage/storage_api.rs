@@ -125,6 +125,12 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSink = ecstore_object::GetObjectSink;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkSegments = ecstore_object::GetObjectSinkSegments;
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) type StorageGetObjectSinkWriter = ecstore_object::GetObjectSinkWriter;
 pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
@@ -132,10 +138,10 @@ pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
     get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
-    parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize, process_lambda_configurations,
-    process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
-    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
-    validate_object_key, wrap_response_with_cors,
+    parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
+    process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
+    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -164,9 +170,8 @@ pub(crate) mod access_consumer {
         authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
         delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
-        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
+        req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
@@ -254,7 +259,8 @@ pub(crate) mod helper_consumer {
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
     };
     pub(crate) use super::super::helper::{
-        OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+        OperationHelper, build_event_resp_elements, build_owned_event_resp_elements, run_owned_mutation,
+        spawn_background_with_context,
     };
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
@@ -325,6 +331,18 @@ pub(crate) mod rpc_consumer {
             find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
             sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
             with_remote_background_io,
+        };
+    }
+
+    /// Server side of internode NIXL chunk reads (`nixl` feature).
+    #[cfg(all(feature = "nixl", target_os = "linux"))]
+    pub(crate) mod nixl_read {
+        pub(crate) use super::super::check_and_record_signed_rpc_nonce;
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
+        pub(crate) use super::super::find_local_disk_by_ref_for_rpc;
+        pub(crate) use rustfs_ecstore::api::disk::Disk;
+        pub(crate) use rustfs_ecstore::api::rpc::nixl::{
+            NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH,
         };
     }
 
@@ -632,6 +650,14 @@ pub(crate) mod ecstore_rio {
     };
 }
 
+/// ECStore surface of the S3-over-RDMA object transport (`cuobject`/`nixl` features).
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+pub(crate) mod ecstore_rdma {
+    pub(crate) use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
+    #[cfg(feature = "nixl")]
+    pub(crate) use rustfs_ecstore::api::rpc::nixl::{NixlRecvBuffer, NixlRecvPool, install_nixl_recv_pool};
+}
+
 #[cfg(feature = "internode-transport")]
 pub(crate) mod ecstore_internode {
     pub use ecstore_rpc::{
@@ -680,6 +706,8 @@ pub(crate) mod ecstore_object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
     };
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectSink, GetObjectSinkSegments, GetObjectSinkWriter};
 }
 
 #[cfg(all(test, feature = "rio-v2"))]

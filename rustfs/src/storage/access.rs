@@ -3758,10 +3758,8 @@ impl S3Access for FS {
         &self,
         req: &mut S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketNotificationAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketNotificationAction)).await
     }
 
     /// Checks whether the GetBucketOwnershipControls request has accesses to the resources.
@@ -3837,18 +3835,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_object(&self, req: &mut S3Request<GetObjectInput>) -> S3Result<()> {
-        let bucket = req.input.bucket.clone();
-        let source_generation = capture_odm_read_generation(self.server_ctx(), req, &bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
-        // s3:GetObjectVersion, not s3:GetObject.
-        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
-        req.install_odm_read_generation(source_generation);
-        Ok(())
+        let (bucket, key, version) = (req.input.bucket.clone(), req.input.key.clone(), req.input.version_id.clone());
+        access_owned::object_read::authorize_get_object(self.server_ctx(), req, &bucket, &key, version.as_deref()).await
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.

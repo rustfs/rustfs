@@ -74,6 +74,8 @@ const MIGRATING_META_BUCKET: &str = ".minio.sys";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+use crate::storage::storage_api::rpc_consumer::nixl_read::{READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH};
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
 const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
@@ -82,8 +84,8 @@ const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
+pub(super) static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+pub(super) static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
@@ -429,15 +431,15 @@ fn validate_walk_dir_completion_request(query: &WalkDirQuery, body: &[u8]) -> Op
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-struct PutFileQuery {
-    disk: String,
-    volume: String,
-    path: String,
-    append: bool,
-    size: i64,
-    put_file_auth: Option<String>,
-    put_file_nonce: Option<uuid::Uuid>,
-    put_file_server_epoch: Option<uuid::Uuid>,
+pub(super) struct PutFileQuery {
+    pub(super) disk: String,
+    pub(super) volume: String,
+    pub(super) path: String,
+    pub(super) append: bool,
+    pub(super) size: i64,
+    pub(super) put_file_auth: Option<String>,
+    pub(super) put_file_nonce: Option<uuid::Uuid>,
+    pub(super) put_file_server_epoch: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -470,7 +472,7 @@ fn put_file_server_epoch_matches(query: &PutFileQuery) -> bool {
     query.put_file_server_epoch == Some(*PUT_FILE_CAPABILITY_SERVER_EPOCH)
 }
 
-fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
+pub(super) fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
     if put_file_server_epoch_matches(query) {
         return true;
     }
@@ -565,6 +567,10 @@ async fn handle_internode_rpc(
                 None => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
             },
             (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            (Method::GET, READ_FILE_NIXL_PATH) => super::nixl_read::handle_read_file_nixl(req).await,
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            (Method::PUT, WRITE_FILE_NIXL_PATH) => super::nixl_read::handle_write_file_nixl(req).await,
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
                 Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
@@ -636,6 +642,10 @@ fn emit_internode_rpc_telemetry(started_at: Instant, status: StatusCode) {
 fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        READ_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        WRITE_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
@@ -1188,7 +1198,7 @@ fn legacy_meta_alias_can_retry(error: &DiskError, volume: &str) -> bool {
     matches!(error, DiskError::FileNotFound | DiskError::VolumeNotFound) && legacy_meta_bucket_alias(volume).is_some()
 }
 
-async fn read_file_stream_with_legacy_meta_fallback(
+pub(super) async fn read_file_stream_with_legacy_meta_fallback(
     disk: &DiskStore,
     volume: &str,
     path: &str,
@@ -1714,7 +1724,7 @@ async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> 
     .map_err(Into::into)
 }
 
-fn write_authenticated_put_file<S, E>(
+pub(super) fn write_authenticated_put_file<S, E>(
     disk: &DiskStore,
     body: S,
     query: &PutFileQuery,

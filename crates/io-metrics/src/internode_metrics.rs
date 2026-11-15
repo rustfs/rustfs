@@ -43,6 +43,7 @@ pub const INTERNODE_OPERATION_GRPC_FORCE_UNLOCK: &str = "grpc_force_unlock";
 pub const INTERNODE_OPERATION_GRPC_OTHER: &str = "grpc_other";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
+pub const INTERNODE_TRANSPORT_BACKEND_RDMA: &str = "rdma";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 
 /// Direction of a msgpack/JSON codec decode, for the JSON-fallback counter: a server decoding a

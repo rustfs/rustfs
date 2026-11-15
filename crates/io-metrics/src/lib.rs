@@ -362,6 +362,8 @@ pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_REMOTE: &str = "set_disk_rename_di
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE: &str = "set_disk_rename_remote_client_prepare";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_ENCODE: &str = "set_disk_rename_remote_client_json_encode";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_ENCODE: &str = "set_disk_rename_remote_client_msgpack_encode";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES: &str = "set_disk_rename_remote_client_json_bytes";
+pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES: &str = "set_disk_rename_remote_client_msgpack_bytes";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_GET_CLIENT: &str = "set_disk_rename_remote_client_get_client";
 pub const PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_CANONICAL_BODY_DIGEST: &str =
     "set_disk_rename_remote_client_canonical_body_digest";
@@ -2436,6 +2438,14 @@ pub fn record_put_object_stage_count(stage: &'static str, count: u64) {
     counter!("rustfs_s3_put_object_stage_count", "stage" => stage).increment(count);
 }
 
+#[inline(always)]
+pub fn record_put_object_stage_bytes(stage: &'static str, bytes: usize) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_stage_bytes", "stage" => stage).record(bytes as f64);
+}
+
 #[derive(Default)]
 struct DiskFsyncWorkerMetricsState {
     workers: AtomicU64,
@@ -4192,6 +4202,14 @@ mod tests {
             PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_TRANSPORT_CALL_POLL_PENDING_COUNT,
         ];
         assert_eq!(count_stages.iter().copied().collect::<HashSet<_>>().len(), count_stages.len());
+        let byte_samples = [
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_JSON_BYTES, 0_usize),
+            (PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_MSGPACK_BYTES, 17_usize),
+        ];
+        assert_eq!(
+            byte_samples.iter().map(|(stage, _)| *stage).collect::<HashSet<_>>().len(),
+            byte_samples.len()
+        );
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -4203,12 +4221,18 @@ mod tests {
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
             }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes + 1);
+            }
             set_put_stage_metrics_enabled(true);
             for stage in stages {
                 record_put_object_stage_duration(stage, 1.0);
             }
             for stage in count_stages {
                 record_put_object_stage_count(stage, 1);
+            }
+            for (stage, bytes) in byte_samples {
+                record_put_object_stage_bytes(stage, bytes);
             }
             set_put_stage_metrics_enabled(false);
         });
@@ -4218,6 +4242,25 @@ mod tests {
             counter_total(&rows, "rustfs_s3_put_object_stage_count"),
             Some(u64::try_from(count_stages.len()).expect("count stage length fits u64")),
         );
+        let recorded_bytes = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_bytes"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded_bytes.len(), byte_samples.len());
+        assert!(byte_samples.iter().all(|(stage, _)| recorded_bytes.contains(*stage)));
+        let mut byte_values = histogram_samples(&rows, "rustfs_s3_put_object_stage_bytes");
+        byte_values.sort_by(f64::total_cmp);
+        assert_eq!(byte_values, vec![0.0, 17.0]);
         let recorded = rows
             .into_iter()
             .filter(|(composite, _, _, _)| {

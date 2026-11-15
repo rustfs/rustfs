@@ -14,20 +14,30 @@
 
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
+use super::get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
+use super::head::ResponseEtag;
 use super::veeam_sosapi;
+use crate::app::dto_values::timestamp;
+use crate::app::{Answered, RequestEnvelope};
+use rustfs_gateway_types::dto as gateway_dto;
+use rustfs_s3_types::S3Result as OwnedResult;
+
 use super::*;
-use crate::app::storage_api::object_usecase::access::replication_proxy_allowed;
 use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
     with_get_object_read_condition,
 };
+#[cfg(test)]
+use crate::app::storage_api::s3::Body;
 use crate::app::storage_api::s3::dto::{
-    Checksum, ChecksumType, ContentType, ETag, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
-    GetObjectInput, GetObjectOutput, ObjectAttributes, ObjectPart, SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId,
-    ServerSideEncryption, StorageClass, StreamingBlob, Timestamp,
+    Checksum, ChecksumType, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts, ObjectAttributes,
+    ObjectPart, Timestamp,
 };
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::{GetObjectInput, GetObjectOutput, StreamingBlob};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
-use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
+#[cfg(test)]
+use crate::app::storage_api::s3::stream::ByteStream;
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use crate::on_demand_migration::WriteBackBody;
 
@@ -255,7 +265,7 @@ const VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 1024 * 1024;
 
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 
-const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
+pub(super) const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
 
 const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
 
@@ -365,14 +375,14 @@ struct GetObjectReadSetup {
     cache_hook_probed: bool,
     cache_fill_allowed: bool,
     rs: Option<HTTPRangeSpec>,
-    content_type: Option<ContentType>,
-    last_modified: Option<Timestamp>,
+    content_type: Option<mime_guess::Mime>,
+    last_modified: Option<OffsetDateTime>,
     response_content_length: i64,
     content_range: Option<String>,
-    server_side_encryption: Option<ServerSideEncryption>,
-    sse_customer_algorithm: Option<SSECustomerAlgorithm>,
-    sse_customer_key_md5: Option<SSECustomerKeyMD5>,
-    ssekms_key_id: Option<SSEKMSKeyId>,
+    server_side_encryption: Option<String>,
+    sse_customer_algorithm: Option<String>,
+    sse_customer_key_md5: Option<String>,
+    ssekms_key_id: Option<String>,
     encryption_applied: bool,
     /// Resolved plaintext start offset of the committed response body
     /// (`get_offset_length` output; 0 for a full-object read). Feeds the
@@ -396,7 +406,7 @@ struct GetObjectStrategyContext {
 }
 
 struct GetObjectOutputContext {
-    output: GetObjectOutput,
+    output: GetObjectOutputFacts,
     event_info: Option<ObjectInfo>,
     response_content_length: i64,
     optimal_buffer_size: usize,
@@ -1067,16 +1077,6 @@ impl futures::Stream for MemoryTrackedBytesStream {
     }
 }
 
-impl ByteStream for MemoryTrackedBytesStream {
-    fn remaining_length(&self) -> RemainingLength {
-        if self.emitted || self.bytes.is_none() {
-            RemainingLength::new_exact(0)
-        } else {
-            RemainingLength::new_exact(self.expected)
-        }
-    }
-}
-
 impl Drop for MemoryTrackedBytesStream {
     fn drop(&mut self) {
         if self.lifecycle.is_finished() {
@@ -1564,15 +1564,6 @@ where
         } else {
             (1, None)
         }
-    }
-}
-
-impl<R> ByteStream for GetObjectReaderStream<R>
-where
-    R: AsyncRead,
-{
-    fn remaining_length(&self) -> RemainingLength {
-        RemainingLength::new_exact(self.remaining)
     }
 }
 
@@ -2389,13 +2380,14 @@ fn should_buffer_get_object_in_memory_with_threshold(
 
 impl DefaultObjectUsecase {
     fn with_get_object_conditions<F: std::future::Future>(
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         part_number: Option<usize>,
         read: F,
     ) -> impl std::future::Future<Output = F::Output> {
         // The concrete reader future is large; keep it out of the request's stack frame.
         let read = Box::pin(read);
-        let condition = if has_read_preconditions(&req.headers) {
+        let condition = if has_read_preconditions(envelope.headers()) {
             let mut headers = HeaderMap::with_capacity(4);
             for name in [
                 http::header::IF_MATCH,
@@ -2403,13 +2395,13 @@ impl DefaultObjectUsecase {
                 http::header::IF_NONE_MATCH,
                 http::header::IF_MODIFIED_SINCE,
             ] {
-                if let Some(value) = req.headers.get(&name) {
+                if let Some(value) = envelope.headers().get(&name) {
                     headers.insert(name, value.clone());
                 }
             }
             Some(Arc::new(ConditionalRead {
-                bucket: req.input.bucket.clone(),
-                object: rustfs_utils::path::encode_dir_object_ref(&req.input.key).into_owned(),
+                bucket: input.bucket.clone(),
+                object: rustfs_utils::path::encode_dir_object_ref(&input.key).into_owned(),
                 headers,
                 part_number,
             }))
@@ -2429,7 +2421,7 @@ impl DefaultObjectUsecase {
         response_content_length: i64,
         source: &'static str,
         lifecycle: GetObjectBodyLifecycle,
-    ) -> StreamingBlob {
+    ) -> GetObjectBody {
         let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let memory_blob_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
@@ -2438,9 +2430,9 @@ impl DefaultObjectUsecase {
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let blob = if is_get_small_body_once_enabled() && bytes_len == remaining {
             let owner = MemoryOnceBodyOwner::new(bytes, guard, lifecycle);
-            StreamingBlob::from_bytes(Bytes::from_owner(owner))
+            GetObjectBody::Bytes(Bytes::from_owner(owner))
         } else {
-            StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle))
+            GetObjectBody::Stream(Box::pin(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle)))
         };
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -2460,7 +2452,7 @@ impl DefaultObjectUsecase {
         response_content_length: i64,
         source: &'static str,
         lifecycle: GetObjectBodyLifecycle,
-    ) -> StreamingBlob {
+    ) -> GetObjectBody {
         Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, source, lifecycle)
     }
 
@@ -2493,7 +2485,7 @@ impl DefaultObjectUsecase {
         key: &str,
         lifecycle: GetObjectBodyLifecycle,
         resume: Option<GetObjectResumeControl<R>>,
-    ) -> S3Result<StreamingBlob>
+    ) -> S3Result<GetObjectBody>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
@@ -2538,7 +2530,7 @@ impl DefaultObjectUsecase {
         let reader = std::io::Cursor::new(prefix).take(prefix_len).chain(reader);
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
             .with_diagnostics(bucket, key, request_id);
-        let blob = StreamingBlob::new(stream);
+        let blob = GetObjectBody::Stream(Box::pin(stream));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 stream_strategy.as_str(),
@@ -2598,26 +2590,33 @@ impl DefaultObjectUsecase {
     }
 
     async fn validate_get_object_before_body(
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         bucket: &str,
         key: &str,
         part_number: Option<usize>,
         info: &ObjectInfo,
     ) -> S3Result<()> {
         if info.delete_marker {
-            let code = if req.input.version_id.is_some() {
+            let code = if input.version_id.is_some() {
                 S3ErrorCode::MethodNotAllowed
             } else {
                 S3ErrorCode::NoSuchKey
             };
-            return Err(with_delete_marker_read_headers(S3Error::new(code), info, req.input.version_id.as_deref()));
+            return Err(with_delete_marker_read_headers(S3Error::new(code), info, input.version_id.as_deref()));
         }
         let result =
-            check_preconditions(&req.headers, info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
+            check_preconditions(envelope.headers(), info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
-            let principal = SseKmsPrincipal::from_request(req);
-            crate::storage::sse::validate_conditional_read(bucket, key, &info.user_defined, &req.headers, principal.as_ref())
-                .await?;
+            let principal = SseKmsPrincipal::from_request(envelope);
+            crate::storage::sse::validate_conditional_read(
+                bucket,
+                key,
+                &info.user_defined,
+                envelope.headers(),
+                principal.as_ref(),
+            )
+            .await?;
         }
         result
     }
@@ -2790,19 +2789,19 @@ impl DefaultObjectUsecase {
 
     /// Cheap request-shape validations, run before the bucket-existence store
     /// lookup so invalid requests keep their InvalidArgument precedence.
-    fn validate_get_object_request(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectValidatedRequest> {
+    fn validate_get_object_request(input: &GetObjectFields) -> S3Result<GetObjectValidatedRequest> {
         // Clone only the fields this path needs instead of the whole input.
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let version_id = req.input.version_id.clone();
-        let part_number = req.input.part_number;
-        let range = req.input.range;
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let version_id = input.version_id.clone();
+        let part_number = input.part_number;
+        let range = input.range;
 
         validate_object_key(&key, "GET")?;
 
         let part_number = parse_part_number_i32_to_usize(part_number, "GET")?;
 
-        let rs = range.map(range_to_http_range_spec).transpose()?;
+        let rs = range.map(byte_range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -2852,7 +2851,8 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read_execution(
         &self,
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         manager: &'static ConcurrencyManager,
         store: Arc<ECStore>,
         wrapper: &RequestTimeoutWrapper,
@@ -2866,9 +2866,9 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
-        let store_headers = project_ssec_transport_headers(&req.headers);
+        let store_headers = project_ssec_transport_headers(envelope.headers());
         let cache_adapter = self.object_data_cache();
-        let conditional = has_read_preconditions(&req.headers);
+        let conditional = has_read_preconditions(envelope.headers());
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
                 manager,
@@ -2883,7 +2883,8 @@ impl DefaultObjectUsecase {
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
                 Self::with_get_object_conditions(
-                    req,
+                    envelope,
+                    input,
                     part_number,
                     store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
                 ),
@@ -2891,7 +2892,8 @@ impl DefaultObjectUsecase {
             .await
             .map_err(map_get_object_reader_error)?;
             let read_setup =
-                Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+                Self::finish_get_object_read(envelope, input, manager, bucket, key, rs, part_number, read_start, reader, true)
+                    .await?;
             return Ok(GetObjectPreparedRead { io_planning, read_setup });
         }
 
@@ -2918,7 +2920,8 @@ impl DefaultObjectUsecase {
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
         if conditional {
-            Self::validate_get_object_before_body(req, bucket, key, part_number, initial_metadata.object_info()).await?;
+            Self::validate_get_object_before_body(envelope, input, bucket, key, part_number, initial_metadata.object_info())
+                .await?;
         }
         let mut prepared = Some(initial_metadata);
         'snapshot: {
@@ -2967,8 +2970,19 @@ impl DefaultObjectUsecase {
                     .ok_or_else(|| s3_error!(InternalError, "prepared cache-hit reader is unavailable"))?
                     .into_object_info();
                 let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
-                let read_setup =
-                    Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+                let read_setup = Self::finish_get_object_read(
+                    envelope,
+                    input,
+                    manager,
+                    bucket,
+                    key,
+                    rs,
+                    part_number,
+                    read_start,
+                    reader,
+                    true,
+                )
+                .await?;
                 return Ok(GetObjectPreparedRead {
                     io_planning: Self::get_object_io_planning_without_disk(manager),
                     read_setup,
@@ -2986,8 +3000,19 @@ impl DefaultObjectUsecase {
                     .ok_or_else(|| s3_error!(InternalError, "prepared cache-hit reader is unavailable"))?
                     .into_object_info();
                 let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
-                let read_setup =
-                    Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+                let read_setup = Self::finish_get_object_read(
+                    envelope,
+                    input,
+                    manager,
+                    bucket,
+                    key,
+                    rs,
+                    part_number,
+                    read_start,
+                    reader,
+                    true,
+                )
+                .await?;
                 return Ok(GetObjectPreparedRead {
                     io_planning: Self::get_object_io_planning_without_disk(manager),
                     read_setup,
@@ -3026,7 +3051,13 @@ impl DefaultObjectUsecase {
                     let range = range.clone();
                     let bucket = bucket.to_owned();
                     let key = key.to_owned();
-                    let opts = opts.clone();
+                    let mut opts = opts.clone();
+                    // The cold-fill producer materializes the body it reads, so it
+                    // must drain the pipeline itself: a caller sink (cuObject
+                    // S3-over-RDMA) would swallow the bytes and leave the
+                    // materialization short. The RDMA reply is then served from
+                    // the materialized body like any cache hit.
+                    opts.get_object_sink = None;
                     let object_traffic_health = object_traffic_health.as_ref().map(Arc::clone);
                     async move {
                         let producer_deadline = producer.deadline();
@@ -3158,9 +3189,19 @@ impl DefaultObjectUsecase {
                         }
                     };
                     let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
-                    let read_setup =
-                        Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true)
-                            .await?;
+                    let read_setup = Self::finish_get_object_read(
+                        envelope,
+                        input,
+                        manager,
+                        bucket,
+                        key,
+                        rs,
+                        part_number,
+                        read_start,
+                        reader,
+                        true,
+                    )
+                    .await?;
                     return Ok(GetObjectPreparedRead {
                         io_planning: Self::get_object_io_planning_without_disk(manager),
                         read_setup,
@@ -3180,7 +3221,12 @@ impl DefaultObjectUsecase {
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
+                Self::with_get_object_conditions(
+                    envelope,
+                    input,
+                    part_number,
+                    prepared.with_headers(store_headers).into_reader(),
+                ),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -3205,7 +3251,12 @@ impl DefaultObjectUsecase {
                 .map_err(map_get_object_reader_error)?;
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
+                    Self::with_get_object_conditions(
+                        envelope,
+                        input,
+                        part_number,
+                        prepared.with_headers(store_headers).into_reader(),
+                    ),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
@@ -3213,7 +3264,8 @@ impl DefaultObjectUsecase {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
                     Self::with_get_object_conditions(
-                        req,
+                        envelope,
+                        input,
                         part_number,
                         store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
                     ),
@@ -3223,9 +3275,19 @@ impl DefaultObjectUsecase {
             };
             (io_planning, reader)
         };
-        let read_setup =
-            Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, cache_fill_allowed)
-                .await?;
+        let read_setup = Self::finish_get_object_read(
+            envelope,
+            input,
+            manager,
+            bucket,
+            key,
+            rs,
+            part_number,
+            read_start,
+            reader,
+            cache_fill_allowed,
+        )
+        .await?;
         // The buffered body has completed storage reads. Release admission
         // before output planning so downstream response work cannot occupy a
         // disk slot; streaming bodies retain the permit below until EOF/drop.
@@ -3242,7 +3304,8 @@ impl DefaultObjectUsecase {
 
     #[allow(clippy::too_many_arguments)]
     async fn finish_get_object_read(
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -3261,7 +3324,7 @@ impl DefaultObjectUsecase {
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
 
-        Self::validate_get_object_before_body(req, bucket, key, part_number, &info).await?;
+        Self::validate_get_object_before_body(envelope, input, bucket, key, part_number, &info).await?;
         let read_duration = read_start.elapsed();
 
         // Conditional metrics recording to reduce overhead
@@ -3282,7 +3345,7 @@ impl DefaultObjectUsecase {
         }
 
         let content_type = if let Some(content_type) = &info.content_type {
-            match ContentType::from_str(content_type) {
+            match content_type.parse::<mime_guess::Mime>() {
                 Ok(res) => Some(res),
                 Err(err) => {
                     error!(content_type, error = ?err, "GET object content-type parse failed");
@@ -3292,7 +3355,7 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
-        let last_modified = info.mod_time.map(Timestamp::from);
+        let last_modified = info.mod_time;
 
         if let Some(part_number) = part_number
             && rs.is_none()
@@ -3310,7 +3373,7 @@ impl DefaultObjectUsecase {
             );
         }
 
-        validate_sse_headers_for_read(&info.user_defined, &req.headers)?;
+        validate_sse_headers_for_read(&info.user_defined, envelope.headers())?;
 
         let mut content_length = info.get_actual_size().map_err(ApiError::from)?;
         let (resume_range_start, resume_range_end, content_range) = if let Some(rs) = &rs {
@@ -3333,16 +3396,16 @@ impl DefaultObjectUsecase {
         debug!(
             "GET object metadata check: parts={}, provided_sse_key={:?}",
             info.parts.len(),
-            req.input.sse_customer_key.is_some()
+            input.sse_customer_key.is_some()
         );
 
-        let read_principal = SseKmsPrincipal::from_request(req);
+        let read_principal = SseKmsPrincipal::from_request(envelope);
         let decryption_request = DecryptionRequest {
             bucket,
             key,
             metadata: &info.user_defined,
-            sse_customer_key: req.input.sse_customer_key.as_ref(),
-            sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
+            sse_customer_key: input.sse_customer_key.as_ref(),
+            sse_customer_key_md5: input.sse_customer_key_md5.as_ref(),
             principal: read_principal.as_ref(),
         };
 
@@ -3364,7 +3427,7 @@ impl DefaultObjectUsecase {
                 headers
                     .sse_customer_algorithm
                     .is_none()
-                    .then(|| ServerSideEncryption::from(headers.server_side_encryption)),
+                    .then_some(headers.server_side_encryption),
                 headers.sse_customer_algorithm,
                 headers.sse_customer_key_md5,
                 headers.ssekms_key_id,
@@ -3542,7 +3605,7 @@ impl DefaultObjectUsecase {
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
         resume: F,
-    ) -> S3Result<StreamingBlob>
+    ) -> S3Result<GetObjectBody>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
         F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<R>>,
@@ -3694,7 +3757,7 @@ impl DefaultObjectUsecase {
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
         resume: F,
-    ) -> S3Result<StreamingBlob>
+    ) -> S3Result<GetObjectBody>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
         F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<R>>,
@@ -4007,26 +4070,26 @@ impl DefaultObjectUsecase {
         headers: &HeaderMap,
         event_info: Option<ObjectInfo>,
         version_id_for_event: String,
-        output: GetObjectOutput,
+        output: GetObjectOutputFacts,
         extra_checksum_headers: Vec<(&'static str, String)>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
+    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
         let helper = match event_info {
             Some(event_info) => helper.object(event_info),
             None => helper,
         };
         let helper = helper.version_id(version_id_for_event);
         let cors_wrap_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        let mut response = read_answer(bucket, method, headers, output).await;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_CORS_WRAP, cors_wrap_start);
         let header_inject_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         inject_accept_ranges_header(&mut response.headers);
-        // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
+        // Emit XXHash3/64/128 and SHA-512 checksums that GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
         let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let _ = helper.complete(&result);
+        complete_read(helper, &result);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_EVENT_COMPLETE, event_complete_start);
         result
     }
@@ -4034,7 +4097,10 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_output_context<F>(
         &self,
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))] rdma_sink: Option<
+            super::cuobject::StagingSinkHandle,
+        >,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -4046,15 +4112,15 @@ impl DefaultObjectUsecase {
         cache_hook_probed: bool,
         cache_fill_allowed: bool,
         rs: Option<HTTPRangeSpec>,
-        content_type: Option<ContentType>,
-        last_modified: Option<Timestamp>,
+        content_type: Option<mime_guess::Mime>,
+        last_modified: Option<OffsetDateTime>,
         response_content_length: i64,
         content_range: Option<String>,
         request_id: &str,
-        server_side_encryption: Option<ServerSideEncryption>,
-        sse_customer_algorithm: Option<SSECustomerAlgorithm>,
-        sse_customer_key_md5: Option<SSECustomerKeyMD5>,
-        ssekms_key_id: Option<SSEKMSKeyId>,
+        server_side_encryption: Option<String>,
+        sse_customer_algorithm: Option<String>,
+        sse_customer_key_md5: Option<String>,
+        ssekms_key_id: Option<String>,
         encryption_applied: bool,
         permit_wait_duration: Duration,
         queue_utilization: f64,
@@ -4087,35 +4153,94 @@ impl DefaultObjectUsecase {
             enable_readahead,
         } = strategy;
         let cache_adapter = self.object_data_cache();
-
         let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let body = Self::build_get_object_body_with_cache(
-            &cache_adapter,
-            final_stream,
-            &info,
-            response_content_length,
-            request_id,
-            content_range.as_deref(),
-            optimal_buffer_size,
-            enable_readahead,
-            concurrent_requests,
-            part_number,
-            rs.is_some(),
-            encryption_applied,
-            buffered_body,
-            cache_hook_served,
-            cache_hook_probed,
-            cache_fill_allowed,
-            bucket,
-            key,
-            lifecycle,
-            resume,
-        )
-        .await?;
+        // Extra response headers beyond what `GetObjectOutput` carries.
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut extra_headers: Vec<(&'static str, String)> = Vec::new();
+        #[cfg_attr(
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
+        let mut http_content_length = response_content_length;
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let rdma_token = super::cuobject::rdma_token_for_request(envelope.headers());
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+        let rdma_token: Option<std::convert::Infallible> = None;
+        let body = match rdma_token {
+            #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+            Some(token) => {
+                // S3-over-RDMA: the object bytes go straight into the client's
+                // registered (GPU or host) memory; the HTTP response carries no body.
+                let mut lifecycle = lifecycle;
+                let transfer = match rdma_sink {
+                    Some(handle) if handle.was_used() => {
+                        super::cuobject::finish_get_through_sink(final_stream, response_content_length, handle).await
+                    }
+                    _ => {
+                        super::cuobject::serve_get_over_rdma(
+                            final_stream,
+                            buffered_body,
+                            response_content_length,
+                            bucket,
+                            key,
+                            &token,
+                        )
+                        .await
+                    }
+                };
+                let moved = match transfer {
+                    Ok(moved) => moved,
+                    Err(error) => {
+                        lifecycle.finish_err();
+                        return Err(error);
+                    }
+                };
+                lifecycle.finish_ok();
+                extra_headers.push((
+                    crate::app::object::cuobject::RDMA_REPLY_HEADER,
+                    if rs.is_some() { "206" } else { "200" }.to_owned(),
+                ));
+                if moved > 0 {
+                    extra_headers.push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+                }
+                http_content_length = 0;
+                GetObjectBody::Bytes(Bytes::new())
+            }
+            #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+            Some(never) => match never {},
+            None => {
+                Self::build_get_object_body_with_cache(
+                    &cache_adapter,
+                    final_stream,
+                    &info,
+                    response_content_length,
+                    request_id,
+                    content_range.as_deref(),
+                    optimal_buffer_size,
+                    enable_readahead,
+                    concurrent_requests,
+                    part_number,
+                    rs.is_some(),
+                    encryption_applied,
+                    buffered_body,
+                    cache_hook_served,
+                    cache_hook_probed,
+                    cache_fill_allowed,
+                    bucket,
+                    key,
+                    lifecycle,
+                    resume,
+                )
+                .await?
+            }
+        };
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUILD, body_build_start);
 
         let checksum_headers_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
+        let checksums = Self::build_get_object_checksums(&info, envelope.headers(), part_number, rs.as_ref())?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
         let output_version_id = s3_response_version_id(info.version_id);
@@ -4130,7 +4255,7 @@ impl DefaultObjectUsecase {
         let lifecycle_expiration_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
-        let storage_class = response_storage_class(&info, &info.user_defined);
+        let storage_class = response_storage_class_name(&info, &info.user_defined);
         let cache_control = info.user_defined.get("cache-control").cloned();
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
@@ -4139,38 +4264,39 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
         let output_struct_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let parts_count = Self::get_object_parts_count(part_number, &info);
-        let output = GetObjectOutput {
+        let output = GetObjectOutputFacts {
             body: Some(body),
-            content_length: Some(response_content_length),
-            last_modified,
-            content_type,
-            content_encoding: info.content_encoding.clone(),
-            content_language: info.user_defined.get("content-language").cloned(),
-            cache_control,
-            content_disposition,
-            content_range,
-            parts_count,
-            e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata,
-            website_redirect_location: req
-                .extensions
-                .get::<crate::app::metadata_route::WebsiteRead>()
-                .and_then(|_| info.user_defined.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned()),
-            server_side_encryption,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            ssekms_key_id,
-            checksum_crc32: checksums.crc32,
-            checksum_crc32c: checksums.crc32c,
-            checksum_sha1: checksums.sha1,
-            checksum_sha256: checksums.sha256,
-            checksum_crc64nvme: checksums.crc64nvme,
-            checksum_type: checksums.checksum_type.map(ChecksumType::from),
-            version_id: output_version_id,
-            restore,
-            expiration,
-            storage_class,
-            ..Default::default()
+            etag: info.etag.as_deref().map(ResponseEtag::from_stored),
+            dto: gateway_dto::GetObjectOutput {
+                content_length: Some(http_content_length),
+                last_modified: last_modified.map(timestamp),
+                content_type: content_type.map(|value| value.to_string()),
+                content_encoding: info.content_encoding.clone(),
+                content_language: info.user_defined.get("content-language").cloned(),
+                cache_control,
+                content_disposition,
+                content_range,
+                parts_count,
+                metadata: metadata.unwrap_or_default().into_iter().collect(),
+                website_redirect_location: envelope
+                    .website_read()
+                    .and_then(|_| info.user_defined.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned()),
+                server_side_encryption: server_side_encryption.map(gateway_dto::ServerSideEncryption::custom),
+                sse_customer_algorithm,
+                sse_customer_key_md5,
+                ssekms_key_id,
+                checksum_crc32: checksums.crc32,
+                checksum_crc32c: checksums.crc32c,
+                checksum_sha1: checksums.sha1,
+                checksum_sha256: checksums.sha256,
+                checksum_crc64nvme: checksums.crc64nvme,
+                checksum_type: checksums.checksum_type.map(gateway_dto::ChecksumType::custom),
+                version_id: output_version_id,
+                restore,
+                expiration: expiration.map(Into::into),
+                storage_class: storage_class.map(gateway_dto::StorageClass::custom),
+                ..Default::default()
+            },
         };
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_OUTPUT_STRUCT_BUILD, output_struct_start);
 
@@ -4179,7 +4305,11 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
-            extra_checksum_headers: checksums.extra,
+            extra_checksum_headers: {
+                let mut extra_checksum_headers = checksums.extra;
+                extra_checksum_headers.extend(extra_headers);
+                extra_checksum_headers
+            },
         })
     }
 
@@ -4188,22 +4318,23 @@ impl DefaultObjectUsecase {
     /// backlog#1675 P1-5). Returns None when no target can serve the object;
     /// the caller then returns the original local error.
     async fn proxy_get_object_to_replication_targets(
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         bucket: &str,
         key: &str,
         opts: &ObjectOptions,
-    ) -> Option<GetObjectOutput> {
+    ) -> Option<GetObjectOutputFacts> {
         let targets = get_read_proxy_targets(bucket, key, opts).await;
         if targets.is_empty() {
             return None;
         }
-        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
-        let range = req
-            .headers
+        let extra_headers = Self::proxy_read_passthrough_headers(envelope.headers());
+        let range = envelope
+            .headers()
             .get(http::header::RANGE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let part_number = req.input.part_number;
+        let part_number = input.part_number;
 
         for target in targets {
             match target
@@ -4222,7 +4353,7 @@ impl DefaultObjectUsecase {
                     // (targets were available), one failed when no target
                     // served it — never per target.
                     record_replication_proxy(bucket, "GetObject", false).await;
-                    return Some(Self::proxy_sdk_get_output_to_s3s(remote));
+                    return Some(Self::proxy_sdk_get_output(remote));
                 }
                 Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
                     debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
@@ -4236,46 +4367,55 @@ impl DefaultObjectUsecase {
         None
     }
 
-    /// Translate a proxied SDK GET response into the s3s output, forwarding
+    /// Translate a proxied SDK GET response into native output facts, forwarding
     /// the body as a stream (no buffering, no local persistence).
-    fn proxy_sdk_get_output_to_s3s(remote: aws_sdk_s3::operation::get_object::GetObjectOutput) -> GetObjectOutput {
+    fn proxy_sdk_get_output(remote: aws_sdk_s3::operation::get_object::GetObjectOutput) -> GetObjectOutputFacts {
         let body = remote.body;
         let body_stream = tokio_util::io::ReaderStream::with_capacity(body.into_async_read(), 64 * 1024);
-        GetObjectOutput {
-            body: Some(StreamingBlob::wrap(body_stream)),
-            content_length: remote.content_length,
-            content_range: remote.content_range,
-            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
-            content_encoding: remote.content_encoding,
-            content_disposition: remote.content_disposition,
-            content_language: remote.content_language,
-            cache_control: remote.cache_control,
-            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
-            last_modified: remote
-                .last_modified
-                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
-                .map(Timestamp::from),
-            metadata: remote.metadata,
-            version_id: remote.version_id,
-            server_side_encryption: remote
-                .server_side_encryption
-                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
-            sse_customer_algorithm: remote.sse_customer_algorithm,
-            sse_customer_key_md5: remote.sse_customer_key_md5,
-            ssekms_key_id: remote.ssekms_key_id,
-            parts_count: remote.parts_count,
-            tag_count: remote.tag_count,
-            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
-            expiration: remote.expiration,
-            restore: remote.restore,
-            website_redirect_location: remote.website_redirect_location,
-            checksum_crc32: remote.checksum_crc32,
-            checksum_crc32c: remote.checksum_crc32_c,
-            checksum_crc64nvme: remote.checksum_crc64_nvme,
-            checksum_sha1: remote.checksum_sha1,
-            checksum_sha256: remote.checksum_sha256,
-            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
-            ..Default::default()
+        GetObjectOutputFacts {
+            body: Some(GetObjectBody::stream(body_stream)),
+            etag: remote.e_tag.as_deref().and_then(ResponseEtag::from_proxy),
+            dto: gateway_dto::GetObjectOutput {
+                content_length: remote.content_length,
+                content_range: remote.content_range,
+                content_type: remote
+                    .content_type
+                    .as_deref()
+                    .and_then(|v| v.parse::<mime_guess::Mime>().ok().map(|value| value.to_string())),
+                content_encoding: remote.content_encoding,
+                content_disposition: remote.content_disposition,
+                content_language: remote.content_language,
+                cache_control: remote.cache_control,
+                last_modified: remote
+                    .last_modified
+                    .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                    .map(timestamp),
+                metadata: remote.metadata.unwrap_or_default().into_iter().collect(),
+                version_id: remote.version_id,
+                server_side_encryption: remote
+                    .server_side_encryption
+                    .map(|sse| gateway_dto::ServerSideEncryption::custom(sse.as_str().to_owned())),
+                sse_customer_algorithm: remote.sse_customer_algorithm,
+                sse_customer_key_md5: remote.sse_customer_key_md5,
+                ssekms_key_id: remote.ssekms_key_id,
+                parts_count: remote.parts_count,
+                tag_count: remote.tag_count,
+                storage_class: remote
+                    .storage_class
+                    .map(|sc| gateway_dto::StorageClass::custom(sc.as_str().to_owned())),
+                expiration: remote.expiration.map(Into::into),
+                restore: remote.restore,
+                website_redirect_location: remote.website_redirect_location,
+                checksum_crc32: remote.checksum_crc32,
+                checksum_crc32c: remote.checksum_crc32_c,
+                checksum_crc64nvme: remote.checksum_crc64_nvme,
+                checksum_sha1: remote.checksum_sha1,
+                checksum_sha256: remote.checksum_sha256,
+                checksum_type: remote
+                    .checksum_type
+                    .map(|ct| gateway_dto::ChecksumType::custom(ct.as_str().to_owned())),
+                ..Default::default()
+            },
         }
     }
 
@@ -4286,7 +4426,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn on_demand_migration_get(
         &self,
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
         store: &Arc<ECStore>,
         bucket: &str,
         key: &str,
@@ -4315,7 +4455,7 @@ impl DefaultObjectUsecase {
                 None => return Some(OdmGetOutcome::RetryLocal),
             }
         }
-        let expected_incarnation = match odm_read_generation(req, bucket) {
+        let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
             Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
@@ -4333,8 +4473,8 @@ impl DefaultObjectUsecase {
             OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
             OdmGetVerdict::Consult { state, client } => (state, client),
         };
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let reply = odm_get_from_source(&state, client.as_ref(), &req.headers, key, range, request_context).await;
+        let request_context = envelope.request_context().cloned();
+        let reply = odm_get_from_source(&state, client.as_ref(), envelope.headers(), key, range, request_context).await;
         Some(match reply {
             OdmGetReply::Served { output, backfill } => {
                 if let Some(reason) = backfill {
@@ -4349,49 +4489,90 @@ impl DefaultObjectUsecase {
         })
     }
 
-    #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
-    pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        self.execute_get_object_boxed(req).await
-    }
-
-    fn execute_get_object_boxed(
+    #[cfg(test)]
+    pub(crate) async fn execute_get_object_from_s3s(
         &self,
-        req: S3Request<GetObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<GetObjectOutput>>> + Send + '_ {
-        Box::pin(self.execute_get_object_inner(req))
+        request: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        crate::app::test_seams::get_object(self, request).await
     }
 
-    fn complete_get_object_error<T>(helper: OperationHelper, err: S3Error) -> S3Result<S3Response<T>> {
-        let result = Err(err);
-        let _ = helper.complete(&result);
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) async fn execute_get_object(
+        &self,
+        envelope: RequestEnvelope,
+        input: gateway_dto::GetObjectInput,
+    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+        use rustfs_gateway_types::RangeParse;
+        self.execute_get_object_fields(
+            envelope,
+            GetObjectFields {
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                version_id: input.version_id,
+                part_number: input.part_number,
+                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                    RangeParse::One(range) => Some(range),
+                    _ => None,
+                }),
+                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+                sse_customer_key_md5: input.sse_customer_key_md5,
+            },
+        )
+        .await
+    }
+
+    #[instrument(name = "execute_get_object", level = "trace", skip(self, envelope, input))]
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::get::DefaultObjectUsecase::execute_get_object"
+    )]
+    pub(crate) async fn execute_get_object_fields(
+        &self,
+        envelope: RequestEnvelope,
+        input: GetObjectFields,
+    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+        Box::pin(self.execute_get_object_inner(envelope, input)).await
+    }
+
+    fn complete_get_object_error<T>(
+        helper: OperationHelper,
+        err: impl Into<rustfs_s3_types::S3Error>,
+    ) -> OwnedResult<Answered<T>> {
+        let result = Err(err.into());
+        complete_read(helper, &result);
         result
     }
 
     async fn serve_veeam_sosapi_get(
         &self,
-        req: &S3Request<GetObjectInput>,
+        envelope: &RequestEnvelope,
+        input: &GetObjectFields,
         store: &Arc<ECStore>,
         kind: veeam_sosapi::SosapiKind,
         part_number: Option<usize>,
         range: Option<&HTTPRangeSpec>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
+    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
         let representation =
-            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
-        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
+            veeam_sosapi::read_representation(store, &input.bucket, kind, envelope.headers(), part_number, range).await?;
+        let content_type = veeam_sosapi::CONTENT_TYPE
+            .parse::<mime_guess::Mime>()
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
         let ranged = representation.content_range.is_some();
-        let output = GetObjectOutput {
-            body: Some(StreamingBlob::from(s3s::Body::from(representation.body))),
-            content_length: Some(representation.content_length),
-            content_type: Some(content_type),
-            content_range: representation.content_range,
-            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
-            last_modified: Some(Timestamp::from(representation.last_modified)),
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
-            ..Default::default()
+        let output = GetObjectOutputFacts {
+            body: Some(GetObjectBody::Bytes(representation.body)),
+            etag: Some(ResponseEtag::from_stored(&representation.etag_hex)),
+            dto: gateway_dto::GetObjectOutput {
+                content_length: Some(representation.content_length),
+                content_type: Some(content_type.to_string()),
+                content_range: representation.content_range,
+                last_modified: Some(timestamp(representation.last_modified)),
+                accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+                ..Default::default()
+            },
         };
-        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
+        let mut response = read_answer(&input.bucket, envelope.method(), envelope.headers(), output).await;
         inject_accept_ranges_header(&mut response.headers);
         if ranged {
             response.status = Some(StatusCode::PARTIAL_CONTENT);
@@ -4399,8 +4580,13 @@ impl DefaultObjectUsecase {
         Ok(response)
     }
 
-    async fn execute_get_object_inner(&self, mut req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+    async fn execute_get_object_inner(
+        &self,
+        mut envelope: RequestEnvelope,
+        input: GetObjectFields,
+    ) -> OwnedResult<Answered<GetObjectOutputFacts>> {
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .suppress_event();
 
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -4408,7 +4594,7 @@ impl DefaultObjectUsecase {
 
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request_shape_start = stage_metrics_enabled.then(std::time::Instant::now);
-        let inbound_request_context = req.extensions.get::<request_context::RequestContext>();
+        let inbound_request_context = envelope.request_context();
         let request_id = inbound_request_context
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
@@ -4421,7 +4607,7 @@ impl DefaultObjectUsecase {
                 context.start_time.elapsed().as_secs_f64(),
             );
         }
-        let bootstrap = match self.init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id) {
+        let bootstrap = match self.init_get_object_bootstrap(&input.bucket, &input.key, &request_id) {
             Ok(bootstrap) => bootstrap,
             Err(err) => return Self::complete_get_object_error(helper, err),
         };
@@ -4437,7 +4623,7 @@ impl DefaultObjectUsecase {
         // Cheap request-shape validations run first so invalid requests keep
         // their InvalidArgument precedence over bucket existence.
         let request_validation_start = stage_metrics_enabled.then(std::time::Instant::now);
-        let validated = match Self::validate_get_object_request(&req) {
+        let validated = match Self::validate_get_object_request(&input) {
             Ok(validated) => validated,
             Err(err) => {
                 lifecycle.finish_err();
@@ -4471,7 +4657,7 @@ impl DefaultObjectUsecase {
             );
         }
         let bucket_validation_start = stage_metrics_enabled.then(std::time::Instant::now);
-        if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
+        if let Err(err) = validate_bucket_exists(&store, &input.bucket).await {
             lifecycle.finish_err();
             return Self::complete_get_object_error(helper, err);
         }
@@ -4481,13 +4667,13 @@ impl DefaultObjectUsecase {
             && let Some(kind) = veeam_sosapi::handled_kind(&validated.key)
         {
             let served = self
-                .serve_veeam_sosapi_get(&req, &store, kind, validated.part_number, validated.rs.as_ref())
+                .serve_veeam_sosapi_get(&envelope, &input, &store, kind, validated.part_number, validated.rs.as_ref())
                 .await;
             match served {
                 Ok(response) => {
                     lifecycle.finish_ok();
                     let result = Ok(response);
-                    let _ = helper.complete(&result);
+                    complete_read(helper, &result);
                     return result;
                 }
                 Err(err) => {
@@ -4498,15 +4684,15 @@ impl DefaultObjectUsecase {
         }
 
         let request_context_start = stage_metrics_enabled.then(std::time::Instant::now);
-        let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
+        let request_context = match Self::prepare_get_object_request_context(validated, envelope.headers()).await {
             Ok(request_context) => request_context,
             Err(err) => {
                 lifecycle.finish_err();
                 return Self::complete_get_object_error(helper, err);
             }
         };
-        let bucket = req.input.bucket.clone();
-        prepare_odm_read_generation(&store, &mut req, &bucket).await;
+        let bucket = input.bucket.clone();
+        prepare_odm_read_generation(&store, &mut envelope, &bucket).await;
         if let Some(request_context_start) = request_context_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -4523,13 +4709,27 @@ impl DefaultObjectUsecase {
             opts,
         } = request_context;
         drop(object_metadata_progress);
+        // cuObject S3-over-RDMA: hand the storage layer a sink that writes decoded
+        // bytes straight into registered staging (no pipe, no consumer copy). The
+        // owned handle moves to the body builder after the read is prepared.
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+        let (opts, rdma_sink) = match super::cuobject::rdma_token_for_request(envelope.headers()) {
+            Some(token) => {
+                let handle = super::cuobject::StagingSinkHandle::new(&bucket, &key, &token).await?;
+                let mut opts = opts;
+                opts.get_object_sink = Some(handle.sink());
+                (opts, Some(handle))
+            }
+            None => (opts, None),
+        };
 
         let manager = get_concurrency_manager();
 
         let prepare_read_start = stage_metrics_enabled.then(std::time::Instant::now);
         let mut prepared_read = self
             .prepare_get_object_read_execution(
-                &req,
+                &envelope,
+                &input,
                 manager,
                 store.clone(),
                 &wrapper,
@@ -4547,39 +4747,40 @@ impl DefaultObjectUsecase {
         // their semantics) may still be served by a remote copy.
         if let Err(err) = &prepared_read
             && matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
-            && replication_proxy_allowed(&req.extensions)
+            && envelope.object_tag_conditions().is_none()
         {
             // Active-active replication lag window: proxy the GET to a
             // replication target (backlog#1675 P1-5).
-            if let Some(mut output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
-                if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
-                    output.website_redirect_location = None;
+            if let Some(mut output) = Self::proxy_get_object_to_replication_targets(&envelope, &input, &bucket, &key, &opts).await
+            {
+                if envelope.website_read().is_none() {
+                    output.dto.website_redirect_location = None;
                 }
                 lifecycle.finish_ok();
-                let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                let mut response = read_answer(&bucket, envelope.method(), envelope.headers(), output).await;
                 inject_accept_ranges_header(&mut response.headers);
                 let result = Ok(response);
-                let _ = helper.version_id(version_id_for_event).complete(&result);
+                complete_read(helper.version_id(version_id_for_event), &result);
                 return result;
             }
             // On-demand migration source (rustfs/backlog#2156): the
             // authoritative external copy, after the cheaper replication
             // proxy.
             match self
-                .on_demand_migration_get(&req, &store, &bucket, &key, rs.as_ref(), &opts, part_number)
+                .on_demand_migration_get(&envelope, &store, &bucket, &key, rs.as_ref(), &opts, part_number)
                 .await
             {
                 None => {}
                 Some(OdmGetOutcome::Respond(Ok(mut output))) => {
-                    if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
-                        output.website_redirect_location = None;
+                    if envelope.website_read().is_none() {
+                        output.dto.website_redirect_location = None;
                     }
                     lifecycle.finish_ok();
-                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, *output).await;
+                    let mut response = read_answer(&bucket, envelope.method(), envelope.headers(), *output).await;
                     inject_accept_ranges_header(&mut response.headers);
                     mark_on_demand_migration_response(&mut response.headers);
                     let result = Ok(response);
-                    let _ = helper.version_id(version_id_for_event).complete(&result);
+                    complete_read(helper.version_id(version_id_for_event), &result);
                     return result;
                 }
                 Some(OdmGetOutcome::Respond(Err(err))) => {
@@ -4590,7 +4791,8 @@ impl DefaultObjectUsecase {
                     let prepare_read_retry_start = stage_metrics_enabled.then(std::time::Instant::now);
                     prepared_read = self
                         .prepare_get_object_read_execution(
-                            &req,
+                            &envelope,
+                            &input,
                             manager,
                             store.clone(),
                             &wrapper,
@@ -4659,7 +4861,9 @@ impl DefaultObjectUsecase {
         let output_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output_context = self
             .build_get_object_output_context(
-                &req,
+                &envelope,
+                #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+                rdma_sink,
                 manager,
                 &bucket,
                 &key,
@@ -4694,7 +4898,7 @@ impl DefaultObjectUsecase {
                             &bucket,
                             &key,
                             opts,
-                            &req.headers,
+                            envelope.headers(),
                             info,
                             resume_range_start,
                             resume_range_end,
@@ -4735,8 +4939,8 @@ impl DefaultObjectUsecase {
         let response = Self::finalize_get_object_response(
             helper,
             &bucket,
-            &req.method,
-            &req.headers,
+            envelope.method(),
+            envelope.headers(),
             event_info,
             version_id_for_event,
             output,
@@ -5009,7 +5213,7 @@ pub(super) enum OdmGetReply {
     /// Stream this source-backed body to the client; `backfill` names the
     /// background pull to queue once the response is on its way.
     Served {
-        output: Box<GetObjectOutput>,
+        output: Box<GetObjectOutputFacts>,
         backfill: Option<PullReason>,
     },
     Error(S3Error),
@@ -5019,7 +5223,7 @@ pub(super) enum OdmGetReply {
 
 /// What the GET handler does after the on-demand migration branch.
 pub(super) enum OdmGetOutcome {
-    Respond(S3Result<Box<GetObjectOutput>>),
+    Respond(S3Result<Box<GetObjectOutputFacts>>),
     RetryLocal,
 }
 
@@ -5105,23 +5309,33 @@ fn odm_content_length(size: u64) -> S3Result<i64> {
 /// Maps a source body onto the s3s output. Only what the source can vouch
 /// for is returned: the ETag and Last-Modified are the source's (the object
 /// is not local yet); no version id, SSE headers, storage class or checksums.
-fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<String>, body: StreamingBlob) -> GetObjectOutput {
-    GetObjectOutput {
+fn odm_get_output(
+    head: &SourceHead,
+    content_length: i64,
+    content_range: Option<String>,
+    body: GetObjectBody,
+) -> GetObjectOutputFacts {
+    GetObjectOutputFacts {
         body: Some(body),
-        content_length: Some(content_length),
-        content_range,
-        content_type: head.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
-        content_encoding: head.content_encoding.clone(),
-        content_disposition: head.content_disposition.clone(),
-        content_language: head.content_language.clone(),
-        cache_control: head.cache_control.clone(),
-        expires: head.expires.clone(),
-        accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
-        e_tag: head.etag.as_deref().map(to_s3s_etag),
-        last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
-        metadata: (!head.user_metadata.is_empty()).then(|| head.user_metadata.clone()),
-        website_redirect_location: head.website_redirect_location.clone(),
-        ..Default::default()
+        etag: head.etag.as_deref().map(ResponseEtag::from_stored),
+        dto: gateway_dto::GetObjectOutput {
+            content_length: Some(content_length),
+            content_range,
+            content_type: head
+                .content_type
+                .as_deref()
+                .and_then(|v| v.parse::<mime_guess::Mime>().ok().map(|value| value.to_string())),
+            content_encoding: head.content_encoding.clone(),
+            content_disposition: head.content_disposition.clone(),
+            content_language: head.content_language.clone(),
+            cache_control: head.cache_control.clone(),
+            expires: head.expires.clone().map(Into::into),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            last_modified: head.last_modified.map(OffsetDateTime::from).map(timestamp),
+            metadata: head.user_metadata.clone().into_iter().collect(),
+            website_redirect_location: head.website_redirect_location.clone(),
+            ..Default::default()
+        },
     }
 }
 
@@ -5141,7 +5355,7 @@ fn odm_inline_client_total_budget(size_bytes: u64) -> Duration {
 /// Feeds the tee primary through a channel because its source is `!Sync`.
 /// Dropping the body or exhausting a downstream budget drops the primary and
 /// hands remaining bytes to the tee's drain task (`drain_on_primary_drop`).
-fn odm_inline_client_body(primary: TeePrimary, idle_budget: Duration, total_budget: Duration) -> StreamingBlob {
+fn odm_inline_client_body(primary: TeePrimary, idle_budget: Duration, total_budget: Duration) -> GetObjectBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(ODM_INLINE_CLIENT_CHANNEL_CHUNKS);
     spawn_traced(async move {
         let pump = async move {
@@ -5156,7 +5370,7 @@ fn odm_inline_client_body(primary: TeePrimary, idle_budget: Duration, total_budg
         // This task is scheduled independently of response body polling.
         let _ = tokio::time::timeout(total_budget, pump).await;
     });
-    StreamingBlob::wrap(ReceiverStream::new(rx))
+    GetObjectBody::stream(ReceiverStream::new(rx))
 }
 
 /// Streams one source GET straight to the client (no local persistence);
@@ -5183,7 +5397,7 @@ async fn odm_get_passthrough<S: OdmGetSource>(
             return OdmGetReply::Error(err);
         }
     };
-    let body = StreamingBlob::wrap(tokio_util::io::ReaderStream::with_capacity(
+    let body = GetObjectBody::stream(tokio_util::io::ReaderStream::with_capacity(
         get.body.into_async_read(),
         ODM_SOURCE_BODY_CHUNK_BYTES,
     ));
@@ -5247,7 +5461,7 @@ async fn odm_get_inline<S: OdmGetSource>(
                 return OdmGetReply::Error(err);
             }
         };
-        let body = StreamingBlob::wrap(tokio_util::io::ReaderStream::with_capacity(
+        let body = GetObjectBody::stream(tokio_util::io::ReaderStream::with_capacity(
             body.into_async_read(),
             ODM_SOURCE_BODY_CHUNK_BYTES,
         ));
@@ -5347,6 +5561,40 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
                 Ok(Err(_)) | Err(_) => odm_get_passthrough(state, source, headers, key, None, None).await,
             }
         }
+    }
+}
+
+impl rustfs_gateway_stream::PayloadStream for MemoryTrackedBytesStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<rustfs_gateway_stream::PayloadRead, rustfs_gateway_stream::StreamError>> {
+        super::get_response::poll_stream(self, cx)
+    }
+    fn caps(&self) -> rustfs_gateway_stream::PayloadCaps {
+        rustfs_gateway_stream::PayloadCaps::PUSH | rustfs_gateway_stream::PayloadCaps::KNOWN_LENGTH
+    }
+    fn len_hint(&self) -> Option<u64> {
+        Some(if self.emitted || self.bytes.is_none() {
+            0
+        } else {
+            self.expected as u64
+        })
+    }
+}
+
+impl<R: AsyncRead + Send> rustfs_gateway_stream::PayloadStream for GetObjectReaderStream<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<rustfs_gateway_stream::PayloadRead, rustfs_gateway_stream::StreamError>> {
+        super::get_response::poll_stream(self, cx)
+    }
+    fn caps(&self) -> rustfs_gateway_stream::PayloadCaps {
+        rustfs_gateway_stream::PayloadCaps::PUSH | rustfs_gateway_stream::PayloadCaps::KNOWN_LENGTH
+    }
+    fn len_hint(&self) -> Option<u64> {
+        Some(self.remaining as u64)
     }
 }
 
@@ -5606,7 +5854,7 @@ mod on_demand_migration_tests {
 
     fn served(reply: OdmGetReply) -> (GetObjectOutput, Option<PullReason>) {
         match reply {
-            OdmGetReply::Served { output, backfill } => (*output, backfill),
+            OdmGetReply::Served { output, backfill } => (output.into_s3s().expect("legacy output projection"), backfill),
             OdmGetReply::Error(err) => panic!("expected Served, got {err:?}"),
             OdmGetReply::RetryLocal => panic!("expected Served, got RetryLocal"),
         }
@@ -5701,7 +5949,7 @@ mod on_demand_migration_tests {
                     max_drain_bytes: data.len(),
                 },
             );
-            let mut client = odm_inline_client_body(primary, Duration::from_millis(100), Duration::from_millis(250));
+            let mut client = odm_inline_client_body(primary, Duration::from_millis(100), Duration::from_millis(250)).into_s3s();
             let commit_state = Arc::clone(&state);
             let commit = tokio::spawn(async move {
                 let result = commit_inline(&commit_state, KEY, head, None, Box::pin(secondary.into_stream()), &idle).await;
@@ -6214,7 +6462,8 @@ mod on_demand_migration_tests {
         let mut followers = 0;
         for task in tasks {
             match task.await.expect("task") {
-                OdmGetReply::Served { mut output, backfill } => {
+                OdmGetReply::Served { output, backfill } => {
+                    let mut output = output.into_s3s().expect("legacy output projection");
                     assert_eq!(backfill, None);
                     assert_eq!(collect_body(&mut output).await, data);
                     leaders += 1;
@@ -6256,7 +6505,9 @@ mod tests {
                 std::hint::black_box(payload);
                 std::future::ready(()).await;
             };
-            let read = DefaultObjectUsecase::with_get_object_conditions(&req, None, read);
+            let envelope = RequestEnvelope::from_s3s(&req);
+            let input = GetObjectFields::from_s3s(req.input.clone());
+            let read = DefaultObjectUsecase::with_get_object_conditions(&envelope, &input, None, read);
             assert!(
                 std::mem::size_of_val(&read) < 2048,
                 "reader scope must not embed the concrete reader future"
@@ -6344,7 +6595,7 @@ mod tests {
                 HeaderValue::from_str(&format!("W/\"{etag}\"")).expect("ETag header"),
             );
             let error = usecase
-                .execute_get_object(req)
+                .execute_get_object_from_s3s(req)
                 .await
                 .expect_err("matching condition returns 304");
             assert_eq!(error.code(), &S3ErrorCode::NotModified);
@@ -6376,7 +6627,7 @@ mod tests {
                     .expect("GET input"),
                 Method::GET,
             );
-            if let Ok(mut response) = usecase.execute_get_object(req).await {
+            if let Ok(mut response) = usecase.execute_get_object_from_s3s(req).await {
                 let mut body = response.output.body.take().expect("body for damaged GET");
                 let mut failed = false;
                 while let Some(chunk) = body.next().await {
@@ -6411,9 +6662,16 @@ mod tests {
         );
         req.headers
             .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
-        let error = DefaultObjectUsecase::validate_get_object_before_body(&req, "bucket", "key", None, &info)
-            .await
-            .expect_err("SSE-C key is mandatory before 304");
+        let error = DefaultObjectUsecase::validate_get_object_before_body(
+            &RequestEnvelope::from_s3s(&req),
+            &GetObjectFields::from_s3s(req.input),
+            "bucket",
+            "key",
+            None,
+            &info,
+        )
+        .await
+        .expect_err("SSE-C key is mandatory before 304");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -6453,7 +6711,7 @@ mod tests {
                     .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-29"));
             }
             let mut response = usecase
-                .execute_get_object(req)
+                .execute_get_object_from_s3s(req)
                 .await
                 .expect("unmatched condition serves body");
             let expected = if ranged { &payload[10..30] } else { payload.as_slice() };
@@ -6491,7 +6749,7 @@ mod tests {
             &req.headers,
             None,
             String::new(),
-            GetObjectOutput::default(),
+            GetObjectOutputFacts::default(),
             Vec::new(),
         )
         .await
@@ -7425,6 +7683,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("reservation bypass must construct the normal streaming fallback");
         let mut received = Vec::new();
         while let Some(chunk) = fallback_body.next().await {
@@ -7575,7 +7834,7 @@ mod tests {
             HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header must be valid"),
         );
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object(req))
+        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object_from_s3s(req))
             .await
             .expect("conditional GET must not wait for the reserved cold-fill session")
             .expect_err("matching If-None-Match must reject the GET");
@@ -7644,7 +7903,10 @@ mod tests {
         ] {
             let mut req = build_request(input.clone(), Method::GET);
             req.headers.insert(header, HeaderValue::from_str(&value).expect("condition"));
-            let error = usecase.execute_get_object(req).await.expect_err("terminal condition");
+            let error = usecase
+                .execute_get_object_from_s3s(req)
+                .await
+                .expect_err("terminal condition");
             assert_eq!(error.code(), &expected);
             assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
             assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
@@ -7653,7 +7915,7 @@ mod tests {
         }
 
         let mut response = usecase
-            .execute_get_object(build_request(input, Method::GET))
+            .execute_get_object_from_s3s(build_request(input, Method::GET))
             .await
             .expect("positive-control GET");
         let mut body = response.output.body.take().expect("body");
@@ -7728,10 +7990,13 @@ mod tests {
             .build()
             .expect("real cold-fill rejection GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object(build_request(input, Method::GET)))
-            .await
-            .expect("rejected real GET must not wait for a cold-fill session")
-            .expect_err("rejected real GET must return an S3 error");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            usecase.execute_get_object_from_s3s(build_request(input, Method::GET)),
+        )
+        .await
+        .expect("rejected real GET must not wait for a cold-fill session")
+        .expect_err("rejected real GET must return an S3 error");
         *COLD_FILL_READER_OPEN_PROBE
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -7811,7 +8076,7 @@ mod tests {
                 HeaderValue::from_str(&format!("\"{etag}\"")).expect("replacement condition"),
             );
         }
-        let request = tokio::spawn(async move { usecase.execute_get_object(req).await });
+        let request = tokio::spawn(async move { usecase.execute_get_object_from_s3s(req).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while coordinator.global_waiter_count_for_test() != 1 {
                 tokio::task::yield_now().await;
@@ -8638,7 +8903,8 @@ mod tests {
             5,
             GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
             GetObjectBodyLifecycle::disabled(),
-        );
+        )
+        .into_s3s();
 
         assert_eq!(blob.remaining_length().exact(), Some(5));
     }
@@ -8656,8 +8922,9 @@ mod tests {
                 5,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 GetObjectBodyLifecycle::tracked(guard),
-            );
-            let mut body = s3s::Body::from(blob);
+            )
+            .into_s3s();
+            let mut body = Body::from(blob);
             let bytes = body.take_bytes().expect("opt-in exact memory body should stay on Body::Once");
 
             assert_eq!(bytes, Bytes::from_static(b"hello"));
@@ -8676,8 +8943,9 @@ mod tests {
                 5,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 GetObjectBodyLifecycle::disabled(),
-            );
-            let mut body = s3s::Body::from(blob);
+            )
+            .into_s3s();
+            let mut body = Body::from(blob);
 
             assert!(body.take_bytes().is_none(), "mismatched memory body must keep the guarded stream path");
         });
@@ -8944,7 +9212,8 @@ mod tests {
             GetObjectBodyLifecycle::disabled(),
             None,
         )
-        .await;
+        .await
+        .map(GetObjectBody::into_s3s);
 
         let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
         assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
@@ -8972,6 +9241,7 @@ mod tests {
                 None,
             )
             .await
+            .map(GetObjectBody::into_s3s)
             .expect("the first byte should be available before response handoff");
 
             assert_eq!(reads.load(AtomicOrdering::Relaxed), 1, "response construction must prime one byte");
@@ -9001,6 +9271,7 @@ mod tests {
             None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("an empty response should not require a storage read");
 
         assert_eq!(reads.load(AtomicOrdering::Relaxed), 0);
@@ -9023,6 +9294,7 @@ mod tests {
             None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("the available first byte should allow response handoff");
 
         let first = body
@@ -9059,6 +9331,7 @@ mod tests {
             Some(control),
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("the first byte should permit response handoff before relocation");
 
         let mut received = Vec::new();
@@ -9884,7 +10157,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
         let mut response = usecase
-            .execute_get_object(build_request(input, Method::GET))
+            .execute_get_object_from_s3s(build_request(input, Method::GET))
             .await
             .expect("the GET commits a response; the body fails mid-stream");
         let mut response_body = response.output.body.take().expect("GET response must include a body");
@@ -9977,7 +10250,7 @@ mod tests {
             .expect("multi-pool resume GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let mut response = usecase
-            .execute_get_object(build_request(input, Method::GET))
+            .execute_get_object_from_s3s(build_request(input, Method::GET))
             .await
             .expect("multi-pool GET must commit its response");
         let mut response_body = response
@@ -10755,6 +11028,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("build_get_object_body should succeed for streaming path");
 
         assert_eq!(
@@ -10794,6 +11068,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("build_get_object_body should succeed for encrypted streaming path");
 
         assert_eq!(
@@ -10833,6 +11108,7 @@ mod tests {
             |_| panic!("a buffered body must not initialize streaming resume state"),
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("build_get_object_body should consume buffered body");
 
         assert_eq!(
@@ -10899,6 +11175,7 @@ mod tests {
             |_| panic!("a cache hit must not initialize streaming resume state"),
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("cache hit body handoff should succeed");
 
         assert_eq!(
@@ -10963,6 +11240,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("size-mismatched direct fill should not create a cache hit");
         let lookup_after_mismatch = adapter.lookup_body(&plan).await;
 
@@ -11026,6 +11304,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("buffered-body handoff should succeed");
 
         // ODC-15: the fill is detached from the response path, so wait for it to
@@ -11055,6 +11334,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("follow-up cache hit should succeed");
 
         assert_eq!(
@@ -11123,6 +11403,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("size-mismatched buffered-body handoff should still return a response body");
         let lookup = adapter.lookup_body(&plan).await;
 
@@ -11208,6 +11489,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("hook-served body handoff should succeed");
 
         assert_eq!(
@@ -11269,6 +11551,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("hook-miss buffered-body handoff should succeed");
 
         assert_eq!(
@@ -11332,6 +11615,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("materialize-fill handoff should succeed");
 
         // ODC-15: the fill is detached from the response path, so wait for it to
@@ -11361,6 +11645,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("follow-up cache hit should succeed");
 
         assert_eq!(
@@ -11423,7 +11708,8 @@ mod tests {
             GetObjectBodyLifecycle::disabled(),
             |_| None,
         )
-        .await;
+        .await
+        .map(GetObjectBody::into_s3s);
 
         assert!(
             result.is_err(),
@@ -11479,7 +11765,8 @@ mod tests {
             GetObjectBodyLifecycle::disabled(),
             |_| None,
         )
-        .await;
+        .await
+        .map(GetObjectBody::into_s3s);
 
         assert!(
             result.is_err(),
@@ -11533,7 +11820,8 @@ mod tests {
             GetObjectBodyLifecycle::disabled(),
             |_| None,
         )
-        .await;
+        .await
+        .map(GetObjectBody::into_s3s);
 
         assert!(
             result.is_err(),
@@ -11574,7 +11862,8 @@ mod tests {
             GetObjectBodyLifecycle::disabled(),
             |_| None,
         )
-        .await;
+        .await
+        .map(GetObjectBody::into_s3s);
 
         assert!(result.is_err(), "a buffered body shorter than the declared content length must hard-fail");
         assert_eq!(
@@ -11619,6 +11908,7 @@ mod tests {
             |_| panic!("an exact-length buffered body must not initialize streaming resume state"),
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("an exact-length buffered body must serve without error");
 
         assert_eq!(
@@ -11674,6 +11964,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("too-large cache candidate should use streaming fallback");
 
         assert_eq!(
@@ -11713,6 +12004,7 @@ mod tests {
             |_| None,
         )
         .await
+        .map(GetObjectBody::into_s3s)
         .expect("build_get_object_body should keep small plain object on streaming path");
 
         assert_eq!(
@@ -11806,7 +12098,7 @@ mod tests {
             GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
         );
 
-        assert_eq!(stream.remaining_length().exact(), Some(5));
+        assert_eq!(rustfs_gateway_stream::PayloadStream::len_hint(&stream), Some(5));
 
         let first = stream
             .next()
@@ -11815,7 +12107,7 @@ mod tests {
             .expect("first chunk should read");
 
         assert_eq!(first.as_ref(), b"he");
-        assert_eq!(stream.remaining_length().exact(), Some(3));
+        assert_eq!(rustfs_gateway_stream::PayloadStream::len_hint(&stream), Some(3));
     }
 
     #[tokio::test]
@@ -12148,7 +12440,9 @@ mod tests {
 
             let context = usecase
                 .build_get_object_output_context(
-                    &req,
+                    &RequestEnvelope::from_s3s(&req),
+                    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+                    None,
                     get_concurrency_manager(),
                     "test-bucket",
                     "path/raw",
@@ -12181,12 +12475,12 @@ mod tests {
                 .await
                 .expect("get object output context");
 
-            assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
-            assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
-            assert_eq!(context.output.content_language.as_deref(), content_language);
+            let output = context.output.into_s3s().expect("legacy output projection");
+            assert_eq!(output.cache_control.as_deref(), Some("public, max-age=259200"));
+            assert_eq!(output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+            assert_eq!(output.content_language.as_deref(), content_language);
             assert_eq!(
-                context
-                    .output
+                output
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.get("content-language"))
@@ -12194,15 +12488,13 @@ mod tests {
                 user_language,
             );
             assert!(
-                !context
-                    .output
+                !output
                     .metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.contains_key("cache-control"))
             );
             assert!(
-                !context
-                    .output
+                !output
                     .metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.contains_key("content-disposition"))
@@ -12222,7 +12514,7 @@ mod tests {
         let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -12303,7 +12595,7 @@ mod tests {
         let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -12358,3 +12650,7 @@ mod tests {
         assert!(!object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_SIZE));
     }
 }
+
+#[cfg(test)]
+#[path = "get_response_test.rs"]
+mod response_tests;

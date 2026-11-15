@@ -1578,7 +1578,7 @@ impl LocalDisk {
         let object_path = self.io_get_object_path(&volume, &object)?;
         let directory = object_path.join(proof.publication.final_data_dir.to_string());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&directory, Some(metadata_owner)).await;
-        let sync = super::effective_durability(&volume).syncs_commit_metadata();
+        let sync = super::effective_durability(&volume).syncs_recovery_protocol_state();
         let result = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
             let result = (|| {
                 let base = &proof.base;

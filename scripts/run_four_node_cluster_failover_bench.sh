@@ -18,6 +18,7 @@ COMPOSE_UP_NO_BUILD="${COMPOSE_UP_NO_BUILD:-false}"
 RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin-local}"
 RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfssecret-local}"
 RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
+RUSTFS_RC_RELEASE="${RUSTFS_RC_RELEASE:-latest}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
@@ -34,6 +35,7 @@ BENCH_WARP_HOSTS="${BENCH_WARP_HOSTS:-http://127.0.0.1:9000,http://127.0.0.1:900
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
 BENCH_AUTO_NEW_BUCKET="${BENCH_AUTO_NEW_BUCKET:-true}"
 BENCH_BUCKET_PREFIX="${BENCH_BUCKET_PREFIX:-rustfs-four-node-bench}"
+BENCH_WARP_MODE="${BENCH_WARP_MODE:-mixed}"
 BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-}"
 BENCH_CONCURRENCIES="${BENCH_CONCURRENCIES:-}"
 BENCH_DURATION="${BENCH_DURATION:-60s}"
@@ -61,6 +63,7 @@ Options:
   --bench-endpoint <url>        benchmark endpoint (default: http://127.0.0.1:9000)
   --bench-warp-hosts <hosts>    comma-separated warp hosts (default: node1..node4)
   --bench-sizes <sizes>         comma list (default: 1KiB,4KiB,11Mi)
+  --bench-warp-mode <mode>      warp mode: mixed|get|put (default: mixed)
   --bench-concurrency <n>       benchmark concurrency
   --bench-concurrencies <list>  benchmark concurrency list (default: 8,16,32,64,128)
   --bench-duration <dur>        benchmark duration
@@ -73,11 +76,13 @@ Environment:
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
   COMPOSE_UP_NO_BUILD (true|false, default: false)
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
+  RUSTFS_RC_RELEASE (default: latest; disabled creates a server-only validation image)
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_PROBE_MODE (service|ready, default: service)
   WAIT_TIMEOUT_SECS FAILOVER_NODE FAILOVER_WARMUP_SECS FAILOVER_SAMPLE_SECS
   FAILOVER_INTERVAL_SECS BENCH_ENDPOINT BENCH_BUCKET BENCH_CONCURRENCY
   BENCH_WARP_HOSTS (default: http://127.0.0.1:9000,http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003)
+  BENCH_WARP_MODE (mixed|get|put, default: mixed)
   BENCH_CONCURRENCIES BENCH_DURATION BENCH_SIZES OUT_DIR
   BENCH_WAIT_MODE (ready|service, default: ready)
   BENCH_READY_TIMEOUT_SECS (default: 180)
@@ -593,6 +598,7 @@ run_benchmark() {
         --secret-key "${RUSTFS_SECRET_KEY}" \
         --bucket "${bench_bucket}" \
         --bucket-prefix "${BENCH_BUCKET_PREFIX}" \
+        --warp-mode "${BENCH_WARP_MODE}" \
         "${bench_extra_args[@]}" \
         --concurrency "${conc}" \
         --duration "${BENCH_DURATION}" \
@@ -673,6 +679,10 @@ parse_args() {
         ;;
       --bench-sizes)
         BENCH_SIZES="$2"
+        shift 2
+        ;;
+      --bench-warp-mode)
+        BENCH_WARP_MODE="$2"
         shift 2
         ;;
       --bench-concurrency)
@@ -758,9 +768,9 @@ main() {
     log_info "Building local image from Dockerfile.source: ${IMAGE_TAG}"
     if [[ -n "${RUSTFS_DOCKER_PLATFORM}" ]]; then
       log_info "Using docker build platform: ${RUSTFS_DOCKER_PLATFORM}"
-      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" --build-arg "RC_RELEASE=${RUSTFS_RC_RELEASE}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
     else
-      docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+      docker build --build-arg "RC_RELEASE=${RUSTFS_RC_RELEASE}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
     fi
   else
     log_info "Skipping image build"

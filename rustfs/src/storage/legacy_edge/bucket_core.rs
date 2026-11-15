@@ -232,6 +232,18 @@ impl FS {
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
         record_s3_op(S3Operation::HeadBucket);
+        if req.input.bucket.is_empty() {
+            // Protocol adapters use the empty bucket for the storage root.
+            let Some(store) = self.server_ctx.object_store() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+            store
+                .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+                .await
+                .map_err(crate::error::ApiError::from)?;
+            return Ok(S3Response::new(HeadBucketOutput::default()));
+        }
+
         let usecase = s3_api::bucket_usecase_for(self);
         through_gateway_seam(req, head_bucket::input_from_s3s, head_bucket::output_to_s3s, |_, input| {
             usecase.execute_head_bucket(input)
