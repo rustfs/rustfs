@@ -73,7 +73,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "batch_read_version_req",
             bin_field: "batch_read_version_req_bin",
         },
-        json_encoder: "let batch_read_version_req = compat_json(&req)?;",
+        json_encoder: "let batch_read_version_req = compat_json(&req, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -118,7 +118,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "read_multiple_req",
             bin_field: "read_multiple_req_bin",
         },
-        json_encoder: "let read_multiple_req = compat_json(&req)?;",
+        json_encoder: "let read_multiple_req = compat_json(&req, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -127,7 +127,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "opts",
             bin_field: "opts_bin",
         },
-        json_encoder: "let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));",
+        json_encoder: "let opts_str = compat_json(opts, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -136,7 +136,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "file_info",
             bin_field: "file_info_bin",
         },
-        json_encoder: "let file_info = compat_json(&fi)?;",
+        json_encoder: "let file_info = compat_json(&fi, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -145,7 +145,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "file_info",
             bin_field: "file_info_bin",
         },
-        json_encoder: "let file_info = compat_json(&fi)?;",
+        json_encoder: "let file_info = compat_json(&fi, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -154,7 +154,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "opts",
             bin_field: "opts_bin",
         },
-        json_encoder: "let opts_str = compat_json(&opts)?;",
+        json_encoder: "let opts_str = compat_json(opts, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
@@ -163,7 +163,7 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "file_info",
             bin_field: "file_info_bin",
         },
-        json_encoder: "let file_info = compat_json(&fi)?;",
+        json_encoder: "let file_info = compat_json(&fi, &policy)?;",
         policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
 ];
