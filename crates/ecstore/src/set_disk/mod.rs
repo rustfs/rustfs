@@ -6325,10 +6325,7 @@ fn try_decode_inline_data_shards(
         let mut remaining = block_length;
         for file in data_files.iter().take(block_length.div_ceil(read_length)) {
             let block = file.data.as_deref()?.get(start..end)?;
-            let (hash, data) = block.split_at(hash_size);
-            if hash_size > 0 && !skip_verify_bitrot && checksum_algo.hash_encode(data).as_ref() != hash {
-                return None;
-            }
+            let data = coding::verified_bitrot_frame(&checksum_algo, skip_verify_bitrot, block).ok()?;
             let take = remaining.min(data.len());
             body.extend_from_slice(&data[..take]);
             remaining -= take;
@@ -7444,7 +7441,7 @@ fn join_errs(errs: &[Option<DiskError>]) -> String {
     errs.join(", ")
 }
 
-async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
+fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
     meta.validate_for_metadata_read()?;
     let [part] = meta.parts.as_slice() else {
         return Err(DiskError::FileCorrupt);
@@ -7457,8 +7454,7 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
     let shard_size = inline_erasure_shard_size(meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
     let part_size =
         inline_erasure_shard_file_size(part.size, meta.erasure.block_size, meta.erasure.data_blocks, meta.uses_legacy_checksum);
-    // Check framing arithmetic and the physical buffer length before the shared
-    // verifier sizes its scratch buffer from the metadata.
+    // Validate the complete framing before visiting borrowed payloads.
     let encoded_size = part_size
         .div_ceil(shard_size)
         .checked_mul(algo.size())
@@ -7467,9 +7463,11 @@ async fn verify_inline_part_bitrot(meta: &FileInfo) -> disk::error::Result<()> {
     if encoded_size != data.len() {
         return Err(DiskError::FileCorrupt);
     }
-    coding::bitrot_verify(Cursor::new(data), encoded_size, part_size, algo, shard_size)
-        .await
-        .map_err(|_| DiskError::FileCorrupt)
+    let stride = shard_size.checked_add(algo.size()).ok_or(DiskError::FileCorrupt)?;
+    for frame in data.chunks(stride) {
+        coding::verified_bitrot_frame(&algo, false, frame).map_err(|_| DiskError::FileCorrupt)?;
+    }
+    Ok(())
 }
 
 fn validate_deep_scan_results(results: &[usize], expected_parts: usize) -> disk::error::Result<()> {
@@ -7687,7 +7685,7 @@ async fn disks_with_all_parts(
         // before deciding whether reconstruction (and its bitrot readers) is needed.
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
             let part_status = if scan_mode == HealScanMode::Deep && meta.data.is_some() {
-                match verify_inline_part_bitrot(meta).await {
+                match verify_inline_part_bitrot(meta) {
                     Ok(()) => CHECK_PART_SUCCESS,
                     Err(DiskError::FileCorrupt) => CHECK_PART_FILE_CORRUPT,
                     Err(err) => return Err(err),
@@ -15065,21 +15063,19 @@ mod tests {
             let (_, files, _, _) = inline_bitrot_files_for_payload_with_mode(&payload, legacy).await;
             for mut meta in files {
                 assert!(meta.erasure.checksums.is_empty(), "legacy metadata may omit per-part checksum entries");
-                verify_inline_part_bitrot(&meta)
-                    .await
-                    .expect("healthy data and parity shards should verify");
+                verify_inline_part_bitrot(&meta).expect("healthy data and parity shards should verify");
                 let original = meta.data.clone().expect("fixture should retain inline bytes");
                 for offset in [0, 32, original.len() - 1] {
                     let mut damaged = original.to_vec();
                     damaged[offset] ^= 1;
                     meta.data = Some(Bytes::from(damaged));
-                    assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+                    assert_eq!(verify_inline_part_bitrot(&meta), Err(DiskError::FileCorrupt));
                 }
                 let mut trailing = original.to_vec();
                 trailing.push(0x7b);
                 for damaged in [Vec::new(), original[..original.len() - 1].to_vec(), trailing] {
                     meta.data = Some(Bytes::from(damaged));
-                    assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+                    assert_eq!(verify_inline_part_bitrot(&meta), Err(DiskError::FileCorrupt));
                 }
             }
         }
@@ -15093,19 +15089,17 @@ mod tests {
         empty.parts[0].size = 0;
         empty.parts[0].actual_size = 0;
         empty.data = Some(Bytes::new());
-        verify_inline_part_bitrot(&empty)
-            .await
-            .expect("empty inline objects have no bitrot frames");
+        verify_inline_part_bitrot(&empty).expect("empty inline objects have no bitrot frames");
         empty.data = Some(Bytes::from_static(b"unexpected"));
-        assert_eq!(verify_inline_part_bitrot(&empty).await, Err(DiskError::FileCorrupt));
+        assert_eq!(verify_inline_part_bitrot(&empty), Err(DiskError::FileCorrupt));
 
         let mut invalid = files[0].clone();
         invalid.erasure.block_size = 0;
-        assert_eq!(verify_inline_part_bitrot(&invalid).await, Err(DiskError::FileCorrupt));
+        assert_eq!(verify_inline_part_bitrot(&invalid), Err(DiskError::FileCorrupt));
         invalid = files[0].clone();
         invalid.parts.push(invalid.parts[0].clone());
         invalid.parts[1].number = 2;
-        assert_eq!(verify_inline_part_bitrot(&invalid).await, Err(DiskError::FileCorrupt));
+        assert_eq!(verify_inline_part_bitrot(&invalid), Err(DiskError::FileCorrupt));
 
         let mut oversized = files[0].clone();
         oversized.erasure.block_size = 2;
@@ -15114,7 +15108,7 @@ mod tests {
         oversized
             .validate_for_metadata_read()
             .expect("logical shard length should fit metadata bounds");
-        assert_eq!(verify_inline_part_bitrot(&oversized).await, Err(DiskError::FileCorrupt));
+        assert_eq!(verify_inline_part_bitrot(&oversized), Err(DiskError::FileCorrupt));
 
         oversized.erasure.block_size = 1 << 40;
         oversized.size = 1 << 40;
@@ -15122,7 +15116,7 @@ mod tests {
         oversized
             .validate_for_metadata_read()
             .expect("large metadata geometry should remain representable");
-        assert_eq!(verify_inline_part_bitrot(&oversized).await, Err(DiskError::FileCorrupt));
+        assert_eq!(verify_inline_part_bitrot(&oversized), Err(DiskError::FileCorrupt));
     }
 
     #[tokio::test]
@@ -15145,13 +15139,11 @@ mod tests {
             assert_eq!(meta.uses_legacy_checksum, legacy);
             assert!(meta.inline_data());
             assert!(meta.data.is_some(), "the production decoder should extract the historical inline value");
-            verify_inline_part_bitrot(&meta)
-                .await
-                .expect("historical inline shard should pass deep verification");
+            verify_inline_part_bitrot(&meta).expect("historical inline shard should pass deep verification");
             let mut damaged = meta.data.as_ref().expect("fixture should be inline").to_vec();
             *damaged.last_mut().expect("fixture shard should not be empty") ^= 1;
             meta.data = Some(Bytes::from(damaged));
-            assert_eq!(verify_inline_part_bitrot(&meta).await, Err(DiskError::FileCorrupt));
+            assert_eq!(verify_inline_part_bitrot(&meta), Err(DiskError::FileCorrupt));
         }
     }
 
@@ -15331,17 +15323,26 @@ mod tests {
             let refs = [&files[0], &files[1]];
             let body = try_decode_inline_data_shards("golden", &info, &refs, false).expect("decode every golden frame");
             assert_eq!(body.as_ref(), payload);
+            if algorithm.size() > 0 {
+                for file in &files {
+                    verify_inline_part_bitrot(file).expect("deep verification covers both padded frames");
+                }
+            }
             let original = files[0].data.as_ref().expect("first data shard").clone();
             let mut truncated = original.to_vec();
             truncated.pop();
             files[0].data = Some(Bytes::from(truncated));
             assert!(try_decode_inline_data_shards("truncated", &info, &[&files[0], &files[1]], false).is_none());
             if algorithm.size() > 0 {
+                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
                 let mut corrupt = original.to_vec();
                 corrupt[erasure.shard_size() + 2 * algorithm.size()] ^= 1;
                 files[0].data = Some(Bytes::from(corrupt));
                 assert!(try_decode_inline_data_shards("corrupt", &info, &[&files[0], &files[1]], false).is_none());
+                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::FileCorrupt));
                 assert!(try_decode_inline_data_shards("diagnostic", &info, &[&files[0], &files[1]], true).is_some());
+            } else {
+                assert_eq!(verify_inline_part_bitrot(&files[0]), Err(DiskError::BitrotHashAlgoInvalid));
             }
         }
     }

@@ -123,6 +123,24 @@ The pinned MinIO Community comparison uses a 1 MiB block for new objects. Its in
 
 For transport comparisons, keep geometry fixed and independently evaluate JSON compatibility mode and the existing MessagePack-only flag pair. Inline RenameData carries its data through metadata RPCs, so JSON serialization and duplicate payloads can outweigh the saved part-file I/O. The Docker lab pins and checks both transport flags on every node. Use its version, geometry and multipart manifests for mixed-reader and full-reader rollback checks before a performance run. Restore JSON compatibility mode before introducing an older peer and record the oldest reader actually tested.
 
+#### Borrowed inline verification kernel
+
+The inline verifier operates on already loaded frame slices. Its manual ABBA comparison exercises the streaming verifier and the borrowed verifier over identical 4 KiB and 128 KiB shard payloads. Capture the reported debug/release profile, iteration counts, elapsed times and baseline drift. This measures frame verification CPU and copying costs. End-to-end acceptance uses the fixed-condition Docker ABBA matrix with request errors, throughput and tail latency recorded for every leg.
+
+```bash
+cargo test -p rustfs-ecstore --lib --features test-util \
+  inline_bitrot_borrowed_verification_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+For batch-delete codec acceptance, run `delete_versions_request_encoding_preserves_batches_and_fleet_guards` to verify the emitted fields, named-map options and encoded byte counts. Run `delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches` in the `rustfs` library tests to exercise the actual remote sender, protobuf handler and disk mutation with both codec modes. Its retained-object oracle protects against deleting an unselected entry. Deploy JSON compatibility mode during mixed-version and old-reader tests, then confirm the homogeneous upgraded fleet before enabling binary-only batches as described in the [codec convergence runbook](internode-msgpack-json-convergence-runbook.md).
+
+```bash
+cargo nextest run -p rustfs-ecstore --lib --features test-util --no-tests fail \
+  -E 'test(delete_versions_request_encoding_preserves_batches_and_fleet_guards)'
+NO_PROXY='*' no_proxy='*' cargo nextest run -p rustfs --lib --features gateway-stack --no-tests fail \
+  -E 'test(delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches)'
+```
+
 ### 5.2 GET
 
 | Knob | Default | Controls | Validating stage | Risk if enabled |
