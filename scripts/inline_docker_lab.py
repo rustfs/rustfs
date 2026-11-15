@@ -112,14 +112,16 @@ elif cfg["action"] in ("compat-seed", "compat-check", "compat-finish-mpu", "comp
             manifest["multipart"]["complete"] = True
         elif cfg["action"] == "compat-delete":
             selected = [item for item in manifest["records"] if item["key"] == "compat/versions"]
-            assert selected, "manifest has no versions to delete"
-            result = client.delete_objects(Bucket=cfg["bucket"], Delete={"Objects": [
-                {"Key": item["key"], "VersionId": item["version_id"]} for item in selected]})
-            assert not result.get("Errors"), result.get("Errors")
-            assert len(result.get("Deleted", [])) == len(selected)
-            manifest["deleted_versions"] = selected
-            manifest["records"] = [item for item in manifest["records"] if item["key"] != "compat/versions"]
-    if cfg["action"] != "compat-seed":
+            if selected:
+                result = client.delete_objects(Bucket=cfg["bucket"], Delete={"Objects": [
+                    {"Key": item["key"], "VersionId": item["version_id"]} for item in selected]})
+                assert not result.get("Errors"), result.get("Errors")
+                assert len(result.get("Deleted", [])) == len(selected)
+                manifest["deleted_versions"] = selected
+                manifest["records"] = [item for item in manifest["records"] if item["key"] != "compat/versions"]
+            else:
+                assert manifest.get("deleted_versions"), "manifest has no versions to delete"
+    if cfg["action"] == "compat-check":
         actual_versions = set()
         for page in client.get_paginator("list_object_versions").paginate(Bucket=cfg["bucket"], Prefix="compat/"):
             assert not page.get("DeleteMarkers"), "unexpected delete marker"
@@ -456,6 +458,15 @@ def execute(args):
         else:
             manifest = json.loads(manifest_path.read_text())
         result = lab.client(args.bucket, args.command, manifest, args.coordinator)
+        if args.command == "compat-seed":
+            coordinator = lab.docker_json("inspect", lab.container(args.coordinator))[0]
+            result["writer_revision"] = coordinator["Config"]["Labels"]["org.opencontainers.image.revision"]
+            result["writer_coordinator"] = args.coordinator
+        if args.command != "compat-check":
+            # Retain the successful mutation before fallible read/geometry checks
+            # so a retry can use the returned version IDs and completed MPU state.
+            write_private(manifest_path, result)
+            result = lab.client(args.bucket, "compat-check", result, args.coordinator)
         node = lab.container("node1")
         for record in result["records"]:
             path = f"/data/rustfs0/{args.bucket}/{record['key']}/xl.meta"
@@ -464,10 +475,6 @@ def execute(args):
             if "geometry" in record and geometry != record["geometry"]:
                 raise ValueError(f"persisted geometry changed for {record['key']} version {record['version_id']}")
             record["geometry"] = geometry
-        if args.command == "compat-seed":
-            coordinator = lab.docker_json("inspect", lab.container(args.coordinator))[0]
-            result["writer_revision"] = coordinator["Config"]["Labels"]["org.opencontainers.image.revision"]
-            result["writer_coordinator"] = args.coordinator
         write_private(manifest_path, result)
         print(f"{args.command} verified {len(result['records'])} objects/versions")
     elif args.command == "mc":

@@ -257,6 +257,71 @@ class InlineDockerLabTests(unittest.TestCase):
             lab.client("inline-test", "compat-check", coordinator="other.example")
         lab.docker.assert_not_called()
 
+    def test_compatibility_mutation_receipt_survives_verification_failure(self):
+        record = {"key": "compat/resumed-multipart", "version_id": "completed-version"}
+        for action, receipt in (
+            ("compat-finish-mpu", {"records": [record], "multipart": {"complete": True}}),
+            ("compat-delete", {"records": [], "deleted_versions": [record]}),
+        ):
+            for failure in ("read", "geometry"):
+                with self.subTest(action=action, failure=failure), tempfile.TemporaryDirectory() as directory:
+                    state = Path(directory)
+                    (state / "config.json").write_text(json.dumps(configuration()))
+                    path = state / "compat-inline-test.json"
+                    path.write_text(json.dumps({"bucket": "inline-test", "records": []}))
+                    result = dict(receipt, bucket="inline-test")
+                    # Keep one surviving object so the geometry failure is exercised.
+                    if failure == "geometry":
+                        result = dict(result, records=[record])
+                    args = argparse.Namespace(command=action, state_dir=directory, bucket="inline-test", coordinator="node2")
+                    responses = [result, ValueError("read verification failed") if failure == "read" else result]
+                    with mock.patch.object(LAB.DockerLab, "assert_owned"), \
+                            mock.patch.object(LAB.DockerLab, "client", side_effect=responses) as client, \
+                            mock.patch.object(LAB.DockerLab, "container", return_value="owned-node"), \
+                            mock.patch.object(LAB.DockerLab, "docker_json", side_effect=ValueError("geometry verification failed")):
+                        with self.assertRaisesRegex(ValueError, "verification failed"):
+                            LAB.execute(args)
+                    self.assertEqual(json.loads(path.read_text()), result)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(client.call_args_list[-1], mock.call("inline-test", "compat-check", result, "node2"))
+
+    def test_compatibility_client_returns_mutation_receipts_and_retries_without_writes(self):
+        client = mock.Mock()
+        client.upload_part.return_value = {"ETag": "second-etag"}
+        client.complete_multipart_upload.return_value = {"VersionId": "completed-version"}
+        client.delete_objects.return_value = {"Deleted": [{"Key": "compat/versions", "VersionId": "deleted-version"}]}
+        client.get_paginator.side_effect = AssertionError("verification must follow receipt persistence")
+        config_module = types.ModuleType("botocore.config")
+        config_module.Config = mock.Mock()
+        boto_module = types.ModuleType("boto3")
+        boto_module.client = mock.Mock(return_value=client)
+        modules = {"boto3": boto_module, "botocore": types.ModuleType("botocore"), "botocore.config": config_module}
+        for action, initial in (
+            ("compat-finish-mpu", {"records": [], "multipart": {"key": "compat/mpu", "upload_id": "pending", "first_etag": "first"}}),
+            ("compat-delete", {"records": [{"key": "compat/versions", "version_id": "deleted-version"}]}),
+        ):
+            with self.subTest(action=action):
+                manifest = dict(initial, bucket="inline-test")
+                request = {"bucket": "inline-test", "action": action, "access_key": "test-access",
+                           "secret_key": "test-secret", "manifest": manifest}
+                output = io.StringIO()
+                with mock.patch.dict(sys.modules, modules), mock.patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                    exec(LAB.CLIENT, {})
+                receipt = json.loads(output.getvalue())
+                if action == "compat-finish-mpu":
+                    self.assertTrue(receipt["multipart"]["complete"])
+                    self.assertEqual(receipt["records"][0]["version_id"], "completed-version")
+                else:
+                    self.assertEqual(receipt["deleted_versions"], initial["records"])
+                    self.assertEqual(receipt["records"], [])
+                client.reset_mock()
+                request["manifest"] = receipt
+                output = io.StringIO()
+                with mock.patch.dict(sys.modules, modules), mock.patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                    exec(LAB.CLIENT, {})
+                self.assertEqual(json.loads(output.getvalue()), receipt)
+                self.assertEqual(client.mock_calls, [])
+
     def test_compatibility_client_rejects_wrong_bytes_and_version_inventory(self):
         manifest = {"bucket": "inline-test", "records": [{"key": "compat/plain", "version_id": "null",
                     "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest()}]}
