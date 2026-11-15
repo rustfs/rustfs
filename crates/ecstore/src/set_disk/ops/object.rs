@@ -3163,7 +3163,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 if inline_count >= data_shards {
                     let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                     let readers = build_inline_bitrot_readers(
-                        &files,
+                        files.iter(),
                         total_shards,
                         bucket,
                         object,

@@ -17,7 +17,7 @@ use super::{
     GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
     GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
-    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers,
     collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
     get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
     is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, part_checksum_algorithm, reduce_read_quorum_errs,
@@ -1387,8 +1387,9 @@ impl SetDisks {
             };
 
             let reader_setup_stage_start = Instant::now();
-            let mut readers = build_inline_bitrot_readers_from_refs(
-                &data_files,
+            let mut readers = build_inline_bitrot_readers(
+                data_files.iter().copied(),
+                data_files.len(),
                 bucket,
                 object,
                 read_length,

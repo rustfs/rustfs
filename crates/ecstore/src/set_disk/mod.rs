@@ -6202,8 +6202,8 @@ fn known_put_object_storage_size(data_size: i64) -> i64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_inline_bitrot_readers(
-    files: &[FileInfo],
+async fn build_inline_bitrot_readers<'a>(
+    files: impl Iterator<Item = &'a FileInfo> + Send,
     total_shards: usize,
     bucket: &str,
     object: &str,
@@ -6213,41 +6213,7 @@ async fn build_inline_bitrot_readers(
     skip_verify_bitrot: bool,
 ) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
     let mut readers = Vec::with_capacity(total_shards);
-    for file in files.iter().take(total_shards) {
-        let reader = if let Some(data) = &file.data {
-            create_bitrot_reader_from_bytes(
-                Some(data.clone()),
-                None,
-                bucket,
-                object,
-                0,
-                read_length,
-                shard_size,
-                checksum_algo.clone(),
-                skip_verify_bitrot,
-                false,
-            )
-            .await?
-        } else {
-            None
-        };
-        readers.push(reader);
-    }
-    Ok(readers)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_inline_bitrot_readers_from_refs(
-    files: &[&FileInfo],
-    bucket: &str,
-    object: &str,
-    read_length: usize,
-    shard_size: usize,
-    checksum_algo: &HashAlgorithm,
-    skip_verify_bitrot: bool,
-) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
-    let mut readers = Vec::with_capacity(files.len());
-    for file in files {
+    for file in files.take(total_shards) {
         let reader = if let Some(data) = &file.data {
             create_bitrot_reader_from_bytes(
                 Some(data.clone()),
@@ -15352,7 +15318,7 @@ mod tests {
         let payload = b"small inline object payload that spans data shards";
         let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
         let mut readers = build_inline_bitrot_readers(
-            &files,
+            files.iter(),
             erasure.data_shards,
             "bucket",
             "object",
@@ -15378,7 +15344,7 @@ mod tests {
         let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload_with_mode(payload, true).await;
         assert_ne!(payload.len() % erasure.data_shards, 0, "test payload must exercise EC padding");
         let mut readers = build_inline_bitrot_readers(
-            &files,
+            files.iter(),
             erasure.data_shards,
             "bucket",
             "object",
@@ -15409,7 +15375,7 @@ mod tests {
         *second = Bytes::from(corrupted);
 
         let mut readers = build_inline_bitrot_readers(
-            &files,
+            files.iter(),
             erasure.total_shard_count(),
             "bucket",
             "object",
