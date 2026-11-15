@@ -391,7 +391,7 @@ impl PoolEndpointList {
                             e.get_mut().extend(host_ip_set.iter());
                         }
                         Entry::Vacant(e) => {
-                            e.insert(host_ip_set.clone());
+                            e.insert(host_ip_set);
                         }
                     }
                 }

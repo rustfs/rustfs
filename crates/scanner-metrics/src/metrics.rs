@@ -5325,6 +5325,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_includes_the_last_slot_of_each_realtime_and_ilm_table() {
+        assert_eq!(Metric::HealAbandonedObject as usize + 1, Metric::LastRealtime as usize);
+        assert_eq!(IlmAction::DelMarkerDeleteAllVersionsAction as usize + 1, IlmAction::ActionCount as usize);
+        let metrics = Metrics::new();
+        let last_ilm = IlmAction::DelMarkerDeleteAllVersionsAction as usize;
+        metrics.latency[Metric::HealAbandonedObject as usize].add(Duration::from_millis(1));
+        metrics.actions[last_ilm].fetch_add(1, Ordering::Relaxed);
+        metrics.actions_latency[last_ilm].add(Duration::from_millis(1));
+
+        let report = metrics.report().await;
+
+        assert_eq!(
+            report
+                .last_minute
+                .actions
+                .get("heal_abandoned_object")
+                .map(|action| action.count),
+            Some(1)
+        );
+        assert_eq!(report.life_time_ilm.get("del_marker_delete_all_versions"), Some(&1));
+        assert_eq!(
+            report
+                .last_minute
+                .ilm
+                .get("del_marker_delete_all_versions")
+                .map(|action| action.count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn active_bucket_drive_snapshot_is_structured_and_retired_on_end() {
         let metrics = Metrics::new();
         metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");

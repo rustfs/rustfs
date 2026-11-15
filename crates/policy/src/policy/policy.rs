@@ -141,7 +141,7 @@ impl Policy {
                 merged.version = p.version.clone();
             }
             for st in p.statements {
-                merged.statements.push(st.clone());
+                merged.statements.push(st);
             }
         }
         merged.drop_duplicate_statements();

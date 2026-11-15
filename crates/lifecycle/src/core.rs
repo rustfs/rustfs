@@ -692,7 +692,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
             let predicted = Event {
                 action: IlmAction::DeleteAction,
-                rule_id: rule.id.clone().unwrap_or_default(),
+                rule_id: rule.id.unwrap_or_default(),
                 due: Some(due),
                 noncurrent_days: 0,
                 newer_noncurrent_versions: 0,
