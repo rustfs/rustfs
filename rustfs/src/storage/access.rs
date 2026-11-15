@@ -4437,6 +4437,7 @@ impl S3Access for FS {
 /// parity tests, which live next to the envelope's facts impl.
 #[cfg(test)]
 pub(crate) mod parity_test_support {
+    pub(crate) use super::envelope_payloads::bucket_config_mutation;
     use super::{Action, Arc, CreateBucketInput, S3Request, S3Result};
     use super::{AuthorizationRequest, AuthzFacts, AuthzPrincipal, AuthzTarget, ECStore, HashMap};
 
