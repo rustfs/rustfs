@@ -1709,8 +1709,7 @@ pub(crate) mod s3_api {
 
     pub(crate) mod multipart {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::{
-            ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-            parse_upload_part_number,
+            ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
         };
     }
 
@@ -1855,8 +1854,10 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
+            #[cfg(any(feature = "gateway-stack", test))]
+            pub(crate) use super::super::super::storage_contracts::multipart::ListPartsOwner;
             pub(crate) use super::super::super::storage_contracts::{
-                CompletePart, ListMultipartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
+                CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
             };
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }

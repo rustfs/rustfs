@@ -59,8 +59,7 @@ use super::storage_api::multipart_usecase::options::{
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
-    ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-    parse_upload_part_number,
+    ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
@@ -132,6 +131,9 @@ mod create;
 mod create_values;
 pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
+#[cfg(feature = "gateway-stack")]
+pub(crate) use list::ListPartsInfo;
+pub(crate) use list::{ListPartsFields, ListPartsTarget};
 #[cfg(test)]
 mod test_support;
 mod upload_part;
