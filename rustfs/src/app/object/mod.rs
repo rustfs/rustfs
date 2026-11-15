@@ -207,6 +207,8 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
 #[cfg(test)]
 mod conditional_read_bench;
 mod copy;
+mod copy_input;
+pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition};
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) mod cuobject;
 mod delete;
