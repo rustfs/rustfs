@@ -1845,8 +1845,11 @@ pub(crate) mod object_usecase {
 
 pub(crate) mod object_meta_usecase {
     pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::object::ObjectLockRetentionOptions;
         pub(crate) use super::super::storage_contracts::{BucketOperations, BucketOptions, ObjectOperations};
     }
+
+    pub(crate) use crate::storage::storage_api::check_retention_for_modification;
 
     pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries;

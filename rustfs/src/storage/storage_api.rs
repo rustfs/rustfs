@@ -106,8 +106,7 @@ pub(crate) mod contract {
 
     pub(crate) mod object {
         pub(crate) use super::super::storage_contracts::{
-            DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectLockRetentionOptions, ObjectOperations,
-            ObjectToDelete,
+            DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectOperations, ObjectToDelete,
         };
     }
 
@@ -217,14 +216,12 @@ pub(crate) mod ecfs_consumer {
         }
 
         pub(crate) mod object {
-            pub(crate) use super::super::super::contract::object::{ObjectLockRetentionOptions, ObjectOperations};
+            pub(crate) use super::super::super::contract::object::ObjectOperations;
         }
     }
 
     pub(crate) mod object_lock {
-        pub(crate) use super::super::super::{
-            parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
-        };
+        pub(crate) use super::super::super::validate_bucket_object_lock_enabled;
     }
 
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;

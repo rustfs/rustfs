@@ -21,14 +21,15 @@ use crate::app::object_meta::ObjectMetaUsecase;
 use crate::app::object_meta::torrent::execute_get_object_torrent;
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_meta::{
-    RequestedObjectTags, authorize_object_tagging_request, authorize_put_object_tagging,
+    RequestedObjectLegalHold, RequestedObjectLockRetention, RequestedObjectTags, authorize_object_tagging_request,
+    authorize_put_object_legal_hold, authorize_put_object_retention, authorize_put_object_tagging,
 };
 use crate::storage_api::server::http::access::authorize_object_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_gateway_types::{BucketName, ObjectKey};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
-use rustfs_s3_types::S3Result;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::sync::Arc;
 
 pub(super) const ROWS: &[OpRow] = &[
@@ -37,6 +38,8 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::PutObjectAcl>(),
     row::<dto::GetObjectLegalHold>(),
     row::<dto::GetObjectRetention>(),
+    row::<dto::PutObjectLegalHold>(),
+    row::<dto::PutObjectRetention>(),
     row::<dto::GetObjectTagging>(),
     row::<dto::DeleteObjectTagging>(),
     row::<dto::PutObjectTagging>(),
@@ -196,6 +199,84 @@ impl Served for dto::PutObjectTagging {
         let usecase = ObjectMetaUsecase::with_context(context);
         usecase
             .execute_put_object_tagging(envelope, request.into_input())
+            .await
+            .map(Resp::new)
+    }
+}
+
+impl Served for dto::PutObjectLegalHold {
+    const METRIC: S3Operation = S3Operation::PutObjectLegalHold;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
+        let legal_hold = RequestedObjectLegalHold(input.legal_hold.status.as_ref().map(|status| status.as_str().to_owned()));
+        Ok(authorize_put_object_legal_hold(
+            envelope,
+            &server,
+            input.bucket.as_str(),
+            input.key.as_str(),
+            input.version_id.as_deref(),
+            legal_hold,
+        )
+        .await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        ObjectMetaUsecase::with_context(context)
+            .put_object_legal_hold_fields(
+                envelope,
+                input.bucket.as_str(),
+                input.key.as_str(),
+                input.version_id,
+                Some(RequestedObjectLegalHold(input.legal_hold.status.map(|status| status.as_str().to_owned()))),
+            )
+            .await
+            .map(Resp::new)
+    }
+}
+
+fn retention_fields(retention: &dto::ObjectLockRetention) -> S3Result<RequestedObjectLockRetention> {
+    Ok(RequestedObjectLockRetention {
+        mode: retention.mode.as_ref().map(|mode| mode.as_str().to_owned()),
+        retain_until: super::object_write::retain_until(retention.retain_until_date.as_ref())?,
+    })
+}
+
+impl Served for dto::PutObjectRetention {
+    const METRIC: S3Operation = S3Operation::PutObjectRetention;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let input = request.input();
+        let server = envelope
+            .server_context()
+            .cloned()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server context is not initialized"))?;
+        Ok(authorize_put_object_retention(
+            envelope,
+            &server,
+            input.bucket.as_str(),
+            input.key.as_str(),
+            input.version_id.as_deref(),
+            retention_fields(&input.retention)?,
+        )
+        .await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        ObjectMetaUsecase::with_context(context)
+            .put_object_retention_fields(
+                envelope,
+                input.bucket.as_str(),
+                input.key.as_str(),
+                input.version_id,
+                Some(retention_fields(&input.retention)?),
+            )
             .await
             .map(Resp::new)
     }

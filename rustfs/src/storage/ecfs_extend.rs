@@ -32,9 +32,11 @@ use rustfs_utils::http::{
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    QueueConfiguration, TopicConfiguration,
 };
+#[cfg(test)]
+use s3s::dto::{ObjectLockLegalHold, ObjectLockRetention};
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -431,6 +433,7 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
     parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
 }
@@ -487,6 +490,7 @@ pub(crate) fn parse_object_lock_retention_native(
     Ok(eval_metadata)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
     parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
 }

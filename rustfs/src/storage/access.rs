@@ -1480,6 +1480,7 @@ fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<Str
         .map(str::to_owned)
 }
 
+#[cfg(test)]
 fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
     let retention = req
         .input
@@ -4188,23 +4189,22 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
-        req.install_requested_legal_hold(
-            req.input
-                .legal_hold
-                .as_ref()
-                .map(RequestedObjectLegalHold::from)
-                .unwrap_or_default(),
-        );
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let input = &req.input;
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        let legal_hold = input
+            .legal_hold
+            .as_ref()
+            .map(RequestedObjectLegalHold::from)
+            .unwrap_or_default();
+        access_owned::object_meta::authorize_put_object_legal_hold(
+            req,
+            self.server_ctx(),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            legal_hold,
+        )
+        .await
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
@@ -4223,23 +4223,22 @@ impl S3Access for FS {
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        set_requested_object_lock_retention(req);
-        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-
-        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
-        if has_bypass_governance_header(&req.headers) {
-            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
-        }
-
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let input = &req.input;
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        let retention = input
+            .retention
+            .as_ref()
+            .map(RequestedObjectLockRetention::from)
+            .unwrap_or_default();
+        access_owned::object_meta::authorize_put_object_retention(
+            req,
+            self.server_ctx(),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            retention,
+        )
+        .await
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
