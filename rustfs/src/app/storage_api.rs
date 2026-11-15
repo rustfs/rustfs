@@ -945,7 +945,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod metadata {
         pub(crate) use crate::storage::storage_api::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
+            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
         };
         pub(crate) const BUCKET_CORS_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_CORS_CONFIG;
         pub(crate) const BUCKET_LIFECYCLE_CONFIG: &str =

@@ -35,6 +35,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketPolicy>(),
     row::<dto::GetBucketPolicyStatus>(),
     row::<dto::GetBucketAcl>(),
+    row::<dto::PutBucketAcl>(),
     row::<dto::GetBucketNotificationConfiguration>(),
     row::<dto::PutBucketNotificationConfiguration>(),
 ];
@@ -119,6 +120,23 @@ impl Served for dto::GetBucketAcl {
             .execute_get_bucket_acl(request.into_input())
             .await?;
         Ok(Resp::new(output))
+    }
+}
+
+impl Served for dto::PutBucketAcl {
+    const METRIC: S3Operation = S3Operation::PutBucketAcl;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketAclAction);
+        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_acl(envelope, input.bucket.as_str(), input.access_control_policy.is_some())
+            .await?;
+        Ok(Resp::new(dto::PutBucketAclOutput::default()))
     }
 }
 

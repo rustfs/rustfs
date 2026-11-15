@@ -48,7 +48,7 @@ pub(crate) mod storage_api;
 pub(crate) use ecfs_extend::*;
 #[allow(unused_imports)]
 pub(crate) use storage_api::{
-    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
+    BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
     BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketBandwidthMonitor, BucketMetadata, BucketVersioningSys, CheckPartsResp, CollectMetricsOpts,
     DEFAULT_READ_BUFFER_SIZE, DailyAllTierStats, DeleteOptions, DiskError, DiskInfo, DiskInfoOptions, DiskResult, DiskStore,

@@ -20,7 +20,7 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::put_bucket_versioning::{
     PutBucketVersioningError, PutBucketVersioningOutput, builders::PutBucketVersioningFluentBuilder,
 };
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{AccessControlPolicy, BucketCannedAcl, BucketVersioningStatus, VersioningConfiguration};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
@@ -58,6 +58,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: get_bucket_acl,
     },
     MatrixRow {
+        operation: "PutBucketAcl",
+        metric: S3Operation::PutBucketAcl,
+        has_error_body: true,
+        call: put_bucket_acl,
+    },
+    MatrixRow {
         operation: "GetBucketNotificationConfiguration",
         metric: S3Operation::GetBucketNotificationConfiguration,
         has_error_body: true,
@@ -92,6 +98,10 @@ fn get_bucket_policy<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, O
 
 fn get_bucket_policy_status<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_policy_status().bucket(bucket).send().await) })
+}
+
+fn put_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.put_bucket_acl().bucket(bucket).send().await) })
 }
 
 fn get_bucket_acl<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -268,6 +278,82 @@ fn the_gateway_stack_answers_the_bucket_acl() {
 #[test]
 fn the_legacy_stack_answers_the_bucket_acl() {
     with_stack(LEGACY, get_bucket_acl_answers_the_owner_with_full_control);
+}
+
+async fn bucket_acl_mutations(server: RustFSServer) {
+    use super::{USER_SECRET_KEY, anonymous_client, create_user_allowed_on_one_bucket};
+
+    const BUCKET: &str = "bucket-acl-write-s3alias";
+    const OTHER: &str = "bucket-acl-write-other";
+    const MISSING: &str = "bucket-acl-write-missing";
+    const WRITER: &str = "bucketaclwriter";
+    const READER: &str = "bucketaclreader";
+    const UNSUPPORTED: &str = "ACL XML grants are not supported; use canned ACL headers or omit ACL";
+
+    for bucket in [BUCKET, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketAcl", BUCKET).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetBucketAcl", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    let before = root.get_bucket_acl().bucket(BUCKET).send().await.expect("original ACL");
+    assert_eq!(put_bucket_acl(&writer, BUCKET).await, Ok(()));
+    writer
+        .put_bucket_acl()
+        .bucket(BUCKET)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect("accept canned ACL header");
+    writer
+        .put_bucket_acl()
+        .bucket(BUCKET)
+        .grant_read("id=\"fixture-owner\"")
+        .send()
+        .await
+        .expect("accept grant header");
+
+    for (client, bucket) in [(&writer, OTHER), (&reader, BUCKET), (&anonymous, BUCKET)] {
+        let err = put_bucket_acl(client, bucket).await.expect_err("permission required");
+        assert_eq!((err.code.as_deref(), err.status), (Some("AccessDenied"), Some(403)));
+    }
+    for (client, bucket, expected) in [
+        (&writer, BUCKET, ("NotImplemented", 501)),
+        (&root, MISSING, ("NoSuchBucket", 404)),
+        (&reader, BUCKET, ("AccessDenied", 403)),
+    ] {
+        let error = client
+            .put_bucket_acl()
+            .bucket(bucket)
+            .access_control_policy(AccessControlPolicy::builder().build())
+            .send()
+            .await
+            .expect_err("XML policy");
+        assert_eq!(refusal(&error), (Some(expected.0.to_owned()), Some(expected.1)));
+        if expected.1 == 501 {
+            assert_eq!(error.as_service_error().and_then(|error| error.meta().message()), Some(UNSUPPORTED));
+        }
+    }
+    let after = root.get_bucket_acl().bucket(BUCKET).send().await.expect("current ACL");
+    assert_eq!(after.owner(), before.owner());
+    assert_eq!(after.grants(), before.grants());
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_preserves_bucket_acl_write_behavior() {
+    with_stack(GATEWAY, bucket_acl_mutations);
+}
+
+#[test]
+fn the_legacy_stack_preserves_bucket_acl_write_behavior() {
+    with_stack(LEGACY, bucket_acl_mutations);
 }
 
 const QUEUE_NOTIFICATION: &str = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><QueueConfiguration><Id>a2-queue</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter></QueueConfiguration></NotificationConfiguration>"#;

@@ -3991,10 +3991,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_acl(&self, req: &mut S3Request<PutBucketAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::PutBucketAclAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::PutBucketAclAction)).await
     }
 
     /// Checks whether the PutBucketAnalyticsConfiguration request has accesses to the resources.

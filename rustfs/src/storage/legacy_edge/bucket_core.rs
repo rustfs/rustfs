@@ -20,53 +20,16 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
-use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecstore_bucket::utils::serialize as serialize_bucket_config;
-use crate::storage::{BUCKET_LOGGING_CONFIG, update_bucket_metadata_config_if_incarnation};
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{create_bucket, delete_bucket, head_bucket};
 use rustfs_gateway_types::compat::s3s_5761ddfe::get_bucket_location;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
-
-/// Handler bodies that [`S3`] runs through `audit_only_operation`.
-impl FS {
-    async fn put_bucket_logging_inner(
-        &self,
-        req: S3Request<PutBucketLoggingInput>,
-    ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        record_s3_op(S3Operation::PutBucketLogging);
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let bucket_logging_status = persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedBucketLoggingStatus>(
-            &req.input.bucket_logging_status,
-        )?;
-        let logging_config = serialize_bucket_config(&bucket_logging_status)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_LOGGING_CONFIG,
-            logging_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketLoggingOutput::default()))
-    }
-}
 
 impl FS {
     #[instrument(
@@ -234,7 +197,16 @@ impl FS {
         &self,
         req: S3Request<PutBucketLoggingInput>,
     ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        audit_only_operation(req, S3Operation::PutBucketLogging, |req| self.put_bucket_logging_inner(req)).await
+        record_s3_op(S3Operation::PutBucketLogging);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_logging(envelope, &req.input.bucket, || {
+                let config: rustfs_gateway_types::persistence::PersistedBucketLoggingStatus =
+                    persisted_from_s3s(&req.input.bucket_logging_status)?;
+                serialize_bucket_config(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_request_payment_edge(

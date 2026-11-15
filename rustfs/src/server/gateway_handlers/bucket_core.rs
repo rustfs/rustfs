@@ -24,7 +24,7 @@ use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_gateway_types::persistence::{
     parse_accelerate, parse_bucket_logging_dto, parse_request_payment, parse_website, parse_website_dto,
-    serialize_accelerate_dto, serialize_request_payment_dto, serialize_website_dto,
+    serialize_accelerate_dto, serialize_bucket_logging_dto, serialize_request_payment_dto, serialize_website_dto,
 };
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
@@ -41,6 +41,7 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketRequestPayment>(),
     row::<dto::GetBucketWebsite>(),
     row::<dto::GetBucketLogging>(),
+    row::<dto::PutBucketLogging>(),
     row::<dto::PutBucketAccelerateConfiguration>(),
     row::<dto::PutBucketRequestPayment>(),
     row::<dto::PutBucketWebsite>(),
@@ -203,6 +204,26 @@ impl Served for dto::GetBucketLogging {
         Ok(Resp::new(dto::GetBucketLoggingOutput {
             logging_enabled: config.logging_enabled,
         }))
+    }
+}
+
+impl Served for dto::PutBucketLogging {
+    const METRIC: S3Operation = S3Operation::PutBucketLogging;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketLoggingAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_logging(envelope, input.bucket.as_str(), || {
+                serialize_bucket_logging_dto(&input.bucket_logging_status)
+                    .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(Resp::new(dto::PutBucketLoggingOutput::default()))
     }
 }
 
