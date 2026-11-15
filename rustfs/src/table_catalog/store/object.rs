@@ -717,8 +717,25 @@ where
                     .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), scan_limit)
                     .await?;
                 let last_scanned = page.objects.last().cloned();
-                if page.objects.iter().any(|object| object.ends_with(entry_file)) {
-                    return Ok(true);
+                for object in page.objects.iter().filter(|object| object.ends_with(entry_file)) {
+                    let state = if entry_file == TABLE_ENTRY_FILE {
+                        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), object).await? else {
+                            continue;
+                        };
+                        validate_table_entry_object(&self.paths, object, &entry)?;
+                        entry.state
+                    } else {
+                        let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), object).await? else {
+                            continue;
+                        };
+                        validate_view_entry_object(&self.paths, object, &entry)?;
+                        entry.state
+                    };
+                    // Retain tombstones for conditional identifier reuse. Pending
+                    // publications and malformed records must still block deletion.
+                    if state != TableCatalogEntryState::Deleted {
+                        return Ok(true);
+                    }
                 }
                 if !page.is_truncated {
                     break;
@@ -1611,6 +1628,55 @@ where
             write_guards,
         )
         .await
+    }
+
+    /// Advances by bucket directories, regardless of the number of table objects.
+    /// The cursor advances before decoding so one invalid bucket cannot starve later buckets.
+    pub(crate) async fn next_table_bucket_for_rename_recovery(
+        &self,
+        cursor: &mut Option<String>,
+    ) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
+        let prefix = self.paths.table_bucket_entries_prefix();
+        let page = self
+            .backend
+            .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), NonZeroUsize::MIN)
+            .await?;
+        let Some(object) = page.objects.first() else {
+            *cursor = None;
+            return Ok(None);
+        };
+        if cursor.as_deref().is_some_and(|previous| object.as_str() <= previous) {
+            return Err(TableCatalogStoreError::Internal("catalog bucket scan did not advance".to_string()));
+        }
+        *cursor = Some(object.clone());
+        let directory = object
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.split_once('/'))
+            .map(|(directory, _)| directory)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("invalid catalog bucket object path".to_string()))?;
+        *cursor = Some(format!("{prefix}{directory}/\u{10ffff}"));
+        let entry_object = format!("{prefix}{directory}/{TABLE_BUCKET_ENTRY_FILE}");
+        let (entry, _) = self
+            .read_entry::<TableBucketEntry>(self.catalog_bucket(), &entry_object)
+            .await?
+            .ok_or_else(|| TableCatalogStoreError::Invalid("catalog bucket entry missing during discovery".to_string()))?;
+        validate_table_bucket_entry_object(&self.paths, &entry_object, &entry)?;
+        Ok(Some(entry))
+    }
+
+    /// Uses the same restore fence, publication lease and state machine as RenameTable.
+    pub(crate) fn recover_pending_table_rename<'a>(
+        &'a self,
+        table_bucket: &'a str,
+    ) -> futures::future::BoxFuture<'a, TableCatalogStoreResult<()>> {
+        // Keep the publication future opaque to the background concurrency adapters.
+        Box::pin(async move {
+            let _restore_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+            let publication = TableCommitLockPublication::new(&self.backend);
+            let _completion = TableCommitPublicationCompletion::new(&publication);
+            publication.begin_table_bucket(table_bucket).await?;
+            self.recover_active_table_rename(table_bucket, &publication).await
+        })
     }
 
     async fn recover_active_table_rename(
