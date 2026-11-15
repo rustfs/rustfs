@@ -60,6 +60,7 @@ Run **before** at the baseline column and **after** at the enabled column, every
 | P1 isolation | `RUSTFS_INTERNODE_CHANNEL_ISOLATION` | `false` (default) | `true` |
 | P1 bulk pool | `RUSTFS_INTERNODE_BULK_CHANNELS` | unset | `2` |
 | P2 msgpack-only | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` | both `false` (default) | per the convergence runbook |
+| P2 per-peer msgpack | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY` | both `false` (default) | both `true`, fleet confirmation `false`, stable direct/affine peer connections only |
 | P3 prewarm | `RUSTFS_INTERNODE_PREWARM` | `false` (default) | `true` |
 | P3 offline bypass | `RUSTFS_INTERNODE_OFFLINE_BYPASS` | `false` (default) | `true` |
 | P3 reprobe / threshold | `RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS` / `RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD` | defaults | defaults (`DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS`, `DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD`) |
