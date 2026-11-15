@@ -138,10 +138,10 @@ pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
     RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
     get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
-    parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize, process_lambda_configurations,
-    process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
-    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
-    validate_object_key, wrap_response_with_cors,
+    parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
+    process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
+    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -170,9 +170,8 @@ pub(crate) mod access_consumer {
         authorize_copy_object_tags, authorize_request, authorize_request_core, bucket_config_mutation_incarnation,
         delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store,
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
-        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_proxy_allowed,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
+        req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
@@ -260,7 +259,8 @@ pub(crate) mod helper_consumer {
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
     };
     pub(crate) use super::super::helper::{
-        OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+        OperationHelper, build_event_resp_elements, build_owned_event_resp_elements, run_owned_mutation,
+        spawn_background_with_context,
     };
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;

@@ -20,7 +20,6 @@ pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::runtime_sources as root_runtime_sources;
 pub(crate) use crate::runtime_sources::{
     AppContext, ServerContextSlot, current_action_credentials, current_boot_time, current_bucket_metadata_handle,
@@ -43,10 +42,6 @@ use tokio::sync::RwLock;
 
 pub(crate) fn default_admin_usecase() -> DefaultAdminUsecase {
     DefaultAdminUsecase::from_global()
-}
-
-pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
-    DefaultObjectUsecase::from_global()
 }
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
