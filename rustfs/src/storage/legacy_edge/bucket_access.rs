@@ -173,11 +173,12 @@ impl FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        let prepared = persisted_from_s3s(&req.input.versioning_configuration);
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketVersioning, |req| {
-            usecase.execute_put_bucket_versioning(req, prepared)
-        })
-        .await
+        record_s3_op(S3Operation::PutBucketVersioning);
+        let prepared = persisted_from_s3s(&req.input.versioning_configuration).map_err(rustfs_s3_types::S3Error::from);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_versioning(envelope, &req.input.bucket, prepared)
+            .await?;
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
     }
 }

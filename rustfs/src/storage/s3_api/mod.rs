@@ -23,7 +23,9 @@ pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
 pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 pub(crate) use crate::app::object::{PutObjectWriteInput, PutObjectWriteOutput, legacy_put_body};
 pub(crate) use crate::app::object_usecase::DefaultObjectUsecase;
-pub(crate) use crate::app::object_usecase::{HeadObjectFields, HeadObjectOutputFacts};
+pub(crate) use crate::app::object_usecase::{
+    GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields, HeadObjectOutputFacts,
+};
 
 pub(crate) mod bucket;
 pub(crate) mod common;

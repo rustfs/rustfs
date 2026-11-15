@@ -18,9 +18,7 @@ use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::handlers::s3_extension;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
-use crate::admin::runtime_sources::{
-    ServerContextSlot, current_object_store_handle, current_region, current_server_config, default_object_usecase,
-};
+use crate::admin::runtime_sources::{ServerContextSlot, current_object_store_handle, current_region, current_server_config};
 use crate::admin::storage_api::access::ReqInfo;
 use crate::admin::utils::{parse_query_pairs, query_value_exact, query_values_exact};
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
@@ -896,8 +894,12 @@ async fn handle_object_lambda_request(req: &mut S3Request<Body>, bucket: &str, o
     authorize_object_lambda_request(req, bucket, object).await?;
     validate_object_lambda_query(&req.uri)?;
     let get_req = authorized_object_lambda_get_request(req, bucket, object).await?;
-    let usecase = default_object_usecase();
-    let get_resp = usecase.execute_get_object(get_req).await?;
+    let slot = get_req
+        .extensions
+        .get::<Arc<ServerContextSlot>>()
+        .cloned()
+        .ok_or_else(server_context_not_ready_error)?;
+    let get_resp = s3s::S3::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), get_req).await?;
     invoke_object_lambda_target(req, bucket, object, get_resp).await
 }
 
