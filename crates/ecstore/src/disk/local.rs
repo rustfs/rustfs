@@ -23057,6 +23057,13 @@ mod test {
                         .expect("committed external payload"),
                     external_payload
                 );
+                // Linux reuses procfs disk handles across fixtures. Consume
+                // every attempt before releasing this disk's path identity.
+                assert_eq!(
+                    os::take_prepared_metadata_sync_count(&metadata_path),
+                    if mode == DurabilityMode::FileSync { 2 } else { 1 },
+                    "each external attempt must synchronize its metadata exactly once"
+                );
                 bucket_durability::set(bucket, None);
             }
         }
