@@ -30,7 +30,8 @@ use rustfs_gateway_dialect_rustfs_admin::AdminResponse as WireResponse;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
     get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_v4_cluster_snapshot::GetV4ClusterSnapshot, get_v4_plugins_catalog::GetV4PluginsCatalog,
+    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_s3_types::Body;
 use rustfs_trusted_proxies::ClientInfo;
@@ -44,6 +45,7 @@ fn native_admin_registers_only_system_reads_and_both_claims() {
         GetV3Info::NAME,
         GetV3Datausageinfo::NAME,
         GetV4PluginsCatalog::NAME,
+        GetV4ClusterSnapshot::NAME,
         GetV3ModuleSwitches::NAME,
         GetV3Storageinfo::NAME,
         GetV4RuntimeCapabilities::NAME,

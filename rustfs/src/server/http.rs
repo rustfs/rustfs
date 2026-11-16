@@ -4477,9 +4477,9 @@ mod tests {
             signed_request_with_headers(form, Method::GET, path, query, key, secret, headers)
         }
 
-        async fn answer<S>(service: S, request: HttpRequest<Empty<Bytes>>) -> (StatusCode, HeaderMap, Bytes)
+        async fn answer<S, B>(service: S, request: HttpRequest<B>) -> (StatusCode, HeaderMap, Bytes)
         where
-            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
+            S: Service<HttpRequest<B>, Response = Response<s3s::Body>, Error = s3s::HttpError>,
         {
             let service = tower::Layer::layer(&crate::server::layer::ExternalRequestContextLayer::new(false), service);
             let response = service.oneshot(request).await.unwrap();
@@ -4614,10 +4614,42 @@ mod tests {
             (env, slot, legacy)
         }
 
+        fn snapshot_wire(response: &(StatusCode, HeaderMap, Bytes), label: &str) {
+            eprintln!(
+                "snapshot-wire {label}: status={} headers={:?} body={}",
+                response.0,
+                response.1,
+                String::from_utf8_lossy(&response.2)
+            );
+            let content_type = if response.0.is_success() {
+                "application/json"
+            } else {
+                "application/xml"
+            };
+            assert_eq!(response.1[http::header::CONTENT_TYPE], content_type, "{label}: content type");
+            assert_eq!(response.1.get("x-request-id").unwrap(), REQUEST_ID, "{label}: request id");
+            if let Some(length) = response.1.get(http::header::CONTENT_LENGTH) {
+                assert_eq!(
+                    length.to_str().unwrap().parse::<usize>().unwrap(),
+                    response.2.len(),
+                    "{label}: content length"
+                );
+            }
+        }
+
+        fn snapshot_error_xml(body: &[u8]) -> String {
+            let xml = std::str::from_utf8(body).unwrap();
+            let declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+            match xml.strip_prefix(&format!("{declaration}\n")) {
+                Some(tail) => format!("{declaration}{tail}"),
+                None => xml.to_owned(),
+            }
+        }
+
         const CATALOG_READS: [&str; 3] = ["/v3/datausageinfo", "/v4/plugins/catalog", "/v3/module-switches"];
 
         // Each caller uses a fresh process because ECStore publishes once-only endpoint state.
-        async fn catalog_reads_contract(use_native: bool) {
+        async fn admin_reads_contract(use_native: bool, suffixes: &[&str]) {
             let (_env, slot, legacy) = admin_fixture().await;
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
@@ -4629,7 +4661,7 @@ mod tests {
                     failures.push(label);
                 }
             };
-            for suffix in CATALOG_READS {
+            for &suffix in suffixes {
                 for prefix in ["/rustfs/admin", "/minio/admin"] {
                     let path = format!("{prefix}{suffix}");
                     for host in ["localhost", "bucket.s3.example.test"] {
@@ -4638,6 +4670,32 @@ mod tests {
                         check(root.0 == StatusCode::OK, format!("root {path} {host}: {} {:?}", root.0, refusal(&root.2)));
                         let expected: serde_json::Value = serde_json::from_slice(&root.2).unwrap();
                         eprintln!("catalog-baseline {path} {host}: status={} headers={:?} json={expected}", root.0, root.1);
+                        if suffix == "/v4/cluster/snapshot" {
+                            // This fixture has no scanner publications or deferred work; its event times are unset.
+                            let usage = &expected["snapshot"]["components"]["usage"];
+                            for field in [
+                                "last_dirty_mark_unix_secs",
+                                "last_dirty_clear_unix_secs",
+                                "last_usage_save_unix_secs",
+                                "last_durable_success_unix_secs",
+                                "last_publication_unix_secs",
+                                "last_deferred_unix_secs",
+                            ] {
+                                check(usage[field] == serde_json::json!(0), format!("{path}: unset event time {field}"));
+                            }
+                            check(
+                                usage.get("last_success_unix_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no successful publication time"),
+                            );
+                            check(
+                                usage.get("deferred_age_secs") == Some(&serde_json::Value::Null),
+                                format!("{path}: no deferred age"),
+                            );
+                            // A writable metadata gate has no transition timestamp.
+                            let gate = &expected["snapshot"]["pool_meta_write_gate"];
+                            check(gate["state"] == "writable", format!("{path}: writable metadata gate"));
+                            check(gate.get("sinceUnixSecs").is_none(), format!("{path}: no metadata gate transition time"));
+                        }
                         for key in [
                             ROOT,
                             "info-allowed",
@@ -4664,6 +4722,16 @@ mod tests {
                                 answer(legacy.clone(), request()).await
                             };
                             let label = format!("{key} {path} {host}");
+                            if suffix == "/v4/cluster/snapshot" {
+                                snapshot_wire(&old, &format!("legacy {label}"));
+                                snapshot_wire(&new, &format!("selected {label}"));
+                                if !allowed {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label}: complete refusal XML"),
+                                    );
+                                }
+                            }
                             let status = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
                             check(
                                 old.0 == status && new.0 == status,
@@ -4716,6 +4784,7 @@ mod tests {
                                         .method(Method::GET)
                                         .uri(&path)
                                         .header("host", host)
+                                        .header("x-request-id", REQUEST_ID)
                                         .body(Empty::new())
                                         .unwrap()
                                 } else {
@@ -4735,6 +4804,35 @@ mod tests {
                                 new.0,
                                 refusal(&new.2)
                             );
+                            if suffix == "/v4/cluster/snapshot" {
+                                snapshot_wire(&old, &format!("legacy {label} {path} {host}"));
+                                snapshot_wire(&new, &format!("selected {label} {path} {host}"));
+                                if use_native {
+                                    let expected_xml = if label == "presigned" {
+                                        check(
+                                            serde_json::from_slice::<serde_json::Value>(&old.2).unwrap() == expected,
+                                            format!("{path}: complete legacy presigned JSON"),
+                                        );
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>the request is not allowed</Message></Error>".to_owned()
+                                    } else {
+                                        let old_xml = snapshot_error_xml(&old.2);
+                                        match label {
+                                            "anonymous" => old_xml.replacen("<Message>Signature is required</Message>", "<Message>the request is not allowed</Message>", 1),
+                                            "disabled" => old_xml.replacen("<Message>check key failed</Message>", "<Message>The Access Key Id you provided does not exist in our records.</Message>", 1),
+                                            _ => old_xml,
+                                        }
+                                    };
+                                    check(
+                                        snapshot_error_xml(&new.2) == expected_xml,
+                                        format!("{label} {path}: complete refusal XML"),
+                                    );
+                                } else if label != "presigned" {
+                                    check(
+                                        snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
+                                        format!("{label} {path}: complete baseline XML"),
+                                    );
+                                }
+                            }
                             let legacy_status = if label == "presigned" {
                                 StatusCode::OK
                             } else {
@@ -4832,13 +4930,84 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn native_admin_catalog_reads_legacy_baseline() {
-            catalog_reads_contract(false).await;
+            admin_reads_contract(false, &CATALOG_READS).await;
         }
 
         #[tokio::test]
         #[serial_test::serial]
         async fn native_admin_catalog_reads_real_signature_iam_and_wire() {
-            catalog_reads_contract(true).await;
+            admin_reads_contract(true, &CATALOG_READS).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/cluster/snapshot"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_cluster_snapshot_unsigned_before_body() {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot)).unwrap());
+            let payload = Bytes::from_static(b"snapshot body must remain unread");
+            let (sender, body, read, _dropped) = tracked_request_body();
+            sender.send(payload.clone()).unwrap();
+            drop(sender);
+            assert_eq!(body.collect().await.unwrap().to_bytes(), payload);
+            assert_eq!(read.load(Ordering::SeqCst), payload.len(), "body observer positive control");
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                let path = format!("{prefix}/v4/cluster/snapshot");
+                for host in ["localhost", "bucket.s3.example.test"] {
+                    let signed = answer(native.clone(), signed(&path, "", host, ROOT, ROOT_SECRET, Signed::Header)).await;
+                    assert_eq!(signed.0, StatusCode::OK, "signed handler control");
+                    let (sender, body, read, _dropped) = tracked_request_body();
+                    sender.send(payload.clone()).unwrap();
+                    drop(sender);
+                    let request = HttpRequest::builder()
+                        .uri(&path)
+                        .header("host", host)
+                        .header("x-request-id", REQUEST_ID)
+                        .body(body)
+                        .unwrap();
+                    let response = answer(native.clone(), request).await;
+                    let old = answer(
+                        legacy.clone(),
+                        HttpRequest::builder()
+                            .uri(&path)
+                            .header("host", host)
+                            .header("x-request-id", REQUEST_ID)
+                            .body(Empty::new())
+                            .unwrap(),
+                    )
+                    .await;
+                    snapshot_wire(&old, "legacy unsigned body observer");
+                    snapshot_wire(&response, "native unsigned body observer");
+                    assert_eq!(
+                        snapshot_error_xml(&response.2),
+                        snapshot_error_xml(&old.2).replacen(
+                            "<Message>Signature is required</Message>",
+                            "<Message>the request is not allowed</Message>",
+                            1
+                        )
+                    );
+                    eprintln!(
+                        "snapshot-unsigned {path} {host}: status={} headers={:?} body={}",
+                        response.0,
+                        response.1,
+                        String::from_utf8_lossy(&response.2)
+                    );
+                    assert_eq!(response.0, StatusCode::FORBIDDEN);
+                    assert_eq!(refusal(&response.2), ("AccessDenied".to_owned(), "the request is not allowed".to_owned()));
+                    assert_eq!(read.load(Ordering::SeqCst), 0, "unsigned body must remain unread");
+                }
+            }
         }
 
         const SYSTEM_READS: [(&str, &str); 3] = [
