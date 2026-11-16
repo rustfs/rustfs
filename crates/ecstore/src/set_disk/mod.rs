@@ -727,6 +727,11 @@ const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
+#[cfg(any(test, feature = "e2e-test-hooks"))]
+const ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE: &str =
+    "RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE";
+#[cfg(any(test, feature = "e2e-test-hooks"))]
+const DEFAULT_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE: bool = false;
 const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
 
 // --- Codec Streaming Configuration ---
@@ -1515,6 +1520,7 @@ mod prepared_get_object_metadata_tests {
             online_disks: vec![None],
             read_quorum: 0,
             verified_inline_body: None,
+            distributed_fence_proof: None,
         });
         let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
 
@@ -3443,6 +3449,20 @@ fn get_object_metadata_cache_max_entries() -> usize {
     }
 }
 
+pub(crate) fn is_get_object_metadata_cache_distributed_proof_enabled() -> bool {
+    #[cfg(any(test, feature = "e2e-test-hooks"))]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE,
+            DEFAULT_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE,
+        )
+    }
+    #[cfg(not(any(test, feature = "e2e-test-hooks")))]
+    {
+        false
+    }
+}
+
 fn is_get_small_object_direct_memory_enabled() -> bool {
     #[cfg(test)]
     {
@@ -5016,6 +5036,7 @@ struct GetObjectMetadataCacheEntry {
     read_quorum: usize,
     capability: GetObjectMetadataCacheCapability,
     verified_inline_body: Option<Bytes>,
+    distributed_fence_proof: Option<Arc<rustfs_lock::CacheFenceProof>>,
 }
 
 #[derive(Clone, Debug)]

@@ -1210,7 +1210,7 @@ impl LocalDisk {
                     return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
                 }
 
-                if sync_commit_directories {
+                if durability.syncs_metadata_commit_directory(rollback_data_dir.is_some()) {
                     if staged_rollback_path.is_none()
                         && rollback_data_dir.is_none()
                         && let Some(ref old_metadata) = has_dst_buf
@@ -1911,9 +1911,10 @@ impl LocalDisk {
             // durable. It is part of the metadata commit machinery, so relaxed
             // tiers leave it to the page cache like the xl.meta it mirrors.
             let backup_sync = durability.recovery_sync_mode();
-            if let (Some(old_data_dir), Some(dst_buf)) = (rollback_data_dir, has_dst_buf.as_ref())
-                && multipart_publication.as_ref().is_none_or(|publication| publication.legacy)
-            {
+            let recovery_backup = rollback_data_dir
+                .zip(has_dst_buf.as_ref())
+                .filter(|_| multipart_publication.as_ref().is_none_or(|publication| publication.legacy));
+            if let Some((old_data_dir, dst_buf)) = recovery_backup {
                 let backup_parent = dst_file_parent.join(old_data_dir.to_string());
                 #[cfg(not(windows))]
                 if let Err(err) = os::make_dir_all(&backup_parent, &skip_parent).await {
@@ -2027,7 +2028,7 @@ impl LocalDisk {
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
-            if durability.syncs_commit_directories()
+            if durability.syncs_metadata_commit_directory(recovery_backup.is_some())
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
@@ -2180,9 +2181,11 @@ impl LocalDisk {
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
-            let sync = durability.syncs_recovery_protocol_state();
+            let sync_metadata_files = durability.syncs_metadata_files();
+            let sync_commit_directories = durability.syncs_commit_directories();
+            let sync_recovery_protocol = durability.syncs_recovery_protocol_state();
             #[cfg(unix)]
-            let receipt_identity = if sync
+            let receipt_identity = if sync_recovery_protocol
                 && pool_meta_condition
                     .as_ref()
                     .is_some_and(|condition| condition.parent_raw_sha256.is_none())
@@ -2210,7 +2213,7 @@ impl LocalDisk {
             }
             #[cfg(test)]
             run_inline_before_file_sync_admission(dst_path);
-            let mut file_sync_admission = if sync {
+            let mut file_sync_admission = if sync_metadata_files || sync_commit_directories || sync_recovery_protocol {
                 let _admission = os::StageTimer::new(native_timing, "pool_meta_native_file_sync_admission");
                 Some(
                     os::acquire_file_sync_admission(self.file_sync_permits.clone())
@@ -2278,14 +2281,10 @@ impl LocalDisk {
                 xlmeta.add_version(fi)?;
                 let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
-                // Write the staged xl.meta. Inline objects carry their data inside
-                // xl.meta, so this is the durable preparation for the metadata commit:
-                // relaxed tiers do no per-object fsync here at all (aligned
-                // with MinIO's default), trading a documented power-loss
-                // window for latency.
+                // Inline payload shares xl.meta's file synchronization policy.
                 {
                     let _new_file = os::StageTimer::new(native_timing, "pool_meta_native_staged_write_sync");
-                    prepared_metadata_source.write_all(&new_buf, sync)?;
+                    prepared_metadata_source.write_all(&new_buf, sync_metadata_files)?;
                 }
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
                 #[cfg(unix)]
@@ -2316,10 +2315,10 @@ impl LocalDisk {
                         if !backup.is_linked() {
                             receipt_candidate = None;
                         }
-                        if sync && !reuses_durability {
+                        if sync_recovery_protocol && !reuses_durability {
                             let _backup_sync = os::StageTimer::new(native_timing, "pool_meta_native_backup_file_sync");
                             backup.sync_data()?;
-                        } else if sync {
+                        } else if sync_recovery_protocol {
                             rustfs_io_metrics::record_put_object_stage_count("pool_meta_native_backup_sync_reused", 1);
                         }
                         Some(backup)
@@ -2333,7 +2332,7 @@ impl LocalDisk {
                 let owned_backup = None;
                 if let Some(ref old_metadata) = has_dst_buf
                     && owned_backup.is_none()
-                    && (rollback_data_dir.is_some() || fi_healing || sync || cfg!(test))
+                    && (rollback_data_dir.is_some() || fi_healing || sync_recovery_protocol || cfg!(test))
                 {
                     #[cfg(windows)]
                     let backup_path = {
@@ -2342,13 +2341,18 @@ impl LocalDisk {
                             .parent()
                             .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "missing staging metadata parent"))?
                             .join(STORAGE_FORMAT_FILE_BACKUP);
-                        source_metadata_guard.write_file_for_path_access(&backup_path, old_metadata, sync, false)?;
+                        source_metadata_guard.write_file_for_path_access(
+                            &backup_path,
+                            old_metadata,
+                            sync_recovery_protocol,
+                            false,
+                        )?;
                         backup_path
                     };
                     #[cfg(not(windows))]
                     let backup_path = {
                         let _backup = os::StageTimer::new(native_timing, "pool_meta_native_backup_create");
-                        create_local_inline_rollback_backup(&dst, &src, old_metadata, sync)?
+                        create_local_inline_rollback_backup(&dst, &src, old_metadata, sync_recovery_protocol)?
                     };
                     staged_rollback_path = Some(StagedRollbackBackup(backup_path));
                 }
@@ -2356,7 +2360,7 @@ impl LocalDisk {
                 let destination_was_absent = has_dst_buf.is_none();
                 if !is_cancelled()
                     && rollback_data_dir.is_none()
-                    && !os::dst_dir_fsync_group_commit_enabled()
+                    && (!sync_commit_directories || !os::dst_dir_fsync_group_commit_enabled())
                     && !has_inline_commit_test_failpoints(&dst_path_for_failpoint)
                 {
                     let rename_res = if should_fail_commit_rename(&dst_path_for_failpoint) {
@@ -2386,7 +2390,7 @@ impl LocalDisk {
                         return Ok(InlinePreparationOutcome::CommitErr(DiskError::from(err)));
                     }
 
-                    if sync
+                    if sync_commit_directories
                         && let Err(err) = fsync_inline_commit_std(
                             &dst,
                             &dst_volume_dir_for_commit,
@@ -2581,7 +2585,7 @@ impl LocalDisk {
                 }
                 #[cfg(test)]
                 run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
-                if sync {
+                if sync_commit_directories || sync_recovery_protocol {
                     let _admission = os::StageTimer::new(native_timing, "pool_meta_native_file_sync_readmission");
                     file_sync_admission = Some(
                         os::acquire_file_sync_admission(self.file_sync_permits.clone())
@@ -2645,8 +2649,10 @@ impl LocalDisk {
                     return Err(std::io::Error::other("test fail after metadata commit"));
                 }
 
-                // Persist the commit rename's directory entry across power loss.
-                if let Some(admission) = file_sync_admission.as_ref()
+                // The object directory also publishes the recovery backup's
+                // directory entry, which file-sync must keep durable.
+                if durability.syncs_metadata_commit_directory(rollback_data_dir.is_some())
+                    && let Some(admission) = file_sync_admission.as_ref()
                     && let Some(dst_parent) = dst_file_path.parent()
                 {
                     let _head_dir = os::StageTimer::new(native_timing, "pool_meta_native_head_dir_sync");
@@ -2679,7 +2685,8 @@ impl LocalDisk {
                 // not its own entry, so for a new inline object fsync the ancestor
                 // chain up to and including the bucket. Overwrites already have a
                 // durable object dir; the starts_with guard bounds the walk.
-                if let Some(admission) = file_sync_admission.as_ref()
+                if sync_commit_directories
+                    && let Some(admission) = file_sync_admission.as_ref()
                     && destination_was_absent
                 {
                     let mut ancestor = dst_file_path.parent().and_then(|object_dir| object_dir.parent());
