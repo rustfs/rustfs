@@ -9987,6 +9987,13 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+        #[cfg(target_os = "linux")]
+        let object_path = {
+            let (root_bucket, object_path) = build_local_disk_object_path(&self.root, volume, path);
+            check_local_disk_object_path_components(&self.root, &root_bucket, &object_path)?;
+            object_path
+        };
+        #[cfg(not(target_os = "linux"))]
         let object_path = self.get_object_path(volume, path)?;
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
             Some(os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await);
