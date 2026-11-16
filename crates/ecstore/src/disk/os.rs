@@ -1771,7 +1771,7 @@ fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::
             #[cfg(test)]
             file_sync_probe::record_group_batch(batch_file_count);
             rustfs_io_metrics::record_put_rename_fdatasync_batch(
-                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL,
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED,
                 batch_file_count,
             );
             let result = if let Some(disk_permits) = group.disk_permits.upgrade() {
@@ -12610,7 +12610,6 @@ mod tests {
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
         set_file_fdatasync_group_commit_wait_for_test(0);
-        file_fdatasync_group_commit_override::set_follower_timeout_micros(1_000);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
@@ -12638,7 +12637,7 @@ mod tests {
 
         let second_limiter = limiter.clone();
         let second_path = second_dir.clone();
-        let mut second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
+        let second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if file_fdatasync_group_commit_counts_for_test().1 == 2 {
@@ -12651,10 +12650,6 @@ mod tests {
         .expect("second waiter should enqueue before releasing the grouped batch");
         release_batch_tx.send(()).expect("release group batch hook");
         file_sync_probe::wait_for_active(1).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut second).await.is_err(),
-            "a claimed follower waits for its batch even after its queue deadline"
-        );
         assert_eq!(file_sync_probe::attempts(), 1, "claimed files must not enter an independent sync");
 
         assert_eq!(

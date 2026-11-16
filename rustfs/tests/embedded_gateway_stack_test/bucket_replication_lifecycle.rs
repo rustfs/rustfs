@@ -24,11 +24,16 @@ use super::{
     outcome, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
+use aws_sdk_s3::client::customize::CustomizableOperation;
 use aws_sdk_s3::error::ProvideErrorMetadata as _;
+use aws_sdk_s3::operation::put_bucket_replication::builders::PutBucketReplicationFluentBuilder;
+use aws_sdk_s3::operation::put_bucket_replication::{PutBucketReplicationError, PutBucketReplicationOutput};
 use futures::future::BoxFuture;
 use rustfs::app::context::get_global_app_context;
 use rustfs::embedded::RustFSServer;
-use rustfs_ecstore::api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG, OBJECT_LOCK_CONFIG};
+use rustfs_ecstore::api::bucket::metadata::{
+    BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+};
 use rustfs_ecstore::api::bucket::metadata_sys;
 use rustfs_iam::store::UserType;
 use rustfs_policy::policy::Policy;
@@ -73,6 +78,50 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::GetBucketReplication,
         has_error_body: true,
         call: stored::<1>,
+    },
+    MatrixRow {
+        operation: "PutBucketReplication",
+        metric: S3Operation::PutBucketReplication,
+        has_error_body: true,
+        call: |client, _| {
+            Box::pin(async move {
+                seed_replication_target(REPLICATION_MATRIX_BUCKET).await;
+                outcome(
+                    put_replication(client, REPLICATION_MATRIX_BUCKET, REPLICATION_WRITE)
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
+    MatrixRow {
+        operation: "DeleteBucketReplication",
+        metric: S3Operation::DeleteBucketReplication,
+        has_error_body: true,
+        call: |client, _| {
+            Box::pin(async move {
+                outcome(
+                    client
+                        .delete_bucket_replication()
+                        .bucket(REPLICATION_MATRIX_BUCKET)
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
+    MatrixRow {
+        operation: "PutObjectLockConfiguration",
+        metric: S3Operation::PutObjectLockConfiguration,
+        has_error_body: true,
+        call: |client, _| {
+            Box::pin(async move {
+                metadata_sys::update(LOCK_CONFIGURATION_MATRIX_BUCKET, OBJECT_LOCK_CONFIG, OBJECT_LOCK.to_vec())
+                    .await
+                    .expect("seed bucket lock configuration");
+                outcome(put_lock(client, LOCK_CONFIGURATION_MATRIX_BUCKET, LOCK_UPDATE).send().await)
+            })
+        },
     },
     MatrixRow {
         operation: "GetObjectLockConfiguration",
@@ -627,4 +676,387 @@ fn gateway_lifecycle_put_rejects_submillisecond_date() {
         assert!(stored_lifecycle(WRITER_BUCKET).await.is_empty());
         server.shutdown().await;
     });
+}
+
+pub(super) const LOCK_CONFIGURATION_MATRIX_BUCKET: &str = "lock-configuration-matrix";
+pub(super) const REPLICATION_MATRIX_BUCKET: &str = "replication-matrix";
+const REPLICATION_ARN: &str = "arn:rustfs:replication:us-east-1:operator:replica";
+const REPLICATION_WRITE: &str = concat!(
+    "<ReplicationConfiguration><Role></Role><Rule><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>",
+    "<DeleteReplication><Status>Enabled</Status></DeleteReplication><Destination><Bucket>arn:rustfs:replication:us-east-1:operator:replica</Bucket>",
+    "<StorageClass>STANDARD</StorageClass></Destination><ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>",
+    "<Filter><And><Prefix>logs/&amp;/</Prefix><Tag><Key>team</Key><Value>storage</Value></Tag></And></Filter>",
+    "<ID>operator</ID><Priority>7</Priority><SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status>",
+    "</ReplicaModifications></SourceSelectionCriteria><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+);
+const REPLICATION_SIMPLE: &str = concat!(
+    "<ReplicationConfiguration><Role></Role><Rule><Destination><Bucket>arn:rustfs:replication:us-east-1:operator:replica</Bucket>",
+    "</Destination><ID>simple</ID><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+);
+const REPLICATION_UNSUPPORTED: &str = concat!(
+    "<ReplicationConfiguration><Role></Role><Rule><Destination><Account>123456789012</Account>",
+    "<Bucket>arn:rustfs:replication:us-east-1:operator:replica</Bucket></Destination><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+);
+
+async fn seed_replication_target(bucket: &str) {
+    use rustfs_ecstore::api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
+
+    metadata_sys::update(
+        bucket,
+        BUCKET_VERSIONING_CONFIG,
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+    )
+    .await
+    .expect("enable replication source versioning");
+    let targets = BucketTargets {
+        targets: vec![BucketTarget {
+            source_bucket: bucket.to_owned(),
+            target_bucket: "replica".to_owned(),
+            arn: REPLICATION_ARN.to_owned(),
+            target_type: BucketTargetType::ReplicationService,
+            ..Default::default()
+        }],
+    };
+    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, serde_json::to_vec(&targets).expect("target bytes"))
+        .await
+        .expect("write replication targets");
+}
+
+fn put_replication(
+    client: &Client,
+    bucket: &str,
+    document: &'static str,
+) -> CustomizableOperation<PutBucketReplicationOutput, PutBucketReplicationError, PutBucketReplicationFluentBuilder> {
+    use aws_sdk_s3::types::{Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus};
+    let configuration = ReplicationConfiguration::builder()
+        .role("")
+        .rules(
+            ReplicationRule::builder()
+                .destination(
+                    Destination::builder()
+                        .bucket(REPLICATION_ARN)
+                        .build()
+                        .expect("placeholder destination"),
+                )
+                .status(ReplicationRuleStatus::Enabled)
+                .build()
+                .expect("placeholder rule"),
+        )
+        .build()
+        .expect("placeholder configuration");
+    client
+        .put_bucket_replication()
+        .bucket(bucket)
+        .replication_configuration(configuration)
+        .customize()
+        .mutate_request(move |request| send_document(request, document))
+}
+
+async fn owned_replication_wire_and_disk(server: RustFSServer) {
+    const BUCKET: &str = "replication-edit-granted";
+    const OTHER: &str = "replication-edit-other";
+    const WRITER: &str = "replicationeditwriter";
+    const READER: &str = "replicationeditreader";
+    for bucket in [BUCKET, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutReplicationConfiguration", BUCKET).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetReplicationConfiguration", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+
+    let unsupported = put_replication(&root, BUCKET, REPLICATION_UNSUPPORTED)
+        .send()
+        .await
+        .expect_err("unsupported destination");
+    let disabled = put_replication(&root, BUCKET, REPLICATION_SIMPLE)
+        .send()
+        .await
+        .expect_err("versioning disabled");
+    for (err, message) in [
+        (
+            unsupported,
+            "replication field Destination.Account is not supported by this RustFS version",
+        ),
+        (disabled, "bucket versioning must be enabled before replication can be configured"),
+    ] {
+        let refusal = err.as_service_error().expect("service refusal");
+        assert_eq!((refusal.code(), refusal.message()), (Some("InvalidRequest"), Some(message)));
+    }
+
+    seed_replication_target(BUCKET).await;
+    seed_replication_target(OTHER).await;
+    for (client, bucket) in [(&reader, BUCKET), (&writer, OTHER)] {
+        assert_eq!(
+            answer(outcome(put_replication(client, bucket, REPLICATION_SIMPLE).send().await)),
+            refused("AccessDenied", 403)
+        );
+    }
+    for bucket in [BUCKET, OTHER] {
+        let stored = metadata_sys::get_config_from_disk(bucket)
+            .await
+            .expect("disk metadata before Put");
+        assert!(stored.replication_config_xml.is_empty());
+    }
+    let stale = put_replication(
+        &writer,
+        BUCKET,
+        "<ReplicationConfiguration><Role></Role><Rule><Destination><Bucket>arn:rustfs:replication:us-east-1:absent:replica</Bucket></Destination><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+    )
+    .send()
+    .await
+    .expect_err("stale target");
+    let stale = stale.as_service_error().expect("stale target refusal");
+    assert_eq!(
+        (stale.code(), stale.message()),
+        (Some("InvalidRequest"), Some("replication config has a stale target"))
+    );
+
+    assert_eq!(answer(outcome(put_replication(&writer, BUCKET, REPLICATION_WRITE).send().await)), Ok(()));
+    let actual = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("disk metadata after Put");
+    assert_eq!(actual.replication_config_xml, REPLICATION_WRITE.as_bytes());
+
+    // Keep actual bytes to observe attempted deletes under both wrong policies.
+    metadata_sys::update(OTHER, BUCKET_REPLICATION_CONFIG, REPLICATION_WRITE.as_bytes().to_vec())
+        .await
+        .expect("persist other bucket's rules");
+    for (client, bucket) in [(&reader, BUCKET), (&writer, OTHER)] {
+        assert_eq!(
+            answer(outcome(client.delete_bucket_replication().bucket(bucket).send().await)),
+            refused("AccessDenied", 403)
+        );
+        let stored = metadata_sys::get_config_from_disk(bucket)
+            .await
+            .expect("disk metadata after refused Delete");
+        assert_eq!(stored.replication_config_xml, REPLICATION_WRITE.as_bytes());
+    }
+
+    for _ in 0..2 {
+        let status = StatusCapture::default();
+        let deleted = writer
+            .delete_bucket_replication()
+            .bucket(BUCKET)
+            .customize()
+            .interceptor(status.clone())
+            .send()
+            .await;
+        assert_eq!((answer(outcome(deleted)), status.take()), (Ok(()), Some(204)));
+        let stored = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("disk metadata after Delete");
+        assert!(stored.replication_config_xml.is_empty());
+        let targets: rustfs_ecstore::api::bucket::target::BucketTargets =
+            serde_json::from_slice(&stored.bucket_targets_config_json).expect("disk targets after Delete");
+        assert!(targets.targets.is_empty());
+    }
+
+    // Real persisted state is consulted after IAM authorization on both edges.
+    let store = get_global_app_context().expect("embedded server context").object_store();
+    let state_path = "config/site-replication/state.json";
+    let state = br#"{
+        "name":"local","service_account_access_key":"","service_account_parent":"",
+        "peers":{"local":{"deploymentID":"local","endpoint":"http://127.0.0.1:9001"},"remote":{"deploymentID":"remote","endpoint":"http://127.0.0.1:9002"}},
+        "updated_at":null,"resync_status":{}
+    }"#;
+    rustfs_ecstore::api::config::com::save_config(store.clone(), state_path, state.to_vec())
+        .await
+        .expect("enable site replication without peer credentials");
+    let before = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("before site-protected edits");
+    let gate = refused("XMinioReplicationDenyEdit", 400);
+    assert_eq!(answer(outcome(put_replication(&writer, BUCKET, REPLICATION_SIMPLE).send().await)), gate);
+    assert_eq!(answer(outcome(writer.delete_bucket_replication().bucket(BUCKET).send().await)), gate);
+    // IAM still denies an unrelated principal before the site gate.
+    assert_eq!(
+        answer(outcome(reader.delete_bucket_replication().bucket(BUCKET).send().await)),
+        refused("AccessDenied", 403)
+    );
+
+    rustfs_ecstore::api::config::com::save_config(store.clone(), state_path, b"{".to_vec())
+        .await
+        .expect("store corrupt site replication state");
+    for client in [&root, &writer] {
+        let err = put_replication(client, BUCKET, REPLICATION_SIMPLE)
+            .send()
+            .await
+            .expect_err("corrupt site replication state");
+        let error = err.as_service_error().expect("state read failure");
+        assert_eq!(error.code(), Some("InternalError"));
+        assert!(
+            error
+                .message()
+                .is_some_and(|message| message.starts_with("invalid site replication state:"))
+        );
+        assert_eq!(
+            answer(outcome(client.delete_bucket_replication().bucket(BUCKET).send().await)),
+            refused("InternalError", 500)
+        );
+    }
+    let after = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("after site-protected edits");
+    assert_eq!(
+        (after.replication_config_xml, after.bucket_targets_config_json),
+        (before.replication_config_xml, before.bucket_targets_config_json)
+    );
+    rustfs_ecstore::api::config::com::delete_config(store, state_path)
+        .await
+        .expect("remove test site state");
+
+    server.shutdown().await;
+}
+
+#[test]
+fn owned_replication_gateway_writes_and_removes_the_config_and_targets() {
+    with_stack(GATEWAY, owned_replication_wire_and_disk);
+}
+
+#[test]
+fn owned_replication_legacy_writes_and_removes_the_config_and_targets() {
+    with_stack(LEGACY, owned_replication_wire_and_disk);
+}
+
+const LOCK_UPDATE: &str = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>2</Years></DefaultRetention></Rule></ObjectLockConfiguration>";
+const LOCK_ENABLED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+const LOCK_SUSPENDED_VERSIONING: &[u8] = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+
+fn put_lock(
+    client: &Client,
+    bucket: &str,
+    document: &'static str,
+) -> CustomizableOperation<
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationOutput,
+    aws_sdk_s3::operation::put_object_lock_configuration::PutObjectLockConfigurationError,
+    aws_sdk_s3::operation::put_object_lock_configuration::builders::PutObjectLockConfigurationFluentBuilder,
+> {
+    client
+        .put_object_lock_configuration()
+        .bucket(bucket)
+        .customize()
+        .mutate_request(move |request| send_document(request, document))
+}
+
+async fn lock_bytes(bucket: &str) -> (Vec<u8>, Vec<u8>) {
+    let metadata = metadata_sys::get_config_from_disk(bucket)
+        .await
+        .expect("durable bucket metadata");
+    (metadata.object_lock_config_xml, metadata.versioning_config_xml)
+}
+
+async fn put_lock_preserves_responses_and_storage(server: RustFSServer, native: bool) {
+    const BUCKET: &str = "lock-put-ordinary";
+    const RESERVED: &str = "sthree-lock-put-reserved";
+    const PLAIN: &str = "lock-put-plain";
+    const WRITER: &str = "lock-put-writer";
+    for bucket in [BUCKET, RESERVED, PLAIN] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    for bucket in [BUCKET, RESERVED] {
+        metadata_sys::update(bucket, OBJECT_LOCK_CONFIG, OBJECT_LOCK.to_vec())
+            .await
+            .unwrap();
+        metadata_sys::update(bucket, BUCKET_VERSIONING_CONFIG, LOCK_SUSPENDED_VERSIONING.to_vec())
+            .await
+            .unwrap();
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketObjectLockConfiguration", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+
+    let invalid = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>0</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
+    for (client, bucket, document, code, status, message) in [
+        (&writer, RESERVED, LOCK_UPDATE, "AccessDenied", 403, "Access Denied"),
+        (
+            &root,
+            "lock-put-missing",
+            invalid,
+            "NoSuchBucket",
+            404,
+            "The specified bucket does not exist",
+        ),
+        (
+            &root,
+            PLAIN,
+            LOCK_UPDATE,
+            "InvalidBucketState",
+            409,
+            "Object Lock configuration cannot be enabled on existing buckets",
+        ),
+        (
+            &root,
+            BUCKET,
+            invalid,
+            "InvalidRetentionPeriod",
+            400,
+            "Default retention period must be a positive integer value for 'Days'",
+        ),
+    ] {
+        let before = if bucket == "lock-put-missing" {
+            None
+        } else {
+            Some(lock_bytes(bucket).await)
+        };
+        let refused = put_lock(client, bucket, document)
+            .send()
+            .await
+            .expect_err("refused Object Lock change");
+        let actual = refused.as_service_error().expect("service error");
+        let bytes = if before.is_some() {
+            Some(lock_bytes(bucket).await)
+        } else {
+            None
+        };
+        assert_eq!(
+            (
+                actual.code(),
+                refused.raw_response().map(|response| response.status().as_u16()),
+                actual.message(),
+                bytes
+            ),
+            (Some(code), Some(status), Some(message), before),
+            "{bucket}",
+        );
+    }
+
+    for (client, bucket) in [(&writer, BUCKET), (&root, RESERVED)] {
+        let before = rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == S3Operation::PutObjectLockConfiguration.as_str())
+            .map(|row| row.total);
+        let scanner_before = rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket);
+        let status = StatusCapture::default();
+        let result = put_lock(client, bucket, LOCK_UPDATE).interceptor(status.clone()).send().await;
+        let counts = rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == S3Operation::PutObjectLockConfiguration.as_str())
+            .map(|row| row.total);
+        assert_eq!(
+            (outcome(result), status.take(), lock_bytes(bucket).await, counts),
+            (
+                Ok(()),
+                Some(200),
+                (LOCK_UPDATE.as_bytes().to_vec(), LOCK_ENABLED_VERSIONING.to_vec()),
+                if native { Some(before.unwrap_or_default() + 1) } else { None }
+            ),
+            "{bucket}",
+        );
+        assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket) > scanner_before);
+    }
+    server.shutdown().await;
+}
+
+#[test]
+fn legacy_put_object_lock_preserves_responses_and_storage() {
+    with_stack(LEGACY, |server| put_lock_preserves_responses_and_storage(server, false));
+}
+
+#[test]
+fn gateway_put_object_lock_preserves_responses_and_storage() {
+    with_stack(GATEWAY, |server| put_lock_preserves_responses_and_storage(server, true));
 }

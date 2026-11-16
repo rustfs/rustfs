@@ -33,9 +33,9 @@ use super::storage_api::bucket_usecase::bucket::{
         run_stale_multipart_upload_cleanup_once, validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
-        BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
-        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TARGETS_FILE,
-        BUCKET_VERSIONING_CONFIG,
+        BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
+        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG,
+        BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG,
     },
     metadata_sys,
     policy_sys::PolicySys,
@@ -92,7 +92,6 @@ use rustfs_gateway_types::persistence::{
     PersistedVersioningConfiguration,
 };
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
-use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -125,6 +124,8 @@ mod core;
 #[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
+#[cfg(test)]
+mod delete_config_tests;
 mod encryption;
 #[cfg(test)]
 mod guards;
