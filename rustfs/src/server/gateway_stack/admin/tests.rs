@@ -31,7 +31,8 @@ use rustfs_gateway_dialect_rustfs_admin::ops::{
     get_iceberg_config::GetIcebergConfig, get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info,
     get_v3_module_switches::GetV3ModuleSwitches, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats,
     get_v3_storageinfo::GetV3Storageinfo, get_v4_cluster_snapshot::GetV4ClusterSnapshot,
-    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_v4_extensions_catalog::GetV4ExtensionsCatalog, get_v4_plugins_catalog::GetV4PluginsCatalog,
+    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_s3_types::Body;
 use rustfs_trusted_proxies::ClientInfo;
@@ -47,6 +48,7 @@ fn native_admin_registers_only_selected_reads_and_four_claims() {
         GetV3Datausageinfo::NAME,
         GetV4PluginsCatalog::NAME,
         GetV4ClusterSnapshot::NAME,
+        GetV4ExtensionsCatalog::NAME,
         GetV3ModuleSwitches::NAME,
         GetV3Storageinfo::NAME,
         GetV4RuntimeCapabilities::NAME,
@@ -130,6 +132,7 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
             .register::<GetIcebergConfig, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Datausageinfo, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV4PluginsCatalog, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV4ExtensionsCatalog, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3ModuleSwitches, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Info, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Storageinfo, _>(Arc::new(Capture(captured.clone())))
@@ -143,6 +146,7 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
         "/_iceberg/v1/config",
         "/minio/admin/v3/datausageinfo",
         "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v4/extensions/catalog",
         "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/minio/admin/v3/storageinfo",
@@ -196,10 +200,12 @@ async fn native_admin_authenticated_request_refuses_an_uninstalled_server_contex
         "/_iceberg/v1/config",
         "/rustfs/admin/v3/datausageinfo",
         "/rustfs/admin/v4/plugins/catalog",
+        "/rustfs/admin/v4/extensions/catalog",
         "/rustfs/admin/v3/module-switches",
         "/rustfs/admin/v3/info",
         "/minio/admin/v3/datausageinfo",
         "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v4/extensions/catalog",
         "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/rustfs/admin/v3/storageinfo",

@@ -422,6 +422,8 @@ mod tests {
                 "/minio/admin/v4/plugins/catalog?detail=1",
                 "/rustfs/admin/v4/cluster/snapshot",
                 "/minio/admin/v4/cluster/snapshot?detail=1",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/minio/admin/v4/extensions/catalog?detail=1",
                 "/rustfs/admin/v3/module-switches",
                 "/minio/admin/v3/module-switches?detail=1",
                 "/rustfs/admin/v3/info",
@@ -451,6 +453,7 @@ mod tests {
             "/v3/datausageinfo",
             "/v4/plugins/catalog",
             "/v4/cluster/snapshot",
+            "/v4/extensions/catalog",
             "/v3/module-switches",
         ] {
             for prefix in ["/rustfs/admin", "/minio/admin"] {

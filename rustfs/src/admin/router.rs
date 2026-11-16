@@ -942,6 +942,8 @@ pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
                 | "/minio/admin/v4/plugins/catalog"
                 | "/rustfs/admin/v4/cluster/snapshot"
                 | "/minio/admin/v4/cluster/snapshot"
+                | "/rustfs/admin/v4/extensions/catalog"
+                | "/minio/admin/v4/extensions/catalog"
                 | "/rustfs/admin/v3/module-switches"
                 | "/minio/admin/v3/module-switches"
                 | "/iceberg/v1/config"

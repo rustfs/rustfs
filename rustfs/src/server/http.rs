@@ -4614,27 +4614,31 @@ mod tests {
             (env, slot, legacy)
         }
 
-        fn snapshot_wire(response: &(StatusCode, HeaderMap, Bytes), label: &str) {
+        fn admin_wire_failures(response: &(StatusCode, HeaderMap, Bytes), label: &str) -> Vec<String> {
             eprintln!(
-                "snapshot-wire {label}: status={} headers={:?} body={}",
+                "admin-wire {label}: status={} headers={:?} body={}",
                 response.0,
                 response.1,
                 String::from_utf8_lossy(&response.2)
             );
+            let mut failures = Vec::new();
             let content_type = if response.0.is_success() {
                 "application/json"
             } else {
                 "application/xml"
             };
-            assert_eq!(response.1[http::header::CONTENT_TYPE], content_type, "{label}: content type");
-            assert_eq!(response.1.get("x-request-id").unwrap(), REQUEST_ID, "{label}: request id");
-            if let Some(length) = response.1.get(http::header::CONTENT_LENGTH) {
-                assert_eq!(
-                    length.to_str().unwrap().parse::<usize>().unwrap(),
-                    response.2.len(),
-                    "{label}: content length"
-                );
+            if !response.1.get(http::header::CONTENT_TYPE).is_some_and(|v| v == content_type) {
+                failures.push(format!("{label}: content type"));
             }
+            if !response.1.get("x-request-id").is_some_and(|v| v == REQUEST_ID) {
+                failures.push(format!("{label}: request id"));
+            }
+            if let Some(length) = response.1.get(http::header::CONTENT_LENGTH)
+                && length.to_str().ok().and_then(|v| v.parse::<usize>().ok()) != Some(response.2.len())
+            {
+                failures.push(format!("{label}: content length"));
+            }
+            failures
         }
 
         fn snapshot_error_xml(body: &[u8]) -> String {
@@ -5094,9 +5098,13 @@ mod tests {
                                 answer(legacy.clone(), request()).await
                             };
                             let label = format!("{key} {path} {host}");
-                            if suffix == "/v4/cluster/snapshot" {
-                                snapshot_wire(&old, &format!("legacy {label}"));
-                                snapshot_wire(&new, &format!("selected {label}"));
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label}")) {
+                                    check(false, failure);
+                                }
                                 if !allowed {
                                     check(
                                         snapshot_error_xml(&new.2) == snapshot_error_xml(&old.2),
@@ -5176,9 +5184,13 @@ mod tests {
                                 new.0,
                                 refusal(&new.2)
                             );
-                            if suffix == "/v4/cluster/snapshot" {
-                                snapshot_wire(&old, &format!("legacy {label} {path} {host}"));
-                                snapshot_wire(&new, &format!("selected {label} {path} {host}"));
+                            if matches!(suffix, "/v4/cluster/snapshot" | "/v4/extensions/catalog") {
+                                for failure in admin_wire_failures(&old, &format!("legacy {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
+                                for failure in admin_wire_failures(&new, &format!("selected {label} {path} {host}")) {
+                                    check(false, failure);
+                                }
                                 if use_native {
                                     let expected_xml = if label == "presigned" {
                                         check(
@@ -5313,6 +5325,18 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial]
+        async fn native_admin_extensions_catalog_legacy_baseline() {
+            admin_reads_contract(false, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_real_signature_iam_and_wire() {
+            admin_reads_contract(true, &["/v4/extensions/catalog"]).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
         async fn native_admin_cluster_snapshot_legacy_baseline() {
             admin_reads_contract(false, &["/v4/cluster/snapshot"]).await;
         }
@@ -5326,16 +5350,26 @@ mod tests {
         #[tokio::test]
         #[serial_test::serial]
         async fn native_admin_cluster_snapshot_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/cluster/snapshot").await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_extensions_catalog_unsigned_before_body() {
+            admin_unsigned_before_body("/v4/extensions/catalog").await;
+        }
+
+        async fn admin_unsigned_before_body(suffix: &str) {
             let (_env, slot, legacy) = admin_fixture().await;
             let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot)).unwrap());
-            let payload = Bytes::from_static(b"snapshot body must remain unread");
+            let payload = Bytes::from_static(b"admin body must remain unread");
             let (sender, body, read, _dropped) = tracked_request_body();
             sender.send(payload.clone()).unwrap();
             drop(sender);
             assert_eq!(body.collect().await.unwrap().to_bytes(), payload);
             assert_eq!(read.load(Ordering::SeqCst), payload.len(), "body observer positive control");
             for prefix in ["/rustfs/admin", "/minio/admin"] {
-                let path = format!("{prefix}/v4/cluster/snapshot");
+                let path = format!("{prefix}{suffix}");
                 for host in ["localhost", "bucket.s3.example.test"] {
                     let signed = answer(native.clone(), signed(&path, "", host, ROOT, ROOT_SECRET, Signed::Header)).await;
                     assert_eq!(signed.0, StatusCode::OK, "signed handler control");
@@ -5359,8 +5393,8 @@ mod tests {
                             .unwrap(),
                     )
                     .await;
-                    snapshot_wire(&old, "legacy unsigned body observer");
-                    snapshot_wire(&response, "native unsigned body observer");
+                    assert!(admin_wire_failures(&old, "legacy unsigned body observer").is_empty());
+                    assert!(admin_wire_failures(&response, "native unsigned body observer").is_empty());
                     assert_eq!(
                         snapshot_error_xml(&response.2),
                         snapshot_error_xml(&old.2).replacen(
