@@ -15,7 +15,7 @@
 use self::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
-use self::access_owned::object_misc::authorize_delete_object;
+use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
@@ -33,7 +33,7 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::denial_audit::DenialAuditor;
-use crate::storage::helper::DenialScope;
+use crate::storage::helper::{AuditRequestView, DenialScope};
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
@@ -2172,15 +2172,15 @@ fn audit_request_denial<R: AuthorizationRequest + ?Sized>(
 
 /// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
 ///
-/// `start` marks the request so per-key denials are logged but not audited; `finish` clears the
+/// `start_owned` marks the request so per-key denials are logged but not audited; `finish_owned` clears the
 /// mark and emits one entry per denied action with the number of keys refused for it.
 pub(crate) struct BulkDenialAudit {
     denied: Vec<(Action, u64)>,
 }
 
 impl BulkDenialAudit {
-    pub(crate) fn start<T>(req: &mut S3Request<T>) -> S3Result<Self> {
-        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = true;
+    pub(crate) fn start_owned<R: AuthorizationRequest + ?Sized>(request: &mut R) -> S3Result<Self> {
+        req_info_mut(request)?.suppress_denial_audit = true;
         Ok(Self { denied: Vec::new() })
     }
 
@@ -2192,14 +2192,24 @@ impl BulkDenialAudit {
         }
     }
 
-    pub(crate) fn finish<T>(self, req: &mut S3Request<T>) -> S3Result<()> {
-        self.finish_with(req, DenialAuditor::global())
+    pub(crate) fn finish_owned<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+    ) -> S3Result<()> {
+        self.finish_owned_with(request, audit_view, DenialAuditor::global())
     }
 
-    fn finish_with<T>(self, req: &mut S3Request<T>, auditor: &DenialAuditor) -> S3Result<()> {
-        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = false;
+    fn finish_owned_with<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+        auditor: &DenialAuditor,
+    ) -> S3Result<()> {
+        req_info_mut(request)?.suppress_denial_audit = false;
+        let view = audit_view(request);
         for (action, keys) in self.denied {
-            auditor.audit(req, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
+            auditor.audit_owned(&view, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
         }
         Ok(())
     }
@@ -3573,12 +3583,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = None;
-        req_info.version_id = None;
-
-        Ok(())
+        let bucket = req.input.bucket.clone();
+        authorize_delete_objects(req, &bucket)
     }
 
     /// Checks whether the DeletePublicAccessBlock request has accesses to the resources.
@@ -6884,21 +6890,25 @@ mod tests {
     #[test]
     fn bulk_denial_is_one_entry_per_denied_action_with_the_key_count() {
         let (auditor, captured) = test_auditor(true, 10, 10);
-        let mut req = denial_request("denial-bulk", true);
+        let req = denial_request("denial-bulk", true);
+        let mut envelope = crate::app::RequestEnvelope::from_s3s(&req);
 
-        let nothing_denied = BulkDenialAudit::start(&mut req).unwrap();
-        assert!(req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
-        nothing_denied.finish_with(&mut req, &auditor).unwrap();
-        assert!(!req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        let nothing_denied = BulkDenialAudit::start_owned(&mut envelope).unwrap();
+        assert!(envelope.req_info().unwrap().suppress_denial_audit);
+        nothing_denied
+            .finish_owned_with(&mut envelope, crate::app::RequestEnvelope::audit_view, &auditor)
+            .unwrap();
+        assert!(!envelope.req_info().unwrap().suppress_denial_audit);
         assert!(captured.lock().unwrap().is_empty());
 
-        let mut bulk = BulkDenialAudit::start(&mut req).unwrap();
+        let mut bulk = BulkDenialAudit::start_owned(&mut envelope).unwrap();
         let delete = Action::S3Action(S3Action::DeleteObjectAction);
         let bypass = Action::S3Action(S3Action::BypassGovernanceRetentionAction);
         for action in [delete, delete, bypass, delete] {
             bulk.denied(action);
         }
-        bulk.finish_with(&mut req, &auditor).unwrap();
+        bulk.finish_owned_with(&mut envelope, crate::app::RequestEnvelope::audit_view, &auditor)
+            .unwrap();
 
         let entries = captured.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -8596,6 +8606,9 @@ mod tests {
         let mut req = build_request(input, Method::POST);
         req.extensions.insert(ReqInfo {
             cred: Some(rustfs_credentials::Credentials::default()),
+            bucket: Some("previous-bucket".to_string()),
+            object: Some("previous-key".to_string()),
+            version_id: Some("previous-version".to_string()),
             ..ReqInfo::default()
         });
 
