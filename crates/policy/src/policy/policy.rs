@@ -161,6 +161,34 @@ impl Policy {
         policy.validate()?;
         Ok(policy)
     }
+
+    /// Encode an IAM policy for public export with AWS lifecycle action names.
+    /// The ordinary serializer retains the RustFS spellings for storage and older peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the policy cannot be serialized.
+    pub fn to_export_value(&self) -> serde_json::Result<Value> {
+        let mut document = serde_json::to_value(self)?;
+        if let Some(statements) = document["Statement"].as_array_mut() {
+            for statement in statements {
+                for field in ["Action", "NotAction"] {
+                    let Some(actions) = statement.get_mut(field).and_then(Value::as_array_mut) else {
+                        continue;
+                    };
+                    for action in actions {
+                        let name = match action.as_str() {
+                            Some("s3:GetBucketLifecycle") => "s3:GetLifecycleConfiguration",
+                            Some("s3:PutBucketLifecycle") => "s3:PutLifecycleConfiguration",
+                            _ => continue,
+                        };
+                        *action = Value::from(name);
+                    }
+                }
+            }
+        }
+        Ok(document)
+    }
 }
 
 impl Validator for Policy {
@@ -4020,7 +4048,7 @@ mod test {
             ]}"#,
         )
         .expect("policy with AWS lifecycle action names parses");
-        let serialized_aws = serde_json::to_value(&policy_aws).expect("serialize lifecycle policy (AWS input)");
+        let serialized_aws = policy_aws.to_export_value().expect("export lifecycle policy (AWS input)");
         assert_eq!(
             serialized_aws["Statement"][0]["Action"],
             serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
@@ -4032,10 +4060,19 @@ mod test {
             ]}"#,
         )
         .expect("policy with legacy lifecycle action names parses");
-        let serialized_legacy = serde_json::to_value(&policy_legacy).expect("serialize lifecycle policy (legacy input)");
+        let serialized_legacy = policy_legacy
+            .to_export_value()
+            .expect("export lifecycle policy (legacy input)");
         assert_eq!(
             serialized_legacy["Statement"][0]["Action"],
             serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
+        );
+
+        let stored =
+            serde_json::to_value(crate::policy::PolicyDoc::new(policy_aws.clone())).expect("serialize stored IAM policy");
+        assert_eq!(
+            stored["Policy"]["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetBucketLifecycle", "s3:PutBucketLifecycle"])
         );
 
         let get = Args {
@@ -4077,6 +4114,25 @@ mod test {
         .expect("policy mixing AWS allow and legacy deny parses");
         assert!(denied_aws_allow_legacy_deny.is_allowed(&get).await);
         assert!(!denied_aws_allow_legacy_deny.is_allowed(&put).await);
+    }
+
+    #[test]
+    fn lifecycle_policy_export_rewrites_not_action_only() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Sid":"s3:GetBucketLifecycle","Effect":"Deny","NotAction":["s3:GetBucketLifecycle","s3:ListBucket"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("NotAction policy parses");
+
+        let exported = policy.to_export_value().expect("export NotAction policy");
+        let statement = &exported["Statement"][0];
+        assert_eq!(
+            statement["NotAction"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:ListBucket"])
+        );
+        assert_eq!(statement["Sid"], "s3:GetBucketLifecycle");
+        assert!(statement.get("Action").is_none());
     }
 
     #[tokio::test]

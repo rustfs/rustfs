@@ -240,10 +240,13 @@ pub(crate) async fn build_info_service_account_resp<T: IamStore>(
             if policy.version.is_empty() {
                 policy.version = DEFAULT_VERSION.to_owned();
             }
-            serde_json::to_string_pretty(&policy).map_err(|e| {
-                debug!("marshal policy failed, e: {:?}", e);
-                s3_error!(InternalError, "marshal policy failed")
-            })
+            policy
+                .to_export_value()
+                .and_then(|document| serde_json::to_string_pretty(&document))
+                .map_err(|e| {
+                    debug!("marshal policy failed, e: {:?}", e);
+                    s3_error!(InternalError, "marshal policy failed")
+                })
         })
         .transpose()?;
 

@@ -572,7 +572,7 @@ impl<T: Store> IamSys<T> {
 
     pub async fn info_policy(&self, name: &str) -> Result<rustfs_madmin::PolicyInfo> {
         let d = self.store.get_policy_doc(name).await?;
-        let pdata = serde_json::to_value(&d.policy)?;
+        let pdata = d.policy.to_export_value()?;
 
         Ok(rustfs_madmin::PolicyInfo {
             policy_name: name.to_string(),
