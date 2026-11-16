@@ -332,9 +332,9 @@ pub enum S3Action {
     ListenBucketNotificationAction,
     #[strum(serialize = "s3:ListMultipartUploadParts")]
     ListMultipartUploadPartsAction,
-    #[strum(to_string = "s3:PutBucketLifecycle", serialize = "s3:PutLifecycleConfiguration")]
+    #[strum(to_string = "s3:PutLifecycleConfiguration", serialize = "s3:PutBucketLifecycle")]
     PutBucketLifecycleAction,
-    #[strum(to_string = "s3:GetBucketLifecycle", serialize = "s3:GetLifecycleConfiguration")]
+    #[strum(to_string = "s3:GetLifecycleConfiguration", serialize = "s3:GetBucketLifecycle")]
     GetBucketLifecycleAction,
     #[strum(serialize = "s3:PutBucketLogging")]
     PutBucketLoggingAction,

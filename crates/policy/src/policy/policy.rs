@@ -4014,16 +4014,28 @@ mod test {
 
     #[tokio::test]
     async fn lifecycle_action_aliases_preserve_policy_semantics() {
-        let policy = Policy::parse_config(
+        let policy_aws = Policy::parse_config(
             br#"{"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":["s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"arn:aws:s3:::bucket"}
             ]}"#,
         )
         .expect("policy with AWS lifecycle action names parses");
-        let serialized = serde_json::to_value(&policy).expect("serialize lifecycle policy");
+        let serialized_aws = serde_json::to_value(&policy_aws).expect("serialize lifecycle policy (AWS input)");
         assert_eq!(
-            serialized["Statement"][0]["Action"],
-            serde_json::json!(["s3:GetBucketLifecycle", "s3:PutBucketLifecycle"])
+            serialized_aws["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
+        );
+
+        let policy_legacy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetBucketLifecycle","s3:PutBucketLifecycle"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy with legacy lifecycle action names parses");
+        let serialized_legacy = serde_json::to_value(&policy_legacy).expect("serialize lifecycle policy (legacy input)");
+        assert_eq!(
+            serialized_legacy["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
         );
 
         let get = Args {
@@ -4041,18 +4053,30 @@ mod test {
             action: Action::S3Action(S3Action::PutBucketLifecycleAction),
             ..get.clone()
         };
-        assert!(policy.is_allowed(&get).await);
-        assert!(policy.is_allowed(&put).await);
+        assert!(policy_aws.is_allowed(&get).await);
+        assert!(policy_aws.is_allowed(&put).await);
+        assert!(policy_legacy.is_allowed(&get).await);
+        assert!(policy_legacy.is_allowed(&put).await);
 
-        let denied = Policy::parse_config(
+        let denied_legacy_allow_aws_deny = Policy::parse_config(
             br#"{"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":["s3:GetBucketLifecycle","s3:PutBucketLifecycle"],"Resource":"arn:aws:s3:::bucket"},
                 {"Effect":"Deny","Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}
             ]}"#,
         )
-        .expect("policy mixing legacy lifecycle actions and an AWS action name parses");
-        assert!(denied.is_allowed(&get).await);
-        assert!(!denied.is_allowed(&put).await);
+        .expect("policy mixing legacy allow and AWS deny parses");
+        assert!(denied_legacy_allow_aws_deny.is_allowed(&get).await);
+        assert!(!denied_legacy_allow_aws_deny.is_allowed(&put).await);
+
+        let denied_aws_allow_legacy_deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"arn:aws:s3:::bucket"},
+                {"Effect":"Deny","Action":"s3:PutBucketLifecycle","Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy mixing AWS allow and legacy deny parses");
+        assert!(denied_aws_allow_legacy_deny.is_allowed(&get).await);
+        assert!(!denied_aws_allow_legacy_deny.is_allowed(&put).await);
     }
 
     #[tokio::test]
