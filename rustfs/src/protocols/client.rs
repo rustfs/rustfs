@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+mod copy_test;
 mod multipart;
 mod owned;
 
@@ -25,9 +27,9 @@ use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqIn
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-use rustfs_gateway_types::compat::s3s_5761ddfe::{
-    self as gateway_s3s_compat, leaf::RequestWire, request_context::GatewayRequestContext,
-};
+use rustfs_gateway_types::compat::s3s_5761ddfe as gateway_s3s_compat;
+#[cfg(test)]
+use rustfs_gateway_types::compat::s3s_5761ddfe::{leaf::RequestWire, request_context::GatewayRequestContext};
 use rustfs_gateway_types::dto as gateway_dto;
 #[cfg(test)]
 use rustfs_gateway_types::{BucketName, OpaqueString};
@@ -175,6 +177,7 @@ fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<g
     })
 }
 
+#[cfg(test)]
 fn gateway_request_context(method: Method, uri: &http::Uri, headers: HeaderMap) -> GatewayRequestContext {
     GatewayRequestContext {
         method,
@@ -860,15 +863,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
-        let copy_source =
-            legacy_copy_source(input.copy_source.clone()).map_err(|e| conversion_error("CopyObject copy_source", e))?;
-        let context = gateway_request_context(Method::PUT, &uri, HeaderMap::new());
-        let wire = RequestWire::of(&context);
-        let input = gateway_s3s_compat::generated::ops::copy_object::input_to_s3s(input, copy_source, &wire)
-            .map_err(|e| conversion_error("CopyObject input", e))?;
-
-        let req = Self::create_request(
-            input,
+        let input = owned::copy_input(input)?;
+        let envelope = Self::create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -876,13 +872,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-
-        match self.fs.copy_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("CopyObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
+        self.owned_usecase()
+            .execute_copy_object_owned(envelope, input)
+            .await
+            .map_err(owned::copy_error)
+            .and_then(owned::copy_output)
     }
 
     async fn delete_bucket(
