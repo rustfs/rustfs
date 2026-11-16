@@ -14687,6 +14687,7 @@ const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucke
 const MULTIPART_BORROWED_KEY_GUARD: &str = "validate_table_catalog_object_mutation(bucket, key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
+const OBJECT_METADATA_BORROWED_KEY_GUARD: &str = MULTIPART_BORROWED_KEY_GUARD;
 
 fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
     let guard_calls = source.count(MULTIPART_KEY_GUARD) + source.count(MULTIPART_BORROWED_KEY_GUARD);
@@ -14701,7 +14702,7 @@ fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sour
         source.describe()
     );
     assert_eq!(
-        source.count(OBJECT_METADATA_KEY_GUARD),
+        source.count(OBJECT_METADATA_KEY_GUARD) + source.count(OBJECT_METADATA_BORROWED_KEY_GUARD),
         2,
         "reserved-prefix guard calls across {}",
         source.describe()
@@ -14718,8 +14719,7 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    // DeleteObjectTagging's call moved into the use case of batch B1; PutObjectTagging's is still on
-    // the legacy edge.
+    // Count mutation guards across the shared use cases and legacy entrypoints.
     let sources = crate::guard_sources::SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge")
         .and(crate::guard_sources::SourceSet::production("src/app/mod.rs", "src/app/object_meta"));
     assert_object_metadata_reserved_prefix_guard_calls(&sources);
@@ -14833,6 +14833,48 @@ fn multipart_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
         );
 
         let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
+fn object_metadata_key_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/mod.rs", guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2).as_str()),
+            (
+                "src/app/object_meta/retention.rs",
+                guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 2).as_str(),
+            ),
+        ],
+        "src/app/mod.rs",
+        "src/app/object_meta",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {OBJECT_METADATA_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/mod.rs", parent.as_str()),
+                ("src/app/object_meta/retention.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/mod.rs",
+            "src/app/object_meta",
+        );
+        let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
         assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
     }
 }
