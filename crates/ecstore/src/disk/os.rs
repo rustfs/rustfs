@@ -5047,7 +5047,7 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
                 false
             };
             if linked {
-                if cfg!(test) && sync_backup && !old_metadata.is_empty() {
+                if sync_backup && !old_metadata.is_empty() {
                     old_destination_file.file.sync_data()?;
                 }
             } else {
