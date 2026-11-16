@@ -18,7 +18,7 @@
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
 //! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, console static requests and the two signed server-info aliases use their native
+//! selected, console static requests and signed system-status reads use their native
 //! services; the legacy service receives the remaining claimed extension and control-plane routes.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
@@ -105,6 +105,7 @@ where
     L::Future: Send + 'static,
     G::Future: Send + 'static,
     C::Future: Send + 'static,
+    R: Default,
 {
     type Response = http::Response<R>;
     type Error = E;
@@ -125,6 +126,15 @@ where
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
         if let Some(gateway) = &mut self.gateway {
+            if claims_route(request.method(), request.uri(), request.headers())
+                && (request.headers().contains_key("x-auth-token") || request.headers().contains_key("x-storage-token"))
+            {
+                return Box::pin(async {
+                    let mut response = http::Response::new(R::default());
+                    *response.status_mut() = http::StatusCode::FORBIDDEN;
+                    Ok(response)
+                });
+            }
             if let Some(console) = &mut self.native_console
                 && claims_native_console_route(request.method(), request.uri())
             {
@@ -278,6 +288,116 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Counting {
+        name: &'static str,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for Counting {
+        type Response = Response<&'static str>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _request: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ready_future(Ok(Response::new(self.name)))
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_keystone_tokens_are_refused_before_non_s3_legacy_dispatch() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let console_path = format!("{}/index.html", crate::server::console_prefix());
+        for stack in [S3Stack::Gateway, S3Stack::Legacy] {
+            for (method, target) in [
+                (Method::GET, "/rustfs/admin/v3/info"),
+                (Method::GET, "/minio/admin/v3/info"),
+                (Method::GET, "/rustfs/admin/v3/datausageinfo"),
+                (Method::GET, "/minio/admin/v3/datausageinfo"),
+                (Method::GET, "/rustfs/admin/v4/plugins/catalog"),
+                (Method::GET, "/minio/admin/v4/plugins/catalog"),
+                (Method::GET, "/rustfs/admin/v3/module-switches"),
+                (Method::GET, "/minio/admin/v3/module-switches"),
+                (Method::POST, "/?Action=AssumeRole&Version=2011-06-15"),
+                (Method::GET, "/bucket?replication-metrics"),
+                (Method::GET, console_path.as_str()),
+            ] {
+                for header in [None, Some("x-auth-token"), Some("x-storage-token")] {
+                    let legacy_calls = Arc::new(AtomicUsize::new(0));
+                    let gateway_calls = Arc::new(AtomicUsize::new(0));
+                    let console_calls = Arc::new(AtomicUsize::new(0));
+                    let admin_calls = Arc::new(AtomicUsize::new(0));
+                    let legacy = Counting {
+                        name: "legacy",
+                        calls: Arc::clone(&legacy_calls),
+                    };
+                    let gateway = Counting {
+                        name: "gateway",
+                        calls: Arc::clone(&gateway_calls),
+                    };
+                    let console = Counting {
+                        name: "console",
+                        calls: Arc::clone(&console_calls),
+                    };
+                    let admin = Counting {
+                        name: "admin",
+                        calls: Arc::clone(&admin_calls),
+                    };
+                    let mut service = select_stack(stack, legacy, || Ok::<_, Infallible>(gateway))
+                        .unwrap()
+                        .with_native_console(Some(console))
+                        .with_native_admin(Some(admin));
+                    let mut request = request(method.clone(), target);
+                    if method == Method::POST {
+                        request
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded".parse().unwrap());
+                    }
+                    if let Some(header) = header {
+                        request.headers_mut().insert(header, "validated-token".parse().unwrap());
+                    }
+                    let response = service.call(request).await.unwrap();
+                    if stack == S3Stack::Gateway && header.is_some() {
+                        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{target} {header:?}");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0, "refused request reached legacy");
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0, "refused request reached native console");
+                        assert_eq!(admin_calls.load(Ordering::SeqCst), 0, "refused request reached native admin");
+                    } else if stack == S3Stack::Gateway && target == console_path {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"console");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 1);
+                    } else if stack == S3Stack::Gateway
+                        && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                    {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"admin");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"legacy");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0);
+                    }
+                    assert_eq!(gateway_calls.load(Ordering::SeqCst), 0, "non-S3 request reached gateway");
+                    assert_eq!(
+                        admin_calls.load(Ordering::SeqCst),
+                        usize::from(
+                            stack == S3Stack::Gateway
+                                && header.is_none()
+                                && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                        )
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_sts_form_post_stays_on_the_legacy_router_and_a_plain_post_does_not() {
         let mut service = gateway_stack();
@@ -295,7 +415,22 @@ mod tests {
     async fn native_admin_selection_is_exact_and_host_independent() {
         let mut service = gateway_stack().with_native_admin(Some(Named("admin")));
         for host in ["localhost", "bucket.s3.example.test"] {
-            for target in ["/rustfs/admin/v3/info", "/minio/admin/v3/info?detail=1"] {
+            for target in [
+                "/rustfs/admin/v3/datausageinfo",
+                "/minio/admin/v3/datausageinfo?detail=1",
+                "/rustfs/admin/v4/plugins/catalog",
+                "/minio/admin/v4/plugins/catalog?detail=1",
+                "/rustfs/admin/v3/module-switches",
+                "/minio/admin/v3/module-switches?detail=1",
+                "/rustfs/admin/v3/info",
+                "/minio/admin/v3/info?detail=1",
+                "/rustfs/admin/v3/storageinfo",
+                "/minio/admin/v3/storageinfo?detail=a%2Fb",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/minio/admin/v4/runtime/capabilities?detail=a%2Fb",
+                "/rustfs/admin/v3/object-data-cache/stats",
+                "/minio/admin/v3/object-data-cache/stats?detail=a%2Fb",
+            ] {
                 let req = Request::builder()
                     .method(Method::GET)
                     .uri(target)
@@ -303,6 +438,32 @@ mod tests {
                     .body(())
                     .unwrap();
                 assert_eq!(answered_by(&mut service, req).await, "admin", "{host} {target}");
+            }
+        }
+        for suffix in [
+            "/v3/storageinfo",
+            "/v4/runtime/capabilities",
+            "/v3/object-data-cache/stats",
+            "/v3/datausageinfo",
+            "/v4/plugins/catalog",
+            "/v3/module-switches",
+        ] {
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                for (method, tail) in [
+                    (Method::POST, ""),
+                    (Method::PUT, ""),
+                    (Method::HEAD, ""),
+                    (Method::DELETE, ""),
+                    (Method::GET, "/"),
+                    (Method::GET, "-neighbor"),
+                    (Method::GET, "?lambdaArn=arn"),
+                    (Method::GET, "?lambdaArn="),
+                    (Method::GET, "?lambdaArn=one&lambdaArn=two"),
+                    (Method::GET, "?lambdaArn=%ZZ"),
+                ] {
+                    let target = format!("{prefix}{suffix}{tail}");
+                    assert_eq!(answered_by(&mut service, request(method, &target)).await, "legacy", "{target}");
+                }
             }
         }
         for (method, target) in [

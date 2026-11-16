@@ -187,7 +187,7 @@ fn protocol_policy_denials_and_request_conditions() {
             .expect("load user")
             .0
             .expect("user exists");
-        let allow = json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"],
+        let allow = json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket"],
         "Resource":[format!("arn:aws:s3:::{bucket}"),format!("arn:aws:s3:::{bucket}/*")]});
         iam.set_policy(
             "protocol-policy",
@@ -219,9 +219,15 @@ fn protocol_policy_denials_and_request_conditions() {
                 .authorize_operation(session, &S3Action::GetObject, bucket, Some("secret.txt"))
                 .await
                 .expect("IAM allow works");
+            for action in [S3Action::HeadBucket, S3Action::DeleteBucket] {
+                backend
+                    .authorize_operation(session, &action, bucket, None)
+                    .await
+                    .expect("IAM bucket allow works");
+            }
         }
         let bucket_policy = json!({"Version":"2012-10-17","Statement":[{
-            "Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"],
+            "Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket"],
             "Resource":[format!("arn:aws:s3:::{bucket}"),format!("arn:aws:s3:::{bucket}/*")],
             "Condition":{"StringLike":{"aws:username":"*"}}
         }]});
@@ -247,8 +253,9 @@ fn protocol_policy_denials_and_request_conditions() {
                 S3Action::PutObject,
                 S3Action::DeleteObject,
                 S3Action::HeadBucket,
+                S3Action::DeleteBucket,
             ] {
-                let object = if matches!(action, S3Action::HeadBucket) {
+                let object = if matches!(action, S3Action::HeadBucket | S3Action::DeleteBucket) {
                     None
                 } else {
                     Some("secret.txt")
@@ -288,6 +295,12 @@ fn protocol_policy_denials_and_request_conditions() {
             )
             .await
             .expect("clear bucket policy");
+        for action in [S3Action::HeadBucket, S3Action::DeleteBucket] {
+            backend
+                .authorize_operation(&root_session, &action, bucket, None)
+                .await
+                .expect("root bucket access after clearing deny");
+        }
         let list_input = ListObjectsV2Input::builder()
             .bucket(BucketName::new(bucket.to_owned()).expect("valid bucket name"))
             .prefix("private /+&=照片/".into())
@@ -692,6 +705,14 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             status: "on".into(),
             ..Default::default()
         };
+        let foreign_root = Credentials {
+            access_key: "listing-foreign-root".into(),
+            secret_key: "listing-foreign-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_foreign_temp, foreign_context, _foreign_iam) = protocol_test_context(foreign_root).await;
+        crate::runtime_sources::publish_test_app_context(foreign_context);
         let (_temp, context, iam) = protocol_test_context(root).await;
         let store = context.object_store();
         let slot = ServerContextSlot::new();
@@ -759,6 +780,13 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             .insert("user-agent", "sftp-listing-test".parse().expect("user agent"));
         let list = || backend.list_buckets_for_session(&session, &session.request_headers, session.secure_transport);
 
+        let count = || {
+            rustfs_io_metrics::s3_op_metrics_snapshot()
+                .into_iter()
+                .find(|row| row.op == rustfs_s3_ops::S3Operation::ListBuckets.as_str())
+                .map_or(0, |row| row.total)
+        };
+        let before = count();
         let visible: Vec<_> = list()
             .await
             .expect("bucket-scoped listing")
@@ -767,6 +795,7 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             .map(|b| b.name.as_str().to_owned())
             .collect();
         assert_eq!(visible, ["listing-visible"], "listing is filtered to buckets the principal may list");
+        assert_eq!(count() - before, 1, "an accepted session listing is counted once");
 
         let mut insecure = session.clone();
         insecure.secure_transport = false;
@@ -841,11 +870,14 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
         .await
         .expect("disable service account");
 
+        let before = count();
         let after_disable = list().await;
         assert!(
             matches!(&after_disable, Err(e) if *e.code() == S3ErrorCode::AccessDenied),
             "a key disabled after login must stop listing buckets: {after_disable:?}"
         );
+
+        assert_eq!(count() - before, 0, "session-key refusal precedes operation dispatch");
 
         #[cfg(feature = "webdav")]
         {
