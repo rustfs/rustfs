@@ -71,6 +71,7 @@ members = [
     "crates/zip", # ZIP file handling and compression
     "crates/zstd-compat", # Fixed codec for dependencies requiring zstd 0.13
 ]
+exclude = ["vendor/hyper"]
 resolver = "3"
 
 [workspace.package]
@@ -454,4 +455,6 @@ strip = "none"
 
 # Pin upstream fixes until compatible crates.io releases are available.
 [patch.crates-io]
+# Remove after Hyper releases HTTP/2 Expect support (hyperium/hyper#4217).
+hyper = { path = "vendor/hyper" }
 zstd = { path = "crates/zstd-compat" }
