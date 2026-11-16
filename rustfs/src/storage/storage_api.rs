@@ -257,8 +257,7 @@ pub(crate) mod helper_consumer {
         MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
     };
     pub(crate) use super::super::helper::{
-        OperationHelper, build_event_resp_elements, build_owned_event_resp_elements, run_owned_mutation,
-        spawn_background_with_context,
+        OperationHelper, build_owned_event_resp_elements, run_owned_mutation, spawn_background_with_context,
     };
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;

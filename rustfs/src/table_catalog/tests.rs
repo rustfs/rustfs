@@ -14440,7 +14440,16 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             "fn execute_delete_object_fields(",
             "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
         ),
-        (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
+        (
+            legacy_delete,
+            "fn delete_objects_edge(",
+            "usecase.execute_delete_objects(envelope, req.input.into())",
+        ),
+        (
+            delete,
+            "fn execute_delete_objects(",
+            "owner.execute_delete_objects_owned(envelope, input)",
+        ),
         (
             legacy_put,
             "fn execute_put_object_extract(",
@@ -14551,6 +14560,18 @@ fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
             "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
             "owner.execute_delete_object_unchecked(envelope, bucket, key, version_id)",
         ),
+        (
+            "legacy batch uses a different use case",
+            true,
+            "usecase.execute_delete_objects(envelope, req.input.into())",
+            "usecase.execute_other_batch(envelope, req.input.into())",
+        ),
+        (
+            "batch delegate uses different input",
+            false,
+            "owner.execute_delete_objects_owned(envelope, input)",
+            "owner.execute_delete_objects_owned(envelope, changed_input)",
+        ),
         ("typed method missing", false, "fn execute_delete_object(", "fn missing_delete_object("),
         ("legacy method missing", true, "fn delete_object_edge(", "fn missing_delete_object_edge("),
         (
@@ -14596,6 +14617,12 @@ fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
                 }
                 "owner.execute_delete_object_owned(envelope, bucket, key, version_id)" => {
                     "fn execute_delete_object_fields( must call its guarded implementation"
+                }
+                "usecase.execute_delete_objects(envelope, req.input.into())" => {
+                    "fn delete_objects_edge( must call its guarded implementation"
+                }
+                "owner.execute_delete_objects_owned(envelope, input)" => {
+                    "fn execute_delete_objects( must call its guarded implementation"
                 }
                 _ => from,
             };
@@ -14687,6 +14714,7 @@ const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucke
 const MULTIPART_BORROWED_KEY_GUARD: &str = "validate_table_catalog_object_mutation(bucket, key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
+const OBJECT_METADATA_BORROWED_KEY_GUARD: &str = MULTIPART_BORROWED_KEY_GUARD;
 
 fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
     let guard_calls = source.count(MULTIPART_KEY_GUARD) + source.count(MULTIPART_BORROWED_KEY_GUARD);
@@ -14701,7 +14729,7 @@ fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sour
         source.describe()
     );
     assert_eq!(
-        source.count(OBJECT_METADATA_KEY_GUARD),
+        source.count(OBJECT_METADATA_KEY_GUARD) + source.count(OBJECT_METADATA_BORROWED_KEY_GUARD),
         2,
         "reserved-prefix guard calls across {}",
         source.describe()
@@ -14718,8 +14746,7 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    // DeleteObjectTagging's call moved into the use case of batch B1; PutObjectTagging's is still on
-    // the legacy edge.
+    // Tagging, retention and legal-hold mutations share the owned use cases across both S3 edges.
     let sources = crate::guard_sources::SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge")
         .and(crate::guard_sources::SourceSet::production("src/app/mod.rs", "src/app/object_meta"));
     assert_object_metadata_reserved_prefix_guard_calls(&sources);
@@ -14792,6 +14819,32 @@ fn multipart_count_guard_accepts_borrowed_resource_names() {
     );
 
     assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_count_guard_accepts_owned_and_borrowed_resource_names() {
+    for borrowed in 0..=2 {
+        let production = format!(
+            "{}{}{}",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 2 - borrowed),
+            guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, borrowed),
+        );
+        let source = guard_fixture(&[("src/app/mod.rs", &production)], "src/app/mod.rs", "src/app/object_meta");
+        assert_object_metadata_reserved_prefix_guard_calls(&source);
+    }
+}
+
+#[test]
+fn object_metadata_borrowed_guard_rejects_test_only_replacements() {
+    let source = format!(
+        "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mention() {{ {OBJECT_METADATA_BORROWED_KEY_GUARD} }}\n}}\n",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 1),
+    );
+    let source = guard_fixture(&[("src/app/mod.rs", &source)], "src/app/mod.rs", "src/app/object_meta");
+    let message = crate::guard_sources::panic_message(|| assert_object_metadata_reserved_prefix_guard_calls(&source));
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
 }
 
 #[test]

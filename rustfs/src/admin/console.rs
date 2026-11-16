@@ -57,7 +57,8 @@ use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(RustEmbed)]
-#[folder = "$CARGO_MANIFEST_DIR/static"]
+#[cfg_attr(test, folder = "$CARGO_MANIFEST_DIR/tests/fixtures/native-console")]
+#[cfg_attr(not(test), folder = "$CARGO_MANIFEST_DIR/static")]
 struct StaticFiles;
 
 /// Static file handler

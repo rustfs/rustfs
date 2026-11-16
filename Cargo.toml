@@ -159,6 +159,8 @@ rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "
 rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "44f9a2422d745ffba952347ec91b0332ef2667a4", version = "0.66.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
 rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "44f9a2422d745ffba952347ec91b0332ef2667a4", default-features = false }
+rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "44f9a2422d745ffba952347ec91b0332ef2667a4", version = "0.63.0", default-features = false }
+rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "44f9a2422d745ffba952347ec91b0332ef2667a4", version = "0.13.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

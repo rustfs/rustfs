@@ -481,3 +481,91 @@ fn a_forked_envelope_reads_like_the_original_and_installs_alone() {
     assert_eq!(odm(&original), Ok(None));
     assert_eq!(original.req_info().and_then(|info| info.object.clone()), None);
 }
+
+#[test]
+fn resource_free_conditions_preserve_legacy_projection_and_erased_keystone_session_facts() {
+    for original_session in [None, Some(false), Some(true)] {
+        for forwarded in [false, true] {
+            let peer: SocketAddr = "192.0.2.9:9000".parse().unwrap();
+            let mut req = legacy(|ext| {
+                ext.insert(Some(RemoteAddr(peer)));
+                if forwarded {
+                    let mut client = ClientInfo::direct("198.51.100.9:443".parse().unwrap());
+                    client.forwarded_proto = Some("https".into());
+                    ext.insert(client);
+                }
+            });
+            for (name, value) in [
+                ("user-agent", "condition-client"),
+                ("referer", "https://example.test/"),
+                ("authorization", "original-authorization"),
+                ("x-amz-security-token", "header-session"),
+                ("x-amz-server-side-encryption-customer-key", "customer-key"),
+                ("x-amz-copy-source-server-side-encryption-customer-key", "source-key"),
+                ("x-amz-meta-tag", "retained-value"),
+            ] {
+                req.headers.insert(name, value.parse().unwrap());
+            }
+            let original = rustfs_credentials::Credentials {
+                access_key: "keystone:request-user".into(),
+                parent_user: "request-parent".into(),
+                session_token: if original_session == Some(true) {
+                    "original-session".into()
+                } else {
+                    String::new()
+                },
+                expiration: Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+                groups: Some(vec!["request-group".into()]),
+                claims: Some(HashMap::from([("keystone_roles".into(), serde_json::json!(["member"]))])),
+                ..Default::default()
+            };
+            let mut credential = original.clone();
+            if original_session.is_some() {
+                credential.session_token.clear();
+            }
+            req.extensions.insert(ReqInfo {
+                cred: Some(credential.clone()),
+                keystone_session_present: original_session,
+                ..Default::default()
+            });
+            let without_clock = |mut values: HashMap<String, Vec<String>>| {
+                assert!(
+                    time::OffsetDateTime::parse(
+                        values.get("CurrentTime").unwrap()[0].as_str(),
+                        &time::format_description::well_known::Rfc3339
+                    )
+                    .is_ok()
+                );
+                assert!(values.get("EpochTime").unwrap()[0].parse::<i64>().is_ok());
+                values.remove("CurrentTime");
+                values.remove("EpochTime");
+                values
+            };
+            let expected = without_clock(crate::auth::get_condition_values_with_client_info(
+                &req.headers,
+                &original,
+                None,
+                None,
+                req.remote_addr(),
+                req.client_info(),
+            ));
+            let actual = without_clock(resource_free_condition_values(&req, &credential));
+            assert_eq!(actual, expected, "session={original_session:?}, forwarded={forwarded}");
+            assert_eq!(
+                without_clock(resource_free_condition_values(&RequestEnvelope::from_s3s(&req), &credential)),
+                expected
+            );
+            assert_eq!(
+                actual.get("username").unwrap(),
+                &vec![
+                    if original_session == Some(true) {
+                        "request-parent"
+                    } else {
+                        "keystone:request-user"
+                    }
+                    .to_owned()
+                ]
+            );
+        }
+    }
+}

@@ -31,8 +31,9 @@ pub(crate) use crate::app::object::{
 };
 pub(crate) use crate::app::object_usecase::DefaultObjectUsecase;
 pub(crate) use crate::app::object_usecase::{
-    GetObjectAttributesFields, GetObjectAttributesOutputFacts, GetObjectBody, GetObjectFields, GetObjectOutputFacts,
-    HeadObjectFields, HeadObjectOutputFacts,
+    DeleteBatchETag, DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput, GetObjectAttributesFields,
+    GetObjectAttributesOutputFacts, GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields,
+    HeadObjectOutputFacts,
 };
 
 pub(crate) mod bucket;
