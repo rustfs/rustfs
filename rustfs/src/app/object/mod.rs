@@ -86,8 +86,7 @@ use super::storage_api::object_usecase::error::{
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::object_usecase::helper::{
-    OperationHelper, build_event_resp_elements, build_owned_event_resp_elements, run_owned_mutation,
-    spawn_background_with_context,
+    OperationHelper, build_owned_event_resp_elements, run_owned_mutation, spawn_background_with_context,
 };
 use super::storage_api::object_usecase::io::{
     DynReader, EtagAlgorithm, HashReader, WritePlan, compression_metadata_value, wrap_reader,
@@ -220,6 +219,8 @@ pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySou
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) mod cuobject;
 mod delete;
+mod delete_batch_types;
+pub(crate) use delete_batch_types::*;
 mod extract;
 mod get;
 mod get_response;
