@@ -521,7 +521,7 @@ impl EndpointTopology {
                     }
                 };
 
-                topology.aliases.entry(host_port.clone()).or_insert(member_index);
+                topology.aliases.entry(host_port).or_insert(member_index);
                 topology.aliases.entry(ep.to_string()).or_insert(member_index);
                 if let Some(display_endpoint) = ep.url.host_str() {
                     match display_aliases.entry(display_endpoint.to_owned()) {

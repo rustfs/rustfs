@@ -2137,7 +2137,7 @@ mod multipart_proof_authority_tests {
             assert_eq!(expected, snapshot);
             assert_eq!(actual_round, round);
             let publication = PublicationIdentity {
-                lineage: round.lineage.clone(),
+                lineage: round.lineage,
                 source_generation: snapshot.generation,
                 attempt: Uuid::new_v4(),
                 version_id: None,
@@ -2145,7 +2145,7 @@ mod multipart_proof_authority_tests {
                 modified_unix_nanos: nanos,
                 completion_identity: [6; 32],
             };
-            snapshot.publication = Some(publication.clone());
+            snapshot.publication = Some(publication);
             let response = MultipartSourceResponse::TerminalConfirmed(
                 MultipartSourceProof::issue(
                     &authority,

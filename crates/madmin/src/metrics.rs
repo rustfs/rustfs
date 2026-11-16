@@ -1537,7 +1537,7 @@ impl RealtimeMetrics {
         self.hosts.sort();
 
         for (k, v) in other.by_disk.into_iter() {
-            self.by_disk.entry(k.to_string()).and_modify(|h| *h = v.clone()).or_insert(v);
+            self.by_disk.entry(k).and_modify(|h| *h = v.clone()).or_insert(v);
         }
     }
 }

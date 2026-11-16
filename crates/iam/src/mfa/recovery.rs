@@ -379,8 +379,8 @@ mod tests {
         let mut stored = generated.stored;
         assert_eq!(remaining(&stored), RECOVERY_CODE_COUNT as u32);
 
-        for index in 0..3 {
-            consume(&mut stored, &generated.plaintext[index], now());
+        for code in generated.plaintext.iter().take(3) {
+            consume(&mut stored, code, now());
         }
         assert_eq!(remaining(&stored), (RECOVERY_CODE_COUNT - 3) as u32);
     }
