@@ -19,7 +19,7 @@ use std::{convert::Infallible, future::Future, sync::Arc, time::Duration};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -119,6 +119,71 @@ async fn h2_expect_continue_unblocks_sequential_upload_parts_once_each() {
             continued(&mut response).await;
             body.send_data(Bytes::from_static(b"hello"), true)
                 .expect("DATA after Continue");
+            final_response(response, StatusCode::OK).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn h2_expect_continue_wakes_when_body_is_read_in_spawned_task() {
+    bounded(async {
+        let mut client = connect(service_fn(|request: Request<Incoming>| async move {
+            tokio::spawn(async move { consume(request).await })
+                .await
+                .expect("body reader task")
+        }))
+        .await;
+        let (mut response, mut body) = client
+            .sender
+            .send_request(request(Some("100-continue"), false), false)
+            .expect("request headers");
+        continued(&mut response).await;
+        body.send_data(Bytes::from_static(b"hello"), true)
+            .expect("DATA after Continue");
+        final_response(response, StatusCode::OK).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn h2_expect_continue_preserves_size_hint_trailers_and_eof() {
+    bounded(async {
+        let mut client = connect(service_fn(|request: Request<Incoming>| async move {
+            let mut body = request.into_body();
+            assert_eq!(body.size_hint().exact(), Some(5));
+            assert!(!body.is_end_stream());
+            let data = body
+                .frame()
+                .await
+                .expect("DATA frame")
+                .expect("valid DATA")
+                .into_data()
+                .expect("first frame is DATA");
+            assert_eq!(data, Bytes::from_static(b"hello"));
+            assert_eq!(body.size_hint().exact(), Some(0));
+            let remaining = (&mut body).collect().await.expect("remaining frames");
+            assert_eq!(remaining.trailers().expect("request trailers")["x-test-trailer"], "preserved");
+            assert!(remaining.to_bytes().is_empty());
+            assert!(body.is_end_stream());
+            assert!(body.frame().await.is_none());
+            Ok::<_, Infallible>(Response::new(Empty::new()))
+        }))
+        .await;
+        // Both paths use the same H2 body representation after Continue has fired.
+        for expect in [Some("100-continue"), None] {
+            let (mut response, mut body) = client
+                .sender
+                .send_request(request(expect, false), false)
+                .expect("request headers");
+            if expect.is_some() {
+                continued(&mut response).await;
+            }
+            body.send_data(Bytes::from_static(b"hello"), false)
+                .expect("DATA without END_STREAM");
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-test-trailer", http::HeaderValue::from_static("preserved"));
+            body.send_trailers(trailers).expect("trailers with END_STREAM");
             final_response(response, StatusCode::OK).await;
         }
     })
