@@ -3657,6 +3657,11 @@ fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bo
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
 
+// Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
+// for their in-flight replies without spending the connection's protocol-error
+// budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
+
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
     rustfs_utils::get_env_bool(
@@ -4110,6 +4115,7 @@ async fn dial_channel(
     let conn_window = checked_rpc_window(conn_window)?;
     let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
         .concurrency_limit(concurrency_limit)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS)
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -4265,6 +4271,9 @@ pub async fn evict_failed_connection_with_reason(
         }
     }
 }
+
+#[cfg(test)]
+mod reset_stream_tests;
 
 #[cfg(test)]
 mod tests {
