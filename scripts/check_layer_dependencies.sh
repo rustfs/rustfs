@@ -22,6 +22,8 @@ classify_source_layer() {
     printf 'composition'
   elif [[ "$file" == rustfs/src/app/* ]]; then
     printf 'app'
+  elif [[ "$file" == rustfs/src/protocols/client.rs ]] || [[ "$file" == rustfs/src/protocols/client/* ]]; then
+    printf 'interface'
   elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] ||
     [[ "$file" == rustfs/src/storage/legacy_edge/* ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]] ||
     [[ "$file" == rustfs/src/storage/s3_compat/* ]]; then
@@ -46,6 +48,12 @@ classify_target_layer() {
       # Server files are composition roots when they import lower layers, but
       # their exported HTTP contracts belong to the interface boundary.
       printf 'interface'
+      ;;
+    protocols)
+      case "${path#protocols::}" in
+        client | client::* | ProtocolStorageClient | ProtocolStorageClient::*) printf 'interface' ;;
+        *) printf 'infra' ;;
+      esac
       ;;
     app)
       printf 'app'
@@ -147,6 +155,16 @@ run_layer_model_self_tests() {
   assert_source_layer 'interface' rustfs/src/storage/legacy_edge/tests/object_meta.rs
   assert_source_layer 'infra' rustfs/src/storage/legacy_edge.rs
   assert_source_layer 'infra' rustfs/src/storage/legacy_edge_helper.rs
+  assert_source_layer 'interface' rustfs/src/protocols/client.rs
+  assert_source_layer 'interface' rustfs/src/protocols/client/owned.rs
+  assert_source_layer 'infra' rustfs/src/protocols/client_helper.rs
+  assert_target_layer 'interface' protocols::client
+  assert_target_layer 'interface' protocols::client::ProtocolStorageClient
+  assert_target_layer 'interface' protocols::ProtocolStorageClient
+  assert_target_layer 'infra' protocols::client_helper
+  assert_dependency_direction 'allowed' "$(classify_source_layer rustfs/src/protocols/client/owned.rs)" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$(classify_target_layer protocols::client::ProtocolStorageClient)"
+  assert_dependency_direction 'reverse' "$app_source" "$(classify_target_layer protocols::ProtocolStorageClient)"
   assert_source_layer 'app' rustfs/src/app/bucket_usecase/cors.rs
   assert_source_layer 'app' rustfs/src/app/multipart_usecase/complete.rs
   assert_target_layer 'interface' storage::legacy_edge
