@@ -14440,7 +14440,16 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             "fn execute_delete_object_fields(",
             "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
         ),
-        (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
+        (
+            legacy_delete,
+            "fn delete_objects_edge(",
+            "usecase.execute_delete_objects(envelope, req.input.into())",
+        ),
+        (
+            delete,
+            "fn execute_delete_objects(",
+            "owner.execute_delete_objects_owned(envelope, input)",
+        ),
         (
             legacy_put,
             "fn execute_put_object_extract(",
@@ -14551,6 +14560,18 @@ fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
             "owner.execute_delete_object_owned(envelope, bucket, key, version_id)",
             "owner.execute_delete_object_unchecked(envelope, bucket, key, version_id)",
         ),
+        (
+            "legacy batch uses a different use case",
+            true,
+            "usecase.execute_delete_objects(envelope, req.input.into())",
+            "usecase.execute_other_batch(envelope, req.input.into())",
+        ),
+        (
+            "batch delegate uses different input",
+            false,
+            "owner.execute_delete_objects_owned(envelope, input)",
+            "owner.execute_delete_objects_owned(envelope, changed_input)",
+        ),
         ("typed method missing", false, "fn execute_delete_object(", "fn missing_delete_object("),
         ("legacy method missing", true, "fn delete_object_edge(", "fn missing_delete_object_edge("),
         (
@@ -14596,6 +14617,12 @@ fn object_mutation_reserved_prefix_guard_rejects_broken_delete_chains() {
                 }
                 "owner.execute_delete_object_owned(envelope, bucket, key, version_id)" => {
                     "fn execute_delete_object_fields( must call its guarded implementation"
+                }
+                "usecase.execute_delete_objects(envelope, req.input.into())" => {
+                    "fn delete_objects_edge( must call its guarded implementation"
+                }
+                "owner.execute_delete_objects_owned(envelope, input)" => {
+                    "fn execute_delete_objects( must call its guarded implementation"
                 }
                 _ => from,
             };
