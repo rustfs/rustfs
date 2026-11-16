@@ -432,6 +432,8 @@ mod tests {
                 "/minio/admin/v4/runtime/capabilities?detail=a%2Fb",
                 "/rustfs/admin/v3/object-data-cache/stats",
                 "/minio/admin/v3/object-data-cache/stats?detail=a%2Fb",
+                "/iceberg/v1/config",
+                "/_iceberg/v1/config?warehouse=warehouse-a",
             ] {
                 let req = Request::builder()
                     .method(Method::GET)
@@ -476,7 +478,12 @@ mod tests {
             (Method::GET, "/%72ustfs/admin/v3/info"),
             (Method::GET, "/rustfs/admin/v4/info"),
             (Method::POST, "/rustfs/admin/v3/info"),
-            (Method::GET, "/iceberg/v1/config"),
+            (Method::POST, "/iceberg/v1/config"),
+            (Method::POST, "/_iceberg/v1/config"),
+            (Method::GET, "/iceberg/v1/config/"),
+            (Method::GET, "/_iceberg/v1/config-neighbor"),
+            (Method::GET, "/iceberg/v10/config"),
+            (Method::GET, "/_iceberg/v1suffix/config"),
             (Method::GET, "/profile/cpu"),
             (Method::GET, "/bucket?events"),
             (Method::GET, "/bucket/key"),
