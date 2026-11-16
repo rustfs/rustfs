@@ -24,7 +24,7 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, is_connectivity_error,
+        TargetTlsState, TargetType, build_event_key, build_queued_payload, build_target_tls_fingerprint, is_connectivity_error,
         open_target_queue_store, persist_queued_payload_to_store,
     },
 };
@@ -291,6 +291,16 @@ impl KafkaArgs {
     }
 }
 
+fn build_kafka_record<'a>(
+    topic: &'a str,
+    body: &'a [u8],
+    meta: &QueuedPayloadMeta,
+) -> Result<Record<'a, String, &'a [u8]>, TargetError> {
+    // Queue metadata carries the form-encoded S3 key, including on replay.
+    let key = build_event_key(&meta.bucket_name, &meta.object_name)?;
+    Ok(Record::from_key_value(topic, key, body))
+}
+
 /// A target that sends events to an Apache Kafka topic
 pub struct KafkaTarget<E>
 where
@@ -459,6 +469,8 @@ where
             "Sending Kafka payload"
         );
 
+        let record = build_kafka_record(&self.args.topic, &body, meta)?;
+
         // rustfs-kafka-async does not validate response correlation IDs. Keep
         // producer selection, send, and timeout invalidation serialized so a
         // waiter cannot reuse a connection with an unread timed-out response.
@@ -467,12 +479,8 @@ where
             &self.delivery_poisoned,
             || self.get_or_build_producer(),
             |producer| async move {
-                // Use "<bucket>/<object>" as the message key so all events for the same
-                // object hash to the same partition and preserve per-object ordering
-                // across multiple partitions (backlog#983).
-                let partition_key = format!("{}/{}", meta.bucket_name, meta.object_name);
                 producer
-                    .send(&Record::from_key_value(&self.args.topic, partition_key, body.as_slice()))
+                    .send(&record)
                     .await
                     .map_err(|err| Self::map_kafka_error(err, "Failed to send message to Kafka"))
             },
@@ -659,6 +667,68 @@ mod tests {
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn kafka_record_key_matches_envelope_for_live_and_queued_events() {
+        let target = KafkaTarget::<serde_json::Value>::new("test".to_string(), base_args())
+            .expect("Kafka target configuration should be valid");
+        let cases = [
+            ("file.txt", "file.txt"),
+            ("test-ns%2Fsflm%2FusecaseB%2Ffile.txt", "test-ns/sflm/usecaseB/file.txt"),
+            ("red+flower.jpg", "red flower.jpg"),
+            ("red%20flower.jpg", "red flower.jpg"),
+            ("a%2Bb%2Fc.txt", "a+b/c.txt"),
+            ("literal%252F%2B%252B%2B%25.txt", "literal%2F+%2B+%.txt"),
+            ("%E7%9B%AE%E5%BD%95%2F%E6%96%87%E4%BB%B6.txt", "目录/文件.txt"),
+            ("%2Fleading%2F", "/leading/"),
+            ("", ""),
+        ];
+        for (encoded, decoded) in cases {
+            let event = EntityTarget {
+                object_name: encoded.to_string(),
+                bucket_name: "test-bucket".to_string(),
+                event_name: crate::EventName::ObjectCreatedPut,
+                data: serde_json::json!({"s3": {"object": {"key": encoded}}}),
+            };
+            let live = target.build_queued_payload(&event).expect("event should serialize");
+            let stored = live.encode().expect("queued payload should encode");
+            let replay = QueuedPayload::decode(&stored).expect("existing queue format should decode");
+            for queued in [&live, &replay] {
+                let record =
+                    build_kafka_record(&target.args.topic, &queued.body, &queued.meta).expect("Kafka record should build");
+                let envelope: serde_json::Value = serde_json::from_slice(record.value).expect("record body should be JSON");
+                assert_eq!(record.key, format!("test-bucket/{decoded}"), "encoded object name: {encoded}");
+                assert_eq!(envelope["Key"], record.key);
+                assert_eq!(envelope["Records"][0]["s3"]["object"]["key"], encoded);
+                assert_eq!(queued.meta.object_name, encoded);
+                assert_eq!(record.topic, "rustfs-events");
+                assert_eq!(record.value.as_ptr(), queued.body.as_ptr(), "record should borrow the body");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kafka_record_rejects_invalid_utf8_before_delivery() {
+        let target = KafkaTarget::<serde_json::Value>::new("test".to_string(), base_args())
+            .expect("Kafka target configuration should be valid");
+        let meta = QueuedPayloadMeta::new(
+            crate::EventName::ObjectCreatedPut,
+            "test-bucket".to_string(),
+            "%FF".to_string(),
+            "application/json",
+            2,
+        );
+        let queued = QueuedPayload::new(meta, b"{}".to_vec());
+        let stored = queued.encode().expect("corrupt event metadata should serialize");
+        let replay = QueuedPayload::decode(&stored).expect("queue framing should decode");
+        let error = target
+            .send_body(replay.body, &replay.meta)
+            .await
+            .expect_err("invalid UTF-8 should reject delivery");
+        assert!(matches!(error, TargetError::Encoding(_)), "unexpected error: {error}");
+        assert!(target.producer.lock().await.is_none());
+        assert!(!target.delivery_poisoned.load(Ordering::Acquire));
     }
 
     #[tokio::test(start_paused = true)]

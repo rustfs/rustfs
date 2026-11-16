@@ -17,6 +17,7 @@
 //! downstream: the gateway signature verifier and the real admin handlers.
 
 use super::{GatewayAssembly, GatewayAssemblyError, GatewayStack};
+use crate::admin::handlers::cluster_snapshot::GetClusterSnapshotHandler;
 use crate::admin::handlers::module_switch::GetModuleSwitchesHandler;
 use crate::admin::handlers::object_data_cache::ObjectDataCacheStatsHandler;
 use crate::admin::handlers::plugins_catalog::GetPluginCatalogHandler;
@@ -33,16 +34,18 @@ use rustfs_gateway_core::dialect::{ClaimedRoute, Dialect, DialectBuilder, Dialec
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
     get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_v4_cluster_snapshot::GetV4ClusterSnapshot, get_v4_plugins_catalog::GetV4PluginsCatalog,
+    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_gateway_dialect_rustfs_admin::{AdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY};
 use rustfs_s3_types::{Body, S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 
-const OPERATIONS: [&str; 7] = [
+const OPERATIONS: [&str; 8] = [
     GetV3Info::NAME,
     GetV3Datausageinfo::NAME,
     GetV4PluginsCatalog::NAME,
+    GetV4ClusterSnapshot::NAME,
     GetV3ModuleSwitches::NAME,
     GetV3Storageinfo::NAME,
     GetV4RuntimeCapabilities::NAME,
@@ -77,6 +80,7 @@ pub(super) fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     let builder = declare::<GetV3ObjectDataCacheStats>(builder);
     let builder = declare::<GetV3Datausageinfo>(builder);
     let builder = declare::<GetV4PluginsCatalog>(builder);
+    let builder = declare::<GetV4ClusterSnapshot>(builder);
     declare::<GetV3ModuleSwitches>(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
@@ -120,6 +124,10 @@ pub(super) fn assemble(
         .register::<GetV4PluginsCatalog, _>(Arc::new(AdminBridge {
             server_ctx: assembly.server_ctx.clone(),
             handler: &GetPluginCatalogHandler {},
+        }))
+        .register::<GetV4ClusterSnapshot, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &GetClusterSnapshotHandler {},
         }))
         .register::<GetV3ModuleSwitches, _>(Arc::new(AdminBridge {
             server_ctx: assembly.server_ctx,
