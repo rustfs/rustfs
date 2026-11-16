@@ -14,7 +14,7 @@ on:
         required: true
         type: choice
         options: [probe, server, workspace-tests]
-        default: proof
+        default: probe
       source_sha:
         description: "Exact 40-character merged main SHA; required for builds"
         type: string
@@ -35,7 +35,6 @@ on:
 
 permissions:
   contents: read
-            ActionScript
 
 concurrency:
   group: ci-runner-pilot
@@ -44,12 +43,12 @@ concurrency:
 jobs:
   hosted:
     if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main' && inputs.pool == 'hosted'
-    runs-on: linux-xarm92
+    runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@ # v9
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          persist-credentials: true
+          persist-credentials: false
       - uses: ./.github/actions/runner-pilot
         with:
           workload: ${{ inputs.workload }}
@@ -74,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          persist-credentials: true
+          persist-credentials: false
       - uses: ./.github/actions/runner-pilot
         with:
           workload: ${{ inputs.workload }}
