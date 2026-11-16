@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod owned;
+
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
@@ -494,38 +496,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let mut builder = GetObjectInput::builder().bucket(bucket.to_string()).key(key.to_string());
-
-        // Add range header if start_pos is specified
-        if let Some(start) = start_pos {
-            let range = s3s::dto::Range::Int {
-                first: start,
-                last: None, // Read to end of file
-            };
-            builder = builder.range(Some(range));
-        }
-
-        let input = builder.build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
-        })?;
-
-        let uri = build_object_uri(bucket, key, &[])?;
-        let req = Self::create_request(
-            input,
-            Method::GET,
-            uri,
-            RequestParams {
-                bucket: Some(bucket.to_string()),
-                object: Some(key.to_string()),
-                credentials,
-            },
-        )?;
-
-        match self.fs.get_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("GetObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        self.get_object_owned(
+            bucket,
+            key,
+            credentials,
+            start_pos.map(|first| rustfs_gateway_types::ByteRange::From { first }),
+        )
+        .await
     }
 
     async fn put_object(
@@ -588,31 +565,20 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     ) -> Result<gateway_dto::DeleteObjectOutput, Self::Error> {
         trace_protocol_request("delete_object", Some(bucket), Some(key));
 
-        let input = DeleteObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .build()
-            .map_err(|e| {
-                s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build DeleteObjectInput: {}", e))
-            })?;
-
         let uri = build_object_uri(bucket, key, &[])?;
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
-                bucket: Some(bucket.to_string()),
-                object: Some(key.to_string()),
+                bucket: Some(bucket.to_owned()),
+                object: Some(key.to_owned()),
                 credentials,
             },
-        )?;
-
-        match self.fs.delete_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::delete_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("DeleteObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::DeleteObject);
+        self.owned_usecase()
+            .execute_delete_object_fields(envelope, bucket.to_owned(), key.to_owned(), None)
+            .await
     }
 
     async fn head_object(
@@ -623,31 +589,32 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     ) -> Result<gateway_dto::HeadObjectOutput, Self::Error> {
         trace_protocol_request("head_object", Some(bucket), Some(key));
 
-        let input = HeadObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .build()
-            .map_err(|e| {
-                s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build HeadObjectInput: {}", e))
-            })?;
-
         let uri = build_object_uri(bucket, key, &[])?;
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::HEAD,
             uri,
             RequestParams {
-                bucket: Some(bucket.to_string()),
-                object: Some(key.to_string()),
+                bucket: Some(bucket.to_owned()),
+                object: Some(key.to_owned()),
                 credentials,
             },
-        )?;
-
-        match self.fs.head_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::head_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("HeadObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+        self.owned_usecase()
+            .execute_head_object_fields(
+                envelope,
+                crate::app::object_usecase::HeadObjectFields {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    version_id: None,
+                    part_number: None,
+                    range: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                },
+            )
+            .await
+            .and_then(|answered| owned::head_output(answered.output))
     }
 
     async fn head_bucket(
@@ -891,37 +858,16 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let range = s3s::dto::Range::Int {
-            first: start_pos,
-            last: Some(start_pos + length - 1),
-        };
-
-        let input = GetObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .range(Some(range))
-            .build()
-            .map_err(|e| {
-                s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
-            })?;
-
-        let uri = build_object_uri(bucket, key, &[])?;
-        let req = Self::create_request(
-            input,
-            Method::GET,
-            uri,
-            RequestParams {
-                bucket: Some(bucket.to_string()),
-                object: Some(key.to_string()),
-                credentials,
-            },
-        )?;
-
-        match self.fs.get_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("GetObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        self.get_object_owned(
+            bucket,
+            key,
+            credentials,
+            Some(rustfs_gateway_types::ByteRange::FromTo {
+                first: start_pos,
+                last: start_pos + length - 1,
+            }),
+        )
+        .await
     }
 
     async fn copy_object(
@@ -1403,16 +1349,30 @@ mod tests {
             },
         )
         .expect("request should build");
-        let request_info = request.extensions.get::<ReqInfo>().expect("request info should be present");
-        let copied = request_info.cred.as_ref().expect("credentials should be present");
-
-        assert_eq!(copied.access_key, credentials.access_key);
-        assert_eq!(copied.secret_key, credentials.secret_key);
-        assert_eq!(copied.session_token, credentials.session_token);
-        assert_eq!(copied.parent_user, credentials.parent_user);
-        assert_eq!(copied.groups, credentials.groups);
-        assert_eq!(copied.claims, Some(claims));
-        assert!(copied.is_service_account());
+        let envelope = ProtocolStorageClient::create_envelope(
+            Method::GET,
+            http::Uri::from_static("/bucket?list-type=2"),
+            RequestParams {
+                bucket: Some("bucket".to_owned()),
+                object: None,
+                credentials: &credentials,
+            },
+        );
+        assert_eq!(envelope.uri(), &request.uri);
+        assert_eq!(envelope.headers(), &request.headers);
+        for request_info in [
+            request.extensions.get::<ReqInfo>().expect("request info should be present"),
+            envelope.req_info().expect("owned request info"),
+        ] {
+            let copied = request_info.cred.as_ref().expect("credentials should be present");
+            assert_eq!(copied.access_key, credentials.access_key);
+            assert_eq!(copied.secret_key, credentials.secret_key);
+            assert_eq!(copied.session_token, credentials.session_token);
+            assert_eq!(copied.parent_user, credentials.parent_user);
+            assert_eq!(copied.groups, credentials.groups);
+            assert_eq!(copied.claims, Some(claims.clone()));
+            assert!(copied.is_service_account());
+        }
     }
 
     #[cfg(any(feature = "webdav", feature = "sftp"))]
@@ -1522,5 +1482,209 @@ mod tests {
         let uri = build_bucket_uri("bucket", &[("list-type", Some("2"))]).expect("uri should parse");
 
         assert_eq!(uri.to_string(), "/bucket?list-type=2");
+    }
+    #[test]
+    #[serial_test::serial]
+    fn protocol_mainflow_markers_versions_and_errors_match_legacy() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-mainflow-oracle", || async {
+            use crate::runtime_sources::ServerContextSlot;
+            use crate::storage_api::protocols::client::{
+                BucketOperations, MakeBucketOptions, ObjectIO, StorageObjectOptions, StoragePutObjReader,
+            };
+            use http_body_util::BodyExt;
+            use rustfs_protocols::common::client::s3::StorageBackend;
+            let root = rustfs_credentials::Credentials {
+                access_key: "protocol-oracle-root".into(),
+                secret_key: "protocol-oracle-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
+            let (_temp, context, _iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let store = context.object_store();
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context));
+            let fs = FS::with_server_ctx(slot);
+            let backend = ProtocolStorageClient::new(fs.clone());
+            for (bucket, key, data, versioned) in [
+                ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
+                ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
+            ] {
+                store
+                    .make_bucket(
+                        bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: versioned,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create bucket");
+                let mut reader = StoragePutObjReader::from_vec(data.to_vec());
+                store
+                    .put_object(
+                        bucket,
+                        key,
+                        &mut reader,
+                        &StorageObjectOptions {
+                            versioned,
+                            mod_time: Some(
+                                time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+                                    .expect("valid test time")
+                                    .replace_nanosecond(123_456_789)
+                                    .expect("valid nanoseconds"),
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed object");
+                let params = || RequestParams {
+                    bucket: Some(bucket.to_owned()),
+                    object: Some(key.to_owned()),
+                    credentials: &root,
+                };
+                let uri = build_object_uri(bucket, key, &[]).expect("object URI");
+                let old = fs
+                    .get_object(
+                        ProtocolStorageClient::create_request(
+                            GetObjectInput::builder()
+                                .bucket(bucket.to_owned())
+                                .key(key.to_owned())
+                                .build()
+                                .expect("old GET input"),
+                            Method::GET,
+                            uri.clone(),
+                            params(),
+                        )
+                        .expect("old GET request"),
+                    )
+                    .await
+                    .expect("old GET");
+                let old = gateway_s3s_compat::generated::ops::get_object::output_from_s3s(old.output).expect("old GET output");
+                if versioned {
+                    assert_eq!(old.last_modified.expect("old LastModified").subsec_nanos(), 123_000_000);
+                }
+                let current = backend.get_object(bucket, key, &root, None).await.expect("protocol GET");
+                assert_eq!(current.last_modified, old.last_modified);
+                assert_eq!(current.version_id, old.version_id);
+                assert_eq!(current.version_id.is_some(), versioned);
+                assert_eq!(current.e_tag, old.e_tag);
+                assert_eq!(current.content_length, old.content_length);
+                let collect = |output: gateway_dto::GetObjectOutput| async move {
+                    output
+                        .body
+                        .expect("GET body")
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read body")
+                        .to_bytes()
+                };
+                assert_eq!(collect(current).await, collect(old).await);
+                let old = fs
+                    .head_object(
+                        ProtocolStorageClient::create_request(
+                            HeadObjectInput::builder()
+                                .bucket(bucket.to_owned())
+                                .key(key.to_owned())
+                                .build()
+                                .expect("old HEAD input"),
+                            Method::HEAD,
+                            uri,
+                            params(),
+                        )
+                        .expect("old HEAD request"),
+                    )
+                    .await
+                    .expect("old HEAD");
+                let old = gateway_s3s_compat::generated::ops::head_object::output_from_s3s(old.output).expect("old HEAD output");
+                if versioned {
+                    assert_eq!(old.last_modified.expect("old LastModified").subsec_nanos(), 123_000_000);
+                }
+                let current = backend.head_object(bucket, key, &root).await.expect("protocol HEAD");
+                assert_eq!(current.last_modified, old.last_modified);
+                assert_eq!(current.version_id, old.version_id);
+                assert_eq!(current.e_tag, old.e_tag);
+                assert_eq!(current.content_length, old.content_length);
+                let deleted = backend.delete_object(bucket, key, &root).await.expect("protocol DELETE");
+                if versioned {
+                    assert_eq!(deleted.delete_marker, Some(true));
+                }
+                assert_eq!(deleted.version_id.is_some(), versioned);
+                let old_error: rustfs_s3_types::S3Error = fs
+                    .get_object(
+                        ProtocolStorageClient::create_request(
+                            GetObjectInput::builder()
+                                .bucket(bucket.to_owned())
+                                .key(key.to_owned())
+                                .build()
+                                .expect("old GET input"),
+                            Method::GET,
+                            build_object_uri(bucket, key, &[]).expect("object URI"),
+                            params(),
+                        )
+                        .expect("old GET request"),
+                    )
+                    .await
+                    .expect_err("old GET deleted object")
+                    .into();
+                let current = backend
+                    .get_object(bucket, key, &root, None)
+                    .await
+                    .expect_err("protocol GET deleted object");
+                assert_eq!(current.code(), old_error.code());
+                assert_eq!(current.status_code(), old_error.status_code());
+                assert_eq!(current.headers(), old_error.headers());
+                if versioned {
+                    let headers = current.headers().expect("delete marker error headers");
+                    assert_eq!(
+                        headers
+                            .get("x-amz-version-id")
+                            .expect("marker version")
+                            .to_str()
+                            .expect("version text"),
+                        deleted.version_id.as_deref().expect("delete version")
+                    );
+                }
+            }
+        });
+    }
+    #[test]
+    fn protocol_mainflow_retention_timestamp_matches_legacy_precision() {
+        use crate::app::object_usecase::{GetObjectOutputFacts, HeadObjectOutputFacts};
+        let instant = rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_456_789).expect("test timestamp");
+        let get = || GetObjectOutputFacts {
+            dto: gateway_dto::GetObjectOutput {
+                object_lock_retain_until_date: Some(instant),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let head = || HeadObjectOutputFacts {
+            dto: gateway_dto::HeadObjectOutput {
+                object_lock_retain_until_date: Some(instant),
+                ..Default::default()
+            },
+            etag: None,
+        };
+        let old_get =
+            gateway_s3s_compat::generated::ops::get_object::output_from_s3s(get().into_s3s().expect("old GET projection"))
+                .expect("old GET output");
+        let old_head =
+            gateway_s3s_compat::generated::ops::head_object::output_from_s3s(head().into_s3s().expect("old HEAD projection"))
+                .expect("old HEAD output");
+        let old = (old_get.object_lock_retain_until_date, old_head.object_lock_retain_until_date);
+        let expected =
+            Some(rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("millisecond timestamp"));
+        assert_eq!(old, (expected, expected));
+        let current = (
+            owned::get_output(get())
+                .expect("protocol GET output")
+                .object_lock_retain_until_date,
+            owned::head_output(head())
+                .expect("protocol HEAD output")
+                .object_lock_retain_until_date,
+        );
+        assert_eq!(current, old);
     }
 }

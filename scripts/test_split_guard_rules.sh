@@ -286,6 +286,18 @@ for silent in ${REAL_SPLIT_FILES[@]+"${REAL_SPLIT_FILES[@]}"}; do
 done
 
 # --- layer dependencies ------------------------------------------------------
+# Protocol edges may call the app; app code cannot call either public client path.
+mkdir -p "$FX/rustfs/src/protocols/client"
+cat >"$FX/rustfs/src/protocols/client/layer_probe.rs" <<'PROTOCOL_EDGE'
+use crate::app::RequestEnvelope;
+PROTOCOL_EDGE
+cat >"$FX/rustfs/src/protocols/client_helper.rs" <<'PROTOCOL_NEIGHBOR'
+use crate::app::RequestEnvelope;
+PROTOCOL_NEIGHBOR
+cat >"$FX/rustfs/src/app/protocol_client_layer_probe.rs" <<'PROTOCOL_REVERSE'
+use crate::protocols::client::ProtocolStorageClient;
+use crate::protocols::ProtocolStorageClient;
+PROTOCOL_REVERSE
 LAYER_OUT="$FX/.layer.out"
 if (cd "$FX" && ./scripts/check_layer_dependencies.sh) >"$LAYER_OUT" 2>&1; then
   fail "layer guard passed over a planted reverse dependency"
@@ -294,6 +306,10 @@ expect_reported "$LAYER_OUT" "dep|$E|interface->composition|" "crate::startup_se
 expect_silent "$LAYER_OUT" "dep|$EDGE_IMPORTS|" "moved ecfs imports stay legal"
 expect_silent "$LAYER_OUT" "dep|rustfs/src/app/lifecycle_transition_api_test/" "moved lifecycle transition tests stay excluded"
 expect_silent "$LAYER_OUT" "dep|$LISTING|" "moved bucket usecase code keeps the app layer"
+expect_silent "$LAYER_OUT" "dep|rustfs/src/protocols/client/layer_probe.rs|" "protocol client edge may use app contracts"
+expect_reported "$LAYER_OUT" "dep|rustfs/src/protocols/client_helper.rs|infra->app|" "crate::app::RequestEnvelope" "neighboring protocol helper remains infrastructure"
+expect_reported "$LAYER_OUT" "dep|rustfs/src/app/protocol_client_layer_probe.rs|app->interface|" "crate::protocols::client::ProtocolStorageClient" "app cannot import the protocol client module"
+expect_reported "$LAYER_OUT" "dep|rustfs/src/app/protocol_client_layer_probe.rs|app->interface|" "crate::protocols::ProtocolStorageClient" "app cannot import the protocol client re-export"
 
 # --- logging hot span --------------------------------------------------------
 LOG_OUT="$FX/.logging.out"
