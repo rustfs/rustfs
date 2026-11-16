@@ -36,6 +36,7 @@ use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
+#[cfg(test)]
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
 use std::fmt::Display;
@@ -792,27 +793,19 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     ) -> Result<gateway_dto::CreateBucketOutput, Self::Error> {
         trace_protocol_request("create_bucket", Some(bucket), None);
 
-        let input = CreateBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build CreateBucketInput: {}", e))
-        })?;
-
         let uri = build_bucket_uri(bucket, &[])?;
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::PUT,
             uri,
             RequestParams {
-                bucket: Some(bucket.to_string()),
+                bucket: Some(bucket.to_owned()),
                 object: None,
                 credentials,
             },
-        )?;
-
-        match self.fs.create_bucket(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::create_bucket::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("CreateBucket output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CreateBucket);
+        let input = owned::create_bucket_input(bucket)?;
+        self.owned_bucket_usecase().execute_create_bucket(envelope, input).await
     }
 
     async fn get_object_range(
@@ -2247,6 +2240,63 @@ mod bucket_tests {
                 serde_json::json!({"code": format!("{:?}",error.code()), "message": error.message(), "status": error.status_code().map(|status|status.as_u16()), "headers": format!("{:?}",error.headers())})
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_create_bucket_runtime_contract() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-create-bucket", || async {
+            let root = rustfs_credentials::Credentials {
+                access_key: "protocol-create-root".into(),
+                secret_key: "protocol-create-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
+            let (_ambient_temp, ambient, _ambient_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            crate::runtime_sources::publish_test_app_context(ambient.clone());
+            let (_target_temp, target, _target_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(target.clone()));
+            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let mut observations = Vec::new();
+            for name in [
+                "protocol-created",
+                "protocol-created",
+                "xn--reserved",
+                "",
+                "bad\0bucket",
+                "a",
+                "a/b",
+                "bad_bucket",
+                "127.0.0.1",
+                "bucket-",
+            ] {
+                let before = count(S3Operation::CreateBucket);
+                let answer = outcome(&backend.create_bucket(name, &root).await);
+                let present = target.object_store().get_bucket_info(name, &Default::default()).await.is_ok();
+                observations.push((name, answer, count(S3Operation::CreateBucket) - before, present));
+            }
+            let ambient_created = ambient
+                .object_store()
+                .get_bucket_info("protocol-created", &Default::default())
+                .await
+                .is_ok();
+            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let before = count(S3Operation::CreateBucket);
+            let fallback = outcome(
+                &uninstalled
+                    .create_bucket("protocol-fallback-created", &rustfs_credentials::Credentials::default())
+                    .await,
+            );
+            let fallback_present = ambient
+                .object_store()
+                .get_bucket_info("protocol-fallback-created", &Default::default())
+                .await
+                .is_ok();
+            let actual = serde_json::json!({"rows": observations, "ambient_created":ambient_created,"fallback":fallback,"fallback_present":fallback_present,"fallback_count":count(S3Operation::CreateBucket)-before});
+            let expected: serde_json::Value = serde_json::from_str(r#"{"ambient_created":false,"fallback":{"output":"Output { location: None }"},"fallback_count":1,"fallback_present":true,"rows":[["protocol-created",{"output":"Output { location: None }"},1,true],["protocol-created",{"output":"Output { location: None }"},1,true],["xn--reserved",{"output":"Output { location: None }"},1,true],["",{"code":"InternalError","headers":"None","message":"failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write","status":500},1,true],["bad\u0000bucket",{"code":"InternalError","headers":"None","message":"failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write","status":500},1,false],["a",{"code":"InternalError","headers":"None","message":"failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write","status":500},1,false],["a/b",{"code":"InternalError","headers":"None","message":"failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write","status":500},1,false],["bad_bucket",{"code":"InvalidBucketName","headers":"None","message":"The specified bucket is not valid.","status":400},1,false],["127.0.0.1",{"code":"InvalidBucketName","headers":"None","message":"The specified bucket is not valid.","status":400},1,false],["bucket-",{"code":"InvalidBucketName","headers":"None","message":"The specified bucket is not valid.","status":400},1,false]]}"#).expect("measured CreateBucket answers");
+            assert_eq!(actual, expected, "CreateBucket answers, counts and bound storage match measured main");
+        });
     }
 
     #[test]

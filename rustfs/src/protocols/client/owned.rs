@@ -387,3 +387,15 @@ pub(super) fn listing_output(mut output: dto::ListObjectsV2Output) -> S3Result<d
     output.rustfs_on_demand_migration_list = None;
     super::require_listed_etags(output).map_err(|error| super::conversion_error("ListObjectsV2 output", error))
 }
+
+pub(super) fn create_bucket_input(bucket: &str) -> S3Result<dto::CreateBucketInput> {
+    Ok(dto::CreateBucketInput {
+        bucket: crate::app::dto_values::stored_bucket_name(bucket).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write",
+            )
+        })?,
+        ..Default::default()
+    })
+}
