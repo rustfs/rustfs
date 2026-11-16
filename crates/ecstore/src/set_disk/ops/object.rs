@@ -11754,7 +11754,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // A quorum-resolved marker returns not-found with a populated name.
         // Only missing metadata needs recovery; unrelated legacy residue or
         // an offline disk must not block a new marker write at quorum.
-        if gerr
+        let no_delete_transactions_at_quorum = if gerr
             .as_ref()
             .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
             && !is_meta_bucketname(bucket)
@@ -11799,7 +11799,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if recovery.rolled_back > 0 || recovery.committed > 0 {
                 (goi, authoritative_file_info, _, gerr) = self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
             }
-        }
+            recovery.no_transactions_at_quorum
+        } else {
+            false
+        };
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
@@ -11810,9 +11813,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 if is_err_object_not_found(err) {
                     ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
-                    if self
-                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref(), transaction_guard.as_ref())
-                        .await?
+                    // No mutation or lock release separates discovery from this
+                    // no-op. Reuse its evidence instead of probing every drive again.
+                    if !no_delete_transactions_at_quorum
+                        && self
+                            .reclaim_missing_delete_residue(
+                                bucket,
+                                object,
+                                &opts,
+                                _lock_guard.as_ref(),
+                                transaction_guard.as_ref(),
+                            )
+                            .await?
                     {
                         if let Some(scope) = scanner_publication_commit_scope.as_ref() {
                             let _ = scope.mark_committed();

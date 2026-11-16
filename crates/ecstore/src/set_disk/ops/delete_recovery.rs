@@ -133,7 +133,8 @@ pub(crate) struct DeleteRecoverySummary {
     pub reclaimed: usize,
     /// Observed removals for this exact key, not aggregated across prefixes.
     pub removed_versions: HashSet<Uuid>,
-    /// Read-only evidence for ordinary missing-key S3 semantics. This never
+    /// Complete discovery on a strict majority found no transaction for this key.
+    /// Reusable only under the same key locks before a mutation. This never
     /// authorizes settlement while a configured participant is unavailable.
     pub no_transactions_at_quorum: bool,
 }
@@ -862,16 +863,18 @@ impl SetDisks {
                 Err(error) => return Err(error),
             }
         }
+        let no_transactions_at_quorum = transactions.is_empty() && !unsupported && inspected > self.set_drive_count / 2;
         if offline {
             return Ok(DeleteRecoverySummary {
                 discovered: transactions.len(),
                 pending: 1,
-                no_transactions_at_quorum: transactions.is_empty() && !unsupported && inspected > self.set_drive_count / 2,
+                no_transactions_at_quorum,
                 ..Default::default()
             });
         }
         let mut summary = DeleteRecoverySummary {
             discovered: transactions.len(),
+            no_transactions_at_quorum,
             ..Default::default()
         };
         let mut all_states = BTreeMap::new();
@@ -3359,6 +3362,64 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("all proof is eventually collected");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_missing_delete_reuses_locked_discovery() {
+        use crate::bucket::metadata_sys::ObjectLockConfigState;
+        use crate::object_api::ObjectLockConfigSnapshot;
+
+        for offline in [false, true] {
+            let bucket = if offline {
+                "missing-probe-degraded"
+            } else {
+                "missing-probe-healthy"
+            };
+            let (_dirs, store, disks) = fixture(bucket).await;
+            let set = &store.pools[0].disk_set[0];
+            if offline {
+                disks[3].force_offline_for_test();
+            }
+            for object in ["missing", "missing/deep/key"] {
+                let online = &disks[..if offline { 3 } else { 4 }];
+                let before: Vec<_> = online
+                    .iter()
+                    .map(|disk| {
+                        disk.metrics_snapshot()
+                            .expect("local disk metrics")
+                            .api_calls
+                            .get("discover_delete_transactions")
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                let opts = ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                };
+                let error = set
+                    .delete_object(bucket, object, opts)
+                    .await
+                    .expect_err("set layer retains typed absence");
+                assert!(crate::error::is_err_object_not_found(&error), "typed absence: {error:?}");
+                for (disk, before) in online.iter().zip(before) {
+                    let after = disk
+                        .metrics_snapshot()
+                        .expect("local disk metrics")
+                        .api_calls
+                        .get("discover_delete_transactions")
+                        .copied()
+                        .unwrap_or(0);
+                    assert_eq!(
+                        after - before,
+                        1,
+                        "one locked discovery per online drive, offline={offline}, key={object}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
