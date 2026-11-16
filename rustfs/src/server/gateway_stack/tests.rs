@@ -14,6 +14,8 @@
 //! The assembled gateway stack, driven through [`GatewayStack::call`] exactly as `server/http.rs`
 //! drives it. Requests that need object storage are in `rustfs/tests/embedded_gateway_stack_test.rs`.
 
+#[path = "admin/tests.rs"]
+mod admin;
 mod ssec;
 
 use super::*;

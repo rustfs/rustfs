@@ -52,6 +52,8 @@
 #[cfg(not(debug_assertions))]
 compile_error!("gateway-stack is restricted to debug builds");
 
+mod admin;
+
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
@@ -81,6 +83,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// What the assembly takes from the server it is built for.
+#[derive(Clone)]
 pub(crate) struct GatewayAssembly {
     pub(crate) server_ctx: Arc<ServerContextSlot>,
     /// The configured root credentials, checked once here. Requests read the live ones.
@@ -115,6 +118,10 @@ pub(crate) enum GatewayAssemblyError {
     ServerDomains(rustfs_gateway::LegacyDomainError),
     #[error("the gateway service refused its assembly: {0:?}")]
     Service(AssemblyError),
+    #[error("the native admin overlay has no server-info operation")]
+    AdminOverlayMissing,
+    #[error("the native admin dialect refused its assembly: {0:?}")]
+    AdminDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
     #[error(
         "RUSTFS_S3_STACK=gateway cannot be served while RUSTFS_KEYSTONE_ENABLE is on: the gateway admits a request that \
          carries only X-Auth-Token as anonymous while RustFS reads the Keystone identity behind it; Keystone support on the \
@@ -142,6 +149,15 @@ impl GatewayStack {
         });
         let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
         Self::assemble_with(assembly, iam, root, early_gate(OPERATIONS))
+    }
+
+    /// Assembles the gateway service for the two signed server-info aliases.
+    pub(crate) fn assemble_admin(assembly: GatewayAssembly) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        admin::assemble(assembly, iam, root)
     }
 
     fn assemble_with(
