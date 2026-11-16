@@ -589,3 +589,64 @@ async fn background_rename_recovery_continues_beyond_one_scan_batch() {
     runtime.request_stop();
     runtime.join().await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn rename_recovery_rechecks_restore_after_waiting_for_publication() {
+    let backend = TestCatalogObjectBackend::default();
+    interrupted_rename(&backend, "analytics", TableRenameIntentState::IndexPublished).await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let lock_path = default_table_bucket_publication_lock_path();
+    let guard = backend.acquire_write_lock("analytics", &lock_path).await.unwrap();
+    backend.lock_attempts.lock().await.clear();
+    let recovery_store = store.clone();
+    let recovery = tokio::spawn(async move { recovery_store.recover_pending_table_rename("analytics").await });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+        loop {
+            if backend
+                .lock_attempts
+                .lock()
+                .await
+                .contains(&("analytics".to_string(), lock_path.clone()))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery reached the publication lock");
+    let restore_path = store.paths.catalog_restore_state_path("analytics");
+    let restore = serde_json::json!({
+        "version": 1, "table_bucket": "analytics", "restore_epoch": Uuid::new_v4().to_string(),
+        "restore_id": "active-restore", "backup_id": "backup", "request_fingerprint": "a".repeat(64), "state": "PREPARED"
+    });
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &restore_path, serde_json::to_vec(&restore).unwrap())
+        .await;
+    let before = maintenance_test_object_versions(&backend).await;
+    drop(guard);
+    assert_matches!(
+        tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, recovery)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(TableCatalogStoreError::Unavailable(_))
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before);
+    backend
+        .state
+        .lock()
+        .await
+        .objects
+        .remove(&(RUSTFS_META_BUCKET.to_string(), restore_path));
+    store.recover_pending_table_rename("analytics").await.unwrap();
+    assert!(
+        store
+            .get_table_bucket("analytics")
+            .await
+            .unwrap()
+            .unwrap()
+            .active_rename_id
+            .is_none()
+    );
+}

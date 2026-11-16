@@ -1671,10 +1671,13 @@ where
     ) -> futures::future::BoxFuture<'a, TableCatalogStoreResult<()>> {
         // Keep the publication future opaque to the background concurrency adapters.
         Box::pin(async move {
-            let _restore_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
             let publication = TableCommitLockPublication::new(&self.backend);
+            publication
+                .attach_catalog_migration_read_guard(self.acquire_object_backed_catalog_write_permit(table_bucket).await?)?;
             let _completion = TableCommitPublicationCompletion::new(&publication);
-            publication.begin_table_bucket(table_bucket).await?;
+            let _migration_guard = self
+                .begin_table_bucket_with_migration_permit(table_bucket, &publication)
+                .await?;
             self.recover_active_table_rename(table_bucket, &publication).await
         })
     }
