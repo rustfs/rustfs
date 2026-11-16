@@ -16,12 +16,15 @@
 //! Protocol clients retain their session checks; use cases own storage and bucket visibility.
 
 use super::{ProtocolStorageClient, RequestParams};
-use crate::app::object_usecase::{DefaultObjectUsecase, GetObjectBody, GetObjectOutputFacts, HeadObjectOutputFacts};
+use crate::app::object_usecase::{
+    CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase, GetObjectBody, GetObjectOutputFacts,
+    HeadObjectOutputFacts,
+};
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::runtime_sources::current_action_credentials;
 use crate::storage_api::protocols::client::{ReqInfo, RequestContext};
 use http::{HeaderMap, Method, Uri};
-use rustfs_gateway_types::{ETag, Timestamp, dto};
+use rustfs_gateway_types::{CopySourceValue, ETag, Timestamp, dto};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 impl ProtocolStorageClient {
@@ -398,4 +401,197 @@ pub(super) fn create_bucket_input(bucket: &str) -> S3Result<dto::CreateBucketInp
         })?,
         ..Default::default()
     })
+}
+
+fn copy_condition(value: Option<&str>, field: &str) -> S3Result<Option<CopySourceCondition>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value == "*" {
+        return Ok(Some(CopySourceCondition::Any));
+    }
+    let quoted = value.strip_prefix("W/").unwrap_or(value);
+    let quoted_tag = quoted.strip_prefix('"').and_then(|value| value.strip_suffix('"'));
+    let valid = if quoted_tag.is_some() {
+        quoted.bytes().all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte))
+    } else {
+        value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    if !valid {
+        return Err(super::conversion_error(
+            "CopyObject input",
+            format!("{field}: not an entity-tag condition the s3s input can hold"),
+        ));
+    }
+    Ok(Some(if value.starts_with("W/") {
+        CopySourceCondition::Weak
+    } else {
+        CopySourceCondition::Strong(quoted_tag.unwrap_or(value).to_owned())
+    }))
+}
+
+pub(super) fn copy_source(source: CopySourceValue) -> S3Result<Option<CopySourceValue>> {
+    let CopySourceValue::Bucket { bucket, key, version_id } = source else {
+        return Ok(None);
+    };
+    let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if !(3..=63).contains(&bucket.len())
+        || !bucket.bytes().all(|byte| alphanumeric(byte) || byte == b'.' || byte == b'-')
+        || !bucket.bytes().next().is_some_and(alphanumeric)
+        || !bucket.bytes().next_back().is_some_and(alphanumeric)
+        || bucket.contains("..")
+        || bucket.starts_with("xn--")
+        || bucket.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Err(super::conversion_error(
+            "CopyObject copy_source",
+            "ParseAmzCopySourceError: InvalidBucketName",
+        ));
+    }
+    Ok(Some(CopySourceValue::Bucket { bucket, key, version_id }))
+}
+
+pub(super) fn copy_input(input: dto::CopyObjectInput) -> S3Result<CopyObjectWriteInput> {
+    let copy_source = copy_source(input.copy_source)?;
+    let error = |field, reason| super::conversion_error("CopyObject input", format!("{field}: {reason}"));
+    for (field, named) in [
+        (
+            "object_lock_event_hold",
+            input
+                .object_lock_event_hold
+                .as_ref()
+                .is_some_and(|value| !value.as_str().is_empty()),
+        ),
+        (
+            "object_lock_event_hold_duration_days",
+            input.object_lock_event_hold_duration_days.is_some(),
+        ),
+        (
+            "object_lock_event_hold_duration_years",
+            input.object_lock_event_hold_duration_years.is_some(),
+        ),
+    ] {
+        if named {
+            return Err(error(
+                field,
+                "an Object Lock event hold, which no pinned s3s shape holds and RustFS does not store",
+            ));
+        }
+    }
+    copy_condition(input.if_match.as_deref(), "if_match")?;
+    let specific_if_none_match = copy_condition(input.if_none_match.as_deref(), "if_none_match")?
+        .is_some_and(|value| !matches!(value, CopySourceCondition::Any));
+    let copy_source_if_match = copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match")?;
+    let copy_source_if_none_match = copy_condition(input.copy_source_if_none_match.as_deref(), "copy_source_if_none_match")?;
+    for (field, value) in [
+        ("copy_source_if_modified_since", input.copy_source_if_modified_since),
+        ("copy_source_if_unmodified_since", input.copy_source_if_unmodified_since),
+    ] {
+        value
+            .map(|at| {
+                time::OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()),
+                )
+                .map_err(|_| error(field, "an instant outside what the s3s shape can hold"))
+            })
+            .transpose()?;
+    }
+    let retain_until = input
+        .object_lock_retain_until_date
+        .map(|at| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()))
+                .map_err(|_| error("object_lock_retain_until_date", "an instant outside what the s3s shape can hold"))
+        })
+        .transpose()?;
+    Ok(CopyObjectWriteInput {
+        copy_source,
+        bucket: input.bucket.as_str().to_owned(),
+        key: input.key.as_str().to_owned(),
+        version_id: None,
+        specific_if_none_match,
+        server_side_encryption: nonempty(input.server_side_encryption.map(|value| value.as_str().to_owned())),
+        ssekms_key_id: nonempty(input.ssekms_key_id),
+        sse_customer_algorithm: nonempty(input.sse_customer_algorithm),
+        sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
+        sse_customer_key_md5: nonempty(input.sse_customer_key_md5),
+        copy_source_sse_customer_algorithm: nonempty(input.copy_source_sse_customer_algorithm),
+        copy_source_sse_customer_key: input
+            .copy_source_sse_customer_key
+            .map(|value| value.expose_secret().to_owned()),
+        copy_source_sse_customer_key_md5: nonempty(input.copy_source_sse_customer_key_md5),
+        metadata_directive: nonempty(input.metadata_directive.map(|value| value.as_str().to_owned())),
+        metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
+        tagging: nonempty(input.tagging),
+        tagging_directive: nonempty(input.tagging_directive.map(|value| value.as_str().to_owned())),
+        copy_source_if_match,
+        copy_source_if_none_match,
+        cache_control: nonempty(input.cache_control),
+        content_disposition: nonempty(input.content_disposition),
+        content_encoding: nonempty(input.content_encoding),
+        content_language: nonempty(input.content_language),
+        content_type: nonempty(input.content_type),
+        expires: nonempty(input.expires.map(|value| value.as_str().to_owned())),
+        website_redirect_location: nonempty(input.website_redirect_location),
+        object_lock_legal_hold_status: nonempty(input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned())),
+        object_lock_mode: nonempty(input.object_lock_mode.map(|value| value.as_str().to_owned())),
+        object_lock_retain_until_date: retain_until,
+        storage_class: nonempty(input.storage_class.map(|value| value.as_str().to_owned())),
+        checksum_algorithm: nonempty(input.checksum_algorithm.map(|value| value.as_str().to_owned())),
+    })
+}
+
+pub(super) fn copy_output(output: CopyObjectWriteOutput) -> S3Result<dto::CopyObjectOutput> {
+    let e_tag = output
+        .e_tag
+        .map(|raw| {
+            let (weak, value) = if let Some(rest) = raw.strip_prefix("W/\"") {
+                (true, rest.strip_suffix('"').unwrap_or(rest))
+            } else {
+                (false, raw.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(&raw))
+            };
+            let value = quick_xml::escape::escape(value).into_owned();
+            if weak { ETag::new_weak(value) } else { ETag::new(value) }
+                .map_err(|_| super::conversion_error("CopyObject output", "e_tag: not an entity tag the gateway can write"))
+        })
+        .transpose()?;
+    Ok(dto::CopyObjectOutput {
+        e_tag,
+        last_modified: output
+            .last_modified
+            .map(crate::app::dto_values::timestamp)
+            .map(millisecond_timestamp),
+        copy_source_version_id: output.copy_source_version_id,
+        version_id: output.version_id,
+        server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        checksum_crc32: output.checksum_crc32,
+        checksum_crc32c: output.checksum_crc32c,
+        checksum_sha1: output.checksum_sha1,
+        checksum_sha256: output.checksum_sha256,
+        checksum_crc64nvme: output.checksum_crc64nvme,
+        checksum_md5: output.checksum_md5,
+        checksum_sha512: output.checksum_sha512,
+        checksum_xxhash3: output.checksum_xxhash3,
+        checksum_xxhash64: output.checksum_xxhash64,
+        checksum_xxhash128: output.checksum_xxhash128,
+        checksum_type: output.checksum_type,
+        ..Default::default()
+    })
+}
+
+pub(super) fn copy_error(mut error: S3Error) -> S3Error {
+    if error.message().is_some() {
+        return error;
+    }
+    let message = match error.code() {
+        S3ErrorCode::InvalidStorageClass => "The storage class you specified is not valid.",
+        S3ErrorCode::PreconditionFailed => "At least one of the preconditions you specified did not hold.",
+        S3ErrorCode::NotImplemented => "A header you provided implies functionality that is not implemented.",
+        S3ErrorCode::InternalError => "We encountered an internal error. Please try again.",
+        _ => return error,
+    };
+    error.set_message(message);
+    error
 }

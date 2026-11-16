@@ -187,7 +187,7 @@ fn protocol_policy_denials_and_request_conditions() {
             .expect("load user")
             .0
             .expect("user exists");
-        let allow = json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket"],
+        let allow = json!({"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket","s3:AbortMultipartUpload"],
         "Resource":[format!("arn:aws:s3:::{bucket}"),format!("arn:aws:s3:::{bucket}/*")]});
         iam.set_policy(
             "protocol-policy",
@@ -215,10 +215,24 @@ fn protocol_policy_denials_and_request_conditions() {
             })
             .collect();
         for session in &sessions {
-            backend
-                .authorize_operation(session, &S3Action::GetObject, bucket, Some("secret.txt"))
-                .await
-                .expect("IAM allow works");
+            for action in [
+                S3Action::GetObject,
+                S3Action::CreateMultipartUpload,
+                S3Action::CompleteMultipartUpload,
+                S3Action::AbortMultipartUpload,
+            ] {
+                let result = backend
+                    .authorize_operation(session, &action, bucket, Some("secret.txt"))
+                    .await;
+                if session.protocol == Protocol::WebDav && action != S3Action::GetObject {
+                    assert!(
+                        matches!(result, Err(AuthorizationError::AccessDenied)),
+                        "WebDAV does not expose multipart operations"
+                    );
+                } else {
+                    result.expect("IAM allow works");
+                }
+            }
             for action in [S3Action::HeadBucket, S3Action::DeleteBucket] {
                 backend
                     .authorize_operation(session, &action, bucket, None)
@@ -227,7 +241,7 @@ fn protocol_policy_denials_and_request_conditions() {
             }
         }
         let bucket_policy = json!({"Version":"2012-10-17","Statement":[{
-            "Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket"],
+            "Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:DeleteBucket","s3:DeleteBucket","s3:AbortMultipartUpload"],
             "Resource":[format!("arn:aws:s3:::{bucket}"),format!("arn:aws:s3:::{bucket}/*")],
             "Condition":{"StringLike":{"aws:username":"*"}}
         }]});
@@ -252,6 +266,9 @@ fn protocol_policy_denials_and_request_conditions() {
                 S3Action::HeadObject,
                 S3Action::PutObject,
                 S3Action::DeleteObject,
+                S3Action::CreateMultipartUpload,
+                S3Action::CompleteMultipartUpload,
+                S3Action::AbortMultipartUpload,
                 S3Action::HeadBucket,
                 S3Action::DeleteBucket,
             ] {
