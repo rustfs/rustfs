@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Request and response projections for protocol object operations.
+//! Request and response projections for protocol storage operations.
 //! Authorization stays on the protocol session edge; storage runs in the client's server context.
 
 use super::{ProtocolStorageClient, RequestParams};
@@ -58,6 +58,10 @@ impl ProtocolStorageClient {
             )
             .await
             .and_then(|answered| get_output(answered.output))
+    }
+
+    pub(super) fn owned_bucket_usecase(&self) -> crate::app::bucket_usecase::DefaultBucketUsecase {
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.fs.server_ctx().app_context())
     }
 
     pub(super) fn owned_usecase(&self) -> DefaultObjectUsecase {
@@ -312,4 +316,21 @@ pub(super) fn put_error(mut error: S3Error) -> S3Error {
     };
     error.set_message(message);
     error
+}
+
+pub(super) fn head_bucket_input(bucket: &str) -> S3Result<dto::HeadBucketInput> {
+    Ok(dto::HeadBucketInput {
+        bucket: if bucket.is_empty() {
+            // Protocol adapters use the empty bucket for the storage root.
+            Default::default()
+        } else {
+            crate::app::dto_values::stored_bucket_name(bucket).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write",
+                )
+            })?
+        },
+        expected_bucket_owner: None,
+    })
 }
