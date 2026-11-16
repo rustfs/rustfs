@@ -20,14 +20,27 @@ with open(os.environ["FAKE_DOCKER_LOG"], "a") as log:
     log.write(" ".join(args) + "\n")
 mode = os.environ.get("FAKE_IDENTITY_FAILURE", "")
 if args[:2] == ["image", "inspect"]:
-    images = [{"Id": "sha256:" + char * 64, "Config": {"Labels": {"vcs-ref": char * 40}}} for char in ("a", "b")]
-    if mode == "same":
-        images[1]["Id"] = images[0]["Id"]
-    if mode == "revision":
-        images[1]["Config"]["Labels"]["vcs-ref"] = "c" * 40
-    for image in images:
-        image["Config"]["Env"] = ["RUSTFS_SECRET_KEY=identity-secret-sentinel"]
-    print(json.dumps(images))
+    char = "a" if "candidate" in args[-1] else "b"
+    image = {"Id": "sha256:" + char * 64, "Config": {"Labels": {"vcs-ref": char * 40}}}
+    if mode == "same" and char == "b":
+        image["Id"] = "sha256:" + "a" * 64
+    if mode == "revision" and char == "b":
+        image["Config"]["Labels"]["vcs-ref"] = "c" * 40
+    if mode in ("history", "history-revision", "history-noncanonical", "history-conflict"):
+        image["Config"]["Labels"] = None
+    image["Config"]["Env"] = ["RUSTFS_SECRET_KEY=identity-secret-sentinel"]
+    print(json.dumps([image]))
+elif args[:2] == ["image", "history"]:
+    image_id = args[-1]
+    revision = ("a" if image_id == "sha256:" + "a" * 64 else "b") * 40
+    if mode == "history-revision" and image_id == "sha256:" + "b" * 64:
+        revision = "c" * 40
+    created_by = f"LABEL vcs-ref={revision}"
+    if mode == "history-noncanonical" and image_id == "sha256:" + "b" * 64:
+        print(json.dumps({"ID": image_id, "CreatedBy": "LABEL vcs-ref latest"}))
+    if mode == "history-conflict" and image_id == "sha256:" + "b" * 64:
+        created_by += " org.opencontainers.image.revision=" + "c" * 40
+    print(json.dumps({"ID": image_id, "CreatedBy": created_by}))
 elif args[:1] == ["compose"]:
     override = Path(args[args.index("-f", args.index("-f") + 1) + 1])
     if "ps" in args:
@@ -60,7 +73,7 @@ for arg in "$@"; do
     time=*) at="${arg#time=}" ;;
   esac
 done
-if [[ "$query" != "vector(0)" && "$query" != *"{rustfs_cluster_id=\"$(cat "$FAKE_CLUSTER_STATE")\"}"* ]]; then
+if [[ "$query" != "vector(0)" && "$query" != *"{rustfs_cluster_id=\"$(cat "$FAKE_CLUSTER_STATE")\""* ]]; then
   echo 'query lacks canary selector' >&2
   exit 1
 fi
@@ -213,8 +226,40 @@ if rg -q 'compose .*up ' "$TMP_DIR/docker.log"; then
 fi
 run_once stale-revision false revision
 [[ "$(cat "$TMP_DIR/stale-revision.status")" != 0 ]]
+if rg -q 'image history ' "$TMP_DIR/docker.log"; then
+  echo "mismatched config label fell back to image history" >&2
+  exit 1
+fi
 if rg -q 'compose .*up ' "$TMP_DIR/docker.log"; then
   echo "stale-revision preflight started the Compose project" >&2
+  exit 1
+fi
+run_once history-labels false history
+[[ "$(cat "$TMP_DIR/history-labels.status")" == 0 ]]
+rg -Fq "image history --no-trunc --format {{json .}} sha256:$(printf 'a%.0s' {1..64})" "$TMP_DIR/docker.log"
+rg -Fq "image history --no-trunc --format {{json .}} sha256:$(printf 'b%.0s' {1..64})" "$TMP_DIR/docker.log"
+python3 - "$TMP_DIR/history-labels/images.json" <<'PY'
+import json
+import sys
+images = json.load(open(sys.argv[1], encoding="utf-8"))
+assert all(image["RevisionEvidence"] == "immutable-history" for image in images)
+PY
+run_once stale-history false history-revision
+[[ "$(cat "$TMP_DIR/stale-history.status")" != 0 ]]
+if rg -q 'compose .*up ' "$TMP_DIR/docker.log"; then
+  echo "stale-history preflight started the Compose project" >&2
+  exit 1
+fi
+run_once noncanonical-history false history-noncanonical
+[[ "$(cat "$TMP_DIR/noncanonical-history.status")" != 0 ]]
+if rg -q 'compose .*up ' "$TMP_DIR/docker.log"; then
+  echo "noncanonical-history preflight started the Compose project" >&2
+  exit 1
+fi
+run_once conflicting-history false history-conflict
+[[ "$(cat "$TMP_DIR/conflicting-history.status")" != 0 ]]
+if rg -q 'compose .*up ' "$TMP_DIR/docker.log"; then
+  echo "conflicting-history preflight started the Compose project" >&2
   exit 1
 fi
 run_once wrong-running-image false running
