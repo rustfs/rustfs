@@ -218,6 +218,7 @@ fn session_list_buckets_request(
     extensions.insert(ReqInfo {
         cred: Some(credentials),
         is_owner,
+        keystone_session_present: None,
         bucket: None,
         object: None,
         version_id: None,
@@ -413,6 +414,7 @@ impl ProtocolStorageClient {
         extensions.insert(ReqInfo {
             cred: Some(params.credentials.clone()),
             is_owner,
+            keystone_session_present: None,
             bucket: params.bucket,
             object: params.object,
             version_id: None,
@@ -532,14 +534,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             headers.insert("content-length", header_value);
         }
 
-        let mut input =
-            gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|e| conversion_error("PutObject input", e))?;
-        if content_length < 0 {
-            input.content_length = None;
-        }
-
-        let req = Self::create_request(
-            input,
+        let input = owned::put_input(input)?;
+        let envelope = Self::create_envelope_with_headers(
             Method::PUT,
             uri,
             RequestParams {
@@ -547,14 +543,14 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-        let req = S3Request { headers, ..req };
-
-        match self.fs.put_object(req).await {
-            Ok(response) => gateway_s3s_compat::put_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("PutObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+            headers,
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+        self.owned_usecase()
+            .execute_put_object_owned(envelope, input)
+            .await
+            .map_err(owned::put_error)
+            .and_then(owned::put_output)
     }
 
     async fn delete_object(
@@ -1686,5 +1682,571 @@ mod tests {
                 .object_lock_retain_until_date,
         );
         assert_eq!(current, old);
+    }
+}
+
+#[cfg(test)]
+mod put_tests {
+    use super::*;
+    use crate::app::object_usecase::PutObjectWriteInput;
+    use rustfs_s3_types::S3ErrorCode;
+
+    fn input() -> gateway_dto::PutObjectInput {
+        gateway_dto::PutObjectInput {
+            bucket: BucketName::new("protocol-put-oracle".to_owned()).expect("bucket"),
+            key: rustfs_gateway_types::ObjectKey::new("object".to_owned()).expect("key"),
+            content_length: 4,
+            body: Some(rustfs_gateway_stream::ByteStream::from_bytes(bytes::Bytes::from_static(b"data"))),
+            ..Default::default()
+        }
+    }
+
+    fn fields(input: PutObjectWriteInput) -> serde_json::Value {
+        serde_json::json!({
+            "bucket": input.bucket, "key": input.key, "length": input.content_length,
+            "metadata": input.metadata, "specific_if_none_match": input.specific_if_none_match,
+            "retain_until": input.object_lock_retain_until_date.map(|at| at.unix_timestamp_nanos().to_string()),
+            "cache_control": input.cache_control, "content_disposition": input.content_disposition,
+            "content_encoding": input.content_encoding, "content_language": input.content_language,
+            "content_type": input.content_type, "expires": input.expires, "tagging": input.tagging,
+            "version_id": input.version_id, "server_side_encryption": input.server_side_encryption,
+            "sse_customer_algorithm": input.sse_customer_algorithm, "sse_customer_key": input.sse_customer_key,
+            "sse_customer_key_md5": input.sse_customer_key_md5, "ssekms_key_id": input.ssekms_key_id,
+            "content_md5": input.content_md5, "legal_hold": input.object_lock_legal_hold_status,
+            "lock_mode": input.object_lock_mode, "storage_class": input.storage_class,
+            "website_redirect_location": input.website_redirect_location, "checksum_algorithm": input.checksum_algorithm,
+            "crc32": input.checksum_crc32, "crc32c": input.checksum_crc32c, "crc64nvme": input.checksum_crc64nvme,
+            "sha1": input.checksum_sha1, "sha256": input.checksum_sha256,
+        })
+    }
+
+    fn legacy_fields(input: gateway_dto::PutObjectInput) -> Result<serde_json::Value, String> {
+        let length = input.content_length;
+        gateway_s3s_compat::put_object::input_to_s3s(input)
+            .map(|mut input| {
+                if length < 0 {
+                    input.content_length = None;
+                }
+                fields(PutObjectWriteInput::from_legacy(input, None))
+            })
+            .map_err(|error| conversion_error("PutObject input", error).to_string())
+    }
+
+    #[test]
+    fn protocol_put_condition_grammar_matches_legacy() {
+        let mut observations = Vec::new();
+        let values = [
+            "",
+            "*",
+            "\"*\"",
+            " * ",
+            "\"abc\"",
+            "W/\"abc\"",
+            "abc",
+            "\"abc\", \"def\"",
+            "\"\"",
+            " ",
+            "\"abc",
+            "abc\"",
+            "\"a b\"",
+            "\"a\\b\"",
+            "\"a\"b\"",
+            "\"a\n b\"",
+            "W/abc",
+            "a,b",
+            "a b",
+            "\tabc",
+            "\"a\t b\"",
+            "é",
+            "\"é\"",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain((0_u8..32).flat_map(|byte| {
+            let value = char::from(byte);
+            [value.to_string(), format!("\"{value}\"")]
+        }));
+        for value in values {
+            for none in [false, true] {
+                let make = || {
+                    let mut request = input();
+                    if none {
+                        request.if_none_match = Some(value.to_owned());
+                    } else {
+                        request.if_match = Some(value.to_owned());
+                    }
+                    request
+                };
+                let old = legacy_fields(make());
+                let current = owned::put_input(make()).map(fields).map_err(|error| error.to_string());
+                observations.push((value.clone(), none, current, old));
+            }
+        }
+        let mismatches: Vec<_> = observations
+            .into_iter()
+            .filter(|(_, _, current, old)| current != old)
+            .collect();
+        assert!(mismatches.is_empty(), "condition projection mismatches: {mismatches:#?}");
+    }
+
+    #[test]
+    fn protocol_put_optional_values_match_legacy() {
+        for value in ["", "value"] {
+            let make = || {
+                let mut request = input();
+                request.cache_control = Some(value.to_owned());
+                request.content_disposition = Some(value.to_owned());
+                request.content_encoding = Some(value.to_owned());
+                request.content_language = Some(value.to_owned());
+                request.content_type = Some(value.to_owned());
+                request.content_md5 = Some(value.to_owned());
+                request.tagging = Some(value.to_owned());
+                request.sse_customer_algorithm = Some(value.to_owned());
+                request.sse_customer_key_md5 = Some(value.to_owned());
+                request.ssekms_key_id = Some(value.to_owned());
+                request.website_redirect_location = Some(value.to_owned());
+                request.storage_class = Some(gateway_dto::StorageClass::custom(value.to_owned()));
+                request.server_side_encryption = Some(gateway_dto::ServerSideEncryption::custom(value.to_owned()));
+                request.object_lock_mode = Some(gateway_dto::ObjectLockMode::custom(value.to_owned()));
+                request.object_lock_legal_hold_status = Some(gateway_dto::ObjectLockLegalHoldStatus::custom(value.to_owned()));
+                request.checksum_algorithm = Some(gateway_dto::ChecksumAlgorithm::custom(value.to_owned()));
+                request.expires = Some(OpaqueString::from(value));
+                if !value.is_empty() {
+                    request.metadata.insert("key".to_owned(), "value".to_owned());
+                }
+                request
+            };
+            assert_eq!(
+                owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
+                legacy_fields(make())
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_put_checksum_input_matches_legacy() {
+        let mut observations = Vec::new();
+        for (header, value) in [
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+            ("x-amz-checksum-crc32c", "AAAAAA=="),
+            ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA="),
+            ("x-amz-checksum-sha1", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            ("x-amz-checksum-sha256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        ] {
+            let make = || {
+                let mut request = input();
+                request.checksum_spec =
+                    Some(rustfs_gateway_types::ChecksumSpec::parse_header(header, value).expect("test checksum"));
+                request
+            };
+            observations.push((
+                header,
+                owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
+                legacy_fields(make()),
+            ));
+        }
+        let mismatches: Vec<_> = observations.into_iter().filter(|(_, current, old)| current != old).collect();
+        assert!(mismatches.is_empty(), "PutObject checksum input mismatches: {mismatches:#?}");
+    }
+
+    #[test]
+    fn protocol_put_retain_until_matches_legacy() {
+        let mut observations = Vec::new();
+        for (secs, nanos) in [
+            (1_700_000_000, 123_456_789),
+            (-1, 123_456_789),
+            (0, 123_456_789),
+            (i64::MAX, 0),
+        ] {
+            let make = || {
+                let mut request = input();
+                request.object_lock_retain_until_date =
+                    Some(rustfs_gateway_types::Timestamp::from_secs_nanos(secs, nanos).expect("instant"));
+                request
+            };
+            observations.push((
+                secs,
+                nanos,
+                owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
+                legacy_fields(make()),
+            ));
+        }
+        let mismatches: Vec<_> = observations
+            .into_iter()
+            .filter(|(_, _, current, old)| current != old)
+            .collect();
+        assert!(mismatches.is_empty(), "retain-until projection mismatches: {mismatches:#?}");
+    }
+
+    #[test]
+    fn protocol_put_output_matches_legacy() {
+        use crate::app::object_usecase::PutObjectWriteOutput;
+        let mut observations = Vec::new();
+        for (raw, tag) in [
+            (None, None),
+            (Some("abc"), Some(s3s::dto::ETag::Strong("abc".to_owned()))),
+            (Some("\"abc\""), Some(s3s::dto::ETag::Strong("abc".to_owned()))),
+            (Some("W/\"abc\""), Some(s3s::dto::ETag::Weak("abc".to_owned()))),
+            (Some("W/\"\"abc\"\""), Some(s3s::dto::ETag::Weak("\"abc\"".to_owned()))),
+            (Some(""), Some(s3s::dto::ETag::Strong(String::new()))),
+            (Some("\"\""), Some(s3s::dto::ETag::Strong(String::new()))),
+            (Some("a\nb"), Some(s3s::dto::ETag::Strong("a\nb".to_owned()))),
+        ] {
+            let old = gateway_s3s_compat::put_object::output_from_s3s(PutObjectOutput {
+                e_tag: tag,
+                ..Default::default()
+            })
+            .map_err(|error| conversion_error("PutObject output", error));
+            let current = owned::put_output(PutObjectWriteOutput {
+                e_tag: raw.map(str::to_owned),
+                ..Default::default()
+            });
+            observations.push((format!("etag {raw:?}"), outcome(&old), outcome(&current)));
+        }
+        for (index, checksum) in [
+            (0, "AAAAAA=="),
+            (1, "AAAAAA=="),
+            (2, "AAAAAAAAAAA="),
+            (3, "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            (4, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            (0, "bad"),
+            (5, "AAAAAA=="),
+        ] {
+            let mut current = PutObjectWriteOutput {
+                e_tag: Some("abc".to_owned()),
+                ..Default::default()
+            };
+            let mut old = PutObjectOutput {
+                e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                ..Default::default()
+            };
+            match index {
+                0 => {
+                    current.checksum_crc32 = Some(checksum.to_owned());
+                    old.checksum_crc32 = Some(checksum.to_owned());
+                }
+                1 => {
+                    current.checksum_crc32c = Some(checksum.to_owned());
+                    old.checksum_crc32c = Some(checksum.to_owned());
+                }
+                2 => {
+                    current.checksum_crc64nvme = Some(checksum.to_owned());
+                    old.checksum_crc64nvme = Some(checksum.to_owned());
+                }
+                3 => {
+                    current.checksum_sha1 = Some(checksum.to_owned());
+                    old.checksum_sha1 = Some(checksum.to_owned());
+                }
+                4 => {
+                    current.checksum_sha256 = Some(checksum.to_owned());
+                    old.checksum_sha256 = Some(checksum.to_owned());
+                }
+                _ => {
+                    current.checksum_crc32 = Some(checksum.to_owned());
+                    current.checksum_crc32c = Some(checksum.to_owned());
+                    old.checksum_crc32 = Some(checksum.to_owned());
+                    old.checksum_crc32c = Some(checksum.to_owned());
+                }
+            }
+            let old =
+                gateway_s3s_compat::put_object::output_from_s3s(old).map_err(|error| conversion_error("PutObject output", error));
+            let current = owned::put_output(current);
+            observations.push((format!("checksum {index} {checksum}"), outcome(&old), outcome(&current)));
+        }
+        let current = crate::app::object_usecase::PutObjectWriteOutput {
+            e_tag: Some("abc".to_owned()),
+            version_id: Some("version".to_owned()),
+            expiration: Some("expiry".to_owned()),
+            server_side_encryption: Some("AES256".to_owned()),
+            sse_customer_algorithm: Some("AES256".to_owned()),
+            sse_customer_key_md5: Some("md5".to_owned()),
+            ssekms_key_id: Some("key-id".to_owned()),
+            ..Default::default()
+        };
+        let old = PutObjectOutput {
+            e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+            version_id: Some("version".to_owned()),
+            expiration: Some("expiry".to_owned()),
+            server_side_encryption: Some(ServerSideEncryption::from("AES256".to_owned())),
+            sse_customer_algorithm: Some("AES256".to_owned()),
+            sse_customer_key_md5: Some("md5".to_owned()),
+            ssekms_key_id: Some("key-id".to_owned()),
+            ..Default::default()
+        };
+        let old =
+            gateway_s3s_compat::put_object::output_from_s3s(old).map_err(|error| conversion_error("PutObject output", error));
+        observations.push(("populated output".to_owned(), outcome(&old), outcome(&owned::put_output(current))));
+        let mismatches: Vec<_> = observations.into_iter().filter(|(_, old, current)| old != current).collect();
+        assert!(mismatches.is_empty(), "PutObject output mismatches: {mismatches:#?}");
+    }
+
+    async fn legacy_put(
+        fs: &FS,
+        input: gateway_dto::PutObjectInput,
+        credentials: &rustfs_credentials::Credentials,
+    ) -> rustfs_s3_types::S3Result<gateway_dto::PutObjectOutput> {
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        let uri = build_object_uri(&bucket, &key, &[])?;
+        let length = input.content_length;
+        let mut headers = HeaderMap::new();
+        if length >= 0 {
+            headers.insert("content-length", length.to_string().parse().expect("length header"));
+        }
+        let mut input =
+            gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|error| conversion_error("PutObject input", error))?;
+        if length < 0 {
+            input.content_length = None;
+        }
+        let request = ProtocolStorageClient::create_request(
+            input,
+            Method::PUT,
+            uri,
+            RequestParams {
+                bucket: Some(bucket),
+                object: Some(key),
+                credentials,
+            },
+        )?;
+        let response = fs.put_object(S3Request { headers, ..request }).await?;
+        gateway_s3s_compat::put_object::output_from_s3s(response.output)
+            .map_err(|error| conversion_error("PutObject output", error))
+    }
+
+    fn case_input(case: &str, key: &str) -> gateway_dto::PutObjectInput {
+        let mut request = input();
+        request.key = rustfs_gateway_types::ObjectKey::new(key.to_owned()).expect("case key");
+        match case {
+            "empty" => {
+                request.content_type = Some(String::new());
+                request.content_md5 = Some(String::new());
+                request.storage_class = Some(gateway_dto::StorageClass::custom(String::new()));
+            }
+            "invalid-class" => request.storage_class = Some(gateway_dto::StorageClass::custom("NOT_A_CLASS".to_owned())),
+            "short-body" => request.content_length = 5,
+            "extra-body" => request.content_length = 3,
+            "oversize" => {
+                request.content_length =
+                    i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE + 1).expect("upload limit fits i64")
+            }
+            "unknown-length" => request.content_length = -1,
+            "expires" => request.expires = Some(OpaqueString::from("not a date")),
+            "empty-expires" => request.expires = Some(OpaqueString::from("")),
+            "if-match" => request.if_match = Some("\"different\"".to_owned()),
+            "bare-if-match" => request.if_match = Some("bare".to_owned()),
+            "bad-if-match" => request.if_match = Some("\"unbalanced".to_owned()),
+            "if-none-match" => request.if_none_match = Some("\"different\"".to_owned()),
+            "bare-if-none-match" => request.if_none_match = Some("bare".to_owned()),
+            "bad-if-none-match" => request.if_none_match = Some("\"unbalanced".to_owned()),
+            "spaced-wildcard" => request.if_match = Some(" * ".to_owned()),
+            "wildcard" => request.if_none_match = Some("*".to_owned()),
+            "empty-event-hold" => request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom(String::new())),
+            "event-hold-off" => request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom("OFF".to_owned())),
+            "event-days-zero" => request.object_lock_event_hold_duration_days = Some(0),
+            "event-years-zero" => request.object_lock_event_hold_duration_years = Some(0),
+            "event-precedence" => {
+                request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom("ON".to_owned()));
+                request.if_match = Some("\"unbalanced".to_owned());
+            }
+            "event-hold" => request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom("ON".to_owned())),
+            "event-days" => request.object_lock_event_hold_duration_days = Some(1),
+            "event-years" => request.object_lock_event_hold_duration_years = Some(1),
+            _ => (),
+        }
+        request
+    }
+
+    fn outcome(result: &rustfs_s3_types::S3Result<gateway_dto::PutObjectOutput>) -> serde_json::Value {
+        match result {
+            Ok(output) => serde_json::json!({"output": format!("{output:?}")}),
+            Err(error) => {
+                serde_json::json!({"code": format!("{:?}", error.code()), "status": error.status_code().map(|status| status.as_u16()), "message": error.message(), "headers": format!("{:?}", error.headers())})
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_put_error_projection_matches_legacy() {
+        use rustfs_s3_types::S3Error;
+        let mut observations = Vec::new();
+        for (code, explicit) in [
+            (S3ErrorCode::InvalidStorageClass, false),
+            (S3ErrorCode::IncompleteBody, false),
+            (S3ErrorCode::UnexpectedContent, false),
+            (S3ErrorCode::Custom("ProtocolPutUnmapped".into()), false),
+            (S3ErrorCode::InvalidStorageClass, true),
+            (S3ErrorCode::IncompleteBody, true),
+            (S3ErrorCode::UnexpectedContent, true),
+            (S3ErrorCode::EntityTooLarge, true),
+            (S3ErrorCode::NotImplemented, true),
+            (S3ErrorCode::Custom("ProtocolPutUnmapped".into()), true),
+        ] {
+            let make = || {
+                let mut error = S3Error::new(code.clone());
+                if explicit {
+                    error.set_message("explicit protocol error");
+                    error.set_status_code(http::StatusCode::IM_A_TEAPOT);
+                    let mut headers = HeaderMap::new();
+                    headers.insert("x-protocol-test", http::HeaderValue::from_static("preserved"));
+                    error.set_headers(headers);
+                }
+                error
+            };
+            let old: s3s::S3Error = make().into();
+            let old = Err(S3Error::from(old));
+            let current = Err(owned::put_error(make()));
+            observations.push((code, explicit, outcome(&old), outcome(&current)));
+        }
+        let mismatches: Vec<_> = observations
+            .into_iter()
+            .filter(|(_, _, old, current)| old != current)
+            .collect();
+        assert!(mismatches.is_empty(), "PutObject error projection mismatches: {mismatches:#?}");
+    }
+
+    fn put_count() -> u64 {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == rustfs_s3_ops::S3Operation::PutObject.as_str())
+            .map_or(0, |row| row.total)
+    }
+
+    async fn object_state(backend: &ProtocolStorageClient, key: &str, root: &rustfs_credentials::Credentials) -> Option<Vec<u8>> {
+        use http_body_util::BodyExt;
+        use rustfs_protocols::common::client::s3::StorageBackend;
+        match backend.get_object("protocol-put-oracle", key, root, None).await {
+            Ok(output) => Some(
+                output
+                    .body
+                    .expect("object body")
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("read object")
+                    .to_bytes()
+                    .to_vec(),
+            ),
+            Err(error) if error.code() == &S3ErrorCode::NoSuchKey => None,
+            Err(error) => panic!("unexpected read after PUT: {error}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_put_runtime_matches_legacy() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-put-oracle", || async {
+            compare_cases(&[
+                ("plain", None),
+                ("empty", None),
+                ("unknown-length", Some(S3ErrorCode::UnexpectedContent)),
+                ("expires", Some(S3ErrorCode::InvalidArgument)),
+                ("empty-expires", None),
+                ("if-match", None),
+                ("bare-if-match", None),
+                ("bad-if-match", Some(S3ErrorCode::InternalError)),
+                ("if-none-match", Some(S3ErrorCode::NotImplemented)),
+                ("bare-if-none-match", Some(S3ErrorCode::NotImplemented)),
+                ("bad-if-none-match", Some(S3ErrorCode::InternalError)),
+                ("spaced-wildcard", Some(S3ErrorCode::InternalError)),
+                ("wildcard", None),
+                ("empty-event-hold", None),
+                ("event-hold-off", Some(S3ErrorCode::InternalError)),
+                ("event-days-zero", Some(S3ErrorCode::InternalError)),
+                ("event-years-zero", Some(S3ErrorCode::InternalError)),
+                ("event-precedence", Some(S3ErrorCode::InternalError)),
+                ("event-hold", Some(S3ErrorCode::InternalError)),
+                ("event-days", Some(S3ErrorCode::InternalError)),
+                ("event-years", Some(S3ErrorCode::InternalError)),
+            ])
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_put_error_boundaries_match_legacy() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-put-error-oracle", || async {
+            compare_cases(&[
+                ("invalid-class", Some(S3ErrorCode::InvalidStorageClass)),
+                ("short-body", Some(S3ErrorCode::IncompleteBody)),
+                ("extra-body", Some(S3ErrorCode::UnexpectedContent)),
+                ("oversize", Some(S3ErrorCode::EntityTooLarge)),
+            ])
+            .await;
+        });
+    }
+
+    async fn compare_cases(cases: &[(&str, Option<S3ErrorCode>)]) {
+        use crate::runtime_sources::ServerContextSlot;
+        use crate::storage_api::protocols::client::{BucketOperations, MakeBucketOptions};
+        use rustfs_protocols::common::client::s3::StorageBackend;
+        let root = rustfs_credentials::Credentials {
+            access_key: "protocol-put-root".into(),
+            secret_key: "protocol-put-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_temp, context, _iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+        context
+            .object_store()
+            .make_bucket("protocol-put-oracle", &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let mut observations = Vec::new();
+        for (case, expected) in cases.iter().cloned() {
+            let old_key = format!("old/{case}");
+            let current_key = format!("current/{case}");
+            let before = put_count();
+            let old = legacy_put(&backend.fs, case_input(case, &old_key), &root).await;
+            let old_count = put_count() - before;
+            let old_state = object_state(&backend, &old_key, &root).await;
+            let before = put_count();
+            let current = backend.put_object(case_input(case, &current_key), &root).await;
+            let current_count = put_count() - before;
+            let state = object_state(&backend, &current_key, &root).await;
+            let expected_count = u64::from(expected != Some(S3ErrorCode::InternalError));
+            observations.push((
+                case,
+                outcome(&old),
+                outcome(&current),
+                old.as_ref().err().map(|error| error.code().clone()),
+                expected.clone(),
+                state,
+                expected.is_none().then(|| b"data".to_vec()),
+                old_state,
+                old_count,
+                current_count,
+                expected_count,
+            ));
+        }
+        let mismatches: Vec<_> = observations
+            .into_iter()
+            .filter(
+                |(
+                    _,
+                    old,
+                    current,
+                    old_code,
+                    expected,
+                    state,
+                    expected_state,
+                    old_state,
+                    old_count,
+                    current_count,
+                    expected_count,
+                )| {
+                    old != current
+                        || old_code != expected
+                        || state != expected_state
+                        || old_state != expected_state
+                        || old_count != expected_count
+                        || current_count != expected_count
+                },
+            )
+            .collect();
+        assert!(mismatches.is_empty(), "protocol PutObject mismatches: {mismatches:#?}");
     }
 }
