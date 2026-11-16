@@ -15,8 +15,6 @@
 //! Bucket CORS configuration use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::GetBucketCorsInput;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Result};
 use rustfs_gateway_types::cors_tagging::parse_cors;
 use rustfs_gateway_types::persistence::serialize_cors_dto;
 
@@ -64,26 +62,30 @@ impl DefaultBucketUsecase {
         .await
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<PersistedCorsConfiguration> {
-        let GetBucketCorsInput { bucket, .. } = req.input;
-
+    /// Returns the stored bucket CORS configuration after checking the bucket exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InternalError` if the store is uninitialized, `NoSuchCORSConfiguration`
+    /// if the configuration is absent, or the storage error from either lookup.
+    #[instrument(level = "debug", skip(self, bucket))]
+    pub async fn execute_get_bucket_cors(&self, bucket: &str) -> rustfs_s3_types::S3Result<PersistedCorsConfiguration> {
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };
 
         store
-            .get_bucket_info(&bucket, &BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        let cors_configuration = match metadata_sys::get_cors_config(&bucket).await {
+        let cors_configuration = match metadata_sys::get_cors_config(bucket).await {
             Ok((config, _)) => config,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::NoSuchCORSConfiguration,
-                        "The CORS configuration does not exist".to_string(),
+                    return Err(rustfs_s3_types::s3_error!(
+                        NoSuchCORSConfiguration,
+                        "The CORS configuration does not exist"
                     ));
                 }
                 warn!(
@@ -154,7 +156,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, gateway_bucket, owned_envelope};
+    use crate::app::bucket_usecase::test_support::{gateway_bucket, owned_envelope};
     use http::Method;
 
     #[tokio::test]
@@ -174,16 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_bucket_cors_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketCorsInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_get_bucket_cors(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        let err = usecase.execute_get_bucket_cors("test-bucket").await.unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
