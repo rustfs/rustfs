@@ -1028,6 +1028,9 @@ pub struct GenerallyLockResponse {
     /// Only populated by unlock RPCs.
     #[prost(enumeration = "LockReleaseStatus", tag = "4")]
     pub release_status: i32,
+    /// Fixed-width optional namespace mutation proof.
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    pub cache_fence_stamp: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1051,6 +1054,9 @@ pub struct GenerallyLockResult {
     /// Only populated by lock batches.
     #[prost(enumeration = "LockAcquireStatus", tag = "5")]
     pub acquire_status: i32,
+    /// Fixed-width optional namespace mutation proof.
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    pub cache_fence_stamp: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]

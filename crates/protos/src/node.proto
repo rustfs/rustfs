@@ -662,6 +662,7 @@ message GenerallyLockResponse {
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Only populated by unlock RPCs.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockRequest {
@@ -681,6 +682,7 @@ message GenerallyLockResult {
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Per-ID result for unlock batches.
   LockAcquireStatus acquire_status = 5; // Only populated by lock batches.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockResponse {
