@@ -913,8 +913,9 @@ pub struct DeleteVersionsRequest {
     pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "4")]
     pub opts: ::prost::alloc::string::String,
-    /// msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
-    /// both; receivers prefer the \*\_bin form and fall back to the JSON string when it is empty.
+    /// Senders dual-write for legacy peers. A nonempty versions_bin list determines
+    /// the batch length and values. Malformed binary items reject the batch.
+    /// An empty binary list selects the legacy versions list. Options decode independently.
     #[prost(bytes = "bytes", repeated, tag = "5")]
     pub versions_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
     #[prost(bytes = "bytes", tag = "6")]

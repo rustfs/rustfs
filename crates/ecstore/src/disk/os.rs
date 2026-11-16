@@ -2371,6 +2371,8 @@ type NativeRootIdentity = (u64, u64);
 struct NativePublicationHistory {
     roots: HashMap<NativeRootIdentity, NativeRootHistory>,
     aliases: HashMap<PathBuf, HashSet<NativeRootIdentity>>,
+    #[cfg(target_os = "linux")]
+    live_proc_roots: HashMap<PathBuf, (NativeRootIdentity, Weak<std::fs::File>)>,
 }
 
 #[derive(Debug, Default)]
@@ -2450,12 +2452,59 @@ pub(crate) fn register_native_publication_root(root: &Path, io_root: &Path) -> O
 /// Record before queueing filesystem work. Cancellation never removes Started.
 pub(crate) fn record_native_publication(path: &Path) {
     let aliases: Vec<_> = {
+        #[cfg(target_os = "linux")]
+        let mut history = NATIVE_PUBLICATION_HISTORY.lock();
+        #[cfg(not(target_os = "linux"))]
         let history = NATIVE_PUBLICATION_HISTORY.lock();
-        path.ancestors()
-            .filter(|alias| history.aliases.contains_key(*alias))
-            .map(Path::to_path_buf)
-            .collect()
+        let mut unpinned = Vec::new();
+        for alias in path.ancestors() {
+            if !history.aliases.contains_key(alias) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some((live_identity, weak)) = history.live_proc_roots.get(alias) {
+                if weak.strong_count() > 0 {
+                    let live_identity = *live_identity;
+                    if history
+                        .aliases
+                        .get(alias)
+                        .is_some_and(|ids| ids.len() == 1 && ids.contains(&live_identity))
+                    {
+                        let Ok(relative) = path.strip_prefix(alias) else {
+                            continue;
+                        };
+                        let mut components = relative.components().filter(|part| !matches!(part, Component::CurDir));
+                        let Some(first) = components.next() else {
+                            continue;
+                        };
+                        let bucket = match first {
+                            Component::Normal(bucket) if components.all(|part| matches!(part, Component::Normal(_))) => {
+                                bucket.to_str()
+                            }
+                            _ => None,
+                        };
+                        let root = history.roots.entry(live_identity).or_default();
+                        match bucket {
+                            Some(bucket) => {
+                                if !root.started.contains(bucket) {
+                                    root.started.insert(bucket.to_owned());
+                                }
+                            }
+                            None => root.unknown = true,
+                        }
+                        continue;
+                    }
+                } else {
+                    history.live_proc_roots.remove(alias);
+                }
+            }
+            unpinned.push(alias.to_path_buf());
+        }
+        unpinned
     };
+    if aliases.is_empty() {
+        return;
+    }
     // Physical lookups must never hold the process-wide publication mutex.
     let observations: Vec<_> = aliases
         .into_iter()
@@ -6116,7 +6165,18 @@ impl PublicationRoot {
         #[cfg(target_os = "linux")]
         let io_path = {
             use std::os::fd::AsRawFd;
-            Arc::new(PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd())))
+            use std::os::unix::fs::MetadataExt;
+            let proc_alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+            if let Ok(metadata) = directory.metadata()
+                && metadata.is_dir()
+            {
+                let identity = (metadata.dev(), metadata.ino());
+                NATIVE_PUBLICATION_HISTORY
+                    .lock()
+                    .live_proc_roots
+                    .insert(proc_alias.clone(), (identity, Arc::downgrade(&directory)));
+            }
+            Arc::new(proc_alias.join("."))
         };
 
         Ok(Self {
@@ -14866,6 +14926,95 @@ mod native_creation_history_tests {
 mod fd_relative_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn live_proc_root_fast_path_preserves_three_way_semantics_and_retires_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("temporary disk");
+        let root = PublicationRoot::new(temp.path()).expect("pinned root");
+        let io_path = root.io_path().to_path_buf();
+        let proc_alias: PathBuf = io_path.components().collect();
+        let reg = register_native_publication_root(temp.path(), &io_path).expect("register root");
+        let backend: Arc<dyn super::super::local::LocalIoBackend> =
+            Arc::new(super::super::local::StdBackend::new(temp.path().to_path_buf()));
+        let disk_id = uuid::Uuid::new_v4();
+
+        let bucket_a = format!("proc-fast-a-{}", uuid::Uuid::new_v4());
+        let bucket_b = format!("proc-fast-b-{}", uuid::Uuid::new_v4());
+        let witness_a = reg
+            .witness(&bucket_a, disk_id, Arc::clone(&backend))
+            .expect("witness a before publication");
+        let witness_b = reg
+            .witness(&bucket_b, disk_id, Arc::clone(&backend))
+            .expect("witness b before publication");
+
+        let stat_hits = Arc::new(AtomicUsize::new(0));
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        // Root-level path (`path == alias` or `alias/.`) must be a no-op and must not set `unknown` or stat.
+        record_native_publication(&io_path);
+        record_native_publication(&proc_alias);
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_a)));
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Publishing into `bucket_a` marks only `bucket_a` as started without statting or poisoning `bucket_b`.
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join(&bucket_a).join("object/xl.meta"));
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness_a)));
+        assert!(validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Non-Normal component (`..`) sets `unknown = true`, invalidating remaining witnesses on that root.
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join(&bucket_b).join("../escape"));
+        assert_eq!(stat_hits.load(Ordering::SeqCst), 0, "live proc fast path must skip stat");
+        drop(stat_guard);
+        assert!(!validate_native_creation_witnesses(std::slice::from_ref(&witness_b)));
+
+        // Dropping the last strong owner of the root directory fd retires the live proc entry and falls back to stat.
+        assert!(NATIVE_PUBLICATION_HISTORY.lock().live_proc_roots.contains_key(&proc_alias));
+        drop(root);
+        let stat_hits_hook = Arc::clone(&stat_hits);
+        let _stat_guard = prepared_publication_test_hooks::install_at(
+            prepared_publication_test_hooks::Stage::NativeRootIdentity,
+            &proc_alias,
+            move || {
+                stat_hits_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        record_native_publication(&io_path.join("after-drop"));
+        assert!(!NATIVE_PUBLICATION_HISTORY.lock().live_proc_roots.contains_key(&proc_alias));
+        assert_eq!(
+            stat_hits.load(Ordering::SeqCst),
+            1,
+            "retired proc root must fall back to native_root_identity"
+        );
+    }
 
     #[tokio::test]
     async fn guarded_first_publication_recovers_from_a_concurrent_parent_prune() {

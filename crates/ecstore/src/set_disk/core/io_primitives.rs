@@ -9904,6 +9904,19 @@ mod tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
+                let fanout_order = bounded_metadata_fanout_order(bucket, &object, DISKS, 2);
+                let distribution = FileInfo::new(&metadata_distribution_key(bucket, &object), 2, 2)
+                    .erasure
+                    .distribution;
+                let initial_parity_disk = *fanout_order
+                    .iter()
+                    .take(3)
+                    .find(|disk_index| distribution[**disk_index] > 2)
+                    .expect("initial fanout should include one parity shard");
+                // Hold the initial parity response so the single-pending-read
+                // hedge is exercised independently of task completion order.
+                let initial_barrier =
+                    rename_fanout_barrier::arm(&object, initial_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                 let spare_disk = bounded_spare_disk_index(bucket, &object, 2, 2);
                 let barrier = rename_fanout_barrier::arm(&object, spare_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                 let tracker = rename_fanout_barrier::observe_tasks(&object);
@@ -9926,9 +9939,13 @@ mod tests {
                     .await
                 });
 
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, initial_barrier.wait_until_paused())
+                    .await
+                    .expect("initial parity response should pause before quorum");
                 tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
                     .await
                     .expect("bounded fanout should hedge and pause the spare disk");
+                initial_barrier.release();
                 let (parts_metadata, errs, diagnostics) = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read)
                     .await
                     .expect("verified inline quorum should return without the paused spare")
@@ -10220,6 +10237,15 @@ mod tests {
         }
         assert_eq!(
             data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &corrupt, &disks).await,
+            Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
+        );
+
+        let mut trailing = parts_metadata.clone();
+        let mut inline_data = trailing[data_disk].data.as_ref().expect("fixture inline bytes").to_vec();
+        inline_data.push(0x7b);
+        trailing[data_disk].data = Some(Bytes::from(inline_data));
+        assert_eq!(
+            data_read_early_stop_inline_body_miss_reason(bucket, object, &candidate, &trailing, &disks).await,
             Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY)
         );
     }
