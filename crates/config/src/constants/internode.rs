@@ -121,9 +121,17 @@ pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
 pub const ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED";
 pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: bool = false;
 
+/// Permit current per-peer capability proof to replace fleet-wide confirmation.
+///
+/// This remains ineffective unless [`ENV_INTERNODE_RPC_MSGPACK_ONLY`] is also enabled. Unknown,
+/// unsupported, revoked, or stale connection generations keep dual-writing JSON.
+pub const ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: bool = false;
+
 // Compile-time invariants: dual-write by default so the base build is byte-for-byte legacy behavior.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED);
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY);
 
 /// Require target-bound v2 signatures on every internode gRPC request, rejecting the legacy
 /// constant-target fallback instead of accepting it (<https://github.com/rustfs/backlog/issues/1327>).
@@ -293,6 +301,14 @@ pub const ENV_INTERNODE_BULK_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_CO
 pub const DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT: usize = 64;
 pub const ENV_INTERNODE_BULK_BUFFER_SIZE: &str = "RUSTFS_INTERNODE_BULK_BUFFER_SIZE";
 pub const DEFAULT_INTERNODE_BULK_BUFFER_SIZE: usize = 1024;
+
+/// Per-peer limit held through complete bulk-unary response decoding and validation. Zero keeps
+/// the compatibility behavior with no additional admission gate.
+pub const ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT";
+pub const DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: usize = 0;
+pub const ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: &str = "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS";
+pub const DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: u64 = 1_000;
+const _: () = assert!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT == 0);
 
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
@@ -501,8 +517,12 @@ mod tests {
     fn internode_channel_isolation_defaults_and_env_names() {
         // The isolation-off default is asserted at compile time next to the constant definition.
         assert_eq!(DEFAULT_INTERNODE_BULK_CHANNELS, 2);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, 0);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, 1_000);
         assert_eq!(ENV_INTERNODE_CHANNEL_ISOLATION, "RUSTFS_INTERNODE_CHANNEL_ISOLATION");
         assert_eq!(ENV_INTERNODE_BULK_CHANNELS, "RUSTFS_INTERNODE_BULK_CHANNELS");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS");
     }
 
     #[test]
@@ -513,6 +533,7 @@ mod tests {
             ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
             "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"
         );
+        assert_eq!(ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY, "RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY");
     }
 
     #[test]

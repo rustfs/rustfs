@@ -166,3 +166,91 @@ fn get_authorization_binds_version_and_explicit_denial() {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn attributes_authorization_requires_each_action_on_the_original_version() {
+    use super::authorize_get_object_attributes;
+
+    crate::app::gating_test_env::run_large_stack_test("attributes-authorization", || async {
+        let context = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = context.object_store();
+        let slot = std::sync::Arc::new(ServerContextSlot::new());
+        assert!(slot.install(Arc::clone(&context)));
+        for (version, required) in [
+            (None, ["s3:GetObjectAttributes", "s3:GetObject"]),
+            (Some(""), ["s3:GetObjectVersionAttributes", "s3:GetObjectVersion"]),
+            (Some("null"), ["s3:GetObjectVersionAttributes", "s3:GetObjectVersion"]),
+            (
+                Some(" aedfa2f8-840d-4a1c-b717-04411d82389e "),
+                ["s3:GetObjectVersionAttributes", "s3:GetObjectVersion"],
+            ),
+        ] {
+            for (allowed, denied, key, permitted) in [
+                (&required[..], None, "key", true),
+                (&required[..1], None, "key", false),
+                (&required[1..], None, "key", false),
+                (&required[..], Some(required[0]), "key", false),
+                (&required[..], Some(required[1]), "key", false),
+                (&required[..], None, "unrelated", false),
+            ] {
+                let bucket = format!("attributes-auth-{}", uuid::Uuid::new_v4().simple());
+                store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+                let resource = format!("arn:aws:s3:::{bucket}/key");
+                let mut statements = vec![serde_json::json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": allowed,
+                    "Resource": resource,
+                })];
+                if let Some(action) = denied {
+                    statements.push(serde_json::json!({
+                        "Effect": "Deny",
+                        "Principal": {"AWS": "*"},
+                        "Action": action,
+                        "Resource": resource,
+                    }));
+                }
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mut request = S3Request {
+                    input: (),
+                    method: Method::GET,
+                    uri: Uri::from_static("/bucket/key?attributes"),
+                    headers: HeaderMap::new(),
+                    extensions: Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                request.extensions.insert(ReqInfo::default());
+                request.extensions.insert(Arc::clone(&slot));
+                let mut envelope = RequestEnvelope::from_s3s(&request);
+                let legacy = authorize_get_object_attributes(&mut request, &bucket, key, version).await;
+                let native = authorize_get_object_attributes(&mut envelope, &bucket, key, version).await;
+                let expected = (!permitted).then_some(&S3ErrorCode::AccessDenied);
+                for (edge, result, info) in [
+                    ("legacy", legacy, request.extensions.get::<ReqInfo>().unwrap()),
+                    ("native", native, envelope.req_info().unwrap()),
+                ] {
+                    assert_eq!(
+                        result.as_ref().err().map(|error| error.code()),
+                        expected,
+                        "edge={edge}, allow={allowed:?}, deny={denied:?}, key={key}, version={version:?}",
+                    );
+                    assert_eq!(
+                        (info.bucket.as_deref(), info.object.as_deref(), info.version_id.as_deref()),
+                        (Some(bucket.as_str()), Some(key), version)
+                    );
+                }
+            }
+        }
+    });
+}

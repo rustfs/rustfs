@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SelectObjectContent requests across the legacy S3 edge.
+//! SelectObjectContent requests from either S3 edge.
 //!
-//! Responsible for: converting the s3s request the edge decoded into the
-//! request the query engine runs (rustfs/backlog#2746), through the gateway's
-//! s3s seam for the serialization shapes. Not responsible for: validating the
-//! request; the select use case does that before the engine is built.
-//! DELETE BY T4.1 (rustfs/backlog#2783) with the rest of the legacy edge.
+//! Both S3 edges pass the request in the shape the query engine reads.
+//! The select use case validates it before building the engine.
+//! The s3s conversion is deleted with the legacy edge (rustfs/backlog#2783).
 
 use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::shapes::input_serialization::input_serialization_from_s3s;
@@ -67,6 +65,43 @@ pub(crate) fn select_input_from_s3s(
             }),
         },
     })
+}
+
+/// Moves the gateway's flat request into the shape the query engine reads.
+#[cfg(any(feature = "gateway-stack", test))]
+pub(crate) fn select_input_from_gateway(
+    input: rustfs_gateway_types::dto::SelectObjectContentInput,
+) -> engine::SelectObjectContentInput {
+    let rustfs_gateway_types::dto::SelectObjectContentInput {
+        bucket,
+        key,
+        expected_bucket_owner,
+        sse_customer_algorithm,
+        sse_customer_key,
+        sse_customer_key_md5,
+        expression,
+        expression_type,
+        input_serialization,
+        output_serialization,
+        request_progress,
+        scan_range,
+    } = input;
+    engine::SelectObjectContentInput {
+        bucket: bucket.as_str().to_owned(),
+        key: key.as_str().to_owned(),
+        expected_bucket_owner,
+        sse_customer_algorithm,
+        sse_customer_key: sse_customer_key.map(|key| key.expose_secret().to_owned()),
+        sse_customer_key_md5,
+        request: engine::SelectObjectContentRequest {
+            expression,
+            expression_type,
+            input_serialization,
+            output_serialization,
+            request_progress,
+            scan_range,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +191,31 @@ mod tests {
         assert_eq!(out.record_delimiter.as_deref(), Some("\r\n"));
         assert_eq!(request.request_progress.as_ref().and_then(|progress| progress.enabled), Some(true));
         let range = request.scan_range.as_ref().expect("scan range");
+        assert_eq!((range.start, range.end), (Some(3), Some(9)));
+    }
+
+    #[test]
+    fn gateway_projection_preserves_the_query_and_read_parameters() {
+        let source = input(InputSerialization {
+            csv: Some(CSVInput::default()),
+            ..Default::default()
+        });
+        let owned = rustfs_gateway_types::compat::s3s_5761ddfe::select::input_from_s3s(source, &Default::default())
+            .expect("materialize the test request");
+        let converted = super::select_input_from_gateway(owned);
+        assert_eq!((converted.bucket.as_str(), converted.key.as_str()), ("bucket", "key"));
+        assert_eq!(converted.expected_bucket_owner.as_deref(), Some("owner"));
+        assert_eq!(converted.sse_customer_algorithm.as_deref(), Some("AES256"));
+        assert_eq!(converted.sse_customer_key.as_deref(), Some("key-text"));
+        assert_eq!(converted.sse_customer_key_md5.as_deref(), Some("client-md5"));
+        let request = converted.request;
+        assert_eq!(request.expression, "SELECT * FROM S3Object");
+        assert_eq!(request.expression_type, super::engine::ExpressionType::SQL);
+        assert!(request.input_serialization.csv.is_some());
+        let csv = request.output_serialization.csv.expect("CSV output");
+        assert_eq!(csv.field_delimiter.as_deref(), Some(";"));
+        assert_eq!(request.request_progress.and_then(|progress| progress.enabled), Some(true));
+        let range = request.scan_range.expect("scan range");
         assert_eq!((range.start, range.end), (Some(3), Some(9)));
     }
 

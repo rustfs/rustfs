@@ -27,6 +27,7 @@ mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
 mod listing_multipart;
+mod object_attributes;
 mod object_commit;
 mod object_meta;
 mod object_misc;
@@ -349,11 +350,21 @@ fn operations_that_answer_every_caller_alike_do_so_on_the_legacy_stack() {
 
 /// Every served operation serves the root caller, counted once under its label, and refuses
 /// each caller it cannot admit with the code the legacy stack answers, counted once.
-async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer) {
+async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server: RustFSServer, legacy: bool) {
     create_bucket_in_the_store(MATRIX_BUCKET).await;
+    // Default encryption would change the object writes in the matrix bucket.
+    create_bucket_in_the_store(bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
+    bucket_configs::store_read_configs(MATRIX_BUCKET, bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
+    bucket_core::seed_website(MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::REPLICATION_MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::LOCK_CONFIGURATION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
+    object_misc::seed_restore_object(object_misc::MATRIX_BUCKET, false).await;
+    object_misc::seed_select_matrix().await;
     create_bucket_in_the_store(object_read::MATRIX_BUCKET).await;
+    create_bucket_in_the_store(object_commit::COPY_MATRIX_BUCKET).await;
+    put_object_in_the_store(object_commit::COPY_MATRIX_BUCKET, object_commit::COPY_MATRIX_SOURCE).await;
     create_user_without_a_policy(NO_POLICY_USER).await;
     let endpoint = server.endpoint();
     let root = s3_client(&endpoint, server.access_key(), server.secret_key());
@@ -382,11 +393,36 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
         let before = s3_request_counts();
         assert_eq!((row.call)(&root, MATRIX_BUCKET).await, Ok(()), "{} as root", row.operation);
         let counted = counted_since(&before);
+        // These legacy edge bodies do not record an operation label.
+        let expected_label = if legacy
+            && matches!(
+                row.metric,
+                S3Operation::GetBucketAccelerateConfiguration
+                    | S3Operation::GetBucketRequestPayment
+                    | S3Operation::GetBucketWebsite
+                    | S3Operation::PutBucketAccelerateConfiguration
+                    | S3Operation::PutBucketRequestPayment
+                    | S3Operation::PutBucketWebsite
+                    | S3Operation::DeleteBucketWebsite
+                    | S3Operation::PutBucketReplication
+                    | S3Operation::DeleteBucketReplication
+                    | S3Operation::PutObjectLockConfiguration
+                    | S3Operation::PutBucketEncryption
+                    | S3Operation::PutBucketTagging
+                    | S3Operation::DeleteBucketEncryption
+                    | S3Operation::DeleteBucketTagging
+                    | S3Operation::SelectObjectContent
+                    | S3Operation::RestoreObject
+            ) {
+            "unknown"
+        } else {
+            row.metric.as_str()
+        };
         assert_eq!(counted.len(), 1, "{}: {counted:?}", row.operation);
         assert!(
             counted
                 .iter()
-                .all(|((_, label, outcome), total)| (*label, *outcome, *total) == (row.metric.as_str(), "2xx", 1)),
+                .all(|((_, label, outcome), total)| (*label, *outcome, *total) == (expected_label, "2xx", 1)),
             "{}: {counted:?}",
             row.operation
         );
@@ -428,12 +464,16 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
 
 #[test]
 fn the_refusal_matrix_holds_on_the_gateway_stack() {
-    with_stack(GATEWAY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
+    bucket_access::with_notification_stack(GATEWAY, |server| {
+        every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server, false)
+    });
 }
 
 #[test]
 fn the_refusal_matrix_holds_on_the_legacy_stack() {
-    with_stack(LEGACY, every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit);
+    bucket_access::with_notification_stack(LEGACY, |server| {
+        every_served_operation_serves_root_and_refuses_the_callers_it_cannot_admit(server, true)
+    });
 }
 
 /// Names RustFS creates and the AWS bucket grammar refuses. An IP-shaped name such as `256.1.1.1`

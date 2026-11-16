@@ -12,25 +12,70 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Refusal-matrix rows of migration batch D (rustfs/backlog#2765). None is served yet.
+//! PutObject and UploadPart refusal rows and legacy/gateway wire behavior.
 
-pub(crate) const MATRIX: &[super::MatrixRow] = &[];
+pub(crate) const MATRIX: &[super::MatrixRow] = &[
+    super::MatrixRow {
+        operation: "PutObject",
+        metric: rustfs_s3_ops::S3Operation::PutObject,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                super::outcome(
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key("put-matrix")
+                        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"matrix"))
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
+    super::MatrixRow {
+        operation: "UploadPart",
+        metric: rustfs_s3_ops::S3Operation::UploadPart,
+        has_error_body: true,
+        call: |client, bucket| {
+            Box::pin(async move {
+                use rustfs_storage_api::MultipartOperations as _;
+                let store = super::get_global_app_context().expect("embedded context").object_store();
+                let upload = store
+                    .new_multipart_upload(bucket, "part-matrix", &Default::default())
+                    .await
+                    .expect("matrix upload");
+                super::outcome(
+                    client
+                        .upload_part()
+                        .bucket(bucket)
+                        .key("part-matrix")
+                        .upload_id(upload.upload_id)
+                        .part_number(1)
+                        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"matrix"))
+                        .send()
+                        .await,
+                )
+            })
+        },
+    },
+];
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct WireClient<'a> {
-    endpoint: &'a str,
-    access_key: &'a str,
-    secret_key: &'a str,
+pub(super) struct WireClient<'a> {
+    pub(super) endpoint: &'a str,
+    pub(super) access_key: &'a str,
+    pub(super) secret_key: &'a str,
 }
 
-struct WireAnswer {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
+pub(super) struct WireAnswer {
+    pub(super) status: u16,
+    pub(super) headers: BTreeMap<String, String>,
+    pub(super) body: String,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -119,7 +164,7 @@ impl WireClient<'_> {
         }
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         method: &str,
         path: &str,
@@ -149,8 +194,34 @@ impl WireClient<'_> {
             .map(|(name, value)| format!("{name}:{}\n", value.trim()))
             .collect();
         let signed_headers = headers.keys().cloned().collect::<Vec<_>>().join(";");
+        let (canonical_path, query) = path.split_once('?').unwrap_or((path, ""));
+        let encode = |raw: &str| {
+            percent_encoding::percent_decode_str(raw)
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                        char::from(byte).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect::<String>()
+        };
+        let mut pairs = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (encode(name), encode(value))
+            })
+            .collect::<Vec<_>>();
+        pairs.sort();
+        let canonical_query = pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
         let canonical = format!(
-            "{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{}",
+            "{method}\n{canonical_path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{}",
             headers["x-amz-content-sha256"]
         );
         let message = format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}", hex(&Sha256::digest(canonical.as_bytes())));
@@ -320,3 +391,275 @@ fn legacy_owned_post_keeps_implicit_status_and_redirect_selection() {
         server.shutdown().await;
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_wire_stores_bytes_and_refuses_corruption_and_wrong_resources() {
+    super::with_stack(super::GATEWAY, |server| async move {
+        const BUCKET: &str = "dg-put-wire";
+        const OTHER: &str = "dg-put-other";
+        const USER: &str = "dgputscoped";
+        for bucket in [BUCKET, OTHER] {
+            super::create_bucket_in_the_store(bucket).await;
+        }
+        super::create_user_allowed_on_one_bucket(USER, "s3:PutObject", &format!("{BUCKET}/allowed")).await;
+        let endpoint = server.endpoint();
+        let client = WireClient {
+            endpoint: &endpoint,
+            access_key: USER,
+            secret_key: super::USER_SECRET_KEY,
+        };
+        let answer = client
+            .request(
+                "PUT",
+                &format!("/{BUCKET}/allowed"),
+                b"hello",
+                &[("x-amz-checksum-crc32", "NhCmhg==")],
+                Some(5),
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(answer.headers.get("x-amz-checksum-crc32").map(String::as_str), Some("NhCmhg=="));
+        assert_eq!(
+            answer.headers.get("etag").map(String::as_str),
+            Some("\"5d41402abc4b2a76b9719d911017c592\"")
+        );
+        for path in [format!("/{BUCKET}/denied"), format!("/{OTHER}/allowed")] {
+            let answer = client.request("PUT", &path, b"hello", &[], Some(5)).await;
+            assert_eq!(answer.status, 403, "{path}: {}", answer.body);
+            assert!(answer.body.contains("<Code>AccessDenied</Code>"));
+        }
+        let root = WireClient {
+            endpoint: &endpoint,
+            access_key: server.access_key(),
+            secret_key: server.secret_key(),
+        };
+        for path in [format!("/{BUCKET}/denied"), format!("/{OTHER}/allowed")] {
+            assert_eq!(root.request("HEAD", &path, b"", &[], Some(0)).await.status, 404);
+        }
+        for (key, content, checksum, declared, expected) in [
+            ("wrong-crc", b"hello".as_slice(), "AAAAAA==", 5, "BadDigest"),
+            ("short", b"abc".as_slice(), "NSRBwg==", 5, "IncompleteBody"),
+        ] {
+            let answer = root
+                .request(
+                    "PUT",
+                    &format!("/{BUCKET}/{key}"),
+                    content,
+                    &[("x-amz-checksum-crc32", checksum)],
+                    Some(declared),
+                )
+                .await;
+            assert_eq!(answer.status, 400, "{key}: {}", answer.body);
+            assert!(answer.body.contains(&format!("<Code>{expected}</Code>")), "{key}: {}", answer.body);
+            assert_eq!(
+                root.request("HEAD", &format!("/{BUCKET}/{key}"), b"", &[], Some(0))
+                    .await
+                    .status,
+                404
+            );
+        }
+        let checksums = [
+            ("x-amz-checksum-crc32", "NhCmhg=="),
+            ("x-amz-checksum-sha256", "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="),
+        ];
+        let path = format!("/{BUCKET}/multiple-checksums");
+        let answer = root.request("PUT", &path, b"hello", &checksums, Some(5)).await;
+        assert_eq!(answer.status, 400, "{}", answer.body);
+        assert!(answer.body.contains("<Code>InvalidRequest</Code>"), "{}", answer.body);
+        assert_eq!(root.request("HEAD", &path, b"", &[], Some(0)).await.status, 404);
+
+        let sha512 = base64_simd::STANDARD.encode_to_string(sha2::Sha512::digest(b"hello"));
+        let answer = root
+            .request(
+                "PUT",
+                &format!("/{BUCKET}/sha512"),
+                b"hello",
+                &[("x-amz-checksum-sha512", &sha512)],
+                Some(5),
+            )
+            .await;
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(answer.headers.get("x-amz-checksum-sha512"), Some(&sha512));
+
+        for (key, extra) in [
+            ("plain-chunked", vec![]),
+            ("decoded-chunked", vec![("x-amz-decoded-content-length", "5")]),
+        ] {
+            let path = format!("/{BUCKET}/{key}");
+            let answer = root.request("PUT", &path, b"hello", &extra, None).await;
+            assert_eq!(answer.status, 411, "{key}: {}", answer.body);
+            assert!(answer.body.contains("<Code>MissingContentLength</Code>"), "{}", answer.body);
+            assert_eq!(root.request("HEAD", &path, b"", &[], Some(0)).await.status, 404);
+        }
+        let context = rustfs::app::context::get_global_app_context().unwrap();
+        let store = context.object_store();
+        use rustfs_storage_api::ObjectOperations as _;
+        let object = store
+            .get_object_info(BUCKET, "allowed", &rustfs_ecstore::api::object::ObjectOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(object.size, 5);
+        assert_eq!(object.etag.as_deref(), Some("5d41402abc4b2a76b9719d911017c592"));
+        server.shutdown().await;
+    });
+}
+
+const CRC32_TRAILER_HEADERS: [(&str, &str); 4] = [
+    ("content-encoding", "aws-chunked"),
+    ("x-amz-decoded-content-length", "5"),
+    ("x-amz-trailer", "x-amz-checksum-crc32"),
+    ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+];
+const VALID_CRC32_TRAILER: &[u8] = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n";
+
+async fn gateway_crc32_trailer_control(server: super::RustFSServer, sdk_algorithm: Option<&str>) {
+    const BUCKET: &str = "dg-put-trailer";
+    super::create_bucket_in_the_store(BUCKET).await;
+    let endpoint = server.endpoint();
+    let client = WireClient {
+        endpoint: &endpoint,
+        access_key: server.access_key(),
+        secret_key: server.secret_key(),
+    };
+    let mut headers = CRC32_TRAILER_HEADERS.to_vec();
+    if let Some(algorithm) = sdk_algorithm {
+        headers.push(("x-amz-sdk-checksum-algorithm", algorithm));
+    }
+    let answer = client
+        .request("PUT", &format!("/{BUCKET}/object"), VALID_CRC32_TRAILER, &headers, None)
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(
+        answer.headers.get("x-amz-checksum-crc32").map(String::as_str),
+        Some("NhCmhg=="),
+        "the response must echo the declared CRC32 trailer"
+    );
+    assert_eq!(
+        answer.headers.get("etag").map(String::as_str),
+        Some("\"5d41402abc4b2a76b9719d911017c592\"")
+    );
+    let stored = super::s3_client(&endpoint, server.access_key(), server.secret_key())
+        .get_object()
+        .bucket(BUCKET)
+        .key("object")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored.body.collect().await.unwrap().into_bytes().as_ref(), b"hello");
+    server.shutdown().await;
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_crc32_trailer_without_sdk_algorithm() {
+    super::with_stack(super::GATEWAY, |server| gateway_crc32_trailer_control(server, None));
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_crc32_trailer_with_matching_sdk_algorithm() {
+    super::with_stack(super::GATEWAY, |server| gateway_crc32_trailer_control(server, Some("CRC32")));
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_crc32_trailer_overrides_mismatching_sdk_algorithm() {
+    super::with_stack(super::GATEWAY, |server| gateway_crc32_trailer_control(server, Some("SHA256")));
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_refuses_invalid_crc32_trailers_without_publishing() {
+    super::with_stack(super::GATEWAY, |server| async move {
+        const BUCKET: &str = "dg-put-trailer-refusal";
+        super::create_bucket_in_the_store(BUCKET).await;
+        let endpoint = server.endpoint();
+        let client = WireClient {
+            endpoint: &endpoint,
+            access_key: server.access_key(),
+            secret_key: server.secret_key(),
+        };
+        for (key, body, expected) in [
+            (
+                "bad-trailer",
+                b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n".as_slice(),
+                "BadDigest",
+            ),
+            ("missing-trailer", b"5\r\nhello\r\n0\r\n\r\n".as_slice(), "BadDigest"),
+            (
+                "short-trailer-body",
+                b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32:NSRBwg==\r\n\r\n".as_slice(),
+                "IncompleteBody",
+            ),
+            ("conflict", VALID_CRC32_TRAILER, "InvalidRequest"),
+        ] {
+            let mut headers = CRC32_TRAILER_HEADERS.to_vec();
+            if key == "conflict" {
+                headers.push(("x-amz-checksum-crc32", "NhCmhg=="));
+            }
+            let path = format!("/{BUCKET}/{key}");
+            let answer = client.request("PUT", &path, body, &headers, None).await;
+            assert_eq!(answer.status, 400, "{key}: {}", answer.body);
+            assert!(answer.body.contains(&format!("<Code>{expected}</Code>")), "{key}: {}", answer.body);
+            assert_eq!(client.request("HEAD", &path, b"", &[], Some(0)).await.status, 404, "{key}");
+        }
+        server.shutdown().await;
+    });
+}
+
+async fn destination_version_queries(server: super::RustFSServer) {
+    let endpoint = server.endpoint();
+    let client = WireClient {
+        endpoint: &endpoint,
+        access_key: server.access_key(),
+        secret_key: server.secret_key(),
+    };
+    const BUCKET: &str = "dg-version-query";
+    super::create_bucket_in_the_store(BUCKET).await;
+    for version in ["null", "invalid", ""] {
+        let answer = client
+            .query_put(&format!("/{BUCKET}/version"), &format!("versionId={version}"), &[])
+            .await;
+        assert_eq!(answer.status, 400, "{version}: {}", answer.body);
+        assert!(answer.body.contains("<Code>InvalidArgument</Code>"), "{}", answer.body);
+        assert!(
+            answer
+                .body
+                .contains("A destination versionId requires replication authorization"),
+            "{}",
+            answer.body
+        );
+    }
+    let answer = client
+        .query_put(
+            &format!("/{BUCKET}/version"),
+            "versionId=null",
+            &[("x-minio-source-replication-request", "true")],
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    server.shutdown().await;
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_put_destination_version_query_answers() {
+    super::with_stack(super::LEGACY, destination_version_queries);
+}
+
+#[test]
+#[serial_test::serial]
+fn gateway_put_destination_version_query_answers() {
+    super::with_stack(super::GATEWAY, destination_version_queries);
+}
+
+impl WireClient<'_> {
+    async fn query_put(&self, path: &str, query: &str, extra: &[(&str, &str)]) -> WireAnswer {
+        self.request("PUT", &format!("{path}?{query}"), b"hello", extra, Some(5))
+            .await
+    }
+}
+
+#[path = "upload_part.rs"]
+mod upload_part;

@@ -97,6 +97,7 @@ use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
+#[cfg(test)]
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
@@ -144,6 +145,7 @@ use rustfs_audit::ObjectVersion as AuditObjectVersion;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
+use rustfs_gateway_types::dto::SelectObjectContentOutput;
 use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
@@ -151,6 +153,7 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
@@ -177,8 +180,9 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-use s3s::dto::{SelectObjectContentInput, SelectObjectContentOutput};
-use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Result};
+#[cfg(test)]
+use s3s::{S3Request, S3Response};
 
 fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
     S3Error::with_message(code, message)
@@ -204,9 +208,15 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
     }
 }
 
+mod attributes;
+#[cfg(test)]
+mod attributes_completion_test;
 #[cfg(test)]
 mod conditional_read_bench;
+pub(crate) use attributes::{GetObjectAttributesFields, GetObjectAttributesOutputFacts};
 mod copy;
+mod copy_input;
+pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition};
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) mod cuobject;
 mod delete;
@@ -224,6 +234,7 @@ mod on_demand_migration_put;
 mod put;
 mod put_input;
 pub(crate) use native_body::from_legacy as legacy_put_body;
+pub(crate) use native_body::{BodyChunks, FrameTrailers};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
@@ -374,16 +385,21 @@ impl DefaultObjectUsecase {
         map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(Some)
     }
 
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_select_object_content(
+    #[instrument(name = "execute_select_object_content", level = "debug", skip(self, envelope, input))]
+    #[hotpath::measure(
+        impl_type = "DefaultObjectUsecase",
+        future = true,
+        label = "rustfs::app::object::DefaultObjectUsecase::execute_select_object_content"
+    )]
+    pub(crate) async fn execute_select_object_content_owned(
         &self,
-        req: S3Request<SelectObjectContentInput>,
-    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        envelope: crate::app::RequestEnvelope,
+        input: SelectObjectContentInput,
+    ) -> rustfs_s3_types::S3Result<crate::app::Answered<SelectObjectContentOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
-        crate::app::select_object::execute_select_object_content(req).await
+        crate::app::select_object::execute_select_object_content(envelope, input).await
     }
 }

@@ -14361,6 +14361,8 @@ fn table_metadata_pointer_json_round_trips() {
     assert_eq!(pointer.metadata_location, location);
 }
 
+const PUT_OBJECT_MUTATION_BOUNDARY: &str = "self.put_object_core(write, body, input.frame_trailers, start_time).await?;";
+
 fn assert_object_mutation_reserved_prefix_guards(delete: &str, legacy_delete: &str) {
     assert_object_mutation_reserved_prefix_sources(
         delete,
@@ -14408,8 +14410,21 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             "fn execute_put_object_inner(",
             "self.execute_put_object_extract_owned(envelope, input)",
         ),
-        (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
-        (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
+        (
+            legacy_delete,
+            "fn execute_copy_object(",
+            "self.execute_copy_object_owned(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_owned(",
+            "self.execute_copy_object_body_boxed(envelope, input)",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_body_boxed(",
+            "self.execute_copy_object_body(envelope, input)",
+        ),
         (
             delete,
             "fn execute_delete_object(",
@@ -14450,7 +14465,7 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
             put,
             "fn execute_put_object_inner(",
             "validate_new_object_key(&key, request_method_name)?;",
-            "self.put_object_core(write, body, start_time).await?;",
+            PUT_OBJECT_MUTATION_BOUNDARY,
         ),
         (
             copy,
@@ -14474,7 +14489,7 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
         assert_ordered(method(source, signature), &[key_validation, key_guard, mutation_boundary]);
     }
     assert_ordered(
-        method(restore, "fn execute_restore_object("),
+        method(restore, "fn execute_restore_object_owned("),
         &[
             "validate_table_catalog_object_mutation(&bucket, &object).await?;",
             store_resolution,
@@ -14669,16 +14684,13 @@ fn object_mutation_guard_rejects_wrong_delete_input_forwarding() {
 }
 
 const MULTIPART_KEY_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+const MULTIPART_BORROWED_KEY_GUARD: &str = "validate_table_catalog_object_mutation(bucket, key).await?;";
 const OBJECT_METADATA_OBJECT_GUARD: &str = "validate_table_catalog_object_mutation(&bucket, &object).await?;";
 const OBJECT_METADATA_KEY_GUARD: &str = MULTIPART_KEY_GUARD;
 
 fn assert_multipart_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
-    assert_eq!(
-        source.count(MULTIPART_KEY_GUARD),
-        4,
-        "reserved-prefix guard calls across {}",
-        source.describe()
-    );
+    let guard_calls = source.count(MULTIPART_KEY_GUARD) + source.count(MULTIPART_BORROWED_KEY_GUARD);
+    assert_eq!(guard_calls, 4, "reserved-prefix guard calls across {}", source.describe());
 }
 
 fn assert_object_metadata_reserved_prefix_guard_calls(source: &crate::guard_sources::SourceSet) {
@@ -14729,7 +14741,7 @@ fn guard_fixture(files: &[(&str, &str)], file: &str, split_dir: &str) -> crate::
 #[test]
 fn multipart_count_guard_fails_when_a_dropped_production_call_is_replaced_by_test_mentions() {
     let parent = format!(
-        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_KEY_GUARD}\n    }}\n}}\n",
+        "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_BORROWED_KEY_GUARD}\n    }}\n}}\n",
         guarded_methods(MULTIPART_KEY_GUARD, 2)
     );
     let source = guard_fixture(
@@ -14757,6 +14769,23 @@ fn multipart_count_guard_passes_when_calls_move_into_the_split_directory() {
         &[
             ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
             ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 3).as_str()),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn multipart_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 3).as_str()),
+            (
+                "src/app/multipart_usecase/upload_part.rs",
+                guarded_methods(MULTIPART_BORROWED_KEY_GUARD, 1).as_str(),
+            ),
         ],
         "src/app/multipart_usecase.rs",
         "src/app/multipart_usecase",
@@ -16609,6 +16638,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
             "self.unchecked_put(envelope, input)",
         ),
         ("put", "validate_new_object_key(&key, request_method_name)?;", "unchecked_key();"),
+        ("put", PUT_OBJECT_MUTATION_BOUNDARY, "unchecked_put_core();"),
         (
             "put",
             "validate_table_catalog_object_mutation(&bucket, &key).await?;",
@@ -16636,7 +16666,7 @@ fn put_object_reserved_prefix_guard_rejects_broken_native_delegation() {
                 if surface == "extract" { &broken } else { extract },
             );
         });
-        let expected = if from.starts_with("validate_") {
+        let expected = if from.starts_with("validate_") || from == PUT_OBJECT_MUTATION_BOUNDARY {
             format!("missing or out-of-order object mutation guard: {from}")
         } else {
             let signature = match surface {
