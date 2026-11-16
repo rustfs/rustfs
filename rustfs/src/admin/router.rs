@@ -922,6 +922,14 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
         || is_control_plane_route(method, uri, headers)
 }
 
+/// Console paths whose requests do not belong to an earlier extension route.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_console_route(method: &Method, uri: &Uri) -> bool {
+    is_console_path(uri.path())
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
+}
+
 fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }

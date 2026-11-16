@@ -18,16 +18,16 @@
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
 //! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, the legacy service receives only what the legacy router claims (the RustFS extension
-//! routes and the control plane), so no S3 request reaches the legacy S3 implementation.
+//! selected, console static requests use the native console service; the legacy service receives
+//! the remaining claimed extension and control-plane routes, never S3 operations.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
-//! Upstream: `server/http.rs`. Downstream: the legacy S3 service and the gateway stack.
+//! Upstream: `server/http.rs`. Downstream: the native console, legacy S3 service and gateway stack.
 //!
-//! This file names neither stack's types: it is generic over two services with one response
+//! This file names no stack's types: it is generic over the services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
-use crate::admin::router::claims_route;
+use crate::admin::router::{claims_native_console_route, claims_route};
 use crate::config::S3Stack;
 use http::Request;
 use std::future::Future;
@@ -38,12 +38,22 @@ use tower::Service;
 /// The S3 service of one server: the legacy stack, or the gateway stack with the legacy router
 /// kept for the routes that are not S3 operations.
 #[derive(Clone)]
-pub(crate) struct S3StackService<L, G> {
+pub(crate) struct S3StackService<L, G, C = G> {
     legacy: L,
     gateway: Option<G>,
+    native_console: Option<C>,
 }
 
-impl<L, G> S3StackService<L, G> {
+impl<L, G, C> S3StackService<L, G, C> {
+    /// Attaches the console service used only by the gateway selection.
+    pub(crate) fn with_native_console<N>(self, native_console: Option<N>) -> S3StackService<L, G, N> {
+        S3StackService {
+            legacy: self.legacy,
+            gateway: self.gateway,
+            native_console,
+        }
+    }
+
     /// The stack this service was built with, as the startup line names it: read from the service
     /// that answers, never from the configuration that asked for it.
     pub(crate) fn assembled(&self) -> &'static str {
@@ -71,15 +81,21 @@ pub(crate) fn select_stack<L, G, E>(
         S3Stack::Legacy => None,
         S3Stack::Gateway => Some(assemble_gateway()?),
     };
-    Ok(S3StackService { legacy, gateway })
+    Ok(S3StackService {
+        legacy,
+        gateway,
+        native_console: None,
+    })
 }
 
-impl<L, G, B, R, E> Service<Request<B>> for S3StackService<L, G>
+impl<L, G, C, B, R, E> Service<Request<B>> for S3StackService<L, G, C>
 where
     L: Service<Request<B>, Response = http::Response<R>, Error = E>,
     G: Service<Request<B>, Response = http::Response<R>, Error = E>,
+    C: Service<Request<B>, Response = http::Response<R>, Error = E>,
     L::Future: Send + 'static,
     G::Future: Send + 'static,
+    C::Future: Send + 'static,
 {
     type Response = http::Response<R>;
     type Error = E;
@@ -88,16 +104,25 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(gateway) = &mut self.gateway {
             ready!(gateway.poll_ready(cx))?;
+            if let Some(console) = &mut self.native_console {
+                ready!(console.poll_ready(cx))?;
+            }
         }
         self.legacy.poll_ready(cx)
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        match &mut self.gateway {
-            // REMOVED BY T2.11: the gateway serves these routes itself once they are migrated.
-            Some(gateway) if !claims_route(request.method(), request.uri(), request.headers()) => Box::pin(gateway.call(request)),
-            _ => Box::pin(self.legacy.call(request)),
+        if let Some(gateway) = &mut self.gateway {
+            if !claims_route(request.method(), request.uri(), request.headers()) {
+                return Box::pin(gateway.call(request));
+            }
+            if let Some(console) = &mut self.native_console
+                && claims_native_console_route(request.method(), request.uri())
+            {
+                return Box::pin(console.call(request));
+            }
         }
+        Box::pin(self.legacy.call(request))
     }
 }
 

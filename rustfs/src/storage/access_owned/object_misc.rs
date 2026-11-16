@@ -38,6 +38,15 @@ use crate::storage::options::destination_version_id;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, force_delete_header};
 
+/// The bulk engine authorizes each entry after this request-level target setup.
+pub(crate) fn authorize_delete_objects<R: AuthorizationRequest + ?Sized>(req: &mut R, bucket: &str) -> S3Result<()> {
+    let info = req_info_mut(req)?;
+    info.bucket = Some(bucket.to_owned());
+    info.object = None;
+    info.version_id = None;
+    Ok(())
+}
+
 /// Both RestoreObject edges retain the bucket generation read before policy evaluation.
 pub(crate) async fn authorize_restore_object<R: AuthorizationRequest + ?Sized>(
     server_ctx: &ServerContextSlot,
