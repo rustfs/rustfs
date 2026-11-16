@@ -81,19 +81,20 @@ impl DeleteReserve {
         }
     }
 
-    /// Retry an allocation-safe scratch operation once after ENOSPC, provided
-    /// truncating the reserve released blocks. The caller must ensure that a
-    /// failed attempt leaves only disposable scratch or an idempotent primitive
-    /// under the existing namespace owner. Never replay a transaction or a
+    /// Retry an allocation-safe scratch operation once after ENOSPC. The first
+    /// waiter releases the reserve; concurrent waiters serialize behind it and
+    /// may use the same released capacity. The caller must ensure that a failed
+    /// attempt leaves only disposable scratch or an idempotent primitive under
+    /// the existing namespace owner. Never replay a transaction or a
     /// publication-plus-sync sequence with this helper.
     ///
     /// The owner mutex covers release and the retry, excluding replenishment
     /// during this bounded operation. Later transaction phases and unrelated
     /// allocators can still compete for the released space.
-    pub(super) fn recover<T>(&self, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    pub(super) fn retry_after_enospc<T>(&self, mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
         match operation() {
             #[cfg(unix)]
-            Err(error) if error.kind() == io::ErrorKind::StorageFull => self.inner.recover(operation, error),
+            Err(error) if error.kind() == io::ErrorKind::StorageFull => self.inner.retry_after_enospc(operation, error),
             result => result,
         }
     }
@@ -284,11 +285,21 @@ mod unix {
             Ok(())
         }
 
-        pub(super) fn recover<T>(&self, mut operation: impl FnMut() -> io::Result<T>, original: io::Error) -> io::Result<T> {
+        pub(super) fn retry_after_enospc<T>(
+            &self,
+            mut operation: impl FnMut() -> io::Result<T>,
+            original: io::Error,
+        ) -> io::Result<T> {
             let _guard = self.mutation.lock();
             match self.release_locked() {
-                Ok(true) => operation(),
-                Ok(false) | Err(_) => Err(original),
+                // A peer may have consumed the shared reserve while this
+                // operation was failing. Waiting for the mutation lock and
+                // replaying once lets it use the capacity that peer released.
+                // The public contract only accepts disposable scratch or an
+                // idempotent primitive, so the retry remains safe even when no
+                // reserve was present. Invalid reserve state still fails closed.
+                Ok(_) => operation(),
+                Err(_) => Err(original),
             }
         }
     }
@@ -309,7 +320,7 @@ mod unix {
         }
 
         #[test]
-        fn delete_reserve_allocates_recovers_once_and_replenishes_real_blocks() {
+        fn delete_reserve_allocates_retries_once_and_replenishes_real_blocks() {
             let root = tempfile::tempdir().expect("create disk root");
             let owner = DeleteReserve::acquire(root.path()).expect("pin disk root");
             owner.initialize().expect("allocate reserve");
@@ -320,7 +331,7 @@ mod unix {
             assert!(owner.is_armed());
             let mut calls = 0;
             let result = owner
-                .recover(|| {
+                .retry_after_enospc(|| {
                     calls += 1;
                     if calls == 1 {
                         Err(io::Error::new(io::ErrorKind::StorageFull, "scratch allocation"))
@@ -328,7 +339,7 @@ mod unix {
                         Ok(42)
                     }
                 })
-                .expect("recover scratch allocation");
+                .expect("retry scratch allocation");
             assert_eq!(result, 42);
             assert_eq!(calls, 2);
             assert!(!owner.is_armed());
@@ -339,18 +350,18 @@ mod unix {
         }
 
         #[test]
-        fn delete_reserve_recovery_keeps_original_failure_without_released_capacity() {
+        fn delete_reserve_retries_once_without_local_reserve_capacity() {
             let root = tempfile::tempdir().expect("create disk root");
             let owner = DeleteReserve::acquire(root.path()).expect("pin disk root");
             let mut calls = 0;
             let error = owner
-                .recover::<()>(|| {
+                .retry_after_enospc::<()>(|| {
                     calls += 1;
-                    Err(io::Error::new(io::ErrorKind::StorageFull, "original allocation"))
+                    Err(io::Error::new(io::ErrorKind::StorageFull, format!("allocation {calls}")))
                 })
-                .expect_err("no reserve means no retry");
-            assert_eq!(calls, 1);
-            assert_eq!(error.to_string(), "original allocation");
+                .expect_err("retry without a reserve still has no capacity");
+            assert_eq!(calls, 2);
+            assert_eq!(error.to_string(), "allocation 2");
             owner.initialize().expect("allocate reserve");
             let parent = metadata_directory(&owner.inner.root, false).expect("metadata directory");
             let reserve = reserve_file(&parent, false).expect("reserve file");
@@ -358,23 +369,23 @@ mod unix {
             calls = 0;
             assert!(
                 owner
-                    .recover::<()>(|| {
+                    .retry_after_enospc::<()>(|| {
                         calls += 1;
                         Err(io::Error::new(io::ErrorKind::StorageFull, "empty reserve"))
                     })
                     .is_err()
             );
-            assert_eq!(calls, 1);
+            assert_eq!(calls, 2);
         }
 
         #[test]
-        fn delete_reserve_recovery_retries_at_most_once_and_ignores_other_errors() {
+        fn delete_reserve_retry_ignores_other_errors_and_stays_bounded() {
             let root = tempfile::tempdir().expect("create disk root");
             let owner = DeleteReserve::acquire(root.path()).expect("pin disk root");
             owner.initialize().expect("allocate reserve");
             let mut calls = 0;
             let error = owner
-                .recover::<()>(|| {
+                .retry_after_enospc::<()>(|| {
                     calls += 1;
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission failure"))
                 })
@@ -384,7 +395,7 @@ mod unix {
             assert!(owner.is_armed());
             calls = 0;
             let error = owner
-                .recover::<()>(|| {
+                .retry_after_enospc::<()>(|| {
                     calls += 1;
                     Err(io::Error::new(io::ErrorKind::StorageFull, format!("allocation {calls}")))
                 })
@@ -411,7 +422,7 @@ mod unix {
             assert!(owner.replenish().is_err());
             let mut calls = 0;
             let error = owner
-                .recover::<()>(|| {
+                .retry_after_enospc::<()>(|| {
                     calls += 1;
                     Err(io::Error::new(io::ErrorKind::StorageFull, "original error"))
                 })
@@ -462,7 +473,7 @@ mod unix {
                 let recovery = scope.spawn(move || {
                     let mut calls = 0;
                     recovery_owner
-                        .recover(|| {
+                        .retry_after_enospc(|| {
                             calls += 1;
                             if calls == 1 {
                                 return Err(io::Error::new(io::ErrorKind::StorageFull, "scratch allocation"));
@@ -475,7 +486,7 @@ mod unix {
                             assert_eq!(std::fs::metadata(reserve_path(&root_path)).expect("depleted reserve").len(), 0);
                             Ok(())
                         })
-                        .expect("recover allocation");
+                        .expect("retry allocation");
                 });
                 retry_entered_rx
                     .recv_timeout(std::time::Duration::from_secs(10))
@@ -491,6 +502,71 @@ mod unix {
             });
             assert!(first.is_armed());
             assert_eq!(std::fs::metadata(reserve_path(root.path())).expect("final reserve").len(), RESERVE_BYTES);
+        }
+
+        #[test]
+        fn delete_reserve_gives_concurrent_enospc_waiters_one_retry() {
+            let root = tempfile::tempdir().expect("create disk root");
+            let first = DeleteReserve::acquire(root.path()).expect("open first owner");
+            let second = DeleteReserve::acquire(root.path()).expect("open second owner");
+            first.initialize().expect("allocate reserve");
+
+            let (first_retry_tx, first_retry_rx) = std::sync::mpsc::channel();
+            let (allow_first_tx, allow_first_rx) = std::sync::mpsc::channel();
+            let (second_failed_tx, second_failed_rx) = std::sync::mpsc::channel();
+            let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+
+            std::thread::scope(|scope| {
+                let first_waiter = scope.spawn(move || {
+                    let mut calls = 0;
+                    first
+                        .retry_after_enospc(|| {
+                            calls += 1;
+                            if calls == 1 {
+                                return Err(io::Error::new(io::ErrorKind::StorageFull, "first ENOSPC"));
+                            }
+                            first_retry_tx.send(()).expect("notify first retry");
+                            allow_first_rx
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .expect("allow first retry to finish");
+                            Ok(())
+                        })
+                        .expect("first waiter retries");
+                    assert_eq!(calls, 2);
+                });
+
+                first_retry_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("first waiter holds recovery lock");
+                let second_waiter = scope.spawn(move || {
+                    let mut calls = 0;
+                    second
+                        .retry_after_enospc(|| {
+                            calls += 1;
+                            if calls == 1 {
+                                second_failed_tx.send(()).expect("notify second ENOSPC");
+                                return Err(io::Error::new(io::ErrorKind::StorageFull, "second ENOSPC"));
+                            }
+                            Ok(())
+                        })
+                        .expect("second waiter retries after shared release");
+                    assert_eq!(calls, 2);
+                    second_done_tx.send(()).expect("notify second completion");
+                });
+
+                second_failed_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("second waiter observed ENOSPC");
+                assert!(matches!(second_done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+                allow_first_tx.send(()).expect("finish first retry");
+                first_waiter.join().expect("first waiter");
+                second_done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("second waiter completed its bounded retry");
+                second_waiter.join().expect("second waiter");
+            });
+
+            assert_eq!(std::fs::metadata(reserve_path(root.path())).expect("depleted reserve").len(), 0);
         }
 
         #[test]

@@ -1884,7 +1884,7 @@ impl LocalDisk {
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
         let reserve = self.delete_reserve.clone();
         let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
-            let staged = reserve.recover(|| {
+            let staged = reserve.retry_after_enospc(|| {
                 std::fs::create_dir_all(&staging_root)?;
                 let staged = Arc::new(
                     tempfile::Builder::new()
@@ -2993,7 +2993,7 @@ impl LocalDisk {
                         Ok(None) => return Ok(Ok(None)),
                         Err(err) => return Ok(Err(err)),
                     };
-                let (staged, rollback_dir_fd) = reserve.recover(|| {
+                let (staged, rollback_dir_fd) = reserve.retry_after_enospc(|| {
                     let staged = match tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root) {
                         Ok(dir) => dir,
                         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -3066,8 +3066,8 @@ impl LocalDisk {
                 }
                 let staged_dir = staged.keep();
                 os::record_native_publication(&destination);
-                if let Err(err) =
-                    reserve.recover(|| rename_into_dir_fd(&staged_dir, file_path_dir.as_deref(), &tx_name, &destination))
+                if let Err(err) = reserve
+                    .retry_after_enospc(|| rename_into_dir_fd(&staged_dir, file_path_dir.as_deref(), &tx_name, &destination))
                 {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
@@ -3086,7 +3086,7 @@ impl LocalDisk {
                     let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
                     let reserved_marker = old_path.join(&reserved_name);
                     let old_dir_file = open_child_dir_fd(file_path_dir.as_deref(), &old_dir_name, &old_path);
-                    let reserve_res = reserve.recover(|| -> std::io::Result<()> {
+                    let reserve_res = reserve.retry_after_enospc(|| -> std::io::Result<()> {
                         #[cfg(test)]
                         preparation_io_fault::run(&reserved_marker)?;
                         let marker = create_and_write_child_file(old_dir_file.as_ref(), &reserved_name, &reserved_marker, &[])?;
@@ -3117,16 +3117,18 @@ impl LocalDisk {
                         Err(_) => false,
                     };
                     let write_res = if linked {
-                        let rename_res = reserve
-                            .recover(|| rename_into_dir_fd(&linked_xl, file_path_dir.as_deref(), STORAGE_FORMAT_FILE, &xl_path));
+                        let rename_res = reserve.retry_after_enospc(|| {
+                            rename_into_dir_fd(&linked_xl, file_path_dir.as_deref(), STORAGE_FORMAT_FILE, &xl_path)
+                        });
                         if rename_res.is_err() {
                             let _ = std::fs::remove_file(&linked_xl);
                         }
                         rename_res
                     } else {
                         (|| -> std::io::Result<()> {
-                            let staged_xl = reserve.recover(|| stage_recovery_file(&staging_root, target_bytes, sync))?;
-                            reserve.recover(|| {
+                            let staged_xl =
+                                reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, target_bytes, sync))?;
+                            reserve.retry_after_enospc(|| {
                                 rename_into_dir_fd(staged_xl.path(), file_path_dir.as_deref(), STORAGE_FORMAT_FILE, &xl_path)
                             })
                         })()
@@ -3284,7 +3286,7 @@ impl LocalDisk {
                     let tmp_receipt = staging_root.join(format!("receipt-{transaction}.tmp"));
                     let receipt_bytes = format_commit_receipt_bytes(&journal_raw, false);
                     let write_res = (|| -> std::io::Result<()> {
-                        reserve.recover(|| {
+                        reserve.retry_after_enospc(|| {
                             let mut file = std::fs::File::create(&tmp_receipt)?;
                             std::io::Write::write_all(&mut file, &receipt_bytes)?;
                             if sync && !receipt_bytes.is_empty() {
@@ -3295,7 +3297,7 @@ impl LocalDisk {
                             Ok(())
                         })?;
                         os::record_native_publication(&receipt_path);
-                        reserve.recover(|| {
+                        reserve.retry_after_enospc(|| {
                             rename_into_dir_fd(
                                 &tmp_receipt,
                                 rollback_dir_fd.as_deref(),
@@ -3395,9 +3397,9 @@ impl LocalDisk {
                     finished: false,
                 };
                 let receipt_bytes = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
-                let staged = reserve.recover(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
+                let staged = reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
                 os::record_native_publication(&receipt_path);
-                reserve.recover(|| std::fs::rename(staged.path(), &receipt_path))?;
+                reserve.retry_after_enospc(|| std::fs::rename(staged.path(), &receipt_path))?;
                 if sync {
                     os::fsync_dir_std(&rollback)?;
                 }
@@ -3564,9 +3566,9 @@ impl LocalDisk {
                         serde_json::to_vec(&receipt).map_err(std::io::Error::other)?
                     }
                 };
-                let staged_receipt = reserve.recover(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
+                let staged_receipt = reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
                 os::record_native_publication(&receipt_path);
-                reserve.recover(|| std::fs::rename(staged_receipt.path(), &receipt_path))?;
+                reserve.retry_after_enospc(|| std::fs::rename(staged_receipt.path(), &receipt_path))?;
                 if sync {
                     let _ = os::fsync_dir_std(&rollback);
                 }
