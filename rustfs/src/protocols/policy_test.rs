@@ -705,6 +705,14 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             status: "on".into(),
             ..Default::default()
         };
+        let foreign_root = Credentials {
+            access_key: "listing-foreign-root".into(),
+            secret_key: "listing-foreign-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_foreign_temp, foreign_context, _foreign_iam) = protocol_test_context(foreign_root).await;
+        crate::runtime_sources::publish_test_app_context(foreign_context);
         let (_temp, context, iam) = protocol_test_context(root).await;
         let store = context.object_store();
         let slot = ServerContextSlot::new();
@@ -772,6 +780,13 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             .insert("user-agent", "sftp-listing-test".parse().expect("user agent"));
         let list = || backend.list_buckets_for_session(&session, &session.request_headers, session.secure_transport);
 
+        let count = || {
+            rustfs_io_metrics::s3_op_metrics_snapshot()
+                .into_iter()
+                .find(|row| row.op == rustfs_s3_ops::S3Operation::ListBuckets.as_str())
+                .map_or(0, |row| row.total)
+        };
+        let before = count();
         let visible: Vec<_> = list()
             .await
             .expect("bucket-scoped listing")
@@ -780,6 +795,7 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
             .map(|b| b.name.as_str().to_owned())
             .collect();
         assert_eq!(visible, ["listing-visible"], "listing is filtered to buckets the principal may list");
+        assert_eq!(count() - before, 1, "an accepted session listing is counted once");
 
         let mut insecure = session.clone();
         insecure.secure_transport = false;
@@ -854,11 +870,14 @@ fn protocol_session_bucket_listing_revalidates_the_session_key() {
         .await
         .expect("disable service account");
 
+        let before = count();
         let after_disable = list().await;
         assert!(
             matches!(&after_disable, Err(e) if *e.code() == S3ErrorCode::AccessDenied),
             "a key disabled after login must stop listing buckets: {after_disable:?}"
         );
+
+        assert_eq!(count() - before, 0, "session-key refusal precedes operation dispatch");
 
         #[cfg(feature = "webdav")]
         {

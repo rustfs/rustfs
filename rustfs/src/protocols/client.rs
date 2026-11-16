@@ -28,6 +28,7 @@ use rustfs_gateway_types::compat::s3s_5761ddfe::{
     self as gateway_s3s_compat, leaf::RequestWire, request_context::GatewayRequestContext,
 };
 use rustfs_gateway_types::dto as gateway_dto;
+#[cfg(test)]
 use rustfs_gateway_types::{BucketName, OpaqueString};
 use rustfs_protocols::common::SessionContext;
 #[cfg(feature = "webdav")]
@@ -139,6 +140,7 @@ fn require_listed_etags(output: gateway_dto::ListObjectsV2Output) -> Result<gate
     Ok(output)
 }
 
+#[cfg(test)]
 fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<gateway_dto::ListBucketsOutput, String> {
     let s3s::dto::ListBucketsOutput {
         buckets,
@@ -196,19 +198,23 @@ fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<
 }
 
 #[cfg(any(feature = "webdav", feature = "sftp"))]
-fn session_list_buckets_request(
-    input: ListBucketsInput,
+fn session_list_buckets_envelope(
+    server_context: std::sync::Arc<crate::runtime_sources::ServerContextSlot>,
     session_context: &SessionContext,
     request_headers: &HeaderMap,
     secure_transport: bool,
     credentials: rustfs_credentials::Credentials,
     is_owner: bool,
-) -> S3Request<ListBucketsInput> {
-    let request_credentials = s3s::auth::Credentials {
-        access_key: credentials.access_key.clone(),
-        secret_key: credentials.secret_key.clone().into(),
-    };
+) -> crate::app::RequestEnvelope {
+    let session_token = crate::auth::get_session_token(&http::Uri::from_static("/"), request_headers).map(str::to_owned);
+    let request_credentials = crate::app::RequestCredentials::new(
+        credentials.access_key.clone(),
+        credentials.secret_key.clone(),
+        session_token.clone(),
+    )
+    .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token));
     let mut extensions = http::Extensions::default();
+    extensions.insert(server_context);
     let remote_addr = std::net::SocketAddr::new(session_context.source_ip, 0);
     extensions.insert(Some(RemoteAddr(remote_addr)));
     let mut client_info = ClientInfo::direct(remote_addr);
@@ -229,17 +235,17 @@ fn session_list_buckets_request(
         suppress_denial_audit: false,
     });
 
-    S3Request {
-        input,
-        method: Method::GET,
-        uri: http::Uri::from_static("/"),
-        headers: request_headers.clone(),
+    crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: Method::GET,
+            uri: http::Uri::from_static("/"),
+            headers: request_headers.clone(),
+            credentials: Some(request_credentials),
+            region: None,
+            service: None,
+        },
         extensions,
-        credentials: Some(request_credentials),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+    )
 }
 
 /// TTL for the cluster usable-capacity snapshot behind WebDAV quota
@@ -634,10 +640,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let uri = build_list_objects_uri(&input)?;
-        let input = gateway_s3s_compat::generated::ops::list_objects_v2::input_to_s3s(input)
-            .map_err(|e| conversion_error("ListObjectsV2 input", e))?;
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::GET,
             uri,
             RequestParams {
@@ -645,15 +648,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: None,
                 credentials,
             },
-        )?;
-
-        match self.fs.list_objects_v2(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(response.output)
-                .map_err(|e| e.to_string())
-                .and_then(require_listed_etags)
-                .map_err(|e| conversion_error("ListObjectsV2 output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
+        self.owned_bucket_usecase()
+            .execute_list_objects_v2(envelope, input)
+            .await
+            .and_then(owned::listing_output)
     }
 
     async fn list_buckets(
@@ -669,12 +669,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let input = ListBucketsInput::builder().build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
-        })?;
-
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::GET,
             http::Uri::from_static("/"),
             RequestParams {
@@ -682,12 +677,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: None,
                 credentials,
             },
-        )?;
-
-        match self.fs.list_buckets(req).await {
-            Ok(response) => list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListBuckets);
+        self.owned_bucket_usecase()
+            .execute_list_buckets(envelope, gateway_dto::ListBucketsInput::default())
+            .await
+            .map(owned::bucket_listing_output)
     }
 
     #[cfg(any(feature = "webdav", feature = "sftp"))]
@@ -706,9 +701,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let input = ListBucketsInput::builder().build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
-        })?;
         let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
         })?;
@@ -723,11 +715,19 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                     s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
                     _ => e,
                 })?;
-        let mut request =
-            session_list_buckets_request(input, session_context, request_headers, secure_transport, credentials, is_owner);
-        request.extensions.insert(self.fs.server_ctx().clone());
-        let response = self.fs.list_buckets(request).await?;
-        list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e))
+        let envelope = session_list_buckets_envelope(
+            self.fs.server_ctx().clone(),
+            session_context,
+            request_headers,
+            secure_transport,
+            credentials,
+            is_owner,
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListBuckets);
+        self.owned_bucket_usecase()
+            .execute_list_buckets(envelope, gateway_dto::ListBucketsInput::default())
+            .await
+            .map(owned::bucket_listing_output)
     }
 
     /// Every input is a cache or snapshot read: quota reporting never triggers
@@ -1374,22 +1374,18 @@ mod tests {
         let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", http::HeaderValue::from_static("webdav-client"));
-        let request = session_list_buckets_request(
-            ListBucketsInput::default(),
+        let request = session_list_buckets_envelope(
+            crate::runtime_sources::ServerContextSlot::new(),
             &session_context,
             &headers,
             true,
             credentials.clone(),
             true,
         );
-        let request_info = request.extensions.get::<ReqInfo>().expect("request info should be present");
+        let request_info = request.req_info().expect("request info should be present");
         let copied = request_info.cred.as_ref().expect("credentials should be present");
-        let remote_addr = request
-            .extensions
-            .get::<Option<RemoteAddr>>()
-            .and_then(Option::as_ref)
-            .expect("remote address should be present");
-        let client_info = request.extensions.get::<ClientInfo>().expect("client info should be present");
+        let remote_addr = request.remote_addr().expect("remote address should be present");
+        let client_info = request.client_info().expect("client info should be present");
 
         assert_eq!(copied.access_key, credentials.access_key);
         assert_eq!(copied.secret_key, credentials.secret_key);
@@ -1398,21 +1394,24 @@ mod tests {
         assert_eq!(copied.groups, credentials.groups);
         assert_eq!(copied.claims, Some(claims));
         assert!(request_info.is_owner, "ownership comes from the server's credential validation");
-        let request_credentials = request.credentials.as_ref().expect("request credentials");
-        assert_eq!(request_credentials.access_key, credentials.access_key);
-        assert_eq!(request_credentials.secret_key.expose(), credentials.secret_key);
-        assert_eq!(remote_addr.0.ip(), source_ip);
+        let request_credentials = request.credentials().expect("request credentials");
+        assert_eq!(request_credentials.access_key(), credentials.access_key);
+        assert_eq!(request_credentials.secret_key(), Some(credentials.secret_key.as_str()));
+        assert_eq!(remote_addr.ip(), source_ip);
         assert_eq!(client_info.real_ip, source_ip);
         assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
-        assert_eq!(request.headers.get("user-agent").expect("user agent"), "webdav-client");
+        assert_eq!(request.headers().get("user-agent").expect("user agent"), "webdav-client");
 
-        let insecure_request =
-            session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false, credentials, false);
-        assert!(!insecure_request.extensions.get::<ReqInfo>().expect("request info").is_owner);
-        let insecure_client_info = insecure_request
-            .extensions
-            .get::<ClientInfo>()
-            .expect("client info should be present");
+        let insecure_request = session_list_buckets_envelope(
+            crate::runtime_sources::ServerContextSlot::new(),
+            &session_context,
+            &headers,
+            false,
+            credentials,
+            false,
+        );
+        assert!(!insecure_request.req_info().expect("request info").is_owner);
+        let insecure_client_info = insecure_request.client_info().expect("client info should be present");
         assert_eq!(insecure_client_info.forwarded_proto.as_deref(), Some("http"));
     }
 
@@ -2442,5 +2441,353 @@ mod bucket_tests {
             expected,
             "strict bucket refusal precedes dispatch and counting"
         );
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::runtime_sources::ServerContextSlot;
+    use crate::storage_api::protocols::client::{
+        BucketOperations, MakeBucketOptions, ObjectIO, StorageObjectOptions, StoragePutObjReader,
+    };
+    use rustfs_protocols::common::client::s3::StorageBackend;
+
+    fn count(operation: rustfs_s3_ops::S3Operation) -> u64 {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == operation.as_str())
+            .map_or(0, |row| row.total)
+    }
+
+    fn input(bucket: &str) -> gateway_dto::ListObjectsV2Input {
+        gateway_dto::ListObjectsV2Input {
+            bucket: BucketName::new(bucket.to_owned()).expect("bucket"),
+            ..Default::default()
+        }
+    }
+
+    async fn listing_client() -> (tempfile::TempDir, rustfs_credentials::Credentials, ProtocolStorageClient) {
+        let root = rustfs_credentials::Credentials {
+            access_key: "listing-runtime-root".into(),
+            secret_key: "listing-runtime-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (temp, context, _iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+        let ambient = crate::runtime_sources::publish_test_app_context(context.clone());
+        assert!(std::sync::Arc::ptr_eq(&ambient, &context));
+        let store = context.object_store();
+        let bucket = "listing-runtime";
+        for name in [bucket, "a-s3alias"] {
+            store
+                .make_bucket(name, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+        }
+        for key in ["a space&/one", "b", "dir/child"] {
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut StoragePutObjReader::from_vec(b"data".to_vec()),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("seed object");
+        }
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        (temp, root, backend)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_listing_pages_and_encoding() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-listing-pages", || async {
+            let (_temp, root, backend) = listing_client().await;
+            let bucket = "listing-runtime";
+            let mut first = input(bucket);
+            first.max_keys = Some(1);
+            first.encoding_type = Some(gateway_dto::EncodingType::URL);
+            let before = count(rustfs_s3_ops::S3Operation::ListObjectsV2);
+            let first = backend.list_objects_v2(first, &root).await.expect("first page");
+            assert_eq!(count(rustfs_s3_ops::S3Operation::ListObjectsV2) - before, 1);
+            assert!(first.is_truncated);
+            assert_eq!(first.contents[0].key.as_str(), "a%20space%26/one");
+            assert!(first.contents[0].e_tag.is_some());
+            let token = first.next_continuation_token.expect("next page token");
+            let mut second = input(bucket);
+            second.continuation_token = Some(token.clone());
+            let second = backend.list_objects_v2(second, &root).await.expect("second page");
+            assert_eq!(second.continuation_token.as_ref(), Some(&token));
+            assert_eq!(
+                second.contents.iter().map(|object| object.key.as_str()).collect::<Vec<_>>(),
+                ["b", "dir/child"]
+            );
+            let mut delimited = input(bucket);
+            delimited.delimiter = Some("/".into());
+            let delimited = backend.list_objects_v2(delimited, &root).await.expect("delimited page");
+            assert_eq!(
+                delimited
+                    .common_prefixes
+                    .iter()
+                    .map(|prefix| prefix.prefix.as_str())
+                    .collect::<Vec<_>>(),
+                ["a space&/", "dir/"]
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_listing_refusals_and_limits() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-listing-errors", || async {
+            let (_temp, root, backend) = listing_client().await;
+            let bucket = "listing-runtime";
+            let mut observations = Vec::new();
+            for case in ["missing", "negative", "token", "zero", "large"] {
+                let mut request = input(if case == "missing" { "listing-absent" } else { bucket });
+                match case {
+                    "negative" => request.max_keys = Some(-1),
+                    "token" => request.continuation_token = Some(OpaqueString::from("%%%")),
+                    "zero" => request.max_keys = Some(0),
+                    "large" => request.max_keys = Some(1001),
+                    _ => {}
+                }
+                let before = count(rustfs_s3_ops::S3Operation::ListObjectsV2);
+                let result = backend.list_objects_v2(request, &root).await;
+                let observed = match result {
+                    Ok(output) => format!("ok:{}:{}:{}", output.max_keys, output.contents.len(), output.is_truncated),
+                    Err(error) => format!("{:?}:{:?}:{:?}", error.code(), error.status_code(), error.message()),
+                };
+                observations.push((case, observed, count(rustfs_s3_ops::S3Operation::ListObjectsV2) - before));
+            }
+            assert_eq!(
+                observations,
+                vec![
+                    (
+                        "missing",
+                        r#"NoSuchBucket:Some(404):Some("The specified bucket does not exist")"#.to_owned(),
+                        1
+                    ),
+                    ("negative", r#"InvalidArgument:Some(400):Some("Invalid max keys")"#.to_owned(), 1),
+                    ("token", r#"InvalidArgument:Some(400):Some("Invalid continuation token")"#.to_owned(), 1),
+                    ("zero", "ok:0:0:false".to_owned(), 1),
+                    ("large", "ok:1000:3:false".to_owned(), 1),
+                ]
+            );
+            for credentials in [
+                rustfs_credentials::Credentials::default(),
+                rustfs_credentials::Credentials {
+                    access_key: "listing-no-policy".into(),
+                    secret_key: "listing-no-policy-secret".into(),
+                    status: "on".into(),
+                    ..Default::default()
+                },
+            ] {
+                let before = count(rustfs_s3_ops::S3Operation::ListBuckets);
+                let result = backend.list_buckets(&credentials).await;
+                let error = result.expect_err("bucket discovery denied");
+                assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                assert_eq!(error.message(), Some("Access Denied"));
+                assert_eq!(count(rustfs_s3_ops::S3Operation::ListBuckets) - before, 1);
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_listing_bucket_context_and_defaults() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-listing-context", || async {
+            let (_temp, root, backend) = listing_client().await;
+            let bucket = "listing-runtime";
+            let before = count(rustfs_s3_ops::S3Operation::ListBuckets);
+            let buckets = backend.list_buckets(&root).await.expect("list buckets");
+            assert_eq!(count(rustfs_s3_ops::S3Operation::ListBuckets) - before, 1);
+            let names: Vec<_> = buckets.buckets.iter().map(|bucket| bucket.name.as_str()).collect();
+            assert_eq!(names, [bucket]);
+            assert_eq!(buckets.owner.id, crate::app::dto_values::owner().id);
+            let (_other_temp, other_context, _other_iam) =
+                crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            other_context
+                .object_store()
+                .make_bucket("listing-context-other", &MakeBucketOptions::default())
+                .await
+                .expect("create other bucket");
+            let other_slot = ServerContextSlot::new();
+            assert!(other_slot.install(other_context));
+            let other = ProtocolStorageClient::new(FS::with_server_ctx(other_slot));
+            let other_buckets = other.list_buckets(&root).await.expect("bound bucket inventory");
+            assert_eq!(
+                other_buckets
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["listing-context-other"]
+            );
+            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled_buckets = uninstalled.list_buckets(&root).await.expect("ambient bucket inventory");
+            assert_eq!(
+                uninstalled_buckets
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.name.as_str())
+                    .collect::<Vec<_>>(),
+                [bucket]
+            );
+        });
+    }
+
+    #[test]
+    fn protocol_listing_output_matches_legacy_projection() {
+        use rustfs_gateway_types::{ETag, ObjectKey, Timestamp};
+        let mut observations = Vec::new();
+        let tags = [None, Some("abc".to_owned()), Some("a&\"b".to_owned()), Some(String::new())]
+            .into_iter()
+            .chain((0_u8..32).map(|byte| Some(char::from(byte).to_string())));
+        let cases = tags
+            .map(|tag| ("listing-output", "dir a/key&".to_owned(), tag, false))
+            .chain([
+                ("a-s3alias", "key".to_owned(), Some("abc".to_owned()), false),
+                ("listing-output", "é".repeat(512), Some("abc".to_owned()), false),
+                ("listing-output", "key".to_owned(), Some("abc".to_owned()), true),
+                ("listing-output", "key".to_owned(), Some("a&b".to_owned()), true),
+            ]);
+        for (name, key, tag, weak) in cases {
+            let mut output = gateway_dto::ListObjectsV2Output {
+                name: crate::app::dto_values::stored_bucket_name(name).expect("stored bucket"),
+                contents: vec![gateway_dto::Object {
+                    key: ObjectKey::new(key.clone()).expect("key"),
+                    e_tag: tag.as_ref().map(|value| {
+                        if weak {
+                            ETag::new_weak(value.clone()).expect("weak tag")
+                        } else {
+                            ETag::from_stored(value.clone())
+                        }
+                    }),
+                    last_modified: Timestamp::from_secs_nanos(1700000000, 123456789).expect("timestamp"),
+                    ..Default::default()
+                }],
+                encoding_type: Some(gateway_dto::EncodingType::URL),
+                common_prefixes: vec![gateway_dto::CommonPrefix {
+                    prefix: "prefix a/sub&".to_owned(),
+                }],
+                rustfs_on_demand_migration_list: Some("local-only".to_owned()),
+                ..Default::default()
+            };
+            let current = owned::listing_output(output.clone());
+            output.rustfs_on_demand_migration_list = None;
+            let old = gateway_s3s_compat::generated::ops::list_objects_v2::output_to_s3s(output)
+                .map_err(|error| conversion_error("ListObjectsV2 output", error))
+                .and_then(|mut old| {
+                    for object in old.contents.iter_mut().flatten() {
+                        if let Some(key) = &mut object.key {
+                            *key = key
+                                .split('/')
+                                .map(|part| urlencoding::encode(part).into_owned())
+                                .collect::<Vec<_>>()
+                                .join("/");
+                        }
+                        if let Some(s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut object.e_tag {
+                            *value = quick_xml::escape::escape(value.as_str()).into_owned();
+                        }
+                    }
+                    for prefix in old.common_prefixes.iter_mut().flatten() {
+                        if let Some(value) = &mut prefix.prefix {
+                            *value = value
+                                .split('/')
+                                .map(|part| urlencoding::encode(part).into_owned())
+                                .collect::<Vec<_>>()
+                                .join("/");
+                        }
+                    }
+                    gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(old)
+                        .map_err(|error| error.to_string())
+                        .and_then(require_listed_etags)
+                        .map_err(|error| conversion_error("ListObjectsV2 output", error))
+                });
+            let describe = |result: rustfs_s3_types::S3Result<gateway_dto::ListObjectsV2Output>| match result {
+                Ok(output) => format!("{output:?}"),
+                Err(error) => format!("{:?}:{:?}:{:?}", error.code(), error.status_code(), error.message()),
+            };
+            observations.push(((name, key, tag, weak), describe(old), describe(current)));
+        }
+        let mismatches: Vec<_> = observations.into_iter().filter(|(_, old, current)| old != current).collect();
+        assert!(mismatches.is_empty(), "listing projection mismatches: {mismatches:#?}");
+    }
+
+    #[test]
+    fn protocol_listing_bucket_projection_preserves_strict_names_and_milliseconds() {
+        let output = gateway_dto::ListBucketsOutput {
+            buckets: ["listing-output", "a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3"]
+                .into_iter()
+                .map(|name| gateway_dto::Bucket {
+                    name: crate::app::dto_values::stored_bucket_name(name).expect("stored bucket name"),
+                    creation_date: rustfs_gateway_types::Timestamp::from_secs_nanos(1700000000, 123456789).expect("timestamp"),
+                    ..Default::default()
+                })
+                .collect(),
+            owner: crate::app::dto_values::owner(),
+            ..Default::default()
+        };
+        let old = gateway_s3s_compat::generated::ops::list_buckets::output_to_s3s(output.clone()).expect("legacy bucket output");
+        let old = list_buckets_output_from_s3s(old).expect("legacy bucket projection");
+        let current = owned::bucket_listing_output(output);
+        assert_eq!(format!("{old:?}"), format!("{current:?}"));
+        assert_eq!(
+            current.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(),
+            ["listing-output"]
+        );
+        assert_eq!(current.buckets[0].creation_date.subsec_nanos(), 123000000);
+    }
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    #[test]
+    fn protocol_listing_session_credential_projection_matches_legacy() {
+        for secret in ["secret", ""] {
+            for token in [None, Some("request-session-token")] {
+                let credentials = rustfs_credentials::Credentials {
+                    access_key: "listing-session".into(),
+                    secret_key: secret.into(),
+                    session_token: "identity-token".into(),
+                    ..Default::default()
+                };
+                let session = SessionContext::new(
+                    rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(rustfs_policy::auth::UserIdentity {
+                        credentials: credentials.clone(),
+                        ..Default::default()
+                    })),
+                    rustfs_protocols::Protocol::WebDav,
+                    "127.0.0.1".parse().expect("loopback"),
+                );
+                let mut headers = HeaderMap::new();
+                if let Some(token) = token {
+                    headers.insert("x-amz-security-token", token.parse().expect("token header"));
+                }
+                let mut legacy = ProtocolStorageClient::create_request(
+                    ListBucketsInput::default(),
+                    Method::GET,
+                    http::Uri::from_static("/"),
+                    RequestParams {
+                        bucket: None,
+                        object: None,
+                        credentials: &credentials,
+                    },
+                )
+                .expect("legacy request");
+                legacy.headers = headers.clone();
+                let legacy = crate::app::RequestEnvelope::from_s3s(&legacy);
+                let current =
+                    session_list_buckets_envelope(ServerContextSlot::new(), &session, &headers, true, credentials, false);
+                let legacy = legacy.credentials().expect("legacy credentials");
+                let current = current.credentials().expect("owned credentials");
+                assert_eq!(
+                    (legacy.access_key(), legacy.secret_key(), legacy.session_token()),
+                    (current.access_key(), current.secret_key(), current.session_token())
+                );
+            }
+        }
     }
 }
