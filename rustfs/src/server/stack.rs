@@ -18,7 +18,7 @@
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
 //! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, console static requests and the two signed server-info aliases use their native
+//! selected, console static requests and signed system-status reads use their native
 //! services; the legacy service receives the remaining claimed extension and control-plane routes.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
@@ -407,7 +407,16 @@ mod tests {
     async fn native_admin_selection_is_exact_and_host_independent() {
         let mut service = gateway_stack().with_native_admin(Some(Named("admin")));
         for host in ["localhost", "bucket.s3.example.test"] {
-            for target in ["/rustfs/admin/v3/info", "/minio/admin/v3/info?detail=1"] {
+            for target in [
+                "/rustfs/admin/v3/info",
+                "/minio/admin/v3/info?detail=1",
+                "/rustfs/admin/v3/storageinfo",
+                "/minio/admin/v3/storageinfo?detail=a%2Fb",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/minio/admin/v4/runtime/capabilities?detail=a%2Fb",
+                "/rustfs/admin/v3/object-data-cache/stats",
+                "/minio/admin/v3/object-data-cache/stats?detail=a%2Fb",
+            ] {
                 let req = Request::builder()
                     .method(Method::GET)
                     .uri(target)
@@ -415,6 +424,22 @@ mod tests {
                     .body(())
                     .unwrap();
                 assert_eq!(answered_by(&mut service, req).await, "admin", "{host} {target}");
+            }
+        }
+        for suffix in ["/v3/storageinfo", "/v4/runtime/capabilities", "/v3/object-data-cache/stats"] {
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                for (method, tail) in [
+                    (Method::POST, ""),
+                    (Method::GET, "/"),
+                    (Method::GET, "-neighbor"),
+                    (Method::GET, "?lambdaArn=arn"),
+                    (Method::GET, "?lambdaArn="),
+                    (Method::GET, "?lambdaArn=one&lambdaArn=two"),
+                    (Method::GET, "?lambdaArn=%ZZ"),
+                ] {
+                    let target = format!("{prefix}{suffix}{tail}");
+                    assert_eq!(answered_by(&mut service, request(method, &target)).await, "legacy", "{target}");
+                }
             }
         }
         for (method, target) in [

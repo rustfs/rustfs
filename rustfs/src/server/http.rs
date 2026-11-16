@@ -4527,9 +4527,7 @@ mod tests {
             assert_eq!(valid.uri().query(), Some("lambdaArn="));
         }
 
-        #[tokio::test]
-        #[serial_test::serial]
-        async fn native_admin_real_iam_and_legacy_contract() {
+        async fn admin_fixture() -> (rustfs_test_utils::TestECStoreEnv, Arc<ServerContextSlot>, s3s::service::S3Service) {
             let env = rustfs_test_utils::TestECStoreEnv::builder()
                 .prefix("native_admin_info")
                 .disk_count(1)
@@ -4549,6 +4547,9 @@ mod tests {
                 ("info-denied", Some("admin:ServerInfo"), true, true, false),
                 ("info-disabled", Some("admin:ServerInfo"), false, false, false),
                 ("info-proxy", Some("admin:ServerInfo"), false, true, true),
+                ("storage-allowed", Some("admin:StorageInfo"), false, true, false),
+                ("storage-denied", Some("admin:StorageInfo"), true, true, false),
+                ("storage-proxy", Some("admin:StorageInfo"), false, true, true),
             ] {
                 iam.create_user(
                     key,
@@ -4571,7 +4572,7 @@ mod tests {
                     }
                     let mut statements = vec![statement];
                     if denied {
-                        statements.push(serde_json::json!({"Effect":"Deny","Action":"admin:ServerInfo"}));
+                        statements.push(serde_json::json!({"Effect":"Deny","Action":action}));
                     }
                     let document = serde_json::json!({"Version":"2012-10-17","Statement":statements});
                     iam.set_policy(key, Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap())
@@ -4599,6 +4600,288 @@ mod tests {
             legacy.set_route(crate::admin::make_admin_route(false, slot.clone()).unwrap());
             legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
             let legacy = legacy.build();
+            (env, slot, legacy)
+        }
+
+        const SYSTEM_READS: [(&str, &str); 3] = [
+            ("/v3/storageinfo", "storage"),
+            ("/v4/runtime/capabilities", "info"),
+            ("/v3/object-data-cache/stats", "info"),
+        ];
+
+        async fn owned_system_read(
+            path: &str,
+            key: &str,
+            secret: &str,
+        ) -> rustfs_s3_types::S3Result<(StatusCode, HeaderMap, Bytes)> {
+            use crate::admin::handlers::object_data_cache::ObjectDataCacheStatsHandler;
+            use crate::admin::handlers::system::{RuntimeCapabilitiesHandler, StorageInfoHandler};
+            use crate::admin::operation::{Operation as _, test_support::TestRequest};
+            let request = TestRequest::new(Method::GET, format!("{path}?detail=a%2Fb"))
+                .credentials(key, secret, None)
+                .build();
+            let response = if path.ends_with("/storageinfo") {
+                StorageInfoHandler {}.call(request, matchit::Params::new()).await?
+            } else if path.ends_with("/capabilities") {
+                RuntimeCapabilitiesHandler {}.call(request, matchit::Params::new()).await?
+            } else {
+                ObjectDataCacheStatsHandler {}.call(request, matchit::Params::new()).await?
+            };
+            let (status, headers, body) = response.into_parts();
+            Ok((status, headers, body.collect().await.unwrap().to_bytes()))
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_system_reads_owned_and_legacy_baseline() {
+            let (_env, _slot, legacy) = admin_fixture().await;
+            for (suffix, family) in SYSTEM_READS {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for key in [
+                        ROOT,
+                        "info-allowed",
+                        "storage-allowed",
+                        "info-no-policy",
+                        "info-denied",
+                        "storage-denied",
+                    ] {
+                        let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                        let allowed = key == ROOT || key == format!("{family}-allowed");
+                        let old =
+                            answer(legacy.clone(), signed(&path, "detail=a%2Fb", "localhost", key, secret, Signed::Header)).await;
+                        let owned = owned_system_read(&path, key, secret).await;
+                        if allowed {
+                            assert_eq!(old.0, StatusCode::OK, "{key} {path}: {:?}", refusal(&old.2));
+                            let owned = owned.unwrap();
+                            assert_eq!(owned.0, old.0, "{key} {path}");
+                            assert_eq!(owned.1[http::header::CONTENT_TYPE], old.1[http::header::CONTENT_TYPE]);
+                            let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                            let owned: serde_json::Value = serde_json::from_slice(&owned.2).unwrap();
+                            assert_eq!(owned, old, "{key} {path}");
+                            if family == "storage" {
+                                assert_eq!(owned.get("info").is_some(), prefix == "/rustfs/admin");
+                                assert_eq!(owned.get("admin_discovery").is_some(), prefix == "/rustfs/admin");
+                            }
+                        } else {
+                            assert_eq!(old.0, StatusCode::FORBIDDEN, "{key} {path}");
+                            assert_eq!(refusal(&old.2).0, "AccessDenied", "{key} {path}");
+                            let error = owned.unwrap_err();
+                            assert_eq!(error.code().as_str(), "AccessDenied", "{key} {path}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_system_reads_real_signature_iam_and_wire() {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.s3_stack = config::S3Stack::Gateway;
+            config.console_enable = false;
+            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let mut failures = Vec::new();
+            let mut check = |condition: bool, label: String| {
+                if !condition {
+                    failures.push(label);
+                }
+            };
+            for (suffix, family) in SYSTEM_READS {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        for key in [
+                            ROOT,
+                            "info-allowed",
+                            "storage-allowed",
+                            "info-no-policy",
+                            "info-denied",
+                            "storage-denied",
+                        ] {
+                            let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                            let allowed = key == ROOT || key == format!("{family}-allowed");
+                            let old =
+                                answer(legacy.clone(), signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header)).await;
+                            let new =
+                                answer(edge.clone(), signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header)).await;
+                            let label = format!("{key} {host} {path}");
+                            let expected = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                            check(
+                                old.0 == expected && new.0 == expected,
+                                format!("{label}: status legacy={} native={}", old.0, new.0),
+                            );
+                            if allowed && old.0 == expected && new.0 == expected {
+                                check(
+                                    old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
+                                        && new.1[http::header::CONTENT_TYPE] == "application/json",
+                                    format!("{label}: content type"),
+                                );
+                                check(
+                                    new.1.get("x-request-id").is_some_and(|value| value == REQUEST_ID),
+                                    format!("{label}: request id"),
+                                );
+                                let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                                let new: serde_json::Value = serde_json::from_slice(&new.2).unwrap();
+                                check(new == old, format!("{label}: complete JSON legacy={old} native={new}"));
+                                if family == "storage" {
+                                    check(
+                                        new.get("info").is_some() == (prefix == "/rustfs/admin")
+                                            && new.get("admin_discovery").is_some() == (prefix == "/rustfs/admin"),
+                                        format!("{label}: raw alias"),
+                                    );
+                                }
+                            } else if !allowed {
+                                check(
+                                    refusal(&old.2).0 == "AccessDenied" && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label}: refusal"),
+                                );
+                            }
+                        }
+                        for (label, key, secret, anonymous, malformed, form, code) in [
+                            (
+                                "unknown",
+                                "missing-system-user",
+                                USER_SECRET,
+                                false,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "disabled",
+                                "info-disabled",
+                                USER_SECRET,
+                                false,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "bad-signature",
+                                ROOT,
+                                "wrong-system-secret",
+                                false,
+                                false,
+                                Signed::Header,
+                                "SignatureDoesNotMatch",
+                            ),
+                            ("anonymous", ROOT, ROOT_SECRET, true, false, Signed::Header, "AccessDenied"),
+                            ("malformed", ROOT, ROOT_SECRET, false, true, Signed::Header, "InvalidRequest"),
+                            ("presigned", ROOT, ROOT_SECRET, false, false, Signed::Query, "AccessDenied"),
+                        ] {
+                            let request = || {
+                                if anonymous || malformed {
+                                    let mut builder = HttpRequest::builder().method(Method::GET).uri(&path).header("host", host);
+                                    if malformed {
+                                        builder = builder.header("authorization", "invalid");
+                                    }
+                                    builder.body(Empty::new()).unwrap()
+                                } else {
+                                    signed(&path, "", host, key, secret, form)
+                                }
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = answer(native.clone(), request()).await;
+                            eprintln!(
+                                "system-compare {label} {path} {host}: legacy={} {:?}, native={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            check(
+                                new.0
+                                    == if malformed {
+                                        StatusCode::BAD_REQUEST
+                                    } else {
+                                        StatusCode::FORBIDDEN
+                                    },
+                                format!("{label} {path}: native status {}", new.0),
+                            );
+                            check(refusal(&new.2).0 == code, format!("{label} {path}: native code {:?}", refusal(&new.2)));
+                            let messages = match label {
+                                "disabled" => {
+                                    Some(("check key failed", "The Access Key Id you provided does not exist in our records."))
+                                }
+                                "anonymous" => Some(("Signature is required", "the request is not allowed")),
+                                _ => None,
+                            };
+                            if let Some((old_message, new_message)) = messages {
+                                check(
+                                    old.0 == StatusCode::FORBIDDEN
+                                        && new.0 == old.0
+                                        && refusal(&old.2) == (code.to_owned(), old_message.to_owned())
+                                        && refusal(&new.2) == (code.to_owned(), new_message.to_owned()),
+                                    format!("{label} {path} {host}: exact refusal messages"),
+                                );
+                            } else if label == "presigned" {
+                                check(
+                                    old.0 == StatusCode::OK
+                                        && refusal(&old.2) == (String::new(), String::new())
+                                        && refusal(&new.2)
+                                            == ("AccessDenied".to_owned(), "the request is not allowed".to_owned()),
+                                    format!("{label} {path} {host}: admin signature floor"),
+                                );
+                            } else {
+                                check(
+                                    new.0 == old.0 && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label} {path}: legacy refusal"),
+                                );
+                            }
+                        }
+                    }
+                    for (client, peer, allowed) in [
+                        ("10.8.7.6:7890", "203.0.113.9:4567", true),
+                        ("203.0.113.9:7890", "10.8.7.6:4567", false),
+                    ] {
+                        let key = format!("{family}-proxy");
+                        let request = || {
+                            let mut request = signed(&path, "", "localhost", &key, USER_SECRET, Signed::Header);
+                            request.extensions_mut().insert(Some(RemoteAddr(peer.parse().unwrap())));
+                            request
+                                .extensions_mut()
+                                .insert(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
+                            request
+                        };
+                        let old = answer(legacy.clone(), request()).await;
+                        let new = answer(native.clone(), request()).await;
+                        let expected = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                        check(
+                            old.0 == expected && new.0 == expected,
+                            format!("{path}: source IP {client} peer {peer}: legacy={} native={}", old.0, new.0),
+                        );
+                        if !allowed {
+                            check(refusal(&old.2) == refusal(&new.2), format!("{path}: source refusal"));
+                        }
+                    }
+                    for query in ["lambdaArn=arn", "lambdaArn=", "lambdaArn"] {
+                        let old = answer(
+                            legacy.clone(),
+                            signed(&path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                        )
+                        .await;
+                        let new = answer(
+                            edge.clone(),
+                            signed(&path, query, "bucket.s3.example.test", ROOT, ROOT_SECRET, Signed::Header),
+                        )
+                        .await;
+                        check(
+                            old.0 != StatusCode::OK && new.0 == old.0 && refusal(&new.2) == refusal(&old.2),
+                            format!("{path}?{query}: object lambda priority"),
+                        );
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_real_iam_and_legacy_contract() {
+            let (_env, slot, legacy) = admin_fixture().await;
             let native = GatewayEdgeService(GatewayStack::assemble_admin(assembly(slot.clone())).unwrap());
             let mut failures = Vec::new();
             let mut check = |condition: bool, label: String| {

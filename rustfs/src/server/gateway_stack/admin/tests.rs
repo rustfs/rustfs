@@ -27,23 +27,42 @@ use http::{HeaderMap, Method, StatusCode};
 use rustfs_gateway::Answer;
 use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, PathStyleOnly, Req, Resp, decide_with};
 use rustfs_gateway_dialect_rustfs_admin::AdminResponse as WireResponse;
-use rustfs_gateway_dialect_rustfs_admin::ops::get_v3_info::GetV3Info;
+use rustfs_gateway_dialect_rustfs_admin::ops::{
+    get_v3_info::GetV3Info, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
+    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+};
 use rustfs_s3_types::Body;
 use rustfs_trusted_proxies::ClientInfo;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 #[test]
-fn native_admin_registers_one_operation_and_both_claims() {
+fn native_admin_registers_only_system_reads_and_both_claims() {
     let dialect = dialect().unwrap();
-    assert_eq!(dialect.operation_names().collect::<Vec<_>>(), [GetV3Info::NAME]);
+    let mut expected = [
+        GetV3Info::NAME,
+        GetV3Storageinfo::NAME,
+        GetV4RuntimeCapabilities::NAME,
+        GetV3ObjectDataCacheStats::NAME,
+    ];
+    expected.sort();
+    let mut names = dialect.operation_names().collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, expected);
     assert_eq!(
         dialect.claims().iter().map(|claim| claim.prefix).collect::<Vec<_>>(),
         ["/rustfs/admin", "/minio/admin"]
     );
-    assert_eq!(dialect.claimed_operations()[0].entries().len(), 2);
+    assert!(
+        dialect
+            .claimed_operations()
+            .iter()
+            .all(|operation| operation.entries().len() == 2)
+    );
     let stack = GatewayStack::assemble_admin(assembly()).unwrap();
-    assert_eq!(stack.service.operations().collect::<Vec<_>>(), [GetV3Info::NAME]);
+    let mut names = stack.service.operations().collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, expected);
 }
 
 #[tokio::test]
@@ -52,9 +71,10 @@ async fn native_admin_complete_response_keeps_bytes_status_and_content_type() {
     headers.insert(http::header::CONTENT_TYPE, "application/custom+json".parse().unwrap());
     headers.insert(http::header::CONTENT_LENGTH, "12".parse().unwrap());
     headers.insert("x-admin-result", "complete".parse().unwrap());
-    let response = complete_response(AdminResponse::with_headers(StatusCode::ACCEPTED, Body::from("opaque bytes"), headers))
-        .await
-        .unwrap();
+    let response =
+        complete_response::<GetV3Info>(AdminResponse::with_headers(StatusCode::ACCEPTED, Body::from("opaque bytes"), headers))
+            .await
+            .unwrap();
     let (answer, status, headers) = response.into_parts();
     assert_eq!(status, 202);
     assert_eq!(headers[http::header::CONTENT_TYPE], "application/custom+json");
@@ -69,8 +89,8 @@ async fn native_admin_complete_response_keeps_bytes_status_and_content_type() {
 
 struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
 
-impl Handler<GetV3Info> for Capture {
-    async fn call(&self, request: Req<GetV3Info>) -> HandlerResult<GetV3Info> {
+impl<O: Operation<Output = WireResponse>> Handler<O> for Capture {
+    async fn call(&self, request: Req<O>) -> HandlerResult<O> {
         let envelope = envelope(request.context(), &ServerContextSlot::new()).map_err(handler_error)?;
         self.0.lock().unwrap().push(serde_json::json!({
             "uri": envelope.uri().to_string(),
@@ -101,69 +121,77 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())
             .register::<GetV3Info, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV3Storageinfo, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV4RuntimeCapabilities, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV3ObjectDataCacheStats, _>(Arc::new(Capture(captured.clone())))
             .build()
             .unwrap(),
     };
-    for injected in [false, true] {
-        let mut request = signed_request(
-            Signed::Header,
-            Method::GET,
-            "/minio/admin/v3/info",
-            "detail=1",
-            ROOT_ACCESS_KEY,
-            ROOT_SECRET_KEY,
-        );
-        request.extensions_mut().insert(Some(RemoteAddr(SocketAddr::from(PEER))));
-        request
-            .extensions_mut()
-            .insert(ClientInfo::direct(SocketAddr::from((CLIENT, 42000))));
-        request.extensions_mut().insert(request_context(REQUEST_ID));
-        if injected {
-            request.extensions_mut().insert(ReqInfo {
-                bucket: Some("preserved-bucket".to_owned()),
-                ..ReqInfo::default()
-            });
+    let paths = [
+        "/minio/admin/v3/info",
+        "/minio/admin/v3/storageinfo",
+        "/minio/admin/v4/runtime/capabilities",
+        "/minio/admin/v3/object-data-cache/stats",
+    ];
+    for path in paths {
+        for injected in [false, true] {
+            let mut request = signed_request(Signed::Header, Method::GET, path, "detail=1", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+            request.extensions_mut().insert(Some(RemoteAddr(SocketAddr::from(PEER))));
+            request
+                .extensions_mut()
+                .insert(ClientInfo::direct(SocketAddr::from((CLIENT, 42000))));
+            request.extensions_mut().insert(request_context(REQUEST_ID));
+            if injected {
+                request.extensions_mut().insert(ReqInfo {
+                    bucket: Some("preserved-bucket".to_owned()),
+                    ..ReqInfo::default()
+                });
+            }
+            let response = stack.call(request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::new());
         }
-        let response = stack.call(request).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::new());
     }
     let observed = captured.lock().unwrap();
     for (index, value) in observed.iter().enumerate() {
-        assert_eq!(value["uri"], "/minio/admin/v3/info?detail=1");
+        assert_eq!(value["uri"], format!("{}?detail=1", paths[index / 2]));
         assert_eq!(value["host"], "localhost");
         assert_eq!(value["peer"], SocketAddr::from(PEER).to_string());
         assert_eq!(value["client"], IpAddr::from(CLIENT).to_string());
         assert_eq!(value["request_id"], REQUEST_ID);
-        assert_eq!(value["has_info"], index == 1);
+        assert_eq!(value["has_info"], index % 2 == 1);
         assert_eq!(
             value["bucket"],
-            if index == 1 {
+            if index % 2 == 1 {
                 serde_json::json!("preserved-bucket")
             } else {
                 serde_json::Value::Null
             }
         );
     }
-    assert_eq!(observed.len(), 2);
+    assert_eq!(observed.len(), paths.len() * 2);
 }
 
 #[tokio::test]
 async fn native_admin_authenticated_request_refuses_an_uninstalled_server_context() {
     let stack = assemble(assembly(), Arc::new(ScriptedIam { ready: false }), root().source()).unwrap();
-    let response = stack
-        .call(signed_request(
-            Signed::Header,
-            Method::GET,
-            "/rustfs/admin/v3/info",
-            "",
-            ROOT_ACCESS_KEY,
-            ROOT_SECRET_KEY,
-        ))
-        .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("<Code>ServiceUnavailable</Code>"), "{body}");
-    assert!(body.contains("<Message>server context is not ready</Message>"), "{body}");
+    for path in [
+        "/rustfs/admin/v3/info",
+        "/minio/admin/v3/info",
+        "/rustfs/admin/v3/storageinfo",
+        "/minio/admin/v3/storageinfo",
+        "/rustfs/admin/v4/runtime/capabilities",
+        "/minio/admin/v4/runtime/capabilities",
+        "/rustfs/admin/v3/object-data-cache/stats",
+        "/minio/admin/v3/object-data-cache/stats",
+    ] {
+        let response = stack
+            .call(signed_request(Signed::Header, Method::GET, path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY))
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"), "{body}");
+        assert!(body.contains("<Message>server context is not ready</Message>"), "{body}");
+    }
 }
