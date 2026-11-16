@@ -511,10 +511,22 @@ fn protocol_copy_source_projection_matches_legacy() {
         "",
         "abc\0",
     ] {
-        for key in ["key", "", "/leading", "trailing/", "a?versionId=x", "%FF", "a\0b"] {
+        for key in [
+            "key".to_owned(),
+            "".to_owned(),
+            "/leading".to_owned(),
+            "trailing/".to_owned(),
+            "a?versionId=x".to_owned(),
+            "%FF".to_owned(),
+            "a\0b".to_owned(),
+            "a".repeat(1024),
+            "a".repeat(1025),
+            "é".repeat(512),
+            format!("{}a", "é".repeat(512)),
+        ] {
             let source = rustfs_gateway_types::CopySourceValue::Bucket {
                 bucket: bucket.into(),
-                key: key.into(),
+                key: key.clone(),
                 version_id: Some("ver ?&%é".into()),
             };
             let current = owned::copy_source(source.clone())
@@ -622,6 +634,7 @@ fn protocol_copy_error_answers_match_legacy() {
     for code in [
         S3ErrorCode::InvalidStorageClass,
         S3ErrorCode::PreconditionFailed,
+        S3ErrorCode::UnexpectedContent,
         S3ErrorCode::NotImplemented,
         S3ErrorCode::InternalError,
     ] {
