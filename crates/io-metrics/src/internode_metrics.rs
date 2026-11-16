@@ -454,6 +454,7 @@ const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_in
 const INTERNODE_MSGPACK_JSON_DECODE_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
 const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
+const INTERNODE_MSGPACK_SEND_DECISIONS_TOTAL: &str = "rustfs_system_network_internode_msgpack_send_decisions_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
 const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
 
@@ -1604,6 +1605,25 @@ impl InternodeMetrics {
         .increment(1);
     }
 
+    /// Record one eligible request's fixed-cardinality JSON/msgpack send decision.
+    pub fn record_msgpack_send_decision(&self, decision: &'static str, reason: &'static str) {
+        let decision = match decision {
+            "msgpack_only" | "dual_write" => decision,
+            _ => "dual_write",
+        };
+        let reason = match reason {
+            "manual_fleet" | "peer_capable" | "peer_unknown" | "peer_revoked" | "not_requested" => reason,
+            _ => "peer_unknown",
+        };
+        counter!(
+            INTERNODE_MSGPACK_SEND_DECISIONS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            "decision" => decision,
+            REASON_LABEL => reason
+        )
+        .increment(1);
+    }
+
     #[doc(hidden)]
     pub fn msgpack_json_decode_error_total_for_test(&self) -> u64 {
         self.msgpack_json_decode_error_total.load(Ordering::Relaxed)
@@ -2698,6 +2718,52 @@ mod tests {
         assert_eq!(observed.len(), 2, "each direction must land in its own series: {observed:?}");
         assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_REQUEST.to_string(), "FileInfo".to_string(), 1)));
         assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_RESPONSE.to_string(), "RawFileInfo".to_string(), 1)));
+    }
+
+    #[test]
+    fn msgpack_send_decision_counter_keeps_fixed_decision_and_reason_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+        metrics::with_local_recorder(&recorder, || {
+            for (decision, reason) in [
+                ("msgpack_only", "manual_fleet"),
+                ("msgpack_only", "peer_capable"),
+                ("dual_write", "peer_unknown"),
+                ("dual_write", "peer_revoked"),
+                ("dual_write", "not_requested"),
+            ] {
+                metrics.record_msgpack_send_decision(decision, reason);
+            }
+            metrics.record_msgpack_send_decision("untrusted", "untrusted");
+        });
+
+        let observed: HashMap<(String, String), u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_MSGPACK_SEND_DECISIONS_TOTAL)
+            .map(|(composite, _, _, value)| {
+                let labels: HashMap<String, String> = composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                let count = match value {
+                    DebugValue::Counter(count) => count,
+                    other => panic!("msgpack send decision must be a counter, got {other:?}"),
+                };
+                (
+                    (
+                        labels.get("decision").cloned().unwrap_or_default(),
+                        labels.get(REASON_LABEL).cloned().unwrap_or_default(),
+                    ),
+                    count,
+                )
+            })
+            .collect();
+        assert_eq!(observed.len(), 5);
+        assert_eq!(observed.get(&("dual_write".to_string(), "peer_unknown".to_string())), Some(&2));
     }
 
     #[test]

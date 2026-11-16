@@ -37,9 +37,7 @@ mod tests {
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
-    use crate::storage::ecfs::{
-        FS, parse_object_version_id, propagate_object_lock_peer_reload, validate_object_lock_configuration_input,
-    };
+    use crate::storage::ecfs::{FS, parse_object_version_id};
     use crate::storage::ecfs_extend::{apply_bucket_default_lock_retention, map_bucket_object_lock_config_state};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
@@ -202,105 +200,6 @@ mod tests {
     /// literals in these tests stay on the wire DTO and convert once here.
     fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
         crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_disabled_status() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from("Disabled".to_string())),
-            rule: None,
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_invalid_default_retention_mode() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from("abc".to_string())),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_days_and_years_together() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(1),
-                    years: Some(1),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_missing_default_retention() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule { default_retention: None }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_zero_days() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(0),
-                    years: None,
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
-    }
-
-    #[test]
-    fn test_validate_object_lock_configuration_rejects_too_many_years() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: None,
-                    years: Some(101),
-                }),
-            }),
-        };
-
-        let err = validate_object_lock_configuration_input(&cfg).unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::Custom("InvalidRetentionPeriod".into()));
-    }
-
-    #[test]
-    fn test_object_lock_peer_reload_failure_is_returned_to_the_client() {
-        let err = propagate_object_lock_peer_reload(Err(StorageError::other("peer reload failed")))
-            .expect_err("peer reload failure must prevent a successful Object Lock update response");
-
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.message().is_some_and(|message| message.contains("peer reload failed")));
     }
 
     #[test]

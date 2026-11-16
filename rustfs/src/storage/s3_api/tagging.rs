@@ -42,14 +42,6 @@ pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
         .map_err(invalid_tag_error)
 }
 
-pub(crate) fn validate_bucket_tag_set(tag_set: &[Tag]) -> S3Result<()> {
-    if tag_set.len() > crate::storage::storage_api::ecstore_bucket::metadata::MAX_BUCKET_TAGS {
-        return Err(invalid_tag_error("Cannot have more than 50 tags per bucket"));
-    }
-    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(&persisted_tags(tag_set))
-        .map_err(invalid_tag_error)
-}
-
 fn validate_tag_component_encoding(component: &str) -> S3Result<()> {
     let bytes = component.as_bytes();
     let mut index = 0;

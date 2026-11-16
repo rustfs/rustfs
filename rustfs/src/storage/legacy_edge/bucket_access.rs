@@ -19,12 +19,10 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
-use crate::error::ApiError;
+use crate::app::RequestEnvelope;
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::persisted_from_s3s;
-use crate::storage::s3_api;
-use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage::s3_api::{self, NotificationDestination};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
     get_bucket_acl, get_bucket_notification_configuration, get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
 };
@@ -32,43 +30,16 @@ use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
 
-/// Handler bodies that [`S3`] runs through `audit_only_operation`.
-impl FS {
-    async fn put_bucket_acl_inner(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        let PutBucketAclInput {
-            bucket,
-            access_control_policy,
-            ..
-        } = req.input;
-        record_s3_op(S3Operation::PutBucketAcl);
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        if access_control_policy.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
-            ));
-        }
-
-        Ok(S3Response::new(PutBucketAclOutput::default()))
-    }
-}
-
 impl FS {
     pub(in crate::storage::ecfs) async fn delete_bucket_policy_edge(
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketPolicy, |req| usecase.execute_delete_bucket_policy(req)).await
+        record_s3_op(S3Operation::DeleteBucketPolicy);
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_policy(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketPolicyOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_acl_edge(
@@ -145,27 +116,37 @@ impl FS {
         &self,
         req: S3Request<PutBucketAclInput>,
     ) -> S3Result<S3Response<PutBucketAclOutput>> {
-        audit_only_operation(req, S3Operation::PutBucketAcl, |req| self.put_bucket_acl_inner(req)).await
+        record_s3_op(S3Operation::PutBucketAcl);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_acl(envelope, &req.input.bucket, req.input.access_control_policy.is_some())
+            .await?;
+        Ok(S3Response::new(PutBucketAclOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_notification_configuration_edge(
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
-        let prepared = persisted_from_s3s(&req.input.notification_configuration);
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketNotificationConfiguration, |req| {
-            usecase.execute_put_bucket_notification_configuration(req, prepared)
-        })
-        .await
+        record_s3_op(S3Operation::PutBucketNotificationConfiguration);
+        let prepared = persisted_from_s3s(&req.input.notification_configuration).map_err(rustfs_s3_types::S3Error::from);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let destinations = notification_destinations(req.input.notification_configuration);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_notification_configuration(envelope, &req.input.bucket, destinations, prepared)
+            .await?;
+        Ok(S3Response::new(PutBucketNotificationConfigurationOutput {}))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_policy_edge(
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketPolicy, |req| usecase.execute_put_bucket_policy(req)).await
+        record_s3_op(S3Operation::PutBucketPolicy);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_policy(RequestEnvelope::from_s3s(&req), &req.input.bucket, &req.input.policy)
+            .await?;
+        Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
 
     #[instrument(name = "put_bucket_versioning", level = "debug", skip(self, req))]
@@ -181,4 +162,46 @@ impl FS {
             .await?;
         Ok(S3Response::new(PutBucketVersioningOutput::default()))
     }
+}
+
+fn notification_destinations(configuration: NotificationConfiguration) -> Vec<NotificationDestination> {
+    let mut destinations = Vec::new();
+    for cfg in configuration.queue_configurations.into_iter().flatten() {
+        destinations.push(NotificationDestination {
+            kind: "QueueConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
+            target_arn: cfg.queue_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    for cfg in configuration.topic_configurations.into_iter().flatten() {
+        destinations.push(NotificationDestination {
+            kind: "TopicConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
+            target_arn: cfg.topic_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    for cfg in configuration.lambda_function_configurations.into_iter().flatten() {
+        destinations.push(NotificationDestination {
+            kind: "LambdaFunctionConfiguration",
+            id: cfg.id,
+            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
+            target_arn: cfg.lambda_function_arn,
+            filters: notification_filters(cfg.filter),
+        });
+    }
+    destinations
+}
+
+fn notification_filters(filter: Option<NotificationConfigurationFilter>) -> Vec<(Option<String>, Option<String>)> {
+    filter
+        .and_then(|filter| filter.key)
+        .and_then(|key| key.filter_rules)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|rule| (rule.name.map(|name| name.as_str().to_owned()), rule.value))
+        .collect()
 }

@@ -64,7 +64,14 @@ impl FS {
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_get_object_attributes(req).await
+        record_s3_op(S3Operation::GetObjectAttributes);
+        through_gateway_seam_answered(
+            req,
+            |input| Ok(s3_api::GetObjectAttributesFields::from_s3s(input)),
+            |output| Ok(s3_api::GetObjectAttributesOutputFacts::into_s3s(output)),
+            |envelope, input| usecase.execute_get_object_attributes(envelope, input),
+        )
+        .await
     }
 
     #[instrument(name = "head_object", level = "debug", skip(self, req))]
@@ -82,6 +89,76 @@ impl FS {
             |envelope, input| usecase.execute_head_object_fields(envelope, input),
         )
         .await
+    }
+}
+
+impl s3_api::GetObjectAttributesFields {
+    fn from_s3s(input: GetObjectAttributesInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            key: input.key,
+            version_id: input.version_id,
+            object_attributes: input
+                .object_attributes
+                .into_iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
+            max_parts: input.max_parts,
+            part_number_marker: input.part_number_marker.map(|marker| marker.to_string()),
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
+impl s3_api::GetObjectAttributesOutputFacts {
+    fn into_s3s(self) -> GetObjectAttributesOutput {
+        GetObjectAttributesOutput {
+            e_tag: self.e_tag.map(|tag| {
+                if tag.weak {
+                    ETag::Weak(tag.opaque)
+                } else {
+                    ETag::Strong(tag.opaque)
+                }
+            }),
+            last_modified: self.last_modified.map(Timestamp::from),
+            version_id: self.version_id,
+            storage_class: self.storage_class.map(StorageClass::from),
+            object_size: self.object_size,
+            checksum: self.checksum.map(|checksum| Checksum {
+                checksum_crc32: checksum.crc32,
+                checksum_crc32c: checksum.crc32c,
+                checksum_crc64nvme: checksum.crc64nvme,
+                checksum_sha1: checksum.sha1,
+                checksum_sha256: checksum.sha256,
+                checksum_type: checksum.checksum_type.map(ChecksumType::from),
+                ..Default::default()
+            }),
+            object_parts: self.object_parts.map(|parts| GetObjectAttributesParts {
+                is_truncated: Some(parts.is_truncated),
+                max_parts: Some(parts.max_parts),
+                next_part_number_marker: parts.next_part_number_marker,
+                part_number_marker: parts.part_number_marker,
+                total_parts_count: Some(parts.total_parts_count),
+                parts: Some(
+                    parts
+                        .parts
+                        .into_iter()
+                        .map(|part| ObjectPart {
+                            part_number: part.part_number,
+                            size: Some(part.size),
+                            checksum_crc32: part.checksums.crc32,
+                            checksum_crc32c: part.checksums.crc32c,
+                            checksum_crc64nvme: part.checksums.crc64nvme,
+                            checksum_sha1: part.checksums.sha1,
+                            checksum_sha256: part.checksums.sha256,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+            }),
+            ..Default::default()
+        }
     }
 }
 
