@@ -28,7 +28,7 @@ use rustfs_s3_types::S3ErrorCode;
 
 const KEY: &str = "directory/a ?#+%.txt";
 
-async fn object_client(bucket: &str) -> (tempfile::TempDir, Credentials, ProtocolStorageClient, String) {
+pub(super) async fn object_client(bucket: &str) -> (tempfile::TempDir, Credentials, ProtocolStorageClient, String) {
     let root = Credentials {
         access_key: "protocol-mainflow-root".into(),
         secret_key: "protocol-mainflow-secret".into(),
@@ -47,6 +47,7 @@ async fn object_client(bucket: &str) -> (tempfile::TempDir, Credentials, Protoco
         .await
         .expect("seed object");
     let slot = ServerContextSlot::new();
+    crate::runtime_sources::publish_test_app_context(context.clone());
     assert!(slot.install(context));
     (
         temp,
@@ -194,5 +195,185 @@ fn protocol_mainflow_refuses_missing_objects_buckets_and_unsatisfied_ranges() {
                 .code(),
             &S3ErrorCode::NoSuchBucket
         );
+    });
+}
+
+fn multipart_count(operation: rustfs_s3_ops::S3Operation) -> u64 {
+    rustfs_io_metrics::s3_op_metrics_snapshot()
+        .into_iter()
+        .find(|row| row.op == operation.as_str())
+        .map_or(0, |row| row.total)
+}
+
+fn multipart_create(bucket: &str, key: &str) -> rustfs_gateway_types::dto::CreateMultipartUploadInput {
+    rustfs_gateway_types::dto::CreateMultipartUploadInput {
+        bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
+        key: rustfs_gateway_types::ObjectKey::new(key).expect("key"),
+        ..Default::default()
+    }
+}
+
+fn multipart_complete(bucket: &str, key: &str, upload: &str) -> rustfs_gateway_types::dto::CompleteMultipartUploadInput {
+    rustfs_gateway_types::dto::CompleteMultipartUploadInput {
+        bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
+        key: rustfs_gateway_types::ObjectKey::new(key).expect("key"),
+        upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload),
+        ..Default::default()
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn protocol_multipart_lifecycle_stores_parts_and_aborts() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-multipart-lifecycle", || async {
+        use rustfs_gateway_types::dto;
+        let bucket = "protocol-multipart-lifecycle";
+        let (_temp, root, backend, _) = object_client(bucket).await;
+
+        let create_count = multipart_count(rustfs_s3_ops::S3Operation::CreateMultipartUpload);
+        let complete_count = multipart_count(rustfs_s3_ops::S3Operation::CompleteMultipartUpload);
+        let created = backend
+            .create_multipart_upload(multipart_create(bucket, KEY), &root)
+            .await
+            .expect("create upload");
+        assert_eq!(multipart_count(rustfs_s3_ops::S3Operation::CreateMultipartUpload), create_count + 1);
+        assert_eq!(created.bucket.as_str(), bucket);
+        assert_eq!(created.key.as_str(), KEY);
+        let uploaded = backend
+            .upload_part(
+                dto::UploadPartInput {
+                    bucket: created.bucket.clone(),
+                    key: created.key.clone(),
+                    upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
+                    part_number: 1,
+                    content_length: 14,
+                    body: Some(rustfs_gateway_stream::ByteStream::from_bytes(bytes::Bytes::from_static(
+                        b"multipart-data",
+                    ))),
+                    ..Default::default()
+                },
+                &root,
+            )
+            .await
+            .expect("stage part");
+        let mut complete = multipart_complete(bucket, KEY, &created.upload_id);
+        complete.multipart_upload.parts.push(dto::CompletedPart {
+            part_number: 1,
+            e_tag: Some(uploaded.e_tag),
+            ..Default::default()
+        });
+        let completed = backend
+            .complete_multipart_upload(complete, &root)
+            .await
+            .expect("complete upload");
+        assert_eq!(multipart_count(rustfs_s3_ops::S3Operation::CompleteMultipartUpload), complete_count + 1);
+        assert_eq!(completed.bucket.as_ref().map(|value| value.as_str()), Some(bucket));
+        assert_eq!(completed.key.as_ref().map(|value| value.as_str()), Some(KEY));
+        assert_eq!(
+            completed.location.as_deref(),
+            Some(format!("/{bucket}/directory/a%20%3F%23%2B%25.txt").as_str())
+        );
+        let read = backend
+            .get_object(bucket, KEY, &root, None)
+            .await
+            .expect("read completed object");
+        assert_eq!(
+            read.body
+                .expect("body")
+                .into_body()
+                .collect()
+                .await
+                .expect("read bytes")
+                .to_bytes()
+                .as_ref(),
+            b"multipart-data"
+        );
+        let created = backend
+            .create_multipart_upload(multipart_create(bucket, "aborted"), &root)
+            .await
+            .expect("create aborted upload");
+        let abort = || dto::AbortMultipartUploadInput {
+            bucket: created.bucket.clone(),
+            key: created.key.clone(),
+            upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
+            ..Default::default()
+        };
+        let abort_count = multipart_count(rustfs_s3_ops::S3Operation::AbortMultipartUpload);
+        backend.abort_multipart_upload(abort(), &root).await.expect("abort upload");
+        assert_eq!(multipart_count(rustfs_s3_ops::S3Operation::AbortMultipartUpload), abort_count + 1);
+        let error = backend
+            .upload_part(
+                dto::UploadPartInput {
+                    bucket: created.bucket,
+                    key: created.key,
+                    upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
+                    part_number: 1,
+                    content_length: 0,
+                    body: Some(rustfs_gateway_stream::ByteStream::from_bytes(bytes::Bytes::new())),
+                    ..Default::default()
+                },
+                &root,
+            )
+            .await
+            .expect_err("aborted session is absent");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchUpload);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn protocol_multipart_lifecycle_refuses_invalid_parts_and_missing_uploads() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-multipart-refusals", || async {
+        use rustfs_gateway_types::dto;
+        let bucket = "protocol-multipart-refusals";
+        let (_temp, root, backend, _) = object_client(bucket).await;
+
+        let created = backend
+            .create_multipart_upload(multipart_create(bucket, KEY), &root)
+            .await
+            .expect("create upload");
+        for (label, number, tag, expected) in [
+            ("empty", None, None, S3ErrorCode::InvalidRequest),
+            ("zero", Some(0), None, S3ErrorCode::InvalidPart),
+            ("negative", Some(-1), None, S3ErrorCode::InvalidPart),
+            ("too-large", Some(10001), None, S3ErrorCode::InvalidPart),
+            ("missing-tag", Some(1), None, S3ErrorCode::InvalidPart),
+            ("wrong-tag", Some(1), Some("wrong"), S3ErrorCode::InvalidPart),
+        ] {
+            let mut input = multipart_complete(bucket, KEY, &created.upload_id);
+            if let Some(part_number) = number {
+                input.multipart_upload.parts.push(dto::CompletedPart {
+                    part_number,
+                    e_tag: tag.map(rustfs_gateway_types::ETag::from_stored),
+                    ..Default::default()
+                });
+            }
+            let error = backend.complete_multipart_upload(input, &root).await.expect_err(label);
+            assert_eq!(error.code(), &expected, "{label}: {error}");
+        }
+        let error = backend
+            .abort_multipart_upload(
+                dto::AbortMultipartUploadInput {
+                    bucket: created.bucket,
+                    key: created.key,
+                    upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload"),
+                    ..Default::default()
+                },
+                &root,
+            )
+            .await
+            .expect_err("missing abort upload");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchUpload);
+        let mut input = multipart_complete(bucket, KEY, "missing-upload");
+        input.multipart_upload.parts.push(dto::CompletedPart {
+            part_number: 1,
+            e_tag: Some(rustfs_gateway_types::ETag::from_stored("wrong")),
+            ..Default::default()
+        });
+        let error = backend
+            .complete_multipart_upload(input, &root)
+            .await
+            .expect_err("missing complete upload");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchUpload);
     });
 }
