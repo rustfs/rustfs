@@ -26,8 +26,10 @@ use crate::storage::access::legacy_copy_source;
 use crate::storage::ecfs::*;
 use crate::storage::ecfs_extend::validate_new_object_key;
 use crate::storage::helper::audit_only_operation;
-use crate::storage::s3_api;
-use crate::storage::s3_api::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase};
+use crate::storage::s3_api::{
+    self, CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase, DeleteBatchETag,
+    DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput,
+};
 use crate::storage::storage_api::to_s3s_xml_etag;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
@@ -192,8 +194,11 @@ impl FS {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        record_s3_op(S3Operation::DeleteObjects);
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_delete_objects(req).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let output = usecase.execute_delete_objects(envelope, req.input.into()).await?;
+        Ok(S3Response::new(output.into()))
     }
 
     pub(in crate::storage::ecfs) async fn restore_object_edge(
@@ -343,4 +348,63 @@ fn copy_output_to_legacy(output: CopyObjectWriteOutput) -> S3Response<CopyObject
         version_id: output.version_id,
         ..Default::default()
     })
+}
+
+impl From<DeleteObjectsInput> for DeleteBatchInput {
+    fn from(input: DeleteObjectsInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            objects: input.delete.objects.into_iter().map(Into::into).collect(),
+            quiet: input.delete.quiet,
+        }
+    }
+}
+
+impl From<ObjectIdentifier> for DeleteBatchEntry {
+    fn from(object: ObjectIdentifier) -> Self {
+        Self {
+            key: object.key,
+            key_too_long: false,
+            version_id: object.version_id,
+            e_tag: object.e_tag.map(|tag| match tag {
+                ETag::Strong(value) => DeleteBatchETag { value, weak: false },
+                ETag::Weak(value) => DeleteBatchETag { value, weak: true },
+            }),
+            _last_modified_time: object.last_modified_time.map(|value| {
+                let instant = time::OffsetDateTime::from(value);
+                (instant.unix_timestamp(), instant.nanosecond())
+            }),
+            _size: object.size,
+        }
+    }
+}
+
+impl From<DeleteBatchOutput> for DeleteObjectsOutput {
+    fn from(output: DeleteBatchOutput) -> Self {
+        Self {
+            deleted: output.deleted.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| DeletedObject {
+                        delete_marker: entry.delete_marker,
+                        delete_marker_version_id: entry.delete_marker_version_id,
+                        key: entry.key,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            errors: output.errors.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| Error {
+                        code: entry.code,
+                        key: entry.key,
+                        message: entry.message,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            request_charged: None,
+        }
+    }
 }
