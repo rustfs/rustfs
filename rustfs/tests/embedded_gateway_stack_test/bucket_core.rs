@@ -14,11 +14,21 @@
 
 //! Refusal-matrix rows of migration batch A4 and of ListBuckets (rustfs/backlog#2765).
 
-use super::{GATEWAY, LEGACY, MatrixRow, Outcome, outcome, s3_client, with_stack};
+use super::{
+    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
+    create_user_allowed_on_one_bucket, outcome, refusal, s3_client, with_stack,
+};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use aws_sdk_s3::types::{
+    AccelerateConfiguration, BucketAccelerateStatus, BucketLocationConstraint, BucketLoggingStatus, CreateBucketConfiguration,
+    IndexDocument, LoggingEnabled, Payer, RequestPaymentConfiguration, WebsiteConfiguration,
+};
 use futures::future::BoxFuture;
 use rustfs::embedded::RustFSServer;
+use rustfs_ecstore::api::bucket::{
+    metadata::{BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG},
+    metadata_sys,
+};
 use rustfs_s3_ops::S3Operation;
 
 pub(crate) const MATRIX: &[MatrixRow] = &[
@@ -52,6 +62,60 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: get_bucket_location,
     },
+    MatrixRow {
+        operation: "GetBucketAccelerateConfiguration",
+        metric: S3Operation::GetBucketAccelerateConfiguration,
+        has_error_body: true,
+        call: get_bucket_accelerate_configuration,
+    },
+    MatrixRow {
+        operation: "GetBucketRequestPayment",
+        metric: S3Operation::GetBucketRequestPayment,
+        has_error_body: true,
+        call: get_bucket_request_payment,
+    },
+    MatrixRow {
+        operation: "GetBucketWebsite",
+        metric: S3Operation::GetBucketWebsite,
+        has_error_body: true,
+        call: get_bucket_website,
+    },
+    MatrixRow {
+        operation: "GetBucketLogging",
+        metric: S3Operation::GetBucketLogging,
+        has_error_body: true,
+        call: get_bucket_logging,
+    },
+    MatrixRow {
+        operation: "PutBucketLogging",
+        metric: S3Operation::PutBucketLogging,
+        has_error_body: true,
+        call: put_bucket_logging,
+    },
+    MatrixRow {
+        operation: "PutBucketAccelerateConfiguration",
+        metric: S3Operation::PutBucketAccelerateConfiguration,
+        has_error_body: true,
+        call: put_bucket_accelerate_configuration,
+    },
+    MatrixRow {
+        operation: "PutBucketRequestPayment",
+        metric: S3Operation::PutBucketRequestPayment,
+        has_error_body: true,
+        call: put_bucket_request_payment,
+    },
+    MatrixRow {
+        operation: "PutBucketWebsite",
+        metric: S3Operation::PutBucketWebsite,
+        has_error_body: true,
+        call: put_bucket_website,
+    },
+    MatrixRow {
+        operation: "DeleteBucketWebsite",
+        metric: S3Operation::DeleteBucketWebsite,
+        has_error_body: true,
+        call: delete_bucket_website,
+    },
 ];
 
 fn list_buckets<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -64,6 +128,22 @@ fn head_bucket<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome
 
 fn get_bucket_location<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(client.get_bucket_location().bucket(bucket).send().await) })
+}
+
+fn get_bucket_accelerate_configuration<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_accelerate_configuration().bucket(bucket).send().await) })
+}
+
+fn get_bucket_request_payment<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_request_payment().bucket(bucket).send().await) })
+}
+
+fn get_bucket_website<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_website().bucket(bucket).send().await) })
+}
+
+fn get_bucket_logging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.get_bucket_logging().bucket(bucket).send().await) })
 }
 
 /// Re-creating the existing matrix bucket: the default region answers it `200`.
@@ -311,4 +391,394 @@ fn the_legacy_stack_orders_force_delete_headers() {
 #[test]
 fn the_gateway_stack_orders_force_delete_headers() {
     with_stack(GATEWAY, force_delete_header_order);
+}
+
+const WEBSITE_CONFIG: &[u8] = br#"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument><RoutingRules><RoutingRule><Condition><KeyPrefixEquals>old/</KeyPrefixEquals></Condition><Redirect><ReplaceKeyPrefixWith>new/</ReplaceKeyPrefixWith></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>"#;
+
+async fn seed_config(bucket: &str, file: &str, xml: &[u8]) {
+    metadata_sys::update(bucket, file, xml.to_vec())
+        .await
+        .expect("seed stored bucket configuration");
+}
+
+pub(super) async fn seed_website(bucket: &str) {
+    seed_config(bucket, BUCKET_WEBSITE_CONFIG, WEBSITE_CONFIG).await;
+}
+
+async fn core_configuration_reads(server: RustFSServer, gateway: bool) {
+    const CONFIGURED: &str = "core-config-granted";
+    const EMPTY: &str = "core-config-empty";
+    const UNUSUAL: &str = "core-config-unusual";
+    const MISSING: &str = "core-config-absent";
+    for bucket in [CONFIGURED, EMPTY, UNUSUAL] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    seed_website(CONFIGURED).await;
+    seed_config(
+        CONFIGURED,
+        BUCKET_ACCELERATE_CONFIG,
+        b"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>",
+    )
+    .await;
+    seed_config(
+        CONFIGURED,
+        BUCKET_REQUEST_PAYMENT_CONFIG,
+        b"<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>",
+    )
+    .await;
+    seed_config(
+        CONFIGURED,
+        BUCKET_LOGGING_CONFIG,
+        b"<BucketLoggingStatus><LoggingEnabled><TargetBucket>core-config-empty</TargetBucket><TargetPrefix>logs/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>",
+    ).await;
+    let long_error_key = "a".repeat(1025);
+    let unusual_website = format!(
+        "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>{long_error_key}</Key></ErrorDocument></WebsiteConfiguration>"
+    );
+    seed_config(UNUSUAL, BUCKET_WEBSITE_CONFIG, unusual_website.as_bytes()).await;
+
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let policy_user = "coreconfigpolicyreader";
+    let logging_user = "coreconfigloggingreader";
+    create_user_allowed_on_one_bucket(policy_user, "s3:GetBucketPolicy", CONFIGURED).await;
+    create_user_allowed_on_one_bucket(logging_user, "s3:GetBucketLogging", CONFIGURED).await;
+    let policy = s3_client(&endpoint, policy_user, USER_SECRET_KEY);
+    let logging = s3_client(&endpoint, logging_user, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    for row in MATRIX.iter().filter(|row| {
+        matches!(
+            row.metric,
+            S3Operation::GetBucketAccelerateConfiguration
+                | S3Operation::GetBucketRequestPayment
+                | S3Operation::GetBucketWebsite
+                | S3Operation::GetBucketLogging
+        )
+    }) {
+        let (allowed, wrong_action) = if row.metric == S3Operation::GetBucketLogging {
+            (&logging, &policy)
+        } else {
+            (&policy, &logging)
+        };
+        let operation = row.operation;
+        let call = row.call;
+        assert_eq!(call(allowed, CONFIGURED).await, Ok(()), "{operation} grant");
+        for (caller, bucket) in [(allowed, EMPTY), (wrong_action, CONFIGURED), (&anonymous, CONFIGURED)] {
+            let error = call(caller, bucket).await.expect_err(operation);
+            assert_eq!((error.code.as_deref(), error.status), (Some("AccessDenied"), Some(403)), "{operation}");
+        }
+        let error = call(&root, MISSING).await.expect_err("missing bucket");
+        assert_eq!((error.code.as_deref(), error.status), (Some("NoSuchBucket"), Some(404)), "{operation}");
+    }
+
+    let accelerate = root
+        .get_bucket_accelerate_configuration()
+        .bucket(CONFIGURED)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accelerate.status().map(|status| status.as_str()), Some("Enabled"));
+    let accelerate = root.get_bucket_accelerate_configuration().bucket(EMPTY).send().await.unwrap();
+    assert!(accelerate.status().is_none());
+
+    let payment = root.get_bucket_request_payment().bucket(CONFIGURED).send().await.unwrap();
+    assert_eq!(payment.payer().map(|payer| payer.as_str()), Some("Requester"));
+    let payment = root.get_bucket_request_payment().bucket(EMPTY).send().await.unwrap();
+    assert_eq!(payment.payer().map(|payer| payer.as_str()), Some("BucketOwner"));
+
+    let website = root.get_bucket_website().bucket(CONFIGURED).send().await.unwrap();
+    assert_eq!(website.error_document().unwrap().key(), "error.html");
+    assert_eq!(website.index_document().unwrap().suffix(), "index.html");
+    let [rule] = website.routing_rules() else { panic!("expected one routing rule") };
+    assert_eq!(rule.condition().unwrap().key_prefix_equals(), Some("old/"));
+    assert_eq!(rule.redirect().unwrap().replace_key_prefix_with(), Some("new/"));
+    let missing_website = root.get_bucket_website().bucket(EMPTY).send().await.unwrap_err();
+    assert_eq!(refusal(&missing_website), (Some("NoSuchWebsiteConfiguration".to_owned()), Some(404)));
+    let unusual_website = root.get_bucket_website().bucket(UNUSUAL).send().await;
+    if gateway {
+        assert_eq!(refusal(&unusual_website.unwrap_err()), (Some("InternalError".to_owned()), Some(500)));
+    } else {
+        assert_eq!(unusual_website.unwrap().error_document().unwrap().key(), long_error_key);
+    }
+
+    let output = root.get_bucket_logging().bucket(CONFIGURED).send().await.unwrap();
+    let enabled = output.logging_enabled().expect("stored logging target");
+    assert_eq!(enabled.target_bucket(), EMPTY);
+    assert_eq!(enabled.target_prefix(), "logs/");
+    let output = root.get_bucket_logging().bucket(EMPTY).send().await.unwrap();
+    assert!(output.logging_enabled().is_none());
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_reads_core_bucket_configurations() {
+    with_stack(GATEWAY, |server| core_configuration_reads(server, true));
+}
+
+#[test]
+fn the_legacy_stack_reads_core_bucket_configurations() {
+    with_stack(LEGACY, |server| core_configuration_reads(server, false));
+}
+
+fn put_bucket_logging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let enabled = LoggingEnabled::builder()
+            .target_bucket("logging-target")
+            .target_prefix("café & tea/")
+            .build()
+            .expect("logging target and prefix");
+        let status = BucketLoggingStatus::builder().logging_enabled(enabled).build();
+        outcome(
+            client
+                .put_bucket_logging()
+                .bucket(bucket)
+                .bucket_logging_status(status)
+                .send()
+                .await,
+        )
+    })
+}
+
+async fn bucket_logging_mutations(server: RustFSServer) {
+    const BUCKET: &str = "logging-write-granted-s3alias";
+    const OTHER: &str = "logging-write-other";
+    const MISSING: &str = "logging-write-missing";
+    const WRITER: &str = "bucketloggingwriter";
+    const READER: &str = "bucketloggingreader";
+
+    for bucket in [BUCKET, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketLogging", BUCKET).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetBucketLogging", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    assert_eq!(put_bucket_logging(&writer, BUCKET).await, Ok(()), "grant on the requested bucket");
+    for (client, bucket, expected) in [
+        (&writer, OTHER, ("AccessDenied", 403)),
+        (&reader, BUCKET, ("AccessDenied", 403)),
+        (&anonymous, BUCKET, ("AccessDenied", 403)),
+        (&root, MISSING, ("NoSuchBucket", 404)),
+    ] {
+        let error = put_bucket_logging(client, bucket).await.expect_err("logging write refusal");
+        assert_eq!((error.code.as_deref(), error.status), (Some(expected.0), Some(expected.1)));
+    }
+    let stored = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("durable logging config");
+    assert_eq!(
+        stored.logging_config_xml,
+        "<BucketLoggingStatus><LoggingEnabled><TargetBucket>logging-target</TargetBucket><TargetPrefix>café &amp; tea/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>".as_bytes()
+    );
+    let response = reader
+        .get_bucket_logging()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("read logging config");
+    let enabled = response.logging_enabled().expect("logging is enabled");
+    assert_eq!((enabled.target_bucket(), enabled.target_prefix()), ("logging-target", "café & tea/"));
+    assert!(
+        metadata_sys::get_config_from_disk(OTHER)
+            .await
+            .expect("untouched bucket")
+            .logging_config_xml
+            .is_empty()
+    );
+
+    writer
+        .put_bucket_logging()
+        .bucket(BUCKET)
+        .bucket_logging_status(BucketLoggingStatus::builder().build())
+        .send()
+        .await
+        .expect("disable logging");
+    let stored = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("durable disabled logging config");
+    assert_eq!(stored.logging_config_xml, b"<BucketLoggingStatus></BucketLoggingStatus>");
+    let response = reader
+        .get_bucket_logging()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("read disabled logging config");
+    assert!(response.logging_enabled().is_none());
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_mutates_bucket_logging() {
+    with_stack(GATEWAY, bucket_logging_mutations);
+}
+
+#[test]
+fn the_legacy_stack_mutates_bucket_logging() {
+    with_stack(LEGACY, bucket_logging_mutations);
+}
+
+fn put_bucket_accelerate_configuration<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let config = AccelerateConfiguration::builder()
+            .status(BucketAccelerateStatus::Enabled)
+            .build();
+        outcome(
+            client
+                .put_bucket_accelerate_configuration()
+                .bucket(bucket)
+                .accelerate_configuration(config)
+                .send()
+                .await,
+        )
+    })
+}
+
+fn put_bucket_request_payment<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let config = RequestPaymentConfiguration::builder()
+            .payer(Payer::Requester)
+            .build()
+            .expect("requester payer");
+        outcome(
+            client
+                .put_bucket_request_payment()
+                .bucket(bucket)
+                .request_payment_configuration(config)
+                .send()
+                .await,
+        )
+    })
+}
+
+fn website_configuration(suffix: &str) -> WebsiteConfiguration {
+    let index = IndexDocument::builder()
+        .suffix(suffix)
+        .build()
+        .expect("index document suffix");
+    WebsiteConfiguration::builder().index_document(index).build()
+}
+
+fn put_bucket_website<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        outcome(
+            client
+                .put_bucket_website()
+                .bucket(bucket)
+                .website_configuration(website_configuration("index & pages.html"))
+                .send()
+                .await,
+        )
+    })
+}
+
+fn delete_bucket_website<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move { outcome(client.delete_bucket_website().bucket(bucket).send().await) })
+}
+
+async fn core_configuration_mutations(server: RustFSServer) {
+    const WRITABLE: &str = "core-writes-granted-s3alias";
+    const OTHER: &str = "core-writes-other";
+    const MISSING: &str = "core-writes-missing";
+    for bucket in [WRITABLE, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    seed_website(OTHER).await;
+
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = "coreconfigpolicywriter";
+    let reader = "coreconfigpolicyreader";
+    create_user_allowed_on_one_bucket(writer, "s3:PutBucketPolicy", WRITABLE).await;
+    create_user_allowed_on_one_bucket(reader, "s3:GetBucketPolicy", WRITABLE).await;
+    let writer = s3_client(&endpoint, writer, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, reader, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    for row in MATRIX.iter().filter(|row| {
+        matches!(
+            row.metric,
+            S3Operation::PutBucketAccelerateConfiguration
+                | S3Operation::PutBucketRequestPayment
+                | S3Operation::PutBucketWebsite
+                | S3Operation::DeleteBucketWebsite
+        )
+    }) {
+        let operation = row.operation;
+        let call = row.call;
+        assert_eq!(call(&writer, WRITABLE).await, Ok(()), "{operation} grant");
+        for (caller, bucket) in [(&writer, OTHER), (&reader, WRITABLE), (&anonymous, WRITABLE)] {
+            let error = call(caller, bucket).await.expect_err(operation);
+            assert_eq!((error.code.as_deref(), error.status), (Some("AccessDenied"), Some(403)), "{operation}");
+        }
+        let error = call(&root, MISSING).await.expect_err(operation);
+        assert_eq!((error.code.as_deref(), error.status), (Some("NoSuchBucket"), Some(404)), "{operation}");
+
+        let stored = metadata_sys::get_config_from_disk(WRITABLE)
+            .await
+            .expect("persisted bucket metadata");
+        match row.metric {
+            S3Operation::PutBucketAccelerateConfiguration => {
+                let config = stored.accelerate_config.expect("stored acceleration");
+                assert_eq!(config.status.as_deref(), Some("Enabled"));
+            }
+            S3Operation::PutBucketRequestPayment => {
+                let config = stored.request_payment_config.expect("stored request payment");
+                assert_eq!(config.payer, "Requester");
+            }
+            S3Operation::PutBucketWebsite => {
+                let config = stored.website_config.expect("stored website");
+                assert_eq!(config.index_document.expect("index document").suffix, "index & pages.html");
+            }
+            S3Operation::DeleteBucketWebsite => assert!(stored.website_config_xml.is_empty()),
+            _ => unreachable!("only core bucket configuration mutations"),
+        }
+    }
+    let stored = metadata_sys::get_config_from_disk(OTHER)
+        .await
+        .expect("persisted bucket metadata");
+    assert!(stored.accelerate_config_xml.is_empty());
+    assert!(stored.request_payment_config_xml.is_empty());
+    assert_eq!(stored.website_config_xml, WEBSITE_CONFIG);
+
+    for (client, bucket, expected) in [
+        (&writer, WRITABLE, ("MalformedXML", 400)),
+        (&root, MISSING, ("NoSuchBucket", 404)),
+        (&reader, WRITABLE, ("AccessDenied", 403)),
+    ] {
+        let result = client
+            .put_bucket_website()
+            .bucket(bucket)
+            .website_configuration(website_configuration("nested/index.html"))
+            .send()
+            .await;
+        let error = outcome(result).expect_err("invalid website suffix");
+        assert_eq!((error.code.as_deref(), error.status), (Some(expected.0), Some(expected.1)));
+    }
+    assert!(
+        metadata_sys::get_config_from_disk(WRITABLE)
+            .await
+            .unwrap()
+            .website_config_xml
+            .is_empty()
+    );
+    assert_eq!(delete_bucket_website(&writer, WRITABLE).await, Ok(()), "delete without a stored website");
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_mutates_core_bucket_configurations() {
+    with_stack(GATEWAY, core_configuration_mutations);
+}
+
+#[test]
+fn the_legacy_stack_mutates_core_bucket_configurations() {
+    with_stack(LEGACY, core_configuration_mutations);
 }

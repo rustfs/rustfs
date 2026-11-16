@@ -17,7 +17,7 @@
 use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, StorageClass, Timestamp, TimestampFormat};
+use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption, Timestamp, TimestampFormat};
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
 use crate::app::storage_api::s3::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
@@ -815,7 +815,7 @@ pub(super) fn response_storage_class_for_object_attributes(
     info: &ObjectInfo,
     metadata: &HashMap<String, String>,
     requested: bool,
-) -> Option<StorageClass> {
+) -> Option<String> {
     if !requested {
         return None;
     }
@@ -828,9 +828,7 @@ pub(super) fn response_storage_class_for_object_attributes(
         && !info.transitioned_object.tier.is_empty())
     .then_some(info.transitioned_object.tier.as_str());
 
-    Some(StorageClass::from(
-        storageclass::effective_class(stored_class, transitioned_tier).to_string(),
-    ))
+    Some(storageclass::effective_class(stored_class, transitioned_tier).to_string())
 }
 
 // Shared across Object Lock validation paths to keep the client-facing
@@ -1953,9 +1951,7 @@ mod tests {
         };
 
         assert_eq!(
-            response_storage_class_for_object_attributes(&info, &metadata, true)
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_for_object_attributes(&info, &metadata, true).as_deref(),
             Some(storageclass::STANDARD)
         );
 
@@ -1964,9 +1960,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true)
-                .as_ref()
-                .map(StorageClass::as_str),
+            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true).as_deref(),
             Some(storageclass::STANDARD)
         );
     }

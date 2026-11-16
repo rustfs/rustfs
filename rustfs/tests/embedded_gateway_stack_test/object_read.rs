@@ -27,12 +27,33 @@ pub(crate) const MATRIX: &[super::MatrixRow] = &[
         has_error_body: true,
         call: get_object,
     },
+    super::MatrixRow {
+        operation: "GetObjectAttributes",
+        metric: rustfs_s3_ops::S3Operation::GetObjectAttributes,
+        has_error_body: true,
+        call: get_object_attributes,
+    },
 ];
 
 fn get_object<'a>(client: &'a aws_sdk_s3::Client, _bucket: &'a str) -> futures::future::BoxFuture<'a, super::Outcome> {
     Box::pin(async move {
         super::put_object_in_the_store(MATRIX_BUCKET, "get-matrix").await;
         super::outcome(client.get_object().bucket(MATRIX_BUCKET).key("get-matrix").send().await)
+    })
+}
+
+fn get_object_attributes<'a>(client: &'a aws_sdk_s3::Client, _bucket: &'a str) -> futures::future::BoxFuture<'a, super::Outcome> {
+    Box::pin(async move {
+        super::put_object_in_the_store(MATRIX_BUCKET, "attributes-matrix").await;
+        super::outcome(
+            client
+                .get_object_attributes()
+                .bucket(MATRIX_BUCKET)
+                .key("attributes-matrix")
+                .object_attributes(aws_sdk_s3::types::ObjectAttributes::ObjectSize)
+                .send()
+                .await,
+        )
     })
 }
 

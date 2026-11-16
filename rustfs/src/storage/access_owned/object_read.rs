@@ -64,6 +64,22 @@ pub(crate) async fn authorize_head_object<R: AuthorizationRequest + ?Sized>(
     Ok(())
 }
 
+/// Attributes require two IAM decisions on the same resource and original version.
+pub(crate) async fn authorize_get_object_attributes<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    let attributes = if version_id.is_some() {
+        S3Action::GetObjectVersionAttributesAction
+    } else {
+        S3Action::GetObjectAttributesAction
+    };
+    authorize_object_request(req, bucket, key, version_id, Action::S3Action(attributes)).await?;
+    authorize_request(req, versioned_read_action(version_id)).await
+}
+
 #[cfg(test)]
 #[path = "object_read_test.rs"]
 mod tests;
