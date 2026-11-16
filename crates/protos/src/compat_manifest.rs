@@ -100,8 +100,8 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "opts",
             bin_field: "opts_bin",
         },
-        json_encoder: "let opts = match serde_json::to_string(&opts) {",
-        policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        json_encoder: "serde_json::to_string(opts)?",
+        policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
         field: CompatPayloadField {
@@ -109,8 +109,8 @@ pub const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
             json_field: "versions",
             bin_field: "versions_bin",
         },
-        json_encoder: "versions_str.push(match serde_json::to_string(file_info_versions) {",
-        policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        json_encoder: "versions_json.push(serde_json::to_string(version)?);",
+        policy: RequestJsonPolicy::MsgpackOnlyEligible,
     },
     RequestCompatSendSite {
         field: CompatPayloadField {

@@ -17648,12 +17648,9 @@ impl DiskAPI for LocalDisk {
                 fi.data = None;
             }
 
-            // Keep this compatibility read-ahead decision on the same policy
-            // as PUT's inline admission. In particular, do not use the old
-            // fixed 128 KiB shard limit: a non-inline object in a wider EC
-            // layout can have a smaller shard and would otherwise be copied
-            // out of part.1 during every metadata read. Such objects remain
-            // fully readable through the normal EC reader below.
+            // Keep legacy external prefetch within one block during metadata
+            // fanout. Persisted inline payloads are loaded by their marker and
+            // can contain several frames without reading external part files.
             let storage_class_config = runtime_sources::storage_class_config_snapshot();
             if should_read_legacy_inline_part(&fi, storage_class_config.as_ref()) {
                 let part_path = path_join_buf(&[
@@ -17926,6 +17923,9 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
     }
 
     let part = &fi.parts[0];
+    if !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
+        return false;
+    }
     let shard_size = fi.shard_file_size(part.actual_size);
     let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
     storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
@@ -18648,9 +18648,16 @@ mod test {
     }
 
     #[test]
-    fn legacy_inline_read_ahead_matches_writer_policy_for_ec_layouts() {
+    fn legacy_inline_read_ahead_stays_single_block_for_ec_layouts() {
         let config = crate::config::storageclass::Config::default();
-        let object_sizes = [128 * 1024_i64, 256 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+        let object_sizes = [
+            128 * 1024_i64,
+            256 * 1024,
+            512 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 1,
+            4 * 1024 * 1024,
+        ];
 
         for (data_shards, parity_shards) in [(8, 4), (12, 4)] {
             for object_size in object_sizes {
@@ -18663,7 +18670,8 @@ mod test {
                     ..Default::default()
                 }];
 
-                let writer_decision = config.should_inline(fi.shard_file_size(object_size), data_shards, false);
+                let writer_decision = config.should_inline(fi.shard_file_size(object_size), data_shards, false)
+                    && usize::try_from(object_size).expect("test size") <= fi.erasure.block_size;
                 assert_eq!(
                     should_read_legacy_inline_part(&fi, &config),
                     writer_decision,
@@ -18676,13 +18684,13 @@ mod test {
         ec12.data_dir = Some(Uuid::from_u128(1));
         ec12.parts = vec![ObjectPartInfo {
             number: 1,
-            size: 1024 * 1024,
-            actual_size: 1024 * 1024,
+            size: 1024 * 1024 + 1,
+            actual_size: 1024 * 1024 + 1,
             ..Default::default()
         }];
         assert!(
-            ec12.shard_file_size(1024 * 1024) < crate::config::storageclass::DEFAULT_INLINE_BLOCK as i64,
-            "the regression guard must exercise the old fixed 128 KiB read-ahead boundary"
+            ec12.shard_file_size(1024 * 1024 + 1) < 128 * 1024,
+            "a multi-block external object can still fit the per-shard budget"
         );
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }

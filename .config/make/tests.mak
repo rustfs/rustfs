@@ -42,6 +42,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_msgpack_peer_canary.py
 	./scripts/test_internode_msgpack_peer_canary_runner.sh
 	./scripts/test_object_batch_bench_enhanced.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_inline_docker_lab.py
 	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
 	./scripts/test_hotpath_warp_abba.sh

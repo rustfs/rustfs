@@ -9483,20 +9483,34 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[tokio::test]
-    async fn target_delete_quorum_failure_restores_remote_marker_and_retries_fail() {
+    struct DeleteRpcTarget {
+        remote: super::DiskStore,
+        local_disks: Vec<super::DiskStore>,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(not(windows))]
+    impl DeleteRpcTarget {
+        async fn close(self) {
+            self.remote.close().await.expect("close remote client");
+            let _ = self.shutdown.send(());
+            super::timeout(Duration::from_secs(10), self.server)
+                .await
+                .expect("server shuts down")
+                .expect("server task");
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn start_delete_rpc_target(fixture: &TargetRpcFixture) -> DeleteRpcTarget {
         use crate::storage::storage_api::{
-            contract::object::ObjectOperations,
-            ecstore_disk::{DeleteOptions, DiskOption, ReadOptions, new_disk},
-            ecstore_error::StorageError,
+            ecstore_disk::{DiskOption, new_disk},
             init_local_disks_with_instance_ctx,
         };
-
-        let fixture = target_rpc_fixture().await;
         let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind DELETE target");
         let addr = listener.local_addr().expect("target address");
-        let set = fixture.env.ecstore.all_set_disks().into_iter().next().expect("erasure set");
         let mut endpoints = fixture.env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
         let mut remote_endpoint = Endpoint::try_from(format!("http://{addr}{}", fixture.env.disk_paths[0].display()).as_str())
             .expect("remote endpoint");
@@ -9544,6 +9558,104 @@ mod tests {
         .await
         .expect("remote disk client");
         assert!(!remote.is_local());
+        DeleteRpcTarget {
+            remote,
+            local_disks,
+            shutdown,
+            server,
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_versions_wire_roundtrip_preserves_json_and_binary_only_batches() {
+        use crate::storage::DiskError;
+        use crate::storage::storage_api::ecstore_disk::{DeleteOptions, FileInfoVersions, ReadOptions};
+        let fixture = target_rpc_fixture().await;
+        let target = start_delete_rpc_target(&fixture).await;
+        let disk = &target.local_disks[0];
+        let mut framed = rustfs_utils::HashAlgorithm::HighwayHash256S
+            .hash_encode(b"abc")
+            .as_ref()
+            .to_vec();
+        framed.extend_from_slice(b"abc");
+        let framed = Bytes::from(framed);
+        for (mode, enabled) in [("json", "false"), ("binary", "true")] {
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some(enabled)),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some(enabled)),
+                ],
+                async {
+                    rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+                    let bucket = format!("batch-delete-{mode}");
+                    disk.make_volume(&bucket).await.expect("create isolated batch bucket");
+                    let mut groups = Vec::new();
+                    for object in ["first", "second", "retained"] {
+                        let mut info = rustfs_filemeta::FileInfo::new(object, 1, 0);
+                        info.erasure.index = 1;
+                        info.version_id = Some(Uuid::new_v4());
+                        info.mod_time = Some(OffsetDateTime::now_utc());
+                        info.size = 3;
+                        info.add_object_part(1, "etag".to_owned(), 3, info.mod_time, 3, None, None);
+                        info.data = Some(framed.clone());
+                        info.set_inline_data();
+                        disk.write_metadata(&bucket, &bucket, object, info.clone())
+                            .await
+                            .expect("seed version");
+                        if object != "retained" {
+                            groups.push(FileInfoVersions {
+                                volume: bucket.clone(),
+                                name: object.to_owned(),
+                                versions: vec![info],
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    let errors = target.remote.delete_versions(&bucket, groups, DeleteOptions::default()).await;
+                    assert_eq!(errors, vec![None, None], "{mode} batch must delete both entries");
+                    for object in ["first", "second"] {
+                        let result = disk.read_version(&bucket, &bucket, object, "", &ReadOptions::default()).await;
+                        assert!(
+                            matches!(result, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                            "{mode} {object}: {result:?}"
+                        );
+                    }
+                    let retained = disk
+                        .read_version(
+                            &bucket,
+                            &bucket,
+                            "retained",
+                            "",
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("unselected version remains readable");
+                    assert_eq!(retained.data, Some(framed.clone()));
+                    rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+                },
+            )
+            .await;
+        }
+        target.close().await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn target_delete_quorum_failure_restores_remote_marker_and_retries_fail() {
+        use crate::storage::storage_api::{
+            contract::object::ObjectOperations,
+            ecstore_disk::{DeleteOptions, ReadOptions},
+            ecstore_error::StorageError,
+        };
+        let fixture = target_rpc_fixture().await;
+        let target = start_delete_rpc_target(&fixture).await;
+        let remote = &target.remote;
+        let local_disks = &target.local_disks;
+        let set = fixture.env.ecstore.all_set_disks().into_iter().next().expect("erasure set");
 
         let bucket = "delete-quorum-rpc";
         let object = "versioned-object";
@@ -9562,7 +9674,7 @@ mod tests {
         original.data = Some(payload.clone());
         original.set_inline_data();
         let mut before = Vec::new();
-        for disk in &local_disks {
+        for disk in local_disks {
             disk.make_volume(bucket).await.expect("create target bucket");
             disk.write_metadata(bucket, bucket, object, original.clone())
                 .await
@@ -9677,13 +9789,8 @@ mod tests {
                 assert_eq!(restored.data, Some(payload.clone()));
             }
         }
-        *set.disks.write().await = local_disks.into_iter().map(Some).collect();
-        remote.close().await.expect("close remote client");
-        let _ = shutdown.send(());
-        super::timeout(Duration::from_secs(10), server)
-            .await
-            .expect("server shuts down")
-            .expect("server task");
+        *set.disks.write().await = local_disks.iter().cloned().map(Some).collect();
+        target.close().await;
     }
 
     #[cfg(not(windows))]
