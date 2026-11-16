@@ -50,6 +50,7 @@ on:
     # Writes a key that no push created, such as one for a new stable
     # toolchain; with every key present the jobs stop after the restore.
     - cron: "41 4,10,16,22 * * *"
+    - cron: "46 8,12,18,27 * * *"
   push:
     branches: [ main ]
     # A toolchain or lockfile change invalidates most of every key; those
@@ -221,7 +222,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-feat-rio
+          cache-shared-key: ci-feat-sao-paulo
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 
@@ -272,9 +273,9 @@ jobs:
   # written on sm-standard-4 would be restored by the hosted runner as if it
   # belonged to it.
   warm-ci-uring:
-    name: Warm ci-uring
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: Warm ci-ss
+    runs-on: linux-xarm92
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -286,7 +287,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-uring
+          cache-shared-key: ci-ss
           cache-save-if: 'true'
           install-build-packaging-tools: 'false'
 
@@ -294,6 +295,6 @@ jobs:
         if: steps.setup.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Build ci-uring superset
+      - name: Build ci-ss superset
         if: steps.setup.outputs.cache-hit != 'true'
         run: cargo build -p rustfs-ecstore --all-targets
