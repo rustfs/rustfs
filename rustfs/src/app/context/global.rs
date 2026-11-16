@@ -377,6 +377,11 @@ impl AppContext {
         self
     }
 
+    pub(crate) fn with_test_notify_interface(mut self, notify: Arc<dyn NotifyInterface>) -> Self {
+        self.notify = notify;
+        self
+    }
+
     pub(crate) fn with_test_notification_system_interface(
         mut self,
         notification_system: Arc<dyn NotificationSystemInterface>,
