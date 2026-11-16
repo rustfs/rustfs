@@ -1,7 +1,7 @@
 # Internode msgpack/JSON convergence runbook
 
 **Use this when:** operating or changing the staged retirement of the JSON compatibility fields on internode gRPC metadata RPCs, deciding whether a fleet may enable `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, or adding a new `*_bin` proto field.
-**Source of truth:** `crates/config/src/constants/internode.rs` (`ENV_INTERNODE_RPC_MSGPACK_ONLY`, `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` and their compile-time default-off asserts), `crates/protos/src/node.proto` (`*_bin` fields), `decode_msgpack_or_json` in `rustfs/src/storage/rpc/node_service/disk.rs` (server side) and `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client side), `crates/io-metrics/src/internode_metrics.rs` (counters).
+**Source of truth:** `crates/config/src/constants/internode.rs` (`ENV_INTERNODE_RPC_MSGPACK_ONLY`, `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED`, `ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY` and their compile-time default-off asserts), `crates/protos/src/node.proto` (`*_bin` fields), `decode_msgpack_or_json` in `rustfs/src/storage/rpc/node_service/disk.rs` (server side) and `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client side), `crates/io-metrics/src/internode_metrics.rs` (counters).
 
 This is a cross-version change and proceeds by observation-gated stages, never in one step.
 
@@ -16,6 +16,7 @@ Internode RPCs dual-encode each metadata value as a msgpack binary field (`*_bin
 | `rustfs_system_network_internode_msgpack_json_decode_total` | `direction`, `message`, `codec` | a msgpack or JSON decode succeeded |
 | `rustfs_system_network_internode_msgpack_json_fallback_total` | `direction`, `message` | a decode fell back to JSON because `_bin` was empty |
 | `rustfs_system_network_internode_msgpack_json_decode_error_total` | `direction`, `message`, `codec` | either codec failed to decode (`codec` = the failed codec) |
+| `rustfs_system_network_internode_msgpack_send_decisions_total` | `decision`, `reason` | an eligible RPC selected `msgpack_only` or `dual_write`; reasons are fixed to `manual_fleet`, `peer_capable`, `peer_unknown`, `peer_revoked`, or `not_requested` |
 
 `direction="request"` is a server decoding a peer's request (`node_service/disk.rs`); `direction="response"` is a client decoding a peer's response (`cluster/rpc/remote_disk.rs`), including the list-level `ReadMultiple` / `BatchReadVersion` fallbacks. `message` is the value name (`FileInfo`, `RawFileInfo`, `ReadMultipleResp`, ...).
 
@@ -92,14 +93,54 @@ Run the fleet with both flags at their default (`false`) for at least one full o
 
 ## Stage 1 — Stop writing JSON (env-gated)
 
-Flag semantics are defined on `ENV_INTERNODE_RPC_MSGPACK_ONLY` and `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` in `crates/config/src/constants/internode.rs`; both default off and only their conjunction stops the JSON write for convergence-ready fields. Decoders keep the JSON fallback in every state.
+Flag semantics are defined in `crates/config/src/constants/internode.rs`; all three flags default off. `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` requests msgpack-only, and JSON stops only when either fleet confirmation is true or the peer-capability gate is true and the exact current peer boot epoch plus physical connection generation has an authenticated capability proof. Unknown, unsupported, revoked, stale, or reconnecting peers continue dual-write. Decoders keep the JSON fallback in every state.
 
 1. Rehearse `request-only`: `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`, `..._FLEET_CONFIRMED=false`. Behaviour is unchanged (still dual-write) and safe with old peers; any fallback or decode-error increment still blocks.
 2. Canary: set both flags `true` on one node, restart that node only, and watch the fallback and decode-error counters for a soak period with real internode traffic.
 3. Fleet: if the counters stay zero, enable both flags fleet-wide with a rolling restart.
 4. Rollback: set either flag to `false` (or unset it) and restart; no wire format changed, so rollback is immediate.
 
+An alternative per-peer canary keeps `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false`, sets `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY=true`, and confirms `reason="peer_capable"` only for proved peers while every `peer_unknown` or `peer_revoked` decision remains `dual_write`. Enable this mode only when one client HTTP/2 connection has stable affinity to one RustFS peer process; an L7 proxy that routes streams from one connection to different backend versions invalidates the connection-generation proof. A connection-generation change may rebuild one request as dual-write only when the retained local guard proves rejection before the first payload frame; remote status text, a dispatched request, or an ordinary transport error never authorizes that compatibility retry. Disable either the base request flag or peer-capability flag to roll back immediately.
+
 The benchmark driver pins these operator states as dry-run phases (`before`, `request-only`, `canary`, `after`, `rollback`); see [internode-grpc-benchmark-runbook.md](internode-grpc-benchmark-runbook.md).
+
+### Per-peer mixed-version evidence gate
+
+The per-peer gate is not qualified by a successful command transcript alone. Record three ordered four-node measurement phases: `mixed-old-peer` (three candidate nodes and one previous-version node), `all-new` (four candidate nodes), and `rollback-old-peer` (replace one candidate with the previous-version image and verify readback). Every candidate node uses `MSGPACK_ONLY=true`, `MSGPACK_PEER_CAPABILITY=true`, and `MSGPACK_ONLY_FLEET_CONFIRMED=false`; previous-version nodes use all three false. Each phase must run real PUT/GET/metadata traffic and retain the exact candidate/baseline revisions, topology, timestamps, workload result, environment, and raw Prometheus HTTP API JSON.
+
+Assign one unique `msgpack-<32-hex>` cluster ID for this run, set `OTEL_RESOURCE_ATTRIBUTES=rustfs.cluster.id=<id>` on every node, and retain the collector’s resource-to-telemetry conversion so Prometheus exposes `rustfs_cluster_id`. Capture these PromQL vectors over each non-overlapping phase window and store the complete HTTP API response, not extracted numbers:
+
+```promql
+sum by (decision, reason) (increase(rustfs_system_network_internode_msgpack_send_decisions_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW]))
+sum(increase(rustfs_system_network_internode_msgpack_json_fallback_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_msgpack_json_decode_error_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
+sum(increase(rustfs_system_network_internode_operation_errors_total{rustfs_cluster_id="$CLUSTER_ID"}[$WINDOW])) or vector(0)
+```
+
+Build a schema-1 manifest with `scope="internode-msgpack-peer-canary"`, `source_revision`, `baseline_revision`, `stable_connection_affinity=true`, `max_metric_lag_secs`, `cluster_id`, an `images` path to sanitized image inspections, and the three phase records. Each phase records integer `start_unix`/`end_unix`, exact topology counts plus a `node1..node4` revision map, the new/old node environment maps, the exact four PromQL strings with a window equal to the phase duration, an `images` path to the verified per-node image ID/revision map, a relative workload JSON path, and relative paths for `decisions`, `fallback`, `decode_errors`, and `rpc_errors`. The workload artifact records `status`, a non-zero integer `requests`, and `rollback_readback` (true only for `rollback-old-peer`). Validate without rewriting raw evidence:
+
+```bash
+python3 scripts/check_internode_msgpack_peer_canary.py \
+  --manifest /path/to/evidence/manifest.json \
+  --out /path/to/evidence/verification.json
+```
+
+The verifier rejects reused/escaping/overwritten artifacts, duplicate or non-exact decision labels, labeled scalar queries, mismatched PromQL windows, wrong per-node revisions, missing peer-capable traffic, missing mixed/rollback dual-write traffic, manual-fleet or not-requested leakage, failed workload/readback, non-zero fallback/decode/RPC errors, stale timestamps, invalid topology, and candidate/baseline identity reuse. The workload artifact binds its raw benchmark `summary.csv` by relative path and SHA-256; rollback also records equal source/download content hashes. Verifier output includes SHA-256 receipts for every raw query, workload, and summary artifact. Passing this gate is compatibility evidence only; production soak and ABBA performance drift gates remain separate.
+
+Use the orchestration runner to create the isolated Compose project, execute the three phases, preserve a known object across node2 rollback, capture the four raw Prometheus responses, build the manifest, and invoke the verifier. Without `--execute` it prints a redacted plan and makes no external changes. The runner verifies distinct immutable image IDs and full `vcs-ref` or OCI revision labels against the requested revisions, pins Compose to those IDs, and checks each running container’s image and telemetry identity in every phase. Images without matching full revision labels are rejected. It retains sanitized identity receipts without container credentials. Execution refuses an existing Compose project/volume set and removes its isolated containers and volumes on exit unless `--keep-up` is explicit.
+
+```bash
+scripts/run_internode_msgpack_peer_canary.sh \
+  --candidate-image rustfs/rustfs:candidate \
+  --baseline-image rustfs/rustfs:previous \
+  --candidate-revision <40-hex-candidate-commit> \
+  --baseline-revision <40-hex-previous-commit> \
+  --prometheus-query-url http://127.0.0.1:9090/api/v1/query \
+  --out-dir /path/to/evidence \
+  --execute
+```
+
+The runner requires Docker Compose, AWS CLI, curl, Warp through `run_object_batch_bench.sh`, Python, the four-node local cluster compose file, prebuilt candidate/baseline images, and an already reachable Prometheus/OTLP pipeline. It never builds, pulls, or starts observability images implicitly. Execution rejects reused Compose resources or a non-empty evidence directory and performs a Prometheus vector preflight before starting the cluster. The workload summary must contain only successful zero-error rows with parseable request rates; the rollback phase must read byte-identical object data written before the version replacement.
 
 ## Stage 2 — Remove the proto JSON fields
 
@@ -113,7 +154,7 @@ Only after Stage 1 has been stable fleet-wide for a full window with the counter
 | Stage | Wire format broken? | Rollback |
 | --- | --- | --- |
 | 0 Observe | no | n/a (metrics only) |
-| 1 msgpack-only send | no | unset either flag and restart |
+| 1 msgpack-only send | no | unset the base request flag, or unset the selected fleet/peer gate, and restart |
 | 2 remove fields | yes | redeploy the prior release; field numbers stay `reserved` |
 
 ## Related

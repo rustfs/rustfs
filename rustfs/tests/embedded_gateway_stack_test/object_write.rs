@@ -66,16 +66,16 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct WireClient<'a> {
-    endpoint: &'a str,
-    access_key: &'a str,
-    secret_key: &'a str,
+pub(super) struct WireClient<'a> {
+    pub(super) endpoint: &'a str,
+    pub(super) access_key: &'a str,
+    pub(super) secret_key: &'a str,
 }
 
-struct WireAnswer {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
+pub(super) struct WireAnswer {
+    pub(super) status: u16,
+    pub(super) headers: BTreeMap<String, String>,
+    pub(super) body: String,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -164,7 +164,7 @@ impl WireClient<'_> {
         }
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         method: &str,
         path: &str,

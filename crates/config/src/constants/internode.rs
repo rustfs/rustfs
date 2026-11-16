@@ -121,9 +121,17 @@ pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
 pub const ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED";
 pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: bool = false;
 
+/// Permit current per-peer capability proof to replace fleet-wide confirmation.
+///
+/// This remains ineffective unless [`ENV_INTERNODE_RPC_MSGPACK_ONLY`] is also enabled. Unknown,
+/// unsupported, revoked, or stale connection generations keep dual-writing JSON.
+pub const ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY: bool = false;
+
 // Compile-time invariants: dual-write by default so the base build is byte-for-byte legacy behavior.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED);
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY);
 
 /// Require target-bound v2 signatures on every internode gRPC request, rejecting the legacy
 /// constant-target fallback instead of accepting it (<https://github.com/rustfs/backlog/issues/1327>).
@@ -525,6 +533,7 @@ mod tests {
             ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
             "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"
         );
+        assert_eq!(ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY, "RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY");
     }
 
     #[test]

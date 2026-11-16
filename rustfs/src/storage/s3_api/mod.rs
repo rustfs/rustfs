@@ -25,7 +25,6 @@ pub(crate) use crate::app::multipart_usecase::{
     AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
     UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput, reject_abort_capabilities,
 };
-pub(crate) use crate::app::object::reject_veeam_sosapi_mutation;
 pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 pub(crate) use crate::app::object::{
     CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, PutObjectWriteInput, PutObjectWriteOutput, legacy_put_body,

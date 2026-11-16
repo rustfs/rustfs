@@ -19,7 +19,7 @@
 //! target through the AWS SDK until one has the object, and the proxy metrics.
 //! NOT responsible for: deciding whether proxying is allowed for the request (the caller checks
 //! that no tag-conditioned authorization ran), or any local tagging.
-//! Upstream: the tagging use cases, and the legacy PutObjectTagging edge until it moves here.
+//! Upstream: the tagging use cases.
 //! Downstream: the replication target clients.
 
 use crate::app::storage_api::object_usecase::StorageObjectOptions as ObjectOptions;
