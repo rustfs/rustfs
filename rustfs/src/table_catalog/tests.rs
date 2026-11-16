@@ -14746,7 +14746,7 @@ fn multipart_mutation_entrypoints_call_reserved_prefix_guard() {
 
 #[test]
 fn object_metadata_mutation_entrypoints_call_reserved_prefix_guard() {
-    // Count mutation guards across the shared use cases and legacy entrypoints.
+    // Tagging, retention and legal-hold mutations share the owned use cases across both S3 edges.
     let sources = crate::guard_sources::SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge")
         .and(crate::guard_sources::SourceSet::production("src/app/mod.rs", "src/app/object_meta"));
     assert_object_metadata_reserved_prefix_guard_calls(&sources);
@@ -14819,6 +14819,32 @@ fn multipart_count_guard_accepts_borrowed_resource_names() {
     );
 
     assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_count_guard_accepts_owned_and_borrowed_resource_names() {
+    for borrowed in 0..=2 {
+        let production = format!(
+            "{}{}{}",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 2 - borrowed),
+            guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, borrowed),
+        );
+        let source = guard_fixture(&[("src/app/mod.rs", &production)], "src/app/mod.rs", "src/app/object_meta");
+        assert_object_metadata_reserved_prefix_guard_calls(&source);
+    }
+}
+
+#[test]
+fn object_metadata_borrowed_guard_rejects_test_only_replacements() {
+    let source = format!(
+        "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mention() {{ {OBJECT_METADATA_BORROWED_KEY_GUARD} }}\n}}\n",
+        guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+        guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 1),
+    );
+    let source = guard_fixture(&[("src/app/mod.rs", &source)], "src/app/mod.rs", "src/app/object_meta");
+    let message = crate::guard_sources::panic_message(|| assert_object_metadata_reserved_prefix_guard_calls(&source));
+    assert!(message.contains("reserved-prefix guard calls"), "{message}");
 }
 
 #[test]
