@@ -42,6 +42,8 @@ use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
+#[cfg(test)]
+use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -960,11 +962,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let content_length = input.content_length;
-        let input = gateway_s3s_compat::generated::ops::upload_part::input_to_s3s(input)
-            .map_err(|e| conversion_error("UploadPart input", e))?;
-        let part_number = input.part_number;
-        let upload_id = input.upload_id.clone();
-        let part_number = part_number.to_string();
+        // This scalar projection remains until the compatibility seam retires.
+        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
+        let part_number = input.part_number.to_string();
         let uri = build_object_uri(
             &bucket,
             &key,
@@ -973,14 +973,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 ("uploadId", Some(upload_id.as_str())),
             ],
         )?;
-
-        let mut headers = HeaderMap::default();
-        if let Ok(header_value) = content_length.to_string().parse() {
-            headers.insert("content-length", header_value);
+        let input = multipart::upload_part_input(input, upload_id);
+        let mut headers = HeaderMap::new();
+        if let Ok(value) = content_length.to_string().parse() {
+            headers.insert("content-length", value);
         }
-
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope_with_headers(
             Method::PUT,
             uri,
             RequestParams {
@@ -988,14 +986,22 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-        let req = S3Request { headers, ..req };
-
-        match self.fs.upload_part(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::upload_part::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("UploadPart output", e)),
-            Err(e) => Err(e.into()),
-        }
+            headers,
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::UploadPart);
+        let helper = crate::app::storage_api::context::OperationHelper::audit_only_from_view(
+            &envelope.audit_view(),
+            rustfs_s3_ops::S3Operation::UploadPart,
+        );
+        let result = self
+            .owned_multipart_usecase()
+            .execute_upload_part_owned(envelope, input)
+            .await
+            .map_err(multipart::upload_part_error);
+        let empty_headers = HeaderMap::new();
+        let headers = result.as_ref().map_or(&empty_headers, |output| &output.headers);
+        let _helper = helper.complete_owned(&result, http::StatusCode::OK, headers);
+        result.and_then(multipart::upload_part_output)
     }
 
     async fn complete_multipart_upload(

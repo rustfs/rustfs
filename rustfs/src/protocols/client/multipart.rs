@@ -195,6 +195,104 @@ pub(super) fn abort_multipart_input(input: &dto::AbortMultipartUploadInput) -> S
     Ok(())
 }
 
+pub(super) fn upload_part_input(
+    input: dto::UploadPartInput,
+    upload_id: String,
+) -> crate::app::multipart_usecase::UploadPartWriteInput {
+    use crate::app::multipart_usecase::{UploadPartTarget, UploadPartWriteInput};
+    use rustfs_gateway_types::ChecksumAlgorithm;
+    let checksum = |algorithm| {
+        input
+            .checksum_spec
+            .as_ref()
+            .filter(|value| value.algorithm() == algorithm)
+            .map(|value| value.render_base64().to_owned())
+    };
+    UploadPartWriteInput {
+        checksum_crc32: checksum(ChecksumAlgorithm::Crc32),
+        checksum_crc32c: checksum(ChecksumAlgorithm::Crc32c),
+        checksum_crc64nvme: checksum(ChecksumAlgorithm::Crc64Nvme),
+        checksum_sha1: checksum(ChecksumAlgorithm::Sha1),
+        checksum_sha256: checksum(ChecksumAlgorithm::Sha256),
+        target: UploadPartTarget::Legacy {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            upload_id,
+        },
+        part_number: input.part_number,
+        content_length: Some(input.content_length),
+        body: input.body.map(|body| body.into_body()),
+        trailing_headers: None,
+        frame_trailers: None,
+        content_md5: nonempty(input.content_md5),
+        checksum_algorithm: nonempty(input.checksum_algorithm.map(|value| value.as_str().to_owned())),
+        sse_customer_algorithm: nonempty(input.sse_customer_algorithm),
+        sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
+        sse_customer_key_md5: nonempty(input.sse_customer_key_md5),
+    }
+}
+
+pub(super) fn upload_part_output(
+    output: crate::app::multipart_usecase::UploadPartWriteOutput,
+) -> S3Result<dto::UploadPartOutput> {
+    use rustfs_gateway_types::{ChecksumAlgorithm, ChecksumSpec};
+    let error = |field, reason| super::conversion_error("UploadPart output", format!("{field}: {reason}"));
+    let raw_etag = output
+        .e_tag
+        .ok_or_else(|| error("e_tag", "the gateway shape requires this member"))?;
+    let e_tag = if let Some(value) = raw_etag.strip_prefix("W/\"") {
+        ETag::new_weak(value.strip_suffix('"').unwrap_or(value).to_owned())
+    } else {
+        ETag::new(
+            raw_etag
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(&raw_etag)
+                .to_owned(),
+        )
+    }
+    .map_err(|_| error("e_tag", "not an entity tag the gateway can write"))?;
+    let mut checksums = [
+        ("checksum_crc32", ChecksumAlgorithm::Crc32, output.checksum_crc32),
+        ("checksum_crc32c", ChecksumAlgorithm::Crc32c, output.checksum_crc32c),
+        ("checksum_crc64nvme", ChecksumAlgorithm::Crc64Nvme, output.checksum_crc64nvme),
+        ("checksum_sha1", ChecksumAlgorithm::Sha1, output.checksum_sha1),
+        ("checksum_sha256", ChecksumAlgorithm::Sha256, output.checksum_sha256),
+    ]
+    .into_iter()
+    .filter_map(|(field, algorithm, value)| value.map(|value| (field, algorithm, value)));
+    let checksum_spec = match (checksums.next(), checksums.next()) {
+        (None, _) => None,
+        (Some(_), Some(_)) => {
+            return Err(error(
+                "checksum_spec",
+                "the gateway shape carries one checksum, so a second would be lost",
+            ));
+        }
+        (Some((field, algorithm, value)), None) => Some(
+            ChecksumSpec::parse_header(algorithm.header_name(), &value)
+                .map_err(|_| error(field, "not a checksum value of this algorithm's width"))?,
+        ),
+    };
+    Ok(dto::UploadPartOutput {
+        e_tag,
+        checksum_spec,
+        server_side_encryption: output.server_side_encryption.map(dto::ServerSideEncryption::custom),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        ..Default::default()
+    })
+}
+
+pub(super) fn upload_part_error(error: S3Error) -> S3Error {
+    let mut error = super::owned::put_error(error);
+    if error.message().is_none() && matches!(error.code(), S3ErrorCode::EntityTooLarge) {
+        error.set_message("Your proposed upload exceeds the maximum allowed object size.");
+    }
+    error
+}
+
 #[cfg(test)]
 #[path = "multipart_test.rs"]
 mod tests;
