@@ -1,0 +1,1 @@
+console-route-static-content
