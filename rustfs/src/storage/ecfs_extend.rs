@@ -32,9 +32,11 @@ use rustfs_utils::http::{
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    QueueConfiguration, TopicConfiguration,
 };
+#[cfg(test)]
+use s3s::dto::{ObjectLockLegalHold, ObjectLockRetention};
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -431,6 +433,7 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
     parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
 }
@@ -487,6 +490,7 @@ pub(crate) fn parse_object_lock_retention_native(
     Ok(eval_metadata)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
     parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
 }
@@ -890,11 +894,15 @@ pub fn invalidate_bucket_validation_cache(bucket: &str) {
 /// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
 /// Returns store directly on cache hit without calling get_bucket_info().
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
+    Ok(get_validated_store_owned(bucket).await?)
+}
+
+pub(crate) async fn get_validated_store_owned(bucket: &str) -> rustfs_s3_types::S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
     };
 
-    validate_bucket_exists(&store, bucket).await?;
+    validate_bucket_exists_owned(&store, bucket).await?;
 
     Ok(store)
 }
@@ -904,6 +912,10 @@ pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECS
 /// store through the request-bound server context (backlog#1052 S6) use this
 /// to keep bucket validation on that store instead of the process-global one.
 pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str) -> S3Result<()> {
+    Ok(validate_bucket_exists_owned(store, bucket).await?)
+}
+
+async fn validate_bucket_exists_owned(store: &super::ECStore, bucket: &str) -> rustfs_s3_types::S3Result<()> {
     // Check cache — TTL is checked manually.
     if let Some(inserted_at) = cache_get(bucket)
         && inserted_at.elapsed() < BUCKET_VALIDATION_TTL

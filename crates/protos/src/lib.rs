@@ -141,6 +141,7 @@ impl Drop for DialLock {
 }
 
 static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
+static INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -3422,9 +3423,35 @@ pub fn internode_rpc_msgpack_only() -> bool {
     enabled
 }
 
+/// Whether msgpack-only was requested and the default-off per-peer capability gate is enabled.
+pub fn internode_rpc_msgpack_peer_capability_enabled() -> bool {
+    match INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+    );
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
 #[doc(hidden)]
 pub fn reset_internode_rpc_msgpack_only_cache() {
     INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
 }
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
@@ -5750,6 +5777,33 @@ mod tests {
                 ],
                 || {
                     assert_eq!(internode_rpc_msgpack_only(), expected);
+                },
+            );
+        }
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_peer_capability_requires_request_and_peer_gate() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (requested, peer_capability, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY, peer_capability),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_peer_capability_enabled(), expected);
                 },
             );
         }

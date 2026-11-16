@@ -1007,6 +1007,7 @@ pub(crate) struct BucketMetaHookCall {
     pub(crate) bucket: String,
     pub(crate) item_type: String,
     pub(crate) scanner_generation: Option<u64>,
+    pub(crate) replication_config: Option<String>,
     pub(crate) scanner_maintenance_generation: u64,
 }
 
@@ -1021,6 +1022,7 @@ pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Resu
         calls.borrow_mut().push(BucketMetaHookCall {
             bucket: item.bucket.clone(),
             item_type: item.r#type.clone(),
+            replication_config: item.replication_config.clone(),
             scanner_generation: rustfs_scanner::scanner_dirty_usage_bucket_generation(&item.bucket),
             scanner_maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
         });

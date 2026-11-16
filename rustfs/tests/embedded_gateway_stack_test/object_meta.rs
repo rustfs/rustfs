@@ -61,6 +61,18 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         call: get_object_retention,
     },
     MatrixRow {
+        operation: "PutObjectLegalHold",
+        metric: S3Operation::PutObjectLegalHold,
+        has_error_body: true,
+        call: put_object_legal_hold,
+    },
+    MatrixRow {
+        operation: "PutObjectRetention",
+        metric: S3Operation::PutObjectRetention,
+        has_error_body: true,
+        call: put_object_retention,
+    },
+    MatrixRow {
         operation: "GetObjectTagging",
         metric: S3Operation::GetObjectTagging,
         has_error_body: true,
@@ -114,6 +126,36 @@ fn get_object_retention<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'
     Box::pin(async move {
         let bucket = locked_bucket(bucket).await;
         outcome(client.get_object_retention().bucket(&bucket).key(KEY).send().await)
+    })
+}
+
+fn put_object_legal_hold<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let bucket = format!("{MATRIX_BUCKET}-locked");
+        outcome(
+            client
+                .put_object_legal_hold()
+                .bucket(bucket)
+                .key(KEY)
+                .legal_hold(legal_hold("ON"))
+                .send()
+                .await,
+        )
+    })
+}
+
+fn put_object_retention<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let bucket = format!("{MATRIX_BUCKET}-locked");
+        outcome(
+            client
+                .put_object_retention()
+                .bucket(bucket)
+                .key(KEY)
+                .retention(retention("2099-01-01T00:00:00Z"))
+                .send()
+                .await,
+        )
     })
 }
 
@@ -803,4 +845,332 @@ fn answer<T, E: ProvideErrorMetadata>(result: Result<T, SdkError<E>>) -> (Option
 #[test]
 fn the_legacy_stack_refuses_keys_outside_the_floor() {
     with_stack(LEGACY, keys_outside_the_floor_are_refused);
+}
+
+fn legal_hold(status: &str) -> aws_sdk_s3::types::ObjectLockLegalHold {
+    aws_sdk_s3::types::ObjectLockLegalHold::builder()
+        .status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::from(status))
+        .build()
+}
+
+fn retention(until: &str) -> aws_sdk_s3::types::ObjectLockRetention {
+    aws_sdk_s3::types::ObjectLockRetention::builder()
+        .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Governance)
+        .retain_until_date(
+            aws_sdk_s3::primitives::DateTime::from_str(until, aws_sdk_s3::primitives::DateTimeFormat::DateTime).unwrap(),
+        )
+        .build()
+}
+
+async fn lock_write_fixture(volume: &std::path::Path) -> (rustfs::embedded::RustFSServer, String, String, String) {
+    use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+    let server = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{}", find_available_port().unwrap()))
+        .access_key(super::ROOT_ACCESS_KEY)
+        .secret_key(super::ROOT_SECRET_KEY)
+        .volume(volume.to_string_lossy())
+        .build()
+        .await
+        .unwrap();
+    let bucket = locked_bucket("lock-write").await;
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let old = tagged_object(&client, &bucket, KEY, b"old object", "test=old").await.unwrap();
+    let latest = tagged_object(&client, &bucket, KEY, b"new object", "test=latest")
+        .await
+        .unwrap();
+    (server, bucket, old, latest)
+}
+
+fn lock_disk_version(volume: &std::path::Path, bucket: &str, version: &str) -> rustfs_filemeta::FileInfo {
+    let bytes = std::fs::read(volume.join(bucket).join(KEY).join("xl.meta")).unwrap();
+    rustfs_filemeta::FileMeta::load(&bytes)
+        .unwrap()
+        .list_versions(bucket, KEY, true)
+        .unwrap()
+        .into_iter()
+        .find(|info| info.version_id == Some(uuid::Uuid::parse_str(version).unwrap()))
+        .unwrap()
+}
+
+fn lock_operation_count(operation: S3Operation) -> u64 {
+    rustfs_io_metrics::s3_op_metrics_snapshot()
+        .into_iter()
+        .find(|row| row.op == operation.as_str())
+        .map_or(0, |row| row.total)
+}
+
+fn put_legal_hold_on_an_explicit_version(stack: Option<&'static str>) {
+    temp_env::with_var(super::ENV_S3_STACK, stack, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let initial = lock_disk_version(volume.path(), &bucket, &old);
+            let untouched = lock_disk_version(volume.path(), &bucket, &latest);
+            let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+            attach_tagging_policy(
+                "hold-body-writer",
+                "s3:PutObjectLegalHold",
+                &format!("arn:aws:s3:::{bucket}/{KEY}"),
+                serde_json::json!({"StringEquals":{"s3:object-lock-legal-hold": "ON", "s3:VersionId": old}}),
+            )
+            .await;
+            let writer = s3_client(&server.endpoint(), "hold-body-writer", USER_SECRET_KEY);
+            let write = |client: &Client, version: &str, status: &str| {
+                client
+                    .put_object_legal_hold()
+                    .bucket(&bucket)
+                    .key(KEY)
+                    .version_id(version)
+                    .legal_hold(legal_hold(status))
+            };
+            let before = lock_operation_count(S3Operation::PutObjectLegalHold);
+            for result in [
+                write(&writer, &latest, "ON").send().await,
+                write(&writer, &old, "OFF").send().await,
+            ] {
+                assert_eq!(refusal(&result.unwrap_err()), (Some("AccessDenied".to_owned()), Some(403)));
+            }
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &old), initial);
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), untouched);
+            for (version, status, code, http) in [
+                ("not-a-version", "ON", "InvalidArgument", 400),
+                (&old, "INVALID", "MalformedXML", 400),
+                ("c8164ea4-fb02-11ee-8564-5a3aed339b15", "ON", "InternalError", 500),
+            ] {
+                let result = write(&root, version, status).send().await;
+                assert_eq!(refusal(&result.unwrap_err()), (Some(code.to_owned()), Some(http)));
+            }
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &old), initial);
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), untouched);
+            let count = lock_operation_count(S3Operation::PutObjectLegalHold);
+            assert!(count > before, "admitted failures enter the operation");
+            let response = write(&writer, &old, "ON").send().await.unwrap();
+            assert_eq!(response.request_charged().map(|value| value.as_str()), Some("requester"));
+            assert_eq!(lock_operation_count(S3Operation::PutObjectLegalHold) - count, 1);
+            let changed = lock_disk_version(volume.path(), &bucket, &old);
+            assert_eq!(changed.metadata.get("x-amz-object-lock-legal-hold").map(String::as_str), Some("ON"));
+            assert_eq!(changed.metadata.get("x-amz-tagging"), initial.metadata.get("x-amz-tagging"));
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), untouched);
+            assert_eq!(object_payload(&root, &bucket, KEY, Some(&old)).await.1, b"old object");
+            server.shutdown().await;
+        });
+    });
+}
+
+fn put_retention_on_an_explicit_version(stack: Option<&'static str>) {
+    temp_env::with_var(super::ENV_S3_STACK, stack, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let initial = lock_disk_version(volume.path(), &bucket, &old);
+            let untouched = lock_disk_version(volume.path(), &bucket, &latest);
+            let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+            attach_tagging_policy(
+                "retention-body-writer",
+                "s3:PutObjectRetention",
+                &format!("arn:aws:s3:::{bucket}/{KEY}"),
+                serde_json::json!({"StringEquals":{"s3:object-lock-mode": "GOVERNANCE", "s3:VersionId": old}}),
+            )
+            .await;
+            let writer = s3_client(&server.endpoint(), "retention-body-writer", USER_SECRET_KEY);
+            let write = |client: &Client, version: &str, until: &str| {
+                client
+                    .put_object_retention()
+                    .bucket(&bucket)
+                    .key(KEY)
+                    .version_id(version)
+                    .retention(retention(until))
+            };
+            const END: &str = "2099-01-03T00:00:00.123Z";
+            for refusal_result in [
+                write(&writer, &latest, END).send().await,
+                write(&writer, &old, END).bypass_governance_retention(true).send().await,
+            ] {
+                assert_eq!(refusal(&refusal_result.unwrap_err()), (Some("AccessDenied".to_owned()), Some(403)));
+            }
+            for (version, until, code, http) in [
+                ("not-a-version", END, "InvalidArgument", 400),
+                (&old, "2000-01-01T00:00:00Z", "InvalidArgument", 400),
+                ("c8164ea4-fb02-11ee-8564-5a3aed339b15", END, "NoSuchVersion", 404),
+            ] {
+                let result = write(&root, version, until).send().await;
+                assert_eq!(refusal(&result.unwrap_err()), (Some(code.to_owned()), Some(http)));
+            }
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &old), initial);
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), untouched);
+            let count = lock_operation_count(S3Operation::PutObjectRetention);
+            let response = write(&writer, &old, END).send().await.unwrap();
+            assert_eq!(response.request_charged().map(|value| value.as_str()), Some("requester"));
+            assert_eq!(lock_operation_count(S3Operation::PutObjectRetention) - count, 1);
+            let changed = lock_disk_version(volume.path(), &bucket, &old);
+            assert_eq!(changed.metadata.get("x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+            let cutoff = changed
+                .metadata
+                .get("x-amz-object-lock-retain-until-date")
+                .expect("committed cutoff");
+            assert_eq!(cutoff, "2099-01-03T00:00:00.123Z");
+            assert_eq!(changed.metadata.get("x-amz-tagging"), initial.metadata.get("x-amz-tagging"));
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), untouched);
+            assert_eq!(object_payload(&root, &bucket, KEY, Some(&old)).await.1, b"old object");
+            let result = write(&root, &old, "2099-01-01T00:00:00Z").send().await;
+            assert_eq!(refusal(&result.unwrap_err()), (Some("AccessDenied".to_owned()), Some(403)));
+            assert_eq!(lock_disk_version(volume.path(), &bucket, &old), changed);
+            server.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn gateway_put_object_legal_hold_edits_only_the_authorized_version() {
+    put_legal_hold_on_an_explicit_version(GATEWAY);
+}
+
+#[test]
+fn legacy_put_object_legal_hold_edits_only_the_authorized_version() {
+    put_legal_hold_on_an_explicit_version(LEGACY);
+}
+
+#[test]
+fn gateway_put_object_retention_edits_only_the_authorized_version() {
+    put_retention_on_an_explicit_version(GATEWAY);
+}
+
+#[test]
+fn legacy_put_object_retention_edits_only_the_authorized_version() {
+    put_retention_on_an_explicit_version(LEGACY);
+}
+
+const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
+const RETENTION_DATES: [&str; 3] = [
+    "2099-01-02T08:00:00.123456789+08:00",
+    "2099-01-03T16:30:00.987654321-07:30",
+    "2099-01-05T00:00:00.000000001Z",
+];
+
+async fn write_retention_xml(
+    client: &super::object_write::WireClient<'_>,
+    path: &str,
+    xml: &str,
+) -> super::object_write::WireAnswer {
+    use md5::Digest as _;
+
+    let md5 = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml.as_bytes()));
+    client
+        .request(
+            "PUT",
+            path,
+            xml.as_bytes(),
+            &[("content-type", "application/xml"), ("content-md5", &md5)],
+            Some(xml.len()),
+        )
+        .await
+}
+
+#[test]
+fn gateway_put_object_retention_preserves_the_authorized_date_on_disk() {
+    use super::object_write::WireClient;
+
+    temp_env::with_var(super::ENV_S3_STACK, GATEWAY, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let endpoint = server.endpoint();
+            let root = WireClient {
+                endpoint: &endpoint,
+                access_key: server.access_key(),
+                secret_key: server.secret_key(),
+            };
+            let writer = WireClient {
+                endpoint: &endpoint,
+                access_key: "retention-date-writer",
+                secret_key: USER_SECRET_KEY,
+            };
+            attach_tagging_policy(
+                writer.access_key,
+                "s3:PutObjectRetention",
+                &format!("arn:aws:s3:::{bucket}/{KEY}"),
+                serde_json::json!({"StringEquals": {
+                    "s3:VersionId": old,
+                    "s3:object-lock-retain-until-date": RETENTION_DATES[0]
+                }}),
+            )
+            .await;
+
+            let path = format!("/{bucket}/{KEY}?retention&versionId={old}");
+            let metadata_path = volume.path().join(&bucket).join(KEY).join("xl.meta");
+            let initial = std::fs::read(&metadata_path).unwrap();
+            let latest_initial = lock_disk_version(volume.path(), &bucket, &latest);
+            let xml = |date| format!("<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{date}</RetainUntilDate></Retention>");
+
+            for (actor, body, status, code) in [
+                (&writer, xml("2099-01-02T00:00:00.123456789Z"), 403, "<Code>AccessDenied</Code>"),
+                (&writer, "<Retention/>".to_owned(), 403, "<Code>AccessDenied</Code>"),
+                (&root, xml("invalid-date"), 400, "<Code>MalformedXML</Code>"),
+            ] {
+                let answer = write_retention_xml(actor, &path, &body).await;
+                assert_eq!(answer.status, status, "{}", answer.body);
+                assert!(answer.body.contains(code), "{}", answer.body);
+                assert_eq!(std::fs::read(&metadata_path).unwrap(), initial);
+            }
+
+            for (actor, date) in [
+                (&writer, RETENTION_DATES[0]),
+                (&root, RETENTION_DATES[1]),
+                (&root, RETENTION_DATES[2]),
+            ] {
+                let answer = write_retention_xml(actor, &path, &xml(date)).await;
+                assert_eq!(answer.status, 200, "retain until {date}: {}", answer.body);
+                let changed = lock_disk_version(volume.path(), &bucket, &old);
+                assert_eq!(changed.metadata.get(RETAIN_UNTIL_HEADER).map(String::as_str), Some(date));
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), latest_initial);
+            }
+            server.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn gateway_put_object_preserves_retention_header_date_on_disk() {
+    use super::object_write::WireClient;
+
+    temp_env::with_var(super::ENV_S3_STACK, GATEWAY, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let endpoint = server.endpoint();
+            let client = WireClient {
+                endpoint: &endpoint,
+                access_key: server.access_key(),
+                secret_key: server.secret_key(),
+            };
+            let path = format!("/{bucket}/{KEY}");
+            let metadata_path = volume.path().join(&bucket).join(KEY).join("xl.meta");
+            let initial = std::fs::read(&metadata_path).unwrap();
+            let old_initial = lock_disk_version(volume.path(), &bucket, &old).metadata;
+            let latest_initial = lock_disk_version(volume.path(), &bucket, &latest).metadata;
+            let mode = ("x-amz-object-lock-mode", "GOVERNANCE");
+
+            for headers in [vec![mode], vec![mode, (RETAIN_UNTIL_HEADER, "invalid-date")]] {
+                let answer = client.request("PUT", &path, b"object", &headers, Some(6)).await;
+                assert_eq!(answer.status, 400, "{}", answer.body);
+                assert_eq!(std::fs::read(&metadata_path).unwrap(), initial);
+            }
+
+            for date in [
+                None,
+                Some(RETENTION_DATES[0]),
+                Some(RETENTION_DATES[1]),
+                Some(RETENTION_DATES[2]),
+            ] {
+                let headers = date.map_or_else(Vec::new, |date| vec![mode, (RETAIN_UNTIL_HEADER, date)]);
+                let answer = client.request("PUT", &path, b"object", &headers, Some(6)).await;
+                assert_eq!(answer.status, 200, "retain until {date:?}: {}", answer.body);
+                let written = lock_disk_version(volume.path(), &bucket, &answer.headers["x-amz-version-id"]);
+                assert_eq!(written.metadata.get(RETAIN_UNTIL_HEADER).map(String::as_str), date);
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &old).metadata, old_initial);
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &latest).metadata, latest_initial);
+            }
+            server.shutdown().await;
+        });
+    });
 }

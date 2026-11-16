@@ -239,7 +239,7 @@ pub(crate) mod server {
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
             pub(crate) use crate::storage::storage_api::access_consumer::{
                 AccessMarkers, VerifiedSignature, admit_operation, authorize_bucket_config_mutation, authorize_bucket_request,
-                authorize_object_request, resolve_req_info,
+                authorize_bucket_tag_deletion, authorize_object_request, resolve_req_info,
             };
 
             #[cfg(test)]

@@ -55,8 +55,8 @@ pub(crate) fn requested_location_constraint(input: &gateway_dto::CreateBucketInp
 }
 
 impl DefaultBucketUsecase {
-    /// Checks that the bucket exists before a stored configuration read.
-    pub(super) async fn ensure_config_read_bucket(&self, bucket: &str) -> rustfs_s3_types::S3Result<()> {
+    /// Checks that the bucket exists before reading or writing a stored configuration.
+    pub(super) async fn ensure_config_bucket(&self, bucket: &str) -> rustfs_s3_types::S3Result<()> {
         let Some(store) = self.object_store() else {
             return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
         };

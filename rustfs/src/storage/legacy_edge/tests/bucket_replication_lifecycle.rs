@@ -15,11 +15,11 @@
 //! Tests of the `bucket_replication_lifecycle` legacy-edge handlers (batch A3), moved unchanged
 //! from `ecfs.rs` and `ecfs_test.rs`.
 
-use super::super::bucket_replication_lifecycle::{
-    SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
-};
 use super::{build_request, store_uninitialized_premise_holds};
 use crate::storage::access::ReqInfo;
+use crate::storage::access::access_owned::bucket_replication_lifecycle::{
+    SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
+};
 use crate::storage::ecfs::*;
 use http::Method;
 use http::StatusCode;
