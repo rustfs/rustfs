@@ -26,11 +26,33 @@ def row(timestamp, value, **labels):
 
 
 class MsgpackPeerCanaryTests(unittest.TestCase):
+    def test_rpc_error_query_scopes_application_response_exclusion_to_read_version(self):
+        cluster_id = "msgpack-" + "c" * 32
+        query = canary.expected_queries(30, cluster_id)["rpc_errors"]
+        self.assertIn(
+            f'rustfs_cluster_id="{cluster_id}",backend="grpc",operation!="grpc_read_version"',
+            query,
+        )
+        self.assertIn("internode_operation_classified_errors_total", query)
+        self.assertIn(
+            f'rustfs_cluster_id="{cluster_id}",backend="grpc",operation="grpc_read_version",'
+            'classification!="remote_response"',
+            query,
+        )
+        self.assertNotIn("http_status_other", query)
+
     def fixture(self):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         phases = []
-        images = [{"Id": "sha256:" + char * 64, "Config": {"Labels": {"vcs-ref": char * 40}}} for char in ("a", "b")]
+        images = [
+            {
+                "Id": "sha256:" + char * 64,
+                "Config": {"Labels": {"vcs-ref": char * 40}},
+                "RevisionEvidence": "config-labels",
+            }
+            for char in ("a", "b")
+        ]
         (root / "images.json").write_text(json.dumps(images))
         layouts = [
             ("mixed-old-peer", 100, 110, 3, 1, [row(110, 4, decision="msgpack_only", reason="peer_capable"),
@@ -111,6 +133,11 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         result = canary.check(manifest, root)
         self.assertTrue(result["observed_pass"])
         self.assertEqual(result["violations"], [])
+        self.assertEqual(result["cluster_id"], manifest["cluster_id"])
+        self.assertEqual(
+            result["image_revision_evidence"],
+            {"candidate": "config-labels", "baseline": "config-labels"},
+        )
         self.assertEqual(len(result["artifacts"]), 22)
         self.assertTrue(all(len(item["sha256"]) == 64 for item in result["artifacts"]))
 
@@ -242,6 +269,11 @@ class MsgpackPeerCanaryTests(unittest.TestCase):
         images[1]["Config"]["Labels"]["vcs-ref"] = "c" * 40
         (root / "images.json").write_text(json.dumps(images))
         with self.assertRaisesRegex(canary.EvidenceError, "revision mismatch"):
+            canary.check(manifest, root)
+        images[1]["Config"]["Labels"]["vcs-ref"] = "b" * 40
+        images[1]["RevisionEvidence"] = "unverified"
+        (root / "images.json").write_text(json.dumps(images))
+        with self.assertRaisesRegex(canary.EvidenceError, "evidence source"):
             canary.check(manifest, root)
 
     def test_cli_exit_codes_distinguish_pass_gate_failure_and_invalid_input(self):
