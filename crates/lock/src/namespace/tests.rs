@@ -665,6 +665,39 @@ async fn test_namespace_lock_get_read_lock_local() {
 }
 
 #[tokio::test]
+async fn cache_fence_read_api_is_opt_in_and_does_not_change_lock_admission() {
+    let clients = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn LockClient>)
+        .collect();
+    let lock = NamespaceLock::with_clients("cache-fence-proof".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object");
+
+    let mut ordinary = lock
+        .get_read_lock(resource.clone(), "ordinary", Duration::from_secs(1))
+        .await
+        .expect("ordinary read lock");
+    assert!(ordinary.cache_fence_proof().is_none(), "ordinary read locks do not add proof traffic");
+    assert!(ordinary.release());
+
+    let mut requested = lock
+        .get_read_lock_with_cache_fence(resource, "cache-reader", Duration::from_secs(1))
+        .await
+        .expect("proof-carrying read lock uses the same quorum admission");
+    assert_eq!(requested.cache_fence_proof().expect("new voter quorum proof").stamps().len(), 2);
+    assert!(requested.release());
+
+    let local = NamespaceLock::with_local_manager("local-cache-fence".to_string(), Arc::new(GlobalLockManager::new()));
+    let local_guard = local
+        .get_read_lock_with_cache_fence(create_test_object_key("bucket", "local-object"), "local-reader", Duration::from_secs(1))
+        .await
+        .expect("local fast lock remains available");
+    assert!(
+        local_guard.cache_fence_proof().is_none(),
+        "single-process fast locks need no distributed proof"
+    );
+}
+
+#[tokio::test]
 async fn test_namespace_lock_guard_release() {
     let manager = Arc::new(GlobalLockManager::new());
     let lock = NamespaceLock::with_local_manager("test-release".to_string(), manager);

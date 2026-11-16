@@ -1252,6 +1252,7 @@ impl ECStore {
         lookup_opts.no_lock = true;
         let oi = if require_all_pools {
             lookup_opts.metadata_cache_safe = false;
+            lookup_opts.metadata_cache_fence_proof = None;
             lookup_opts.suppress_read_repair = true;
             // Only completion uses this branch, after validating bucket and object.
             let encoded_object = encode_dir_object_ref(object);
