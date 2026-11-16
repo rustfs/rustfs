@@ -18,6 +18,13 @@
 //! keeps its operations and their tests in its own file under `bucket_usecase/`.
 
 use super::storage_api::bucket_usecase::ECStore;
+use super::storage_api::managed;
+#[cfg(test)]
+use super::storage_api::managed::{
+    AccountNamespaceId, BucketHandle, BucketIdentityError, BucketIncarnationFenceGuard, BucketKind, BucketPublicName,
+    StorageBucketId,
+};
+
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
@@ -335,6 +342,46 @@ fn notify_bucket_metadata_delete(bucket: String, request_context: Option<request
     });
 }
 
+#[cfg(test)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BucketResolveError {
+    #[error(transparent)]
+    InvalidIdentity(#[from] BucketIdentityError),
+    #[error("bucket identity is missing")]
+    MissingIdentity,
+    #[error("bucket kind differs from the requested kind")]
+    KindMismatch,
+    #[error("bucket identity differs from the requested identity")]
+    IdentityMismatch,
+    #[error("managed bucket deployment capability is unavailable")]
+    CapabilityUnavailable,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+#[cfg(test)]
+pub(crate) fn vector_storage_bucket_id(
+    account: &AccountNamespaceId,
+    region: &str,
+    public_name: &BucketPublicName,
+) -> Result<StorageBucketId, BucketResolveError> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"rustfs.vector-bucket.v1");
+    for value in [account.as_str(), region, public_name.as_str()] {
+        let length = u32::try_from(value.len()).map_err(|_| BucketIdentityError::InvalidPublicName)?;
+        digest.update(length.to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut name = String::from(managed::BUCKET_VECTOR_STORAGE_PREFIX);
+    for byte in &digest[..24] {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").map_err(|_| BucketIdentityError::InvalidStorageBucketId)?;
+    }
+    Ok(StorageBucketId::try_new(name)?)
+}
+
 #[derive(Clone, Default)]
 pub struct DefaultBucketUsecase {
     context: Option<Arc<AppContext>>,
@@ -377,6 +424,151 @@ where
 }
 
 impl DefaultBucketUsecase {
+    #[cfg(test)]
+    pub(super) fn checked_storage_bucket_id(
+        &self,
+        kind: BucketKind,
+        account: &AccountNamespaceId,
+        region: &str,
+        public_name: &BucketPublicName,
+    ) -> Result<StorageBucketId, BucketResolveError> {
+        if self.context.is_none() {
+            return Err(BucketResolveError::CapabilityUnavailable);
+        }
+        let current_region = self
+            .global_region()
+            .map(|region| region.to_string())
+            .unwrap_or_else(|| RUSTFS_REGION.to_owned());
+        if !account.as_str().is_empty() || region != current_region {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        if kind == BucketKind::Vector {
+            let name = public_name.as_str().as_bytes();
+            if !(3..=63).contains(&name.len())
+                || !name
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+                || !name.first().is_some_and(u8::is_ascii_alphanumeric)
+                || !name.last().is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return Err(BucketIdentityError::InvalidPublicName.into());
+            }
+            vector_storage_bucket_id(account, region, public_name)
+        } else {
+            Ok(StorageBucketId::try_new(public_name.as_str().to_owned())?)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resolve_bucket_handle(
+        &self,
+        kind: BucketKind,
+        account_namespace_id: &AccountNamespaceId,
+        region: &str,
+        public_name: &BucketPublicName,
+    ) -> Result<BucketHandle, BucketResolveError> {
+        let storage_id = self.checked_storage_bucket_id(kind, account_namespace_id, region, public_name)?;
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        let metadata = managed::get_bucket_metadata(&store, storage_id.as_str())
+            .await
+            .map_err(|error| match error {
+                StorageError::ConfigNotFound => BucketResolveError::MissingIdentity,
+                other => BucketResolveError::Storage(other),
+            })?;
+        if metadata.bucket_kind()? != kind {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let handle = metadata.bucket_handle(account_namespace_id, region)?;
+        if handle.public_name() != public_name || handle.storage_bucket_id() != &storage_id {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        self.validate_bucket_handle(&handle).await?;
+        Ok(handle)
+    }
+
+    /// Creation retains the existing lifecycle/metadata/namespace lock order and EC commit behavior.
+    #[cfg(test)]
+    pub(crate) async fn create_managed_bucket(
+        &self,
+        identity: BucketHandle,
+        encryption_config_xml: Vec<u8>,
+        tagging_config_xml: Vec<u8>,
+    ) -> Result<BucketHandle, BucketResolveError> {
+        if identity.kind() != BucketKind::Vector {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let expected_storage = self.checked_storage_bucket_id(
+            identity.kind(),
+            identity.account_namespace_id(),
+            identity.region(),
+            identity.public_name(),
+        )?;
+        if &expected_storage != identity.storage_bucket_id() {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        match managed::make_managed_bucket(
+            &store,
+            &identity,
+            &encryption_config_xml,
+            &tagging_config_xml,
+            &MakeBucketOptions::default(),
+        )
+        .await
+        {
+            Ok(()) => self.validate_bucket_handle(&identity).await?,
+            Err(StorageError::PreconditionFailed) => {
+                let _guard = self.acquire_bucket_handle_guard(&identity).await?;
+                let metadata = managed::get_bucket_metadata(&store, identity.storage_bucket_id().as_str()).await?;
+                if metadata.encryption_config_xml != encryption_config_xml || metadata.tagging_config_xml != tagging_config_xml {
+                    return Err(BucketResolveError::IdentityMismatch);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_bucket_handle_guard(
+        &self,
+        expected: &BucketHandle,
+    ) -> Result<BucketIncarnationFenceGuard, BucketResolveError> {
+        if self.context.is_none() {
+            return Err(BucketResolveError::CapabilityUnavailable);
+        }
+        if expected.kind() == BucketKind::Vector {
+            let storage_id = self.checked_storage_bucket_id(
+                expected.kind(),
+                expected.account_namespace_id(),
+                expected.region(),
+                expected.public_name(),
+            )?;
+            if &storage_id != expected.storage_bucket_id() {
+                return Err(BucketResolveError::IdentityMismatch);
+            }
+        }
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        let guard = managed::acquire_bucket_incarnation_fence(
+            &store,
+            expected.storage_bucket_id().as_str(),
+            expected.incarnation().as_uuid(),
+        )
+        .await?;
+        let metadata = managed::get_bucket_metadata(&store, expected.storage_bucket_id().as_str()).await?;
+        metadata.validate_bucket_handle(expected)?;
+        if guard.is_lock_lost() {
+            return Err(StorageError::PreconditionFailed.into());
+        }
+        Ok(guard)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn validate_bucket_handle(&self, expected: &BucketHandle) -> Result<(), BucketResolveError> {
+        let _guard = self.acquire_bucket_handle_guard(expected).await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
@@ -465,6 +657,7 @@ impl DefaultBucketUsecase {
 
         let buckets = bucket_infos
             .iter()
+            .filter(|info| !info.name.starts_with(managed::BUCKET_VECTOR_STORAGE_PREFIX))
             .map(|info| {
                 Ok(gateway_dto::Bucket {
                     name: dto_values::stored_bucket_name(&info.name)?,
@@ -988,5 +1181,192 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_list_buckets_hides_managed_storage_from_owner() {
+        crate::app::gating_test_env::shared_gating_ambient().await;
+        let (request, access, store, _reset) = crate::app::object::managed_request_fixture().await;
+        let server = request.server_context().expect("server context").clone();
+        let context = server.installed_app_context().expect("installed context");
+        let general = format!("general-list-{}", uuid::Uuid::new_v4().simple());
+        store
+            .make_bucket(&general, &MakeBucketOptions::default())
+            .await
+            .expect("ordinary bucket");
+        let mut request = build_request_with_req_info(
+            (),
+            Method::GET,
+            ReqInfo {
+                cred: Some(rustfs_credentials::Credentials {
+                    access_key: "managed-list-owner".into(),
+                    ..Default::default()
+                }),
+                is_owner: true,
+                ..Default::default()
+            },
+        );
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: "managed-list-owner".into(),
+            secret_key: "managed-list-test-secret".into(),
+        });
+        request.extensions.insert(server);
+        let output = DefaultBucketUsecase::with_context(Some(context))
+            .execute_list_buckets(RequestEnvelope::from_s3s(&request), gateway_dto::ListBucketsInput::default())
+            .await
+            .expect("owner bucket listing");
+        assert!(output.buckets.iter().any(|bucket| bucket.name.as_str() == general));
+        assert!(
+            output
+                .buckets
+                .iter()
+                .all(|bucket| bucket.name.as_str() != access.bucket().storage_bucket_id().as_str())
+        );
+    }
+
+    #[test]
+    fn vector_storage_id_uses_versioned_length_prefixed_identity() {
+        let account = AccountNamespaceId::empty();
+        let public_name = BucketPublicName::try_new("my-vectors".into()).expect("public name");
+        let id = vector_storage_bucket_id(&account, "us-east-1", &public_name).expect("storage identity");
+        assert_eq!(id.as_str(), "rustfs-v-5116163f2a2e3c469d61cc3623014d1bf542342a26548465");
+        assert_eq!(id.as_str().len(), 57);
+        assert_ne!(id, vector_storage_bucket_id(&account, "us-west-2", &public_name).expect("other region"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_resolver_checks_instance_region_kind_and_identity() {
+        let (request, access, store, _reset) = crate::app::object::managed_request_fixture().await;
+        let context = request
+            .server_context()
+            .expect("server")
+            .installed_app_context()
+            .expect("context");
+        let usecase = DefaultBucketUsecase::with_context(Some(context));
+        let identity = access.bucket();
+        let account = AccountNamespaceId::empty();
+        let resolved = usecase
+            .resolve_bucket_handle(BucketKind::Vector, &account, identity.region(), identity.public_name())
+            .await
+            .expect("real committed binding");
+        assert_eq!(&resolved, identity);
+        assert!(matches!(
+            usecase
+                .resolve_bucket_handle(BucketKind::Vector, &account, "another-region", identity.public_name())
+                .await,
+            Err(BucketResolveError::IdentityMismatch)
+        ));
+        let internal_name = BucketPublicName::try_new(identity.storage_bucket_id().as_str().into()).expect("internal name");
+        assert!(matches!(
+            usecase
+                .resolve_bucket_handle(BucketKind::General, &account, identity.region(), &internal_name)
+                .await,
+            Err(BucketResolveError::KindMismatch)
+        ));
+        for name in ["Abc", "abc.def", "-abc", "abc-", "ab"] {
+            let name = BucketPublicName::try_new(name.into()).expect("basic name syntax");
+            assert!(matches!(
+                usecase
+                    .resolve_bucket_handle(BucketKind::Vector, &account, identity.region(), &name)
+                    .await,
+                Err(BucketResolveError::InvalidIdentity(BucketIdentityError::InvalidPublicName))
+            ));
+        }
+        let missing = BucketPublicName::try_new(format!("absent-{}", uuid::Uuid::new_v4().simple())).expect("missing name");
+        assert!(matches!(
+            usecase
+                .resolve_bucket_handle(BucketKind::Vector, &account, identity.region(), &missing)
+                .await,
+            Err(BucketResolveError::MissingIdentity)
+        ));
+        let general = BucketPublicName::try_new(format!("legacy-{}", uuid::Uuid::new_v4().simple())).expect("general name");
+        store
+            .make_bucket(general.as_str(), &MakeBucketOptions::default())
+            .await
+            .expect("ordinary bucket");
+        assert_eq!(
+            usecase
+                .resolve_bucket_handle(BucketKind::General, &account, identity.region(), &general)
+                .await
+                .expect("ordinary identity")
+                .kind(),
+            BucketKind::General
+        );
+        assert!(matches!(
+            DefaultBucketUsecase::without_context().validate_bucket_handle(identity).await,
+            Err(BucketResolveError::CapabilityUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_create_retries_exact_identity_and_rejects_conflicts() {
+        use crate::app::storage_api::managed::BucketIncarnation;
+        let (request, access, store, _reset) = crate::app::object::managed_request_fixture().await;
+        let context = request
+            .server_context()
+            .expect("server")
+            .installed_app_context()
+            .expect("context");
+        let usecase = DefaultBucketUsecase::with_context(Some(context));
+        let metadata = managed::get_bucket_metadata(&store, access.bucket().storage_bucket_id().as_str())
+            .await
+            .expect("SSE configuration");
+        let name = BucketPublicName::try_new(format!("created-{}", uuid::Uuid::new_v4().simple())).expect("name");
+        let account = AccountNamespaceId::empty();
+        let storage_id = vector_storage_bucket_id(&account, access.bucket().region(), &name).expect("storage name");
+        let identity = BucketHandle::try_from_parts(
+            BucketKind::Vector,
+            account,
+            access.bucket().region().into(),
+            name,
+            storage_id,
+            BucketIncarnation::try_new(uuid::Uuid::new_v4()).expect("incarnation"),
+        )
+        .expect("identity");
+        for _ in 0..2 {
+            assert_eq!(
+                usecase
+                    .create_managed_bucket(identity.clone(), metadata.encryption_config_xml.clone(), Vec::new())
+                    .await
+                    .expect("exact creation retry"),
+                identity
+            );
+        }
+        let conflicting = BucketHandle::try_from_parts(
+            identity.kind(),
+            identity.account_namespace_id().clone(),
+            identity.region().into(),
+            identity.public_name().clone(),
+            identity.storage_bucket_id().clone(),
+            BucketIncarnation::try_new(uuid::Uuid::new_v4()).expect("different incarnation"),
+        )
+        .expect("conflicting identity");
+        assert!(
+            usecase
+                .create_managed_bucket(conflicting, metadata.encryption_config_xml.clone(), Vec::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            usecase
+                .create_managed_bucket(identity.clone(), Vec::new(), Vec::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            usecase
+                .resolve_bucket_handle(
+                    identity.kind(),
+                    identity.account_namespace_id(),
+                    identity.region(),
+                    identity.public_name()
+                )
+                .await
+                .expect("original survives"),
+            identity
+        );
     }
 }

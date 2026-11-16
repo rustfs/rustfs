@@ -14,7 +14,7 @@
 
 use super::{
     ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
-    statement::BPStatement, statement::variable_resolver_for_policy_args,
+    statement::BPStatement, statement::s3vectors_request_is_valid, statement::variable_resolver_for_policy_args,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub struct Policy {
 
 impl Policy {
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+            return false;
+        }
         // First, check all Deny statements - if any Deny matches, deny the request
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
@@ -206,6 +209,9 @@ pub struct BucketPolicy {
 
 impl BucketPolicy {
     pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+            return false;
+        }
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
                 return false;

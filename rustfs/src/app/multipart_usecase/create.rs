@@ -69,21 +69,38 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        validate_new_object_key(&req.input.key, "CreateMultipartUpload")?;
-        let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedSigV4Request>().is_some(),
-        )?;
-        reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
-        )?;
-        let helper =
-            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
-                .suppress_event();
-        let replication_authorized = replication_request_authorized(&req);
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        self.create_multipart_with_origin(envelope, req.input, MultipartOrigin::Request)
+            .await
+    }
+
+    pub(crate) async fn create_multipart_with_origin(
+        &self,
+        req: crate::app::RequestEnvelope,
+        input: CreateMultipartUploadInput,
+        origin: MultipartOrigin,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let headers = origin.headers(&req);
+        validate_new_object_key(&input.key, "CreateMultipartUpload")?;
+        let multipart_max_total_object_size = if origin.is_managed() {
+            None
+        } else {
+            parse_presigned_multipart_max_total_object_size(&headers, req.uri().query(), req.verified_sigv4().is_some())?
+        };
+        if !origin.is_managed() {
+            reject_presigned_put_max_content_length_for_other_operation(
+                &headers,
+                req.uri().query(),
+                req.verified_presigned().is_some(),
+            )?;
+        }
+        let helper = OperationHelper::from_view(
+            &req.audit_view(),
+            EventName::ObjectCreatedCreateMultipartUpload,
+            S3Operation::CreateMultipartUpload,
+        )
+        .suppress_event();
+        let replication_authorized = !origin.is_managed() && replication_request_authorized(&req);
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -100,13 +117,13 @@ impl DefaultMultipartUsecase {
             object_lock_retain_until_date,
             metadata: input_metadata,
             ..
-        } = req.input.clone();
+        } = input;
 
         let server_side_encryption = server_side_encryption
             .map(|value| value.as_str().to_owned())
-            .or(extract_server_side_encryption_from_headers(&req.headers)?);
+            .or(extract_server_side_encryption_from_headers(&headers)?);
         let ssekms_key_id = ssekms_key_id.or_else(|| {
-            req.headers
+            headers
                 .get("x-amz-server-side-encryption-aws-kms-key-id")
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned)
@@ -119,8 +136,10 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
-        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
-        validate_table_catalog_object_mutation(&bucket, &key).await?;
+        if !origin.is_managed() {
+            reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+            validate_table_catalog_object_mutation(&bucket, &key).await?;
+        }
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -128,22 +147,26 @@ impl DefaultMultipartUsecase {
 
         validate_archive_content_encoding(
             &key,
-            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
-            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+            headers.get("content-type").and_then(|value| value.to_str().ok()),
+            headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
+        let mut metadata = create_multipart_upload_metadata(input_metadata, &headers, tagging, storage_class.as_ref());
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
         }
-        if bucket_uses_xxh3_etag(&bucket) {
+        if !origin.is_managed() && bucket_uses_xxh3_etag(&bucket) {
             insert_str(&mut metadata, SUFFIX_ETAG_ALGORITHM, ETAG_ALGORITHM_XXH3.to_string());
         }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some()
             || object_lock_retain_until_date.is_some()
-            || has_replication_retention_update(&req.headers, replication_authorized);
-        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+            || has_replication_retention_update(&headers, replication_authorized);
+        let object_lock_config_state = if origin.is_managed() {
+            metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        } else {
+            load_bucket_object_lock_config_state(&bucket).await?
+        };
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             &object_lock_config_state,
@@ -160,7 +183,7 @@ impl DefaultMultipartUsecase {
             has_explicit_object_lock_retention,
         )?;
         let (header_sse_customer_algorithm, header_sse_customer_key, header_sse_customer_key_md5) =
-            extract_ssec_params_from_headers(&req.headers)?;
+            extract_ssec_params_from_headers(&headers)?;
         let sse_customer_algorithm = sse_customer_algorithm.or(header_sse_customer_algorithm);
         let sse_customer_key = sse_customer_key.or(header_sse_customer_key);
         let sse_customer_key_md5 = sse_customer_key_md5.or(header_sse_customer_key_md5);
@@ -173,7 +196,7 @@ impl DefaultMultipartUsecase {
             key: &key,
             server_side_encryption,
             ssekms_key_id,
-            ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
+            ssekms_context: extract_ssekms_context_from_headers(&headers)?,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -184,8 +207,8 @@ impl DefaultMultipartUsecase {
         // session DEK is prepared; a session marker tells UploadPart to store
         // the ciphertext verbatim instead of recovering encryption material.
         let ciphertext_passthrough = replication_authorized
-            && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true")
-            && rustfs_utils::http::ssec_transport_to_stored_metadata(&req.headers).is_some();
+            && get_header(&headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true")
+            && rustfs_utils::http::ssec_transport_to_stored_metadata(&headers).is_some();
         if ciphertext_passthrough && let Some(metadata_sys) = self.bucket_metadata_sys() {
             let check_result = map_quota_check_outcome(
                 &bucket,
@@ -204,11 +227,14 @@ impl DefaultMultipartUsecase {
             insert_str(&mut metadata, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, "true".to_string());
         }
 
-        let prepared_material = if ciphertext_passthrough {
+        let prepared_material = if ciphertext_passthrough || origin.unencrypted() {
             None
         } else {
             sse_prepare_encryption(encryption_request).await?
         };
+        if origin.is_managed() && !origin.unencrypted() && prepared_material.is_none() {
+            return Err(s3_error!(InternalError, "requested managed encryption material is unavailable"));
+        }
         let (effective_sse, effective_kms_key_id) = match prepared_material {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
@@ -228,7 +254,7 @@ impl DefaultMultipartUsecase {
         if should_advertise_session_compression(
             is_multipart_disk_compression_enabled(),
             ciphertext_passthrough,
-            is_disk_compressible(&req.headers, &key),
+            is_disk_compressible(&headers, &key),
         ) {
             rustfs_utils::http::insert_str(
                 &mut metadata,
@@ -238,30 +264,37 @@ impl DefaultMultipartUsecase {
         }
 
         let mt2 = metadata.clone();
-        let mut opts: ObjectOptions =
-            put_opts_with_replication_authorization(&bucket, &key, version_id, &req.headers, metadata, replication_authorized)
+        let mut opts: ObjectOptions = if origin.is_managed() {
+            ObjectOptions {
+                user_defined: metadata,
+                ..Default::default()
+            }
+        } else {
+            put_opts_with_replication_authorization(&bucket, &key, version_id, &headers, metadata, replication_authorized)
                 .await
-                .map_err(ApiError::from)?;
-        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+                .map_err(ApiError::from)?
+        };
+        origin.apply_bucket_guard(&req, &bucket, &mut opts)?;
 
-        let dsc =
-            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
-                .await;
-        if dsc.replicate_any() {
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
-            insert_str(
-                &mut opts.user_defined,
-                SUFFIX_REPLICATION_STATUS,
-                dsc.pending_status().unwrap_or_default(),
-            );
+        if !origin.is_managed() {
+            let dsc =
+                must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                    .await;
+            if dsc.replicate_any() {
+                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
+                insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+                insert_str(
+                    &mut opts.user_defined,
+                    SUFFIX_REPLICATION_STATUS,
+                    dsc.pending_status().unwrap_or_default(),
+                );
+            }
         }
-
         if !super::super::object::shared::put_like_write_creates_new_version(&opts)
             && super::super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state)
         {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-                get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+                get_opts(&bucket, &key, opts.version_id.clone(), None, &headers)
                     .await
                     .map_err(ApiError::from)?,
             );
@@ -277,7 +310,7 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
+        let checksum_type = rustfs_rio::ChecksumType::from_header(&headers);
         if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
             return Err(s3_error!(InvalidArgument, "Invalid checksum type"));
         } else if checksum_type.is_set() && !checksum_type.is(rustfs_rio::ChecksumType::TRAILING) {

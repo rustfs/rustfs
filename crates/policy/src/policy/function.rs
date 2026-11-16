@@ -57,7 +57,19 @@ pub enum Quantifier {
 /// Code that assembles the condition map uses this to refuse request-supplied values
 /// for identity and connection keys. See [`KeyName::is_server_derived`].
 pub fn is_server_derived_condition_key(name: &str) -> bool {
-    KeyName::server_derived_key_names().any(|reserved| reserved.eq_ignore_ascii_case(name))
+    let namespace = name.split('/').next().unwrap_or(name);
+    [
+        "RequestTag",
+        "ResourceTag",
+        "VectorBucketTag",
+        "TagKeys",
+        "RequestedRegion",
+        "kmsKeyArn",
+        "sseType",
+    ]
+    .iter()
+    .any(|reserved| reserved.eq_ignore_ascii_case(namespace))
+        || KeyName::server_derived_key_names().any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 #[derive(Clone, Default, Debug)]
@@ -68,6 +80,14 @@ pub struct Functions {
 }
 
 impl Functions {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &key::Key> {
+        self.for_any_value
+            .iter()
+            .chain(self.for_all_values.iter())
+            .chain(self.for_normal.iter())
+            .flat_map(Condition::keys)
+    }
+
     pub async fn evaluate(&self, values: &HashMap<String, Vec<String>>) -> bool {
         self.evaluate_with_resolver(values, None).await
     }

@@ -151,14 +151,14 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 # engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "2a6b8d1f7663db978d8784ab3ea331cade19237b", version = "0.40.0", default-features = false }
-rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "2a6b8d1f7663db978d8784ab3ea331cade19237b", version = "0.2.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.42.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.2.0", default-features = false }
 # The gateway framework itself, consumed for its extension traits by the ring-2
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
-rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "2a6b8d1f7663db978d8784ab3ea331cade19237b", version = "0.63.0", default-features = false }
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.67.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
-rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "2a6b8d1f7663db978d8784ab3ea331cade19237b", default-features = false }
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -306,6 +306,12 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 hostname = "0.4.2"
 ipnetwork = { version = "0.21.1" }
+lance = { version = "=14.0.2", default-features = false }
+lance-arrow = { version = "=14.0.2", default-features = false }
+lance-core = { version = "=14.0.2", default-features = false }
+lance-file = { version = "=14.0.2", default-features = false }
+lance-io = { version = "=14.0.2", default-features = false }
+lance-table = { version = "=14.0.2", default-features = false }
 lazy_static = "1.5.1"
 libc = "0.2.191"
 cuobject = "0.1.0"
@@ -323,6 +329,7 @@ netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.13.0"
 object = { version = "=0.41.0", default-features = false }
+object_store_lance = { package = "object_store", version = "=0.14.2", default-features = false }
 parking_lot = "0.13.0"
 same-file = "1.0.6"
 path-absolutize = "4.0.1"

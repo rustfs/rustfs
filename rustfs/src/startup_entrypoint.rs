@@ -2113,6 +2113,8 @@ async fn run_server(
 
     let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
 
+    #[cfg(all(test, unix))]
+    let catalog_worker_context = server_ctx.clone();
     let service_runtime = init_startup_runtime_services(
         &config,
         endpoint_pools,
@@ -2123,6 +2125,9 @@ async fn run_server(
         server_ctx,
     )
     .await?;
+
+    #[cfg(all(test, unix))]
+    let _catalog_worker = catalog_worker::start_if_configured(store.clone(), catalog_worker_context, ctx.clone()).await?;
 
     run_startup_runtime_lifecycle(
         StartupRuntimeLifecycle {
@@ -2142,9 +2147,201 @@ async fn run_server(
     .await
 }
 
+#[cfg(all(test, unix))]
+mod catalog_worker;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_worker_native_lifecycle() -> Result<()> {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Child, Command, Stdio};
+
+        const WORKER_TEST: &str = "startup_entrypoint::tests::catalog_worker_native_lifecycle";
+        const WORKER_ENV: [&str; 3] = [
+            "RUSTFS_CATALOG_WORKER_SOCKET",
+            "RUSTFS_CATALOG_WORKER_NODE_ID",
+            "RUSTFS_CATALOG_WORKER_NONCE",
+        ];
+        let configured = WORKER_ENV.iter().filter(|key| std::env::var_os(key).is_some()).count();
+        if configured != 0 {
+            if configured != WORKER_ENV.len() {
+                return Err(Error::other("catalog worker requires all three private control settings"));
+            }
+            return run_on_startup_thread(|| {
+                let (runtime, _dial9_guard) = crate::server::build_tokio_runtime().map_err(Error::other)?;
+                runtime.block_on(async {
+                    let compatibility = bootstrap_external_prefix_compat()?;
+                    let CommandResult::Server(config) = Opt::parse_command(vec!["rustfs".to_owned()]).map_err(Error::other)?
+                    else {
+                        return Err(Error::other("catalog worker requires a server configuration"));
+                    };
+                    init_startup_server_preflight(&config, &compatibility)
+                        .await
+                        .map_err(Error::other)?;
+                    run(
+                        *config,
+                        #[cfg(feature = "internode-transport")]
+                        None,
+                    )
+                    .await
+                })
+            });
+        }
+
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        fn call(socket: &std::path::Path, nonce: &str, action: serde_json::Value) -> Result<serde_json::Value> {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let mut stream = UnixStream::connect(socket)?;
+            stream.set_read_timeout(Some(Duration::from_secs(90)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            serde_json::to_writer(
+                &mut stream,
+                &serde_json::json!({"version": 1, "nonce": nonce, "request_id": request_id, "action": action}),
+            )
+            .map_err(Error::other)?;
+            stream.write_all(b"\n")?;
+            let mut response = String::new();
+            std::io::BufReader::new(std::io::Read::take(stream, 16 * 1024 * 1024 + 1)).read_line(&mut response)?;
+            if response.len() > 16 * 1024 * 1024 || !response.ends_with('\n') {
+                return Err(Error::other("catalog worker response exceeded its bound or lacked a terminator"));
+            }
+            let response: serde_json::Value = serde_json::from_str(&response).map_err(Error::other)?;
+            assert_eq!(response["version"], 1);
+            assert_eq!(response["request_id"], request_id);
+            assert_eq!(response["node_id"], "self-test");
+            assert_eq!(response["status"], "ok", "worker response: {response}");
+            Ok(response)
+        }
+
+        let directory = tempfile::Builder::new().prefix("cw-").tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket = directory.path().join("node.sock");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let address = {
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+            reservation.local_addr()?.to_string()
+        };
+        let volumes = (0..4)
+            .map(|index| {
+                let path = directory.path().join(format!("drive{index}"));
+                std::fs::create_dir(&path)?;
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let log_path = directory.path().join("node.log");
+        let log = std::fs::File::create(&log_path)?;
+        let mut command = Command::new(std::env::current_exe()?);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RUSTFS_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(["--exact", WORKER_TEST, "--nocapture", "--test-threads=1"])
+            .env(WORKER_ENV[0], &socket)
+            .env(WORKER_ENV[1], "self-test")
+            .env(WORKER_ENV[2], &nonce)
+            .env("RUSTFS_VOLUMES", volumes.join(" "))
+            .env("RUSTFS_ADDRESS", &address)
+            .env("RUSTFS_ACCESS_KEY", format!("test{}", uuid::Uuid::new_v4().simple()))
+            .env("RUSTFS_SECRET_KEY", uuid::Uuid::new_v4().to_string())
+            .env("RUSTFS_CONSOLE_ENABLE", "false")
+            .env("RUSTFS_KMS_ENABLE", "false")
+            .env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true")
+            .env("RUSTFS_TABLE_CATALOG_BACKING", "object")
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1")
+            .env("HTTP_PROXY", "")
+            .env("HTTPS_PROXY", "")
+            .env("http_proxy", "")
+            .env("https_proxy", "")
+            .env("ALL_PROXY", "")
+            .env("all_proxy", "")
+            .current_dir(directory.path())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log));
+        let mut child = OwnedChild(command.spawn()?);
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while !socket.exists() {
+            if let Some(status) = child.0.try_wait()? {
+                return Err(Error::other(format!(
+                    "catalog worker exited before readiness: {status}; {}",
+                    std::fs::read_to_string(&log_path)?
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::other(format!(
+                    "catalog worker readiness timed out; {}",
+                    std::fs::read_to_string(&log_path)?
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let ping = call(&socket, &nonce, serde_json::json!({"op": "ping"}))?;
+        assert_eq!(ping["pid"], child.0.id());
+        assert_eq!(ping["result"]["store_context_matches"], true);
+        uuid::Uuid::parse_str(
+            ping["boot_id"]
+                .as_str()
+                .ok_or_else(|| Error::other("missing worker boot ID"))?,
+        )
+        .map_err(Error::other)?;
+        let created = call(
+            &socket,
+            &nonce,
+            serde_json::json!({"op":"create", "public_name":"native-catalog-test", "index_name":"index.v1", "dimension":3}),
+        )?;
+        let session = created["result"]["session_id"].clone();
+        let prepared = call(
+            &socket,
+            &nonce,
+            serde_json::json!({"op":"prepare", "session_id":session, "commit_id":uuid::Uuid::new_v4().to_string(), "idempotency_key":"native-successor"}),
+        )?;
+        let initial = call(&socket, &nonce, serde_json::json!({"op":"read", "session_id":session}))?;
+        assert_eq!(initial["result"]["manifest_version"], 1, "an unpublished candidate must remain invisible");
+        call(
+            &socket,
+            &nonce,
+            serde_json::json!({"op":"commit", "prepared_token":prepared["result"]["prepared_token"]}),
+        )?;
+        let current = call(&socket, &nonce, serde_json::json!({"op":"read", "session_id":session}))?;
+        assert_eq!(current["result"]["manifest_version"], 2);
+        assert_eq!(current["result"]["manifest"]["sha256"], prepared["result"]["candidate"]["sha256"]);
+        assert!(
+            current["result"]["manifest"]["sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+        );
+        let signal = Command::new("kill").args(["-TERM", &child.0.id().to_string()]).status()?;
+        assert!(signal.success(), "signal the owned worker process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(status) = child.0.try_wait()? {
+                assert!(status.success(), "worker shutdown: {status}; {}", std::fs::read_to_string(&log_path)?);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::other("catalog worker did not complete shutdown"));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    }
 
     #[test]
     fn fatal_stderr_message_uses_consistent_prefix_and_context() {

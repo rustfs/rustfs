@@ -2801,6 +2801,7 @@ impl BucketMetadataSys {
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
         self.revoke_pending_bucket_creation(&bm.name).await;
         bm.bucket_creation_committed = true;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store_committed(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
@@ -2828,6 +2829,7 @@ impl BucketMetadataSys {
         // transaction, and namespace write) and physical creation already
         // returned, so this generation is committed.
         bm.bucket_creation_committed = true;
+        bm.bucket_creation_commit_record_present = true;
         bm.save_with_store_committed(self.object_store()).await?;
         self.set(bm.name.clone(), Arc::new(bm)).await;
         Ok(())
@@ -3287,6 +3289,11 @@ impl BucketMetadataSys {
             return Ok(BucketMetadataAuthority::Fabricated);
         }
         if metadata.needs_bucket_creation_commit() {
+            // Managed identities are published only by their original creation commit.
+            // Physical directories do not prove that the managed configuration was committed.
+            if metadata.bucket_kind()? == crate::storage_api_contracts::bucket::BucketKind::Vector {
+                return Err(Error::PreconditionFailed);
+            }
             metadata.bucket_creation_committed = true;
             metadata.save_with_store_committed(self.object_store()).await?;
         }
@@ -3518,7 +3525,10 @@ impl BucketMetadataSys {
         }
 
         let (metadata, persisted) = metadata_res?;
-        if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
+        if persisted
+            && (metadata.lock_enabled || metadata.bucket_kind()? == crate::storage_api_contracts::bucket::BucketKind::Vector)
+            && !metadata.bucket_creation_committed
+        {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {

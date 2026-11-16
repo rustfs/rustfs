@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
+use crate::table_catalog::*;
 use datafusion::arrow::array::{
     Array, BinaryArray, BinaryViewArray, FixedSizeListArray, LargeBinaryArray, LargeListArray, LargeListViewArray,
     LargeStringArray, ListArray, ListViewArray, MapArray, StringArray, StringViewArray, StructArray, downcast_dictionary_array,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::parquet::arrow::{
-    add_encoded_arrow_schema_to_metadata, arrow_reader::ArrowReaderOptions, arrow_writer::ArrowWriterOptions,
+    ArrowWriter, add_encoded_arrow_schema_to_metadata,
+    arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    arrow_writer::ArrowWriterOptions,
 };
 use datafusion::parquet::file::metadata::ColumnChunkMetaData;
 use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -465,6 +467,254 @@ struct WorkerBarrier {
 }
 #[cfg(test)]
 tokio::task_local! { static COMPACTION_WORKER_BARRIER: Arc<WorkerBarrier>; }
+
+impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
+    pub(crate) async fn commit_table_compaction(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
+        let publication = crate::table_catalog::store::TableCommitLockPublication::new(&self.backend, &self.paths);
+        self.commit_table_compaction_with_publication(&self.backend, &publication, table_bucket, namespace, table, config)
+            .await
+    }
+    pub(crate) async fn commit_table_compaction_with_publication<P>(
+        &self,
+        object_backend: &P,
+        publication: &(dyn TableCommitPublication + Sync),
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableCompactionPlanningConfig,
+    ) -> TableCatalogStoreResult<TableCompactionPlanningReport>
+    where
+        P: TableCatalogObjectBackend,
+    {
+        validate_table_compaction_planning_config(&config)?;
+        // Never queue while holding publication locks. Workers share this
+        // permit so dropping the request cannot admit another decoder early.
+        let admission = try_admit_compaction()?;
+
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata) = read_table_metadata_value(object_backend, table_bucket, &entry.metadata_location).await?
+        else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let mut report =
+            table_compaction_planning_report(object_backend, table_bucket, &namespace, &table, &entry, &current_metadata, config)
+                .await?;
+        if report.status != TableCompactionPlanningStatus::RewriteCandidates {
+            return Err(TableCatalogStoreError::Invalid("compaction has no safe rewrite candidates".to_string()));
+        }
+        let current_data_files = compaction_current_data_files(
+            object_backend,
+            table_bucket,
+            &namespace,
+            &table,
+            &entry,
+            &current_metadata,
+            &admission,
+        )
+        .await?;
+        let current_data_files_by_key = current_data_files
+            .iter()
+            .map(|file| (file.object_key.as_str(), file))
+            .collect::<BTreeMap<_, _>>();
+        let rewritten_inputs = report
+            .rewrite_groups
+            .iter()
+            .flat_map(|group| group.input_file_locations.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let mut manifest_data_files = current_data_files
+            .iter()
+            .filter(|file| !rewritten_inputs.contains(&file.object_key))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let now = OffsetDateTime::now_utc();
+        let snapshot_id = compaction_snapshot_id(&current_metadata, &entry, now);
+        let sequence_number = next_compaction_sequence_number(&current_metadata);
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let warehouse_object_prefix = table_warehouse_object_prefix(&entry)?;
+        let compaction_id = Uuid::new_v4().to_string();
+        // The stored-input ceiling applies to one rewrite group: inputs are
+        // released after each group, so a multi-group job must not fail late
+        // with outputs already written. The planner packs groups under the
+        // same ceiling; a plan from another node or an older release is
+        // rejected here, before any group's output is written.
+        let ceiling = u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).unwrap_or(u64::MAX);
+        if let Some(oversized) = report.rewrite_groups.iter().find(|group| group.input_bytes > ceiling) {
+            return Err(compaction_stored_input_ceiling_error(&oversized.group_id));
+        }
+        let mut compacted_files = Vec::with_capacity(report.rewrite_groups.len());
+        for rewrite_group in &mut report.rewrite_groups {
+            let mut stored_input_bytes = 0_usize;
+            let output_prefix = rewrite_group
+                .input_file_locations
+                .first()
+                .and_then(|input| compaction_data_file_rewrite_prefix(&namespace, &table, Some(&warehouse_object_prefix), input))
+                .ok_or_else(|| TableCatalogStoreError::Invalid("compaction rewrite group has no input files".to_string()))?;
+            let output_file = format!("{output_prefix}/compaction-{compaction_id}-{}.parquet", rewrite_group.group_id);
+            let output_file_path = table_object_s3_location(table_bucket, &output_file);
+            let (partition_spec_id, partition) = compaction_rewrite_group_partition(&current_data_files_by_key, rewrite_group)?;
+            let sort_order_id = compaction_rewrite_group_sort_order(&current_data_files_by_key, rewrite_group)?;
+            let mut input_files = Vec::with_capacity(rewrite_group.input_file_locations.len());
+            for input_file in &rewrite_group.input_file_locations {
+                let remaining = TABLE_COMPACTION_MAX_STORED_BYTES.saturating_sub(stored_input_bytes);
+                let Some(input_object) = object_backend
+                    .read_object_limited(table_bucket, input_file, remaining)
+                    .await?
+                else {
+                    return Err(TableCatalogStoreError::NotFound(format!("compaction input data file {input_file}")));
+                };
+                stored_input_bytes = stored_input_bytes
+                    .checked_add(input_object.data.len())
+                    .filter(|size| *size <= TABLE_COMPACTION_MAX_STORED_BYTES)
+                    .ok_or_else(|| compaction_stored_input_ceiling_error(&rewrite_group.group_id))?;
+                input_files.push((input_file.clone(), input_object.data));
+            }
+            let compacted_file = run_compaction_worker(input_files, Arc::clone(&admission)).await?;
+            let output_bytes = u64::try_from(compacted_file.data.len()).unwrap_or(u64::MAX);
+            // Keep output memory and admission with the actual write owner
+            // even if the request is cancelled during storage I/O.
+            let output_backend = object_backend.clone();
+            let output_bucket = table_bucket.to_owned();
+            let output_key = output_file.clone();
+            let output_admission = Arc::clone(&admission);
+            let record_count = compacted_file.record_count;
+            run_compaction_output(
+                async move {
+                    output_backend
+                        .put_object(&output_bucket, &output_key, compacted_file.data, TableCatalogPutPrecondition::IfAbsent)
+                        .await
+                },
+                output_admission,
+            )
+            .await?;
+            rewrite_group.output_file_location = Some(output_file_path.clone());
+            rewrite_group.output_bytes = Some(output_bytes);
+            compacted_files.push(CompactedDataFile {
+                object_key: output_file,
+                file_path: output_file_path,
+                file_size_bytes: output_bytes,
+                record_count,
+                partition_spec_id,
+                partition,
+                sort_order_id,
+                status: 1,
+                snapshot_id,
+                sequence_number,
+                file_sequence_number: sequence_number,
+            });
+        }
+        manifest_data_files.extend(compacted_files.iter().cloned());
+
+        let new_manifest = format!("{metadata_dir}/manifest-compaction-{compaction_id}.avro");
+        let new_manifest_list = format!("{metadata_dir}/snap-{snapshot_id}-compaction-{compaction_id}.avro");
+        let new_metadata =
+            default_table_metadata_file_path(&namespace, &table, &format!("compaction-{compaction_id}.metadata.json"));
+        let manifest_data = compacted_manifest_avro_bytes(&manifest_data_files)?;
+        let manifest_length = u64::try_from(manifest_data.len()).unwrap_or(u64::MAX);
+        object_backend
+            .put_object(table_bucket, &new_manifest, manifest_data, TableCatalogPutPrecondition::IfAbsent)
+            .await?;
+        let added_files_count = compacted_files.len();
+        let added_rows_count = compacted_files
+            .iter()
+            .fold(0_u64, |rows, file| rows.saturating_add(file.record_count));
+        let existing_files_count = manifest_data_files.len().saturating_sub(added_files_count);
+        let existing_rows_count = manifest_data_files
+            .iter()
+            .filter(|file| file.status == 0)
+            .fold(0_u64, |rows, file| rows.saturating_add(file.record_count));
+        let manifest_list_data = compacted_manifest_list_avro_bytes(CompactionManifestListSummary {
+            manifest_path: &new_manifest,
+            manifest_length,
+            partition_spec_id: compaction_manifest_partition_spec_id(&manifest_data_files)?,
+            snapshot_id,
+            sequence_number,
+            added_files_count,
+            existing_files_count,
+            added_rows_count,
+            existing_rows_count,
+        })?;
+        object_backend
+            .put_object(
+                table_bucket,
+                &new_manifest_list,
+                manifest_list_data,
+                TableCatalogPutPrecondition::IfAbsent,
+            )
+            .await?;
+        let new_metadata_data = compaction_metadata_json(
+            &current_metadata,
+            &entry,
+            snapshot_id,
+            sequence_number,
+            &new_manifest_list,
+            &entry.metadata_location,
+            now,
+        )?;
+        object_backend
+            .put_object(table_bucket, &new_metadata, new_metadata_data, TableCatalogPutPrecondition::IfAbsent)
+            .await?;
+
+        let commit_result = self
+            .commit_table_with_publication(
+                TableCommitRequest {
+                    table_bucket: table_bucket.to_string(),
+                    namespace: namespace.public_name(),
+                    table: table.as_str().to_string(),
+                    commit_id: format!("compaction-{compaction_id}"),
+                    idempotency_key: Some(format!("compaction-{compaction_id}")),
+                    operation: "compaction".to_string(),
+                    expected_version_token: entry.version_token,
+                    expected_metadata_location: entry.metadata_location,
+                    new_metadata_location: new_metadata.clone(),
+                    requirements: Vec::new(),
+                    writer: Some("rustfs-maintenance".to_string()),
+                },
+                publication,
+            )
+            .await?;
+
+        report.status = TableCompactionPlanningStatus::Committed;
+        report.committed_metadata_location = Some(commit_result.table.metadata_location);
+        for snapshot in &mut report.snapshot_reports {
+            if snapshot.status == TableCompactionPlanningStatus::RewriteCandidates {
+                snapshot.status = TableCompactionPlanningStatus::Committed;
+                if !snapshot.reasons.contains(&TableCompactionPlanningReason::CompactionCommitted) {
+                    snapshot.reasons.push(TableCompactionPlanningReason::CompactionCommitted);
+                }
+            }
+        }
+        Ok(report)
+    }
+}
 
 #[cfg(test)]
 mod tests {

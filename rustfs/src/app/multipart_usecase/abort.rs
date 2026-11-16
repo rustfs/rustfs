@@ -24,24 +24,39 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        reject_presigned_multipart_max_total_object_size_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedSigV4Request>().is_some(),
-        )?;
-        reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
-        )?;
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        self.abort_multipart_with_origin(envelope, req.input, MultipartOrigin::Request)
+            .await
+    }
+
+    pub(crate) async fn abort_multipart_with_origin(
+        &self,
+        req: crate::app::RequestEnvelope,
+        input: AbortMultipartUploadInput,
+        origin: MultipartOrigin,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        if !origin.is_managed() {
+            reject_presigned_multipart_max_total_object_size_for_other_operation(
+                req.headers(),
+                req.uri().query(),
+                req.verified_sigv4().is_some(),
+            )?;
+            reject_presigned_put_max_content_length_for_other_operation(
+                req.headers(),
+                req.uri().query(),
+                req.verified_presigned().is_some(),
+            )?;
+        }
         record_s3_op(S3Operation::AbortMultipartUpload);
         let mut opts = ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
+        origin.apply_bucket_guard(&req, &input.bucket, &mut opts)?;
         let AbortMultipartUploadInput {
             bucket, key, upload_id, ..
-        } = req.input;
+        } = input;
 
-        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        if !origin.is_managed() {
+            reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        }
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));

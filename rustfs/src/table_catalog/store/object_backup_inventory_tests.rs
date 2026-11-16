@@ -60,6 +60,8 @@ async fn inventory_fixture() -> InventoryFixture {
     let unretained_history = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
     let view_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
     let entry = TableEntry {
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: BUCKET.to_string(),
         namespace: namespace.public_name(),

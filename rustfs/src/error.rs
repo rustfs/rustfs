@@ -749,10 +749,16 @@ impl From<crate::table_catalog::TableCatalogStoreError> for ApiError {
             // bounded metrics, public message, and retry advice.
             return Self::from(StorageError::Lock(*source));
         }
-        let code = if err.is_unavailable() {
-            S3ErrorCode::ServiceUnavailable
-        } else {
-            S3ErrorCode::InternalError
+        let code = match &err {
+            #[cfg(test)]
+            crate::table_catalog::TableCatalogStoreError::Io { classification, .. } => match classification {
+                crate::table_catalog::CatalogIoErrorKind::Denied => S3ErrorCode::AccessDenied,
+                crate::table_catalog::CatalogIoErrorKind::Conflict => S3ErrorCode::PreconditionFailed,
+                crate::table_catalog::CatalogIoErrorKind::Unavailable => S3ErrorCode::ServiceUnavailable,
+                crate::table_catalog::CatalogIoErrorKind::Internal => S3ErrorCode::InternalError,
+            },
+            _ if err.is_unavailable() => S3ErrorCode::ServiceUnavailable,
+            _ => S3ErrorCode::InternalError,
         };
         Self {
             message: Self::error_code_to_message(&code),
@@ -1158,6 +1164,33 @@ mod tests {
             let error = S3Error::from(ApiError::from(failure));
             let response = error.to_http_response().expect("serialize unattributed failure");
             assert!(!response.headers().contains_key("x-rustfs-error-cause"));
+        }
+    }
+
+    #[test]
+    fn catalog_io_error_preserves_classification_and_source() {
+        use crate::table_catalog::{CatalogIoErrorKind, TableCatalogStoreError};
+        use std::error::Error;
+
+        for (classification, expected) in [
+            (CatalogIoErrorKind::Denied, S3ErrorCode::AccessDenied),
+            (CatalogIoErrorKind::Conflict, S3ErrorCode::PreconditionFailed),
+            (CatalogIoErrorKind::Unavailable, S3ErrorCode::ServiceUnavailable),
+            (CatalogIoErrorKind::Internal, S3ErrorCode::InternalError),
+        ] {
+            let api = ApiError::from(TableCatalogStoreError::Io {
+                classification,
+                context: "read managed catalog candidate",
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private-source-canary")),
+            });
+            assert_eq!(api.code, expected);
+            assert!(!api.message.contains("private-source-canary"));
+            let catalog = api.source().expect("catalog source");
+            let source = catalog.source().expect("original I/O cause");
+            assert_eq!(
+                source.downcast_ref::<std::io::Error>().expect("typed I/O cause").kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
         }
     }
 

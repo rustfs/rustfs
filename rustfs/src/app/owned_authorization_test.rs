@@ -2164,3 +2164,45 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
     }
     assert!(mismatches.is_empty(), "write check mismatches:\n{}", mismatches.join("\n"));
 }
+
+#[tokio::test]
+#[serial]
+async fn vector_bucket_denied_through_both_request_edges() {
+    use rustfs_credentials::Credentials;
+    let _ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+    for is_owner in [false, true] {
+        for action in [
+            S3Action::ListBucketAction,
+            S3Action::ListBucketVersionsAction,
+            S3Action::GetObjectAction,
+            S3Action::GetObjectVersionAction,
+            S3Action::PutObjectAction,
+            S3Action::DeleteObjectAction,
+            S3Action::DeleteObjectVersionAction,
+            S3Action::AbortMultipartUploadAction,
+            S3Action::ListMultipartUploadPartsAction,
+        ] {
+            let mut legacy = build_request((), Method::GET);
+            legacy.extensions.insert(ReqInfo {
+                cred: Some(Credentials {
+                    access_key: "managed-isolation-user".to_owned(),
+                    ..Default::default()
+                }),
+                is_owner,
+                bucket: Some("rustfs-v-reserved-even-without-metadata".to_owned()),
+                object: Some("indexes/private/object".to_owned()),
+                ..Default::default()
+            });
+            let mut owned = RequestEnvelope::from_s3s(&legacy);
+            let action = Action::S3Action(action);
+            let error = crate::app::storage_api::owned_parity::authorize_request(&mut legacy, action)
+                .await
+                .expect_err("ordinary legacy access must reject managed storage");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let error = crate::app::authorize_owned_request(&mut owned, action, None)
+                .await
+                .expect_err("ordinary owned access must reject managed storage");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+        }
+    }
+}

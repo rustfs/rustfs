@@ -19,6 +19,8 @@ use super::request_body::UploadChunks;
 use super::*;
 use crate::app::RequestEnvelope;
 #[cfg(test)]
+use crate::app::storage_api::object_usecase::contract::http::HTTPPreconditions;
+#[cfg(test)]
 use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
 use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
@@ -954,6 +956,13 @@ pub(super) enum PutObjectContentMd5 {
 
 /// Where a single-object write originates.
 pub(super) enum PutObjectOrigin<'a> {
+    #[cfg(test)]
+    Managed {
+        context: &'a super::managed::ManagedObjectContext,
+        principal: SseKmsPrincipal,
+        lifecycle_guard: Option<Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>>,
+        completion: Option<OperationHelper>,
+    },
     /// The S3 PutObject/PostObject handler: request-bound identity, the
     /// audit/notification chain and the bucket-generation guard installed by
     /// the access layer all come from the request.
@@ -970,7 +979,7 @@ pub(super) enum PutObjectOrigin<'a> {
         emit_events: bool,
         preserve_delete_marker: bool,
         expected_bucket_incarnation_id: Option<Uuid>,
-        table_publication_guard: Option<table_catalog::TableCatalogLockGuard>,
+        table_publication_guard: Option<Box<table_catalog::TableCatalogLockGuard>>,
     },
 }
 
@@ -979,12 +988,26 @@ impl PutObjectOrigin<'_> {
         match self {
             Self::S3 { req, .. } => replication_request_authorized(*req),
             Self::Internal { .. } => false,
+            #[cfg(test)]
+            Self::Managed { .. } => false,
         }
     }
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
             Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
+            #[cfg(test)]
+            Self::Managed {
+                context,
+                lifecycle_guard,
+                ..
+            } => {
+                opts.expected_bucket_incarnation_id = Some(context.access.bucket().incarnation().as_uuid());
+                if let Some(guard) = lifecycle_guard {
+                    guard.attach_to_object_options(opts);
+                }
+                Ok(())
+            }
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1006,12 +1029,14 @@ impl PutObjectOrigin<'_> {
         }
     }
 
-    fn take_table_publication_guard(&mut self) -> Option<table_catalog::TableCatalogLockGuard> {
+    fn take_table_publication_guard(&mut self) -> Option<Box<table_catalog::TableCatalogLockGuard>> {
         match self {
             Self::Internal {
                 table_publication_guard, ..
             } => table_publication_guard.take(),
             Self::S3 { .. } => None,
+            #[cfg(test)]
+            Self::Managed { .. } => None,
         }
     }
 
@@ -1019,6 +1044,16 @@ impl PutObjectOrigin<'_> {
         match self {
             Self::S3 { req, .. } => retained_table_data_plane_publication_guards(*req),
             Self::Internal { .. } => None,
+            #[cfg(test)]
+            Self::Managed { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn take_managed_lifecycle_guard(&mut self) -> Option<Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>> {
+        match self {
+            Self::Managed { lifecycle_guard, .. } => lifecycle_guard.take(),
+            _ => None,
         }
     }
 
@@ -1026,6 +1061,8 @@ impl PutObjectOrigin<'_> {
         match self {
             Self::S3 { req, .. } => SseKmsPrincipal::from_request(*req),
             Self::Internal { .. } => None,
+            #[cfg(test)]
+            Self::Managed { principal, .. } => Some(principal.clone()),
         }
     }
 }
@@ -1539,6 +1576,8 @@ impl DefaultObjectUsecase {
                 (super::request_body::demand_native_upload(body, control.clone()), Some(control))
             }
             PutObjectOrigin::Internal { .. } => (body, None),
+            #[cfg(test)]
+            PutObjectOrigin::Managed { .. } => (body, None),
         };
 
         reject_veeam_sosapi_mutation(|| self.object_store(), bucket.as_str(), key.as_str()).await?;
@@ -1613,12 +1652,18 @@ impl DefaultObjectUsecase {
         };
 
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let bucket_sse_config = load_bucket_default_sse_config(&bucket).await;
-        #[cfg(test)]
-        let bucket_sse_config = injected_put_storage_failure(PutStorageTestStage::DefaultSse)
-            .map_or(bucket_sse_config, |err| Err(ApiError::from(err).into()));
+        let bucket_sse_config = match &origin {
+            #[cfg(test)]
+            PutObjectOrigin::Managed { .. } => None,
+            PutObjectOrigin::S3 { .. } | PutObjectOrigin::Internal { .. } => {
+                let config = load_bucket_default_sse_config(&bucket).await;
+                #[cfg(test)]
+                let config = injected_put_storage_failure(PutStorageTestStage::DefaultSse)
+                    .map_or(config, |err| Err(ApiError::from(err).into()));
+                config?
+            }
+        };
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
-        let bucket_sse_config = bucket_sse_config?;
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -1696,7 +1741,14 @@ impl DefaultObjectUsecase {
             || object_lock.retain_until_date.is_some()
             || has_replication_retention_update(headers, inbound_replication_put);
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        let object_lock_config_state = match &origin {
+            #[cfg(test)]
+            // Managed admission verified persisted configuration under its retained lifecycle guard.
+            PutObjectOrigin::Managed { .. } => metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            PutObjectOrigin::S3 { .. } | PutObjectOrigin::Internal { .. } => {
+                load_bucket_object_lock_config_state(&bucket).await?
+            }
+        };
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
         apply_put_request_metadata_native(&mut metadata, headers, &key, content)?;
         apply_bucket_default_lock_retention(
@@ -1708,16 +1760,27 @@ impl DefaultObjectUsecase {
         metadata.extend(internal_metadata);
 
         let put_opts_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let mut opts: ObjectOptions = put_opts_with_replication_authorization(
-            &bucket,
-            &key,
-            version_id.clone(),
-            headers,
-            metadata.clone(),
-            origin.replication_request_authorized(),
-        )
-        .await
-        .map_err(ApiError::from)?;
+        let mut opts: ObjectOptions = match &origin {
+            #[cfg(test)]
+            PutObjectOrigin::Managed { .. } => ObjectOptions {
+                user_defined: metadata.clone(),
+                http_preconditions: Some(HTTPPreconditions {
+                    if_none_match: Some("*".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            PutObjectOrigin::S3 { .. } | PutObjectOrigin::Internal { .. } => put_opts_with_replication_authorization(
+                &bucket,
+                &key,
+                version_id.clone(),
+                headers,
+                metadata.clone(),
+                origin.replication_request_authorized(),
+            )
+            .await
+            .map_err(ApiError::from)?,
+        };
         // Keep the request awaiting the rename fan-out that owns its namespace guard.
         opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
         if let Some(etag) = preserve_etag {
@@ -1728,6 +1791,10 @@ impl DefaultObjectUsecase {
         } = &origin
         {
             opts.preserve_delete_marker = *preserve_delete_marker;
+        }
+        #[cfg(test)]
+        if matches!(origin, PutObjectOrigin::Managed { .. }) {
+            opts.preserve_delete_marker = true;
         }
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut opts, quota_check)?;
@@ -1997,7 +2064,16 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_path(put_path);
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
-        let (mut completion, request_context) = match &origin {
+        let (mut completion, request_context) = match &mut origin {
+            #[cfg(test)]
+            PutObjectOrigin::Managed { context, completion, .. } => (
+                PutObjectCompletion::S3(
+                    completion
+                        .take()
+                        .ok_or_else(|| s3_error!(InternalError, "managed completion owner is missing"))?,
+                ),
+                context.request.request_context().cloned(),
+            ),
             PutObjectOrigin::S3 { req, event_name } => (
                 PutObjectCompletion::S3(OperationHelper::from_view(&req.audit_view(), *event_name, S3Operation::PutObject)),
                 req.request_context().cloned(),
@@ -2044,14 +2120,24 @@ impl DefaultObjectUsecase {
         // explicit guard is required because prepare_sse_configuration inside
         // it falls back to the bucket default encryption config and would
         // double-encrypt the already-encrypted body.
-        let encryption_material = if opts.preserve_ciphertext {
-            None
-        } else {
-            match sse_encryption(encryption_request).await {
+        let encryption_material = match &origin {
+            #[cfg(test)]
+            PutObjectOrigin::Managed { context, .. } if context.encryption() == &ManagedEncryption::Unencrypted => None,
+            _ if opts.preserve_ciphertext => None,
+            _ => match sse_encryption(encryption_request).await {
                 Ok(material) => material,
                 Err(err) => return Err(fail_put_object(completion, err.into())),
-            }
+            },
         };
+        #[cfg(test)]
+        if matches!(&origin, PutObjectOrigin::Managed { context, .. } if context.encryption() != &ManagedEncryption::Unencrypted)
+            && encryption_material.is_none()
+        {
+            return Err(fail_put_object(
+                completion,
+                rustfs_s3_types::s3_error!(InternalError, "requested managed encryption material is unavailable"),
+            ));
+        }
 
         if let Some(material) = encryption_material {
             effective_sse = Some(material.server_side_encryption.clone());
@@ -2170,10 +2256,14 @@ impl DefaultObjectUsecase {
             let put_path = put_path.to_string();
             let put_admission = put_admission;
             let table_publication_guard = origin.take_table_publication_guard();
+            #[cfg(test)]
+            let managed_lifecycle_guard = origin.take_managed_lifecycle_guard();
             let table_data_plane_publication_guards = origin.table_data_plane_publication_guards();
             // Keep the large commit future off the request stack when propagating task-local context.
             Box::pin(async move {
                 let _table_publication_guard = table_publication_guard;
+                #[cfg(test)]
+                let _managed_lifecycle_guard = managed_lifecycle_guard;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let _put_admission = put_admission;
                 let object_traffic_progress = object_traffic_health

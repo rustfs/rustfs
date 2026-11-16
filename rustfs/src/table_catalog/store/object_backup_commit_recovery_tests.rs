@@ -51,6 +51,8 @@ fn object(path: String, data: Vec<u8>) -> ObjectCatalogBackupObject {
 
 fn current_commit(entry: &TableEntry) -> CommitLogEntry {
     CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "current-commit".to_string(),
         idempotency_key: Some("current-request".to_string()),

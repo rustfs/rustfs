@@ -219,6 +219,12 @@ mod head;
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
+#[cfg(test)]
+mod managed;
+#[cfg(test)]
+pub(crate) use managed::tests::{managed_request_fixture, managed_request_fixture_with_encryption};
+#[cfg(test)]
+pub(crate) use managed::{ManagedEncryption, ManagedObjectContext, ManagedObjectError};
 mod native_body;
 mod on_demand_migration_put;
 mod put;

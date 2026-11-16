@@ -25,6 +25,7 @@ pub enum KeyName {
     Sts(StsKeyName),
     Svc(SvcKeyName),
     S3(S3KeyName),
+    S3Vectors(S3VectorsKeyName),
 }
 
 impl TryFrom<&str> for KeyName {
@@ -32,6 +33,8 @@ impl TryFrom<&str> for KeyName {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Ok(if value.starts_with("s3:") {
             Self::S3(S3KeyName::try_from(value).map_err(|_| InvalidKeyName(value.into()))?)
+        } else if value.starts_with("s3vectors:") {
+            Self::S3Vectors(S3VectorsKeyName::try_from(value).map_err(|_| InvalidKeyName(value.into()))?)
         } else if value.starts_with("aws:") {
             Self::Aws(AwsKeyName::try_from(value).map_err(|_| InvalidKeyName(value.into()))?)
         } else if value.starts_with("ldap:") {
@@ -107,6 +110,7 @@ impl KeyName {
             KeyName::Sts(_) => "sts:".len(),
             KeyName::Svc(_) => "svc:".len(),
             KeyName::S3(_) => "s3:".len(),
+            KeyName::S3Vectors(_) => "s3vectors:".len(),
         }
     }
 
@@ -127,7 +131,9 @@ impl KeyName {
     /// `s3:LocationConstraint`, ...) are computed by the server.
     pub fn is_server_derived(&self) -> bool {
         match self {
-            KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) => true,
+            KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) | KeyName::S3Vectors(_) => {
+                true
+            }
             KeyName::S3(S3KeyName::S3IfMatch | S3KeyName::S3IfNoneMatch) => false,
             KeyName::S3(_) => !self.name().starts_with("x-amz-"),
         }
@@ -154,8 +160,21 @@ impl From<&KeyName> for &'static str {
             KeyName::Sts(sts) => sts.into(),
             KeyName::Svc(svc) => svc.into(),
             KeyName::S3(s3) => s3.into(),
+            KeyName::S3Vectors(s3vectors) => s3vectors.into(),
         }
     }
+}
+
+/// S3 Vectors conditions populated from validated requests and resource metadata.
+#[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "&str", into = "&str")]
+pub enum S3VectorsKeyName {
+    #[strum(serialize = "s3vectors:VectorBucketTag")]
+    VectorBucketTag,
+    #[strum(serialize = "s3vectors:kmsKeyArn")]
+    KmsKeyArn,
+    #[strum(serialize = "s3vectors:sseType")]
+    SseType,
 }
 
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
@@ -353,6 +372,18 @@ pub enum StsKeyName {
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AwsKeyName {
+    #[strum(serialize = "aws:RequestTag")]
+    AWSRequestTag,
+
+    #[strum(serialize = "aws:ResourceTag")]
+    AWSResourceTag,
+
+    #[strum(serialize = "aws:TagKeys")]
+    AWSTagKeys,
+
+    #[strum(serialize = "aws:RequestedRegion")]
+    AWSRequestedRegion,
+
     #[strum(serialize = "aws:Referer")]
     AWSReferer,
 
