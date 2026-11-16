@@ -23,8 +23,8 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata as _;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization,
-    RestoreRequest, VersioningConfiguration,
+    BucketVersioningStatus, CsvInput, CsvOutput, Delete, ExpressionType, FileHeaderInfo, InputSerialization, ObjectIdentifier,
+    OutputSerialization, RestoreRequest, VersioningConfiguration,
 };
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -45,6 +45,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::DeleteObject,
         has_error_body: true,
         call: delete_object,
+    },
+    MatrixRow {
+        operation: "DeleteObjects",
+        metric: S3Operation::DeleteObjects,
+        has_error_body: true,
+        call: delete_objects,
     },
     MatrixRow {
         operation: "RestoreObject",
@@ -286,6 +292,46 @@ fn the_gateway_stack_admits_and_renews_restore_object() {
 #[test]
 fn the_legacy_stack_admits_and_renews_restore_object() {
     with_stack(LEGACY, restore_admits_once_and_renews_in_place);
+}
+
+fn batch(keys: &[&str]) -> aws_sdk_s3::types::builders::DeleteBuilder {
+    Delete::builder().set_objects(Some(
+        keys.iter()
+            .map(|key| ObjectIdentifier::builder().key(*key).build().expect("object key"))
+            .collect(),
+    ))
+}
+
+fn delete_objects<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        let result = client
+            .delete_objects()
+            .bucket(MATRIX_BUCKET)
+            .delete(batch(&["matrix-absent"]).build().unwrap())
+            .customize()
+            .interceptor(status.clone())
+            .send()
+            .await;
+        let Ok(output) = result else {
+            return outcome(result);
+        };
+        let response = status.take_response().expect("receive DeleteObjects response");
+        assert_eq!(response.status, 200);
+        if let [error] = output.errors() {
+            assert_eq!(error.key(), Some("matrix-absent"));
+            assert!(output.deleted().is_empty());
+            return Err(super::Refusal {
+                code: error.code().map(str::to_owned),
+                status: Some(response.status),
+                request_ids: response.request_ids,
+            });
+        }
+        assert!(output.errors().is_empty(), "unexpected response: {output:?}");
+        assert_eq!(output.deleted().len(), 1);
+        assert_eq!(output.deleted()[0].key(), Some("matrix-absent"));
+        Ok(())
+    })
 }
 
 const DELETE_BUCKET: &str = "e2-delete-object";
@@ -691,4 +737,133 @@ fn gateway_select_preserves_the_event_sequence_and_denies_unauthorized_reads() {
 #[test]
 fn legacy_select_preserves_the_event_sequence_and_denies_unauthorized_reads() {
     with_stack(LEGACY, select_parity);
+}
+
+async fn delete_objects_checks_each_key_and_preserves_quiet_errors(server: RustFSServer) {
+    const BUCKET: &str = "e2-delete-batch-scoped";
+    const USER: &str = "e2deletebatchscoped";
+    create_bucket_in_the_store(BUCKET).await;
+    create_user_without_a_policy(USER).await;
+    let policy = rustfs_policy::policy::Policy::parse_config(format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{BUCKET}/allowed*"}}]}}"#
+    ).as_bytes()).expect("parse batch policy");
+    let iam = get_global_app_context().expect("embedded server context").iam().handle();
+    iam.set_policy(USER, policy).await.expect("store batch policy");
+    iam.policy_db_set(USER, rustfs_iam::store::UserType::Reg, false, USER)
+        .await
+        .expect("attach batch policy");
+
+    let client = s3_client(&server.endpoint(), USER, USER_SECRET_KEY);
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    for quiet in [false, true] {
+        put_in_the_store(BUCKET, "allowed").await;
+        put_in_the_store(BUCKET, "allowed-etag").await;
+        put_in_the_store(BUCKET, "denied").await;
+        let head = root
+            .head_object()
+            .bucket(BUCKET)
+            .key("allowed-etag")
+            .send()
+            .await
+            .expect("read fixture ETag");
+        let objects = [
+            ObjectIdentifier::builder().key("denied").build().unwrap(),
+            ObjectIdentifier::builder().key("allowed").e_tag("*").build().unwrap(),
+            ObjectIdentifier::builder().key("allowed-absent").build().unwrap(),
+            ObjectIdentifier::builder().key("allowed-absent").build().unwrap(),
+            ObjectIdentifier::builder()
+                .key("allowed-etag")
+                .e_tag(head.e_tag().expect("stored ETag"))
+                .build()
+                .unwrap(),
+        ];
+        let output = client
+            .delete_objects()
+            .bucket(BUCKET)
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects.into()))
+                    .quiet(quiet)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .expect("mixed DeleteObjects returns per-key outcomes");
+        assert!(is_in_the_store(BUCKET, "denied").await, "key-level denial must preserve the object");
+        assert!(
+            is_in_the_store(BUCKET, "allowed-etag").await,
+            "concrete ETag without GetObject must preserve the object"
+        );
+        assert!(
+            !is_in_the_store(BUCKET, "allowed").await,
+            "the wildcard needs DeleteObject but not GetObject"
+        );
+        let deleted: Vec<_> = output.deleted().iter().map(|object| object.key().unwrap()).collect();
+        assert_eq!(
+            deleted,
+            if quiet {
+                vec![]
+            } else {
+                vec!["allowed", "allowed-absent", "allowed-absent"]
+            }
+        );
+        let errors: Vec<_> = output
+            .errors()
+            .iter()
+            .map(|error| (error.key().unwrap(), error.code().unwrap()))
+            .collect();
+        assert_eq!(errors, [("denied", "AccessDenied"), ("allowed-etag", "AccessDenied")]);
+    }
+}
+
+#[test]
+fn the_gateway_stack_deletes_only_authorized_batch_entries() {
+    with_stack(GATEWAY, delete_objects_checks_each_key_and_preserves_quiet_errors);
+}
+
+#[test]
+fn the_legacy_stack_deletes_only_authorized_batch_entries() {
+    with_stack(LEGACY, delete_objects_checks_each_key_and_preserves_quiet_errors);
+}
+
+#[test]
+fn the_gateway_stack_echoes_rejected_entries_without_executing_them() {
+    with_stack(GATEWAY, |server| async move {
+        const BUCKET: &str = "e2-delete-batch-refusals";
+        create_bucket_in_the_store(BUCKET).await;
+        for key in ["kept", "conditional", "deleted"] {
+            put_in_the_store(BUCKET, key).await;
+        }
+        let oversized_key = format!("{}kept", "/".repeat(1025));
+        let objects = [
+            ObjectIdentifier::builder().key("").build().unwrap(),
+            ObjectIdentifier::builder().key(&oversized_key).build().unwrap(),
+            ObjectIdentifier::builder().key("conditional").e_tag("\"\"").build().unwrap(),
+            ObjectIdentifier::builder().key("deleted").build().unwrap(),
+        ];
+        let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+        let output = root
+            .delete_objects()
+            .bucket(BUCKET)
+            .delete(Delete::builder().set_objects(Some(objects.into())).build().unwrap())
+            .send()
+            .await
+            .expect("the independent entry still succeeds");
+
+        assert_eq!(output.deleted().len(), 1);
+        assert_eq!(output.deleted()[0].key(), Some("deleted"));
+        let errors: Vec<_> = output.errors().iter().map(|error| (error.key(), error.code())).collect();
+        assert_eq!(
+            errors,
+            [
+                (Some(""), Some("InvalidArgument")),
+                (Some(oversized_key.as_str()), Some("InvalidArgument")),
+                (Some("conditional"), Some("InvalidArgument")),
+            ],
+        );
+        assert!(is_in_the_store(BUCKET, "kept").await);
+        assert!(is_in_the_store(BUCKET, "conditional").await);
+        assert!(!is_in_the_store(BUCKET, "deleted").await);
+    });
 }

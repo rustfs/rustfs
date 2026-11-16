@@ -437,7 +437,8 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                 Err(refusal) => refusal,
             };
             let context = format!("{} as the {caller} caller: {refusal:?}", row.operation);
-            assert_eq!(refusal.status, Some(403), "{context}");
+            let per_key = row.metric == S3Operation::DeleteObjects && !by_authentication;
+            assert_eq!(refusal.status, Some(if per_key { 200 } else { 403 }), "{context}");
             if row.has_error_body {
                 assert_eq!(refusal.code.as_deref(), Some(*code), "{context}");
             }
@@ -448,7 +449,17 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
             );
             let counted = counted_since(&before);
             assert_eq!(counted.values().sum::<u64>(), 1, "counted once: {context} {counted:?}");
-            assert!(counted.keys().all(|(_, _, outcome)| *outcome == "4xx"), "{context} {counted:?}");
+            let expected_outcome = if per_key { "2xx" } else { "4xx" };
+            assert!(
+                counted.keys().all(|(_, _, outcome)| *outcome == expected_outcome),
+                "{context} {counted:?}"
+            );
+            if per_key {
+                assert!(
+                    counted.keys().all(|(_, label, _)| *label == row.metric.as_str()),
+                    "under the batch operation: {context} {counted:?}"
+                );
+            }
             if *by_authentication {
                 assert!(
                     counted.keys().all(|(_, label, _)| *label == "unknown"),
