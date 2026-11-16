@@ -10596,11 +10596,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         continue;
                     }
                     Ok(recovery)
-                        if (recovery.pending > 0
-                            && !(recovery.no_transactions_at_quorum
-                                && dobj.version_id.is_none()
-                                && !versioned
-                                && !version_suspended))
+                        if (recovery.pending > 0 && !recovery.no_transactions_at_quorum)
                             || (recovery.blocked > 0 && (dobj.version_id.is_some() || versioned || version_suspended)) =>
                     {
                         del_errs[i] = Some(if recovery.pending > 0 {
@@ -11791,11 +11787,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     },
                 )
                 .await?;
-            if (recovery.pending > 0
-                && !(recovery.no_transactions_at_quorum
-                    && opts.version_id.is_none()
-                    && !opts.versioned
-                    && !opts.version_suspended))
+            if (recovery.pending > 0 && !recovery.no_transactions_at_quorum)
                 || (recovery.blocked > 0 && (opts.version_id.is_some() || opts.versioned || opts.version_suspended))
             {
                 return Err(if recovery.pending > 0 {
@@ -29347,6 +29339,291 @@ mod delete_objects_stage_summary_tests {
         assert_eq!(
             summary.disk_error_counts,
             std::collections::BTreeMap::from([(DiskError::ErasureWriteQuorum.to_u32(), 2)])
+        );
+    }
+}
+
+#[cfg(test)]
+mod degraded_missing_delete_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use super::*;
+
+    fn delete_options() -> ObjectOptions {
+        ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_unversioned_single_and_batch() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-delete";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        disks[0].force_offline_for_test();
+        for object in ["absent", "never/created/deep/key"] {
+            for _ in 0..2 {
+                let error = set
+                    .delete_object(bucket, object, delete_options())
+                    .await
+                    .expect_err("set-layer missing key retains its typed absence result");
+                assert!(is_err_object_not_found(&error), "expected idempotent absence: {error:?}");
+            }
+        }
+        let (deleted, errors) = set
+            .delete_objects(
+                bucket,
+                ["absent", "never/created/deep/key", "absent"]
+                    .into_iter()
+                    .map(|name| ObjectToDelete {
+                        object_name: name.to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                delete_options(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "missing batch keys must succeed: {errors:?}");
+        assert_eq!(deleted.len(), 3);
+        assert!(deleted.iter().all(|result| !result.found && !result.delete_marker));
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_versioned_creates_markers_at_quorum() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-markers";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        disks[0].force_offline_for_test();
+        for object in ["absent", "never/created/deep/key"] {
+            let mut previous_version = None;
+            for _ in 0..2 {
+                let result = set
+                    .delete_object(
+                        bucket,
+                        object,
+                        ObjectOptions {
+                            versioned: true,
+                            ..delete_options()
+                        },
+                    )
+                    .await
+                    .expect("degraded versioned delete should commit its marker");
+                assert!(result.delete_marker);
+                let version = result.version_id.expect("versioned marker has an identity");
+                assert_ne!(Some(version), previous_version, "repeated delete creates a fresh marker");
+                previous_version = Some(version);
+                for disk in disks.iter().skip(1) {
+                    let marker = disk
+                        .read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                        .await
+                        .expect("marker must exist on both quorum members");
+                    assert!(marker.deleted);
+                    assert_eq!(marker.version_id, Some(version));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_suspended_and_explicit_version() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-suspended";
+        let object = "never/created/deep/key";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        disks[0].force_offline_for_test();
+        for _ in 0..2 {
+            let marker = set
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        version_suspended: true,
+                        ..delete_options()
+                    },
+                )
+                .await
+                .expect("suspended delete commits its null marker at quorum");
+            assert!(marker.delete_marker);
+            assert_eq!(marker.version_id, Some(Uuid::nil()));
+            for disk in disks.iter().skip(1) {
+                let persisted = disk
+                    .read_version("", bucket, object, "", &crate::disk::ReadOptions::default())
+                    .await
+                    .expect("null marker must exist on both online members");
+                assert!(persisted.deleted);
+                assert!(persisted.version_id.is_none());
+            }
+        }
+        let error = set
+            .delete_object(
+                bucket,
+                "missing-explicit-version",
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::new_v4().to_string()),
+                    ..delete_options()
+                },
+            )
+            .await
+            .expect_err("set layer retains typed explicit-version absence");
+        assert!(is_err_version_not_found(&error), "expected missing version, got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_versioned_batch_commits_markers() {
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration;
+
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-batch-markers";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        disks[0].force_offline_for_test();
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            PersistedVersioningConfiguration {
+                status: Some("Enabled".to_owned()),
+                ..Default::default()
+            },
+            None,
+        ));
+        let names = ["absent", "never/created/deep/key"];
+        let (deleted, errors) = set
+            .delete_objects(
+                bucket,
+                names
+                    .iter()
+                    .map(|name| ObjectToDelete {
+                        object_name: (*name).to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions {
+                    versioned: true,
+                    delete_replication_config_snapshot: Some(snapshot),
+                    ..delete_options()
+                },
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "versioned missing batch must succeed: {errors:?}");
+        assert_eq!(deleted.len(), names.len());
+        for (result, name) in deleted.iter().zip(names) {
+            assert!(result.delete_marker);
+            let version = result.delete_marker_version_id.expect("marker identity must be reported");
+            for disk in disks.iter().skip(1) {
+                let persisted = disk
+                    .read_version("", bucket, name, &version.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .expect("batch marker must be durable on both online members");
+                assert!(persisted.deleted);
+                assert_eq!(persisted.version_id, Some(version));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_preserves_observed_prepared_transaction() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-pending";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        let mut reader = PutObjReader::from_vec(vec![7; 32]);
+        let uploaded = set
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write source before its interrupted delete");
+        let version = uploaded.version_id.expect("source has a version identity");
+        let transaction = Uuid::new_v4();
+        for disk in disks.iter().skip(1) {
+            let source = disk
+                .read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("read source before preparing deletion");
+            let errors = disk
+                .delete_versions_recoverable(
+                    bucket,
+                    vec![FileInfoVersions {
+                        name: object.to_owned(),
+                        versions: vec![source],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "prepare interrupted deletion: {errors:?}");
+        }
+        disks[0].force_offline_for_test();
+        let error = set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..delete_options()
+                },
+            )
+            .await
+            .expect_err("observed undecided transaction must block a fresh marker");
+        assert!(
+            matches!(error, StorageError::InsufficientWriteQuorum(_, _)),
+            "pending transaction retains its quorum failure: {error:?}"
+        );
+        for disk in disks.iter().skip(1) {
+            let inspection = disk
+                .inspect_delete_transaction(bucket, object, transaction)
+                .await
+                .expect("prepared recovery evidence remains readable");
+            assert_eq!(inspection.state, crate::disk::DeleteRecoveryState::NewPrepared);
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_missing_delete_rejects_loss_of_write_quorum() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(3).await;
+        let bucket = "degraded-missing-no-quorum";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture bucket");
+        }
+        disks[0].force_offline_for_test();
+        disks[1].force_offline_for_test();
+        let error = set
+            .delete_object(
+                bucket,
+                "absent",
+                ObjectOptions {
+                    versioned: true,
+                    ..delete_options()
+                },
+            )
+            .await
+            .expect_err("one online member cannot commit a marker");
+        assert!(!is_err_object_not_found(&error), "insufficient quorum must remain a failure");
+        assert!(
+            disks[2]
+                .read_version("", bucket, "absent", "", &crate::disk::ReadOptions::default())
+                .await
+                .is_err(),
+            "failed delete must leave no readable marker"
         );
     }
 }

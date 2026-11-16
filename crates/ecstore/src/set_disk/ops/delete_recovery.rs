@@ -1400,6 +1400,7 @@ fn unavailable(error: &DiskError) -> bool {
     match error {
         DiskError::DiskNotFound
         | DiskError::FaultyDisk
+        | DiskError::FaultyRemoteDisk
         | DiskError::DiskOngoingReq
         | DiskError::Timeout
         | DiskError::RemoteClientUnavailable(_) => true,
@@ -1426,6 +1427,32 @@ fn unavailable(error: &DiskError) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+
+    #[test]
+    fn recovery_availability_classifies_local_and_remote_disk_failures() {
+        for error in [
+            DiskError::DiskNotFound,
+            DiskError::FaultyDisk,
+            DiskError::FaultyRemoteDisk,
+            DiskError::Timeout,
+            DiskError::DiskOngoingReq,
+        ] {
+            assert!(unavailable(&error), "drive availability failure must defer recovery: {error:?}");
+        }
+        for error in [
+            DiskError::FileCorrupt,
+            DiskError::DiskAccessDenied,
+            DiskError::FileAccessDenied,
+            DiskError::InvalidPath,
+            DiskError::DeleteRecoveryWorkLimit,
+            DiskError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+        ] {
+            assert!(
+                !unavailable(&error),
+                "integrity, access and unclassified IO errors must propagate: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn unresolved_heal_error_distinguishes_legacy_ambiguity_from_transient_blocks() {
