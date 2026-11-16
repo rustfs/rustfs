@@ -41,8 +41,9 @@ use std::sync::Arc;
 /// # Errors
 ///
 /// What the legacy access check answers: the credential refusals of the key lookup,
-/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
-/// `InternalError` when IAM or the license cannot be read or the request cannot be read back.
+/// `MethodNotAllowed` for ACL deletion, `InvalidRequest` for a misplaced capability query,
+/// `AccessDenied` for a refused license, and `InternalError` when IAM or the license cannot
+/// be read or the request cannot be read back.
 pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &RequestContextView) -> S3Result<RequestEnvelope> {
     let signature = verified_signature(context);
     let mut envelope = RequestEnvelope::from_gateway(context, server_ctx, signature)?;
@@ -63,7 +64,13 @@ pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &Request
         resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
     };
     envelope.install_req_info(req_info);
-    admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
+    admit_operation(
+        envelope.method(),
+        envelope.headers(),
+        envelope.uri().query(),
+        context.operation(),
+        signature,
+    )?;
     Ok(envelope)
 }
 

@@ -87,6 +87,8 @@ mod permission_probe_test;
 #[cfg(test)]
 #[path = "access_readers_test.rs"]
 mod readers_test;
+#[path = "access_request_validation.rs"]
+mod request_validation;
 
 fn iam_authorization_error(err: IamError) -> ApiError {
     match err {
@@ -1776,20 +1778,22 @@ pub(crate) async fn resolve_req_info(
     })
 }
 
-/// The operation-aware admission every S3 request passes after its caller is resolved and before
-/// its own authorization: a signed upload-size capability is refused on any operation but the one
-/// it is scoped to, and the license must be valid.
+/// The admission every S3 request passes after its caller is resolved and before operation
+/// authorization: reject ACL deletion, restrict signed upload-size capabilities to their
+/// intended operations, and validate the license.
 ///
 /// # Errors
 ///
-/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
-/// `InternalError` when the license cannot be checked.
+/// `MethodNotAllowed` for ACL deletion, `InvalidRequest` for a misplaced capability query,
+/// `AccessDenied` for a refused license, and `InternalError` when the license cannot be checked.
 pub(crate) fn admit_operation(
+    method: &http::Method,
     headers: &HeaderMap,
     raw_query: Option<&str>,
     operation: &str,
     signature: VerifiedSignature,
 ) -> S3Result<()> {
+    request_validation::validate_method_subresource(method, raw_query)?;
     // The size capability is intentionally scoped to the single-object
     // PutObject operation. Validate this at the operation-aware access
     // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
@@ -1822,6 +1826,21 @@ mod access_phase_tests {
     use super::{
         AccessMarkers, AuthType, MultipartStagingOperation, VerifiedPresignedRequest, VerifiedSigV4Request, VerifiedSignature,
     };
+
+    #[test]
+    fn admission_rejects_delete_acl_before_operation_authorization() {
+        for operation in ["DeleteObject", "DeleteBucket", "DeleteObjectTagging", "AbortMultipartUpload"] {
+            let error = super::admit_operation(
+                &http::Method::DELETE,
+                &http::HeaderMap::new(),
+                Some("%61cl&versionId=version-1"),
+                operation,
+                VerifiedSignature::default(),
+            )
+            .expect_err("ACL DELETE must be refused by the shared admission phase");
+            assert_eq!(error.code(), &s3s::S3ErrorCode::MethodNotAllowed);
+        }
+    }
 
     #[test]
     fn only_a_sigv4_header_or_query_signature_is_marked_verified() {
@@ -3376,7 +3395,7 @@ impl S3Access for FS {
         ext.insert(req_info);
         markers.install(ext);
 
-        admit_operation(cx.headers(), cx.uri().query(), cx.s3_op().name(), signature)
+        admit_operation(cx.method(), cx.headers(), cx.uri().query(), cx.s3_op().name(), signature)
     }
 
     /// Checks whether the CreateBucket request has accesses to the resources.
