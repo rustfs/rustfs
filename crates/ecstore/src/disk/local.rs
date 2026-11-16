@@ -22,6 +22,7 @@ use self::commit::lock_rename_commit_directories;
 
 mod commit;
 pub(super) mod delete_recovery;
+mod delete_reserve;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
@@ -8661,6 +8662,15 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
+        // A persisted reserve can also make a full disk writable after restart.
+        let reserve_root = io_root.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            let _ = delete_reserve::release_if_low(&reserve_root);
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?;
         Self::check_startup_writable(&publication_root, &root).await?;
         multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
         multipart_source_state::invalidate_active_multipart_sources_under(&root);
@@ -8676,6 +8686,16 @@ impl LocalDisk {
             .inspect_err(|err| {
                 log_startup_disk_error("ensure_data_usage_layout", &root, err);
             })?;
+
+        let reserve_root = io_root.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            // Reservation is best effort: a legacy full disk must remain readable.
+            let _ = delete_reserve::initialize(&reserve_root);
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?;
 
         let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
         let startup_cleanup_notify = Arc::new(Notify::new());

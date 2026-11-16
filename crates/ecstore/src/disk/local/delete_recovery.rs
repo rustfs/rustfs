@@ -1872,7 +1872,9 @@ impl LocalDisk {
         let record_destination = destination.clone();
         let staging_root = temporary;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
-        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
+        let reserve_root = self.io_root().to_path_buf();
+        let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync || cfg!(unix), move || {
+            let _ = super::delete_reserve::release_if_low(&reserve_root);
             std::fs::create_dir_all(&staging_root)?;
             let staged = Arc::new(
                 tempfile::Builder::new()
@@ -2812,11 +2814,13 @@ impl LocalDisk {
         let object_str = object.to_owned();
 
         let recovery_scope = recovery_operation_scope();
+        let reserve_root = self.io_root().to_path_buf();
         type FusedStage1Outcome = Option<(Option<Uuid>, PathBuf, PreparedDeleteReceiptEntry)>;
         let res = os::run_blocking_namespace_operation_with_sync(
             lease,
-            sync,
+            sync || cfg!(unix),
             move || -> std::io::Result<Result<FusedStage1Outcome>> {
+                let _ = super::delete_reserve::release_if_low(&reserve_root);
                 #[cfg(unix)]
                 let file_path_dir = match open_dir_fd(&file_path) {
                     Ok(dir) => Some(Arc::new(dir)),
@@ -3517,7 +3521,8 @@ impl LocalDisk {
                 .collect()
         };
 
-        let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
+        let reserve_root = self.io_root().to_path_buf();
+        let res = os::run_blocking_namespace_operation_with_sync(lease, sync || cfg!(unix), move || -> std::io::Result<()> {
             let persist_receipt = |finished: bool| -> std::io::Result<()> {
                 let receipt_bytes = match &cached_journal_raw {
                     Some(raw) => format_commit_receipt_bytes(raw, finished),
@@ -3716,6 +3721,7 @@ impl LocalDisk {
                     }
                 }
             }
+            let _ = super::delete_reserve::replenish(&reserve_root);
             Ok(())
         })
         .await;
@@ -8506,6 +8512,15 @@ mod tests {
             .await
             .expect("write xl.meta");
 
+        #[cfg(unix)]
+        let reserve_path = disk.io_root().join(".rustfs.sys/delete-reserve");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("initialized reserve").len(),
+            super::super::delete_reserve::RESERVE_BYTES
+        );
+        #[cfg(unix)]
+        let low_space = super::super::delete_reserve::force_low_space(disk.io_root()).expect("force low space for this disk");
         let transaction = Uuid::new_v4();
         let opts = DeleteOptions {
             recoverable_delete: true,
@@ -8516,6 +8531,14 @@ mod tests {
             .await
             .expect("fused unversioned physical delete must succeed");
         assert_eq!(fused, Some(()));
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("released reserve").len(),
+            0,
+            "preparation must release emergency space"
+        );
+        #[cfg(unix)]
+        drop(low_space);
 
         let (journal, sole_transaction, target_satisfied) = disk
             .try_publish_prepared_delete_local("recovery", "object", transaction, None)
@@ -8534,6 +8557,11 @@ mod tests {
             .await
             .expect("local finalize must succeed");
         assert!(finalized);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("replenished reserve").len(),
+            super::super::delete_reserve::RESERVE_BYTES
+        );
         assert!(!rollback.exists(), "rollback directory must be pruned");
         assert!(!root.join(data_dir.to_string()).exists(), "physical data_dir must be removed");
         assert!(!root.exists(), "empty object directory must be pruned");
