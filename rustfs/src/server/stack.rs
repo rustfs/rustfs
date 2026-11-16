@@ -18,16 +18,16 @@
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
 //! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, the legacy service receives only what the legacy router claims (the RustFS extension
-//! routes and the control plane), so no S3 request reaches the legacy S3 implementation.
+//! selected, console static requests and the two signed server-info aliases use their native
+//! services; the legacy service receives the remaining claimed extension and control-plane routes.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
-//! Upstream: `server/http.rs`. Downstream: the legacy S3 service and the gateway stack.
+//! Upstream: `server/http.rs`. Downstream: the native console, legacy S3 service and gateway stack.
 //!
-//! This file names neither stack's types: it is generic over two services with one response
+//! This file names no stack's types: it is generic over the services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
-use crate::admin::router::claims_route;
+use crate::admin::router::{claims_native_admin_route, claims_native_console_route, claims_route};
 use crate::config::S3Stack;
 use http::Request;
 use std::future::Future;
@@ -38,12 +38,30 @@ use tower::Service;
 /// The S3 service of one server: the legacy stack, or the gateway stack with the legacy router
 /// kept for the routes that are not S3 operations.
 #[derive(Clone)]
-pub(crate) struct S3StackService<L, G> {
+pub(crate) struct S3StackService<L, G, C = G> {
     legacy: L,
     gateway: Option<G>,
+    native_console: Option<C>,
+    native_admin: Option<G>,
 }
 
-impl<L, G> S3StackService<L, G> {
+impl<L, G, C> S3StackService<L, G, C> {
+    /// Attaches the console service used only by the gateway selection.
+    pub(crate) fn with_native_console<N>(self, native_console: Option<N>) -> S3StackService<L, G, N> {
+        S3StackService {
+            legacy: self.legacy,
+            gateway: self.gateway,
+            native_console,
+            native_admin: self.native_admin,
+        }
+    }
+
+    /// Attaches the signed admin service used only by the gateway selection.
+    pub(crate) fn with_native_admin(mut self, native_admin: Option<G>) -> Self {
+        self.native_admin = native_admin;
+        self
+    }
+
     /// The stack this service was built with, as the startup line names it: read from the service
     /// that answers, never from the configuration that asked for it.
     pub(crate) fn assembled(&self) -> &'static str {
@@ -71,15 +89,22 @@ pub(crate) fn select_stack<L, G, E>(
         S3Stack::Legacy => None,
         S3Stack::Gateway => Some(assemble_gateway()?),
     };
-    Ok(S3StackService { legacy, gateway })
+    Ok(S3StackService {
+        legacy,
+        gateway,
+        native_console: None,
+        native_admin: None,
+    })
 }
 
-impl<L, G, B, R, E> Service<Request<B>> for S3StackService<L, G>
+impl<L, G, C, B, R, E> Service<Request<B>> for S3StackService<L, G, C>
 where
     L: Service<Request<B>, Response = http::Response<R>, Error = E>,
     G: Service<Request<B>, Response = http::Response<R>, Error = E>,
+    C: Service<Request<B>, Response = http::Response<R>, Error = E>,
     L::Future: Send + 'static,
     G::Future: Send + 'static,
+    C::Future: Send + 'static,
 {
     type Response = http::Response<R>;
     type Error = E;
@@ -88,16 +113,33 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(gateway) = &mut self.gateway {
             ready!(gateway.poll_ready(cx))?;
+            if let Some(admin) = &mut self.native_admin {
+                ready!(admin.poll_ready(cx))?;
+            }
+            if let Some(console) = &mut self.native_console {
+                ready!(console.poll_ready(cx))?;
+            }
         }
         self.legacy.poll_ready(cx)
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        match &mut self.gateway {
-            // REMOVED BY T2.11: the gateway serves these routes itself once they are migrated.
-            Some(gateway) if !claims_route(request.method(), request.uri(), request.headers()) => Box::pin(gateway.call(request)),
-            _ => Box::pin(self.legacy.call(request)),
+        if let Some(gateway) = &mut self.gateway {
+            if let Some(console) = &mut self.native_console
+                && claims_native_console_route(request.method(), request.uri())
+            {
+                return Box::pin(console.call(request));
+            }
+            if let Some(admin) = &mut self.native_admin
+                && claims_native_admin_route(request.method(), request.uri())
+            {
+                return Box::pin(admin.call(request));
+            }
+            if !claims_route(request.method(), request.uri(), request.headers()) {
+                return Box::pin(gateway.call(request));
+            }
         }
+        Box::pin(self.legacy.call(request))
     }
 }
 
@@ -248,5 +290,47 @@ mod tests {
 
         assert_eq!(answered_by(&mut service, sts).await, "legacy");
         assert_eq!(answered_by(&mut service, request(Method::POST, "/")).await, "gateway");
+    }
+    #[tokio::test]
+    async fn native_admin_selection_is_exact_and_host_independent() {
+        let mut service = gateway_stack().with_native_admin(Some(Named("admin")));
+        for host in ["localhost", "bucket.s3.example.test"] {
+            for target in ["/rustfs/admin/v3/info", "/minio/admin/v3/info?detail=1"] {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(target)
+                    .header("host", host)
+                    .body(())
+                    .unwrap();
+                assert_eq!(answered_by(&mut service, req).await, "admin", "{host} {target}");
+            }
+        }
+        for (method, target) in [
+            (Method::GET, "/rustfs/admin/v3/info/"),
+            (Method::GET, "/rustfs/admin/v3/info-neighbor"),
+            (Method::GET, "/rustfs/admin//v3/info"),
+            (Method::GET, "/%72ustfs/admin/v3/info"),
+            (Method::GET, "/rustfs/admin/v4/info"),
+            (Method::POST, "/rustfs/admin/v3/info"),
+            (Method::GET, "/iceberg/v1/config"),
+            (Method::GET, "/profile/cpu"),
+            (Method::GET, "/bucket?events"),
+            (Method::GET, "/bucket/key"),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=arn"),
+            (Method::GET, "/minio/admin/v3/info?lambdaArn="),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=one&lambdaArn=two"),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=%ZZ"),
+        ] {
+            let expected = if claims_route(&method, &target.parse().unwrap(), &http::HeaderMap::new()) {
+                "legacy"
+            } else {
+                "gateway"
+            };
+            assert_eq!(answered_by(&mut service, request(method, target)).await, expected, "{target}");
+        }
+        let mut legacy = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
+            .unwrap()
+            .with_native_admin(Some(Named("admin")));
+        assert_eq!(answered_by(&mut legacy, request(Method::GET, "/rustfs/admin/v3/info")).await, "legacy");
     }
 }

@@ -16,8 +16,8 @@
 
 use super::BUCKET_ACCELERATE_CONFIG;
 use super::{
-    ApiError, DefaultBucketUsecase, StorageError, bucket_config_mutation_incarnation, metadata_sys, serialize,
-    update_bucket_config_for_incarnation,
+    ApiError, DefaultBucketUsecase, S3Operation, StatusCode, StorageError, bucket_config_mutation_incarnation, metadata_sys,
+    serialize, update_bucket_config_for_incarnation,
 };
 use crate::app::RequestEnvelope;
 use rustfs_gateway_types::persistence::PersistedAccelerateConfiguration;
@@ -42,14 +42,22 @@ impl DefaultBucketUsecase {
         bucket: &str,
         configuration: impl FnOnce() -> S3Result<PersistedAccelerateConfiguration> + Send,
     ) -> S3Result<()> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
-        self.ensure_config_bucket(bucket).await?;
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::PutBucketAccelerateConfiguration,
+            StatusCode::OK,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                self.ensure_config_bucket(bucket).await?;
 
-        let config = configuration()?;
-        let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
-        update_bucket_config_for_incarnation(bucket, BUCKET_ACCELERATE_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
-        Ok(())
+                let config = configuration()?;
+                let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
+                update_bucket_config_for_incarnation(bucket, BUCKET_ACCELERATE_CONFIG, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+                Ok(())
+            },
+        )
+        .await
     }
 }

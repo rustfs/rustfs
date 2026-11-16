@@ -89,7 +89,7 @@ fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerCont
 
 /// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
 /// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
-pub(super) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
+pub(in crate::server) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
     match context.principal().map(RequestPrincipal::scheme) {
         Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
             sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),
