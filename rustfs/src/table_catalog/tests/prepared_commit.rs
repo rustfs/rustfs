@@ -268,6 +268,85 @@ async fn catalog_prepared_commit_rejects_stale_head_and_reads_committed_history(
 }
 
 #[tokio::test]
+async fn catalog_vector_scope_rejects_table_rename_recovery() {
+    let fixture = prepared_fixture().await;
+    fixture.backend.reset_call_counts().await;
+    let mut cursor = None;
+    assert_matches!(
+        fixture.store.next_table_bucket_for_rename_recovery(&mut cursor).await,
+        Err(TableCatalogStoreError::Unsupported(_))
+    );
+    assert_matches!(
+        fixture
+            .store
+            .recover_pending_table_rename(fixture.bucket.storage_bucket_id().as_str())
+            .await,
+        Err(TableCatalogStoreError::Unsupported(_))
+    );
+    assert!(cursor.is_none());
+    assert_eq!(fixture.backend.list_call_count().await, 0);
+    assert_eq!(fixture.backend.read_call_count().await, 0);
+}
+
+#[tokio::test]
+async fn catalog_rename_recovery_discovery_preserves_scope_and_bucket_type() {
+    let fixture = prepared_fixture().await;
+    let table_store = ObjectTableCatalogStore::new(fixture.backend.clone());
+    let table_bucket = test_bucket_entry("analytics");
+    table_store.put_table_bucket(table_bucket.clone()).await.unwrap();
+    let mut cursor = None;
+    assert_eq!(
+        table_store.next_table_bucket_for_rename_recovery(&mut cursor).await.unwrap(),
+        Some(table_bucket)
+    );
+    assert!(
+        table_store
+            .next_table_bucket_for_rename_recovery(&mut cursor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(cursor.is_none());
+
+    let bucket_id = fixture.bucket.storage_bucket_id().as_str();
+    let vector_object = fixture.store.paths.table_bucket_entry_path(bucket_id);
+    let vector_bytes = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &vector_object)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &table_store.paths.table_bucket_entry_path(bucket_id),
+            vector_bytes.data.clone(),
+        )
+        .await;
+    let mut invalid = 0;
+    let mut found = 0;
+    for _ in 0..3 {
+        match table_store.next_table_bucket_for_rename_recovery(&mut cursor).await {
+            Ok(Some(entry)) => {
+                assert_eq!(entry.table_bucket, "analytics");
+                found += 1;
+            }
+            Ok(None) => break,
+            Err(TableCatalogStoreError::Invalid(_)) => invalid += 1,
+            Err(error) => panic!("unexpected discovery failure: {error}"),
+        }
+    }
+    assert_eq!(found, 1);
+    assert_eq!(invalid, 1);
+    assert!(cursor.is_none());
+    assert_eq!(
+        fixture.backend.read_object(RUSTFS_META_BUCKET, &vector_object).await.unwrap(),
+        Some(vector_bytes)
+    );
+}
+
+#[tokio::test]
 async fn catalog_vector_scope_rejects_table_backup() {
     let fixture = prepared_fixture().await;
     assert_matches!(

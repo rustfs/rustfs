@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+mod copy_test;
 mod multipart;
 mod owned;
 
@@ -25,9 +27,9 @@ use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqIn
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-use rustfs_gateway_types::compat::s3s_5761ddfe::{
-    self as gateway_s3s_compat, leaf::RequestWire, request_context::GatewayRequestContext,
-};
+use rustfs_gateway_types::compat::s3s_5761ddfe as gateway_s3s_compat;
+#[cfg(test)]
+use rustfs_gateway_types::compat::s3s_5761ddfe::{leaf::RequestWire, request_context::GatewayRequestContext};
 use rustfs_gateway_types::dto as gateway_dto;
 #[cfg(test)]
 use rustfs_gateway_types::{BucketName, OpaqueString};
@@ -40,6 +42,8 @@ use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
+#[cfg(test)]
+use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -175,6 +179,7 @@ fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<g
     })
 }
 
+#[cfg(test)]
 fn gateway_request_context(method: Method, uri: &http::Uri, headers: HeaderMap) -> GatewayRequestContext {
     GatewayRequestContext {
         method,
@@ -860,15 +865,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
-        let copy_source =
-            legacy_copy_source(input.copy_source.clone()).map_err(|e| conversion_error("CopyObject copy_source", e))?;
-        let context = gateway_request_context(Method::PUT, &uri, HeaderMap::new());
-        let wire = RequestWire::of(&context);
-        let input = gateway_s3s_compat::generated::ops::copy_object::input_to_s3s(input, copy_source, &wire)
-            .map_err(|e| conversion_error("CopyObject input", e))?;
-
-        let req = Self::create_request(
-            input,
+        let input = owned::copy_input(input)?;
+        let envelope = Self::create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -876,13 +874,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-
-        match self.fs.copy_object(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("CopyObject output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
+        self.owned_usecase()
+            .execute_copy_object_owned(envelope, input)
+            .await
+            .map_err(owned::copy_error)
+            .and_then(owned::copy_output)
     }
 
     async fn delete_bucket(
@@ -964,11 +962,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let content_length = input.content_length;
-        let input = gateway_s3s_compat::generated::ops::upload_part::input_to_s3s(input)
-            .map_err(|e| conversion_error("UploadPart input", e))?;
-        let part_number = input.part_number;
-        let upload_id = input.upload_id.clone();
-        let part_number = part_number.to_string();
+        // This scalar projection remains until the compatibility seam retires.
+        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
+        let part_number = input.part_number.to_string();
         let uri = build_object_uri(
             &bucket,
             &key,
@@ -977,14 +973,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 ("uploadId", Some(upload_id.as_str())),
             ],
         )?;
-
-        let mut headers = HeaderMap::default();
-        if let Ok(header_value) = content_length.to_string().parse() {
-            headers.insert("content-length", header_value);
+        let input = multipart::upload_part_input(input, upload_id);
+        let mut headers = HeaderMap::new();
+        if let Ok(value) = content_length.to_string().parse() {
+            headers.insert("content-length", value);
         }
-
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope_with_headers(
             Method::PUT,
             uri,
             RequestParams {
@@ -992,14 +986,22 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-        let req = S3Request { headers, ..req };
-
-        match self.fs.upload_part(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::upload_part::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("UploadPart output", e)),
-            Err(e) => Err(e.into()),
-        }
+            headers,
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::UploadPart);
+        let helper = crate::app::storage_api::context::OperationHelper::audit_only_from_view(
+            &envelope.audit_view(),
+            rustfs_s3_ops::S3Operation::UploadPart,
+        );
+        let result = self
+            .owned_multipart_usecase()
+            .execute_upload_part_owned(envelope, input)
+            .await
+            .map_err(multipart::upload_part_error);
+        let empty_headers = HeaderMap::new();
+        let headers = result.as_ref().map_or(&empty_headers, |output| &output.headers);
+        let _helper = helper.complete_owned(&result, http::StatusCode::OK, headers);
+        result.and_then(multipart::upload_part_output)
     }
 
     async fn complete_multipart_upload(

@@ -481,3 +481,6 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
         }
     }
 }
+
+#[path = "upload_part_test.rs"]
+mod upload_part_tests;
