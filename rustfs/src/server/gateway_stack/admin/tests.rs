@@ -28,8 +28,9 @@ use rustfs_gateway::Answer;
 use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, PathStyleOnly, Req, Resp, decide_with};
 use rustfs_gateway_dialect_rustfs_admin::AdminResponse as WireResponse;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
-    get_v3_info::GetV3Info, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
+    get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
+    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_s3_types::Body;
 use rustfs_trusted_proxies::ClientInfo;
@@ -41,6 +42,9 @@ fn native_admin_registers_only_system_reads_and_both_claims() {
     let dialect = dialect().unwrap();
     let mut expected = [
         GetV3Info::NAME,
+        GetV3Datausageinfo::NAME,
+        GetV4PluginsCatalog::NAME,
+        GetV3ModuleSwitches::NAME,
         GetV3Storageinfo::NAME,
         GetV4RuntimeCapabilities::NAME,
         GetV3ObjectDataCacheStats::NAME,
@@ -120,6 +124,9 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())
+            .register::<GetV3Datausageinfo, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV4PluginsCatalog, _>(Arc::new(Capture(captured.clone())))
+            .register::<GetV3ModuleSwitches, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Info, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV3Storageinfo, _>(Arc::new(Capture(captured.clone())))
             .register::<GetV4RuntimeCapabilities, _>(Arc::new(Capture(captured.clone())))
@@ -128,6 +135,9 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
             .unwrap(),
     };
     let paths = [
+        "/minio/admin/v3/datausageinfo",
+        "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/minio/admin/v3/storageinfo",
         "/minio/admin/v4/runtime/capabilities",
@@ -176,7 +186,13 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
 async fn native_admin_authenticated_request_refuses_an_uninstalled_server_context() {
     let stack = assemble(assembly(), Arc::new(ScriptedIam { ready: false }), root().source()).unwrap();
     for path in [
+        "/rustfs/admin/v3/datausageinfo",
+        "/rustfs/admin/v4/plugins/catalog",
+        "/rustfs/admin/v3/module-switches",
         "/rustfs/admin/v3/info",
+        "/minio/admin/v3/datausageinfo",
+        "/minio/admin/v4/plugins/catalog",
+        "/minio/admin/v3/module-switches",
         "/minio/admin/v3/info",
         "/rustfs/admin/v3/storageinfo",
         "/minio/admin/v3/storageinfo",

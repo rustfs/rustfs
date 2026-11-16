@@ -316,6 +316,12 @@ mod tests {
             for (method, target) in [
                 (Method::GET, "/rustfs/admin/v3/info"),
                 (Method::GET, "/minio/admin/v3/info"),
+                (Method::GET, "/rustfs/admin/v3/datausageinfo"),
+                (Method::GET, "/minio/admin/v3/datausageinfo"),
+                (Method::GET, "/rustfs/admin/v4/plugins/catalog"),
+                (Method::GET, "/minio/admin/v4/plugins/catalog"),
+                (Method::GET, "/rustfs/admin/v3/module-switches"),
+                (Method::GET, "/minio/admin/v3/module-switches"),
                 (Method::POST, "/?Action=AssumeRole&Version=2011-06-15"),
                 (Method::GET, "/bucket?replication-metrics"),
                 (Method::GET, console_path.as_str()),
@@ -365,7 +371,9 @@ mod tests {
                         assert_eq!(response.body(), &"console");
                         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
                         assert_eq!(console_calls.load(Ordering::SeqCst), 1);
-                    } else if stack == S3Stack::Gateway && matches!(target, "/rustfs/admin/v3/info" | "/minio/admin/v3/info") {
+                    } else if stack == S3Stack::Gateway
+                        && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                    {
                         assert_eq!(response.status(), StatusCode::OK);
                         assert_eq!(response.body(), &"admin");
                         assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
@@ -382,7 +390,7 @@ mod tests {
                         usize::from(
                             stack == S3Stack::Gateway
                                 && header.is_none()
-                                && matches!(target, "/rustfs/admin/v3/info" | "/minio/admin/v3/info")
+                                && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
                         )
                     );
                 }
@@ -408,6 +416,12 @@ mod tests {
         let mut service = gateway_stack().with_native_admin(Some(Named("admin")));
         for host in ["localhost", "bucket.s3.example.test"] {
             for target in [
+                "/rustfs/admin/v3/datausageinfo",
+                "/minio/admin/v3/datausageinfo?detail=1",
+                "/rustfs/admin/v4/plugins/catalog",
+                "/minio/admin/v4/plugins/catalog?detail=1",
+                "/rustfs/admin/v3/module-switches",
+                "/minio/admin/v3/module-switches?detail=1",
                 "/rustfs/admin/v3/info",
                 "/minio/admin/v3/info?detail=1",
                 "/rustfs/admin/v3/storageinfo",
@@ -426,10 +440,20 @@ mod tests {
                 assert_eq!(answered_by(&mut service, req).await, "admin", "{host} {target}");
             }
         }
-        for suffix in ["/v3/storageinfo", "/v4/runtime/capabilities", "/v3/object-data-cache/stats"] {
+        for suffix in [
+            "/v3/storageinfo",
+            "/v4/runtime/capabilities",
+            "/v3/object-data-cache/stats",
+            "/v3/datausageinfo",
+            "/v4/plugins/catalog",
+            "/v3/module-switches",
+        ] {
             for prefix in ["/rustfs/admin", "/minio/admin"] {
                 for (method, tail) in [
                     (Method::POST, ""),
+                    (Method::PUT, ""),
+                    (Method::HEAD, ""),
+                    (Method::DELETE, ""),
                     (Method::GET, "/"),
                     (Method::GET, "-neighbor"),
                     (Method::GET, "?lambdaArn=arn"),

@@ -4550,6 +4550,10 @@ mod tests {
                 ("storage-allowed", Some("admin:StorageInfo"), false, true, false),
                 ("storage-denied", Some("admin:StorageInfo"), true, true, false),
                 ("storage-proxy", Some("admin:StorageInfo"), false, true, true),
+                ("usage-allowed", Some("admin:DataUsageInfo"), false, true, false),
+                ("usage-denied", Some("admin:DataUsageInfo"), true, true, false),
+                ("list-allowed", Some("s3:ListBucket"), false, true, false),
+                ("list-denied", Some("s3:ListBucket"), true, true, false),
             ] {
                 iam.create_user(
                     key,
@@ -4567,12 +4571,19 @@ mod tests {
                 .unwrap();
                 if let Some(action) = action {
                     let mut statement = serde_json::json!({"Effect":"Allow","Action":action});
+                    if action.starts_with("s3:") {
+                        statement["Resource"] = serde_json::json!("*");
+                    }
                     if source_ip {
                         statement["Condition"] = serde_json::json!({"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}});
                     }
                     let mut statements = vec![statement];
                     if denied {
-                        statements.push(serde_json::json!({"Effect":"Deny","Action":action}));
+                        statements.push(if action.starts_with("s3:") {
+                            serde_json::json!({"Effect":"Deny","Action":action,"Resource":"*"})
+                        } else {
+                            serde_json::json!({"Effect":"Deny","Action":action})
+                        });
                     }
                     let document = serde_json::json!({"Version":"2012-10-17","Statement":statements});
                     iam.set_policy(key, Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap())
@@ -4601,6 +4612,233 @@ mod tests {
             legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
             let legacy = legacy.build();
             (env, slot, legacy)
+        }
+
+        const CATALOG_READS: [&str; 3] = ["/v3/datausageinfo", "/v4/plugins/catalog", "/v3/module-switches"];
+
+        // Each caller uses a fresh process because ECStore publishes once-only endpoint state.
+        async fn catalog_reads_contract(use_native: bool) {
+            let (_env, slot, legacy) = admin_fixture().await;
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.s3_stack = config::S3Stack::Gateway;
+            config.console_enable = false;
+            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
+            let mut failures = Vec::new();
+            let mut check = |condition: bool, label: String| {
+                if !condition {
+                    failures.push(label);
+                }
+            };
+            for suffix in CATALOG_READS {
+                for prefix in ["/rustfs/admin", "/minio/admin"] {
+                    let path = format!("{prefix}{suffix}");
+                    for host in ["localhost", "bucket.s3.example.test"] {
+                        let root =
+                            answer(legacy.clone(), signed(&path, "detail=a%2Fb", host, ROOT, ROOT_SECRET, Signed::Header)).await;
+                        check(root.0 == StatusCode::OK, format!("root {path} {host}: {} {:?}", root.0, refusal(&root.2)));
+                        let expected: serde_json::Value = serde_json::from_slice(&root.2).unwrap();
+                        eprintln!("catalog-baseline {path} {host}: status={} headers={:?} json={expected}", root.0, root.1);
+                        for key in [
+                            ROOT,
+                            "info-allowed",
+                            "usage-allowed",
+                            "list-allowed",
+                            "info-no-policy",
+                            "info-denied",
+                            "usage-denied",
+                            "list-denied",
+                            "storage-allowed",
+                        ] {
+                            let allowed = key == ROOT
+                                || if suffix == "/v3/datausageinfo" {
+                                    key == "usage-allowed" || key == "list-allowed"
+                                } else {
+                                    key == "info-allowed"
+                                };
+                            let secret = if key == ROOT { ROOT_SECRET } else { USER_SECRET };
+                            let request = || signed(&path, "detail=a%2Fb", host, key, secret, Signed::Header);
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            let label = format!("{key} {path} {host}");
+                            let status = if allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                            check(
+                                old.0 == status && new.0 == status,
+                                format!("{label}: status legacy={} selected={}", old.0, new.0),
+                            );
+                            if allowed && old.0 == status && new.0 == status {
+                                check(
+                                    old.1.get(http::header::CONTENT_TYPE) == new.1.get(http::header::CONTENT_TYPE)
+                                        && new.1[http::header::CONTENT_TYPE] == "application/json",
+                                    format!("{label}: content type"),
+                                );
+                                check(new.1.get("x-request-id").is_some_and(|v| v == REQUEST_ID), format!("{label}: request id"));
+                                let old: serde_json::Value = serde_json::from_slice(&old.2).unwrap();
+                                let new: serde_json::Value = serde_json::from_slice(&new.2).unwrap();
+                                check(
+                                    old == expected && new == expected,
+                                    format!("{label}: complete JSON old={old} new={new} root={expected}"),
+                                );
+                            } else if !allowed {
+                                check(
+                                    refusal(&old.2).0 == "AccessDenied" && refusal(&new.2) == refusal(&old.2),
+                                    format!("{label}: refusal"),
+                                );
+                            }
+                        }
+                        for (label, key, secret, anonymous, form, code) in [
+                            ("disabled", "info-disabled", USER_SECRET, false, Signed::Header, "InvalidAccessKeyId"),
+                            (
+                                "unknown",
+                                "missing-catalog-user",
+                                USER_SECRET,
+                                false,
+                                Signed::Header,
+                                "InvalidAccessKeyId",
+                            ),
+                            (
+                                "bad-signature",
+                                ROOT,
+                                "wrong-catalog-secret",
+                                false,
+                                Signed::Header,
+                                "SignatureDoesNotMatch",
+                            ),
+                            ("anonymous", ROOT, ROOT_SECRET, true, Signed::Header, "AccessDenied"),
+                            ("presigned", ROOT, ROOT_SECRET, false, Signed::Query, "AccessDenied"),
+                        ] {
+                            let request = || {
+                                if anonymous {
+                                    HttpRequest::builder()
+                                        .method(Method::GET)
+                                        .uri(&path)
+                                        .header("host", host)
+                                        .body(Empty::new())
+                                        .unwrap()
+                                } else {
+                                    signed(&path, "", host, key, secret, form)
+                                }
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            eprintln!(
+                                "catalog-compare {label} {path} {host}: legacy={} {:?}, selected={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            let legacy_status = if label == "presigned" {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::FORBIDDEN
+                            };
+                            check(old.0 == legacy_status, format!("{label} {path}: legacy status {}", old.0));
+                            if use_native {
+                                check(
+                                    new.0 == StatusCode::FORBIDDEN && refusal(&new.2).0 == code,
+                                    format!("{label} {path}: native status/code {} {:?}", new.0, refusal(&new.2)),
+                                );
+                                match label {
+                                    "disabled" | "anonymous" => {
+                                        let (old_message, new_message) = if label == "disabled" {
+                                            ("check key failed", "The Access Key Id you provided does not exist in our records.")
+                                        } else {
+                                            ("Signature is required", "the request is not allowed")
+                                        };
+                                        check(
+                                            refusal(&old.2) == (code.to_owned(), old_message.to_owned())
+                                                && refusal(&new.2) == (code.to_owned(), new_message.to_owned()),
+                                            format!("{label} {path} {host}: exact refusal messages"),
+                                        );
+                                    }
+                                    "presigned" => check(
+                                        refusal(&old.2) == (String::new(), String::new())
+                                            && refusal(&new.2)
+                                                == ("AccessDenied".to_owned(), "the request is not allowed".to_owned()),
+                                        format!("{label} {path} {host}: admin signature floor"),
+                                    ),
+                                    _ => check(refusal(&old.2) == refusal(&new.2), format!("{label} {path}: exact refusal")),
+                                }
+                            } else {
+                                check(
+                                    old.0 == new.0 && refusal(&old.2) == refusal(&new.2),
+                                    format!("{label} {path}: baseline repeat"),
+                                );
+                            }
+                        }
+                        for query in ["lambdaArn=arn", "lambdaArn=", "lambdaArn"] {
+                            let request = || signed(&path, query, host, ROOT, ROOT_SECRET, Signed::Header);
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            check(
+                                old.0 != StatusCode::OK && old.0 == new.0 && refusal(&old.2) == refusal(&new.2),
+                                format!("{path}?{query} {host}: lambda precedence"),
+                            );
+                        }
+                        for (method, tail) in [
+                            (Method::PUT, ""),
+                            (Method::POST, ""),
+                            (Method::HEAD, ""),
+                            (Method::GET, "/"),
+                            (Method::GET, "-neighbor"),
+                        ] {
+                            let target = format!("{path}{tail}");
+                            let request = || {
+                                let mut headers = HeaderMap::new();
+                                headers.insert(http::header::HOST, host.parse().unwrap());
+                                signed_request_with_headers(
+                                    Signed::Header,
+                                    method.clone(),
+                                    &target,
+                                    "",
+                                    ROOT,
+                                    ROOT_SECRET,
+                                    headers,
+                                )
+                            };
+                            let old = answer(legacy.clone(), request()).await;
+                            let new = if use_native {
+                                answer(edge.clone(), request()).await
+                            } else {
+                                answer(legacy.clone(), request()).await
+                            };
+                            eprintln!(
+                                "catalog-neighbor {method} {target} {host}: legacy={} {:?}, selected={} {:?}",
+                                old.0,
+                                refusal(&old.2),
+                                new.0,
+                                refusal(&new.2)
+                            );
+                            check(old.0 == new.0 && old.2 == new.2, format!("{method} {target} {host}: adjacent route"));
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_catalog_reads_legacy_baseline() {
+            catalog_reads_contract(false).await;
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn native_admin_catalog_reads_real_signature_iam_and_wire() {
+            catalog_reads_contract(true).await;
         }
 
         const SYSTEM_READS: [(&str, &str); 3] = [

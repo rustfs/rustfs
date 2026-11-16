@@ -17,8 +17,10 @@
 //! downstream: the gateway signature verifier and the real admin handlers.
 
 use super::{GatewayAssembly, GatewayAssemblyError, GatewayStack};
+use crate::admin::handlers::module_switch::GetModuleSwitchesHandler;
 use crate::admin::handlers::object_data_cache::ObjectDataCacheStatsHandler;
-use crate::admin::handlers::system::{RuntimeCapabilitiesHandler, ServerInfoHandler, StorageInfoHandler};
+use crate::admin::handlers::plugins_catalog::GetPluginCatalogHandler;
+use crate::admin::handlers::system::{DataUsageInfoHandler, RuntimeCapabilitiesHandler, ServerInfoHandler, StorageInfoHandler};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as AdminHandler};
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
@@ -29,15 +31,19 @@ use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, Req, RequestCo
 use rustfs_gateway_adapter::{IamKeyLookup, RootSource};
 use rustfs_gateway_core::dialect::{ClaimedRoute, Dialect, DialectBuilder, DialectOverlay, OverlayRow};
 use rustfs_gateway_dialect_rustfs_admin::ops::{
-    get_v3_info::GetV3Info, get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
-    get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
+    get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info, get_v3_module_switches::GetV3ModuleSwitches,
+    get_v3_object_data_cache_stats::GetV3ObjectDataCacheStats, get_v3_storageinfo::GetV3Storageinfo,
+    get_v4_plugins_catalog::GetV4PluginsCatalog, get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
 use rustfs_gateway_dialect_rustfs_admin::{AdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY};
 use rustfs_s3_types::{Body, S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 
-const OPERATIONS: [&str; 4] = [
+const OPERATIONS: [&str; 7] = [
     GetV3Info::NAME,
+    GetV3Datausageinfo::NAME,
+    GetV4PluginsCatalog::NAME,
+    GetV3ModuleSwitches::NAME,
     GetV3Storageinfo::NAME,
     GetV4RuntimeCapabilities::NAME,
     GetV3ObjectDataCacheStats::NAME,
@@ -68,7 +74,10 @@ pub(super) fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     let builder = declare::<GetV3Info>(Dialect::assemble(overlay));
     let builder = declare::<GetV3Storageinfo>(builder);
     let builder = declare::<GetV4RuntimeCapabilities>(builder);
-    declare::<GetV3ObjectDataCacheStats>(builder)
+    let builder = declare::<GetV3ObjectDataCacheStats>(builder);
+    let builder = declare::<GetV3Datausageinfo>(builder);
+    let builder = declare::<GetV4PluginsCatalog>(builder);
+    declare::<GetV3ModuleSwitches>(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
 }
@@ -101,8 +110,20 @@ pub(super) fn assemble(
             handler: &RuntimeCapabilitiesHandler {},
         }))
         .register::<GetV3ObjectDataCacheStats, _>(Arc::new(AdminBridge {
-            server_ctx: assembly.server_ctx,
+            server_ctx: assembly.server_ctx.clone(),
             handler: &ObjectDataCacheStatsHandler {},
+        }))
+        .register::<GetV3Datausageinfo, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &DataUsageInfoHandler {},
+        }))
+        .register::<GetV4PluginsCatalog, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx.clone(),
+            handler: &GetPluginCatalogHandler {},
+        }))
+        .register::<GetV3ModuleSwitches, _>(Arc::new(AdminBridge {
+            server_ctx: assembly.server_ctx,
+            handler: &GetModuleSwitchesHandler {},
         }))
         .build()
         .map_err(GatewayAssemblyError::Service)?;
