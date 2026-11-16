@@ -52,6 +52,8 @@
 #[cfg(not(debug_assertions))]
 compile_error!("gateway-stack is restricted to debug builds");
 
+mod admin;
+
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, register, serves};
@@ -67,8 +69,8 @@ use rustfs_gateway::{
     TransportSecurity, decide_with,
 };
 use rustfs_gateway_adapter::{
-    IamCredentials, IamKeyLookup, RequestIdCarrier, RootCredentials, RootCredentialsError, RootSource, host_request_id,
-    rustfs_host_resolver,
+    IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
+    RootSource, establish_keystone_identity, host_request_id, keystone_header_token_claim, rustfs_host_resolver,
 };
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::manager::get_token_signing_key;
@@ -81,6 +83,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// What the assembly takes from the server it is built for.
+#[derive(Clone)]
 pub(crate) struct GatewayAssembly {
     pub(crate) server_ctx: Arc<ServerContextSlot>,
     /// The configured root credentials, checked once here. Requests read the live ones.
@@ -93,14 +96,38 @@ pub(crate) struct GatewayAssembly {
     /// `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT`: the longest silence between two body reads. Zero
     /// disables the bound, as it does on the legacy stack.
     pub(crate) body_read_timeout: Duration,
-    /// Whether Keystone authentication is enabled in configuration (`RUSTFS_KEYSTONE_ENABLE`).
-    pub(crate) keystone_enabled: bool,
+    /// The same initialized provider installed in the outer Keystone middleware.
+    pub(crate) keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
 }
 
-/// Whether Keystone authentication is switched on in configuration. A Keystone configuration
-/// that cannot be read counts as switched on: only a readable configuration can say it is off.
-pub(crate) fn keystone_enabled_in_configuration() -> bool {
-    rustfs_keystone::KeystoneConfig::from_env().map_or(true, |config| config.enable)
+/// Reads and validates the configuration before enabling the gateway identity bridge.
+pub(crate) fn keystone_provider_in_configuration()
+-> Result<Option<Arc<rustfs_keystone::KeystoneAuthProvider>>, GatewayAssemblyError> {
+    let config = rustfs_keystone::KeystoneConfig::from_env().map_err(GatewayAssemblyError::KeystoneConfig)?;
+    if !config.enable {
+        return Ok(None);
+    }
+    config.validate().map_err(GatewayAssemblyError::KeystoneConfig)?;
+    crate::auth_keystone::get_keystone_auth()
+        .map(Some)
+        .ok_or(GatewayAssemblyError::KeystoneNotInitialized)
+}
+
+/// Sanitized authorization facts paired with the identity established at this gateway edge.
+/// Only consuming the middleware's validation can construct this request payload.
+#[derive(Clone)]
+pub(crate) struct OwnedKeystoneIdentity {
+    credentials: rustfs_credentials::Credentials,
+    had_session_token: bool,
+}
+
+impl OwnedKeystoneIdentity {
+    pub(crate) fn credentials(&self) -> &rustfs_credentials::Credentials {
+        &self.credentials
+    }
+    pub(crate) fn had_session_token(&self) -> bool {
+        self.had_session_token
+    }
 }
 
 /// Why the gateway stack could not be assembled. Startup fails with it; the legacy stack is never
@@ -115,18 +142,23 @@ pub(crate) enum GatewayAssemblyError {
     ServerDomains(rustfs_gateway::LegacyDomainError),
     #[error("the gateway service refused its assembly: {0:?}")]
     Service(AssemblyError),
-    #[error(
-        "RUSTFS_S3_STACK=gateway cannot be served while RUSTFS_KEYSTONE_ENABLE is on: the gateway admits a request that \
-         carries only X-Auth-Token as anonymous while RustFS reads the Keystone identity behind it; Keystone support on the \
-         gateway stack is rustfs/gateway#1586"
-    )]
-    KeystoneEnabled,
+    #[error("the native admin overlay has no server-info operation")]
+    AdminOverlayMissing,
+    #[error("the native admin dialect refused its assembly: {0:?}")]
+    AdminDialect(Vec<rustfs_gateway_core::dialect::DialectError>),
+    #[error("RUSTFS_KEYSTONE_ENABLE configuration is invalid: {0}")]
+    KeystoneConfig(rustfs_keystone::KeystoneError),
+    #[error("RUSTFS_KEYSTONE_ENABLE requires an initialized Keystone provider on RUSTFS_S3_STACK=gateway")]
+    KeystoneNotInitialized,
+    #[error("the Keystone header claim is invalid")]
+    KeystoneClaim,
 }
 
 /// The assembled gateway service.
 #[derive(Clone)]
 pub(crate) struct GatewayStack {
     service: rustfs_gateway::S3Service,
+    keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
 }
 
 impl GatewayStack {
@@ -144,6 +176,15 @@ impl GatewayStack {
         Self::assemble_with(assembly, iam, root, early_gate(OPERATIONS))
     }
 
+    /// Assembles the gateway service for the two signed server-info aliases.
+    pub(crate) fn assemble_admin(assembly: GatewayAssembly) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        admin::assemble(assembly, iam, root)
+    }
+
     fn assemble_with(
         assembly: GatewayAssembly,
         iam: Arc<dyn IamKeyLookup>,
@@ -155,7 +196,10 @@ impl GatewayStack {
         let service = register(OPERATIONS, builder, &backend)
             .build()
             .map_err(GatewayAssemblyError::Service)?;
-        Ok(Self { service })
+        Ok(Self {
+            service,
+            keystone_auth: assembly.keystone_auth,
+        })
     }
 
     fn configured_builder(
@@ -164,13 +208,6 @@ impl GatewayStack {
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<ServiceBuilder, GatewayAssemblyError> {
-        // The pinned gateway admits a request that carries only `X-Auth-Token` as anonymous and
-        // runs no authenticator for it, while the RustFS code behind the gateway reads the
-        // Keystone identity: the request would be authorized as one caller and served as
-        // another. Refused until the gateway authenticates the token (rustfs/gateway#1586).
-        if assembly.keystone_enabled {
-            return Err(GatewayAssemblyError::KeystoneEnabled);
-        }
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
@@ -199,6 +236,14 @@ impl GatewayStack {
             .host_resolver(hosts)
             // The fallback only: `attach_host_facts` hands RustFS's own identifier over.
             .trace_source(MintedTraces::with_uuid_request_ids());
+        let builder = if assembly.keystone_auth.is_some() {
+            builder.host_verified_header_token(
+                keystone_header_token_claim().map_err(|_| GatewayAssemblyError::KeystoneClaim)?,
+                KeystoneVerifier,
+            )
+        } else {
+            builder
+        };
         let (builder, _settings) = builder.config(service_config(assembly.body_read_timeout));
         Ok(builder)
     }
@@ -210,11 +255,38 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        attach_host_facts(request.extensions_mut());
+        let extensions = request.extensions_mut();
+        extensions.remove::<KeystoneEstablished>();
+        extensions.remove::<OwnedKeystoneIdentity>();
+        let validation = extensions.remove::<rustfs_keystone::KeystoneRequestIdentity>();
+        let valid = match (validation, self.keystone_auth.as_ref()) {
+            (Some(validation), Some(provider)) => {
+                validation
+                    .take_for(provider)
+                    .ok()
+                    .is_some_and(|(proof, credentials, had_session_token)| {
+                        if establish_keystone_identity(extensions, proof).is_err() {
+                            return false;
+                        }
+                        extensions.insert(OwnedKeystoneIdentity {
+                            credentials,
+                            had_session_token,
+                        });
+                        true
+                    })
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        attach_host_facts(extensions);
         let mut service = self.service.clone();
-        let answer = tower::Service::call(&mut service, request);
         async move {
-            match answer.await {
+            if !valid {
+                let mut response = Response::new(rustfs_gateway::Body::empty());
+                *response.status_mut() = http::StatusCode::FORBIDDEN;
+                return response;
+            }
+            match tower::Service::call(&mut service, request).await {
                 Ok(response) => response,
                 Err(never) => match never {},
             }

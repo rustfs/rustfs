@@ -25,7 +25,7 @@ use crate::auth::facts::{
 use crate::auth::{
     AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
     RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
-    check_key_valid_with_context, get_condition_values_with_client_info, get_request_auth_type_with_query, get_session_token,
+    check_key_valid_with_context, get_request_auth_type_with_query, get_session_token,
     parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
     reject_unsigned_amz_headers_on_sigv4_request,
 };
@@ -103,6 +103,8 @@ const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 pub(crate) struct ReqInfo {
     pub cred: Option<rustfs_credentials::Credentials>,
     pub is_owner: bool,
+    /// Original session presence of a host-verified Keystone identity; its token bytes were erased.
+    pub keystone_session_present: Option<bool>,
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
@@ -1328,6 +1330,14 @@ fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut target: Au
     })
 }
 
+fn request_principal<'a, R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    cred: &'a rustfs_credentials::Credentials,
+    root: &str,
+) -> AuthzPrincipal<'a> {
+    AuthzPrincipal::with_session_presence(cred, root, req.req_info().and_then(|info| info.keystone_session_present))
+}
+
 /// The root access key a principal is compared against to be the `Account`.
 fn root_access_key() -> String {
     runtime_sources::current_action_credentials()
@@ -1624,7 +1634,26 @@ pub(crate) fn resource_free_condition_values<R: AuthorizationRequest + ?Sized>(
     req: &R,
     cred: &rustfs_credentials::Credentials,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_client_info(req.headers(), cred, None, None, req.remote_addr(), req.client_info())
+    let root = root_access_key();
+    let principal = request_principal(req, cred, &root);
+    let target = AuthzTarget {
+        action: Action::None,
+        bucket: "",
+        object: "",
+        version_id: None,
+        location_constraint: None,
+    };
+    let facts = AuthzFacts::from_request_parts(
+        req.headers(),
+        None,
+        req.remote_addr(),
+        req.client_info(),
+        target,
+        OffsetDateTime::now_utc(),
+    );
+    let mut conditions = build_conditions(&principal, &facts);
+    forward_secret_headers(req.headers(), &mut conditions);
+    conditions
 }
 
 fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
@@ -1937,7 +1966,7 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<R: AuthorizationReque
     let claims = cred.claims.clone().unwrap_or_default();
     let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
     let root_access_key = root_access_key();
-    let principal = AuthzPrincipal::new(cred, &root_access_key);
+    let principal = request_principal(req, cred, &root_access_key);
     let facts = request_authz_facts(
         req,
         AuthzTarget {
@@ -2240,7 +2269,7 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
         .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
     let bucket = info.bucket.as_deref().unwrap_or_default();
     let root = root_access_key();
-    let principal = AuthzPrincipal::new(cred, &root).with_owner(info.is_owner);
+    let principal = request_principal(req, cred, &root).with_owner(info.is_owner);
     let facts = request_authz_facts(
         req,
         AuthzTarget {
@@ -2433,7 +2462,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         let iam_store = request_iam_store(req)?;
 
         let root_access_key = root_access_key();
-        let principal = AuthzPrincipal::new(cred, &root_access_key).with_owner(is_owner);
+        let principal = request_principal(req, cred, &root_access_key).with_owner(is_owner);
         let facts = request_authz_facts(
             req,
             AuthzTarget {
@@ -2737,7 +2766,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
         let root_access_key = root_access_key();
-        let principal = AuthzPrincipal::new(&default_cred, &root_access_key);
+        let principal = request_principal(req, &default_cred, &root_access_key);
         let facts = request_authz_facts(
             req,
             AuthzTarget {

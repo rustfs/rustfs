@@ -14,6 +14,9 @@
 //! The assembled gateway stack, driven through [`GatewayStack::call`] exactly as `server/http.rs`
 //! drives it. Requests that need object storage are in `rustfs/tests/embedded_gateway_stack_test.rs`.
 
+#[path = "admin/tests.rs"]
+mod admin;
+mod keystone;
 mod ssec;
 
 use super::*;
@@ -38,7 +41,7 @@ fn assembly() -> GatewayAssembly {
         region: Some("us-east-1".to_owned()),
         server_domains: Vec::new(),
         body_read_timeout: Duration::from_secs(300),
-        keystone_enabled: false,
+        keystone_auth: None,
     }
 }
 
@@ -211,36 +214,40 @@ async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothi
 }
 
 #[test]
-fn keystone_enabled_fails_the_assembly_and_names_both_settings() {
-    let refused = GatewayStack::assemble(GatewayAssembly {
-        keystone_enabled: true,
-        ..assembly()
-    });
-
-    let error = refused.err().expect("the gateway stack is not served with Keystone enabled");
-    assert!(matches!(error, GatewayAssemblyError::KeystoneEnabled), "{error:?}");
-    let message = error.to_string();
-    for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE", "rustfs/gateway#1586"] {
-        assert!(message.contains(named), "{named} is missing from: {message}");
-    }
+fn keystone_enabled_requires_an_initialized_provider_and_names_both_settings() {
+    temp_env::with_vars(
+        [
+            ("RUSTFS_KEYSTONE_ENABLE", Some("true")),
+            ("RUSTFS_KEYSTONE_AUTH_URL", Some("http://keystone.example.test:5000")),
+        ],
+        || {
+            let error = keystone_provider_in_configuration()
+                .err()
+                .expect("the provider must be initialized before assembly");
+            assert!(matches!(error, GatewayAssemblyError::KeystoneNotInitialized));
+            let message = error.to_string();
+            for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE"] {
+                assert!(message.contains(named), "{named} is missing from: {message}");
+            }
+        },
+    );
 }
 
 #[test]
-fn keystone_is_read_from_configuration_and_an_unreadable_one_counts_as_enabled() {
+fn keystone_is_read_from_configuration_and_an_unreadable_one_is_refused() {
     const ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
     const AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
-
     temp_env::with_vars([(ENABLE, None::<&str>), (AUTH_URL, None)], || {
-        assert!(!keystone_enabled_in_configuration(), "unset is off");
+        assert!(keystone_provider_in_configuration().unwrap().is_none());
     });
     temp_env::with_vars([(ENABLE, Some("false")), (AUTH_URL, None)], || {
-        assert!(!keystone_enabled_in_configuration(), "false is off");
-    });
-    temp_env::with_vars([(ENABLE, Some("true")), (AUTH_URL, Some("http://keystone.example.test:5000"))], || {
-        assert!(keystone_enabled_in_configuration(), "true is on");
+        assert!(keystone_provider_in_configuration().unwrap().is_none());
     });
     temp_env::with_vars([(ENABLE, Some("true")), (AUTH_URL, None)], || {
-        assert!(keystone_enabled_in_configuration(), "on but unreadable is still on");
+        assert!(matches!(
+            keystone_provider_in_configuration(),
+            Err(GatewayAssemblyError::KeystoneConfig(_))
+        ));
     });
 }
 
