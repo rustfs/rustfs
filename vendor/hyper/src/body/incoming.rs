@@ -64,9 +64,7 @@ enum Kind {
 
 #[cfg(all(feature = "http2", feature = "server"))]
 struct ExpectContinue {
-    content_length: DecodedLength,
-    ping: ping::Recorder,
-    recv: h2::RecvStream,
+    body: Incoming,
     tx: oneshot::Sender<()>,
 }
 
@@ -141,21 +139,10 @@ impl Incoming {
 
     #[cfg(all(feature = "http2", feature = "server"))]
     pub(crate) fn with_expect_continue(self, tx: oneshot::Sender<()>) -> Self {
-        // Before the first poll there is no DATA progress state to preserve.
-        match self.kind {
-            Kind::H2 {
-                content_length,
-                data_done: false,
-                ping,
-                recv,
-            } => Incoming::new(Kind::ExpectContinue(Box::new(ExpectContinue {
-                content_length,
-                ping,
-                recv,
-                tx,
-            }))),
-            _ => unreachable!("expect-continue requires an unpolled HTTP/2 body"),
-        }
+        Incoming::new(Kind::ExpectContinue(Box::new(ExpectContinue {
+            body: self,
+            tx,
+        })))
     }
 
     #[cfg(feature = "ffi")]
@@ -263,18 +250,8 @@ impl Body for Incoming {
                     Kind::ExpectContinue(expect) => expect,
                     _ => unreachable!(),
                 };
-                let ExpectContinue {
-                    content_length,
-                    ping,
-                    recv,
-                    tx,
-                } = *expect;
-                self.kind = Kind::H2 {
-                    content_length,
-                    data_done: false,
-                    ping,
-                    recv,
-                };
+                let ExpectContinue { body, tx } = *expect;
+                *self = body;
                 let res = self.as_mut().poll_frame(cx);
                 // Only ask the client to continue if the body hasn't already arrived.
                 if res.is_pending() {
@@ -296,7 +273,7 @@ impl Body for Incoming {
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
             Kind::H2 { recv: h2, .. } => h2.is_end_stream(),
             #[cfg(all(feature = "http2", feature = "server"))]
-            Kind::ExpectContinue(expect) => expect.recv.is_end_stream(),
+            Kind::ExpectContinue(expect) => expect.body.is_end_stream(),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => false,
         }
@@ -322,7 +299,7 @@ impl Body for Incoming {
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
             Kind::H2 { content_length, .. } => opt_len(*content_length),
             #[cfg(all(feature = "http2", feature = "server"))]
-            Kind::ExpectContinue(expect) => opt_len(expect.content_length),
+            Kind::ExpectContinue(expect) => expect.body.size_hint(),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => SizeHint::default(),
         }
