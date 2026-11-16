@@ -616,31 +616,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     async fn head_bucket(
         &self,
         bucket: &str,
-        credentials: &rustfs_credentials::Credentials,
+        _credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::HeadBucketOutput, Self::Error> {
         trace_protocol_request("head_bucket", Some(bucket), None);
-
-        let input = HeadBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build HeadBucketInput: {}", e))
-        })?;
-
-        let uri = build_bucket_uri(bucket, &[])?;
-        let req = Self::create_request(
-            input,
-            Method::HEAD,
-            uri,
-            RequestParams {
-                bucket: Some(bucket.to_string()),
-                object: None,
-                credentials,
-            },
-        )?;
-
-        match self.fs.head_bucket(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::head_bucket::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("HeadBucket output", e)),
-            Err(e) => Err(e.into()),
-        }
+        let _uri = build_bucket_uri(bucket, &[])?;
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadBucket);
+        let input = owned::head_bucket_input(bucket)?;
+        self.owned_bucket_usecase().execute_head_bucket(input).await
     }
 
     async fn list_objects_v2(
@@ -915,33 +897,23 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::DeleteBucketOutput, Self::Error> {
         trace_protocol_request("delete_bucket", Some(bucket), None);
-
         let uri = build_bucket_uri(bucket, &[])?;
-        let gateway_input = gateway_dto::DeleteBucketInput {
+        let input = gateway_dto::DeleteBucketInput {
             bucket: rustfs_gateway_types::BucketName::new(bucket.to_owned())
                 .map_err(|e| conversion_error("DeleteBucket bucket", e))?,
             expected_bucket_owner: None,
         };
-        let context = gateway_request_context(Method::DELETE, &uri, HeaderMap::new());
-        let wire = RequestWire::of(&context);
-        let input = gateway_s3s_compat::generated::ops::delete_bucket::input_to_s3s(gateway_input, &wire)
-            .map_err(|e| conversion_error("DeleteBucket input", e))?;
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
-                bucket: Some(bucket.to_string()),
+                bucket: Some(bucket.to_owned()),
                 object: None,
                 credentials,
             },
-        )?;
-
-        match self.fs.delete_bucket(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::delete_bucket::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("DeleteBucket output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::DeleteBucket);
+        self.owned_bucket_usecase().execute_delete_bucket(envelope, input).await
     }
 
     async fn create_multipart_upload(
@@ -2248,5 +2220,227 @@ mod put_tests {
             )
             .collect();
         assert!(mismatches.is_empty(), "protocol PutObject mismatches: {mismatches:#?}");
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+    use crate::runtime_sources::ServerContextSlot;
+    use crate::storage_api::protocols::client::{
+        BucketOperations, MakeBucketOptions, ObjectIO, StorageObjectOptions, StoragePutObjReader,
+    };
+    use http_body_util::BodyExt;
+    use rustfs_protocols::common::client::s3::StorageBackend;
+    use rustfs_s3_ops::S3Operation;
+
+    fn count(op: S3Operation) -> u64 {
+        rustfs_io_metrics::s3_op_metrics_snapshot()
+            .into_iter()
+            .find(|row| row.op == op.as_str())
+            .map_or(0, |row| row.total)
+    }
+
+    fn outcome<T: std::fmt::Debug>(result: &rustfs_s3_types::S3Result<T>) -> serde_json::Value {
+        match result {
+            Ok(output) => serde_json::json!({"output": format!("{output:?}")}),
+            Err(error) => {
+                serde_json::json!({"code": format!("{:?}",error.code()), "message": error.message(), "status": error.status_code().map(|status|status.as_u16()), "headers": format!("{:?}",error.headers())})
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_bucket_runtime_contract() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-bucket-contract", || async {
+            let root = rustfs_credentials::Credentials {
+                access_key: "protocol-bucket-root".into(),
+                secret_key: "protocol-bucket-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
+            let (_temp, context, _iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let ambient = crate::runtime_sources::publish_test_app_context(context.clone());
+            assert!(std::sync::Arc::ptr_eq(&ambient, &context), "fixture publishes its own context");
+            let store = context.object_store();
+            for bucket in ["protocol-bucket-empty", "protocol-bucket-full"] {
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("seed bucket");
+            }
+            let mut reader = StoragePutObjReader::from_vec(b"retained".to_vec());
+            store
+                .put_object("protocol-bucket-full", "object", &mut reader, &StorageObjectOptions::default())
+                .await
+                .expect("seed object");
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context.clone()));
+            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let mut observations = Vec::new();
+            for bucket in [
+                "protocol-bucket-full",
+                "protocol-bucket-missing",
+                "xn--reserved",
+                "",
+                "bad\0bucket",
+            ] {
+                let before = count(S3Operation::HeadBucket);
+                let result = backend.head_bucket(bucket, &root).await;
+                observations.push(("head", bucket, outcome(&result), count(S3Operation::HeadBucket) - before));
+            }
+            for bucket in [
+                "protocol-bucket-full",
+                "protocol-bucket-missing",
+                "xn--reserved",
+                "",
+                "bad\0bucket",
+                "protocol-bucket-empty",
+            ] {
+                let before = count(S3Operation::DeleteBucket);
+                let result = backend.delete_bucket(bucket, &root).await;
+                observations.push(("delete", bucket, outcome(&result), count(S3Operation::DeleteBucket) - before));
+            }
+
+            let full_present = store
+                .get_bucket_info("protocol-bucket-full", &Default::default())
+                .await
+                .is_ok();
+            let retained = match backend.get_object("protocol-bucket-full", "object", &root, None).await {
+                Ok(output) => match output.body {
+                    Some(body) => body
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|body| body.to_bytes().to_vec())
+                        .map_err(|error| error.to_string()),
+                    None => Err("missing retained body".to_owned()),
+                },
+                Err(error) => Err(format!("{:?}", error.code())),
+            };
+            let empty_present = store
+                .get_bucket_info("protocol-bucket-empty", &Default::default())
+                .await
+                .is_ok();
+            let expected: serde_json::Value = serde_json::from_str(r#"[
+["head","protocol-bucket-full",{"output":"Output { bucket_region: \"\" }"},1],
+["head","protocol-bucket-missing",{"code":"NoSuchBucket","headers":"None","message":"The specified bucket does not exist","status":404},1],
+["head","xn--reserved",{"code":"NoSuchBucket","headers":"None","message":"The specified bucket does not exist","status":404},1],
+["head","",{"output":"Output { bucket_region: \"\" }"},1],
+["head","bad\u0000bucket",{"code":"InternalError","headers":"None","message":"failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write","status":500},1],
+["delete","protocol-bucket-full",{"code":"BucketNotEmpty","headers":"None","message":"The bucket you tried to delete is not empty","status":409},1],
+["delete","protocol-bucket-missing",{"code":"NoSuchBucket","headers":"None","message":"The specified bucket does not exist","status":404},1],
+["delete","xn--reserved",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name uses a reserved form [rule: aws:bucketnamingrules]","status":500},0],
+["delete","",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name is empty [rule: aws:bucketnamingrules]","status":500},0],
+["delete","bad\u0000bucket",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name contains a NUL byte [rule: aws:bucketnamingrules]","status":500},0],
+["delete","protocol-bucket-empty",{"output":"Output"},1]
+]"#).expect("baseline answers");
+            assert_eq!(
+                (
+                    serde_json::to_value(observations).expect("observations"),
+                    full_present,
+                    retained,
+                    empty_present
+                ),
+                (expected, true, Ok::<Vec<u8>, String>(b"retained".to_vec()), false),
+                "protocol bucket answers, counts, and storage match measured main"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_bucket_context_isolation() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-bucket-context", || async {
+            let root = rustfs_credentials::Credentials {
+                access_key: "protocol-context-root".into(),
+                secret_key: "protocol-context-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
+            let (_ambient_temp, ambient, _ambient_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let published = crate::runtime_sources::publish_test_app_context(ambient.clone());
+            assert!(std::sync::Arc::ptr_eq(&published, &ambient));
+            let (_target_temp, target, _target_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let bucket = "protocol-bucket-bound";
+            for context in [&ambient, &target] {
+                context
+                    .object_store()
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("seed bound bucket");
+            }
+            ambient
+                .object_store()
+                .make_bucket("protocol-ambient-only", &MakeBucketOptions::default())
+                .await
+                .expect("seed ambient-only bucket");
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(target.clone()));
+            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            backend.head_bucket(bucket, &root).await.expect("bound bucket exists");
+            assert_eq!(
+                backend
+                    .head_bucket("protocol-ambient-only", &root)
+                    .await
+                    .expect_err("ambient bucket is not in target")
+                    .code(),
+                &rustfs_s3_types::S3ErrorCode::NoSuchBucket
+            );
+            backend.delete_bucket(bucket, &root).await.expect("delete bound bucket");
+            let target_absent = target
+                .object_store()
+                .get_bucket_info(bucket, &Default::default())
+                .await
+                .is_err();
+            let ambient_present = ambient
+                .object_store()
+                .get_bucket_info(bucket, &Default::default())
+                .await
+                .is_ok();
+            assert_eq!((target_absent, ambient_present), (true, true), "only the bound store is changed");
+            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let mut heads = Vec::new();
+            for name in [bucket, ""] {
+                heads.push((name, outcome(&uninstalled.head_bucket(name, &root).await)));
+            }
+            let deleted = outcome(&uninstalled.delete_bucket(bucket, &root).await);
+            let present = ambient
+                .object_store()
+                .get_bucket_info(bucket, &Default::default())
+                .await
+                .is_ok();
+            let actual = serde_json::json!({"heads":heads,"delete":deleted,"present":present});
+            let expected: serde_json::Value = serde_json::from_str(r#"{"heads":[["protocol-bucket-bound",{"output":"Output { bucket_region: \"\" }"}],["",{"output":"Output { bucket_region: \"\" }"}]],"delete":{"output":"Output"},"present":false}"#).expect("measured compatibility context answers");
+            assert_eq!(
+                actual, expected,
+                "uninstalled context preserves measured compatibility answers and store state"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn protocol_bucket_invalid_delete_names_match_legacy() {
+        let backend = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+        let credentials = rustfs_credentials::Credentials::default();
+        let mut observations = Vec::new();
+        for name in ["a", "a/b", "bad_bucket", "127.0.0.1", "bucket-"] {
+            let before = count(S3Operation::DeleteBucket);
+            let current = outcome(&backend.delete_bucket(name, &credentials).await);
+            observations.push((name, current, count(S3Operation::DeleteBucket) - before));
+        }
+        let expected: serde_json::Value = serde_json::from_str(r#"[
+["a",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name is shorter than the minimum length [rule: aws:bucketnamingrules]","status":500},0],
+["a/b",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name contains a path separator [rule: aws:bucketnamingrules]","status":500},0],
+["bad_bucket",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name contains a character the naming rules do not admit [rule: aws:bucketnamingrules]","status":500},0],
+["127.0.0.1",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name uses a reserved form [rule: aws:bucketnamingrules]","status":500},0],
+["bucket-",{"code":"InternalError","headers":"None","message":"failed to convert DeleteBucket bucket through the gateway compatibility seam: invalid BucketName: the name contains a character the naming rules do not admit [rule: aws:bucketnamingrules]","status":500},0]
+]"#).expect("measured strict name refusals");
+        assert_eq!(
+            serde_json::to_value(observations).expect("delete name observations"),
+            expected,
+            "strict bucket refusal precedes dispatch and counting"
+        );
     }
 }
