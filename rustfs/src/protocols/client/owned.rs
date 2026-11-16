@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Request and response projections for protocol object operations.
-//! Authorization stays on the protocol session edge; storage runs in the client's server context.
+//! Request and response projections for protocol storage operations.
+//! Protocol clients retain their session checks; use cases own storage and bucket visibility.
 
 use super::{ProtocolStorageClient, RequestParams};
 use crate::app::object_usecase::{DefaultObjectUsecase, GetObjectBody, GetObjectOutputFacts, HeadObjectOutputFacts};
@@ -58,6 +58,10 @@ impl ProtocolStorageClient {
             )
             .await
             .and_then(|answered| get_output(answered.output))
+    }
+
+    pub(super) fn owned_bucket_usecase(&self) -> crate::app::bucket_usecase::DefaultBucketUsecase {
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(self.fs.server_ctx().app_context())
     }
 
     pub(super) fn owned_usecase(&self) -> DefaultObjectUsecase {
@@ -312,4 +316,86 @@ pub(super) fn put_error(mut error: S3Error) -> S3Error {
     };
     error.set_message(message);
     error
+}
+
+pub(super) fn head_bucket_input(bucket: &str) -> S3Result<dto::HeadBucketInput> {
+    Ok(dto::HeadBucketInput {
+        bucket: if bucket.is_empty() {
+            // Protocol adapters use the empty bucket for the storage root.
+            Default::default()
+        } else {
+            crate::app::dto_values::stored_bucket_name(bucket).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write",
+                )
+            })?
+        },
+        expected_bucket_owner: None,
+    })
+}
+
+pub(super) fn bucket_listing_output(mut output: dto::ListBucketsOutput) -> dto::ListBucketsOutput {
+    output
+        .buckets
+        .retain(|bucket| rustfs_gateway_types::BucketName::new(bucket.name.as_str()).is_ok());
+    for bucket in &mut output.buckets {
+        bucket.creation_date = millisecond_timestamp(bucket.creation_date);
+    }
+    output
+}
+
+// Protocol listings keep the legacy edge's entry encoding and XML entity-tag spelling.
+pub(super) fn listing_output(mut output: dto::ListObjectsV2Output) -> S3Result<dto::ListObjectsV2Output> {
+    let error = |field, reason| super::conversion_error("ListObjectsV2 output", format!("{field}: {reason}"));
+    let encode = |value: &str| {
+        if output
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding| encoding.as_str() == "url")
+        {
+            value
+                .split('/')
+                .map(|part| urlencoding::encode(part).into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        } else {
+            value.to_owned()
+        }
+    };
+    for object in &mut output.contents {
+        object.key = rustfs_gateway_types::ObjectKey::new(encode(object.key.as_str()))
+            .map_err(|_| error("key", "not an object key the gateway can write"))?;
+        object.last_modified = millisecond_timestamp(object.last_modified);
+        object.e_tag = object
+            .e_tag
+            .take()
+            .map(|tag| {
+                let value = quick_xml::escape::escape(tag.opaque_tag()).into_owned();
+                if tag.is_weak() {
+                    ETag::new_weak(value)
+                } else {
+                    ETag::new(value)
+                }
+                .map_err(|_| error("e_tag", "not an entity tag the gateway can write"))
+            })
+            .transpose()?;
+    }
+    for prefix in &mut output.common_prefixes {
+        prefix.prefix = encode(&prefix.prefix);
+    }
+    output.rustfs_on_demand_migration_list = None;
+    super::require_listed_etags(output).map_err(|error| super::conversion_error("ListObjectsV2 output", error))
+}
+
+pub(super) fn create_bucket_input(bucket: &str) -> S3Result<dto::CreateBucketInput> {
+    Ok(dto::CreateBucketInput {
+        bucket: crate::app::dto_values::stored_bucket_name(bucket).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "failed to convert through the gateway compatibility seam: bucket: not a bucket name the gateway can write",
+            )
+        })?,
+        ..Default::default()
+    })
 }

@@ -936,6 +936,12 @@ pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
                 | "/minio/admin/v4/runtime/capabilities"
                 | "/rustfs/admin/v3/object-data-cache/stats"
                 | "/minio/admin/v3/object-data-cache/stats"
+                | "/rustfs/admin/v3/datausageinfo"
+                | "/minio/admin/v3/datausageinfo"
+                | "/rustfs/admin/v4/plugins/catalog"
+                | "/minio/admin/v4/plugins/catalog"
+                | "/rustfs/admin/v3/module-switches"
+                | "/minio/admin/v3/module-switches"
         )
         && parse_object_lambda_request(method, uri).is_none()
 }
