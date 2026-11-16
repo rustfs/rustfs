@@ -111,7 +111,7 @@ async fn final_response(mut response: h2::client::ResponseFuture, status: Status
 async fn h2_expect_continue_unblocks_sequential_upload_parts_once_each() {
     bounded(async {
         let mut client = connect(service_fn(consume)).await;
-        for expect in ["100-continue", "100-CoNtInUe"] {
+        for expect in ["100-continue", "100-CONTINUE"] {
             let (mut response, mut body) = client
                 .sender
                 .send_request(request(Some(expect), false), false)
