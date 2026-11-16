@@ -37,6 +37,7 @@ fn complete_input_preserves_part_fields() {
         CompletedPart {
             part_number: None,
             e_tag: Some(ETag::Strong(String::new())),
+            checksum_crc32: Some(String::new()),
             ..Default::default()
         },
         CompletedPart {
@@ -60,6 +61,7 @@ fn complete_input_preserves_part_fields() {
         .map(|part| (part.part_number, part.e_tag.as_ref().map(|tag| tag.opaque_tag())))
         .collect();
     assert_eq!(read, [(0, Some("")), (2, Some("abc")), (3, None)]);
+    assert_eq!(converted.parts[0].checksum_crc32.as_deref(), Some(""));
 }
 
 /// Several per-algorithm checksum members, and one of the wrong width, do not stop the request:

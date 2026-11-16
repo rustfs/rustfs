@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod multipart;
 mod owned;
 
 use crate::runtime_sources::current_action_credentials;
@@ -927,13 +928,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[("uploads", None)])?;
-        let context = gateway_request_context(Method::POST, &uri, HeaderMap::new());
-        let wire = RequestWire::of(&context);
-        let input = gateway_s3s_compat::generated::ops::create_multipart_upload::input_to_s3s(input, &wire)
-            .map_err(|e| conversion_error("CreateMultipartUpload input", e))?;
-
-        let req = Self::create_request(
-            input,
+        let input = multipart::create_multipart_input(input)?;
+        let envelope = Self::create_envelope(
             Method::POST,
             uri,
             RequestParams {
@@ -941,13 +937,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-
-        match self.fs.create_multipart_upload(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::create_multipart_upload::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("CreateMultipartUpload output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CreateMultipartUpload);
+        self.owned_multipart_usecase()
+            .execute_create_multipart_upload(envelope, input, None)
+            .await
+            .and_then(multipart::create_multipart_output)
     }
 
     async fn upload_part(
@@ -1024,13 +1019,11 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let input = gateway_s3s_compat::generated::ops::complete_multipart_upload::input_to_s3s(input)
-            .map_err(|e| conversion_error("CompleteMultipartUpload input", e))?;
-        let upload_id = input.upload_id.clone();
+        // This scalar projection remains until the compatibility seam retires.
+        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
+        let input = multipart::complete_multipart_input(input)?;
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
-
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::POST,
             uri,
             RequestParams {
@@ -1038,13 +1031,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 object: Some(key),
                 credentials,
             },
-        )?;
-
-        match self.fs.complete_multipart_upload(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::complete_multipart_upload::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("CompleteMultipartUpload output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CompleteMultipartUpload);
+        self.owned_multipart_usecase()
+            .execute_complete_multipart_upload(envelope, input)
+            .await
+            .map_err(multipart::complete_multipart_error)
+            .and_then(multipart::complete_multipart_output)
     }
 
     async fn abort_multipart_upload(
@@ -1064,27 +1057,27 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let input = gateway_s3s_compat::generated::ops::abort_multipart_upload::input_to_s3s(input)
-            .map_err(|e| conversion_error("AbortMultipartUpload input", e))?;
-        let upload_id = input.upload_id.clone();
+        multipart::abort_multipart_input(&input)?;
+        // This scalar projection remains until the compatibility seam retires.
+        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
-
-        let req = Self::create_request(
-            input,
+        let envelope = Self::create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
-                bucket: Some(bucket),
-                object: Some(key),
+                bucket: Some(bucket.clone()),
+                object: Some(key.clone()),
                 credentials,
             },
-        )?;
-
-        match self.fs.abort_multipart_upload(req).await {
-            Ok(response) => gateway_s3s_compat::generated::ops::abort_multipart_upload::output_from_s3s(response.output)
-                .map_err(|e| conversion_error("AbortMultipartUpload output", e)),
-            Err(e) => Err(e.into()),
-        }
+        );
+        let target = crate::app::multipart_usecase::reject_abort_capabilities(&envelope).map(|()| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::AbortMultipartUpload);
+            crate::app::multipart_usecase::AbortMultipartUploadTarget::Legacy { bucket, key, upload_id }
+        });
+        self.owned_multipart_usecase()
+            .execute_abort_multipart_upload(envelope, target)
+            .await?;
+        Ok(gateway_dto::AbortMultipartUploadOutput::default())
     }
 
     async fn upload_part_copy(
