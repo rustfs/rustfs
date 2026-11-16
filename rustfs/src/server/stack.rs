@@ -18,8 +18,8 @@
 //! be, and [`select_stack`], the only place a stack is chosen. The whole stack is one or the
 //! other: no request is routed between stacks by its operation, and a request the gateway stack
 //! refuses is answered by that refusal and never retried on the legacy stack. With the gateway
-//! selected, console static requests use the native console service; the legacy service receives
-//! the remaining claimed extension and control-plane routes, never S3 operations.
+//! selected, console static requests and signed system-status reads use their native
+//! services; the legacy service receives the remaining claimed extension and control-plane routes.
 //! NOT responsible for: assembling either stack (`server/http.rs` builds the legacy service,
 //! `server/gateway_stack.rs` the gateway one), or the middleware around them.
 //! Upstream: `server/http.rs`. Downstream: the native console, legacy S3 service and gateway stack.
@@ -27,7 +27,7 @@
 //! This file names no stack's types: it is generic over the services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
-use crate::admin::router::{claims_native_console_route, claims_route};
+use crate::admin::router::{claims_native_admin_route, claims_native_console_route, claims_route};
 use crate::config::S3Stack;
 use http::Request;
 use std::future::Future;
@@ -42,6 +42,7 @@ pub(crate) struct S3StackService<L, G, C = G> {
     legacy: L,
     gateway: Option<G>,
     native_console: Option<C>,
+    native_admin: Option<G>,
 }
 
 impl<L, G, C> S3StackService<L, G, C> {
@@ -51,7 +52,14 @@ impl<L, G, C> S3StackService<L, G, C> {
             legacy: self.legacy,
             gateway: self.gateway,
             native_console,
+            native_admin: self.native_admin,
         }
+    }
+
+    /// Attaches the signed admin service used only by the gateway selection.
+    pub(crate) fn with_native_admin(mut self, native_admin: Option<G>) -> Self {
+        self.native_admin = native_admin;
+        self
     }
 
     /// The stack this service was built with, as the startup line names it: read from the service
@@ -85,6 +93,7 @@ pub(crate) fn select_stack<L, G, E>(
         legacy,
         gateway,
         native_console: None,
+        native_admin: None,
     })
 }
 
@@ -96,6 +105,7 @@ where
     L::Future: Send + 'static,
     G::Future: Send + 'static,
     C::Future: Send + 'static,
+    R: Default,
 {
     type Response = http::Response<R>;
     type Error = E;
@@ -104,6 +114,9 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(gateway) = &mut self.gateway {
             ready!(gateway.poll_ready(cx))?;
+            if let Some(admin) = &mut self.native_admin {
+                ready!(admin.poll_ready(cx))?;
+            }
             if let Some(console) = &mut self.native_console {
                 ready!(console.poll_ready(cx))?;
             }
@@ -113,13 +126,27 @@ where
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
         if let Some(gateway) = &mut self.gateway {
-            if !claims_route(request.method(), request.uri(), request.headers()) {
-                return Box::pin(gateway.call(request));
+            if claims_route(request.method(), request.uri(), request.headers())
+                && (request.headers().contains_key("x-auth-token") || request.headers().contains_key("x-storage-token"))
+            {
+                return Box::pin(async {
+                    let mut response = http::Response::new(R::default());
+                    *response.status_mut() = http::StatusCode::FORBIDDEN;
+                    Ok(response)
+                });
             }
             if let Some(console) = &mut self.native_console
                 && claims_native_console_route(request.method(), request.uri())
             {
                 return Box::pin(console.call(request));
+            }
+            if let Some(admin) = &mut self.native_admin
+                && claims_native_admin_route(request.method(), request.uri())
+            {
+                return Box::pin(admin.call(request));
+            }
+            if !claims_route(request.method(), request.uri(), request.headers()) {
+                return Box::pin(gateway.call(request));
             }
         }
         Box::pin(self.legacy.call(request))
@@ -261,6 +288,116 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Counting {
+        name: &'static str,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for Counting {
+        type Response = Response<&'static str>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _request: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ready_future(Ok(Response::new(self.name)))
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_keystone_tokens_are_refused_before_non_s3_legacy_dispatch() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let console_path = format!("{}/index.html", crate::server::console_prefix());
+        for stack in [S3Stack::Gateway, S3Stack::Legacy] {
+            for (method, target) in [
+                (Method::GET, "/rustfs/admin/v3/info"),
+                (Method::GET, "/minio/admin/v3/info"),
+                (Method::GET, "/rustfs/admin/v3/datausageinfo"),
+                (Method::GET, "/minio/admin/v3/datausageinfo"),
+                (Method::GET, "/rustfs/admin/v4/plugins/catalog"),
+                (Method::GET, "/minio/admin/v4/plugins/catalog"),
+                (Method::GET, "/rustfs/admin/v3/module-switches"),
+                (Method::GET, "/minio/admin/v3/module-switches"),
+                (Method::POST, "/?Action=AssumeRole&Version=2011-06-15"),
+                (Method::GET, "/bucket?replication-metrics"),
+                (Method::GET, console_path.as_str()),
+            ] {
+                for header in [None, Some("x-auth-token"), Some("x-storage-token")] {
+                    let legacy_calls = Arc::new(AtomicUsize::new(0));
+                    let gateway_calls = Arc::new(AtomicUsize::new(0));
+                    let console_calls = Arc::new(AtomicUsize::new(0));
+                    let admin_calls = Arc::new(AtomicUsize::new(0));
+                    let legacy = Counting {
+                        name: "legacy",
+                        calls: Arc::clone(&legacy_calls),
+                    };
+                    let gateway = Counting {
+                        name: "gateway",
+                        calls: Arc::clone(&gateway_calls),
+                    };
+                    let console = Counting {
+                        name: "console",
+                        calls: Arc::clone(&console_calls),
+                    };
+                    let admin = Counting {
+                        name: "admin",
+                        calls: Arc::clone(&admin_calls),
+                    };
+                    let mut service = select_stack(stack, legacy, || Ok::<_, Infallible>(gateway))
+                        .unwrap()
+                        .with_native_console(Some(console))
+                        .with_native_admin(Some(admin));
+                    let mut request = request(method.clone(), target);
+                    if method == Method::POST {
+                        request
+                            .headers_mut()
+                            .insert(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded".parse().unwrap());
+                    }
+                    if let Some(header) = header {
+                        request.headers_mut().insert(header, "validated-token".parse().unwrap());
+                    }
+                    let response = service.call(request).await.unwrap();
+                    if stack == S3Stack::Gateway && header.is_some() {
+                        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{target} {header:?}");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0, "refused request reached legacy");
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0, "refused request reached native console");
+                        assert_eq!(admin_calls.load(Ordering::SeqCst), 0, "refused request reached native admin");
+                    } else if stack == S3Stack::Gateway && target == console_path {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"console");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 1);
+                    } else if stack == S3Stack::Gateway
+                        && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                    {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"admin");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.body(), &"legacy");
+                        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(console_calls.load(Ordering::SeqCst), 0);
+                    }
+                    assert_eq!(gateway_calls.load(Ordering::SeqCst), 0, "non-S3 request reached gateway");
+                    assert_eq!(
+                        admin_calls.load(Ordering::SeqCst),
+                        usize::from(
+                            stack == S3Stack::Gateway
+                                && header.is_none()
+                                && (target.starts_with("/rustfs/admin/") || target.starts_with("/minio/admin/"))
+                        )
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_sts_form_post_stays_on_the_legacy_router_and_a_plain_post_does_not() {
         let mut service = gateway_stack();
@@ -273,5 +410,91 @@ mod tests {
 
         assert_eq!(answered_by(&mut service, sts).await, "legacy");
         assert_eq!(answered_by(&mut service, request(Method::POST, "/")).await, "gateway");
+    }
+    #[tokio::test]
+    async fn native_admin_selection_is_exact_and_host_independent() {
+        let mut service = gateway_stack().with_native_admin(Some(Named("admin")));
+        for host in ["localhost", "bucket.s3.example.test"] {
+            for target in [
+                "/rustfs/admin/v3/datausageinfo",
+                "/minio/admin/v3/datausageinfo?detail=1",
+                "/rustfs/admin/v4/plugins/catalog",
+                "/minio/admin/v4/plugins/catalog?detail=1",
+                "/rustfs/admin/v4/cluster/snapshot",
+                "/minio/admin/v4/cluster/snapshot?detail=1",
+                "/rustfs/admin/v3/module-switches",
+                "/minio/admin/v3/module-switches?detail=1",
+                "/rustfs/admin/v3/info",
+                "/minio/admin/v3/info?detail=1",
+                "/rustfs/admin/v3/storageinfo",
+                "/minio/admin/v3/storageinfo?detail=a%2Fb",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/minio/admin/v4/runtime/capabilities?detail=a%2Fb",
+                "/rustfs/admin/v3/object-data-cache/stats",
+                "/minio/admin/v3/object-data-cache/stats?detail=a%2Fb",
+            ] {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(target)
+                    .header("host", host)
+                    .body(())
+                    .unwrap();
+                assert_eq!(answered_by(&mut service, req).await, "admin", "{host} {target}");
+            }
+        }
+        for suffix in [
+            "/v3/storageinfo",
+            "/v4/runtime/capabilities",
+            "/v3/object-data-cache/stats",
+            "/v3/datausageinfo",
+            "/v4/plugins/catalog",
+            "/v4/cluster/snapshot",
+            "/v3/module-switches",
+        ] {
+            for prefix in ["/rustfs/admin", "/minio/admin"] {
+                for (method, tail) in [
+                    (Method::POST, ""),
+                    (Method::PUT, ""),
+                    (Method::HEAD, ""),
+                    (Method::DELETE, ""),
+                    (Method::GET, "/"),
+                    (Method::GET, "-neighbor"),
+                    (Method::GET, "?lambdaArn=arn"),
+                    (Method::GET, "?lambdaArn="),
+                    (Method::GET, "?lambdaArn=one&lambdaArn=two"),
+                    (Method::GET, "?lambdaArn=%ZZ"),
+                ] {
+                    let target = format!("{prefix}{suffix}{tail}");
+                    assert_eq!(answered_by(&mut service, request(method, &target)).await, "legacy", "{target}");
+                }
+            }
+        }
+        for (method, target) in [
+            (Method::GET, "/rustfs/admin/v3/info/"),
+            (Method::GET, "/rustfs/admin/v3/info-neighbor"),
+            (Method::GET, "/rustfs/admin//v3/info"),
+            (Method::GET, "/%72ustfs/admin/v3/info"),
+            (Method::GET, "/rustfs/admin/v4/info"),
+            (Method::POST, "/rustfs/admin/v3/info"),
+            (Method::GET, "/iceberg/v1/config"),
+            (Method::GET, "/profile/cpu"),
+            (Method::GET, "/bucket?events"),
+            (Method::GET, "/bucket/key"),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=arn"),
+            (Method::GET, "/minio/admin/v3/info?lambdaArn="),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=one&lambdaArn=two"),
+            (Method::GET, "/rustfs/admin/v3/info?lambdaArn=%ZZ"),
+        ] {
+            let expected = if claims_route(&method, &target.parse().unwrap(), &http::HeaderMap::new()) {
+                "legacy"
+            } else {
+                "gateway"
+            };
+            assert_eq!(answered_by(&mut service, request(method, target)).await, expected, "{target}");
+        }
+        let mut legacy = select_stack(S3Stack::Legacy, Named("legacy"), || Ok::<_, Infallible>(Named("gateway")))
+            .unwrap()
+            .with_native_admin(Some(Named("admin")));
+        assert_eq!(answered_by(&mut legacy, request(Method::GET, "/rustfs/admin/v3/info")).await, "legacy");
     }
 }

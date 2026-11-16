@@ -232,7 +232,7 @@ async fn prepare_table_data_plane_list_access<R: AuthorizationRequest + ?Sized>(
     let default_cred = rustfs_credentials::Credentials::default();
     let condition_cred = cred.as_ref().unwrap_or(&default_cred);
     let root_access_key = root_access_key();
-    let principal = AuthzPrincipal::new(condition_cred, &root_access_key);
+    let principal = request_principal(req, condition_cred, &root_access_key);
     let facts = request_authz_facts(
         req,
         AuthzTarget {
