@@ -405,12 +405,22 @@ fn single_rule(method: &str, origin: &str) -> CorsConfiguration {
         .expect("valid configuration")
 }
 
-/// Records the status of the one response a request receives.
+/// Records the status and request ID headers of the response.
 #[derive(Clone, Debug, Default)]
-pub(super) struct StatusCapture(Arc<Mutex<Option<u16>>>);
+pub(super) struct StatusCapture(Arc<Mutex<Option<CapturedResponse>>>);
+
+#[derive(Debug)]
+pub(super) struct CapturedResponse {
+    pub(super) status: u16,
+    pub(super) request_ids: [Option<String>; 2],
+}
 
 impl StatusCapture {
     pub(super) fn take(&self) -> Option<u16> {
+        self.take_response().map(|response| response.status)
+    }
+
+    pub(super) fn take_response(&self) -> Option<CapturedResponse> {
         self.0.lock().ok().and_then(|mut slot| slot.take())
     }
 }
@@ -426,11 +436,15 @@ impl Intercept for StatusCapture {
         _runtime_components: &RuntimeComponents,
         _cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        let status = context.response().status().as_u16();
+        let response = context.response();
+        let header = |name| response.headers().get(name).map(str::to_owned);
         *self
             .0
             .lock()
-            .map_err(|_| std::io::Error::other("status capture mutex was poisoned"))? = Some(status);
+            .map_err(|_| std::io::Error::other("status capture mutex was poisoned"))? = Some(CapturedResponse {
+            status: response.status().as_u16(),
+            request_ids: [header("x-amz-request-id"), header("x-request-id")],
+        });
         Ok(())
     }
 }
