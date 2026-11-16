@@ -1039,3 +1039,138 @@ fn gateway_put_object_retention_edits_only_the_authorized_version() {
 fn legacy_put_object_retention_edits_only_the_authorized_version() {
     put_retention_on_an_explicit_version(LEGACY);
 }
+
+const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
+const RETENTION_DATES: [&str; 3] = [
+    "2099-01-02T08:00:00.123456789+08:00",
+    "2099-01-03T16:30:00.987654321-07:30",
+    "2099-01-05T00:00:00.000000001Z",
+];
+
+async fn write_retention_xml(
+    client: &super::object_write::WireClient<'_>,
+    path: &str,
+    xml: &str,
+) -> super::object_write::WireAnswer {
+    use md5::Digest as _;
+
+    let md5 = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml.as_bytes()));
+    client
+        .request(
+            "PUT",
+            path,
+            xml.as_bytes(),
+            &[("content-type", "application/xml"), ("content-md5", &md5)],
+            Some(xml.len()),
+        )
+        .await
+}
+
+#[test]
+fn gateway_put_object_retention_preserves_the_authorized_date_on_disk() {
+    use super::object_write::WireClient;
+
+    temp_env::with_var(super::ENV_S3_STACK, GATEWAY, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let endpoint = server.endpoint();
+            let root = WireClient {
+                endpoint: &endpoint,
+                access_key: server.access_key(),
+                secret_key: server.secret_key(),
+            };
+            let writer = WireClient {
+                endpoint: &endpoint,
+                access_key: "retention-date-writer",
+                secret_key: USER_SECRET_KEY,
+            };
+            attach_tagging_policy(
+                writer.access_key,
+                "s3:PutObjectRetention",
+                &format!("arn:aws:s3:::{bucket}/{KEY}"),
+                serde_json::json!({"StringEquals": {
+                    "s3:VersionId": old,
+                    "s3:object-lock-retain-until-date": RETENTION_DATES[0]
+                }}),
+            )
+            .await;
+
+            let path = format!("/{bucket}/{KEY}?retention&versionId={old}");
+            let metadata_path = volume.path().join(&bucket).join(KEY).join("xl.meta");
+            let initial = std::fs::read(&metadata_path).unwrap();
+            let latest_initial = lock_disk_version(volume.path(), &bucket, &latest);
+            let xml = |date| format!("<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{date}</RetainUntilDate></Retention>");
+
+            for (actor, body, status, code) in [
+                (&writer, xml("2099-01-02T00:00:00.123456789Z"), 403, "<Code>AccessDenied</Code>"),
+                (&writer, "<Retention/>".to_owned(), 403, "<Code>AccessDenied</Code>"),
+                (&root, xml("invalid-date"), 400, "<Code>MalformedXML</Code>"),
+            ] {
+                let answer = write_retention_xml(actor, &path, &body).await;
+                assert_eq!(answer.status, status, "{}", answer.body);
+                assert!(answer.body.contains(code), "{}", answer.body);
+                assert_eq!(std::fs::read(&metadata_path).unwrap(), initial);
+            }
+
+            for (actor, date) in [
+                (&writer, RETENTION_DATES[0]),
+                (&root, RETENTION_DATES[1]),
+                (&root, RETENTION_DATES[2]),
+            ] {
+                let answer = write_retention_xml(actor, &path, &xml(date)).await;
+                assert_eq!(answer.status, 200, "retain until {date}: {}", answer.body);
+                let changed = lock_disk_version(volume.path(), &bucket, &old);
+                assert_eq!(changed.metadata.get(RETAIN_UNTIL_HEADER).map(String::as_str), Some(date));
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &latest), latest_initial);
+            }
+            server.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn gateway_put_object_preserves_retention_header_date_on_disk() {
+    use super::object_write::WireClient;
+
+    temp_env::with_var(super::ENV_S3_STACK, GATEWAY, || {
+        super::common::run_embedded_test(|| async {
+            let volume = tempfile::tempdir().unwrap();
+            let (server, bucket, old, latest) = lock_write_fixture(volume.path()).await;
+            let endpoint = server.endpoint();
+            let client = WireClient {
+                endpoint: &endpoint,
+                access_key: server.access_key(),
+                secret_key: server.secret_key(),
+            };
+            let path = format!("/{bucket}/{KEY}");
+            let metadata_path = volume.path().join(&bucket).join(KEY).join("xl.meta");
+            let initial = std::fs::read(&metadata_path).unwrap();
+            let old_initial = lock_disk_version(volume.path(), &bucket, &old).metadata;
+            let latest_initial = lock_disk_version(volume.path(), &bucket, &latest).metadata;
+            let mode = ("x-amz-object-lock-mode", "GOVERNANCE");
+
+            for headers in [vec![mode], vec![mode, (RETAIN_UNTIL_HEADER, "invalid-date")]] {
+                let answer = client.request("PUT", &path, b"object", &headers, Some(6)).await;
+                assert_eq!(answer.status, 400, "{}", answer.body);
+                assert_eq!(std::fs::read(&metadata_path).unwrap(), initial);
+            }
+
+            for date in [
+                None,
+                Some(RETENTION_DATES[0]),
+                Some(RETENTION_DATES[1]),
+                Some(RETENTION_DATES[2]),
+            ] {
+                let headers = date.map_or_else(Vec::new, |date| vec![mode, (RETAIN_UNTIL_HEADER, date)]);
+                let answer = client.request("PUT", &path, b"object", &headers, Some(6)).await;
+                assert_eq!(answer.status, 200, "retain until {date:?}: {}", answer.body);
+                let written = lock_disk_version(volume.path(), &bucket, &answer.headers["x-amz-version-id"]);
+                assert_eq!(written.metadata.get(RETAIN_UNTIL_HEADER).map(String::as_str), date);
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &old).metadata, old_initial);
+                assert_eq!(lock_disk_version(volume.path(), &bucket, &latest).metadata, latest_initial);
+            }
+            server.shutdown().await;
+        });
+    });
+}

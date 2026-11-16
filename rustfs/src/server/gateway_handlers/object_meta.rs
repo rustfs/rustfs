@@ -240,10 +240,14 @@ impl Served for dto::PutObjectLegalHold {
     }
 }
 
-fn retention_fields(retention: &dto::ObjectLockRetention) -> S3Result<RequestedObjectLockRetention> {
+fn retention_fields(request: &Req<dto::PutObjectRetention>) -> S3Result<RequestedObjectLockRetention> {
+    let retention = &request.input().retention;
     Ok(RequestedObjectLockRetention {
         mode: retention.mode.as_ref().map(|mode| mode.as_str().to_owned()),
-        retain_until: super::object_write::retain_until(retention.retain_until_date.as_ref())?,
+        retain_until: super::object_write::retain_until_with_offset(
+            retention.retain_until_date.as_ref(),
+            request.context().object_lock_retain_until_offset_seconds(),
+        )?,
     })
 }
 
@@ -262,21 +266,16 @@ impl Served for dto::PutObjectRetention {
             input.bucket.as_str(),
             input.key.as_str(),
             input.version_id.as_deref(),
-            retention_fields(&input.retention)?,
+            retention_fields(request)?,
         )
         .await?)
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let retention = retention_fields(&request)?;
         let input = request.into_input();
         ObjectMetaUsecase::with_context(context)
-            .put_object_retention_fields(
-                envelope,
-                input.bucket.as_str(),
-                input.key.as_str(),
-                input.version_id,
-                Some(retention_fields(&input.retention)?),
-            )
+            .put_object_retention_fields(envelope, input.bucket.as_str(), input.key.as_str(), input.version_id, Some(retention))
             .await
             .map(Resp::new)
     }
