@@ -6825,6 +6825,28 @@ mod tests {
         tokio::fs::remove_file(conflicting_metadata)
             .await
             .expect("remove conflicting fixture");
+        struct RequiresOwner;
+        impl crate::storage_api_contracts::multipart::MultipartAbortAuthorization for RequiresOwner {
+            type Error = StorageError;
+
+            fn authorize(&self, _: Option<&crate::storage_api_contracts::multipart::MultipartOwner>) -> Result<()> {
+                panic!("metadata-absent recovery cannot observe an upload owner");
+            }
+        }
+        let native_opts = ObjectOptions {
+            multipart_abort_authorization: Some(Arc::new(RequiresOwner)),
+            ..Default::default()
+        };
+        let rejected = store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &native_opts)
+            .await;
+        for disk_index in 0..3 {
+            assert!(
+                staging_dir(0, disk_index).join("part.1").exists(),
+                "owner-required Abort must preserve late data"
+            );
+        }
+        assert!(matches!(rejected, Err(StorageError::InvalidUploadID(..))));
         let (paused, release) = crate::store::multipart::pause_orphan_multipart_cleanup_for_test(&bucket);
         let recovery_store = store.clone();
         let recovery_bucket = bucket.clone();

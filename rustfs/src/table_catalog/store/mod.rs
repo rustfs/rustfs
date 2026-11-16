@@ -900,6 +900,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             "bucket lifecycle validation is unavailable".to_string(),
         ))
     }
+    #[cfg(test)]
     async fn reuse_bucket_lifecycle_read(
         &self,
         _expected: &BucketHandle,
@@ -1292,6 +1293,7 @@ impl Default for TableCatalogObjectPaths {
 }
 
 impl TableCatalogObjectPaths {
+    #[cfg(test)]
     pub(in crate::table_catalog) fn for_vector() -> Self {
         Self {
             scope: CatalogScope::Vector,
@@ -2399,6 +2401,7 @@ where
             write_commit_guard: None,
         })
     }
+    #[cfg(test)]
     async fn reuse_bucket_lifecycle_read(
         &self,
         expected: &BucketHandle,
@@ -3063,6 +3066,7 @@ impl VectorCatalogOperationGuard {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn lifecycle_guard(&self) -> TableCatalogStoreResult<Arc<BucketIncarnationFenceGuard>> {
         self.check_held()?;
         self.inner
@@ -3072,6 +3076,7 @@ impl VectorCatalogOperationGuard {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VectorCatalogEntry {
     head: CatalogHead,
@@ -3079,6 +3084,7 @@ pub(crate) struct VectorCatalogEntry {
     entry: TableEntry,
 }
 
+#[cfg(test)]
 impl VectorCatalogEntry {
     fn from_entry(entry: TableEntry) -> TableCatalogStoreResult<Self> {
         if entry.version != 3 {
@@ -3112,6 +3118,7 @@ impl VectorCatalogEntry {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VectorIndexCreateReservation {
     intent: VectorIndexCreateIntentV1,
@@ -3125,6 +3132,7 @@ pub(crate) struct VectorIndexCreateReservation {
     published_entry: Option<VectorCatalogEntry>,
 }
 
+#[cfg(test)]
 impl VectorIndexCreateReservation {
     fn from_intent(intent: VectorIndexCreateIntentV1) -> TableCatalogStoreResult<Self> {
         intent.validate()?;
@@ -3182,6 +3190,7 @@ impl VectorIndexCreateReservation {
     }
 }
 
+#[cfg(test)]
 impl TableCatalogObjectPaths {
     fn vector_create_intent_path(&self, bucket: &str, namespace: &Namespace, name: &CatalogName) -> String {
         let head = self.table_entry_path(bucket, namespace, name);
@@ -3196,12 +3205,14 @@ impl TableCatalogObjectPaths {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum VectorTagUpdate {
     Set(BTreeMap<String, String>),
     Remove(BTreeSet<String>),
 }
 
+#[cfg(test)]
 impl<S: TableCatalogStorage> EcStoreTableCatalogObjectBackend<S> {
     async fn reuse_vector_bucket_lifecycle(
         &self,

@@ -43,10 +43,12 @@ const LOG_COMPONENT_CONNECT: &str = "connect";
 const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
 #[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct ManagedLanceObjects {
     usecase: crate::app::object::DefaultObjectUsecase,
     context: crate::app::object::ManagedObjectContext,
     max_bytes: usize,
+    operation_guard: Option<Arc<crate::table_catalog::VectorCatalogOperationGuard>>,
 }
 
 #[cfg(test)]
@@ -77,6 +79,7 @@ pub(crate) fn managed_lance_objects(
         usecase: crate::app::object::DefaultObjectUsecase::with_context(Some(app)),
         context,
         max_bytes,
+        operation_guard: None,
     }))
 }
 
@@ -92,6 +95,12 @@ impl crate::table_catalog::CatalogManagedCandidateReader for ManagedLanceObjects
     ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableCatalogObject>> {
         use crate::table_catalog::{CatalogIoErrorKind, TableCatalogStoreError};
 
+        if let Some(operation_guard) = &self.operation_guard {
+            let native = operation_guard.lifecycle_guard()?;
+            if !std::ptr::eq(native.as_ref(), lifecycle) {
+                return Err(TableCatalogStoreError::Conflict("candidate read received another lifecycle owner".into()));
+            }
+        }
         if bucket != self.context.access().bucket() {
             return Err(TableCatalogStoreError::Io {
                 classification: CatalogIoErrorKind::Denied,
@@ -174,6 +183,9 @@ impl ManagedLanceObjects {
         if access != self.context.access() {
             return Err(crate::storage_api::startup::services::BucketIdentityError::ObjectOutsideScope.into());
         }
+        if let Some(guard) = &self.operation_guard {
+            guard.check_held()?;
+        }
         Ok(())
     }
 
@@ -229,6 +241,24 @@ impl crate::vector::lance::ManagedManifestObjects for ManagedLanceObjects {
             operation: "measure managed manifest",
             source: Box::new(source),
         })?;
+        if let Some(guard) = &self.operation_guard {
+            let native = guard.lifecycle_guard()?;
+            let objects = self.clone();
+            let key = key.clone();
+            return run_managed_bridge_mutation(async move {
+                objects.check_access(objects.context.access())?;
+                let info = objects.usecase.managed_create_object_with_guard(
+                    &objects.context, key.as_str(), size,
+                    futures::stream::once(std::future::ready(Ok(content))), native,
+                ).await.map_err(|error| {
+                    if matches!(&error, crate::app::object::ManagedObjectError::Api(api) if api.code.as_str() == "PreconditionFailed") {
+                        crate::vector::lance::LanceManifestError::CandidateAlreadyExists { key: key.as_str().to_owned() }
+                    } else { Self::error("create Managed Dataset object", key.as_str(), error) }
+                })?;
+                objects.check_access(objects.context.access())?;
+                Self::metadata(info)
+            }).await;
+        }
         let body = futures::stream::once(std::future::ready(Ok(content)));
         let info = self
             .usecase
@@ -249,12 +279,33 @@ impl crate::vector::lance::ManagedManifestObjects for ManagedLanceObjects {
     async fn create_multipart(
         &self,
         access: &crate::storage_api::startup::services::ManagedObjectAccess,
-        _key: &crate::table_catalog::CatalogObjectKey,
+        key: &crate::table_catalog::CatalogObjectKey,
     ) -> std::result::Result<Arc<dyn crate::vector::lance::ManagedDatasetMultipart>, crate::vector::lance::LanceManifestError>
     {
         self.check_access(access)?;
-        // This manifest fixture has no Catalog operation guard for multipart writes.
-        Err(crate::storage_api::startup::services::BucketIdentityError::OperationNotAllowed.into())
+        let native = self
+            .operation_guard
+            .as_ref()
+            .ok_or(crate::storage_api::startup::services::BucketIdentityError::OperationNotAllowed)?
+            .lifecycle_guard()?;
+        let objects = self.clone();
+        let key = key.clone();
+        run_managed_bridge_mutation(async move {
+            objects.check_access(objects.context.access())?;
+            let upload = objects
+                .usecase
+                .managed_create_multipart_upload_with_guard(&objects.context, key.as_str(), native)
+                .await
+                .map_err(|error| Self::error("create Managed Dataset multipart", key.as_str(), error))?;
+            objects.check_access(objects.context.access())?;
+            Ok(Arc::new(ManagedObjectMultipartSession {
+                objects,
+                key,
+                upload,
+                state: Arc::new(tokio::sync::Mutex::new(ManagedObjectMultipartState::default())),
+            }) as Arc<dyn crate::vector::lance::ManagedDatasetMultipart>)
+        })
+        .await
     }
 
     async fn get(
@@ -265,11 +316,25 @@ impl crate::vector::lance::ManagedManifestObjects for ManagedLanceObjects {
         expected_body_revision: Option<uuid::Uuid>,
     ) -> std::result::Result<crate::table_catalog::TableCatalogObject, crate::vector::lance::LanceManifestError> {
         self.check_access(access)?;
-        let (info, bytes) = self
-            .usecase
-            .managed_get_object(&self.context, key.as_str(), expected_body_revision, range, self.max_bytes)
-            .await
-            .map_err(|error| Self::error("read managed manifest", key.as_str(), error))?;
+        let read = if let Some(guard) = &self.operation_guard {
+            let native = guard.lifecycle_guard()?;
+            self.usecase
+                .managed_get_object_with_guard(
+                    &self.context,
+                    key.as_str(),
+                    expected_body_revision,
+                    range,
+                    self.max_bytes,
+                    &native,
+                )
+                .await
+        } else {
+            self.usecase
+                .managed_get_object(&self.context, key.as_str(), expected_body_revision, range, self.max_bytes)
+                .await
+        };
+        let (info, bytes) = read.map_err(|error| Self::error("read managed manifest", key.as_str(), error))?;
+        self.check_access(access)?;
         let metadata = Self::metadata(info)?;
         Ok(crate::table_catalog::TableCatalogObject {
             data: bytes.to_vec(),
@@ -285,24 +350,233 @@ impl crate::vector::lance::ManagedManifestObjects for ManagedLanceObjects {
         key: &crate::table_catalog::CatalogObjectKey,
     ) -> std::result::Result<crate::table_catalog::TableCatalogObjectMetadata, crate::vector::lance::LanceManifestError> {
         self.check_access(access)?;
-        let info = self
-            .usecase
-            .managed_head_object(&self.context, key.as_str(), None)
-            .await
-            .map_err(|error| Self::error("inspect managed manifest", key.as_str(), error))?;
+        let head = if let Some(guard) = &self.operation_guard {
+            let native = guard.lifecycle_guard()?;
+            self.usecase
+                .managed_head_object_with_guard(&self.context, key.as_str(), None, &native)
+                .await
+        } else {
+            self.usecase.managed_head_object(&self.context, key.as_str(), None).await
+        };
+        let info = head.map_err(|error| Self::error("inspect managed manifest", key.as_str(), error))?;
+        self.check_access(access)?;
         Self::metadata(info)
     }
 }
 
 #[cfg(test)]
 pub(crate) fn guarded_managed_lance_objects(
-    _access: crate::storage_api::startup::services::ManagedObjectAccess,
-    _request: Arc<crate::app::RequestEnvelope>,
-    _definition: &crate::table_catalog::VectorIndexDefinitionV1,
-    _guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
-    _limits: crate::vector::lance::ManifestIoLimits,
+    access: crate::storage_api::startup::services::ManagedObjectAccess,
+    request: Arc<crate::app::RequestEnvelope>,
+    definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+    limits: crate::vector::lance::ManifestIoLimits,
 ) -> std::result::Result<Arc<ManagedLanceObjects>, crate::vector::lance::LanceManifestError> {
-    Err(crate::table_catalog::TableCatalogStoreError::Unsupported("guarded Managed Dataset bridge is unavailable".into()).into())
+    use crate::table_catalog::{CatalogFormat, VectorEffectiveEncryptionV1};
+    definition.validate()?;
+    guard.check_held()?;
+    let resource = guard.resource_identity();
+    if resource.vector_bucket() != Some(access.bucket())
+        || resource.table_id() != access.table_id()
+        || resource.format() != CatalogFormat::Lance
+        || resource.dataset_prefix() != access.allowed_prefix()
+    {
+        return Err(crate::vector::lance::LanceManifestError::ResourceMismatch {
+            reason: "Managed Dataset access differs from its Catalog operation",
+        });
+    }
+    guard.lifecycle_guard()?;
+    let encryption = match &definition.effective_encryption {
+        VectorEffectiveEncryptionV1::Unencrypted => crate::app::object::ManagedEncryption::Unencrypted,
+        VectorEffectiveEncryptionV1::Aes256 => crate::app::object::ManagedEncryption::Aes256,
+        VectorEffectiveEncryptionV1::AwsKms { key_id, .. } => {
+            crate::app::object::ManagedEncryption::AwsKms { key_id: key_id.clone() }
+        }
+    };
+    let mut objects = managed_lance_objects(access, request, encryption, limits)?;
+    Arc::get_mut(&mut objects)
+        .ok_or(crate::vector::lance::LanceManifestError::ReferenceMismatch {
+            reason: "new Managed Dataset bridge already has another owner",
+        })?
+        .operation_guard = Some(guard);
+    Ok(objects)
+}
+
+#[cfg(test)]
+async fn run_managed_bridge_mutation<T, F>(operation: F) -> std::result::Result<T, crate::vector::lance::LanceManifestError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = std::result::Result<T, crate::vector::lance::LanceManifestError>> + Send + 'static,
+{
+    let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
+    let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
+    let operation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        operation,
+    );
+    crate::storage_api::table::spawn_traced_join(operation)
+        .await
+        .map_err(|source| crate::vector::lance::LanceManifestError::Storage {
+            operation: "join Managed Dataset mutation",
+            source: Box::new(source),
+        })?
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManagedObjectMultipartSession {
+    objects: ManagedLanceObjects,
+    key: crate::table_catalog::CatalogObjectKey,
+    upload: Arc<crate::app::object::ManagedMultipartUpload>,
+    state: Arc<tokio::sync::Mutex<ManagedObjectMultipartState>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ManagedObjectMultipartState {
+    // An absent receipt retains the identity of an interrupted or failed part.
+    parts: std::collections::BTreeMap<u16, Option<(crate::storage_api::startup::services::CompletePart, u64)>>,
+    completing: Option<u16>,
+    completed: Option<crate::table_catalog::TableCatalogObjectMetadata>,
+    aborted: bool,
+}
+
+#[cfg(test)]
+impl ManagedObjectMultipartSession {
+    fn invalid(reason: &'static str) -> crate::vector::lance::LanceManifestError {
+        crate::vector::lance::LanceManifestError::ReferenceMismatch { reason }
+    }
+
+    async fn complete_owned(
+        &self,
+        expected_parts: u16,
+    ) -> std::result::Result<crate::table_catalog::TableCatalogObjectMetadata, crate::vector::lance::LanceManifestError> {
+        self.objects.check_access(self.objects.context.access())?;
+        let mut state = self.state.lock().await;
+        if expected_parts == 0 || state.aborted || state.completing.is_some_and(|count| count != expected_parts) {
+            return Err(Self::invalid("multipart completion differs from its admitted upload"));
+        }
+        if state.parts.len() != usize::from(expected_parts) {
+            return Err(Self::invalid("multipart completion requires every part in 1..N"));
+        }
+        let mut total = 0_u64;
+        let mut receipts = Vec::with_capacity(usize::from(expected_parts));
+        for number in 1..=expected_parts {
+            let (receipt, size) = state
+                .parts
+                .get(&number)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| Self::invalid("multipart completion is missing an accepted part receipt"))?;
+            if receipt.part_num != usize::from(number) || receipt.etag.as_ref().is_none_or(String::is_empty) {
+                return Err(Self::invalid("multipart receipt does not identify its accepted part"));
+            }
+            total = total
+                .checked_add(*size)
+                .ok_or_else(|| Self::invalid("multipart byte count overflow"))?;
+            receipts.push(receipt.clone());
+        }
+        if let Some(completed) = &state.completed {
+            let revision = completed
+                .body_revision
+                .filter(|revision| !revision.is_nil())
+                .ok_or_else(|| Self::invalid("completed multipart has no exact body revision"))?;
+            let info = self
+                .objects
+                .usecase
+                .managed_confirm_completed_multipart_upload(&self.upload, revision)
+                .await
+                .map_err(|error| {
+                    ManagedLanceObjects::error("confirm completed Managed Dataset multipart", self.key.as_str(), error)
+                })?;
+            let metadata = ManagedLanceObjects::metadata(info)?;
+            if &metadata != completed || metadata.size != total {
+                return Err(Self::invalid("multipart completion replay changed the committed identity"));
+            }
+            self.objects.check_access(self.objects.context.access())?;
+            return Ok(metadata);
+        }
+        state.completing = Some(expected_parts);
+        let info = self
+            .objects
+            .usecase
+            .managed_complete_multipart_upload(&self.upload, receipts)
+            .await
+            .map_err(|error| ManagedLanceObjects::error("complete Managed Dataset multipart", self.key.as_str(), error))?;
+        let metadata = ManagedLanceObjects::metadata(info)?;
+        if metadata.size != total || metadata.body_revision.is_none() {
+            return Err(Self::invalid("completed multipart metadata differs from its accepted parts"));
+        }
+        state.completed = Some(metadata.clone());
+        self.objects.check_access(self.objects.context.access())?;
+        Ok(metadata)
+    }
+
+    async fn abort_owned(&self) -> std::result::Result<(), crate::vector::lance::LanceManifestError> {
+        self.objects.check_access(self.objects.context.access())?;
+        let mut state = self.state.lock().await;
+        if state.aborted || state.completed.is_some() {
+            return Ok(());
+        }
+        self.objects
+            .usecase
+            .managed_abort_multipart_upload(&self.upload)
+            .await
+            .map_err(|error| ManagedLanceObjects::error("abort Managed Dataset multipart", self.key.as_str(), error))?;
+        state.aborted = true;
+        self.objects.check_access(self.objects.context.access())
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl crate::vector::lance::ManagedDatasetMultipart for ManagedObjectMultipartSession {
+    async fn put_part(
+        &self,
+        part_number: u16,
+        content: Vec<bytes::Bytes>,
+        size: u64,
+    ) -> std::result::Result<(), crate::vector::lance::LanceManifestError> {
+        self.objects.check_access(self.objects.context.access())?;
+        if part_number == 0 {
+            return Err(Self::invalid("multipart part numbers start at one"));
+        }
+        let measured = content
+            .iter()
+            .try_fold(0_u64, |total, chunk| total.checked_add(u64::try_from(chunk.len()).ok()?));
+        if measured != Some(size) {
+            return Err(Self::invalid("multipart part byte count differs from its declared length"));
+        }
+        let mut state = self.state.lock().await;
+        if state.aborted || state.completing.is_some() || state.parts.contains_key(&part_number) {
+            return Err(Self::invalid("multipart part is duplicated or the upload is sealed"));
+        }
+        state.parts.insert(part_number, None);
+        // UploadPart keeps the application's native cancellation semantics.
+        let receipt = self
+            .objects
+            .usecase
+            .managed_upload_part(&self.upload, part_number, size, futures::stream::iter(content.into_iter().map(Ok)))
+            .await
+            .map_err(|error| ManagedLanceObjects::error("write Managed Dataset part", self.key.as_str(), error))?;
+        if receipt.part_num != usize::from(part_number) || receipt.etag.as_ref().is_none_or(String::is_empty) {
+            return Err(Self::invalid("multipart response has no exact part receipt"));
+        }
+        state.parts.insert(part_number, Some((receipt, size)));
+        self.objects.check_access(self.objects.context.access())
+    }
+
+    async fn complete(
+        &self,
+        expected_parts: u16,
+    ) -> std::result::Result<crate::table_catalog::TableCatalogObjectMetadata, crate::vector::lance::LanceManifestError> {
+        let session = self.clone();
+        run_managed_bridge_mutation(async move { session.complete_owned(expected_parts).await }).await
+    }
+
+    async fn abort(&self) -> std::result::Result<(), crate::vector::lance::LanceManifestError> {
+        let session = self.clone();
+        run_managed_bridge_mutation(async move { session.abort_owned().await }).await
+    }
 }
 
 pub(crate) struct StartupServiceRuntime {
@@ -1418,8 +1692,66 @@ mod managed_bridge_tests {
     }
 
     async fn fixture(encryption: ManagedEncryption) -> (BridgeFixture, impl Send) {
+        fixture_with_kms_authorizer(encryption, None).await
+    }
+
+    async fn fixture_with_kms_authorizer(
+        encryption: ManagedEncryption,
+        authorizer: Option<Arc<dyn crate::app::storage_api::test::sse::KmsKeyAuthorizer>>,
+    ) -> (BridgeFixture, impl Send) {
         let (request, initial_access, storage, reset) =
             crate::app::object::managed_request_fixture_with_encryption(encryption.clone()).await;
+        let kms_key_dir = if let ManagedEncryption::AwsKms { key_id } = &encryption {
+            use crate::app::storage_api::test::sse::{kms_sse_dek_provider_for_test, set_sse_dek_provider_for_test};
+            use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+            let directory = tempfile::TempDir::new().expect("KMS key directory");
+            let manager = Arc::new(rustfs_kms::KmsServiceManager::new());
+            manager
+                .reconfigure(rustfs_kms::KmsConfig::local(directory.path().to_path_buf()).with_insecure_development_defaults())
+                .await
+                .expect("instance KMS configuration");
+            manager
+                .get_encryption_service()
+                .await
+                .expect("KMS service")
+                .create_key(CreateKeyRequest {
+                    key_name: Some(key_id.clone()),
+                    key_usage: KeyUsage::EncryptDecrypt,
+                    description: None,
+                    policy: None,
+                    tags: Default::default(),
+                    origin: None,
+                })
+                .await
+                .expect("bridge KMS key");
+            set_sse_dek_provider_for_test(kms_sse_dek_provider_for_test(manager).await.expect("real KMS provider"));
+            Some(directory)
+        } else {
+            None
+        };
+        let request = if let Some(authorizer) = authorizer {
+            let mut extensions = request.residual_extensions().clone();
+            extensions.insert(request.request_context().expect("fixture request context").clone());
+            extensions.insert(request.server_context().expect("fixture server context").clone());
+            extensions.insert(request.req_info().expect("fixture request identity").clone());
+            extensions.insert(crate::app::storage_api::test::sse::TestAuthorizationHooks {
+                enforced: true,
+                authorizer,
+            });
+            Arc::new(crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: request.method().clone(),
+                    uri: request.uri().clone(),
+                    headers: request.headers().clone(),
+                    credentials: request.credentials().cloned(),
+                    region: request.region().map(str::to_owned),
+                    service: request.service().map(str::to_owned),
+                },
+                extensions,
+            ))
+        } else {
+            request
+        };
         let resource = CatalogResourceIdentity::try_new(
             initial_access.bucket().clone(),
             initial_access.table_id().clone(),
@@ -1479,7 +1811,10 @@ mod managed_bridge_tests {
             effective_encryption: match encryption {
                 ManagedEncryption::Unencrypted => VectorEffectiveEncryptionV1::Unencrypted,
                 ManagedEncryption::Aes256 => VectorEffectiveEncryptionV1::Aes256,
-                ManagedEncryption::AwsKms { .. } => unreachable!("fixture cases use unencrypted or AES256"),
+                ManagedEncryption::AwsKms { key_id } => VectorEffectiveEncryptionV1::AwsKms {
+                    kms_key_arn: format!("arn:aws:kms:us-east-1::key/{key_id}"),
+                    key_id,
+                },
             },
             tags: Default::default(),
         };
@@ -1557,7 +1892,7 @@ mod managed_bridge_tests {
                 objects,
                 limits,
             },
-            reset,
+            (reset, kms_key_dir),
         )
     }
 
@@ -1819,5 +2154,101 @@ mod managed_bridge_tests {
         })
         .await
         .expect("Catalog owner releases after native Complete finishes");
+    }
+    struct RevocableMultipartKmsAuthorizer {
+        allow_writes: std::sync::atomic::AtomicBool,
+        calls: std::sync::Mutex<Vec<(rustfs_policy::policy::action::KmsAction, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::app::storage_api::test::sse::KmsKeyAuthorizer for RevocableMultipartKmsAuthorizer {
+        async fn is_allowed(
+            &self,
+            _principal: &crate::app::storage_api::sse::SseKmsPrincipal,
+            action: rustfs_policy::policy::action::KmsAction,
+            key_id: &str,
+        ) -> std::result::Result<bool, crate::error::ApiError> {
+            self.calls
+                .lock()
+                .expect("KMS authorization calls")
+                .push((action, key_id.to_owned()));
+            Ok(action != rustfs_policy::policy::action::KmsAction::GenerateDataKeyAction
+                || self.allow_writes.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bridge_v3_complete_retry_rechecks_revoked_kms_write_permission() {
+        use rustfs_policy::policy::action::KmsAction;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let authorizer = Arc::new(RevocableMultipartKmsAuthorizer {
+            allow_writes: AtomicBool::new(true),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let kms_key_id = "managed-bridge-retry-key";
+        let (fixture, _reset) = fixture_with_kms_authorizer(
+            ManagedEncryption::AwsKms {
+                key_id: kms_key_id.to_owned(),
+            },
+            Some(authorizer.clone()),
+        )
+        .await;
+        let key = CatalogObjectKey::try_new(format!("{}data/kms-retry.lance", fixture.access.allowed_prefix())).unwrap();
+        let upload = fixture.objects.create_multipart(&fixture.access, &key).await.unwrap();
+        upload.put_part(1, vec![Bytes::from_static(b"kmsdata")], 7).await.unwrap();
+        let completed = upload.complete(1).await.expect("first completion publishes the KMS object");
+        assert_eq!(completed.size, 7);
+        assert!(completed.body_revision.is_some());
+
+        authorizer.allow_writes.store(false, Ordering::SeqCst);
+        authorizer.calls.lock().expect("KMS authorization calls").clear();
+        assert_eq!(
+            fixture
+                .objects
+                .head(&fixture.access, &key)
+                .await
+                .expect("Decrypt remains authorized"),
+            completed
+        );
+        {
+            let calls = authorizer.calls.lock().expect("KMS authorization calls");
+            assert!(
+                calls
+                    .iter()
+                    .any(|(action, key)| *action == KmsAction::DecryptAction && key == kms_key_id)
+            );
+            assert!(calls.iter().all(|(action, _)| *action != KmsAction::GenerateDataKeyAction));
+        }
+        let error = upload
+            .complete(1)
+            .await
+            .expect_err("completion retry must authorize the current KMS write permission");
+        let LanceManifestError::Storage { source, .. } = error else {
+            panic!("completion retry returned an unexpected error: {error}");
+        };
+        assert!(
+            matches!(
+                source.downcast_ref::<crate::app::object::ManagedObjectError>(),
+                Some(crate::app::object::ManagedObjectError::Api(api)) if api.code.as_str() == "AccessDenied"
+            ),
+            "completion retry must preserve KMS AccessDenied: {source}"
+        );
+        assert!(
+            authorizer
+                .calls
+                .lock()
+                .expect("KMS authorization calls")
+                .iter()
+                .any(|(action, key)| *action == KmsAction::GenerateDataKeyAction && key == kms_key_id)
+        );
+        authorizer.allow_writes.store(true, Ordering::SeqCst);
+        assert_eq!(
+            upload
+                .complete(1)
+                .await
+                .expect("restored KMS permission admits the exact completed object"),
+            completed
+        );
     }
 }

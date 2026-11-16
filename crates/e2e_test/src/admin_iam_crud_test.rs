@@ -146,7 +146,11 @@ async fn create_service_account_for(
         Some(serde_json::json!({ "targetUser": parent }).to_string()),
     )
     .await?;
-    let response: serde_json::Value = serde_json::from_str(&response)?;
+    service_account_keys(&response)
+}
+
+fn service_account_keys(response: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+    let response: serde_json::Value = serde_json::from_str(response)?;
     let access_key = response["credentials"]["accessKey"]
         .as_str()
         .ok_or("service account response should contain credentials.accessKey")?
@@ -341,6 +345,134 @@ async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestRe
     );
 
     env.stop_server();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delegated_service_account_creation_through_console_sessions() -> TestResult {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_without_cleanup(vec![]).await?;
+    let bucket = "delegated-backups";
+    let target = "backup-user";
+    let operator = "backup-operator";
+    let operator_secret = "operatorSecret123";
+    let wildcard_admin = "backup-admin";
+    let wildcard_secret = "adminSecret123";
+    let s3 = env.create_s3_client();
+    s3.create_bucket().bucket(bucket).send().await?;
+    for (name, secret) in [
+        (target, "backupSecret123"),
+        (operator, operator_secret),
+        (wildcard_admin, wildcard_secret),
+        ("other-user", "otherUserSecret123"),
+    ] {
+        admin_ok(
+            &env,
+            http::Method::PUT,
+            &format!("/rustfs/admin/v3/add-user?accessKey={name}"),
+            Some(serde_json::json!({"secretKey":secret,"status":"enabled"}).to_string()),
+        )
+        .await?;
+    }
+    let delegation = serde_json::json!({
+        "Version":"2012-10-17",
+        "Statement":[
+            {"Effect":"Allow","Action":"admin:CreateServiceAccount"},
+            {"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:s3:::*"},
+            {"Effect":"Allow","Action":"admin:CreateServiceAccountForUser","Condition":{"StringEquals":{"svc:TargetUser":target}}}
+        ]
+    });
+    let wildcard = serde_json::json!({
+        "Version":"2012-10-17",
+        "Statement":[
+            {"Effect":"Allow","Action":"admin:*"},
+            {"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:s3:::*"}
+        ]
+    });
+    for (user, name, policy) in [
+        (wildcard_admin, "backup-admin-wildcard", wildcard.to_string()),
+        (target, "backup-writer", bucket_rw_policy(bucket)),
+        (operator, "backup-key-manager", delegation.to_string()),
+    ] {
+        admin_ok(
+            &env,
+            http::Method::PUT,
+            &format!("/rustfs/admin/v3/add-canned-policy?name={name}"),
+            Some(policy),
+        )
+        .await?;
+        admin_ok(
+            &env,
+            http::Method::POST,
+            "/rustfs/admin/v3/idp/builtin/policy/attach",
+            Some(serde_json::json!({"policies":[name],"user":user}).to_string()),
+        )
+        .await?;
+    }
+    for (name, secret) in [
+        (operator, operator_secret),
+        (wildcard_admin, wildcard_secret),
+        (env.access_key.as_str(), env.secret_key.as_str()),
+    ] {
+        let session = build_test_sts_client(&env.url, name, secret, None, "delegated-create")
+            .assume_role()
+            .role_arn("arn:aws:iam::123456789012:role/console")
+            .role_session_name("console")
+            .send()
+            .await?;
+        let caller = session.credentials().ok_or("missing console session")?;
+        let create = |user: &str| {
+            admin_request_with_session_token(
+                &env.url,
+                http::Method::PUT,
+                "/rustfs/admin/v3/add-service-account",
+                Some(serde_json::json!({"targetUser":user}).to_string()),
+                caller.access_key_id(),
+                caller.secret_access_key(),
+                Some(caller.session_token()),
+            )
+        };
+        let (status, response) = create(target).await?;
+        assert_eq!(status, StatusCode::OK, "create for target as {name}");
+        let (key, secret) = service_account_keys(&response)?;
+        let client = build_s3_client(&env.url, &key, &secret);
+        wait_for_s3_put(&client, bucket, "backup", Duration::from_secs(10)).await?;
+        let denied = client
+            .create_bucket()
+            .bucket("outside-backup-policy")
+            .send()
+            .await
+            .expect_err("target cannot create unrelated buckets");
+        assert_eq!(denied.as_service_error().and_then(|e| e.code()), Some("AccessDenied"));
+        if name != env.access_key {
+            let (status, _) = create(&env.access_key).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "delegated targets exclude root");
+        }
+        if name == operator {
+            let (status, _) = create("other-user").await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "outside delegated target");
+        }
+    }
+    let restricted = build_test_sts_client(&env.url, &env.access_key, &env.secret_key, None, "restricted-root")
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/console")
+        .role_session_name("restricted-console")
+        .policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:CreateServiceAccount"}]}"#)
+        .send()
+        .await?;
+    let caller = restricted.credentials().ok_or("missing restricted root session")?;
+    let (status, _) = admin_request_with_session_token(
+        &env.url,
+        http::Method::PUT,
+        "/rustfs/admin/v3/add-service-account",
+        Some(serde_json::json!({"targetUser":target}).to_string()),
+        caller.access_key_id(),
+        caller.secret_access_key(),
+        Some(caller.session_token()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "restricted root session requires delegated permission");
     Ok(())
 }
 

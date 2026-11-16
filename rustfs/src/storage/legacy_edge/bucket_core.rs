@@ -20,58 +20,16 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
-use crate::storage::access::bucket_config_mutation_incarnation;
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
 use crate::storage::storage_api::ecfs_consumer::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage::storage_api::ecstore_bucket::utils::serialize as serialize_bucket_config;
-use crate::storage::validate_website_configuration;
-use crate::storage::{
-    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG, StorageError,
-    delete_bucket_metadata_config_if_incarnation, get_bucket_accelerate_config, get_bucket_logging_config,
-    get_bucket_request_payment_config, get_bucket_website_config, update_bucket_metadata_config_if_incarnation,
-};
 use crate::storage::{persisted_from_s3s, persisted_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{create_bucket, delete_bucket, head_bucket};
 use rustfs_gateway_types::compat::s3s_5761ddfe::get_bucket_location;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
-
-/// Handler bodies that [`S3`] runs through `audit_only_operation`.
-impl FS {
-    async fn put_bucket_logging_inner(
-        &self,
-        req: S3Request<PutBucketLoggingInput>,
-    ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        record_s3_op(S3Operation::PutBucketLogging);
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let bucket_logging_status = persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedBucketLoggingStatus>(
-            &req.input.bucket_logging_status,
-        )?;
-        let logging_config = serialize_bucket_config(&bucket_logging_status)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_LOGGING_CONFIG,
-            logging_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketLoggingOutput::default()))
-    }
-}
 
 impl FS {
     #[instrument(
@@ -117,20 +75,10 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        delete_bucket_metadata_config_if_incarnation(&req.input.bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
+        let envelope = RequestEnvelope::from_s3s(&req);
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_website(envelope, &req.input.bucket)
+            .await?;
         Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
     }
 
@@ -138,23 +86,13 @@ impl FS {
         &self,
         req: S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_accelerate_config(&req.input.bucket).await {
-            Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
-                status: accelerate.status.map(BucketAccelerateStatus::from),
-                ..Default::default()
-            })),
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput::default())),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_accelerate_configuration(&req.input.bucket)
+            .await?;
+        Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
+            status: config.status.map(BucketAccelerateStatus::from),
+            ..Default::default()
+        }))
     }
 
     /// Get bucket location
@@ -178,52 +116,28 @@ impl FS {
         &self,
         req: S3Request<GetBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_request_payment_config(&req.input.bucket).await {
-            Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
-                payer: Some(Payer::from(payment.payer)),
-            })),
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
-                payer: Some(Payer::from_static(Payer::BUCKET_OWNER)),
-            })),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_request_payment(&req.input.bucket)
+            .await?;
+        Ok(S3Response::new(GetBucketRequestPaymentOutput {
+            payer: Some(Payer::from(config.payer)),
+        }))
     }
 
     pub(in crate::storage::ecfs) async fn get_bucket_website_edge(
         &self,
         req: S3Request<GetBucketWebsiteInput>,
     ) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_website_config(&req.input.bucket).await {
-            Ok((website, _)) => {
-                let website: WebsiteConfiguration = persisted_to_s3s(&website)?;
-                Ok(S3Response::new(GetBucketWebsiteOutput {
-                    error_document: website.error_document,
-                    index_document: website.index_document,
-                    redirect_all_requests_to: website.redirect_all_requests_to,
-                    routing_rules: website.routing_rules,
-                }))
-            }
-            Err(StorageError::ConfigNotFound) => Err(s3_error!(NoSuchWebsiteConfiguration)),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_website(&req.input.bucket)
+            .await?;
+        let config: WebsiteConfiguration = persisted_to_s3s(&config)?;
+        Ok(S3Response::new(GetBucketWebsiteOutput {
+            error_document: config.error_document,
+            index_document: config.index_document,
+            redirect_all_requests_to: config.redirect_all_requests_to,
+            routing_rules: config.routing_rules,
+        }))
     }
 
     #[instrument(name = "head_bucket", level = "debug", skip(self, req))]
@@ -255,30 +169,13 @@ impl FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let accelerate_configuration = persisted_from_s3s::<
-            _,
-            rustfs_gateway_types::persistence::PersistedAccelerateConfiguration,
-        >(&req.input.accelerate_configuration)?;
-        let accelerate_config = serialize_bucket_config(&accelerate_configuration)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_ACCELERATE_CONFIG,
-            accelerate_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let usecase = s3_api::bucket_usecase_for(self);
+        usecase
+            .execute_put_bucket_accelerate_configuration(envelope, &req.input.bucket, || {
+                Ok(persisted_from_s3s(&req.input.accelerate_configuration)?)
+            })
+            .await?;
         Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
     }
 
@@ -287,61 +184,42 @@ impl FS {
         req: S3Request<GetBucketLoggingInput>,
     ) -> S3Result<S3Response<GetBucketLoggingOutput>> {
         record_s3_op(S3Operation::GetBucketLogging);
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        match get_bucket_logging_config(&req.input.bucket).await {
-            Ok((logging, _)) => {
-                let logging: BucketLoggingStatus = persisted_to_s3s(&logging)?;
-                Ok(S3Response::new(GetBucketLoggingOutput {
-                    logging_enabled: logging.logging_enabled,
-                }))
-            }
-            Err(StorageError::ConfigNotFound) => Ok(S3Response::new(GetBucketLoggingOutput::default())),
-            Err(err) => Err(crate::error::ApiError::from(err).into()),
-        }
+        let config = s3_api::bucket_usecase_for(self)
+            .execute_get_bucket_logging(&req.input.bucket)
+            .await?;
+        let config: BucketLoggingStatus = persisted_to_s3s(&config)?;
+        Ok(S3Response::new(GetBucketLoggingOutput {
+            logging_enabled: config.logging_enabled,
+        }))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_logging_edge(
         &self,
         req: S3Request<PutBucketLoggingInput>,
     ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        audit_only_operation(req, S3Operation::PutBucketLogging, |req| self.put_bucket_logging_inner(req)).await
+        record_s3_op(S3Operation::PutBucketLogging);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_logging(envelope, &req.input.bucket, || {
+                let config: rustfs_gateway_types::persistence::PersistedBucketLoggingStatus =
+                    persisted_from_s3s(&req.input.bucket_logging_status)?;
+                serialize_bucket_config(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(S3Response::new(PutBucketLoggingOutput::default()))
     }
 
     pub(in crate::storage::ecfs) async fn put_bucket_request_payment_edge(
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let request_payment_configuration = persisted_from_s3s::<
-            _,
-            rustfs_gateway_types::persistence::PersistedRequestPaymentConfiguration,
-        >(&req.input.request_payment_configuration)?;
-        let payment_config = serialize_bucket_config(&request_payment_configuration)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_REQUEST_PAYMENT_CONFIG,
-            payment_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let usecase = s3_api::bucket_usecase_for(self);
+        usecase
+            .execute_put_bucket_request_payment(envelope, &req.input.bucket, || {
+                Ok(persisted_from_s3s(&req.input.request_payment_configuration)?)
+            })
+            .await?;
         Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
     }
 
@@ -349,31 +227,11 @@ impl FS {
         &self,
         req: S3Request<PutBucketWebsiteInput>,
     ) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let website_configuration = persisted_from_s3s::<_, rustfs_gateway_types::persistence::PersistedWebsiteConfiguration>(
-            &req.input.website_configuration,
-        )?;
-        validate_website_configuration(&website_configuration)?;
-
-        let website_config = serialize_bucket_config(&website_configuration)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_WEBSITE_CONFIG,
-            website_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let usecase = s3_api::bucket_usecase_for(self);
+        usecase
+            .execute_put_bucket_website(envelope, &req.input.bucket, || Ok(persisted_from_s3s(&req.input.website_configuration)?))
+            .await?;
         Ok(S3Response::new(PutBucketWebsiteOutput::default()))
     }
 }

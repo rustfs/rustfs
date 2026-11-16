@@ -16,16 +16,18 @@
 //! AbortMultipartUpload: batch B2 of the gateway migration (rustfs/backlog#2765).
 //!
 //! `impl S3 for FS` in `ecfs.rs` calls the `*_edge` fn of each operation here. A migrated
-//! operation converts its request into the gateway's input, runs the owned use case and converts
-//! the answer back, then applies what the legacy encoder needs and the gateway's encoder does
+//! operation projects the request into owned values, runs the use case and converts the answer
+//! back, then applies what the legacy encoder needs and the gateway's encoder does
 //! itself: `encoding-type=url` (legacy RustFS's members and per-segment rule, the one the gateway
 //! applies under its RustFS profile) and XML escaping of entity tags. The batch that moves these
 //! operations onto the gateway owns this file and is the only one that edits it.
 
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api::bucket::encode_list_output_value;
-use crate::storage::s3_api::{self, mark_on_demand_migration_list_local_only};
+use crate::storage::s3_api::{
+    self, AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
+    mark_on_demand_migration_list_local_only, multipart::build_list_parts_output, reject_abort_capabilities,
+};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{
     list_multipart_uploads, list_object_versions, list_objects, list_objects_v2,
 };
@@ -33,14 +35,69 @@ use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use tracing::instrument;
 
+impl CreateMultipartUploadFields {
+    pub(crate) fn from_legacy(input: CreateMultipartUploadInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            key: input.key,
+            metadata: input.metadata,
+            tagging: input.tagging,
+            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
+            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
+            sse_customer_algorithm: input.sse_customer_algorithm,
+            sse_customer_key: input.sse_customer_key,
+            sse_customer_key_md5: input.sse_customer_key_md5,
+            ssekms_key_id: input.ssekms_key_id,
+            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
+            object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
+        }
+    }
+}
+
+impl DefaultMultipartUsecase {
+    pub(crate) async fn execute_create_multipart_upload_from_s3s(
+        &self,
+        mut req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let query_version = req.input.version_id.take();
+        let output = self
+            .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
+            .await?;
+        Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(output.bucket),
+            key: Some(output.key),
+            upload_id: Some(output.upload_id),
+            server_side_encryption: output.server_side_encryption.map(Into::into),
+            sse_customer_algorithm: output.sse_customer_algorithm,
+            sse_customer_key_md5: output.sse_customer_key_md5,
+            ssekms_key_id: output.ssekms_key_id,
+            checksum_algorithm: output.checksum_algorithm.map(Into::into),
+            checksum_type: output.checksum_type.map(Into::into),
+            ..Default::default()
+        }))
+    }
+}
+
 impl FS {
     #[instrument(name = "abort_multipart_upload", level = "debug", skip(self, req))]
     pub(in crate::storage::ecfs) async fn abort_multipart_upload_edge(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let usecase = s3_api::multipart_usecase_for(self);
-        audit_only_operation(req, S3Operation::AbortMultipartUpload, |req| usecase.execute_abort_multipart_upload(req)).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let target = reject_abort_capabilities(&envelope).map(|()| {
+            record_s3_op(S3Operation::AbortMultipartUpload);
+            let AbortMultipartUploadInput {
+                bucket, key, upload_id, ..
+            } = req.input;
+            AbortMultipartUploadTarget::Legacy { bucket, key, upload_id }
+        });
+        s3_api::multipart_usecase_for(self)
+            .execute_abort_multipart_upload(envelope, target)
+            .await?;
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     #[instrument(name = "create_multipart_upload", level = "debug", skip(self, req))]
@@ -49,8 +106,10 @@ impl FS {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         crate::hp_guard!("S3::create_multipart_upload");
-        let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_create_multipart_upload(req).await
+        record_s3_op(S3Operation::CreateMultipartUpload);
+        s3_api::multipart_usecase_for(self)
+            .execute_create_multipart_upload_from_s3s(req)
+            .await
     }
 
     pub(in crate::storage::ecfs) async fn list_multipart_uploads_edge(
@@ -129,7 +188,22 @@ impl FS {
     ) -> S3Result<S3Response<ListPartsOutput>> {
         record_s3_op(S3Operation::ListParts);
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_list_parts(req).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let ListPartsInput {
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            ..
+        } = req.input;
+        let fields = ListPartsFields {
+            target: ListPartsTarget::Legacy { bucket, key, upload_id },
+            part_number_marker: part_number_marker.map(|marker| marker.to_string()),
+            max_parts,
+        };
+        let page = usecase.execute_list_parts(envelope, fields).await?;
+        Ok(S3Response::new(build_list_parts_output(page)))
     }
 }
 

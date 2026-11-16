@@ -615,6 +615,7 @@ pub(in crate::table_catalog) fn catalog_prepared_request_digest(
     Ok(CatalogRequestDigest::from_bytes(encoding.0.finalize().into()))
 }
 
+#[cfg(test)]
 pub(crate) fn commit_log_matches_prepared(log: &CommitLogEntry, prepared: &PreparedCatalogCommit, table_id: &str) -> bool {
     let request = CatalogCommitFields::from_prepared(prepared);
     let fields_match = log.commit_id == request.commit_id
@@ -782,6 +783,7 @@ pub(in crate::table_catalog) trait CatalogCommitPreparation: Send + Sync {
 }
 
 pub(in crate::table_catalog) enum CatalogCommitInput<'a> {
+    #[cfg(test)]
     Prepared(Box<PreparedCatalogCommit>),
     Pending {
         fields: Box<CatalogCommitFields>,
@@ -793,6 +795,7 @@ pub(in crate::table_catalog) enum CatalogCommitInput<'a> {
 impl CatalogCommitInput<'_> {
     pub(in crate::table_catalog) fn fields(&self) -> CatalogCommitFields {
         match self {
+            #[cfg(test)]
             Self::Prepared(prepared) => CatalogCommitFields::from_prepared(prepared),
             Self::Pending { fields, .. } => fields.as_ref().clone(),
         }
@@ -800,6 +803,7 @@ impl CatalogCommitInput<'_> {
 
     pub(in crate::table_catalog) fn prepared(&self) -> Option<&PreparedCatalogCommit> {
         match self {
+            #[cfg(test)]
             Self::Prepared(prepared) => Some(prepared),
             Self::Pending { .. } => None,
         }
@@ -807,6 +811,7 @@ impl CatalogCommitInput<'_> {
 
     pub(in crate::table_catalog) fn matches_log(&self, log: &CommitLogEntry, table_id: &str) -> bool {
         match self {
+            #[cfg(test)]
             Self::Prepared(prepared) => commit_log_matches_prepared(log, prepared, table_id),
             Self::Pending {
                 fields, compatibility, ..
@@ -832,6 +837,7 @@ impl CatalogCommitInput<'_> {
         reader: Option<&dyn CatalogObjectReader>,
     ) -> TableCatalogStoreResult<PreparedCatalogCommit> {
         match self {
+            #[cfg(test)]
             Self::Prepared(prepared) => Ok(*prepared),
             Self::Pending {
                 fields,

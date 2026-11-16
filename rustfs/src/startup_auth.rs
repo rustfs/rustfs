@@ -33,10 +33,25 @@ const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
 const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
 const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
 
+// Config is published after the provider and mapper. All production initialization uses
+// this lock, so another listener reuses the complete publication instead of replacing it.
+static KEYSTONE_INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn init_keystone_auth_once(
+    config: rustfs_keystone::KeystoneConfig,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let _initializing = KEYSTONE_INITIALIZATION.lock().await;
+    if crate::auth_keystone::get_keystone_auth().is_some() && crate::auth_keystone::is_keystone_enabled() {
+        config.validate()?;
+        return Ok(());
+    }
+    crate::auth_keystone::init_keystone_auth(config).await
+}
+
 pub(crate) async fn init_auth_integrations(shutdown: CancellationToken) -> Result<Option<AbortOnDropHandle<()>>> {
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
-        match crate::auth_keystone::init_keystone_auth(keystone_config).await {
+        match init_keystone_auth_once(keystone_config).await {
             Ok(_) => info!(
                 event = EVENT_KEYSTONE_AUTH_INITIALIZED,
                 component = LOG_COMPONENT_MAIN,
@@ -139,6 +154,73 @@ fn oidc_extra_root_ca_generation(outbound_generation: u64, root_ca_pem: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keystone_initialization_reuses_the_provider_for_concurrent_calls() {
+        const ISOLATED: &str = "RUSTFS_TEST_KEYSTONE_INITIALIZATION_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("startup_auth::tests::keystone_initialization_reuses_the_provider_for_concurrent_calls")
+                .arg("--nocapture")
+                .env(ISOLATED, "1")
+                .output()
+                .expect("start isolated Keystone initialization test");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "isolated initializer must actually run: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::startup_runtime_hooks::install_default_crypto_provider().expect("TLS provider");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("initialization runtime");
+        runtime.block_on(async {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let start = |barrier: Arc<tokio::sync::Barrier>| {
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    let config = rustfs_keystone::KeystoneConfig {
+                        enable: true,
+                        auth_url: "https://keystone.example.test".into(),
+                        ..Default::default()
+                    };
+                    init_keystone_auth_once(config)
+                        .await
+                        .expect("concurrent Keystone initialization");
+                    crate::auth_keystone::get_keystone_auth().expect("published Keystone provider")
+                })
+            };
+            let left = start(Arc::clone(&barrier));
+            let right = start(barrier);
+            let (left, right) = tokio::join!(left, right);
+            let left = left.expect("left initializer");
+            let right = right.expect("right initializer");
+            assert!(Arc::ptr_eq(&left, &right), "concurrent listeners must share one provider");
+            init_keystone_auth_once(rustfs_keystone::KeystoneConfig {
+                enable: true,
+                auth_url: "https://keystone.example.test".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("later auth integration initialization");
+            assert!(
+                Arc::ptr_eq(&left, &crate::auth_keystone::get_keystone_auth().expect("retained provider")),
+                "auth integrations must retain the listener's provider"
+            );
+        });
+    }
 
     #[test]
     fn standard_oidc_runtime_retains_one_oidc_arc() {

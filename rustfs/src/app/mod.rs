@@ -35,7 +35,7 @@ pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
-mod select_request;
+pub(crate) mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
 pub(crate) mod trailer_adapter;
@@ -65,3 +65,5 @@ mod owned_authorization_test;
 mod put_prelookup_gating_test;
 #[cfg(test)]
 pub(crate) mod test_seams;
+#[cfg(test)]
+mod vector_access_tests;

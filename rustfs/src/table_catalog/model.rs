@@ -2142,7 +2142,9 @@ impl VectorCommitBindingV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogHead {
     resource_identity: CatalogResourceIdentity,
+    #[cfg(test)]
     namespace: Namespace,
+    #[cfg(test)]
     name: CatalogName,
     version_token: CatalogVersionToken,
     generation: CatalogGeneration,
@@ -2180,10 +2182,14 @@ impl CatalogHead {
                 "vector catalog entry contradicts head binding".to_string(),
             ));
         }
+        let _namespace = Namespace::parse(&entry.namespace).map_err(|err| TableCatalogStoreError::Invalid(err.to_string()))?;
+        let _name = CatalogName::parse(&entry.table).map_err(|err| TableCatalogStoreError::Invalid(err.to_string()))?;
         Ok(Self {
             resource_identity,
-            namespace: Namespace::parse(&entry.namespace).map_err(|err| TableCatalogStoreError::Invalid(err.to_string()))?,
-            name: CatalogName::parse(&entry.table).map_err(|err| TableCatalogStoreError::Invalid(err.to_string()))?,
+            #[cfg(test)]
+            namespace: _namespace,
+            #[cfg(test)]
+            name: _name,
             version_token: CatalogVersionToken::try_new(entry.version_token.clone())?,
             generation: CatalogGeneration(entry.generation),
             metadata,
@@ -2193,9 +2199,11 @@ impl CatalogHead {
     pub(crate) fn resource_identity(&self) -> &CatalogResourceIdentity {
         &self.resource_identity
     }
+    #[cfg(test)]
     pub(crate) fn namespace(&self) -> &Namespace {
         &self.namespace
     }
+    #[cfg(test)]
     pub(crate) fn name(&self) -> &CatalogName {
         &self.name
     }
@@ -2222,7 +2230,9 @@ impl CatalogHead {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogCommittedVersion {
+    #[cfg(test)]
     metadata: CatalogMetadataRef,
+    #[cfg(test)]
     format_descriptor: CatalogFormatDescriptor,
     commit_id: Option<CatalogCommitId>,
 }
@@ -2236,14 +2246,18 @@ impl CatalogCommittedVersion {
             return Err(TableCatalogStoreError::Invalid("catalog history descriptor mismatch".to_string()));
         }
         Ok(Self {
+            #[cfg(test)]
             metadata,
+            #[cfg(test)]
             format_descriptor,
             commit_id,
         })
     }
+    #[cfg(test)]
     pub(crate) fn metadata(&self) -> &CatalogMetadataRef {
         &self.metadata
     }
+    #[cfg(test)]
     pub(crate) fn format_descriptor(&self) -> &CatalogFormatDescriptor {
         &self.format_descriptor
     }
@@ -2251,10 +2265,12 @@ impl CatalogCommittedVersion {
         self.commit_id.as_ref()
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogCommittedHistory {
     versions: Vec<CatalogCommittedVersion>,
 }
+#[cfg(test)]
 impl CatalogCommittedHistory {
     pub(in crate::table_catalog) fn new(versions: Vec<CatalogCommittedVersion>) -> Self {
         Self { versions }
@@ -2379,6 +2395,7 @@ impl VectorEffectiveEncryptionV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_bytes(&self) -> TableCatalogStoreResult<Vec<u8>> {
         self.validate()?;
         match self {
@@ -2400,6 +2417,7 @@ impl VectorEffectiveEncryptionV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn descriptor_sha256(&self) -> TableCatalogStoreResult<CatalogContentSha256> {
         Ok(CatalogContentSha256::digest(&self.canonical_bytes()?))
     }
@@ -2535,6 +2553,7 @@ impl VectorResourceMutationBindingV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::table_catalog) fn request_digest(
         &self,
         prepared: &PreparedCatalogCommit,
@@ -3006,6 +3025,7 @@ impl CatalogRecordRepresentation<VectorCommitBindingFields> {
 }
 
 impl PreparedCatalogCommit {
+    #[cfg(test)]
     pub(in crate::table_catalog) fn with_vector_resource_mutation(
         mut self,
         mutation: VectorResourceMutationBindingV1,
@@ -3030,6 +3050,7 @@ impl PreparedCatalogCommit {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum VectorIndexCreatePhase {
@@ -3039,6 +3060,7 @@ pub(crate) enum VectorIndexCreatePhase {
     Aborted,
     ManualReview,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexCreatePhase {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match String::deserialize(deserializer)?.as_str() {
@@ -3051,6 +3073,7 @@ impl<'de> Deserialize<'de> for VectorIndexCreatePhase {
         }
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum VectorIndexDeletePhase {
@@ -3060,6 +3083,7 @@ pub(crate) enum VectorIndexDeletePhase {
     Complete,
     ManualReview,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexDeletePhase {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match String::deserialize(deserializer)?.as_str() {
@@ -3072,12 +3096,14 @@ impl<'de> Deserialize<'de> for VectorIndexDeletePhase {
         }
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VectorIndexCreateParentV1 {
     pub bucket_entry_etag: String,
     pub bucket: VectorBucketBindingV1,
     pub state: TableCatalogEntryState,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexCreateParentV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -3097,6 +3123,7 @@ impl<'de> Deserialize<'de> for VectorIndexCreateParentV1 {
         })
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VectorIndexCreateNameV1 {
     pub table_id: String,
@@ -3105,6 +3132,7 @@ pub(crate) struct VectorIndexCreateNameV1 {
     pub state: TableCatalogEntryState,
     pub entry_etag: String,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexCreateNameV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -3127,11 +3155,13 @@ impl<'de> Deserialize<'de> for VectorIndexCreateNameV1 {
         })
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VectorIndexCreateCandidateV1 {
     pub metadata: CatalogMetadataRefRecordV1,
     pub descriptor: CatalogFormatDescriptorRecordV1,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexCreateCandidateV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -3149,6 +3179,7 @@ impl<'de> Deserialize<'de> for VectorIndexCreateCandidateV1 {
         })
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VectorIndexCreateIntentV1 {
     pub version: u16,
@@ -3170,6 +3201,7 @@ pub(crate) struct VectorIndexCreateIntentV1 {
     pub created_at: String,
     pub updated_at: String,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexCreateIntentV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -3222,6 +3254,7 @@ impl<'de> Deserialize<'de> for VectorIndexCreateIntentV1 {
         })
     }
 }
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VectorIndexDeleteIntentV1 {
     pub version: u16,
@@ -3237,6 +3270,7 @@ pub(crate) struct VectorIndexDeleteIntentV1 {
     pub created_at: String,
     pub updated_at: String,
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for VectorIndexDeleteIntentV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -3273,6 +3307,7 @@ impl<'de> Deserialize<'de> for VectorIndexDeleteIntentV1 {
         })
     }
 }
+#[cfg(test)]
 fn deserialize_vector_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3281,12 +3316,14 @@ where
     Option::deserialize(deserializer)
 }
 
+#[cfg(test)]
 fn deserialize_vector_bucket_record<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<VectorBucketBindingV1, D::Error> {
     deserialize_vector_record(deserializer)
 }
 
+#[cfg(test)]
 fn deserialize_vector_metadata_record<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<CatalogMetadataRefRecordV1, D::Error> {
@@ -3311,6 +3348,7 @@ fn deserialize_vector_metadata_record<'de, D: serde::Deserializer<'de>>(
     })
 }
 
+#[cfg(test)]
 fn deserialize_vector_descriptor_record<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<CatalogFormatDescriptorRecordV1, D::Error> {
@@ -3334,6 +3372,7 @@ fn deserialize_vector_descriptor_record<'de, D: serde::Deserializer<'de>>(
     })
 }
 
+#[cfg(test)]
 fn validate_vector_intent_uuid(value: &str) -> TableCatalogStoreResult<()> {
     let id = Uuid::parse_str(value).map_err(|_| TableCatalogStoreError::Invalid("invalid Vector lifecycle UUID".into()))?;
     if id.is_nil() || id.to_string() != value {
@@ -3344,6 +3383,7 @@ fn validate_vector_intent_uuid(value: &str) -> TableCatalogStoreResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_vector_intent_timestamps(created_at: &str, updated_at: &str) -> TableCatalogStoreResult<()> {
     let parse = |value| {
         OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
@@ -3359,6 +3399,7 @@ fn validate_vector_intent_timestamps(created_at: &str, updated_at: &str) -> Tabl
     Ok(())
 }
 
+#[cfg(test)]
 impl VectorIndexCreateIntentV1 {
     pub(in crate::table_catalog) fn resource_identity(&self) -> TableCatalogStoreResult<CatalogResourceIdentity> {
         validate_vector_intent_uuid(&self.table_id)?;
@@ -3496,6 +3537,7 @@ impl VectorIndexCreateIntentV1 {
     }
 }
 
+#[cfg(test)]
 impl VectorIndexDeleteIntentV1 {
     pub(in crate::table_catalog) fn canonical_request_digest(&self) -> TableCatalogStoreResult<CatalogRequestDigest> {
         let head = CatalogHead::from_vector_entry(&self.expected_entry)?;
@@ -3575,6 +3617,7 @@ impl VectorIndexDeleteIntentV1 {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct VectorIndexCreateRequest {
     pub resource_identity: CatalogResourceIdentity,
@@ -3588,6 +3631,7 @@ pub(crate) struct VectorIndexCreateRequest {
 }
 
 impl CatalogExpectedHead {
+    #[cfg(test)]
     pub(in crate::table_catalog) fn for_vector_creation(create_id: &str) -> TableCatalogStoreResult<Self> {
         validate_vector_intent_uuid(create_id)?;
         Ok(Self {

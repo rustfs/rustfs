@@ -976,3 +976,31 @@ fn build_args_asks_about_the_target_as_the_principal() {
     assert!(!args.is_owner, "ownership is never assumed");
     assert_eq!(args.account, "");
 }
+
+#[test]
+fn keystone_session_presence_preserves_legacy_username_without_retaining_a_token() {
+    for (had_session, expired, expected) in [
+        (false, false, "keystone:user-id"),
+        (true, false, "legacy-parent"),
+        (true, true, "keystone:user-id"),
+        (false, true, "keystone:user-id"),
+    ] {
+        let mut credentials = Credentials {
+            access_key: "keystone:user-id".into(),
+            parent_user: "legacy-parent".into(),
+            expiration: Some(
+                OffsetDateTime::now_utc()
+                    + if expired {
+                        time::Duration::hours(-1)
+                    } else {
+                        time::Duration::hours(1)
+                    },
+            ),
+            ..Default::default()
+        };
+        let principal = AuthzPrincipal::with_session_presence(&credentials, "", Some(had_session));
+        assert_eq!(principal.username, expected);
+        credentials.session_token = if had_session { "original-session" } else { "" }.into();
+        assert_eq!(AuthzPrincipal::new(&credentials, "").username, expected);
+    }
+}

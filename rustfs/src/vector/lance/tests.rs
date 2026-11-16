@@ -1382,14 +1382,15 @@ async fn managed_data_put_and_streamed_ranges_preserve_exact_identity() {
     assert!(created.version.is_some());
     let range = store.get_range(&path, 13..(data.len() as u64 - 17)).await.unwrap();
     assert_eq!(range, data.slice(13..data.len() - 17));
-    let ranges = objects.ranges.lock().unwrap();
-    assert!(ranges.len() > 1);
-    assert!(
-        ranges
-            .iter()
-            .all(|range| range.as_ref().is_some_and(|range| range.end - range.start <= 1024 * 1024))
-    );
-    drop(ranges);
+    {
+        let ranges = objects.ranges.lock().unwrap();
+        assert!(ranges.len() > 1);
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.as_ref().is_some_and(|range| range.end - range.start <= 1024 * 1024))
+        );
+    }
     assert!(
         store
             .put_opts(&path, Bytes::from_static(b"replacement").into(), PutOptions::default())
@@ -2606,4 +2607,1088 @@ async fn dataset_distance_4096_dimensions_preserve_f64_extreme_results() {
         assert!((found[0].distance_f64 - expected).abs() <= expected * 1e-12);
         assert!(found[0].distance_f64.is_finite());
     }
+}
+
+#[derive(Clone)]
+struct ServiceRequestFixture {
+    request: crate::vector::protocol::Request,
+    bucket: crate::storage_api::vector::BucketHandle,
+    name: crate::table_catalog::CatalogName,
+    backend: crate::table_catalog::test_support::TestCatalogObjectBackend,
+    deny: bool,
+    managed_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::vector::service::VectorRequestAccess for ServiceRequestFixture {
+    fn request(&self) -> &crate::vector::protocol::Request {
+        &self.request
+    }
+    fn request_id(&self) -> crate::vector::service::VectorRequestId {
+        crate::vector::service::VectorRequestId::try_new(uuid::Uuid::from_u128(301)).unwrap()
+    }
+    fn bucket(&self) -> &crate::storage_api::vector::BucketHandle {
+        &self.bucket
+    }
+    fn index_name(&self) -> &crate::table_catalog::CatalogName {
+        &self.name
+    }
+
+    async fn authorize_index(
+        &self,
+        request: &crate::vector::protocol::Request,
+        resource: &crate::table_catalog::CatalogResourceIdentity,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<(), crate::vector::service::VectorServiceError> {
+        assert_eq!(request, &self.request);
+        assert_eq!(resource.vector_bucket(), Some(&self.bucket));
+        definition.validate()?;
+        if self.deny {
+            return Err(crate::vector::protocol::ProtocolError::new(
+                crate::vector::protocol::ErrorCode::AccessDenied,
+                "fixture denial",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn resolve_index_definition(
+        &self,
+        input: &crate::vector::protocol::dto::CreateIndexInput,
+    ) -> Result<crate::table_catalog::VectorIndexDefinitionV1, crate::vector::service::VectorServiceError> {
+        assert!(input.encryption_configuration.is_none());
+        Ok(crate::table_catalog::VectorIndexDefinitionV1 {
+            version: 1,
+            effective_encryption: crate::table_catalog::VectorEffectiveEncryptionV1::Unencrypted,
+            tags: input.tags.clone().unwrap_or_default(),
+        })
+    }
+
+    async fn managed_dataset(
+        &self,
+        guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<crate::vector::service::ManagedDatasetAccess, crate::vector::service::VectorServiceError> {
+        use crate::storage_api::vector::{ManagedObjectAccess, ManagedObjectOperation};
+        guard.check_held()?;
+        definition.validate()?;
+        self.managed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let resource = guard.resource_identity();
+        let access = ManagedObjectAccess::try_from_parts(
+            self.bucket.clone(),
+            resource.table_id().clone(),
+            resource.dataset_prefix(),
+            [
+                ManagedObjectOperation::CreateOnly,
+                ManagedObjectOperation::Get,
+                ManagedObjectOperation::Head,
+                ManagedObjectOperation::Range,
+                ManagedObjectOperation::CreateMultipart,
+                ManagedObjectOperation::UploadPart,
+                ManagedObjectOperation::CompleteMultipart,
+                ManagedObjectOperation::AbortMultipart,
+            ]
+            .into(),
+        )
+        .unwrap();
+        Ok(crate::vector::service::ManagedDatasetAccess {
+            access,
+            objects: Arc::new(CatalogManagedObjects(self.backend.clone())),
+        })
+    }
+}
+
+fn service_request(fixture: &CatalogFixture) -> ServiceRequestFixture {
+    use crate::vector::protocol::{Request, dto};
+    ServiceRequestFixture {
+        request: Request::CreateIndex(dto::CreateIndexInput {
+            vector_bucket_name: Some("vectors".into()),
+            vector_bucket_arn: None,
+            index_name: "service-index".into(),
+            data_type: dto::DataType::Float32,
+            dimension: 3,
+            distance_metric: dto::DistanceMetric::Cosine,
+            metadata_configuration: Some(dto::MetadataConfiguration {
+                non_filterable_metadata_keys: vec!["private".into()],
+            }),
+            encryption_configuration: None,
+            tags: Some([("owner".into(), "research".into())].into()),
+        }),
+        bucket: managed_access().bucket().clone(),
+        name: crate::table_catalog::CatalogName::parse("service-index").unwrap(),
+        backend: fixture.backend.clone(),
+        deny: false,
+        managed_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+fn index_service(
+    fixture: &CatalogFixture,
+) -> crate::vector::service::VectorService<crate::table_catalog::test_support::TestCatalogObjectBackend> {
+    crate::vector::service::VectorService::new(fixture.store.clone(), io_limits(), std::num::NonZeroUsize::new(3).unwrap())
+}
+
+#[tokio::test]
+async fn service_creation_publishes_real_initial_manifest_and_restores_reserved_identity() {
+    use crate::vector::{protocol::Response, service::VectorExecution};
+    let fixture = catalog_fixture().await;
+    let context = service_request(&fixture);
+    let service = index_service(&fixture);
+    let result = service.execute(&context).await.unwrap();
+    assert!(
+        matches!(result, VectorExecution::Complete(Response::CreateIndex(output)) if output.index_arn == "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index")
+    );
+    let (guard, entry) = fixture
+        .store
+        .begin_vector_operation(
+            &context.bucket,
+            &crate::table_catalog::Namespace::parse("indexes").unwrap(),
+            &context.name,
+        )
+        .await
+        .unwrap();
+    let original_identity = guard.resource_identity().clone();
+    assert_eq!(entry.head().generation().get(), 1);
+    assert_eq!(entry.definition().tags.get("owner").map(String::as_str), Some("research"));
+    assert!(entry.head().metadata().body_revision().is_some());
+    let original_reference = entry.head().metadata().clone();
+    drop(guard);
+    let calls = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
+    service.resume_index_creation(&context).await.unwrap();
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    let (guard, entry) = fixture
+        .store
+        .begin_vector_operation(
+            &context.bucket,
+            &crate::table_catalog::Namespace::parse("indexes").unwrap(),
+            &context.name,
+        )
+        .await
+        .unwrap();
+    assert_eq!(guard.resource_identity(), &original_identity);
+    assert_eq!(entry.head().metadata(), &original_reference);
+}
+
+#[tokio::test]
+async fn service_crud_and_prefilter_use_published_catalog_data() {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::VectorExecution,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: vec![
+            dto::PutInputVector {
+                key: "near-denied".into(),
+                data: dto::VectorData {
+                    float32: vec![1.0, 0.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"genre":"drama"})),
+            },
+            dto::PutInputVector {
+                key: "far-allowed".into(),
+                data: dto::VectorData {
+                    float32: vec![0.0, 1.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"genre":"comedy"})),
+            },
+        ],
+    });
+    service.execute(&context).await.unwrap();
+    context.request = Request::QueryVectors(dto::QueryVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        top_k: 1,
+        query_vector: dto::VectorData {
+            float32: vec![1.0, 0.0, 0.0],
+        },
+        filter: Some(serde_json::json!({"genre":"comedy"})),
+        query_mode: Some(dto::IndexMode::Enhanced),
+        return_metadata: Some(true),
+        return_distance: Some(true),
+        next_token: None,
+    });
+    let VectorExecution::QueryVectors(query) = service.execute(&context).await.unwrap() else {
+        panic!("expected prepared query");
+    };
+    assert_eq!(query.candidates[0].key, "far-allowed");
+    assert_eq!(query.candidates[0].distance_f64, 1.0);
+    assert_eq!(query.metadata_rows.as_ref().unwrap()[0].metadata.as_ref().unwrap()["genre"], "comedy");
+    context.request = Request::DeleteVectors(dto::DeleteVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        keys: vec!["far-allowed".into()],
+    });
+    service.execute(&context).await.unwrap();
+    assert_eq!(
+        query
+            .snapshot
+            .get(&["far-allowed".into()], all_vector_fields())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    context.request = Request::GetVectors(dto::GetVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        keys: vec!["near-denied".into()],
+        return_data: Some(true),
+        return_metadata: Some(true),
+    });
+    let VectorExecution::GetVectors(get) = service.execute(&context).await.unwrap() else {
+        panic!("expected prepared get");
+    };
+    assert_eq!(get.vectors.len(), 1);
+    assert_eq!(get.vectors[0].data.as_ref().unwrap().float32, vec![1.0, 0.0, 0.0]);
+}
+
+#[tokio::test]
+async fn service_denial_prevents_managed_object_access() {
+    use crate::vector::protocol::{Request, dto};
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.deny = true;
+    context.request = Request::GetVectors(dto::GetVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        keys: vec!["anything".into()],
+        return_data: Some(true),
+        return_metadata: Some(true),
+    });
+    let before = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        matches!(service.execute(&context).await, Err(crate::vector::service::VectorServiceError::Protocol(error)) if error.code() == crate::vector::protocol::ErrorCode::AccessDenied)
+    );
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+#[tokio::test]
+async fn service_delete_index_blocks_new_vector_operations() {
+    use crate::vector::protocol::{Request, dto};
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.request = Request::DeleteIndex(dto::DeleteIndexInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+    });
+    service.execute(&context).await.unwrap();
+    let result = fixture
+        .store
+        .begin_vector_operation(
+            &context.bucket,
+            &crate::table_catalog::Namespace::parse("indexes").unwrap(),
+            &context.name,
+        )
+        .await;
+    assert!(matches!(result, Err(crate::table_catalog::TableCatalogStoreError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn service_repeated_put_keys_fail_before_catalog_and_object_io() {
+    use crate::vector::protocol::{Request, dto};
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: vec![
+            dto::PutInputVector {
+                key: "same".into(),
+                data: dto::VectorData {
+                    float32: vec![1.0, 0.0, 0.0],
+                },
+                metadata: None,
+            },
+            dto::PutInputVector {
+                key: "same".into(),
+                data: dto::VectorData {
+                    float32: vec![0.0, 1.0, 0.0],
+                },
+                metadata: None,
+            },
+        ],
+    });
+    let before = {
+        let state = fixture.backend.state.lock().await;
+        (state.read_calls, state.metadata_calls, state.put_attempts.clone(), state.objects.clone())
+    };
+    assert!(matches!(
+        service.execute(&context).await,
+        Err(crate::vector::service::VectorServiceError::Dataset(
+            super::dataset::DatasetError::DuplicateInputKey { position: 1 }
+        ))
+    ));
+    let state = fixture.backend.state.lock().await;
+    assert_eq!(
+        (state.read_calls, state.metadata_calls, state.put_attempts.clone(), state.objects.clone()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn service_index_tags_merge_remove_and_preserve_dataset_identity() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::VectorExecution,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    let namespace = crate::table_catalog::Namespace::parse("indexes").unwrap();
+    let (guard, before) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    let identity = guard.resource_identity().clone();
+    drop(guard);
+    let managed_calls = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
+    let resource_arn = "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index".to_owned();
+    context.request = Request::TagResource(dto::TagResourceInput {
+        resource_arn: resource_arn.clone(),
+        tags: [("owner".into(), "updated".into()), ("keep".into(), "yes".into())].into(),
+    });
+    assert!(matches!(
+        service.execute(&context).await.unwrap(),
+        VectorExecution::Complete(Response::TagResource(_))
+    ));
+    context.request = Request::UntagResource(dto::UntagResourceInput {
+        resource_arn: resource_arn.clone(),
+        tag_keys: vec!["owner".into(), "missing".into()],
+    });
+    assert!(matches!(
+        service.execute(&context).await.unwrap(),
+        VectorExecution::Complete(Response::UntagResource(_))
+    ));
+    context.request = Request::ListTagsForResource(dto::ListTagsForResourceInput { resource_arn });
+    let VectorExecution::Complete(Response::ListTagsForResource(output)) = service.execute(&context).await.unwrap() else {
+        panic!("expected tags response")
+    };
+    assert_eq!(output.tags, [("keep".into(), "yes".into())].into());
+    let (guard, after) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    assert_eq!(guard.resource_identity(), &identity);
+    assert_eq!(after.head().metadata(), before.head().metadata());
+    assert_eq!(after.head().generation().get(), before.head().generation().get() + 2);
+    assert_eq!(after.definition().effective_encryption, before.definition().effective_encryption);
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), managed_calls);
+}
+
+#[tokio::test]
+async fn service_index_tag_denial_preserves_authoritative_entry() {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::VectorServiceError,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    let namespace = crate::table_catalog::Namespace::parse("indexes").unwrap();
+    let (guard, before) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    drop(guard);
+    context.deny = true;
+    context.request = Request::TagResource(dto::TagResourceInput {
+        resource_arn: "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index".into(),
+        tags: [("owner".into(), "denied".into())].into(),
+    });
+    assert!(
+        matches!(service.execute(&context).await, Err(VectorServiceError::Protocol(error)) if error.code() == crate::vector::protocol::ErrorCode::AccessDenied)
+    );
+    let (_, after) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    assert_eq!(after.head().resource_identity(), before.head().resource_identity());
+    assert_eq!(after.head().namespace(), before.head().namespace());
+    assert_eq!(after.head().name(), before.head().name());
+    assert_eq!(after.head().version_token(), before.head().version_token());
+    assert_eq!(after.head().generation(), before.head().generation());
+    assert_eq!(after.head().metadata(), before.head().metadata());
+    assert_eq!(after.head().format_descriptor(), before.head().format_descriptor());
+    assert_eq!(after.definition(), before.definition());
+}
+
+#[tokio::test]
+async fn service_enhanced_mode_checks_live_index_without_new_head() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::{VectorExecution, VectorServiceError},
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    let namespace = crate::table_catalog::Namespace::parse("indexes").unwrap();
+    let (guard, before) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    drop(guard);
+    context.request = Request::UpdateIndexMode(dto::UpdateIndexModeInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        index_mode: dto::IndexMode::Enhanced,
+    });
+    assert!(matches!(
+        service.execute(&context).await.unwrap(),
+        VectorExecution::Complete(Response::UpdateIndexMode(_))
+    ));
+    let (guard, after) = fixture
+        .store
+        .begin_vector_operation(&context.bucket, &namespace, &context.name)
+        .await
+        .unwrap();
+    assert_eq!(after.head().resource_identity(), before.head().resource_identity());
+    assert_eq!(after.head().namespace(), before.head().namespace());
+    assert_eq!(after.head().name(), before.head().name());
+    assert_eq!(after.head().version_token(), before.head().version_token());
+    assert_eq!(after.head().generation(), before.head().generation());
+    assert_eq!(after.head().metadata(), before.head().metadata());
+    assert_eq!(after.head().format_descriptor(), before.head().format_descriptor());
+    drop(guard);
+    context.deny = true;
+    assert!(
+        matches!(service.execute(&context).await, Err(VectorServiceError::Protocol(error)) if error.code() == crate::vector::protocol::ErrorCode::AccessDenied)
+    );
+    context.deny = false;
+    if let Request::UpdateIndexMode(input) = &mut context.request {
+        input.index_mode = dto::IndexMode::Classic;
+    }
+    assert!(
+        matches!(service.execute(&context).await, Err(VectorServiceError::Protocol(error)) if error.code() == crate::vector::protocol::ErrorCode::Validation)
+    );
+}
+
+#[tokio::test]
+async fn service_query_output_preserves_f64_order_and_encodes_float_boundaries() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::VectorExecution,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    let Request::CreateIndex(input) = &mut context.request else {
+        panic!("expected the Index creation fixture");
+    };
+    input.distance_metric = dto::DistanceMetric::Euclidean;
+    service.execute(&context).await.expect("create the Euclidean Index");
+    let below_max = f32::from_bits(f32::MAX.to_bits() - 1);
+    let records = [
+        ("a-overflow", [f32::MAX, f32::MAX, 0.0]),
+        ("b-just-over", [f32::MAX, f32::MAX * 0.0001_f32, 0.0]),
+        ("y-maximum", [f32::MAX, 0.0, 0.0]),
+        ("z-below", [below_max, 0.0, 0.0]),
+    ];
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: records
+            .into_iter()
+            .map(|(key, data)| dto::PutInputVector {
+                key: key.into(),
+                data: dto::VectorData { float32: data.into() },
+                metadata: Some(serde_json::json!({"source": key})),
+            })
+            .collect(),
+    });
+    service.execute(&context).await.expect("publish the finite boundary vectors");
+    let expected_keys = ["z-below", "y-maximum", "b-just-over", "a-overflow"];
+    for (return_metadata, return_distance) in [(true, true), (false, true), (true, false), (false, false)] {
+        context.request = Request::QueryVectors(dto::QueryVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            top_k: 4,
+            query_vector: dto::VectorData { float32: vec![0.0; 3] },
+            filter: None,
+            query_mode: Some(dto::IndexMode::Enhanced),
+            return_metadata: Some(return_metadata),
+            return_distance: Some(return_distance),
+            next_token: None,
+        });
+        let VectorExecution::QueryVectors(query) = service.execute(&context).await.expect("query the published boundary vectors")
+        else {
+            panic!("expected the prepared boundary query");
+        };
+        assert_eq!(
+            query
+                .candidates
+                .iter()
+                .map(|candidate| candidate.key.as_str())
+                .collect::<Vec<_>>(),
+            expected_keys
+        );
+        assert!(query.candidates[2].distance_f64 > f64::from(f32::MAX));
+        assert_eq!(query.candidates[2].distance_f64 as f32, f32::MAX);
+        assert!(query.candidates[3].distance_f64 > query.candidates[2].distance_f64);
+        let output = query.into_output().expect("convert the fixed query result");
+        assert_eq!(output.distance_metric, dto::DistanceMetric::Euclidean);
+        assert!(output.next_token.is_none());
+        assert_eq!(output.vectors.iter().map(|vector| vector.key.as_str()).collect::<Vec<_>>(), expected_keys);
+        if return_distance {
+            assert_eq!(output.vectors[0].distance, Some(below_max));
+            assert_eq!(output.vectors[1].distance, Some(f32::MAX));
+            assert_eq!(output.vectors[2].distance, Some(f32::INFINITY));
+            assert_eq!(output.vectors[3].distance, Some(f32::INFINITY));
+        } else {
+            assert!(output.vectors.iter().all(|vector| vector.distance.is_none()));
+        }
+        let body = Response::QueryVectors(output)
+            .body_bytes()
+            .expect("serialize the protocol response");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("decode the actual response JSON");
+        assert_eq!(json["distanceMetric"], "euclidean");
+        assert!(json.get("nextToken").is_none());
+        for (position, key) in expected_keys.iter().enumerate() {
+            let vector = &json["vectors"][position];
+            assert_eq!(vector["key"].as_str(), Some(*key));
+            if return_metadata {
+                assert_eq!(vector["metadata"], serde_json::json!({"source": key}));
+            } else {
+                assert!(vector.get("metadata").is_none());
+            }
+            if !return_distance {
+                assert!(vector.get("distance").is_none());
+            } else if position < 2 {
+                assert!(vector["distance"].is_number());
+            } else {
+                assert_eq!(vector["distance"], "Infinity");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_query_output_retains_snapshot_metadata_and_cosine_metric() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::VectorExecution,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.expect("create the cosine Index");
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: vec![
+            dto::PutInputVector {
+                key: "z-first".into(),
+                data: dto::VectorData {
+                    float32: vec![1.0, 0.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"edition": "original"})),
+            },
+            dto::PutInputVector {
+                key: "a-second".into(),
+                data: dto::VectorData {
+                    float32: vec![0.0, 1.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"edition": "second"})),
+            },
+        ],
+    });
+    service.execute(&context).await.expect("publish the original metadata");
+    context.request = Request::QueryVectors(dto::QueryVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        top_k: 2,
+        query_vector: dto::VectorData {
+            float32: vec![1.0, 0.0, 0.0],
+        },
+        filter: None,
+        query_mode: Some(dto::IndexMode::Enhanced),
+        return_metadata: Some(true),
+        return_distance: Some(true),
+        next_token: None,
+    });
+    let VectorExecution::QueryVectors(query) = service.execute(&context).await.expect("prepare the original snapshot result")
+    else {
+        panic!("expected the prepared cosine query");
+    };
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: vec![dto::PutInputVector {
+            key: "z-first".into(),
+            data: dto::VectorData {
+                float32: vec![1.0, 0.0, 0.0],
+            },
+            metadata: Some(serde_json::json!({"edition": "replacement"})),
+        }],
+    });
+    service
+        .execute(&context)
+        .await
+        .expect("publish replacement metadata in a new snapshot");
+    let output = query.into_output().expect("convert the original fixed snapshot");
+    assert_eq!(output.distance_metric, dto::DistanceMetric::Cosine);
+    assert_eq!(output.vectors[0].key, "z-first");
+    assert_eq!(output.vectors[0].distance, Some(0.0));
+    assert_eq!(output.vectors[0].metadata, Some(serde_json::json!({"edition": "original"})));
+    assert_eq!(output.vectors[1].key, "a-second");
+    assert_eq!(output.vectors[1].distance, Some(1.0));
+    assert_eq!(output.vectors[1].metadata, Some(serde_json::json!({"edition": "second"})));
+    let body = Response::QueryVectors(output)
+        .body_bytes()
+        .expect("serialize the cosine response");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode the actual cosine response");
+    assert_eq!(json["distanceMetric"], "cosine");
+    assert_eq!(json["vectors"][0]["metadata"]["edition"], "original");
+
+    context.request = Request::GetVectors(dto::GetVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        keys: vec!["z-first".into()],
+        return_data: Some(false),
+        return_metadata: Some(true),
+    });
+    let VectorExecution::GetVectors(get) = service.execute(&context).await.expect("read the current snapshot metadata") else {
+        panic!("expected the prepared current GetVectors result");
+    };
+    assert_eq!(get.requested_keys, vec!["z-first".to_owned()]);
+    assert_eq!(get.vectors.len(), 1);
+    assert_eq!(get.vectors[0].key, "z-first");
+    assert!(get.vectors[0].data.is_none());
+    assert_eq!(get.vectors[0].metadata, Some(serde_json::json!({"edition": "replacement"})));
+}
+
+#[tokio::test]
+async fn service_query_output_requires_pagination_only_above_one_hundred_matches() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::{VectorExecution, VectorServiceError},
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    let Request::CreateIndex(input) = &mut context.request else {
+        panic!("expected the Index creation fixture");
+    };
+    input.distance_metric = dto::DistanceMetric::Euclidean;
+    service.execute(&context).await.expect("create the pagination boundary Index");
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: (0..101_u16)
+            .map(|ordinal| dto::PutInputVector {
+                key: format!("item-{ordinal:03}"),
+                data: dto::VectorData {
+                    float32: vec![f32::from(ordinal), 0.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"ordinal": ordinal, "hundred": ordinal < 100, "short": ordinal < 3})),
+            })
+            .collect(),
+    });
+    service.execute(&context).await.expect("publish 101 actual Dataset rows");
+    for (top_k, filter, expected_rows) in [
+        (101, Some(serde_json::json!({"hundred": true})), 100_usize),
+        (101, None, 101),
+        (1000, Some(serde_json::json!({"short": true})), 3),
+    ] {
+        context.request = Request::QueryVectors(dto::QueryVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            top_k,
+            query_vector: dto::VectorData { float32: vec![0.0; 3] },
+            filter,
+            query_mode: Some(dto::IndexMode::Enhanced),
+            return_metadata: Some(true),
+            return_distance: Some(true),
+            next_token: None,
+        });
+        let VectorExecution::QueryVectors(query) = service.execute(&context).await.expect("query the fixed Dataset snapshot")
+        else {
+            panic!("expected the prepared pagination boundary query");
+        };
+        assert_eq!(query.candidates.len(), expected_rows);
+        assert_eq!(query.metadata_rows.as_ref().expect("requested metadata").len(), expected_rows);
+        for (ordinal, candidate) in query.candidates.iter().enumerate() {
+            assert_eq!(candidate.key, format!("item-{ordinal:03}"));
+            assert_eq!(
+                candidate.distance_f64,
+                f64::from(u16::try_from(ordinal).expect("bounded fixture ordinal"))
+            );
+        }
+        let result = query.into_output();
+        if expected_rows == 101 {
+            assert!(matches!(result, Err(VectorServiceError::PendingIntegration("query result pagination"))));
+            continue;
+        }
+        let output = result.expect("at most 100 actual matches fit one complete page");
+        assert_eq!(output.vectors.len(), expected_rows);
+        assert!(output.next_token.is_none());
+        assert_eq!(output.distance_metric, dto::DistanceMetric::Euclidean);
+        for (ordinal, vector) in output.vectors.iter().enumerate() {
+            assert_eq!(vector.key, format!("item-{ordinal:03}"));
+            assert_eq!(vector.distance, Some(f32::from(u16::try_from(ordinal).expect("bounded fixture ordinal"))));
+            assert_eq!(
+                vector.metadata.as_ref().expect("same-snapshot metadata")["ordinal"],
+                serde_json::json!(ordinal)
+            );
+        }
+        let body = Response::QueryVectors(output)
+            .body_bytes()
+            .expect("serialize the complete single page");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("decode the actual single-page response");
+        assert_eq!(json["vectors"].as_array().expect("response vectors").len(), expected_rows);
+        assert!(json.get("nextToken").is_none());
+    }
+}
+
+struct ServiceRetryRequestFixture {
+    inner: ServiceRequestFixture,
+    first_managed_entered: tokio::sync::Notify,
+    first_managed_release: tokio::sync::Notify,
+    managed_attempts: std::sync::atomic::AtomicUsize,
+    authorized_resources: std::sync::Mutex<Vec<crate::table_catalog::CatalogResourceIdentity>>,
+}
+
+#[async_trait::async_trait]
+impl crate::vector::service::VectorRequestAccess for ServiceRetryRequestFixture {
+    fn request(&self) -> &crate::vector::protocol::Request {
+        &self.inner.request
+    }
+
+    fn request_id(&self) -> crate::vector::service::VectorRequestId {
+        crate::vector::service::VectorRequestAccess::request_id(&self.inner)
+    }
+
+    fn bucket(&self) -> &crate::storage_api::vector::BucketHandle {
+        &self.inner.bucket
+    }
+
+    fn index_name(&self) -> &crate::table_catalog::CatalogName {
+        &self.inner.name
+    }
+
+    async fn authorize_index(
+        &self,
+        request: &crate::vector::protocol::Request,
+        resource: &crate::table_catalog::CatalogResourceIdentity,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<(), crate::vector::service::VectorServiceError> {
+        crate::vector::service::VectorRequestAccess::authorize_index(&self.inner, request, resource, definition).await?;
+        self.authorized_resources
+            .lock()
+            .expect("record retry authorization")
+            .push(resource.clone());
+        Ok(())
+    }
+
+    async fn resolve_index_definition(
+        &self,
+        input: &crate::vector::protocol::dto::CreateIndexInput,
+    ) -> Result<crate::table_catalog::VectorIndexDefinitionV1, crate::vector::service::VectorServiceError> {
+        crate::vector::service::VectorRequestAccess::resolve_index_definition(&self.inner, input).await
+    }
+
+    async fn managed_dataset(
+        &self,
+        guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<crate::vector::service::ManagedDatasetAccess, crate::vector::service::VectorServiceError> {
+        if self.managed_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.first_managed_entered.notify_one();
+            self.first_managed_release.notified().await;
+        }
+        crate::vector::service::VectorRequestAccess::managed_dataset(&self.inner, guard, definition).await
+    }
+}
+
+async fn check_service_retry_resource_identity(delete: bool, recreate: bool) {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::{VectorExecution, VectorServiceError},
+    };
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    let fixture = catalog_fixture().await;
+    let creation = service_request(&fixture);
+    let mut control = creation.clone();
+    let service = index_service(&fixture);
+    service.execute(&creation).await.expect("create the original Index");
+    let seed_request = |edition: &str, target: [f32; 3]| {
+        Request::PutVectors(dto::PutVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            vectors: vec![
+                dto::PutInputVector {
+                    key: "target".into(),
+                    data: dto::VectorData { float32: target.into() },
+                    metadata: Some(serde_json::json!({"edition": edition})),
+                },
+                dto::PutInputVector {
+                    key: "keep".into(),
+                    data: dto::VectorData {
+                        float32: vec![1.0, 0.0, 0.0],
+                    },
+                    metadata: Some(serde_json::json!({"edition": "keep"})),
+                },
+            ],
+        })
+    };
+    control.request = seed_request("original", [1.0, 0.0, 0.0]);
+    service.execute(&control).await.expect("publish the original target");
+    let namespace = crate::table_catalog::Namespace::parse("indexes").expect("Index namespace");
+    let (original_guard, original_entry) = fixture
+        .store
+        .begin_vector_operation(&control.bucket, &namespace, &control.name)
+        .await
+        .expect("read the original identity and head");
+    let original_resource = original_guard.resource_identity().clone();
+    drop(original_guard);
+    let (catalog_bucket, table_path) = {
+        let state = fixture.backend.state.lock().await;
+        let entries = state
+            .objects
+            .iter()
+            .filter_map(|(key, record)| {
+                let entry = serde_json::from_slice::<crate::table_catalog::TableEntry>(&record.data).ok()?;
+                (entry.table_id == original_resource.table_id().as_str() && entry.table == control.name.as_str())
+                    .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "locate the authoritative entry for the original Index");
+        entries[0].clone()
+    };
+
+    let mut delayed_context = control.clone();
+    delayed_context.request = if delete {
+        Request::DeleteVectors(dto::DeleteVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            keys: vec!["target".into()],
+        })
+    } else {
+        Request::PutVectors(dto::PutVectorsInput {
+            vector_bucket_name: Some("vectors".into()),
+            index_name: Some("service-index".into()),
+            index_arn: None,
+            vectors: vec![dto::PutInputVector {
+                key: "target".into(),
+                data: dto::VectorData {
+                    float32: vec![0.0, 1.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"edition": "delayed"})),
+            }],
+        })
+    };
+    let delayed_context = ServiceRetryRequestFixture {
+        inner: delayed_context,
+        first_managed_entered: tokio::sync::Notify::new(),
+        first_managed_release: tokio::sync::Notify::new(),
+        managed_attempts: std::sync::atomic::AtomicUsize::new(0),
+        authorized_resources: std::sync::Mutex::new(Vec::new()),
+    };
+    let mut delayed = Box::pin(service.execute(&delayed_context));
+    tokio::select! {
+        result = &mut delayed => panic!("write returned before the first Managed bind: {:?}", result.err()),
+        entered = tokio::time::timeout(Duration::from_secs(10), delayed_context.first_managed_entered.notified()) => {
+            entered.expect("write captures its original Catalog identity before pausing");
+        },
+    }
+    control.request = Request::TagResource(dto::TagResourceInput {
+        resource_arn: "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index".into(),
+        tags: [("conflict".into(), "winner".into())].into(),
+    });
+    service
+        .execute(&control)
+        .await
+        .expect("publish a competing head for the same identity");
+    let (tagged_guard, tagged_entry) = fixture
+        .store
+        .begin_vector_operation(&control.bucket, &namespace, &control.name)
+        .await
+        .expect("read the competing head");
+    assert_eq!(tagged_guard.resource_identity(), &original_resource);
+    assert_ne!(tagged_entry.head().expected_head(), original_entry.head().expected_head());
+    drop(tagged_guard);
+
+    // Capture the competing head before allowing deletion and name reuse.
+    let head_pause = fixture.backend.pause_next_read(&catalog_bucket, &table_path).await;
+    delayed_context.first_managed_release.notify_one();
+    tokio::select! {
+        result = &mut delayed => panic!("write returned before the captured conflicting head: {:?}", result.err()),
+        entered = tokio::time::timeout(Duration::from_secs(10), head_pause.wait_started()) => {
+            entered.expect("write reads the definite head conflict before retrying");
+        },
+    }
+
+    let replacement = if recreate {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            control.request = Request::DeleteIndex(dto::DeleteIndexInput {
+                vector_bucket_name: Some("vectors".into()),
+                index_name: Some("service-index".into()),
+                index_arn: None,
+            });
+            service.execute(&control).await.expect("logically delete the original Index");
+            service.execute(&creation).await.expect("recreate the same Index name");
+            control.request = seed_request("replacement", [0.0, 0.0, 1.0]);
+            service.execute(&control).await.expect("publish the replacement Index target");
+        })
+        .await
+        .expect("Index deletion and recreation complete while the original read is paused");
+        let (guard, entry) = fixture
+            .store
+            .begin_vector_operation(&control.bucket, &namespace, &control.name)
+            .await
+            .expect("capture the replacement Index");
+        assert_ne!(guard.resource_identity(), &original_resource);
+        drop(guard);
+        Some(entry)
+    } else {
+        None
+    };
+    let before_retry = {
+        let state = fixture.backend.state.lock().await;
+        (state.objects.clone(), state.put_attempts.clone())
+    };
+    head_pause.release();
+    let result = tokio::time::timeout(Duration::from_secs(30), &mut delayed)
+        .await
+        .expect("the write finishes its conflict retry");
+    drop(delayed);
+    if let Some(replacement) = replacement {
+        assert!(matches!(
+            result,
+            Err(VectorServiceError::Manifest(LanceManifestError::ResourceMismatch {
+                reason: "Vector retry resource identity changed"
+            }))
+        ));
+        assert_eq!(delayed_context.managed_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *delayed_context
+                .authorized_resources
+                .lock()
+                .expect("retry authorization observations"),
+            vec![original_resource.clone()]
+        );
+        let state = fixture.backend.state.lock().await;
+        assert_eq!((state.objects.clone(), state.put_attempts.clone()), before_retry);
+        drop(state);
+        let (guard, after) = fixture
+            .store
+            .begin_vector_operation(&control.bucket, &namespace, &control.name)
+            .await
+            .expect("read the unchanged replacement head");
+        assert_eq!(after.head().resource_identity(), replacement.head().resource_identity());
+        assert_eq!(after.head().namespace(), replacement.head().namespace());
+        assert_eq!(after.head().name(), replacement.head().name());
+        assert_eq!(after.head().expected_head(), replacement.head().expected_head());
+        drop(guard);
+    } else {
+        result.expect("a definite conflict retries successfully within the original identity");
+        assert_eq!(delayed_context.managed_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *delayed_context
+                .authorized_resources
+                .lock()
+                .expect("retry authorization observations"),
+            vec![original_resource.clone(), original_resource.clone()]
+        );
+    }
+
+    control.request = Request::QueryVectors(dto::QueryVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        top_k: 10,
+        query_vector: dto::VectorData {
+            float32: vec![1.0, 0.0, 0.0],
+        },
+        filter: None,
+        query_mode: Some(dto::IndexMode::Enhanced),
+        return_metadata: Some(true),
+        return_distance: Some(true),
+        next_token: None,
+    });
+    let VectorExecution::QueryVectors(query) = service
+        .execute(&control)
+        .await
+        .expect("read the authoritative Dataset after retry")
+    else {
+        panic!("expected the actual Dataset query result");
+    };
+    assert!(query.candidates.iter().any(|candidate| candidate.key == "keep"));
+    if delete && !recreate {
+        assert_eq!(query.candidates.len(), 1);
+        assert!(query.candidates.iter().all(|candidate| candidate.key != "target"));
+    } else {
+        assert_eq!(query.candidates.len(), 2);
+        let target = query
+            .snapshot
+            .get(&["target".into()], all_vector_fields())
+            .await
+            .expect("read the actual target bytes");
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].key, "target");
+        assert_eq!(target[0].data, Some(if recreate { vec![0.0, 0.0, 1.0] } else { vec![0.0, 1.0, 0.0] }));
+        assert_eq!(
+            target[0].metadata.as_ref().expect("target metadata")["edition"],
+            if recreate { "replacement" } else { "delayed" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn service_put_retry_rejects_recreated_index() {
+    check_service_retry_resource_identity(false, true).await;
+}
+
+#[tokio::test]
+async fn service_delete_retry_rejects_recreated_index() {
+    check_service_retry_resource_identity(true, true).await;
+}
+
+#[tokio::test]
+async fn service_put_retry_succeeds_for_same_identity() {
+    check_service_retry_resource_identity(false, false).await;
+}
+
+#[tokio::test]
+async fn service_delete_retry_succeeds_for_same_identity() {
+    check_service_retry_resource_identity(true, false).await;
 }

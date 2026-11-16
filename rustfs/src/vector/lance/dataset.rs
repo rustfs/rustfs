@@ -1,8 +1,14 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, BinaryHeap},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
+use futures::TryStreamExt;
 use lance::{
     Dataset,
     dataset::{
@@ -82,10 +88,34 @@ pub(crate) struct QueryMatch {
     pub distance_f64: f64,
 }
 
+struct RankedQueryMatch(QueryMatch);
+
+impl Ord for RankedQueryMatch {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .distance_f64
+            .total_cmp(&other.0.distance_f64)
+            .then_with(|| self.0.key.as_bytes().cmp(other.0.key.as_bytes()))
+            .then_with(|| self.0.row_id.cmp(&other.0.row_id))
+    }
+}
+
+impl PartialOrd for RankedQueryMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedQueryMatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedQueryMatch {}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatasetError {
-    #[error("Dataset operation is not implemented: {operation}")]
-    OperationUnavailable { operation: &'static str },
     #[error("vector input is invalid")]
     InvalidVector(#[from] VectorInputError),
     #[error("Lance Dataset operation failed")]
@@ -235,6 +265,97 @@ pub(super) async fn list_batch(
         .limit(Some(limit), Some(offset))?;
     let batch = scanner.try_into_batch().await?;
     decode_records(&batch, projection)
+}
+
+pub(super) async fn query_matches(
+    dataset: &Dataset,
+    query: &[f32],
+    index: &VectorIndexManifestSpec,
+    top_k: NonZeroUsize,
+    filter: Option<ValidatedFilter>,
+) -> Result<Vec<QueryMatch>, DatasetError> {
+    validate_vector(query, index.dimension, index.distance_metric)?;
+    if top_k.get() > 10_000 {
+        return Err(DatasetError::InvalidQueryLimit);
+    }
+    let query_norm = if index.distance_metric == VectorDistanceMetric::Cosine {
+        query.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>().sqrt()
+    } else {
+        0.0
+    };
+
+    // ANN training provenance is not available for this snapshot. Scan every
+    // visible fragment using its original float32 values and controlled filter.
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["key", "vector"])?
+        .with_row_id()
+        .prefilter(true)
+        .use_scalar_index(false)
+        .scan_in_order(true)
+        .batch_size(256)
+        .batch_size_bytes(4 * 1024 * 1024)
+        .batch_readahead(1)
+        .fragment_readahead(1)
+        .io_buffer_size(8 * 1024 * 1024);
+    if let Some(filter) = filter {
+        scanner.filter_expr(filter_expr(filter));
+    }
+    let mut stream = scanner.try_into_stream().await?;
+    let mut matches = BinaryHeap::<RankedQueryMatch>::with_capacity(top_k.get());
+    while let Some(batch) = stream.try_next().await? {
+        let keys = required_array::<StringArray>(&batch, "key")?;
+        let row_ids = required_array::<UInt64Array>(&batch, "_rowid")?;
+        let vectors = required_array::<FixedSizeListArray>(&batch, "vector")?;
+        for row in 0..batch.num_rows() {
+            let values = vectors.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or(DatasetError::InvalidColumn { column: "vector" })?;
+            if values.null_count() != 0 {
+                return Err(DatasetError::InvalidColumn { column: "vector" });
+            }
+            validate_vector(values.values(), index.dimension, index.distance_metric)
+                .map_err(|_| DatasetError::InvalidColumn { column: "vector" })?;
+            let candidate = RankedQueryMatch(QueryMatch {
+                key: keys.value(row).to_string(),
+                row_id: row_ids.value(row),
+                distance_f64: distance_f64(query, values.values(), index.distance_metric, query_norm),
+            });
+            if matches.len() < top_k.get() {
+                matches.push(candidate);
+            } else if let Some(mut farthest) = matches.peek_mut()
+                && candidate < *farthest
+            {
+                *farthest = candidate;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(matches.into_sorted_vec().into_iter().map(|value| value.0).collect())
+}
+
+fn distance_f64(query: &[f32], vector: &[f32], metric: VectorDistanceMetric, query_norm: f64) -> f64 {
+    // At most 4096 finite float32 components keep all products and sums within
+    // float64's finite range, including the smallest float32 subnormal norms.
+    let distance = match metric {
+        VectorDistanceMetric::Euclidean => query
+            .iter()
+            .zip(vector)
+            .map(|(query_value, vector_value)| (f64::from(*query_value) - f64::from(*vector_value)).powi(2))
+            .sum::<f64>()
+            .sqrt(),
+        VectorDistanceMetric::Cosine => {
+            let (dot, norm_squared) = query.iter().zip(vector).fold((0.0, 0.0), |(dot, norm_squared), (q, v)| {
+                let q = f64::from(*q);
+                let v = f64::from(*v);
+                (dot + q * v, norm_squared + v * v)
+            });
+            (1.0 - dot / (query_norm * norm_squared.sqrt())).clamp(0.0, 2.0)
+        }
+    };
+    if distance == 0.0 { 0.0 } else { distance }
 }
 
 pub(super) async fn query_candidates(

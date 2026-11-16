@@ -20,10 +20,17 @@
 //! former trait method bodies, unchanged; the batch that moves these operations onto the gateway
 //! owns this file and is the only one that edits it.
 
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
+use crate::storage::access::legacy_copy_source;
 use crate::storage::ecfs::*;
 use crate::storage::ecfs_extend::validate_new_object_key;
 use crate::storage::helper::audit_only_operation;
-use crate::storage::s3_api;
+use crate::storage::s3_api::{
+    self, CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase, DeleteBatchETag,
+    DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput,
+};
+use crate::storage::storage_api::to_s3s_xml_etag;
 use http::{HeaderMap, HeaderValue};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::delete_object;
@@ -150,6 +157,7 @@ impl FS {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
+        record_s3_op(S3Operation::CopyObject);
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_copy_object(req).await
     }
@@ -186,8 +194,11 @@ impl FS {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        record_s3_op(S3Operation::DeleteObjects);
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_delete_objects(req).await
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let output = usecase.execute_delete_objects(envelope, req.input.into()).await?;
+        Ok(S3Response::new(output.into()))
     }
 
     pub(in crate::storage::ecfs) async fn restore_object_edge(
@@ -214,5 +225,186 @@ impl FS {
         record_s3_op(S3Operation::UploadPartCopy);
         let usecase = s3_api::multipart_usecase_for(self);
         audit_only_operation(req, S3Operation::UploadPartCopy, |req| Box::pin(usecase.execute_upload_part_copy(req))).await
+    }
+}
+
+impl DefaultObjectUsecase {
+    /// Projects a legacy SelectObjectContent request onto the shared Select query path.
+    pub async fn execute_select_object_content(
+        &self,
+        req: S3Request<SelectObjectContentInput>,
+    ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = crate::app::select_request::select_input_from_s3s(req.input).map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("convert the SelectObjectContent request: {err}"))
+        })?;
+        let answer = self.execute_select_object_content_owned(envelope, input).await?;
+        let output = rustfs_gateway_types::compat::s3s_5761ddfe::select::output_to_s3s(answer.output);
+        let mut response = S3Response::new(output);
+        response.status = answer.status;
+        response.headers = answer.headers;
+        Ok(response)
+    }
+
+    /// Projects a legacy RestoreObject request onto the shared restore path.
+    pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = req.input;
+        self.execute_restore_object_owned(
+            envelope,
+            input.bucket,
+            input.key,
+            input.version_id,
+            input.restore_request.map(restore_request_from_wire),
+        )
+        .await
+        .map(|output| {
+            S3Response::new(RestoreObjectOutput {
+                request_charged: output
+                    .request_charged
+                    .map(|value| RequestCharged::from(value.as_str().to_owned())),
+                restore_output_path: output.restore_output_path,
+            })
+        })
+        .map_err(Into::into)
+    }
+
+    /// Projects a legacy CopyObject request onto the shared copy path.
+    pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = copy_input_from_legacy(req.input);
+        self.execute_copy_object_owned(envelope, input)
+            .await
+            .map(copy_output_to_legacy)
+            .map_err(Into::into)
+    }
+}
+
+fn copy_input_from_legacy(input: CopyObjectInput) -> CopyObjectWriteInput {
+    let condition = |value: ETagCondition| match value {
+        ETagCondition::Any => CopySourceCondition::Any,
+        ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
+        ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
+    };
+    let copy_source = legacy_copy_source(&input.copy_source)
+        .map(|(bucket, key, version_id)| rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id });
+    CopyObjectWriteInput {
+        copy_source,
+        bucket: input.bucket,
+        key: input.key,
+        version_id: input.version_id,
+        specific_if_none_match: matches!(input.if_none_match, Some(ETagCondition::ETag(_))),
+        server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
+        ssekms_key_id: input.ssekms_key_id,
+        sse_customer_algorithm: input.sse_customer_algorithm,
+        sse_customer_key: input.sse_customer_key,
+        sse_customer_key_md5: input.sse_customer_key_md5,
+        copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
+        copy_source_sse_customer_key: input.copy_source_sse_customer_key,
+        copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
+        metadata_directive: input.metadata_directive.map(|value| value.as_str().to_owned()),
+        metadata: input.metadata,
+        tagging: input.tagging,
+        tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
+        copy_source_if_match: input.copy_source_if_match.map(condition),
+        copy_source_if_none_match: input.copy_source_if_none_match.map(condition),
+        cache_control: input.cache_control,
+        content_disposition: input.content_disposition,
+        content_encoding: input.content_encoding,
+        content_language: input.content_language,
+        content_type: input.content_type,
+        expires: input.expires,
+        website_redirect_location: input.website_redirect_location,
+        object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
+        object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
+        object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
+        storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
+        checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
+    }
+}
+
+fn copy_output_to_legacy(output: CopyObjectWriteOutput) -> S3Response<CopyObjectOutput> {
+    S3Response::new(CopyObjectOutput {
+        copy_object_result: Some(CopyObjectResult {
+            e_tag: output.e_tag.as_deref().map(to_s3s_xml_etag),
+            last_modified: output.last_modified.map(Timestamp::from),
+            checksum_crc32: output.checksum_crc32,
+            checksum_crc32c: output.checksum_crc32c,
+            checksum_sha1: output.checksum_sha1,
+            checksum_sha256: output.checksum_sha256,
+            checksum_crc64nvme: output.checksum_crc64nvme,
+            checksum_md5: output.checksum_md5,
+            checksum_sha512: output.checksum_sha512,
+            checksum_xxhash3: output.checksum_xxhash3,
+            checksum_xxhash64: output.checksum_xxhash64,
+            checksum_xxhash128: output.checksum_xxhash128,
+            checksum_type: output.checksum_type.map(ChecksumType::from),
+        }),
+        copy_source_version_id: output.copy_source_version_id,
+        server_side_encryption: output.server_side_encryption.map(Into::into),
+        ssekms_key_id: output.ssekms_key_id,
+        sse_customer_algorithm: output.sse_customer_algorithm,
+        sse_customer_key_md5: output.sse_customer_key_md5,
+        version_id: output.version_id,
+        ..Default::default()
+    })
+}
+
+impl From<DeleteObjectsInput> for DeleteBatchInput {
+    fn from(input: DeleteObjectsInput) -> Self {
+        Self {
+            bucket: input.bucket,
+            objects: input.delete.objects.into_iter().map(Into::into).collect(),
+            quiet: input.delete.quiet,
+        }
+    }
+}
+
+impl From<ObjectIdentifier> for DeleteBatchEntry {
+    fn from(object: ObjectIdentifier) -> Self {
+        Self {
+            key: object.key,
+            key_too_long: false,
+            version_id: object.version_id,
+            e_tag: object.e_tag.map(|tag| match tag {
+                ETag::Strong(value) => DeleteBatchETag { value, weak: false },
+                ETag::Weak(value) => DeleteBatchETag { value, weak: true },
+            }),
+            _last_modified_time: object.last_modified_time.map(|value| {
+                let instant = time::OffsetDateTime::from(value);
+                (instant.unix_timestamp(), instant.nanosecond())
+            }),
+            _size: object.size,
+        }
+    }
+}
+
+impl From<DeleteBatchOutput> for DeleteObjectsOutput {
+    fn from(output: DeleteBatchOutput) -> Self {
+        Self {
+            deleted: output.deleted.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| DeletedObject {
+                        delete_marker: entry.delete_marker,
+                        delete_marker_version_id: entry.delete_marker_version_id,
+                        key: entry.key,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            errors: output.errors.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| Error {
+                        code: entry.code,
+                        key: entry.key,
+                        message: entry.message,
+                        version_id: entry.version_id,
+                    })
+                    .collect()
+            }),
+            request_charged: None,
+        }
     }
 }

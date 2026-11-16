@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn combined_constraints_share_one_budget() {
         let allowed = json!({"$and": (0..100).map(|value| json!({"category": value})).collect::<Vec<_>>()});
-        let rejected = json!({"$and": [allowed.clone(), {"flag": true}]});
+        let rejected = json!({"$and": [allowed, {"flag": true}]});
         assert!(ValidatedFilter::parse(&allowed, &BTreeSet::new()).is_ok());
         assert!(ValidatedFilter::parse(&rejected, &BTreeSet::new()).is_err());
     }

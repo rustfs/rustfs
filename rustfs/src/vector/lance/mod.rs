@@ -24,12 +24,8 @@ mod schema;
 pub(crate) use commit::{
     CommittedManifestInfo, DatasetSnapshot, LanceManifestAdapter, LanceOperationContext, ManifestPrepareRequest,
 };
-pub(crate) use dataset::{
-    DatasetError, ProjectedVector, QueryCandidate, QueryMatch, VectorProjection, VectorRecord, validate_record_keys,
-};
-pub(crate) use initial::{
-    InitialManifestPlan, decode_initialization_payload, encode_initialization_payload, plan_initial_manifest,
-};
+pub(crate) use dataset::{DatasetError, ProjectedVector, QueryMatch, VectorProjection, VectorRecord, validate_record_keys};
+pub(crate) use initial::{decode_initialization_payload, encode_initialization_payload, plan_initial_manifest};
 #[cfg(test)]
 pub(crate) use schema::VectorDistanceMetric;
 pub(crate) use schema::VectorIndexManifestSpec;

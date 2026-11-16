@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod access_core;
 pub(crate) mod filter;
 pub(crate) mod lance;
 pub(crate) mod model;
 pub(crate) mod protocol;
+pub(crate) mod service;

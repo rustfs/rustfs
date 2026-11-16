@@ -159,6 +159,8 @@ rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "
 rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.67.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
 rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", default-features = false }
+rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.64.0", default-features = false }
+rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "60c4e3af74214ca3a0aedd1678ffd6ba638f8d12", version = "0.13.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -186,6 +188,7 @@ memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
 rustfs-kafka-async = { version = "1.4.1" }
+slab = { version = "0.4.12" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.54.1" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
@@ -319,6 +322,7 @@ libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"
 memmap2 = "0.9.12"
+nixl-sys = { git = "https://github.com/houseme/nixl", rev = "cc636c83f13d692e85b67e55aed092413d16fb41" }
 lz4 = "1.28.1"
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame"] }
 matchit = "0.9.2"

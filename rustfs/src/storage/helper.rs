@@ -27,6 +27,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
+#[cfg(test)]
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
@@ -173,10 +174,6 @@ where
 }
 
 /// Builds S3-compatible notification response elements with the canonical request ID.
-pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
-    build_owned_event_resp_elements(&response.headers, request_id)
-}
-
 pub(crate) fn build_owned_event_resp_elements(response_headers: &HeaderMap, request_id: &str) -> HashMap<String, String> {
     let mut resp_elements = extract_params_header(response_headers);
     resp_elements.insert(AMZ_REQUEST_ID.to_string(), request_id.to_string());
@@ -370,15 +367,15 @@ pub struct EnabledOperationHelper {
 }
 
 impl OperationHelper {
-    /// Create a new OperationHelper for S3 requests.
+    /// Builds the legacy request helper for audit and notification fixtures.
+    #[cfg(test)]
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
         record_s3_op(op);
         Self::from_view(&AuditRequestView::legacy(req), event, op)
     }
 
-    /// [`Self::new`] for a request whose audit facts an owned edge decoded
-    /// (`RequestEnvelope::audit_view`). It does not count the operation: the owned edge already
-    /// did, once, before calling the use case.
+    /// Builds the helper from the audit facts decoded by the operation edge.
+    /// The edge counts the operation before calling the use case.
     pub(crate) fn from_view(req: &AuditRequestView<'_>, event: EventName, op: S3Operation) -> Self {
         Self::build(req, event, op, false)
     }
@@ -387,8 +384,7 @@ impl OperationHelper {
     ///
     /// For operations that have no notification event of their own (`UploadPart`, the
     /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
-    /// Unlike `new` it does not call `record_s3_op`, so per-operation metrics stay as the
-    /// handlers already report them.
+    /// The handler records the per-operation metric.
     pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
         Self::audit_only_from_view(&AuditRequestView::legacy(req), op)
     }
@@ -691,11 +687,6 @@ impl OperationHelper {
 
     /// Returns the operation's canonical context, reading the ingress extension
     /// when the disabled fast path holds no request state.
-    pub(crate) fn request_context_or_from_request<T>(&self, req: &S3Request<T>) -> RequestContext {
-        self.request_context_or_from_view(&AuditRequestView::legacy(req))
-    }
-
-    /// [`Self::request_context_or_from_request`] for a request whose audit facts an owned edge decoded.
     pub(crate) fn request_context_or_from_view(&self, req: &AuditRequestView<'_>) -> RequestContext {
         match self {
             Self::Enabled(state) => state.request_context.clone(),
@@ -1845,7 +1836,7 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
-                let request_context = helper.request_context_or_from_request(&req);
+                let request_context = helper.request_context_or_from_view(&super::AuditRequestView::legacy(&req));
                 let request_id = request_context.request_id;
                 assert!(uuid::Uuid::parse_str(&request_id).is_ok());
                 let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
@@ -1893,7 +1884,12 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 assert!(matches!(&helper, OperationHelper::Disabled));
-                assert_eq!(helper.request_context_or_from_request(&req).request_id, "server-request-id");
+                assert_eq!(
+                    helper
+                        .request_context_or_from_view(&super::AuditRequestView::legacy(&req))
+                        .request_id,
+                    "server-request-id"
+                );
             },
         );
     }

@@ -59,8 +59,7 @@ use super::storage_api::multipart_usecase::options::{
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
-    ListMultipartUploadsParams, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
-    parse_upload_part_number,
+    ListMultipartUploadsParams, parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
@@ -84,8 +83,7 @@ use crate::app::object_data_cache::{
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
-    validate_existing_object_lock_for_write,
+    apply_quota_admission, map_quota_check_outcome, s3s_body_error_to_io, validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -104,7 +102,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
 use metrics::counter;
-use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -128,9 +125,15 @@ use urlencoding::encode;
 use uuid::Uuid;
 
 mod abort;
+pub(crate) use abort::{AbortMultipartUploadTarget, reject_abort_capabilities};
 mod complete;
 mod create;
+mod create_values;
+pub(crate) use create_values::{CreateMultipartUploadFields, CreateMultipartUploadResult};
 mod list;
+#[cfg(feature = "gateway-stack")]
+pub(crate) use list::ListPartsInfo;
+pub(crate) use list::{ListPartsFields, ListPartsTarget};
 #[cfg(test)]
 mod test_support;
 mod upload_part;
@@ -142,7 +145,7 @@ pub(crate) enum MultipartOrigin {
     Request,
     #[cfg(test)]
     Managed {
-        context: crate::app::object::ManagedObjectContext,
+        context: Box<crate::app::object::ManagedObjectContext>,
         lifecycle_guard: Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>,
     },
 }
@@ -615,7 +618,7 @@ mod tests {
                 .build()
                 .expect("valid create request DTO");
             let error = make_usecase()
-                .execute_create_multipart_upload(build_request(create, Method::POST))
+                .execute_create_multipart_upload_from_s3s(build_request(create, Method::POST))
                 .await
                 .expect_err("reserved key must be rejected before accessing storage");
             assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);

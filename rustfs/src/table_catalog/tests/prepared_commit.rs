@@ -2518,3 +2518,408 @@ async fn catalog_vector_v3_parent_registration_rejects_retained_old_incarnation(
     assert_eq!(after.data, before.data);
     assert_eq!(after.etag, before.etag);
 }
+
+type NativeVectorParentStorage = crate::storage_api::startup::services::ECStore;
+
+struct NativeVectorParentFixture {
+    bucket: BucketHandle,
+    storage: Arc<NativeVectorParentStorage>,
+    backend: EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>,
+    catalog: ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    guard: Arc<crate::storage_api::table::managed::BucketIncarnationFenceGuard>,
+}
+
+async fn native_vector_parent_fixture() -> (NativeVectorParentFixture, impl Send) {
+    let (request, access, storage, reset) =
+        crate::app::object::managed_request_fixture_with_encryption(crate::app::object::ManagedEncryption::Unencrypted).await;
+    let app = request.server_context().unwrap().installed_app_context().unwrap();
+    let bucket = access.bucket().clone();
+    let guard = Arc::new(
+        crate::app::bucket_usecase::DefaultBucketUsecase::with_context(Some(app))
+            .acquire_bucket_handle_guard(&bucket)
+            .await
+            .expect("real Managed bucket lifecycle guard"),
+    );
+    let backend = EcStoreTableCatalogObjectBackend::new(storage.clone());
+    let catalog = ObjectTableCatalogStore::for_vector_scope(backend.clone(), bucket.clone())
+        .await
+        .expect("real Vector Catalog scope");
+    (
+        NativeVectorParentFixture {
+            bucket,
+            storage,
+            backend,
+            catalog,
+            guard,
+        },
+        reset,
+    )
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_v3_native_parent_reuses_same_instance_guard() {
+    use crate::storage_api::table::managed::ManagedBucketStorage as _;
+    let (fixture, _reset) = native_vector_parent_fixture().await;
+    let bucket = fixture.bucket.storage_bucket_id().as_str();
+    fixture.storage.validate_managed_bucket_fence(&fixture.guard, bucket).unwrap();
+    fixture
+        .catalog
+        .ensure_vector_catalog_parent(&fixture.bucket, fixture.guard.clone())
+        .await
+        .unwrap();
+    let namespace = Namespace::parse("indexes").unwrap();
+    let parent_path = fixture.catalog.paths.table_bucket_entry_path(bucket);
+    let namespace_path = fixture.catalog.paths.namespace_entry_path(bucket, &namespace);
+    let parent = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &parent_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let indexes = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &namespace_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_entry: TableBucketEntry = serde_json::from_slice(&parent.data).unwrap();
+    let namespace_entry: NamespaceEntry = serde_json::from_slice(&indexes.data).unwrap();
+    assert_eq!(parent_entry.vector_bucket_binding.unwrap().to_handle().unwrap(), fixture.bucket);
+    assert_eq!(parent_entry.state, TableCatalogEntryState::Active);
+    assert_eq!(namespace_entry.table_bucket, bucket);
+    assert_eq!(namespace_entry.namespace, "indexes");
+    assert_eq!(namespace_entry.state, TableCatalogEntryState::Active);
+    fixture
+        .catalog
+        .ensure_vector_catalog_parent(&fixture.bucket, fixture.guard.clone())
+        .await
+        .unwrap();
+    let repeated_parent = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &parent_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let repeated_indexes = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &namespace_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated_parent.data, parent.data);
+    assert_eq!(repeated_parent.etag, parent.etag);
+    assert_eq!(repeated_parent.body_revision, parent.body_revision);
+    assert_eq!(repeated_indexes.data, indexes.data);
+    assert_eq!(repeated_indexes.etag, indexes.etag);
+    assert_eq!(repeated_indexes.body_revision, indexes.body_revision);
+    assert_eq!(
+        Arc::strong_count(&fixture.guard),
+        1,
+        "completed registration releases its borrowed ownership"
+    );
+    fixture.storage.validate_managed_bucket_fence(&fixture.guard, bucket).unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_v3_native_parent_rejects_another_bucket_guard() {
+    use crate::storage_api::table::managed::ManagedBucketStorage as _;
+    let (source, _source_reset) = native_vector_parent_fixture().await;
+    let (target, _target_reset) = native_vector_parent_fixture().await;
+    assert!(Arc::ptr_eq(&source.storage, &target.storage));
+    assert_ne!(source.bucket.storage_bucket_id(), target.bucket.storage_bucket_id());
+    target
+        .storage
+        .validate_managed_bucket_fence(&target.guard, target.bucket.storage_bucket_id().as_str())
+        .unwrap();
+    let parent_path = target
+        .catalog
+        .paths
+        .table_bucket_entry_path(target.bucket.storage_bucket_id().as_str());
+    let namespace_path = target
+        .catalog
+        .paths
+        .namespace_entry_path(target.bucket.storage_bucket_id().as_str(), &Namespace::parse("indexes").unwrap());
+    assert!(
+        target
+            .backend
+            .read_object(RUSTFS_META_BUCKET, &parent_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .backend
+            .read_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_matches!(
+        target.catalog.ensure_vector_catalog_parent(&target.bucket, source.guard.clone()).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("validate shared managed bucket lifecycle")
+    );
+    assert!(
+        target
+            .backend
+            .read_object(RUSTFS_META_BUCKET, &parent_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        target
+            .backend
+            .read_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    source
+        .storage
+        .validate_managed_bucket_fence(&source.guard, source.bucket.storage_bucket_id().as_str())
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_v3_native_parent_rejects_another_instance_guard() {
+    use crate::app::storage_api::managed::make_managed_bucket;
+    use crate::app::storage_api::test::contract::bucket::MakeBucketOptions;
+    use crate::storage_api::table::managed::ManagedBucketStorage as _;
+    let (source, _reset) = native_vector_parent_fixture().await;
+    let (_temp, _paths, isolated) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    assert!(!Arc::ptr_eq(&source.storage, &isolated));
+    make_managed_bucket(&isolated, &source.bucket, &[], &[], &MakeBucketOptions::default())
+        .await
+        .unwrap();
+    let backend = EcStoreTableCatalogObjectBackend::new(isolated.clone());
+    let catalog = ObjectTableCatalogStore::for_vector_scope(backend.clone(), source.bucket.clone())
+        .await
+        .unwrap();
+    let parent_path = catalog
+        .paths
+        .table_bucket_entry_path(source.bucket.storage_bucket_id().as_str());
+    let namespace_path = catalog
+        .paths
+        .namespace_entry_path(source.bucket.storage_bucket_id().as_str(), &Namespace::parse("indexes").unwrap());
+    assert!(backend.read_object(RUSTFS_META_BUCKET, &parent_path).await.unwrap().is_none());
+    assert!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_matches!(
+        isolated.validate_managed_bucket_fence(&source.guard, source.bucket.storage_bucket_id().as_str()),
+        Err(crate::storage_api::table::StorageError::PreconditionFailed)
+    );
+    assert_matches!(
+        catalog.ensure_vector_catalog_parent(&source.bucket, source.guard.clone()).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("validate shared managed bucket lifecycle")
+    );
+    assert!(backend.read_object(RUSTFS_META_BUCKET, &parent_path).await.unwrap().is_none());
+    assert!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    source
+        .storage
+        .validate_managed_bucket_fence(&source.guard, source.bucket.storage_bucket_id().as_str())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn catalog_vector_v3_creation_enumeration_preserves_pending_and_published_records() {
+    let fixture = prepared_fixture().await;
+    let mut pending =
+        vector_creation_request(&fixture, "acb99a64-f604-461c-984a-bf38aa8c3991", "28f4b8a3-1728-4611-92f4-e461c1e32015");
+    pending.name = CatalogName::parse("pending-index").unwrap();
+    let (pending_reservation, pending_guard) = fixture
+        .store
+        .reserve_vector_index(&fixture.bucket, pending.clone())
+        .await
+        .unwrap();
+    let mut published =
+        vector_creation_request(&fixture, "e2ead908-a802-4a0a-9a14-d18ab29b5366", "9469611b-66bf-426d-98ef-3a1b5eb74d12");
+    published.name = CatalogName::parse("published-index").unwrap();
+    let (published_reservation, published_guard) = fixture
+        .store
+        .reserve_vector_index(&fixture.bucket, published.clone())
+        .await
+        .unwrap();
+    let prepared = prepare_reserved_initial(&fixture, &published, &published_reservation).await;
+    fixture
+        .store
+        .publish_vector_index_initial_head(&published_guard, &published_reservation, prepared)
+        .await
+        .unwrap();
+    let before_objects = fixture.backend.state.lock().await.objects.clone();
+    let before_puts = fixture.backend.state.lock().await.put_attempts.clone();
+    let listed = fixture
+        .store
+        .list_vector_index_creation_reservations(&fixture.bucket)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    for (request, phase) in [
+        (&pending, VectorIndexCreatePhase::Reserved),
+        (&published, VectorIndexCreatePhase::Published),
+    ] {
+        let found = listed
+            .iter()
+            .find(|item| item.name() == &request.name)
+            .expect("both canonical reservations are enumerated");
+        assert_eq!(found.phase(), phase);
+        assert_eq!(found.resource_identity(), &request.resource_identity);
+        assert_eq!(found.create_id(), &request.create_id);
+        assert_eq!(found.namespace(), &request.namespace);
+        assert_eq!(found.planned_manifest(), &request.planned_manifest);
+        assert_eq!(found.definition(), &request.definition);
+        assert_eq!(found.initialization_payload(), request.initialization_payload);
+        assert!(found.published_entry().is_none(), "enumeration cannot replace guarded publication proof");
+    }
+    assert_eq!(pending_reservation.phase(), VectorIndexCreatePhase::Reserved);
+    pending_guard.check_held().unwrap();
+    published_guard.check_held().unwrap();
+    assert_eq!(fixture.backend.state.lock().await.objects, before_objects);
+    assert_eq!(fixture.backend.state.lock().await.put_attempts, before_puts);
+}
+
+#[tokio::test]
+async fn catalog_vector_v3_creation_enumeration_rejects_malformed_or_changed_digest() {
+    for corruption in ["json", "digest"] {
+        let fixture = prepared_fixture().await;
+        let request =
+            vector_creation_request(&fixture, "bd057f04-e76a-40fd-bdef-715e285f8e47", "dc71e65a-df0e-4a72-8475-3855017b2618");
+        let (_reservation, guard) = fixture
+            .store
+            .reserve_vector_index(&fixture.bucket, request.clone())
+            .await
+            .unwrap();
+        let path = create_intent_path(&fixture, &request);
+        let saved = fixture.backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap();
+        let corrupted = if corruption == "json" {
+            b"{\"version\":".to_vec()
+        } else {
+            let mut intent: VectorIndexCreateIntentV1 = serde_json::from_slice(&saved.data).unwrap();
+            intent
+                .definition
+                .tags
+                .insert("changed-after-reservation".into(), "yes".into());
+            serde_json::to_vec(&intent).unwrap()
+        };
+        fixture.backend.seed_object(RUSTFS_META_BUCKET, &path, corrupted).await;
+        let before_objects = fixture.backend.state.lock().await.objects.clone();
+        let before_puts = fixture.backend.state.lock().await.put_attempts.clone();
+        let result = fixture.store.list_vector_index_creation_reservations(&fixture.bucket).await;
+        assert_matches!(result, Err(TableCatalogStoreError::Invalid(_)));
+        assert_eq!(fixture.backend.state.lock().await.objects, before_objects);
+        assert_eq!(fixture.backend.state.lock().await.put_attempts, before_puts);
+        guard.check_held().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn catalog_vector_v3_creation_enumeration_rejects_disappearance_after_list() {
+    let fixture = prepared_fixture().await;
+    let request =
+        vector_creation_request(&fixture, "44b49813-efce-4600-bd25-46df8837b026", "955bf96b-9fc4-440e-a3e0-f59c01feb5e9");
+    let (_reservation, guard) = fixture
+        .store
+        .reserve_vector_index(&fixture.bucket, request.clone())
+        .await
+        .unwrap();
+    let path = create_intent_path(&fixture, &request);
+    let pause = fixture.backend.pause_before_next_read(RUSTFS_META_BUCKET, &path).await;
+    let lists_before = fixture.backend.list_call_count().await;
+    let before_puts = fixture.backend.state.lock().await.put_attempts.clone();
+    let store = fixture.store.clone();
+    let bucket = fixture.bucket.clone();
+    let mut enumeration = tokio::spawn(async move { store.list_vector_index_creation_reservations(&bucket).await });
+    tokio::select! {
+        result = &mut enumeration => panic!("enumeration returned before its selected record read: {result:?}"),
+        paused = tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_started()) => {
+            paused.expect("enumeration reaches the selected read after LIST");
+        },
+    }
+    assert_eq!(fixture.backend.list_call_count().await, lists_before + 1);
+    assert!(
+        fixture
+            .backend
+            .state
+            .lock()
+            .await
+            .objects
+            .contains_key(&(RUSTFS_META_BUCKET.into(), path.clone()))
+    );
+    // Inject backend disappearance after LIST and before the paused object lookup.
+    fixture.backend.delete_object(RUSTFS_META_BUCKET, &path).await.unwrap();
+    assert!(
+        !fixture
+            .backend
+            .state
+            .lock()
+            .await
+            .objects
+            .contains_key(&(RUSTFS_META_BUCKET.into(), path))
+    );
+    pause.release();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), enumeration)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(result, Err(TableCatalogStoreError::Conflict(message)) if message.contains("disappeared during enumeration"));
+    assert_eq!(fixture.backend.state.lock().await.put_attempts, before_puts);
+    guard.check_held().unwrap();
+}
+
+#[tokio::test]
+async fn catalog_vector_v3_creation_enumeration_rejects_another_incarnation() {
+    use crate::storage_api::table::managed::BucketIncarnation;
+    let fixture = prepared_fixture().await;
+    let request =
+        vector_creation_request(&fixture, "3b964306-2723-478b-b766-aebf270df0b3", "03131648-24d0-4139-b5ec-c12c854e2501");
+    let (_reservation, guard) = fixture
+        .store
+        .reserve_vector_index(&fixture.bucket, request.clone())
+        .await
+        .unwrap();
+    let path = create_intent_path(&fixture, &request);
+    let saved = fixture.backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap();
+    let other = BucketHandle::try_from_parts(
+        fixture.bucket.kind(),
+        fixture.bucket.account_namespace_id().clone(),
+        fixture.bucket.region().into(),
+        fixture.bucket.public_name().clone(),
+        fixture.bucket.storage_bucket_id().clone(),
+        BucketIncarnation::try_new(Uuid::new_v4()).unwrap(),
+    )
+    .unwrap();
+    let mut intent: VectorIndexCreateIntentV1 = serde_json::from_slice(&saved.data).unwrap();
+    intent.bucket = VectorBucketBindingV1::from_handle(&other).unwrap();
+    intent.expected_parent.bucket = intent.bucket.clone();
+    intent.request_sha256 = intent.canonical_request_digest().unwrap().to_hex();
+    intent
+        .validate()
+        .expect("record is internally valid for the other incarnation");
+    fixture
+        .backend
+        .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&intent).unwrap())
+        .await;
+    let before_objects = fixture.backend.state.lock().await.objects.clone();
+    let before_puts = fixture.backend.state.lock().await.put_attempts.clone();
+    assert_matches!(
+        fixture.store.list_vector_index_creation_reservations(&fixture.bucket).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("another bucket incarnation")
+    );
+    assert_eq!(fixture.backend.state.lock().await.objects, before_objects);
+    assert_eq!(fixture.backend.state.lock().await.put_attempts, before_puts);
+    guard.check_held().unwrap();
+}

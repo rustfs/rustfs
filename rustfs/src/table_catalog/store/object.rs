@@ -480,6 +480,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn for_vector_scope(backend: B, bucket: BucketHandle) -> TableCatalogStoreResult<Self> {
         if bucket.kind() != BucketKind::Vector {
             return Err(TableCatalogStoreError::Invalid("Vector catalog requires a Vector bucket".to_string()));
@@ -7116,6 +7117,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
+    #[cfg(test)]
     async fn retain_vector_resource_guard(
         &self,
         resource: CatalogResourceIdentity,
@@ -7202,6 +7204,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         guard.check_held()
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_vector_operation(
         &self,
         bucket: &BucketHandle,
@@ -7234,6 +7237,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok((guard, current))
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_vector_entry_with_guard(
         &self,
         guard: &VectorCatalogOperationGuard,
@@ -7258,6 +7262,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(current)
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_catalog_head_with_guard(
         &self,
         guard: &VectorCatalogOperationGuard,
@@ -7265,6 +7270,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(self.read_vector_entry_with_guard(guard).await?.head)
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_committed_history_with_guard(
         &self,
         guard: &VectorCatalogOperationGuard,
@@ -7292,6 +7298,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(CatalogCommittedHistory::new(versions))
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_vector_prepared_with_guard(
         &self,
         guard: &VectorCatalogOperationGuard,
@@ -7329,6 +7336,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
+#[cfg(test)]
 async fn run_vector_catalog_mutation<F, T>(operation: F) -> TableCatalogStoreResult<T>
 where
     F: std::future::Future<Output = TableCatalogStoreResult<T>> + Send + 'static,
@@ -7421,6 +7429,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         fence.ensure_held()
     }
 }
+#[cfg(test)]
 fn vector_reserved_name_matches(expected: Option<&VectorIndexCreateNameV1>, current: Option<&(TableEntry, String)>) -> bool {
     match (expected, current) {
         (None, None) => true,
@@ -7436,6 +7445,7 @@ fn vector_reserved_name_matches(expected: Option<&VectorIndexCreateNameV1>, curr
     }
 }
 
+#[cfg(test)]
 fn validate_vector_create_intent_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
@@ -7454,6 +7464,7 @@ fn validate_vector_create_intent_object(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_vector_delete_intent_object(
     paths: &TableCatalogObjectPaths,
     object: &str,
@@ -7470,6 +7481,7 @@ fn validate_vector_delete_intent_object(
     Ok(())
 }
 
+#[cfg(test)]
 fn initial_vector_entry(
     intent: &VectorIndexCreateIntentV1,
     candidate: &VectorIndexCreateCandidateV1,
@@ -7505,6 +7517,7 @@ fn initial_vector_entry(
     Ok(entry)
 }
 
+#[cfg(test)]
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     async fn list_vector_creation_intents_unprotected(
         &self,
@@ -8070,6 +8083,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
+#[cfg(test)]
 fn prepare_vector_resource_mutation(
     expected: &TableEntry,
     mutation: VectorResourceMutationBindingV1,
@@ -8097,6 +8111,7 @@ fn prepare_vector_resource_mutation(
     .with_vector_resource_mutation(mutation)
 }
 
+#[cfg(test)]
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     async fn read_vector_delete_intent(
         &self,
@@ -8432,6 +8447,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
+#[cfg(test)]
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     pub(crate) async fn update_vector_tags_with_guard(
         &self,
@@ -8481,6 +8497,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
+#[cfg(test)]
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     pub(crate) async fn ensure_vector_catalog_parent(
         &self,

@@ -239,6 +239,67 @@ async fn put_authorization_honors_request_object_tag_policy_on_both_edges() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn put_authorization_installs_the_decoded_retention_date() {
+    use crate::server::gateway_handlers::error::handler_error;
+    use rustfs_gateway::{Handler, HandlerResult, RegionSet, ServiceBuilder, SigV4Authenticator, StaticCredentials, allow_when};
+
+    const DATE: &str = "2099-01-02T08:00:00.123456789+08:00";
+    struct Probe(Arc<ServerContextSlot>);
+
+    impl Handler<dto::PutObject> for Probe {
+        async fn call(&self, request: Req<dto::PutObject>) -> HandlerResult<dto::PutObject> {
+            let mut envelope = envelope(&self.0, HeaderMap::new());
+            <dto::PutObject as Served>::authorize(&mut envelope, &request)
+                .await
+                .map_err(handler_error)?;
+            let date = AuthorizationRequest::requested_retain_until(&envelope)
+                .expect("authorized date")
+                .0;
+            assert_eq!(date.format(&time::format_description::well_known::Rfc3339).unwrap(), DATE);
+            Ok(Resp::new(dto::PutObjectOutput::default()))
+        }
+    }
+
+    let (server, bucket) = fixture(&[]).await;
+    set_policy(
+        &bucket,
+        serde_json::json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": "*"},
+            "Action": ["s3:PutObject", "s3:PutObjectRetention"],
+            "Resource": format!("arn:aws:s3:::{bucket}/allowed"),
+            "Condition": {"NumericGreaterThanEquals": {"s3:object-lock-remaining-retention-days": "1"}},
+        }),
+    )
+    .await;
+    let authenticator =
+        SigV4Authenticator::new(Arc::new(StaticCredentials::new()), RegionSet::new(["us-east-1"]).unwrap()).rustfs_profile();
+    let service = ServiceBuilder::new()
+        .rustfs_profile()
+        .authenticator(authenticator)
+        .authorizer(allow_when(|_| true))
+        .register::<dto::PutObject, _>(Arc::new(Probe(server)))
+        .build()
+        .unwrap();
+    let write = |date: Option<&str>| {
+        let mut request = http::Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/{bucket}/allowed"))
+            .header("host", "localhost")
+            .header("content-length", "0");
+        if let Some(date) = date {
+            request = request
+                .header("x-amz-object-lock-mode", "GOVERNANCE")
+                .header("x-amz-object-lock-retain-until-date", date);
+        }
+        request.body(http_body_util::Empty::<Bytes>::new()).unwrap()
+    };
+    assert_eq!(service.call(write(None)).await.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(service.call(write(Some(DATE))).await.status(), http::StatusCode::OK);
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("fixture producer failure")]
 struct FixtureProducerFailure;
@@ -419,7 +480,7 @@ fn native_put_projection_preserves_unvalidated_write_fields() {
         checksum_spec: Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "NSRBwg==").unwrap()),
         ..Default::default()
     };
-    let input = native_input(input).unwrap();
+    let input = native_input(input, None);
     assert_eq!(input.storage_class.as_deref(), Some("INVALID"));
     assert_eq!(input.server_side_encryption.as_deref(), Some("INVALID"));
     assert_eq!(input.object_lock_mode.as_deref(), Some("INVALID"));

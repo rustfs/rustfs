@@ -40,9 +40,9 @@ use super::storage_api::bucket_usecase::bucket::{
         run_stale_multipart_upload_cleanup_once, validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
-        BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
-        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TARGETS_FILE,
-        BUCKET_VERSIONING_CONFIG,
+        BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
+        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG,
+        BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG,
     },
     metadata_sys,
     policy_sys::PolicySys,
@@ -68,10 +68,7 @@ use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
 };
-use super::storage_api::bucket_usecase::{
-    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    request_context, validate_list_object_unordered_with_delimiter,
-};
+use super::storage_api::bucket_usecase::{get_validated_store, request_context, validate_list_object_unordered_with_delimiter};
 #[cfg(feature = "diagnostic-read-version-caller")]
 use super::storage_api::diagnostic;
 use crate::app::RequestEnvelope;
@@ -102,7 +99,6 @@ use rustfs_gateway_types::persistence::{
     PersistedVersioningConfiguration,
 };
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
-use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -135,6 +131,8 @@ mod core;
 #[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
+#[cfg(test)]
+mod delete_config_tests;
 mod encryption;
 #[cfg(test)]
 mod guards;
@@ -145,6 +143,7 @@ pub(crate) mod list_objects;
 mod listing;
 mod logging;
 mod notification;
+pub(crate) use notification::NotificationDestination;
 mod object_lock;
 mod policy;
 mod public_access_block;
@@ -282,6 +281,23 @@ pub(crate) async fn notify_table_bucket_metadata_reload(
     notify_bucket_metadata_reload_with_context(bucket, operation, None, false, app_context).await;
 }
 
+#[cfg(test)]
+type BucketMetadataReloadObserver = Box<dyn Fn(bool, &'static str, bool) + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static BUCKET_METADATA_RELOAD_PROBE: (String, BucketMetadataReloadObserver);
+}
+
+#[cfg(test)]
+fn record_bucket_metadata_reload(bucket: &str, completed: bool, operation: &'static str, scanner_maintenance_change: bool) {
+    let _ = BUCKET_METADATA_RELOAD_PROBE.try_with(|(observed_bucket, record)| {
+        if observed_bucket == bucket {
+            record(completed, operation, scanner_maintenance_change);
+        }
+    });
+}
+
 async fn notify_bucket_metadata_reload_with_context(
     bucket: String,
     operation: &'static str,
@@ -289,6 +305,11 @@ async fn notify_bucket_metadata_reload_with_context(
     scanner_maintenance_change: bool,
     app_context: Option<Arc<AppContext>>,
 ) {
+    #[cfg(test)]
+    record_bucket_metadata_reload(&bucket, false, operation, scanner_maintenance_change);
+    #[cfg(test)]
+    let observed_bucket = bucket.clone();
+
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
     // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
@@ -310,7 +331,12 @@ async fn notify_bucket_metadata_reload_with_context(
         }
         let _ = completed_tx.send(());
     });
-    let _ = completed_rx.await;
+    let completed = completed_rx.await;
+    #[cfg(test)]
+    if completed.is_ok() {
+        record_bucket_metadata_reload(&observed_bucket, true, operation, scanner_maintenance_change);
+    }
+    let _ = completed;
 }
 
 fn record_local_scanner_maintenance_reload(bucket: &str, scanner_maintenance_change: bool) {
@@ -425,13 +451,7 @@ where
 
 impl DefaultBucketUsecase {
     #[cfg(test)]
-    pub(super) fn checked_storage_bucket_id(
-        &self,
-        kind: BucketKind,
-        account: &AccountNamespaceId,
-        region: &str,
-        public_name: &BucketPublicName,
-    ) -> Result<StorageBucketId, BucketResolveError> {
+    fn validate_managed_bucket_deployment(&self, account: &AccountNamespaceId, region: &str) -> Result<(), BucketResolveError> {
         if self.context.is_none() {
             return Err(BucketResolveError::CapabilityUnavailable);
         }
@@ -442,6 +462,18 @@ impl DefaultBucketUsecase {
         if !account.as_str().is_empty() || region != current_region {
             return Err(BucketResolveError::IdentityMismatch);
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn checked_storage_bucket_id(
+        &self,
+        kind: BucketKind,
+        account: &AccountNamespaceId,
+        region: &str,
+        public_name: &BucketPublicName,
+    ) -> Result<StorageBucketId, BucketResolveError> {
+        self.validate_managed_bucket_deployment(account, region)?;
         if kind == BucketKind::Vector {
             let name = public_name.as_str().as_bytes();
             if !(3..=63).contains(&name.len())
@@ -561,6 +593,76 @@ impl DefaultBucketUsecase {
             return Err(StorageError::PreconditionFailed.into());
         }
         Ok(guard)
+    }
+
+    /// The service retains its admitted lifecycle guard and owns Vector authorization and audit.
+    #[cfg(test)]
+    pub(crate) async fn read_managed_bucket_metadata(
+        &self,
+        expected: &BucketHandle,
+        guard: &BucketIncarnationFenceGuard,
+    ) -> Result<Arc<managed::BucketMetadata>, BucketResolveError> {
+        use rustfs_policy::policy::Validator;
+        if expected.kind() != BucketKind::Vector {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let storage_id = self.checked_storage_bucket_id(
+            expected.kind(),
+            expected.account_namespace_id(),
+            expected.region(),
+            expected.public_name(),
+        )?;
+        if &storage_id != expected.storage_bucket_id() {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        managed::validate_bucket_incarnation_fence(&store, guard, storage_id.as_str())?;
+        let metadata = managed::get_bucket_metadata(&store, storage_id.as_str()).await?;
+        if let Some(policy) = managed::ConfigState::of(&metadata.policy_config_json, &metadata.policy_config)
+            .require(storage_id.as_str(), BUCKET_POLICY_CONFIG)?
+        {
+            policy.is_valid().map_err(StorageError::other)?;
+        }
+        managed::ConfigState::of(&metadata.encryption_config_xml, &metadata.sse_config)
+            .require(storage_id.as_str(), BUCKET_SSECONFIG)?;
+        managed::ConfigState::of(&metadata.tagging_config_xml, &metadata.tagging_config)
+            .require(storage_id.as_str(), managed::BUCKET_TAGGING_CONFIG)?;
+        metadata.validate_bucket_handle(expected)?;
+        if guard.is_lock_lost() {
+            return Err(StorageError::PreconditionFailed.into());
+        }
+        Ok(metadata)
+    }
+
+    /// Returns current validated snapshots for an already-authorized Vector list request.
+    /// Later resource operations must reacquire their protection and resolve current authorization.
+    #[cfg(test)]
+    pub(crate) async fn list_managed_buckets(
+        &self,
+        account: &AccountNamespaceId,
+        region: &str,
+    ) -> Result<Vec<(BucketHandle, Arc<managed::BucketMetadata>)>, BucketResolveError> {
+        self.validate_managed_bucket_deployment(account, region)?;
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        let buckets = store
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut snapshots = Vec::new();
+        for bucket in buckets {
+            if !bucket.name.starts_with(managed::BUCKET_VECTOR_STORAGE_PREFIX) {
+                continue;
+            }
+            let metadata = managed::get_bucket_metadata(&store, &bucket.name).await?;
+            let identity = metadata.bucket_handle(account, region)?;
+            let guard = managed::acquire_bucket_incarnation_fence(&store, &bucket.name, identity.incarnation().as_uuid()).await?;
+            let snapshot = self.read_managed_bucket_metadata(&identity, &guard).await?;
+            snapshots.push((identity, snapshot));
+        }
+        snapshots.sort_by(|left, right| left.0.public_name().as_str().cmp(right.0.public_name().as_str()));
+        Ok(snapshots)
     }
 
     #[cfg(test)]
@@ -1368,5 +1470,260 @@ mod tests {
                 .expect("original survives"),
             identity
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_read_returns_exact_configuration_snapshot() {
+        use crate::app::object::ManagedEncryption;
+        for encryption in [ManagedEncryption::Unencrypted, ManagedEncryption::Aes256] {
+            let (request, access, store, _reset) =
+                crate::app::object::managed_request_fixture_with_encryption(encryption.clone()).await;
+            let usecase = DefaultBucketUsecase::with_context(request.server_context().unwrap().installed_app_context());
+            let identity = access.bucket();
+            let mut stored = managed::get_bucket_metadata(&store, identity.storage_bucket_id().as_str())
+                .await
+                .unwrap()
+                .as_ref()
+                .clone();
+            stored.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+            stored.tagging_config_xml =
+                b"<Tagging><TagSet><Tag><Key>purpose</Key><Value>vectors</Value></Tag></TagSet></Tagging>".to_vec();
+            stored.save_with_store(store.clone()).await.unwrap();
+            let guard = usecase.acquire_bucket_handle_guard(identity).await.unwrap();
+            let snapshot = usecase
+                .read_managed_bucket_metadata(identity, &guard)
+                .await
+                .expect("exact managed snapshot");
+            assert_eq!(
+                snapshot
+                    .bucket_handle(identity.account_namespace_id(), identity.region())
+                    .unwrap(),
+                *identity
+            );
+            assert_eq!(snapshot.created, stored.created);
+            assert_eq!(snapshot.policy_config_json, stored.policy_config_json);
+            assert!(snapshot.policy_config.is_some());
+            assert_eq!(snapshot.tagging_config_xml, stored.tagging_config_xml);
+            let tags = snapshot.tagging_config.as_ref().expect("parsed tags");
+            assert_eq!(tags.tag_set.len(), 1);
+            assert_eq!(tags.tag_set[0].key.as_deref(), Some("purpose"));
+            assert_eq!(tags.tag_set[0].value.as_deref(), Some("vectors"));
+            assert_eq!(snapshot.encryption_config_xml, stored.encryption_config_xml);
+            assert_eq!(snapshot.sse_config.is_some(), encryption == ManagedEncryption::Aes256);
+            assert!(!guard.is_lock_lost());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_read_rejects_stale_identity_and_foreign_store_guard() {
+        use crate::app::object::ManagedEncryption;
+        use crate::app::storage_api::managed::BucketIncarnation;
+        let (request, access, store, _reset) =
+            crate::app::object::managed_request_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let context = request.server_context().unwrap().installed_app_context().unwrap();
+        let usecase = DefaultBucketUsecase::with_context(Some(context.clone()));
+        let identity = access.bucket();
+        let guard = usecase.acquire_bucket_handle_guard(identity).await.unwrap();
+        let stale = BucketHandle::try_from_parts(
+            identity.kind(),
+            identity.account_namespace_id().clone(),
+            identity.region().to_owned(),
+            identity.public_name().clone(),
+            identity.storage_bucket_id().clone(),
+            BucketIncarnation::try_new(uuid::Uuid::new_v4()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            usecase.read_managed_bucket_metadata(&stale, &guard).await,
+            Err(BucketResolveError::Storage(_))
+        ));
+        let (_directory, _paths, other_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let other_context = Arc::new(AppContext::new(other_store.clone(), context.iam(), context.kms()));
+        let other_usecase = DefaultBucketUsecase::with_context(Some(other_context));
+        let tags = b"<Tagging><TagSet><Tag><Key>instance</Key><Value>other</Value></Tag></TagSet></Tagging>".to_vec();
+        other_usecase
+            .create_managed_bucket(identity.clone(), Vec::new(), tags.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            other_usecase.read_managed_bucket_metadata(identity, &guard).await,
+            Err(BucketResolveError::Storage(_))
+        ));
+        let other_guard = other_usecase.acquire_bucket_handle_guard(identity).await.unwrap();
+        let other = other_usecase
+            .read_managed_bucket_metadata(identity, &other_guard)
+            .await
+            .expect("own instance guard");
+        assert_eq!(other.tagging_config_xml, tags);
+        let original = usecase.read_managed_bucket_metadata(identity, &guard).await.unwrap();
+        assert!(original.tagging_config_xml.is_empty());
+        let listed = other_usecase
+            .list_managed_buckets(identity.account_namespace_id(), identity.region())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(&listed[0].0, identity);
+        assert_eq!(listed[0].1.tagging_config_xml, tags);
+        assert!(
+            managed::get_bucket_metadata(&store, identity.storage_bucket_id().as_str())
+                .await
+                .unwrap()
+                .tagging_config_xml
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_read_reuses_guard_with_waiting_bucket_delete() {
+        use crate::app::object::ManagedEncryption;
+        let (request, access, store, _reset) =
+            crate::app::object::managed_request_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let usecase = DefaultBucketUsecase::with_context(request.server_context().unwrap().installed_app_context());
+        let identity = access.bucket();
+        let guard = usecase.acquire_bucket_handle_guard(identity).await.unwrap();
+        let lock_counts = || {
+            crate::app::storage_api::test::bootstrap_instance_ctx()
+                .lock_manager()
+                .as_fast_lock_manager()
+                .expect("fixture lock manager")
+                .current_lock_counts()
+        };
+        let before = lock_counts().1;
+        let bucket = identity.storage_bucket_id().as_str().to_owned();
+        let writer = tokio::spawn(async move { store.delete_bucket(&bucket, &DeleteBucketOptions::default()).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lock_counts().1 <= before {
+                assert!(!writer.is_finished(), "bucket writer must reach the lock queue");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bucket writer queues");
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), usecase.read_managed_bucket_metadata(identity, &guard))
+            .await
+            .expect("metadata read reuses the admitted lifecycle guard")
+            .expect("guarded metadata");
+        assert_eq!(
+            snapshot
+                .bucket_handle(identity.account_namespace_id(), identity.region())
+                .unwrap(),
+            *identity
+        );
+        assert!(!writer.is_finished());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("empty bucket deletion finishes");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_list_returns_only_validated_vector_snapshots() {
+        use crate::app::object::ManagedEncryption;
+        use crate::app::storage_api::managed::BucketIncarnation;
+        let (request, access, store, _reset) =
+            crate::app::object::managed_request_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let usecase = DefaultBucketUsecase::with_context(request.server_context().unwrap().installed_app_context());
+        let first = access.bucket();
+        let public_name = BucketPublicName::try_new(format!("aaa-vector-{}", uuid::Uuid::new_v4().simple())).unwrap();
+        let second = BucketHandle::try_from_parts(
+            BucketKind::Vector,
+            first.account_namespace_id().clone(),
+            first.region().to_owned(),
+            public_name.clone(),
+            vector_storage_bucket_id(first.account_namespace_id(), first.region(), &public_name).unwrap(),
+            BucketIncarnation::try_new(uuid::Uuid::new_v4()).unwrap(),
+        )
+        .unwrap();
+        usecase
+            .create_managed_bucket(second.clone(), Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        let general = format!("general-{}", uuid::Uuid::new_v4().simple());
+        store.make_bucket(&general, &MakeBucketOptions::default()).await.unwrap();
+        let listed = usecase
+            .list_managed_buckets(first.account_namespace_id(), first.region())
+            .await
+            .expect("managed listing");
+        assert!(listed.iter().any(|(identity, _)| identity == first));
+        assert!(listed.iter().any(|(identity, _)| identity == &second));
+        assert!(
+            listed
+                .windows(2)
+                .all(|pair| pair[0].0.public_name().as_str() < pair[1].0.public_name().as_str())
+        );
+        for (identity, snapshot) in &listed {
+            assert_eq!(identity.kind(), BucketKind::Vector);
+            assert_ne!(identity.storage_bucket_id().as_str(), general);
+            snapshot.validate_bucket_handle(identity).unwrap();
+            assert_eq!(snapshot.name, identity.storage_bucket_id().as_str());
+        }
+        assert!(matches!(
+            usecase
+                .list_managed_buckets(first.account_namespace_id(), "another-region")
+                .await,
+            Err(BucketResolveError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            DefaultBucketUsecase::without_context()
+                .list_managed_buckets(first.account_namespace_id(), first.region())
+                .await,
+            Err(BucketResolveError::CapabilityUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_read_and_list_reject_unreadable_metadata() {
+        use crate::app::object::ManagedEncryption;
+        let (request, access, store, _reset) =
+            crate::app::object::managed_request_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let usecase = DefaultBucketUsecase::with_context(request.server_context().unwrap().installed_app_context());
+        let identity = access.bucket();
+        let guard = usecase.acquire_bucket_handle_guard(identity).await.unwrap();
+        let original = managed::get_bucket_metadata(&store, identity.storage_bucket_id().as_str())
+            .await
+            .unwrap();
+        for config in ["policy", "policy-version", "encryption", "tags", "binding"] {
+            let mut corrupt = original.as_ref().clone();
+            match config {
+                "policy" => corrupt.policy_config_json = b"broken policy".to_vec(),
+                "policy-version" => corrupt.policy_config_json = br#"{"Version":"invalid","Statement":[]}"#.to_vec(),
+                "encryption" => corrupt.encryption_config_xml = b"<broken>".to_vec(),
+                "tags" => corrupt.tagging_config_xml = b"<broken>".to_vec(),
+                "binding" => {
+                    let mut record: serde_json::Value = serde_json::from_slice(&corrupt.bucket_identity_config_json).unwrap();
+                    record["binding"]["public_name"] = serde_json::json!("another-vector-name");
+                    corrupt.bucket_identity_config_json = serde_json::to_vec(&record).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            corrupt
+                .save_with_store(store.clone())
+                .await
+                .expect("persist exact corrupt bytes");
+            let read = usecase.read_managed_bucket_metadata(identity, &guard).await;
+            let listed = usecase
+                .list_managed_buckets(identity.account_namespace_id(), identity.region())
+                .await;
+            let mut restored = original.as_ref().clone();
+            restored.save_with_store(store.clone()).await.unwrap();
+            assert!(
+                matches!(read, Err(BucketResolveError::Storage(_))),
+                "{config}: unreadable metadata must fail"
+            );
+            assert!(
+                matches!(listed, Err(BucketResolveError::Storage(_) | BucketResolveError::IdentityMismatch)),
+                "{config}: listing must preserve the error"
+            );
+        }
+        usecase
+            .read_managed_bucket_metadata(identity, &guard)
+            .await
+            .expect("restored metadata is readable");
     }
 }

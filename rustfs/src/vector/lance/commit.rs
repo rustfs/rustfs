@@ -526,13 +526,12 @@ impl<B: TableCatalogObjectBackend> DatasetSnapshot<B> {
 
     pub(crate) async fn query_matches(
         &self,
-        _query: &[f32],
-        _top_k: std::num::NonZeroUsize,
-        _filter: Option<crate::vector::filter::ValidatedFilter>,
+        query: &[f32],
+        top_k: std::num::NonZeroUsize,
+        filter: Option<crate::vector::filter::ValidatedFilter>,
     ) -> Result<Vec<super::dataset::QueryMatch>, DatasetError> {
-        Err(DatasetError::OperationUnavailable {
-            operation: "query distances from the exact snapshot",
-        })
+        self.owner.check_guard()?;
+        dataset::query_matches(&self.dataset, query, &self.info.index, top_k, filter).await
     }
 
     pub(crate) async fn query_candidates(

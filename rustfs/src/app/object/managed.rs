@@ -11,6 +11,7 @@ use crate::app::storage_api::managed::{
     self, BucketIdentityError, BucketIncarnationFenceGuard, BucketKind, ManagedObjectAccess, ManagedObjectOperation,
 };
 use crate::app::storage_api::multipart_usecase::contract::multipart::CompletePart;
+use crate::app::storage_api::object_usecase::sse::authorize_sse_kms_multipart_write;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +203,7 @@ impl ManagedObjectContext {
 impl ManagedMultipartUpload {
     fn origin(&self) -> crate::app::multipart_usecase::MultipartOrigin {
         crate::app::multipart_usecase::MultipartOrigin::Managed {
-            context: self.context.clone(),
+            context: Box::new(self.context.clone()),
             lifecycle_guard: self.lifecycle_guard.clone(),
         }
     }
@@ -305,10 +306,7 @@ impl DefaultObjectUsecase {
         });
         let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
         let session = run_owned_mutation(async move {
-            let response = owner
-                .create_multipart_with_origin(request, input, upload.origin())
-                .await
-                .map_err(rustfs_s3_types::S3Error::from)?;
+            let response = owner.create_multipart_with_origin(request, input, upload.origin()).await?;
             let upload_id = response
                 .output
                 .upload_id
@@ -416,6 +414,47 @@ impl DefaultObjectUsecase {
         Ok(info)
     }
 
+    /// Reauthorizes an object whose successful completion was already observed by this session.
+    pub(crate) async fn managed_confirm_completed_multipart_upload(
+        &self,
+        upload: &Arc<ManagedMultipartUpload>,
+        expected_body_revision: Uuid,
+    ) -> Result<ObjectInfo, ManagedObjectError> {
+        let helper =
+            OperationHelper::audit_only_from_view(&upload.context.request.audit_view(), S3Operation::CompleteMultipartUpload);
+        let principal = upload.context.operation_principal();
+        let result = async {
+            if expected_body_revision.is_nil() {
+                return Err(ManagedObjectError::MissingBodyRevision);
+            }
+            upload
+                .context
+                .access
+                .check(&upload.key, ManagedObjectOperation::CompleteMultipart)?;
+            upload.context.access.check(&upload.key, ManagedObjectOperation::CreateOnly)?;
+            let info = self
+                .managed_head_object_under_guard(
+                    &upload.context,
+                    &upload.key,
+                    Some(expected_body_revision),
+                    &principal,
+                    &upload.lifecycle_guard,
+                )
+                .await?;
+            authorize_sse_kms_multipart_write(Some(&principal), &info.user_defined).await?;
+            if rustfs_utils::http::get_consistent_str(&info.user_defined, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)
+                != Some(upload.upload_id.as_str())
+                || upload.lifecycle_guard.is_lock_lost()
+            {
+                return Err(ApiError::from(StorageError::PreconditionFailed).into());
+            }
+            Ok(info)
+        }
+        .await;
+        finish_managed_read(helper, &result);
+        result
+    }
+
     pub(crate) async fn managed_abort_multipart_upload(
         &self,
         upload: &Arc<ManagedMultipartUpload>,
@@ -435,10 +474,7 @@ impl DefaultObjectUsecase {
             let request = upload.context.request.fork_for_authorization();
             let origin = upload.origin();
             run_owned_mutation(async move {
-                owner
-                    .abort_multipart_with_origin(request, input, origin)
-                    .await
-                    .map_err(rustfs_s3_types::S3Error::from)?;
+                owner.abort_multipart_with_origin(request, input, origin).await?;
                 Ok::<_, rustfs_s3_types::S3Error>(())
             })
             .await?;
