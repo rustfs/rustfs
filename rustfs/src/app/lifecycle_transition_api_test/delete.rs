@@ -332,7 +332,7 @@ async fn delete_objects_resolves_bucket_versioning_once_per_request() {
     let lookups_before = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst);
     let snapshots_before = DELETE_CONFIG_SNAPSHOT_LOADS.load(Ordering::SeqCst);
     let response = usecase
-        .execute_delete_objects(req)
+        .execute_delete_objects_from_s3s(req)
         .await
         .expect("delete objects should succeed");
 
@@ -389,7 +389,7 @@ async fn delete_objects_treats_empty_directory_version_as_absent() {
     });
 
     let response = usecase
-        .execute_delete_objects(req)
+        .execute_delete_objects_from_s3s(req)
         .await
         .expect("empty VersionId should be treated as an absent version");
     let deleted = response
@@ -438,7 +438,7 @@ async fn delete_objects_preserves_explicit_null_directory_version() {
     });
 
     let response = usecase
-        .execute_delete_objects(req)
+        .execute_delete_objects_from_s3s(req)
         .await
         .expect("explicit null VersionId should delete the directory's null version");
     let deleted = response
@@ -839,7 +839,7 @@ async fn delete_objects_replication_config_failure_does_not_call_storage_delete(
     });
 
     let err = usecase
-        .execute_delete_objects(req)
+        .execute_delete_objects_from_s3s(req)
         .await
         .expect_err("replication config failure must reject DeleteObjects");
 
