@@ -38,7 +38,7 @@ impl Served for dto::PutObject {
         let input = request.input();
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let retain_until = retain_until(input.object_lock_retain_until_date.as_ref());
+        let retain_until = put_object_retain_until(request);
         let version_id = request_version_id(envelope);
         let specific_etag = input.if_match.as_deref().is_some_and(|value| value.trim() != "*");
         let legal_hold = input.object_lock_legal_hold_status.is_some();
@@ -63,7 +63,8 @@ impl Served for dto::PutObject {
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        let mut input = native_input(request.into_input())?;
+        let retain_until = put_object_retain_until(&request)?;
+        let mut input = native_input(request.into_input(), retain_until);
         input.version_id = request_version_id(&envelope);
         if let Some(algorithm) = trailer_checksum_algorithm(&envelope)? {
             input.checksum_algorithm = Some(algorithm.wire_name().to_owned());
@@ -187,18 +188,38 @@ pub(super) fn request_version_id(envelope: &RequestEnvelope) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+fn put_object_retain_until(request: &Req<dto::PutObject>) -> S3Result<Option<time::OffsetDateTime>> {
+    retain_until_with_offset(
+        request.input().object_lock_retain_until_date.as_ref(),
+        request.context().object_lock_retain_until_offset_seconds(),
+    )
+}
+
 pub(super) fn retain_until(value: Option<&Timestamp>) -> S3Result<Option<time::OffsetDateTime>> {
+    retain_until_with_offset(value, None)
+}
+
+pub(super) fn retain_until_with_offset(
+    value: Option<&Timestamp>,
+    offset_seconds: Option<i32>,
+) -> S3Result<Option<time::OffsetDateTime>> {
     value
         .map(|value| {
-            time::OffsetDateTime::from_unix_timestamp_nanos(
+            let invalid_date = || s3_error!(InvalidArgument, "Invalid retain-until date");
+            let instant = time::OffsetDateTime::from_unix_timestamp_nanos(
                 i128::from(value.secs()) * 1_000_000_000 + i128::from(value.subsec_nanos()),
             )
-            .map_err(|_| s3_error!(InvalidArgument, "Invalid retain-until date"))
+            .map_err(|_| invalid_date())?;
+            let Some(seconds) = offset_seconds else {
+                return Ok(instant);
+            };
+            let offset = time::UtcOffset::from_whole_seconds(seconds).map_err(|_| invalid_date())?;
+            instant.checked_to_offset(offset).ok_or_else(invalid_date)
         })
         .transpose()
 }
 
-fn native_input(input: dto::PutObjectInput) -> S3Result<PutObjectWriteInput> {
+fn native_input(input: dto::PutObjectInput, retain_until: Option<time::OffsetDateTime>) -> PutObjectWriteInput {
     let checksum = |algorithm| {
         input
             .checksum_spec
@@ -206,7 +227,7 @@ fn native_input(input: dto::PutObjectInput) -> S3Result<PutObjectWriteInput> {
             .filter(|value| value.algorithm() == algorithm)
             .map(|value| value.render_base64().to_owned())
     };
-    Ok(PutObjectWriteInput {
+    PutObjectWriteInput {
         checksum_crc32: checksum(ChecksumAlgorithm::Crc32),
         checksum_crc32c: checksum(ChecksumAlgorithm::Crc32c),
         checksum_sha1: checksum(ChecksumAlgorithm::Sha1),
@@ -220,7 +241,7 @@ fn native_input(input: dto::PutObjectInput) -> S3Result<PutObjectWriteInput> {
         content_length: Some(input.content_length),
         metadata: Some(input.metadata.into_iter().collect()),
         specific_if_none_match: input.if_none_match.as_deref().is_some_and(|value| value.trim() != "*"),
-        object_lock_retain_until_date: retain_until(input.object_lock_retain_until_date.as_ref())?,
+        object_lock_retain_until_date: retain_until,
         cache_control: input.cache_control,
         content_disposition: input.content_disposition,
         content_encoding: input.content_encoding,
@@ -240,7 +261,7 @@ fn native_input(input: dto::PutObjectInput) -> S3Result<PutObjectWriteInput> {
         storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
         website_redirect_location: input.website_redirect_location,
         checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
-    })
+    }
 }
 
 fn native_output(output: PutObjectWriteOutput) -> S3Result<Resp<dto::PutObject>> {

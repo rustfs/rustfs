@@ -346,7 +346,7 @@ pub(crate) mod access {
 }
 
 pub(crate) mod bucket {
-    use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::{
         RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging,
     };
     use std::sync::Arc;
@@ -393,7 +393,7 @@ pub(crate) mod bucket {
         crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
     }
 
-    // Remove this conversion when RestoreObject receives Gateway inputs.
+    // The legacy edge keeps values that its decoder permits before domain validation.
     pub(crate) fn restore_request_from_wire(request: s3s::dto::RestoreRequest) -> RestoreRequest {
         use rustfs_gateway_types::dto;
 
@@ -944,8 +944,9 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod metadata {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
         pub(crate) use crate::storage::storage_api::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
+            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_WEBSITE_CONFIG,
         };
         pub(crate) const BUCKET_CORS_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_CORS_CONFIG;
         pub(crate) const BUCKET_LIFECYCLE_CONFIG: &str =
@@ -961,7 +962,6 @@ pub(crate) mod bucket {
         pub(crate) const BUCKET_TARGETS_FILE: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
         pub(crate) const BUCKET_VERSIONING_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
-        #[cfg(test)]
         pub(crate) const OBJECT_LOCK_CONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
     }
 
@@ -1723,7 +1723,7 @@ pub(crate) mod s3_api {
 
     pub(crate) mod tagging {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::tagging::{
-            parse_copy_object_tags, resolve_copy_object_tags, validate_bucket_tag_set,
+            parse_copy_object_tags, resolve_copy_object_tags,
         };
     }
 }
@@ -1845,8 +1845,11 @@ pub(crate) mod object_usecase {
 
 pub(crate) mod object_meta_usecase {
     pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::object::ObjectLockRetentionOptions;
         pub(crate) use super::super::storage_contracts::{BucketOperations, BucketOptions, ObjectOperations};
     }
+
+    pub(crate) use crate::storage::storage_api::check_retention_for_modification;
 
     pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries;
@@ -1899,8 +1902,8 @@ pub(crate) mod select_object {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::StorageError;
     pub(crate) use crate::storage::storage_api::{
-        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
-        validate_ssec_for_read,
+        StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store_owned,
+        validate_sse_headers_for_read, validate_ssec_for_read,
     };
 }
 

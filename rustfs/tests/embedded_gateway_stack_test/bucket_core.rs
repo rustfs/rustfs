@@ -20,8 +20,8 @@ use super::{
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::{
-    AccelerateConfiguration, BucketAccelerateStatus, BucketLocationConstraint, CreateBucketConfiguration, IndexDocument, Payer,
-    RequestPaymentConfiguration, WebsiteConfiguration,
+    AccelerateConfiguration, BucketAccelerateStatus, BucketLocationConstraint, BucketLoggingStatus, CreateBucketConfiguration,
+    IndexDocument, LoggingEnabled, Payer, RequestPaymentConfiguration, WebsiteConfiguration,
 };
 use futures::future::BoxFuture;
 use rustfs::embedded::RustFSServer;
@@ -85,6 +85,12 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         metric: S3Operation::GetBucketLogging,
         has_error_body: true,
         call: get_bucket_logging,
+    },
+    MatrixRow {
+        operation: "PutBucketLogging",
+        metric: S3Operation::PutBucketLogging,
+        has_error_body: true,
+        call: put_bucket_logging,
     },
     MatrixRow {
         operation: "PutBucketAccelerateConfiguration",
@@ -514,6 +520,108 @@ fn the_gateway_stack_reads_core_bucket_configurations() {
 #[test]
 fn the_legacy_stack_reads_core_bucket_configurations() {
     with_stack(LEGACY, |server| core_configuration_reads(server, false));
+}
+
+fn put_bucket_logging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let enabled = LoggingEnabled::builder()
+            .target_bucket("logging-target")
+            .target_prefix("café & tea/")
+            .build()
+            .expect("logging target and prefix");
+        let status = BucketLoggingStatus::builder().logging_enabled(enabled).build();
+        outcome(
+            client
+                .put_bucket_logging()
+                .bucket(bucket)
+                .bucket_logging_status(status)
+                .send()
+                .await,
+        )
+    })
+}
+
+async fn bucket_logging_mutations(server: RustFSServer) {
+    const BUCKET: &str = "logging-write-granted-s3alias";
+    const OTHER: &str = "logging-write-other";
+    const MISSING: &str = "logging-write-missing";
+    const WRITER: &str = "bucketloggingwriter";
+    const READER: &str = "bucketloggingreader";
+
+    for bucket in [BUCKET, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(WRITER, "s3:PutBucketLogging", BUCKET).await;
+    create_user_allowed_on_one_bucket(READER, "s3:GetBucketLogging", BUCKET).await;
+    let endpoint = server.endpoint();
+    let root = s3_client(&endpoint, server.access_key(), server.secret_key());
+    let writer = s3_client(&endpoint, WRITER, USER_SECRET_KEY);
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    let anonymous = anonymous_client(&endpoint).await;
+
+    assert_eq!(put_bucket_logging(&writer, BUCKET).await, Ok(()), "grant on the requested bucket");
+    for (client, bucket, expected) in [
+        (&writer, OTHER, ("AccessDenied", 403)),
+        (&reader, BUCKET, ("AccessDenied", 403)),
+        (&anonymous, BUCKET, ("AccessDenied", 403)),
+        (&root, MISSING, ("NoSuchBucket", 404)),
+    ] {
+        let error = put_bucket_logging(client, bucket).await.expect_err("logging write refusal");
+        assert_eq!((error.code.as_deref(), error.status), (Some(expected.0), Some(expected.1)));
+    }
+    let stored = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("durable logging config");
+    assert_eq!(
+        stored.logging_config_xml,
+        "<BucketLoggingStatus><LoggingEnabled><TargetBucket>logging-target</TargetBucket><TargetPrefix>café &amp; tea/</TargetPrefix></LoggingEnabled></BucketLoggingStatus>".as_bytes()
+    );
+    let response = reader
+        .get_bucket_logging()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("read logging config");
+    let enabled = response.logging_enabled().expect("logging is enabled");
+    assert_eq!((enabled.target_bucket(), enabled.target_prefix()), ("logging-target", "café & tea/"));
+    assert!(
+        metadata_sys::get_config_from_disk(OTHER)
+            .await
+            .expect("untouched bucket")
+            .logging_config_xml
+            .is_empty()
+    );
+
+    writer
+        .put_bucket_logging()
+        .bucket(BUCKET)
+        .bucket_logging_status(BucketLoggingStatus::builder().build())
+        .send()
+        .await
+        .expect("disable logging");
+    let stored = metadata_sys::get_config_from_disk(BUCKET)
+        .await
+        .expect("durable disabled logging config");
+    assert_eq!(stored.logging_config_xml, b"<BucketLoggingStatus></BucketLoggingStatus>");
+    let response = reader
+        .get_bucket_logging()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("read disabled logging config");
+    assert!(response.logging_enabled().is_none());
+
+    server.shutdown().await;
+}
+
+#[test]
+fn the_gateway_stack_mutates_bucket_logging() {
+    with_stack(GATEWAY, bucket_logging_mutations);
+}
+
+#[test]
+fn the_legacy_stack_mutates_bucket_logging() {
+    with_stack(LEGACY, bucket_logging_mutations);
 }
 
 fn put_bucket_accelerate_configuration<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {

@@ -21,7 +21,6 @@
 
 use crate::app::RequestEnvelope;
 use crate::storage::ecfs::*;
-use crate::storage::helper::audit_only_operation;
 use crate::storage::s3_api;
 use crate::storage::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{delete_bucket_cors, put_bucket_cors};
@@ -50,11 +49,10 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketEncryption, |req| {
-            usecase.execute_delete_bucket_encryption(req)
-        })
-        .await
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_encryption(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
     #[instrument(name = "delete_bucket_tagging", level = "debug", skip(self, req))]
@@ -62,8 +60,10 @@ impl FS {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::DeleteBucketTagging, |req| usecase.execute_delete_bucket_tagging(req)).await
+        s3_api::bucket_usecase_for(self)
+            .execute_delete_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket)
+            .await?;
+        Ok(S3Response::new(DeleteBucketTaggingOutput::default()))
     }
 
     #[instrument(name = "delete_public_access_block", level = "debug", skip(self, req))]
@@ -147,12 +147,11 @@ impl FS {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        let prepared = persisted_from_s3s(&req.input.server_side_encryption_configuration);
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketEncryption, |req| {
-            usecase.execute_put_bucket_encryption(req, prepared)
-        })
-        .await
+        let prepared = persisted_from_s3s(&req.input.server_side_encryption_configuration).map_err(Into::into);
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&req), &req.input.bucket, prepared)
+            .await?;
+        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
 
     #[instrument(name = "put_public_access_block", level = "debug", skip(self, req))]
@@ -174,7 +173,9 @@ impl FS {
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let tagging = tagging_from_s3s(&req.input.tagging);
-        let usecase = s3_api::bucket_usecase_for(self);
-        audit_only_operation(req, S3Operation::PutBucketTagging, |req| usecase.execute_put_bucket_tagging(req, tagging)).await
+        s3_api::bucket_usecase_for(self)
+            .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, tagging)
+            .await?;
+        Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 }

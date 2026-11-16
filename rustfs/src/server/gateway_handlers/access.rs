@@ -27,7 +27,8 @@
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
 use crate::storage_api::server::http::access::{
-    VerifiedSignature, admit_operation, authorize_bucket_config_mutation as authorize_config_mutation, resolve_req_info,
+    VerifiedSignature, admit_operation, authorize_bucket_config_mutation as authorize_config_mutation,
+    authorize_bucket_tag_deletion as authorize_tag_deletion, resolve_req_info,
 };
 use rustfs_gateway::sig::{SigFamily, SigLocation};
 use rustfs_gateway::{RequestContextView, RequestPrincipal};
@@ -70,11 +71,20 @@ pub(super) async fn authorize_bucket_config_mutation(
     bucket: &str,
     action: Action,
 ) -> S3Result<()> {
-    let server_ctx = envelope
+    let server_ctx = require_server_context(envelope)?;
+    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+}
+
+pub(super) async fn authorize_bucket_tag_deletion(envelope: &mut RequestEnvelope, bucket: &str) -> S3Result<()> {
+    let server_ctx = require_server_context(envelope)?;
+    Ok(authorize_tag_deletion(&server_ctx, envelope, bucket).await?)
+}
+
+fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerContextSlot>> {
+    envelope
         .server_context()
         .cloned()
-        .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "the request carries no server context"))?;
-    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+        .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "the request carries no server context"))
 }
 
 /// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the

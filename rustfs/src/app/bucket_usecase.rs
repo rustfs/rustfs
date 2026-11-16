@@ -92,7 +92,6 @@ use rustfs_gateway_types::persistence::{
     PersistedVersioningConfiguration,
 };
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
-use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     action::{Action, S3Action},
@@ -125,6 +124,8 @@ mod core;
 #[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
+#[cfg(test)]
+mod delete_config_tests;
 mod encryption;
 #[cfg(test)]
 mod guards;

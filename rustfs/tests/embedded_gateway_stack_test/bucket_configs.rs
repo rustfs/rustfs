@@ -92,7 +92,278 @@ pub(crate) const MATRIX: &[MatrixRow] = &[
         has_error_body: true,
         call: delete_bucket_cors,
     },
+    MatrixRow {
+        operation: "PutBucketEncryption",
+        metric: S3Operation::PutBucketEncryption,
+        has_error_body: true,
+        call: put_bucket_encryption,
+    },
+    MatrixRow {
+        operation: "PutBucketTagging",
+        metric: S3Operation::PutBucketTagging,
+        has_error_body: true,
+        call: put_bucket_tagging,
+    },
+    MatrixRow {
+        operation: "DeleteBucketEncryption",
+        metric: S3Operation::DeleteBucketEncryption,
+        has_error_body: true,
+        call: delete_bucket_encryption,
+    },
+    MatrixRow {
+        operation: "DeleteBucketTagging",
+        metric: S3Operation::DeleteBucketTagging,
+        has_error_body: true,
+        call: delete_bucket_tagging,
+    },
 ];
+
+fn put_bucket_encryption<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use aws_sdk_s3::types::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
+
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        let rule = ServerSideEncryptionRule::builder()
+            .apply_server_side_encryption_by_default(
+                ServerSideEncryptionByDefault::builder()
+                    .sse_algorithm(ServerSideEncryption::Aes256)
+                    .build()
+                    .expect("encryption algorithm"),
+            )
+            .build();
+        let config = ServerSideEncryptionConfiguration::builder()
+            .rules(rule)
+            .build()
+            .expect("encryption rule");
+        outcome(
+            client
+                .put_bucket_encryption()
+                .bucket(ENCRYPTION_MATRIX_BUCKET)
+                .server_side_encryption_configuration(config)
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(200))),
+        )
+    })
+}
+
+fn put_bucket_tagging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    use aws_sdk_s3::types::{Tag, Tagging};
+
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        let tag = Tag::builder().key("team").value("gateway").build().expect("tag");
+        let tagging = Tagging::builder().tag_set(tag).build().expect("tag set");
+        outcome(
+            client
+                .put_bucket_tagging()
+                .bucket(bucket)
+                .tagging(tagging)
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| assert_eq!(status.take(), Some(200))),
+        )
+    })
+}
+
+fn delete_bucket_encryption<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        outcome(
+            client
+                .delete_bucket_encryption()
+                .bucket(bucket)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| {
+                    assert_eq!(status.take(), Some(204));
+                }),
+        )
+    })
+}
+
+fn delete_bucket_tagging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
+    Box::pin(async move {
+        let status = StatusCapture::default();
+        outcome(
+            client
+                .delete_bucket_tagging()
+                .bucket(bucket)
+                .customize()
+                .interceptor(status.clone())
+                .send()
+                .await
+                .map(|_| {
+                    assert_eq!(status.take(), Some(204));
+                }),
+        )
+    })
+}
+
+async fn bucket_configuration_deletes_authorize_the_existing_action_and_bucket(server: RustFSServer) {
+    const ALLOWED: &str = "config-delete-authorized";
+    const OTHER: &str = "config-delete-other";
+    const READER: &str = "config-delete-reader";
+    for bucket in [ALLOWED, OTHER] {
+        create_bucket_in_the_store(bucket).await;
+    }
+    create_user_allowed_on_one_bucket(READER, "s3:ListBucket", ALLOWED).await;
+    let endpoint = server.endpoint();
+    let reader = s3_client(&endpoint, READER, USER_SECRET_KEY);
+    type Delete = for<'a> fn(&'a Client, &'a str) -> BoxFuture<'a, Outcome>;
+    let deletes: [(&str, &str, Delete); 3] = [
+        ("config-delete-sse", "s3:PutBucketEncryption", delete_bucket_encryption),
+        (
+            "config-delete-policy",
+            "s3:DeleteBucketPolicy",
+            super::bucket_access::delete_bucket_policy,
+        ),
+        ("config-delete-tags", "s3:PutBucketTagging", delete_bucket_tagging),
+    ];
+    for (user, action, delete) in deletes {
+        create_user_allowed_on_one_bucket(user, action, ALLOWED).await;
+        let writer = s3_client(&endpoint, user, USER_SECRET_KEY);
+        assert_read_error(delete(&reader, ALLOWED).await, "AccessDenied", 403, action);
+        assert_read_error(delete(&writer, OTHER).await, "AccessDenied", 403, action);
+        assert_eq!(delete(&writer, ALLOWED).await, Ok(()), "{action} on the authorized bucket");
+    }
+    server.shutdown().await;
+}
+
+#[test]
+fn gateway_bucket_configuration_deletes_authorize_the_existing_action_and_bucket() {
+    with_stack(GATEWAY, bucket_configuration_deletes_authorize_the_existing_action_and_bucket);
+}
+
+#[test]
+fn legacy_bucket_configuration_deletes_authorize_the_existing_action_and_bucket() {
+    with_stack(LEGACY, bucket_configuration_deletes_authorize_the_existing_action_and_bucket);
+}
+
+#[test]
+fn tag_deletion_reaches_opa_with_unreadable_tags_on_both_stacks() {
+    const STACK: &str = "RUSTFS_TEST_TAG_REPAIR_STACK";
+    match std::env::var(STACK).as_deref() {
+        Ok("gateway") => with_stack(GATEWAY, tag_deletion_reaches_opa_with_unreadable_tags),
+        Ok("legacy") => with_stack(LEGACY, tag_deletion_reaches_opa_with_unreadable_tags),
+        _ => {
+            // The IAM plug-in is process-wide, so isolate it from the other embedded tests.
+            for stack in ["gateway", "legacy"] {
+                let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "bucket_configs::tag_deletion_reaches_opa_with_unreadable_tags_on_both_stacks",
+                    ])
+                    .env(STACK, stack)
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .env("no_proxy", "127.0.0.1,localhost")
+                    .output()
+                    .expect("run isolated OPA test");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                    "{stack} OPA test failed:\n{stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+async fn tag_deletion_reaches_opa_with_unreadable_tags(server: RustFSServer) {
+    use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_policy::policy::opa::{Args, AuthZPlugin};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BUCKET: &str = "config-delete-opa";
+    const ACTOR: &str = "config-delete-opa-user";
+    const UNREADABLE_TAGS: &[u8] = b"<Tagging><TagSet>";
+    create_bucket_in_the_store(BUCKET).await;
+    super::create_user_without_a_policy(ACTOR).await;
+    let context = get_global_app_context().expect("application context");
+    let metadata_system = context.bucket_metadata().handle().expect("bucket metadata system");
+    let mut metadata = metadata_system
+        .read()
+        .await
+        .get_config_from_disk(BUCKET)
+        .await
+        .expect("bucket metadata");
+    metadata.tagging_config_xml = UNREADABLE_TAGS.to_vec();
+    metadata.tagging_config = None;
+    metadata
+        .save_with_store(context.object_store())
+        .await
+        .expect("persist unreadable tags");
+    metadata_system.write().await.set(BUCKET.to_owned(), Arc::new(metadata)).await;
+
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let record = Arc::clone(&decisions);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind OPA fixture");
+    let url = format!("http://{}/decision", listener.local_addr().expect("OPA fixture address"));
+    let router = axum::Router::new().route(
+        "/decision",
+        axum::routing::post(move |axum::Json(payload): axum::Json<serde_json::Value>| async move {
+            record.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(payload["input"]["resource"]["bucket"], BUCKET);
+            assert_eq!(payload["input"]["action"], "s3:PutBucketTagging");
+            axum::Json(serde_json::json!({"result": true}))
+        }),
+    );
+    let opa = tokio::spawn(async move { axum::serve(listener, router).await.expect("serve OPA fixture") });
+    IamSys::<ObjectStore>::set_policy_plugin_client(AuthZPlugin::new(Args {
+        url,
+        auth_token: String::new(),
+    }))
+    .await;
+
+    let client = s3_client(&server.endpoint(), ACTOR, USER_SECRET_KEY);
+    let client = Client::from_conf(
+        client
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build(),
+    );
+    assert_read_error(
+        get_bucket_tagging(&client, BUCKET).await,
+        "InternalError",
+        500,
+        "read with unreadable tags",
+    );
+    assert_eq!(decisions.load(Ordering::Relaxed), 0, "ordinary authorization cannot read the tags");
+
+    let deletion = delete_bucket_tagging(&client, BUCKET).await;
+    assert_eq!(
+        decisions.load(Ordering::Relaxed),
+        1,
+        "tag deletion reaches OPA before storage checks the tags"
+    );
+    assert_read_error(deletion, "ServiceUnavailable", 503, "storage refuses to rewrite unreadable tags");
+    let stored = metadata_system
+        .read()
+        .await
+        .get_config_from_disk(BUCKET)
+        .await
+        .expect("reload durable metadata");
+    assert_eq!(stored.tagging_config_xml, UNREADABLE_TAGS);
+    assert_read_error(
+        get_bucket_tagging(&client, BUCKET).await,
+        "InternalError",
+        500,
+        "read after the refused delete",
+    );
+    assert_eq!(decisions.load(Ordering::Relaxed), 1);
+    opa.abort();
+    server.shutdown().await;
+}
 
 fn put_bucket_cors<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move { outcome(put_cors(client, bucket, cors_document()).send().await) })

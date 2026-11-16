@@ -14489,7 +14489,7 @@ fn assert_object_mutation_reserved_prefix_sources(delete: &str, legacy_delete: &
         assert_ordered(method(source, signature), &[key_validation, key_guard, mutation_boundary]);
     }
     assert_ordered(
-        method(restore, "fn execute_restore_object("),
+        method(restore, "fn execute_restore_object_owned("),
         &[
             "validate_table_catalog_object_mutation(&bucket, &object).await?;",
             store_resolution,

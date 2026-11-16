@@ -356,8 +356,12 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
     create_bucket_in_the_store(bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
     bucket_configs::store_read_configs(MATRIX_BUCKET, bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
     bucket_core::seed_website(MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::REPLICATION_MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::LOCK_CONFIGURATION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
+    object_misc::seed_restore_object(object_misc::MATRIX_BUCKET, false).await;
+    object_misc::seed_select_matrix().await;
     create_bucket_in_the_store(object_read::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_commit::COPY_MATRIX_BUCKET).await;
     put_object_in_the_store(object_commit::COPY_MATRIX_BUCKET, object_commit::COPY_MATRIX_SOURCE).await;
@@ -400,6 +404,15 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                     | S3Operation::PutBucketRequestPayment
                     | S3Operation::PutBucketWebsite
                     | S3Operation::DeleteBucketWebsite
+                    | S3Operation::PutBucketReplication
+                    | S3Operation::DeleteBucketReplication
+                    | S3Operation::PutObjectLockConfiguration
+                    | S3Operation::PutBucketEncryption
+                    | S3Operation::PutBucketTagging
+                    | S3Operation::DeleteBucketEncryption
+                    | S3Operation::DeleteBucketTagging
+                    | S3Operation::SelectObjectContent
+                    | S3Operation::RestoreObject
             ) {
             "unknown"
         } else {
