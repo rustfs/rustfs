@@ -67,11 +67,13 @@ pub(crate) fn signed_request_with_headers(
     secret_key: &str,
     mut headers: HeaderMap,
 ) -> Request<Empty<Bytes>> {
-    headers.insert(http::header::HOST, HeaderValue::from_static("localhost"));
+    headers
+        .entry(http::header::HOST)
+        .or_insert(HeaderValue::from_static("localhost"));
     let probe = Request::builder()
         .method(method.clone())
         .uri(path)
-        .header(http::header::HOST, "localhost")
+        .header(http::header::HOST, headers.get(http::header::HOST).expect("a supplied or default host"))
         .body(Bytes::new())
         .expect("static request");
     let accepted = WireRequest::accept(probe, &Limits::default()).expect("an acceptable host");

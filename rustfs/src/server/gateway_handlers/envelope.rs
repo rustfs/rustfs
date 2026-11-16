@@ -28,11 +28,12 @@ use crate::app::object::request_body::BodyReadControl;
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::auth::get_session_token;
 use crate::runtime_sources::ServerContextSlot;
+use crate::server::gateway_stack::OwnedKeystoneIdentity;
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::access::{AccessMarkers, VerifiedSignature};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, HeaderMap, HeaderValue, Uri};
-use rustfs_gateway::{RequestContextView, TransportExtensions};
+use rustfs_gateway::{IdentityOrigin, RequestContextView, TransportExtensions};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_trusted_proxies::ClientInfo;
 use std::sync::Arc;
@@ -77,7 +78,13 @@ impl RequestEnvelope {
                     get_session_token(&uri, &headers),
                 )?)
             }
-            None => None,
+            None => match context.header_token_principal() {
+                Some(_) => {
+                    let owned = keystone_identity(context)?;
+                    Some(RequestCredentials::without_secret_key(owned.credentials().access_key.clone(), None))
+                }
+                None => None,
+            },
         };
 
         let mut extensions = Extensions::new();
@@ -101,6 +108,20 @@ impl RequestEnvelope {
         };
         Ok(Self::from_parts(head, extensions))
     }
+}
+
+/// Binds the gateway's host-token verdict to this request's owned authorization identity.
+pub(super) fn keystone_identity(context: &RequestContextView) -> S3Result<&OwnedKeystoneIdentity> {
+    let denied = || rustfs_s3_types::s3_error!(AccessDenied, "Keystone identity is not established");
+    let principal = context.header_token_principal().ok_or_else(denied)?;
+    let owned = context
+        .transport_extensions()
+        .get::<OwnedKeystoneIdentity>()
+        .ok_or_else(denied)?;
+    if principal.origin() != IdentityOrigin::HostToken || principal.access_key_id() != owned.credentials().access_key {
+        return Err(denied());
+    }
+    Ok(owned)
 }
 
 /// The request target as it arrived: the raw path and query, with the scheme and authority when

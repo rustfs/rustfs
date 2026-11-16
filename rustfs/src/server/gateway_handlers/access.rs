@@ -52,8 +52,16 @@ pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &Request
         .and_then(|credentials| credentials.session_token())
         .unwrap_or_default()
         .to_owned();
-    let req_info =
-        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?;
+    let req_info = if context.header_token_principal().is_some() {
+        let identity = super::envelope::keystone_identity(context)?;
+        let mut info = resolve_req_info(server_ctx, None, "", envelope.request_context().cloned()).await?;
+        info.is_owner = crate::auth::keystone_is_owner(identity.credentials());
+        info.cred = Some(identity.credentials().clone());
+        info.keystone_session_present = Some(identity.had_session_token());
+        info
+    } else {
+        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
+    };
     envelope.install_req_info(req_info);
     admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
     Ok(envelope)
@@ -89,7 +97,7 @@ fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerCont
 
 /// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
 /// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
-pub(super) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
+pub(in crate::server) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
     match context.principal().map(RequestPrincipal::scheme) {
         Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
             sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),
