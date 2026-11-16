@@ -1538,7 +1538,7 @@ type S3EdgeService = S3Service;
 /// The S3 service mounted under the middleware: the legacy stack or the gateway stack, selected at
 /// startup (`server/stack.rs`).
 #[cfg(feature = "gateway-stack")]
-type S3EdgeService = S3StackService<S3Service, GatewayEdgeService>;
+type S3EdgeService = S3StackService<S3Service, GatewayEdgeService, NativeConsoleEdgeService>;
 
 /// The gateway stack where the legacy service is mounted: the same response and error types, so
 /// the layers around it do not change with the stack.
@@ -1566,6 +1566,44 @@ where
     }
 }
 
+#[cfg(feature = "gateway-stack")]
+#[derive(Clone)]
+struct NativeConsoleEdgeService(axum::Router);
+
+#[cfg(feature = "gateway-stack")]
+impl NativeConsoleEdgeService {
+    fn for_config(config: &config::Config) -> Option<Self> {
+        (matches!(config.s3_stack, config::S3Stack::Gateway) && config.console_enable)
+            .then(|| Self(admin::console::make_console_server()))
+    }
+}
+
+#[cfg(feature = "gateway-stack")]
+impl<B> Service<HttpRequest<B>> for NativeConsoleEdgeService
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Response = Response<s3s::Body>;
+    type Error = s3s::HttpError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let answer = self.0.call(request.map(axum::body::Body::new));
+        Box::pin(async move {
+            let response = match answer.await {
+                Ok(response) => response,
+                Err(never) => match never {},
+            };
+            Ok(response.map(s3s::Body::http_body_unsync))
+        })
+    }
+}
+
 /// Selects the S3 stack of this server, once. A gateway stack that cannot be assembled fails
 /// startup; the legacy stack is never started in its place.
 #[cfg(feature = "gateway-stack")]
@@ -1577,7 +1615,8 @@ fn select_s3_stack(
     let service = select_stack(config.s3_stack, legacy, || -> Result<GatewayEdgeService> {
         let stack = GatewayStack::assemble(assembly()).map_err(Error::other)?;
         Ok(GatewayEdgeService(stack))
-    })?;
+    })?
+    .with_native_console(NativeConsoleEdgeService::for_config(config));
     info!(
         event = EVENT_S3_STACK_ASSEMBLED,
         component = LOG_COMPONENT_SERVER,
@@ -4380,6 +4419,325 @@ mod tests {
         digest_error(service.oneshot(request).await.unwrap(), "BadDigest").await;
         // The declared-empty SigV2 PUT, the SigV4 PUT and the matching-MD5 PUT reached the service.
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    mod native_console_tests {
+        use super::*;
+        use crate::config::S3Stack;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        async fn assert_console_response_equivalent(
+            expected: Response<s3s::Body>,
+            actual: Response<s3s::Body>,
+            method: &Method,
+            target: &str,
+        ) {
+            use http_body_util::BodyExt;
+            assert_eq!(actual.status(), expected.status(), "{method} {target}");
+            for header in [http::header::CONTENT_TYPE, http::header::CONTENT_LENGTH, http::header::ALLOW] {
+                assert_eq!(
+                    actual.headers().get(&header),
+                    expected.headers().get(&header),
+                    "{method} {target}: {header}"
+                );
+            }
+            assert_eq!(
+                actual.into_body().collect().await.unwrap().to_bytes(),
+                expected.into_body().collect().await.unwrap().to_bytes(),
+                "{method} {target}"
+            );
+        }
+
+        #[tokio::test]
+        async fn native_console_route_contract() {
+            use http_body_util::BodyExt;
+            legacy_console_characterizes_public_static_and_malformed_authorization().await;
+            let target = format!("{}/route-fixture.txt", crate::server::console_prefix());
+            let (service, calls) = edge(S3Stack::Gateway, true);
+            let response = service.oneshot(console_request(Method::GET, &target, false)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get(http::header::CONTENT_TYPE).unwrap(), "text/plain");
+            assert_eq!(response.headers().get(http::header::CONTENT_LENGTH).unwrap(), "28");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes().as_ref(),
+                b"console-route-static-content"
+            );
+            assert_eq!(counts(&calls), [0, 0, 1]);
+            public_static_uses_native_console_without_legacy_or_gateway_s3_calls().await;
+            neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded().await;
+            disabled_console_and_legacy_mode_keep_the_existing_entrypoint().await;
+        }
+
+        struct ConsoleTestS3;
+
+        #[async_trait::async_trait]
+        impl s3s::S3 for ConsoleTestS3 {}
+
+        fn legacy_console(enabled: bool) -> s3s::service::S3Service {
+            let mut builder = s3s::service::S3ServiceBuilder::new(ConsoleTestS3);
+            builder.set_auth(crate::auth::IAMAuth::new("console-test-access", "console-test-secret"));
+            builder.set_route(crate::admin::router::S3Router::<crate::admin::router::AdminOperation>::new(enabled));
+            builder.build()
+        }
+
+        fn console_request(method: Method, target: &str, malformed_auth: bool) -> HttpRequest<Empty<Bytes>> {
+            let mut builder = HttpRequest::builder().method(method).uri(target).header("host", "localhost");
+            if malformed_auth {
+                builder = builder.header(http::header::AUTHORIZATION, "invalid");
+            }
+            builder.body(Empty::new()).expect("static request")
+        }
+
+        fn static_console_cases() -> [(Method, String); 5] {
+            let prefix = crate::server::console_prefix();
+            [
+                (Method::GET, format!("{prefix}/index.html")),
+                (Method::HEAD, format!("{prefix}/index.html")),
+                (Method::OPTIONS, format!("{prefix}/index.html")),
+                (Method::GET, "/favicon.ico".to_owned()),
+                (Method::GET, format!("{prefix}/missing-static-file.js")),
+            ]
+        }
+
+        async fn static_response_body(response: Response<s3s::Body>, method: &Method, target: &str) -> Bytes {
+            use http_body_util::BodyExt;
+            let (fixture, content_type): (&[u8], &str) = if target == "/favicon.ico" {
+                (include_bytes!("../../tests/fixtures/native-console/favicon.ico"), "image/x-icon")
+            } else {
+                (include_bytes!("../../tests/fixtures/native-console/index.html"), "text/html")
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{method} {target}");
+            if method == Method::OPTIONS {
+                assert_eq!(
+                    response.headers().get("access-control-allow-methods").unwrap(),
+                    "GET,POST,PUT,DELETE,OPTIONS"
+                );
+                assert_eq!(response.headers().get("access-control-allow-headers").unwrap(), "*");
+                assert!(response.headers().get(http::header::CONTENT_TYPE).is_none());
+                assert!(response.headers().get(http::header::CONTENT_LENGTH).is_none());
+            } else {
+                assert_eq!(response.headers().get(http::header::CONTENT_TYPE).unwrap(), content_type);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(http::header::CONTENT_LENGTH)
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                    fixture.len().to_string()
+                );
+            }
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let expected = if method == Method::HEAD || method == Method::OPTIONS {
+                b"".as_slice()
+            } else {
+                fixture
+            };
+            assert_eq!(body.as_ref(), expected, "{method} {target}");
+            body
+        }
+
+        async fn legacy_console_characterizes_public_static_and_malformed_authorization() {
+            use http_body_util::BodyExt;
+            for (method, target) in static_console_cases() {
+                let legacy = legacy_console(true)
+                    .oneshot(console_request(method.clone(), &target, false))
+                    .await
+                    .unwrap();
+                let native = crate::admin::console::make_console_server()
+                    .oneshot(console_request(method.clone(), &target, false))
+                    .await
+                    .unwrap()
+                    .map(s3s::Body::http_body_unsync);
+                let malformed_native = crate::admin::console::make_console_server()
+                    .oneshot(console_request(method.clone(), &target, true))
+                    .await
+                    .unwrap()
+                    .map(s3s::Body::http_body_unsync);
+                assert_eq!(legacy.status(), native.status(), "{method} {target}");
+                assert_eq!(malformed_native.status(), native.status(), "native {method} {target}");
+                for header in [http::header::CONTENT_TYPE, http::header::CONTENT_LENGTH, http::header::ALLOW] {
+                    assert_eq!(
+                        legacy.headers().get(&header),
+                        native.headers().get(&header),
+                        "{method} {target}: {header}"
+                    );
+                    assert_eq!(
+                        malformed_native.headers().get(&header),
+                        native.headers().get(&header),
+                        "native malformed auth {method} {target}: {header}"
+                    );
+                }
+                let legacy_body = static_response_body(legacy, &method, &target).await;
+                let native_body = static_response_body(native, &method, &target).await;
+                let malformed_native_body = static_response_body(malformed_native, &method, &target).await;
+                assert_eq!(legacy_body, native_body, "{method} {target}");
+                assert_eq!(malformed_native_body, native_body, "native malformed auth {method} {target}");
+                let malformed = legacy_console(true)
+                    .oneshot(console_request(method.clone(), &target, true))
+                    .await
+                    .unwrap();
+                assert_eq!(malformed.status(), StatusCode::BAD_REQUEST, "legacy {method} {target}");
+                let malformed_body = malformed.into_body().collect().await.unwrap().to_bytes();
+                if method == Method::HEAD {
+                    assert!(malformed_body.is_empty());
+                } else {
+                    assert!(String::from_utf8_lossy(&malformed_body).contains("<Code>InvalidRequest</Code>"));
+                }
+            }
+        }
+
+        type Probe = tower::util::BoxCloneService<HttpRequest<Empty<Bytes>>, Response<s3s::Body>, s3s::HttpError>;
+
+        fn counted<S>(inner: S, calls: Arc<AtomicUsize>) -> Probe
+        where
+            S: Service<HttpRequest<Empty<Bytes>>, Response = Response<s3s::Body>, Error = s3s::HttpError>
+                + Clone
+                + Send
+                + 'static,
+            S::Future: Send + 'static,
+        {
+            Probe::new(tower::service_fn(move |request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                inner.clone().oneshot(request)
+            }))
+        }
+
+        fn edge(stack: S3Stack, enabled: bool) -> (S3StackService<Probe, Probe>, [Arc<AtomicUsize>; 3]) {
+            let calls = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+            let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
+            config.s3_stack = stack;
+            config.console_enable = enabled;
+            let legacy = counted(legacy_console(enabled), calls[0].clone());
+            let gateway = counted(
+                tower::service_fn(|_| async {
+                    Ok::<_, s3s::HttpError>(
+                        Response::builder()
+                            .status(StatusCode::IM_A_TEAPOT)
+                            .body(s3s::Body::empty())
+                            .unwrap(),
+                    )
+                }),
+                calls[1].clone(),
+            );
+            let console = NativeConsoleEdgeService::for_config(&config).map(|service| counted(service, calls[2].clone()));
+            let edge = select_stack(stack, legacy, || Ok::<_, s3s::HttpError>(gateway))
+                .unwrap()
+                .with_native_console(console);
+            (edge, calls)
+        }
+
+        fn counts(calls: &[Arc<AtomicUsize>; 3]) -> [usize; 3] {
+            std::array::from_fn(|i| calls[i].load(Ordering::SeqCst))
+        }
+
+        async fn public_static_uses_native_console_without_legacy_or_gateway_s3_calls() {
+            let (service, calls) = edge(S3Stack::Gateway, true);
+            let prefix = crate::server::console_prefix();
+            let cases: Vec<_> = static_console_cases()
+                .into_iter()
+                .chain([
+                    (Method::GET, "/apple-touch-icon.png".to_owned()),
+                    (Method::GET, format!("{prefix}/index.html?events")),
+                    (Method::HEAD, format!("{prefix}/index.html?lambdaArn=bad")),
+                    (Method::GET, "/favicon.ico?lambdaArn=bad".to_owned()),
+                ])
+                .collect();
+            for (method, target) in &cases {
+                let actual = service
+                    .clone()
+                    .oneshot(console_request(method.clone(), target, false))
+                    .await
+                    .unwrap();
+                let expected = legacy_console(true)
+                    .oneshot(console_request(method.clone(), target, false))
+                    .await
+                    .unwrap();
+                assert_console_response_equivalent(expected, actual, method, target).await;
+            }
+            assert_eq!(counts(&calls), [0, 0, cases.len()]);
+        }
+
+        async fn neighboring_prefixes_admin_sts_s3_and_console_extension_queries_are_excluded() {
+            let (service, calls) = edge(S3Stack::Gateway, true);
+            let prefix = crate::server::console_prefix();
+            let cases = [
+                (Method::GET, format!("{prefix}x/index.html"), false, false),
+                (Method::GET, "/favicon.icox".to_owned(), false, false),
+                (Method::GET, "/apple-touch-icon.pngx".to_owned(), false, false),
+                (Method::GET, "/rustfs/administrator".to_owned(), false, false),
+                (Method::GET, "/bucket/key".to_owned(), false, false),
+                (Method::PUT, "/bucket/key".to_owned(), false, false),
+                (Method::POST, "/".to_owned(), false, false),
+                (Method::GET, "/rustfs/admin/v3/info".to_owned(), true, false),
+                (Method::GET, "/minio/admin/v3/info".to_owned(), true, false),
+                (Method::GET, "/iceberg/v1/config".to_owned(), true, false),
+                (Method::POST, "/".to_owned(), true, true),
+                (Method::GET, "/favicon.ico?events".to_owned(), true, false),
+                (Method::GET, "/favicon.ico?replication-metrics".to_owned(), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn="), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn=bad"), true, false),
+                (Method::GET, format!("{prefix}/index.html?lambdaArn=bad&lambdaArn=bad"), true, false),
+            ];
+            for (method, target, legacy, sts) in &cases {
+                for malformed_auth in [false, true] {
+                    let make_request = || {
+                        let mut request = console_request(method.clone(), target, malformed_auth);
+                        if *sts {
+                            request.headers_mut().insert(
+                                http::header::CONTENT_TYPE,
+                                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+                            );
+                        }
+                        request
+                    };
+                    let actual = service.clone().oneshot(make_request()).await.unwrap();
+                    if *legacy {
+                        let expected = legacy_console(true).oneshot(make_request()).await.unwrap();
+                        if target == "/rustfs/admin/v3/info" || target == "/minio/admin/v3/info" {
+                            assert_eq!(
+                                actual.status(),
+                                if malformed_auth {
+                                    StatusCode::BAD_REQUEST
+                                } else {
+                                    StatusCode::FORBIDDEN
+                                },
+                                "admin on console listener"
+                            );
+                        }
+                        assert_console_response_equivalent(expected, actual, method, target).await;
+                    } else {
+                        assert_eq!(actual.status(), StatusCode::IM_A_TEAPOT, "{method} {target}");
+                    }
+                }
+            }
+            let legacy_cases = cases.iter().filter(|case| case.2).count();
+            assert_eq!(counts(&calls), [legacy_cases * 2, (cases.len() - legacy_cases) * 2, 0]);
+        }
+
+        async fn disabled_console_and_legacy_mode_keep_the_existing_entrypoint() {
+            for (stack, enabled) in [(S3Stack::Gateway, false), (S3Stack::Legacy, true)] {
+                let (service, calls) = edge(stack, enabled);
+                let cases = static_console_cases();
+                for (method, target) in &cases {
+                    for malformed_auth in [false, true] {
+                        let actual = service
+                            .clone()
+                            .oneshot(console_request(method.clone(), target, malformed_auth))
+                            .await
+                            .unwrap();
+                        let expected = legacy_console(enabled)
+                            .oneshot(console_request(method.clone(), target, malformed_auth))
+                            .await
+                            .unwrap();
+                        assert_console_response_equivalent(expected, actual, method, target).await;
+                    }
+                }
+                assert_eq!(counts(&calls), [cases.len() * 2, 0, 0]);
+            }
+        }
     }
 
     type RateLimitTestCore = tower::util::BoxCloneService<
