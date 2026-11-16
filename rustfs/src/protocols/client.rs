@@ -218,6 +218,7 @@ fn session_list_buckets_request(
     extensions.insert(ReqInfo {
         cred: Some(credentials),
         is_owner,
+        keystone_session_present: None,
         bucket: None,
         object: None,
         version_id: None,
@@ -413,6 +414,7 @@ impl ProtocolStorageClient {
         extensions.insert(ReqInfo {
             cred: Some(params.credentials.clone()),
             is_owner,
+            keystone_session_present: None,
             bucket: params.bucket,
             object: params.object,
             version_id: None,

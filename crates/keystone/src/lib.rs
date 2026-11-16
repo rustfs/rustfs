@@ -74,7 +74,7 @@ pub use client::KeystoneClient;
 pub use config::{KeystoneConfig, RoleMapping};
 pub use error::{KeystoneError, Result};
 pub use identity::KeystoneIdentityMapper;
-pub use middleware::{KEYSTONE_CREDENTIALS, KeystoneAuthLayer};
+pub use middleware::{KEYSTONE_CREDENTIALS, KeystoneAuthLayer, KeystoneRequestIdentity, KeystoneRequestNotValidated};
 
 /// Keystone API version
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

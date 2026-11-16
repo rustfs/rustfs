@@ -81,6 +81,7 @@ impl ProtocolStorageClient {
         let mut extensions = http::Extensions::new();
         extensions.insert(ReqInfo {
             cred: Some(params.credentials.clone()),
+            keystone_session_present: None,
             is_owner,
             bucket: params.bucket,
             object: params.object,

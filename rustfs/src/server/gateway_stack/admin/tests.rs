@@ -96,6 +96,7 @@ async fn native_admin_envelope_preserves_raw_alias_host_facts_and_optional_req_i
     )
     .unwrap();
     let stack = GatewayStack {
+        keystone_auth: None,
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())

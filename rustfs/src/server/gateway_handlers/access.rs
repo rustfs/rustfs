@@ -52,8 +52,16 @@ pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &Request
         .and_then(|credentials| credentials.session_token())
         .unwrap_or_default()
         .to_owned();
-    let req_info =
-        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?;
+    let req_info = if context.header_token_principal().is_some() {
+        let identity = super::envelope::keystone_identity(context)?;
+        let mut info = resolve_req_info(server_ctx, None, "", envelope.request_context().cloned()).await?;
+        info.is_owner = crate::auth::keystone_is_owner(identity.credentials());
+        info.cred = Some(identity.credentials().clone());
+        info.keystone_session_present = Some(identity.had_session_token());
+        info
+    } else {
+        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
+    };
     envelope.install_req_info(req_info);
     admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
     Ok(envelope)

@@ -74,7 +74,10 @@ pub(super) fn assemble(
         }))
         .build()
         .map_err(GatewayAssemblyError::Service)?;
-    Ok(GatewayStack { service })
+    Ok(GatewayStack {
+        service,
+        keystone_auth: assembly.keystone_auth,
+    })
 }
 
 struct ServerInfoBridge {

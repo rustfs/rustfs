@@ -19,7 +19,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 #[cfg(feature = "gateway-stack")]
-use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_enabled_in_configuration};
+use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_provider_in_configuration};
 #[cfg(feature = "gateway-stack")]
 use crate::server::stack::{S3StackService, select_stack};
 use crate::server::{
@@ -1610,11 +1610,11 @@ where
 fn select_s3_stack(
     config: &config::Config,
     legacy: S3Service,
-    assembly: impl FnOnce() -> GatewayAssembly,
+    assembly: impl FnOnce() -> Result<GatewayAssembly>,
 ) -> Result<S3EdgeService> {
     let mut native_admin = None;
     let service = select_stack(config.s3_stack, legacy, || -> Result<GatewayEdgeService> {
-        let assembly = assembly();
+        let assembly = assembly()?;
         native_admin = Some(GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?));
         let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
         Ok(GatewayEdgeService(stack))
@@ -2632,14 +2632,25 @@ async fn start_http_server_inner(
         "S3 stack assembled"
     );
     #[cfg(feature = "gateway-stack")]
-    let s3_service = select_s3_stack(config, s3_service, || GatewayAssembly {
-        server_ctx: Arc::clone(&server_ctx),
-        root_access_key: config.access_key.clone(),
-        root_secret_key: config.secret_key.clone(),
-        region: config.region.clone(),
-        server_domains: vh_domain_hosts.to_vec(),
-        body_read_timeout: http_request_body_read_timeout,
-        keystone_enabled: keystone_enabled_in_configuration(),
+    if matches!(config.s3_stack, config::S3Stack::Gateway) {
+        let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+        if keystone_config.enable {
+            crate::startup_auth::init_keystone_auth_once(keystone_config)
+                .await
+                .map_err(|error| Error::other(error.to_string()))?;
+        }
+    }
+    #[cfg(feature = "gateway-stack")]
+    let s3_service = select_s3_stack(config, s3_service, || {
+        Ok(GatewayAssembly {
+            server_ctx: Arc::clone(&server_ctx),
+            root_access_key: config.access_key.clone(),
+            root_secret_key: config.secret_key.clone(),
+            region: config.region.clone(),
+            server_domains: vh_domain_hosts.to_vec(),
+            body_read_timeout: http_request_body_read_timeout,
+            keystone_auth: keystone_provider_in_configuration().map_err(Error::other)?,
+        })
     })?;
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
@@ -4455,7 +4466,7 @@ mod tests {
                 region: Some("us-east-1".to_owned()),
                 server_domains: vec!["s3.example.test".to_owned()],
                 body_read_timeout: Duration::from_secs(300),
-                keystone_enabled: false,
+                keystone_auth: None,
             }
         }
 
@@ -4745,7 +4756,7 @@ mod tests {
             let mut config = config::Config::new("127.0.0.1:9001", Vec::new());
             config.s3_stack = config::S3Stack::Gateway;
             config.console_enable = false;
-            let edge = select_s3_stack(&config, legacy.clone(), || assembly(slot)).unwrap();
+            let edge = select_s3_stack(&config, legacy.clone(), || Ok(assembly(slot))).unwrap();
             let selected = answer(
                 edge.clone(),
                 signed(
