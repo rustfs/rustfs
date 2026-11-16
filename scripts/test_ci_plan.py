@@ -50,6 +50,37 @@ class Repository:
 
 
 class PlannerTests(unittest.TestCase):
+    def test_runtime_package_install_uses_ipv4_and_propagates_errors(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        action = gate.workflow_document((root / '.github/actions/test-runtime/action.yml').read_text())
+        body = next(step['run'] for step in action['runs']['steps'] if step.get('name') == 'Install runtime tools')
+        with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory)
+            sudo = commands / 'sudo'
+            sudo.write_text('#!/bin/sh\nexec "$@"\n')
+            sudo.chmod(0o755)
+            apt = commands / 'apt-get'
+            apt.write_text('''#!/bin/sh
+printf '%s\\n' "$*" >> "$APT_CALLS"
+[ "$1" = -o ] && [ "$2" = Acquire::ForceIPv4=true ] || exit 100
+shift 2
+[ "$1" != "$APT_FAIL_STEP" ] || exit 37
+''')
+            apt.chmod(0o755)
+            calls = commands / 'calls'
+            for fail_step, status in (('', 0), ('update', 37), ('install', 37)):
+                calls.write_text('')
+                environment = dict(os.environ, PATH=f"{commands}{os.pathsep}{os.environ['PATH']}",
+                                   APT_CALLS=str(calls), APT_FAIL_STEP=fail_step)
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', body],
+                                        env=environment, capture_output=True, text=True)
+                with self.subTest(fail_step=fail_step):
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    expected = ['-o Acquire::ForceIPv4=true update']
+                    if fail_step != 'update':
+                        expected.append('-o Acquire::ForceIPv4=true install -y libssl-dev ripgrep')
+                    self.assertEqual(calls.read_text().splitlines(), expected)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
