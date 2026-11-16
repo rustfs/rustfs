@@ -4013,6 +4013,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn lifecycle_action_aliases_preserve_policy_semantics() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy with AWS lifecycle action names parses");
+        let serialized = serde_json::to_value(&policy).expect("serialize lifecycle policy");
+        assert_eq!(
+            serialized["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetBucketLifecycle", "s3:PutBucketLifecycle"])
+        );
+
+        let get = Args {
+            account: "user",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetBucketLifecycleAction),
+            bucket: "bucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+        let put = Args {
+            action: Action::S3Action(S3Action::PutBucketLifecycleAction),
+            ..get.clone()
+        };
+        assert!(policy.is_allowed(&get).await);
+        assert!(policy.is_allowed(&put).await);
+
+        let denied = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetBucketLifecycle","s3:PutBucketLifecycle"],"Resource":"arn:aws:s3:::bucket"},
+                {"Effect":"Deny","Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy mixing legacy lifecycle actions and an AWS action name parses");
+        assert!(denied.is_allowed(&get).await);
+        assert!(!denied.is_allowed(&put).await);
+    }
+
+    #[tokio::test]
     async fn force_delete_actions_require_an_explicit_grant() {
         let wildcard = Policy::parse_config(
             br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
