@@ -16,8 +16,8 @@
 
 use super::BUCKET_WEBSITE_CONFIG;
 use super::{
-    ApiError, DefaultBucketUsecase, StorageError, bucket_config_mutation_incarnation, delete_bucket_config_for_incarnation,
-    metadata_sys, serialize, update_bucket_config_for_incarnation,
+    ApiError, DefaultBucketUsecase, S3Operation, StatusCode, StorageError, bucket_config_mutation_incarnation,
+    delete_bucket_config_for_incarnation, metadata_sys, serialize, update_bucket_config_for_incarnation,
 };
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::bucket_usecase::validate_website_configuration;
@@ -43,26 +43,37 @@ impl DefaultBucketUsecase {
         bucket: &str,
         configuration: impl FnOnce() -> S3Result<PersistedWebsiteConfiguration> + Send,
     ) -> S3Result<()> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
-        self.ensure_config_bucket(bucket).await?;
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketWebsite, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            self.ensure_config_bucket(bucket).await?;
 
-        let config = configuration()?;
-        validate_website_configuration(&config)?;
-        let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
-        update_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
-        Ok(())
+            let config = configuration()?;
+            validate_website_configuration(&config)?;
+            let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
+            update_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, data, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn execute_delete_bucket_website(&self, envelope: RequestEnvelope, bucket: &str) -> S3Result<()> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
-        self.ensure_config_bucket(bucket).await?;
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::DeleteBucketWebsite,
+            StatusCode::NO_CONTENT,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                self.ensure_config_bucket(bucket).await?;
 
-        delete_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
-        Ok(())
+                delete_bucket_config_for_incarnation(bucket, BUCKET_WEBSITE_CONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+                Ok(())
+            },
+        )
+        .await
     }
 }
 
@@ -70,9 +81,10 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::super::{BUCKET_ACCELERATE_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG};
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
+    use crate::app::storage_api::object_usecase::helper::MutationCompletionProbe;
     use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
     use rustfs_credentials::Credentials;
     use rustfs_gateway_types::persistence::{parse_accelerate, parse_request_payment, parse_website};
@@ -80,6 +92,96 @@ mod tests {
     use rustfs_s3_types::S3ErrorCode;
     use serial_test::serial;
     use std::sync::Arc;
+
+    #[test]
+    #[serial]
+    fn core_config_mutations_emit_one_audit_entry_for_success_and_failure() {
+        use super::super::{BucketOperations, MakeBucketOptions};
+
+        run_large_stack_test("core-config-audit", || async {
+            let ambient = shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let usecase = DefaultBucketUsecase::with_context(Some(Arc::clone(&ambient)));
+            for exists in [false, true] {
+                let bucket = format!("core-config-audit-{}", uuid::Uuid::new_v4().simple());
+                if exists {
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create audit fixture bucket");
+                }
+                for (method, operation, success_status) in [
+                    (http::Method::PUT, S3Operation::PutBucketAccelerateConfiguration, StatusCode::OK),
+                    (http::Method::PUT, S3Operation::PutBucketRequestPayment, StatusCode::OK),
+                    (http::Method::PUT, S3Operation::PutBucketWebsite, StatusCode::OK),
+                    (http::Method::DELETE, S3Operation::DeleteBucketWebsite, StatusCode::NO_CONTENT),
+                ] {
+                    let probe = MutationCompletionProbe::install(&bucket);
+                    let mut request = build_request_with_req_info(
+                        (),
+                        method,
+                        ReqInfo {
+                            bucket: Some(bucket.clone()),
+                            ..Default::default()
+                        },
+                    );
+                    request.uri = format!("/{bucket}").parse().expect("audit request URI");
+                    let envelope = RequestEnvelope::from_s3s(&request);
+                    let result = match operation {
+                        S3Operation::PutBucketAccelerateConfiguration => {
+                            usecase
+                                .execute_put_bucket_accelerate_configuration(envelope, &bucket, || {
+                                    Ok(parse_accelerate(
+                                        b"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>",
+                                    )
+                                    .expect("valid accelerate fixture"))
+                                })
+                                .await
+                        }
+                        S3Operation::PutBucketRequestPayment => {
+                            usecase
+                                .execute_put_bucket_request_payment(envelope, &bucket, || {
+                                    Ok(parse_request_payment(
+                                        b"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>",
+                                    )
+                                    .expect("valid request payment fixture"))
+                                })
+                                .await
+                        }
+                        S3Operation::PutBucketWebsite => {
+                            usecase
+                                .execute_put_bucket_website(envelope, &bucket, || {
+                                    Ok(parse_website(
+                                        b"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>",
+                                    )
+                                    .expect("valid website fixture"))
+                                })
+                                .await
+                        }
+                        S3Operation::DeleteBucketWebsite => usecase.execute_delete_bucket_website(envelope, &bucket).await,
+                        _ => unreachable!("only core bucket configuration mutations"),
+                    };
+                    if exists {
+                        result.expect("persist bucket configuration");
+                    } else {
+                        assert_eq!(result.expect_err("missing bucket").code(), &S3ErrorCode::NoSuchBucket);
+                    }
+                    let audits = probe.audits.lock().expect("captured audits");
+                    assert_eq!(audits.len(), 1, "{} exists={exists}", operation.as_str());
+                    assert_eq!(audits[0].api.name.as_deref(), Some(operation.as_str()));
+                    assert_eq!(audits[0].api.bucket.as_deref(), Some(bucket.as_str()));
+                    assert_eq!(
+                        audits[0].api.status_code,
+                        Some(if exists { i32::from(success_status.as_u16()) } else { 404 })
+                    );
+                    assert!(
+                        probe.events.lock().expect("captured events").is_empty(),
+                        "audit-only operation must not emit an object event"
+                    );
+                }
+            }
+        });
+    }
 
     #[test]
     #[serial]
