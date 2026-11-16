@@ -111,6 +111,20 @@ fn is_pool_meta_object(bucket: &str, object: &str) -> bool {
     bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME
 }
 
+/// Whether a drive, as a pool.bin heal inspection reports it, needs a repair
+/// that a write can deliver: the drive answers but lacks the current copy.
+///
+/// An offline or faulty drive cannot take the write. Republishing pool.bin
+/// for it anyway gives the reachable replicas a new version and leaves the
+/// unreachable one a version behind once it is back. In a set of three drives
+/// at EC:1, losing another drive then leaves one current and one stale
+/// replica: pool.bin has no read quorum and no node can start.
+fn pool_meta_drive_needs_repair(state: &str) -> bool {
+    use rustfs_heal_contracts::heal_channel::DriveState;
+    let current_or_unreachable = [DriveState::Ok, DriveState::Offline, DriveState::Faulty];
+    !current_or_unreachable.iter().any(|skip| state == skip.to_str())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HealFormatPoolSkip {
     Completed,
@@ -1489,7 +1503,11 @@ impl ECStore {
             .await?;
         let target = pool.get_disks_for_heal_object(POOL_META_NAME, opts)?;
         let owns_replica = Arc::ptr_eq(&target, &pool.get_disks_by_key(POOL_META_NAME));
-        let needs_repair = !before.after.drives.is_empty() && before.after.drives.iter().any(|drive| drive.state != "ok");
+        let needs_repair = before
+            .after
+            .drives
+            .iter()
+            .any(|drive| pool_meta_drive_needs_repair(&drive.state));
         if opts.dry_run || error.is_some() || !owns_replica || !needs_repair {
             return Ok((before, error, absence));
         }
@@ -1570,6 +1588,7 @@ mod tests {
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{
         RebalanceInfo, RebalanceStats, test_three_pool_stores_with_isolated_node_contexts, test_two_pool_stores,
+        test_two_pool_stores_with_three_drive_sets,
     };
     use crate::storage_api_contracts::bucket::{
         BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
@@ -3793,6 +3812,83 @@ mod tests {
             missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
             "pool metadata read repair should restore the missing shard"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_repair_does_not_republish_for_an_unreachable_drive() {
+        // Three drives at EC:1. A republish while one drive is unreachable would
+        // give the two others a version the unreachable drive lacks; losing one
+        // of them later would leave pool.bin without read quorum.
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores_with_three_drive_sets().await;
+        let disks: Vec<DiskStore> = store.pools[0]
+            .get_disks_by_key(POOL_META_NAME)
+            .disks
+            .read()
+            .await
+            .iter()
+            .map(|disk| disk.clone().expect("pool metadata fixture disk should be online"))
+            .collect();
+        assert_eq!(disks.len(), 3);
+        let unreachable = &disks[0];
+        unreachable.close().await.expect("stop disk monitoring");
+        unreachable.force_offline_for_test();
+        let mut replicas_before = Vec::new();
+        for disk in &disks[1..] {
+            let raw = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            replicas_before.push(raw.buf);
+        }
+
+        let (result, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    read_repair: true,
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata read repair should not hang on an unreachable drive")
+        .expect("pool metadata read repair should report its outcome");
+
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| [DriveState::Offline.to_string(), DriveState::Faulty.to_string()].contains(&drive.state)),
+            "the fixture drive should be reported unreachable: {:?}",
+            result.after.drives
+        );
+        for (disk, before) in disks[1..].iter().zip(replicas_before) {
+            let after = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            assert_eq!(after.buf, before, "pool.bin must keep the version the unreachable drive holds");
+        }
+    }
+
+    #[test]
+    fn pool_meta_drive_needs_repair_only_for_a_reachable_drive_without_the_current_copy() {
+        for state in [DriveState::Ok, DriveState::Offline, DriveState::Faulty] {
+            assert!(!pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
+        for state in [
+            DriveState::Missing,
+            DriveState::Corrupt,
+            DriveState::Unknown("outdated".to_string()),
+        ] {
+            assert!(pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
     }
 
     #[tokio::test]
