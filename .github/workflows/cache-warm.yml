@@ -52,7 +52,6 @@ on:
     - cron: "41 4,10,16,22 * * *"
     - cron: "46 8,12,18,27 * * *"
   push:
-  push:
     branches: [ main ]
     # A toolchain or lockfile change invalidates most of every key; those
     # re-warm at once instead of waiting for the next slot.
