@@ -12,4 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bucket request-payment configuration use-case operations (reserved for the next batch).
+//! Bucket request-payment configuration shared by the S3 edges.
+
+use super::BUCKET_REQUEST_PAYMENT_CONFIG;
+use super::{
+    ApiError, DefaultBucketUsecase, StorageError, bucket_config_mutation_incarnation, metadata_sys, serialize,
+    update_bucket_config_for_incarnation,
+};
+use crate::app::RequestEnvelope;
+use rustfs_gateway_types::persistence::PersistedRequestPaymentConfiguration;
+use rustfs_s3_types::S3Result;
+
+impl DefaultBucketUsecase {
+    pub(crate) async fn execute_get_bucket_request_payment(
+        &self,
+        bucket: &str,
+    ) -> S3Result<PersistedRequestPaymentConfiguration> {
+        self.ensure_config_bucket(bucket).await?;
+        match metadata_sys::get_request_payment_config(bucket).await {
+            Ok((config, _)) => Ok(config),
+            Err(StorageError::ConfigNotFound) => Ok(PersistedRequestPaymentConfiguration {
+                payer: "BucketOwner".to_owned(),
+            }),
+            Err(err) => Err(ApiError::from(err).into()),
+        }
+    }
+
+    pub(crate) async fn execute_put_bucket_request_payment(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        configuration: impl FnOnce() -> S3Result<PersistedRequestPaymentConfiguration> + Send,
+    ) -> S3Result<()> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+        self.ensure_config_bucket(bucket).await?;
+
+        let config = configuration()?;
+        let data = serialize(&config).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))?;
+        update_bucket_config_for_incarnation(bucket, BUCKET_REQUEST_PAYMENT_CONFIG, data, expected_incarnation_id)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(())
+    }
+}
