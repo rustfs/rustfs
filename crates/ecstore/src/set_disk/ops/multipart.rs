@@ -3657,6 +3657,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await;
         if result.is_ok() {
             remove_capped_multipart_staging_semaphore(&upload_id_path);
+            #[cfg(any(test, feature = "test-util"))]
+            pause_multipart_commit(bucket, object, MultipartCommitPause::AbortAfterDelete).await;
         }
         result
     }
@@ -7611,12 +7613,13 @@ mod tests {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
         let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
         let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, lockers, instance_ctx).await;
         make_bucket_on_all(&disk_stores, bucket).await;
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x47; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
         let complete_store = set_disks.clone();
@@ -7662,27 +7665,14 @@ mod tests {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
         let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
         let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, lockers, instance_ctx).await;
         make_bucket_on_all(&disk_stores, bucket).await;
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x48; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
-        let object_holder = set_disks
-            .new_ns_lock(bucket, object)
-            .await
-            .expect("object namespace lock should be created")
-            .get_write_lock(Duration::from_secs(5))
-            .await
-            .expect("test should hold the object lock");
-        let holder = set_disks
-            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
-            .await
-            .expect("upload namespace lock should be created")
-            .get_write_lock(Duration::from_secs(5))
-            .await
-            .expect("test should hold the upload lock");
-        signaling.wait_for_attempts(1).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AbortAfterDelete);
 
         let abort_store = set_disks.clone();
         let abort_upload_id = upload_id.clone();
@@ -7691,7 +7681,9 @@ mod tests {
                 .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
                 .await
         });
-        signaling.wait_for_attempts(2).await;
+        // Abort finishes disk cleanup before completion starts its lock deadline,
+        // and retains upload ownership until the competing request is waiting.
+        barrier.wait_until_paused().await;
 
         let complete_store = set_disks.clone();
         let complete_upload_id = upload_id.clone();
@@ -7700,21 +7692,21 @@ mod tests {
                 .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
                 .await
         });
-        drop(holder);
+        signaling.wait_for_attempts(2).await;
+        assert!(!complete.is_finished(), "completion must wait for the abort upload lock");
+        barrier.release();
 
         abort
             .await
             .expect("abort task should not panic")
             .expect("abort should win the upload finalization");
-        drop(object_holder);
         let complete_err = complete
             .await
             .expect("completion task should not panic")
             .expect_err("completion must observe the aborted upload");
         assert!(
             matches!(complete_err, StorageError::InvalidUploadID(..)),
-            "abort-first refusal case={bucket} code={}",
-            complete_err.code().as_u32()
+            "abort-first refusal case={bucket}: {complete_err:?}"
         );
         let object_err = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())
