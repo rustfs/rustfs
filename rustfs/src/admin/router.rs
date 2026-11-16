@@ -940,6 +940,8 @@ pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
                 | "/minio/admin/v3/datausageinfo"
                 | "/rustfs/admin/v4/plugins/catalog"
                 | "/minio/admin/v4/plugins/catalog"
+                | "/rustfs/admin/v4/cluster/snapshot"
+                | "/minio/admin/v4/cluster/snapshot"
                 | "/rustfs/admin/v3/module-switches"
                 | "/minio/admin/v3/module-switches"
         )
