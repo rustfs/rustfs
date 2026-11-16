@@ -54,7 +54,7 @@ fn decode_policy(value: serde_json::Value) -> Result<rustfs_policy::policy::Poli
     serde_json::from_str(&value.to_string())
 }
 
-async fn protocol_test_context(root: Credentials) -> (tempfile::TempDir, Arc<AppContext>, Arc<IamSys<ObjectStore>>) {
+pub(super) async fn protocol_test_context(root: Credentials) -> (tempfile::TempDir, Arc<AppContext>, Arc<IamSys<ObjectStore>>) {
     let (temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     ObjectStore::new(store.clone())
         .save_iam_config(json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
