@@ -684,7 +684,7 @@ mod audit_coverage_tests {
             .collect();
         // AbortMultipartUpload has an internal event but no handler-built helper.
         expected.push(S3Operation::AbortMultipartUpload);
-        assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
+        assert_eq!(expected.len(), 26, "an operation was added or removed: {expected:?}");
 
         let legacy_edge = SourceSet::production("src/storage/ecfs.rs", "src/storage/legacy_edge");
         let use_cases = SourceSet::production("src/app/mod.rs", "src/app");
