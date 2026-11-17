@@ -302,6 +302,7 @@ async fn resolve_resource_tokens(
             }
             // Missing variables invalidate this resource rather than matching the
             // placeholder's literal spelling, including for anonymous callers.
+            values.retain(|value| !value.is_empty());
             if values.is_empty() {
                 return None;
             }
@@ -489,6 +490,26 @@ mod tests {
         assert!(resource.is_match("bucket/team*?/file", &conditions).await);
         assert!(!resource.is_match("bucket/team-other/file", &conditions).await);
         assert!(!resource.is_match("bucket/${aws:username}/file", &HashMap::new()).await);
+        let prefix_resource = Resource::S3("bucket/${aws:username}*".to_owned());
+        let empty_conditions = HashMap::from([(
+            KeyName::COMMON_KEYS
+                .iter()
+                .find(|key| key.var_name() == "${aws:username}")
+                .expect("username common key")
+                .name()
+                .to_owned(),
+            vec![String::new()],
+        )]);
+        assert!(!prefix_resource.is_match("bucket/private", &empty_conditions).await);
+        let empty_resolver = VariableResolver::new(VariableContext {
+            username: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(
+            !prefix_resource
+                .is_match_with_resolver("bucket/private", &HashMap::new(), Some(&empty_resolver))
+                .await
+        );
         let resolver = VariableResolver::new(VariableContext {
             username: Some("team*?".to_owned()),
             ..Default::default()
