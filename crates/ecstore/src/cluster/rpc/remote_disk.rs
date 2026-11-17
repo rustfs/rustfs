@@ -1199,6 +1199,10 @@ pub(crate) struct RemoteRenameBatchStream {
 
 impl RemoteRenameBatchStream {
     fn terminate_ambiguous(&mut self, error: Error) -> Error {
+        if !self.terminal {
+            let missing = (self.expected_mask & !self.seen_mask).count_ones() as usize;
+            rustfs_io_metrics::record_ecstore_rename_batch_terminal_missing(missing);
+        }
         self.terminal = true;
         if let Some(admission) = self.admission.take() {
             admission.quarantine_until(self.deadline);
@@ -1234,6 +1238,7 @@ impl RemoteRenameBatchStream {
         if self.admission.as_mut().is_some_and(|admission| !admission.release_one()) {
             return Err(self.terminate_ambiguous(DiskError::Unexpected));
         }
+        rustfs_io_metrics::record_ecstore_rename_batch_item_completed();
         let result = if response.success {
             if response.error.is_some() {
                 Err(DiskError::FileCorrupt)
@@ -1249,6 +1254,10 @@ impl RemoteRenameBatchStream {
 
 impl Drop for RemoteRenameBatchStream {
     fn drop(&mut self) {
+        if !self.terminal {
+            let missing = (self.expected_mask & !self.seen_mask).count_ones() as usize;
+            rustfs_io_metrics::record_ecstore_rename_batch_terminal_missing(missing);
+        }
         if let Some(admission) = self.admission.take() {
             admission.quarantine_until(self.deadline);
         }

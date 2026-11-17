@@ -4443,6 +4443,7 @@ impl SetDisks {
                     });
                 }
                 for group in fanout_plan.batch_groups {
+                    rustfs_io_metrics::record_ecstore_rename_batch_planned(group.slots.len());
                     let outcome_tx = outcome_tx.clone();
                     let paths = paths.clone();
                     let file_infos = file_infos.clone();
@@ -4540,6 +4541,7 @@ impl SetDisks {
                         };
                         match start {
                             Ok(mut stream) => {
+                                rustfs_io_metrics::record_ecstore_rename_batch_stream_started(entries.len());
                                 let mut remaining = entries.into_iter().map(Some).collect::<Vec<_>>();
                                 loop {
                                     match stream.next_outcome().await {
@@ -4571,6 +4573,7 @@ impl SetDisks {
                                 }
                             }
                             Err(RenameBatchStartError::UnsupportedBeforeStream) => {
+                                rustfs_io_metrics::record_ecstore_rename_batch_fallback(entries.len());
                                 let mut fallbacks = FuturesUnordered::new();
                                 for (slot, observation) in entries {
                                     fallbacks.push(Self::run_admitted_unary_slot(slot, observation));
@@ -4580,6 +4583,7 @@ impl SetDisks {
                                 }
                             }
                             Err(RenameBatchStartError::NotDispatched(error)) => {
+                                rustfs_io_metrics::record_ecstore_rename_batch_not_dispatched(entries.len());
                                 let message = error.to_string();
                                 for (slot, observation) in entries {
                                     let result = Err(DiskError::other(message.clone()));
@@ -4594,6 +4598,7 @@ impl SetDisks {
                                 }
                             }
                             Err(RenameBatchStartError::MayHavePublished(error)) => {
+                                rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(entries.len());
                                 let message = error.to_string();
                                 for (slot, observation) in entries {
                                     let result = Err(DiskError::other(message.clone()));

@@ -467,11 +467,24 @@ pub const ECSTORE_RENAME_PEER_WIDTHS: [&str; 18] = [
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "gt16",
 ];
 pub const ECSTORE_RENAME_COVERAGE: [&str; 3] = ["none", "partial", "full"];
+pub const ECSTORE_RENAME_BATCH_EXECUTION: [&str; 10] = [
+    "planned_groups",
+    "planned_items",
+    "stream_groups",
+    "stream_items",
+    "completed_items",
+    "fallback_groups",
+    "fallback_items",
+    "not_dispatched_items",
+    "may_have_published_items",
+    "terminal_missing_items",
+];
 
 static ECSTORE_RENAME_RPC_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static ECSTORE_RENAME_REMOTE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 static ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 static ECSTORE_RENAME_COVERAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static ECSTORE_RENAME_BATCH_EXECUTION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcstoreRenameDiagnosticsSnapshot {
@@ -479,6 +492,7 @@ pub struct EcstoreRenameDiagnosticsSnapshot {
     pub remote_width_counts: [u64; 18],
     pub batchable_width_counts: [u64; 18],
     pub coverage_counts: [u64; 3],
+    pub batch_execution_counts: [u64; 10],
 }
 
 impl EcstoreRenameDiagnosticsSnapshot {
@@ -488,6 +502,7 @@ impl EcstoreRenameDiagnosticsSnapshot {
             .chain(self.remote_width_counts.iter())
             .chain(self.batchable_width_counts.iter())
             .chain(self.coverage_counts.iter())
+            .chain(self.batch_execution_counts.iter())
             .all(|count| *count == 0)
     }
 }
@@ -498,6 +513,7 @@ pub fn snapshot_ecstore_rename_diagnostics() -> EcstoreRenameDiagnosticsSnapshot
         remote_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
         batchable_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
         coverage_counts: std::array::from_fn(|index| ECSTORE_RENAME_COVERAGE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_execution_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].load(Ordering::Relaxed)),
     }
 }
 
@@ -2753,6 +2769,52 @@ pub fn record_ecstore_rename_batch_candidate_peer(remote_disks: usize, batchable
     ECSTORE_RENAME_COVERAGE_COUNTS[coverage_index].fetch_add(1, Ordering::Relaxed);
 }
 
+#[inline(always)]
+fn record_ecstore_rename_batch_execution(index: usize, count: usize) {
+    if put_stage_metrics_enabled() {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_planned(items: usize) {
+    record_ecstore_rename_batch_execution(0, 1);
+    record_ecstore_rename_batch_execution(1, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_stream_started(items: usize) {
+    record_ecstore_rename_batch_execution(2, 1);
+    record_ecstore_rename_batch_execution(3, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_item_completed() {
+    record_ecstore_rename_batch_execution(4, 1);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_fallback(items: usize) {
+    record_ecstore_rename_batch_execution(5, 1);
+    record_ecstore_rename_batch_execution(6, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_not_dispatched(items: usize) {
+    record_ecstore_rename_batch_execution(7, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_may_have_published(items: usize) {
+    record_ecstore_rename_batch_execution(8, items);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_terminal_missing(items: usize) {
+    record_ecstore_rename_batch_execution(9, items);
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -4693,6 +4755,13 @@ mod tests {
         record_ecstore_rename_batch_candidate_peer(4, 3);
         record_ecstore_rename_batch_candidate_peer(4, 0);
         record_ecstore_rename_batch_candidate_peer(20, 20);
+        record_ecstore_rename_batch_planned(4);
+        record_ecstore_rename_batch_stream_started(4);
+        record_ecstore_rename_batch_item_completed();
+        record_ecstore_rename_batch_fallback(3);
+        record_ecstore_rename_batch_not_dispatched(2);
+        record_ecstore_rename_batch_may_have_published(4);
+        record_ecstore_rename_batch_terminal_missing(1);
         set_put_stage_metrics_enabled(false);
 
         let after = snapshot_ecstore_rename_diagnostics();
@@ -4708,6 +4777,12 @@ mod tests {
         assert_eq!(after.coverage_counts[0] - before.coverage_counts[0], 1);
         assert_eq!(after.coverage_counts[1] - before.coverage_counts[1], 1);
         assert_eq!(after.coverage_counts[2] - before.coverage_counts[2], 2);
+        assert_eq!(
+            std::array::from_fn::<_, 10, _>(|index| {
+                after.batch_execution_counts[index] - before.batch_execution_counts[index]
+            }),
+            [1, 4, 1, 4, 1, 1, 3, 2, 4, 1]
+        );
     }
 
     #[test]
