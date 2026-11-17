@@ -29,6 +29,7 @@ pub enum BatchAcquireOutcome {
     Granted {
         lock_info: Option<Box<LockInfo>>,
         wait_time: Duration,
+        cache_fence_stamp: Option<crate::CacheFenceStamp>,
     },
     /// This attempt cannot grant later, and another attempt may succeed.
     RetryableNoGrant { error: LockError },
@@ -49,6 +50,7 @@ impl BatchAcquireOutcome {
             Self::Granted {
                 lock_info: response.lock_info.map(Box::new),
                 wait_time: response.wait_time,
+                cache_fence_stamp: response.cache_fence_stamp,
             }
         } else {
             Self::Ambiguous {
@@ -231,6 +233,7 @@ mod tests {
                 error: None,
                 wait_time: Duration::ZERO,
                 position_in_queue: None,
+                cache_fence_stamp: None,
             }),
             BatchAcquireOutcome::Granted { lock_info: None, .. }
         ));

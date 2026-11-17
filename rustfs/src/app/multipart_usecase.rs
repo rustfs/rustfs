@@ -89,9 +89,10 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
 use crate::app::table_list_isolation;
+#[cfg(test)]
+use crate::auth::VerifiedPresignedRequest;
 use crate::auth::{
-    VerifiedPresignedRequest, VerifiedSigV4Request, parse_presigned_multipart_max_total_object_size,
-    reject_presigned_multipart_max_total_object_size_for_other_operation,
+    parse_presigned_multipart_max_total_object_size, reject_presigned_multipart_max_total_object_size_for_other_operation,
     reject_presigned_put_max_content_length_for_other_operation,
 };
 use crate::capacity::record_capacity_write;
@@ -138,6 +139,7 @@ pub(crate) use list::{ListPartsFields, ListPartsTarget};
 mod test_support;
 mod upload_part;
 mod upload_part_copy;
+pub(crate) use upload_part_copy::{UploadPartCopyWriteInput, UploadPartCopyWriteOutput};
 mod upload_values;
 pub(crate) use upload_values::{UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
 

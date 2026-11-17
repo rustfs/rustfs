@@ -83,9 +83,9 @@ use crate::set_disk::core::multipart_source::{
 use crate::set_disk::mem;
 use crate::set_disk::metadata_sys;
 use crate::set_disk::runtime_sources;
-use crate::storage_api_contracts::multipart::ListPartsOwner;
 #[cfg(test)]
 use crate::storage_api_contracts::multipart::MultipartOperations;
+use crate::storage_api_contracts::multipart::{ListPartsOwner, MultipartOwner};
 #[cfg(test)]
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::storage_api_contracts::object::ObjectOperations;
@@ -440,6 +440,8 @@ pub enum MultipartCommitPause {
     NewUploadBeforeLockLost,
     #[cfg(test)]
     ListPartsAfterMetadata,
+    #[cfg(test)]
+    PartBindingAfterMetadata,
     PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterCapacityAdmission,
@@ -1115,6 +1117,57 @@ struct MultipartUploadListScope<'a> {
 }
 
 impl SetDisks {
+    async fn read_multipart_info<const INCLUDE_OWNER: bool>(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(MultipartInfo, Option<MultipartOwner>)> {
+        let _upload_guard = self
+            .acquire_multipart_upload_read_lock("get_multipart_info", bucket, object, upload_id, opts)
+            .await?;
+        let (mut fi, _) = self
+            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
+        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
+        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
+            .await?;
+        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+
+        #[cfg(test)]
+        if INCLUDE_OWNER {
+            pause_multipart_commit(bucket, object, MultipartCommitPause::PartBindingAfterMetadata).await;
+        }
+        let owner = if INCLUDE_OWNER {
+            recorded_multipart_owner(&fi.metadata, bucket, object)
+        } else {
+            None
+        };
+        let info = MultipartInfo {
+            bucket: bucket.to_owned(),
+            object: decode_dir_object(object),
+            upload_id: upload_id.to_owned(),
+            user_defined: {
+                strip_internal_multipart_metadata(&mut fi.metadata);
+                fi.metadata.clone()
+            },
+            ..Default::default()
+        };
+        Ok((info, owner))
+    }
+
+    pub(crate) async fn lookup_multipart_part_binding(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(MultipartInfo, Option<MultipartOwner>)> {
+        self.read_multipart_info::<true>(bucket, object, upload_id, opts).await
+    }
+
     fn validated_multipart_upload_path(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> Result<String> {
         let path = Self::get_upload_id_dir(bucket, object, upload_id);
         if !path
@@ -3208,18 +3261,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .unwrap_or_else(|| storageclass::STANDARD.to_string());
 
         // Use the same metadata snapshot that produced the page.
-        let recorded_owner = match (
-            get_consistent_str(&fi.metadata, "multipart-bucket"),
-            get_consistent_str(&fi.metadata, "multipart-object"),
-        ) {
-            (Some(recorded_bucket), Some(recorded_object)) if recorded_bucket == bucket && recorded_object == object => {
-                Some(ListPartsOwner {
-                    bucket: recorded_bucket.to_owned(),
-                    object: decode_dir_object(recorded_object),
-                })
-            }
-            _ => None,
-        };
+        let recorded_owner = recorded_multipart_owner(&fi.metadata, bucket, object).map(|owner| ListPartsOwner {
+            bucket: owner.bucket,
+            object: owner.object,
+        });
         let mut ret = ListPartsInfo {
             recorded_owner,
             bucket: bucket.to_owned(),
@@ -3588,28 +3633,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         upload_id: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartInfo> {
-        let _upload_guard = self
-            .acquire_multipart_upload_read_lock("get_multipart_info", bucket, object, upload_id, opts)
-            .await?;
-        let (mut fi, _) = self
-            .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
+        self.read_multipart_info::<false>(bucket, object, upload_id, opts)
             .await
-            .map_err(|e| to_object_err(e, vec![bucket, object, upload_id]))?;
-        ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
-        ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
-            .await?;
-        ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
-
-        Ok(MultipartInfo {
-            bucket: bucket.to_owned(),
-            object: decode_dir_object(object),
-            upload_id: upload_id.to_owned(),
-            user_defined: {
-                strip_internal_multipart_metadata(&mut fi.metadata);
-                fi.metadata.clone()
-            },
-            ..Default::default()
-        })
+            .map(|(info, _)| info)
     }
 
     #[tracing::instrument(skip(self))]
@@ -3657,6 +3683,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await;
         if result.is_ok() {
             remove_capped_multipart_staging_semaphore(&upload_id_path);
+            #[cfg(any(test, feature = "test-util"))]
+            pause_multipart_commit(bucket, object, MultipartCommitPause::AbortAfterDelete).await;
         }
         result
     }
@@ -6557,7 +6585,122 @@ mod tests {
                 expected,
                 "{label}"
             );
+            let info = set
+                .get_multipart_info(bucket, object, &upload.upload_id, &opts)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!((info.bucket.as_str(), info.object.as_str()), (bucket, object), "{label}");
+            assert_eq!(info.upload_id, upload.upload_id, "{label}");
+            assert_eq!(info.user_defined, page.user_defined, "{label}");
+            let (bound_info, owner) = set
+                .lookup_multipart_part_binding(bucket, object, &upload.upload_id, &opts)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!((bound_info.bucket.as_str(), bound_info.object.as_str()), (bucket, object), "{label}");
+            assert_eq!(bound_info.upload_id, upload.upload_id, "{label}");
+            assert_eq!(
+                owner.as_ref().map(|owner| (owner.bucket.as_str(), owner.object.as_str())),
+                page.recorded_owner
+                    .as_ref()
+                    .map(|owner| (owner.bucket.as_str(), owner.object.as_str())),
+                "{label}"
+            );
+            assert_eq!(bound_info.user_defined, page.user_defined, "{label}");
         }
+    }
+
+    #[test]
+    fn multipart_owner_matches_encoded_namespace_before_decoding() {
+        let bucket = "owner-bucket";
+        let object = encode_dir_object("directory/");
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, "multipart-bucket", bucket.to_owned());
+        insert_str(&mut metadata, "multipart-object", object.clone());
+        let owner = recorded_multipart_owner(&metadata, bucket, &object).expect("matching metadata");
+        assert_eq!((owner.bucket.as_str(), owner.object.as_str()), (bucket, "directory/"));
+        assert!(recorded_multipart_owner(&metadata, bucket, "directory/").is_none());
+        assert!(recorded_multipart_owner(&metadata, "other-bucket", &object).is_none());
+        metadata.insert("X-Minio-Internal-Multipart-Object".to_owned(), "foreign".to_owned());
+        assert!(recorded_multipart_owner(&metadata, bucket, &object).is_none());
+        metadata.remove("X-Minio-Internal-Multipart-Object");
+        insert_str(&mut metadata, "multipart-object", String::new());
+        assert!(recorded_multipart_owner(&metadata, bucket, &object).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn multipart_part_binding_uses_one_snapshot_under_upload_read_lock() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let lockers: Vec<Arc<dyn LockClient>> = vec![Arc::new(LocalClient::with_manager(manager))];
+        let (_dirs, disks, set) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "part-binding-snapshot";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let upload = set
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload");
+        let path = SetDisks::get_upload_id_dir(bucket, object, &upload.upload_id);
+        for disk in &disks {
+            let mut fi = disk
+                .read_version("", RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                .await
+                .expect("read upload metadata");
+            fi.metadata.insert("x-amz-meta-observation".to_owned(), "before".to_owned());
+            disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, fi)
+                .await
+                .expect("write initial observation");
+        }
+
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PartBindingAfterMetadata);
+        let lookup_set = Arc::clone(&set);
+        let upload_id = upload.upload_id.clone();
+        let lookup = tokio::spawn(async move {
+            lookup_set
+                .lookup_multipart_part_binding(bucket, object, &upload_id, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let upload_lock = set
+            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &path)
+            .await
+            .expect("create upload lock");
+        let lock_error = upload_lock
+            .get_write_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the binding must retain its upload read lock while observing metadata");
+        assert!(matches!(lock_error, rustfs_lock::LockError::Timeout { .. }));
+
+        // Bypass the upload lock to detect an accidental second metadata read.
+        for disk in &disks {
+            let mut fi = disk
+                .read_version("", RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                .await
+                .expect("read upload metadata");
+            insert_str(&mut fi.metadata, "multipart-object", "foreign".to_owned());
+            fi.metadata.insert("x-amz-meta-observation".to_owned(), "after".to_owned());
+            disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, fi)
+                .await
+                .expect("write changed observation");
+        }
+        barrier.release();
+        let (info, owner) = lookup.await.expect("lookup task").expect("initial binding");
+        assert_eq!(info.user_defined.get("x-amz-meta-observation").map(String::as_str), Some("before"));
+        let owner = owner.expect("initial owner");
+        assert_eq!((owner.bucket.as_str(), owner.object.as_str()), (bucket, object));
+        drop(barrier);
+
+        let (updated, owner) = set
+            .lookup_multipart_part_binding(bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("updated binding");
+        assert_eq!(updated.user_defined.get("x-amz-meta-observation").map(String::as_str), Some("after"));
+        assert!(owner.is_none(), "a changed recorded namespace must not produce owner evidence");
+        upload_lock
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("the upload read lock is released after the observation");
     }
 
     async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
@@ -7611,12 +7754,13 @@ mod tests {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
         let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
         let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, lockers, instance_ctx).await;
         make_bucket_on_all(&disk_stores, bucket).await;
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x47; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
         let complete_store = set_disks.clone();
@@ -7662,27 +7806,14 @@ mod tests {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
         let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
         let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        instance_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, lockers, instance_ctx).await;
         make_bucket_on_all(&disk_stores, bucket).await;
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x48; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
-        let object_holder = set_disks
-            .new_ns_lock(bucket, object)
-            .await
-            .expect("object namespace lock should be created")
-            .get_write_lock(Duration::from_secs(5))
-            .await
-            .expect("test should hold the object lock");
-        let holder = set_disks
-            .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
-            .await
-            .expect("upload namespace lock should be created")
-            .get_write_lock(Duration::from_secs(5))
-            .await
-            .expect("test should hold the upload lock");
-        signaling.wait_for_attempts(1).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AbortAfterDelete);
 
         let abort_store = set_disks.clone();
         let abort_upload_id = upload_id.clone();
@@ -7691,7 +7822,9 @@ mod tests {
                 .abort_multipart_upload(bucket, object, &abort_upload_id, &ObjectOptions::default())
                 .await
         });
-        signaling.wait_for_attempts(2).await;
+        // Abort finishes disk cleanup before completion starts its lock deadline,
+        // and retains upload ownership until the competing request is waiting.
+        barrier.wait_until_paused().await;
 
         let complete_store = set_disks.clone();
         let complete_upload_id = upload_id.clone();
@@ -7700,21 +7833,21 @@ mod tests {
                 .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
                 .await
         });
-        drop(holder);
+        signaling.wait_for_attempts(2).await;
+        assert!(!complete.is_finished(), "completion must wait for the abort upload lock");
+        barrier.release();
 
         abort
             .await
             .expect("abort task should not panic")
             .expect("abort should win the upload finalization");
-        drop(object_holder);
         let complete_err = complete
             .await
             .expect("completion task should not panic")
             .expect_err("completion must observe the aborted upload");
         assert!(
             matches!(complete_err, StorageError::InvalidUploadID(..)),
-            "abort-first refusal case={bucket} code={}",
-            complete_err.code().as_u32()
+            "abort-first refusal case={bucket}: {complete_err:?}"
         );
         let object_err = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())

@@ -14977,6 +14977,91 @@ fn object_metadata_borrowed_guard_rejects_test_only_replacements() {
 }
 
 #[test]
+fn multipart_count_guard_accepts_owned_and_borrowed_resource_arguments() {
+    let source = guard_fixture(
+        &[
+            ("src/app/multipart_usecase.rs", guarded_methods(MULTIPART_KEY_GUARD, 2).as_str()),
+            ("src/app/multipart_usecase/complete.rs", guarded_methods(MULTIPART_KEY_GUARD, 1).as_str()),
+            (
+                "src/app/multipart_usecase/upload_part.rs",
+                guarded_methods(MULTIPART_BORROWED_KEY_GUARD, 1).as_str(),
+            ),
+        ],
+        "src/app/multipart_usecase.rs",
+        "src/app/multipart_usecase",
+    );
+
+    assert_multipart_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn multipart_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        MULTIPART_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        MULTIPART_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {MULTIPART_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(MULTIPART_KEY_GUARD, 3)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/multipart_usecase.rs", parent.as_str()),
+                ("src/app/multipart_usecase/upload_part.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/multipart_usecase.rs",
+            "src/app/multipart_usecase",
+        );
+
+        let message = crate::guard_sources::panic_message(move || assert_multipart_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
+fn object_metadata_key_count_guard_accepts_borrowed_resource_names() {
+    let source = guard_fixture(
+        &[
+            ("src/app/mod.rs", guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2).as_str()),
+            (
+                "src/app/object_meta/retention.rs",
+                guarded_methods(OBJECT_METADATA_BORROWED_KEY_GUARD, 2).as_str(),
+            ),
+        ],
+        "src/app/mod.rs",
+        "src/app/object_meta",
+    );
+
+    assert_object_metadata_reserved_prefix_guard_calls(&source);
+}
+
+#[test]
+fn object_metadata_key_count_guard_rejects_misbound_or_unpropagated_borrowed_guards() {
+    for broken in [
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace("(bucket,", "(other_bucket,"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(", key)", ", other_key)"),
+        OBJECT_METADATA_BORROWED_KEY_GUARD.replace(".await?;", ".await;"),
+    ] {
+        let parent = format!(
+            "{}{}\n#[cfg(test)]\nmod tests {{\n    fn mentions() {{\n        {OBJECT_METADATA_BORROWED_KEY_GUARD}\n    }}\n}}\n",
+            guarded_methods(OBJECT_METADATA_OBJECT_GUARD, 2),
+            guarded_methods(OBJECT_METADATA_KEY_GUARD, 1)
+        );
+        let source = guard_fixture(
+            &[
+                ("src/app/mod.rs", parent.as_str()),
+                ("src/app/object_meta/retention.rs", guarded_methods(&broken, 1).as_str()),
+            ],
+            "src/app/mod.rs",
+            "src/app/object_meta",
+        );
+        let message = crate::guard_sources::panic_message(move || assert_object_metadata_reserved_prefix_guard_calls(&source));
+        assert!(message.contains("reserved-prefix guard calls"), "{broken}: {message}");
+    }
+}
+
+#[test]
 fn object_metadata_key_count_guard_fails_when_a_moved_call_is_broken() {
     let moved_and_broken = guarded_methods(MULTIPART_KEY_GUARD, 1).replace("&key)", "key.as_str())");
     let parent = format!(

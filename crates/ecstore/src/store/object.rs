@@ -3124,6 +3124,7 @@ impl ECStore {
         let mut lookup_opts = opts.clone();
         lookup_opts.no_lock = true;
         lookup_opts.metadata_cache_safe = false;
+        lookup_opts.metadata_cache_fence_proof = None;
         lookup_opts.suppress_read_repair = true;
         lookup_opts.http_preconditions = None;
         lookup_opts.version_id = None;
@@ -3312,6 +3313,7 @@ impl ECStore {
         // (or another SetDisks owner) can commit without invalidating this cache.
         let mut opts = opts.clone();
         opts.metadata_cache_safe = false;
+        opts.metadata_cache_fence_proof = None;
         Ok(if self.single_pool() {
             let pool = Arc::clone(&self.pools[0]);
             let metadata = pool.prepare_get_object_reader_metadata(bucket, object, &opts).await?;
@@ -3351,6 +3353,7 @@ impl ECStore {
         let mut opts = opts.clone();
         opts.no_lock = false;
         opts.metadata_cache_safe = false;
+        opts.metadata_cache_fence_proof = None;
         let read_lock_guards = self
             .acquire_all_object_read_locks("select_object", bucket, &object, &mut opts)
             .await?;
@@ -3668,7 +3671,13 @@ impl ECStore {
         let acquire_start = Instant::now();
         let timeout = get_lock_acquire_timeout();
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, opts.version_id.as_deref(), &ns_lock, "read", timeout);
-        let result = ns_lock.get_read_lock(timeout).await;
+        let distributed_cache_proof =
+            crate::set_disk::is_get_object_metadata_cache_distributed_proof_enabled() && self.ctx.is_dist_erasure().await;
+        let result = if distributed_cache_proof {
+            ns_lock.get_read_lock_with_cache_fence(timeout).await
+        } else {
+            ns_lock.get_read_lock(timeout).await
+        };
         attempt.observe(&result);
         let guard = result.map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
@@ -3683,6 +3692,9 @@ impl ECStore {
         );
         opts.no_lock = true;
         opts.metadata_cache_safe = true;
+        if distributed_cache_proof {
+            opts.add_metadata_cache_read_guard(&guard);
+        }
 
         Ok(Some(
             ObjectLockDiagGuard::new(

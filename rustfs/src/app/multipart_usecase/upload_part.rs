@@ -20,6 +20,8 @@ use crate::app::object::BodyChunks;
 use crate::app::object::request_body::{DemandReader, UploadChunks, guard_native_upload_progress};
 use crate::app::storage_api::multipart_usecase::access::AuthorizationRequest;
 use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartInfo;
+#[cfg(any(feature = "gateway-stack", test))]
+use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOwner;
 use http_body::Body as _;
 use rustfs_gateway_stream::Body;
 #[cfg(any(feature = "gateway-stack", test))]
@@ -27,24 +29,43 @@ use rustfs_gateway_types::{RecordedUpload, resolve_upload_async};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 #[cfg(any(feature = "gateway-stack", test))]
-struct PartUpload(MultipartInfo);
+pub(super) struct PartUpload {
+    pub(super) owner: MultipartOwner,
+    pub(super) info: MultipartInfo,
+}
 
 #[cfg(any(feature = "gateway-stack", test))]
 impl RecordedUpload for PartUpload {
     fn bucket(&self) -> &str {
-        &self.0.bucket
+        &self.owner.bucket
     }
 
     fn key(&self) -> &str {
-        &self.0.object
+        &self.owner.object
     }
 }
 
 async fn lookup_part_upload(store: &ECStore, bucket: &str, key: &str, id: &str, opts: &ObjectOptions) -> S3Result<MultipartInfo> {
     let result = store.get_multipart_info(bucket, key, id, opts).await;
+    result.map_err(|error| multipart_upload_api_error(error).into())
+}
+
+#[cfg(any(feature = "gateway-stack", test))]
+pub(super) async fn lookup_recorded_part_upload(
+    store: &ECStore,
+    bucket: &str,
+    key: &str,
+    id: &str,
+    opts: &ObjectOptions,
+) -> S3Result<Option<PartUpload>> {
+    let result = store.lookup_multipart_part_binding(bucket, key, id, opts).await;
     #[cfg(test)]
     let result = tests::observe_lookup(result);
-    result.map_err(|error| multipart_upload_api_error(error).into())
+    match result.map_err(|error| S3Error::from(multipart_upload_api_error(error))) {
+        Ok((info, owner)) => Ok(owner.map(|owner| PartUpload { owner, info })),
+        Err(error) if error.code() == &S3ErrorCode::NoSuchUpload => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn resolve_upload_part_size(content_length: Option<i64>, body: Option<&Body>) -> rustfs_s3_types::S3Result<Option<i64>> {
@@ -226,13 +247,11 @@ impl DefaultMultipartUsecase {
                 let lookup_store = &store;
                 let lookup_opts = &opts;
                 let (id, upload) = resolve_upload_async(upload_id, bucket_name, object_key, |id| async move {
-                    lookup_part_upload(lookup_store, bucket, key, id, lookup_opts)
-                        .await
-                        .map(|info| Some(PartUpload(info)))
+                    lookup_recorded_part_upload(lookup_store, bucket, key, id, lookup_opts).await
                 })
                 .await?
                 .map_err(|rejection| S3Error::with_message(S3ErrorCode::NoSuchUpload, rejection.reason()))?;
-                (id.id().to_owned(), upload.0)
+                (id.id().to_owned(), upload.info)
             }
         };
         rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);

@@ -16,14 +16,15 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::{
-    FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
-    LockResponse, LockStats, LockStatus, LockType, Result,
+    CACHE_FENCE_SHARD_COUNT, CacheFenceStamp, FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager,
+    LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    types::cache_fence_shard_index,
 };
 
 /// Default shard count for guard storage (must be power of 2)
@@ -204,6 +205,13 @@ pub struct LocalClient {
     manager: Option<Arc<GlobalLockManager>>,
     reaper_started: AtomicBool,
     reaper_interval: Duration,
+    cache_fence_boot_id: uuid::Uuid,
+    cache_fence_generations: Box<[AtomicU64]>,
+}
+
+struct LocalGrant {
+    info: LockInfo,
+    cache_fence_stamp: Option<CacheFenceStamp>,
 }
 
 #[derive(Debug)]
@@ -291,7 +299,7 @@ impl LocalClient {
         &self,
         request: &LockRequest,
         acquire_deadline: Instant,
-    ) -> std::result::Result<LockInfo, LocalAcquireFailure> {
+    ) -> std::result::Result<LocalGrant, LocalAcquireFailure> {
         let started = Instant::now();
         self.ensure_reaper();
         if request.lock_id.resource != request.resource {
@@ -402,7 +410,14 @@ impl LocalClient {
                         priority: request.priority,
                         wait_start_time: None,
                     };
-                    return Ok(lock_info);
+                    return Ok(LocalGrant {
+                        info: lock_info,
+                        cache_fence_stamp: self.cache_fence_stamp_for_grant(
+                            &request.resource,
+                            request.lock_type,
+                            request.cache_fence_stamp_requested,
+                        ),
+                    });
                 }
                 Err(crate::fast_lock::LockResult::Timeout) => {
                     if !retried_after_reclaim {
@@ -463,6 +478,36 @@ impl LocalClient {
             manager,
             reaper_started: AtomicBool::new(false),
             reaper_interval,
+            cache_fence_boot_id: uuid::Uuid::new_v4(),
+            cache_fence_generations: (0..CACHE_FENCE_SHARD_COUNT)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn cache_fence_stamp_for_grant(
+        &self,
+        resource: &crate::ObjectKey,
+        lock_type: LockType,
+        stamp_requested: bool,
+    ) -> Option<CacheFenceStamp> {
+        match lock_type {
+            LockType::Exclusive => {
+                let shard_index = cache_fence_shard_index(resource);
+                let generation = &self.cache_fence_generations[usize::from(shard_index)];
+                let _ = generation
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1))
+                    .ok()?
+                    .checked_add(1)?;
+                None
+            }
+            LockType::Shared if stamp_requested => {
+                let shard_index = cache_fence_shard_index(resource);
+                let generation = &self.cache_fence_generations[usize::from(shard_index)];
+                CacheFenceStamp::new(self.cache_fence_boot_id, shard_index, generation.load(Ordering::Acquire))
+            }
+            LockType::Shared => None,
         }
     }
 
@@ -579,7 +624,10 @@ impl LockClient for LocalClient {
         let started = Instant::now();
         let deadline = started.checked_add(request.acquire_timeout).unwrap_or(started);
         Ok(match self.acquire_lock_until(request, deadline).await {
-            Ok(info) => LockResponse::success(info, Duration::ZERO),
+            Ok(grant) => match grant.cache_fence_stamp {
+                Some(stamp) => LockResponse::success_with_cache_fence_stamp(grant.info, Duration::ZERO, stamp),
+                None => LockResponse::success(grant.info, Duration::ZERO),
+            },
             Err(failure) => failure.into_response(request),
         })
     }
@@ -591,9 +639,10 @@ impl LockClient for LocalClient {
             let item_deadline = deadline.min(started.checked_add(request.acquire_timeout).unwrap_or(started));
             async move {
                 match self.acquire_lock_until(request, item_deadline).await {
-                    Ok(info) => super::BatchAcquireOutcome::Granted {
-                        lock_info: Some(Box::new(info)),
+                    Ok(grant) => super::BatchAcquireOutcome::Granted {
+                        lock_info: Some(Box::new(grant.info)),
                         wait_time: Duration::ZERO,
+                        cache_fence_stamp: grant.cache_fence_stamp,
                     },
                     Err(failure) => failure.into_batch_outcome(request),
                 }
@@ -1634,5 +1683,133 @@ mod tests {
         );
         let recovered = client.acquire_lock(&second).await.unwrap();
         assert!(recovered.success, "the reclaimed guard must be available to the next request");
+    }
+
+    #[tokio::test]
+    async fn cache_fence_stamp_advances_only_for_exclusive_grants() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let resource = crate::ObjectKey::new("bucket", "cache-fence");
+        let ordinary = LockRequest::new(resource.clone(), LockType::Shared, "ordinary-reader");
+        let ordinary_response = client.acquire_lock(&ordinary).await.expect("ordinary shared grant");
+        assert!(
+            ordinary_response.cache_fence_stamp.is_none(),
+            "ordinary shared locks preserve their wire shape"
+        );
+        assert!(client.release(&ordinary.lock_id).await.expect("release ordinary reader"));
+
+        let first_read = LockRequest::new(resource.clone(), LockType::Shared, "reader-a").request_cache_fence_stamp();
+        let first = client
+            .acquire_lock(&first_read)
+            .await
+            .expect("first shared grant")
+            .cache_fence_stamp
+            .expect("new local voter supplies a stamp");
+        assert!(client.release(&first_read.lock_id).await.expect("release first reader"));
+
+        let write = LockRequest::new(resource.clone(), LockType::Exclusive, "writer");
+        let write_response = client.acquire_lock(&write).await.expect("exclusive grant");
+        assert!(
+            write_response.cache_fence_stamp.is_none(),
+            "exclusive grants advance without adding response bytes"
+        );
+        assert!(client.release(&write.lock_id).await.expect("release writer"));
+
+        let second_read = LockRequest::new(resource, LockType::Shared, "reader-b").request_cache_fence_stamp();
+        let second = client
+            .acquire_lock(&second_read)
+            .await
+            .expect("second shared grant")
+            .cache_fence_stamp
+            .expect("second shared grant supplies a stamp");
+        assert_eq!(second.voter_boot_id(), first.voter_boot_id());
+        assert_eq!(second.shard_index(), first.shard_index());
+        assert_eq!(second.generation(), first.generation() + 1);
+    }
+
+    #[tokio::test]
+    async fn cache_fence_voter_restart_changes_boot_identity() {
+        let resource = crate::ObjectKey::new("bucket", "restart");
+        let request = LockRequest::new(resource, LockType::Shared, "reader").request_cache_fence_stamp();
+        let first = LocalClient::with_manager(Arc::new(GlobalLockManager::new()))
+            .acquire_lock(&request)
+            .await
+            .expect("first voter grant")
+            .cache_fence_stamp
+            .expect("first voter stamp");
+        let second = LocalClient::with_manager(Arc::new(GlobalLockManager::new()))
+            .acquire_lock(&request)
+            .await
+            .expect("restarted voter grant")
+            .cache_fence_stamp
+            .expect("restarted voter stamp");
+        assert_ne!(first.voter_boot_id(), second.voter_boot_id());
+    }
+
+    #[tokio::test]
+    async fn cache_fence_generation_overflow_permanently_withholds_proof() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let resource = crate::ObjectKey::new("bucket", "overflow");
+        let shard = cache_fence_shard_index(&resource);
+        client.cache_fence_generations[usize::from(shard)].store(u64::MAX - 1, Ordering::Release);
+
+        let write = LockRequest::new(resource.clone(), LockType::Exclusive, "writer");
+        let response = client
+            .acquire_lock(&write)
+            .await
+            .expect("overflowing exclusive grant remains a valid lock");
+        assert!(response.success);
+        assert!(response.cache_fence_stamp.is_none(), "exhausted generation cannot authorize cache use");
+        assert!(client.release(&write.lock_id).await.expect("release overflow writer"));
+
+        let read = LockRequest::new(resource, LockType::Shared, "reader").request_cache_fence_stamp();
+        let response = client
+            .acquire_lock(&read)
+            .await
+            .expect("shared grant after overflow remains a valid lock");
+        assert!(response.success);
+        assert!(
+            response.cache_fence_stamp.is_none(),
+            "overflowed shard stays fail closed until voter restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_fence_hash_collision_causes_only_conservative_invalidation() {
+        let mut seen = std::collections::HashMap::new();
+        let (first_key, second_key) = (0..=CACHE_FENCE_SHARD_COUNT)
+            .find_map(|index| {
+                let key = crate::ObjectKey::new("bucket", format!("collision-{index}"));
+                let shard = cache_fence_shard_index(&key);
+                seen.insert(shard, key.clone()).map(|previous| (previous, key))
+            })
+            .expect("4097 keys must contain a collision across 4096 shards");
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+
+        let first_read = LockRequest::new(first_key.clone(), LockType::Shared, "reader-a").request_cache_fence_stamp();
+        let before = client
+            .acquire_lock(&first_read)
+            .await
+            .expect("first collision reader")
+            .cache_fence_stamp
+            .expect("first collision stamp");
+        assert!(
+            client
+                .release(&first_read.lock_id)
+                .await
+                .expect("release first collision reader")
+        );
+
+        let other_write = LockRequest::new(second_key, LockType::Exclusive, "writer");
+        assert!(client.acquire_lock(&other_write).await.expect("colliding writer").success);
+        assert!(client.release(&other_write.lock_id).await.expect("release colliding writer"));
+
+        let second_read = LockRequest::new(first_key, LockType::Shared, "reader-b").request_cache_fence_stamp();
+        let after = client
+            .acquire_lock(&second_read)
+            .await
+            .expect("second collision reader")
+            .cache_fence_stamp
+            .expect("second collision stamp");
+        assert_eq!(after.generation(), before.generation() + 1);
     }
 }
