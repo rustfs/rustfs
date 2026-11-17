@@ -15031,22 +15031,26 @@ mod inline_put_commit_path_tests {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "external-inline-marker";
         let object = "object.bin";
-        let payload = vec![42; 512 * 1024];
         make_bucket(&disk_stores, bucket).await;
-        let mut opts = ObjectOptions::default();
+        let mut opts = ObjectOptions {
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
         rustfs_utils::http::insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_INLINE_DATA, "true".to_owned());
         opts.user_defined.insert(
             format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, rustfs_utils::http::SUFFIX_INLINE_DATA)
                 .to_ascii_uppercase(),
             "true".to_owned(),
         );
-        for _ in 0..2 {
+        let mut prior_dirs = vec![None; disk_stores.len()];
+        for byte in [42, 43] {
+            let payload = vec![byte; 512 * 1024];
             let mut reader = PutObjReader::from_vec(payload.clone());
             set_disks
                 .put_object(bucket, object, &mut reader, &opts)
                 .await
                 .expect("external PUT commits");
-            for disk in &disk_stores {
+            for ((disk, root), prior_dir) in disk_stores.iter().zip(&temp_dirs).zip(&mut prior_dirs) {
                 let fi = disk
                     .read_version(
                         "",
@@ -15061,8 +15065,14 @@ mod inline_put_commit_path_tests {
                     .await
                     .expect("read persisted layout");
                 assert!(!fi.inline_data(), "external shards must not inherit the inline marker");
+                let generation = fi.data_dir.expect("external metadata must name its data directory");
+                let dir = root.path().join(bucket).join(object).join(generation.to_string());
+                assert!(dir.join("part.1").is_file(), "current generation must retain its shard");
+                // Retired shards may remain in system trash until the background purge.
+                if let Some(old) = prior_dir.replace(dir) {
+                    assert!(!old.try_exists().expect("inspect previous generation"), "overwrite must retire {old:?}");
+                }
             }
-            assert_eq!(count_part_files(&temp_dirs), disk_stores.len(), "overwrite must reclaim the prior parts");
             assert_eq!(read_back(&set_disks, bucket, object).await, payload);
         }
     }
