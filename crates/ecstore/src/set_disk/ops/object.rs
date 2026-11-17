@@ -12863,6 +12863,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 return Ok(());
             }
 
+            // Even an unversioned source has a specific physical target: omitting
+            // its null ID here would let MPU creation choose a new version.
+            ropts.version_id = Some(actual_fi.version_id.unwrap_or_default().to_string());
             let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
             #[cfg(test)]
             {
@@ -12964,20 +12967,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         .etag = Some("injected-invalid-complete-etag".to_string());
                 }
                 let complete_opts = ObjectOptions {
-                    mod_time: oi.mod_time,
-                    version_id: oi.version_id.map(|version| version.to_string()),
-                    expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
-                    bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
                     user_defined: restore_commit_metadata,
-                    no_lock: false,
-                    restore_copyback: true,
-                    decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
-                    // The composite ETag would otherwise be recomputed from the
-                    // parts as they were written back, which for an encrypted or
-                    // compressed object digests stored bytes rather than the
-                    // object's public ETag.
-                    preserve_etag: oi.etag.clone(),
-                    ..Default::default()
+                    ..ropts
                 };
                 self_
                     .clone()
@@ -17615,7 +17606,12 @@ mod transition_commit_failure_tests {
                 )
                 .await
                 .expect("the injected restore generation should be installed");
-            let mut opts = ObjectOptions::default();
+            let mut opts = ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            };
             opts.transition.restore_request.days = Some(1);
             opts.user_defined = restore_operation_id_metadata(operation_id);
             set_disks
@@ -17679,7 +17675,10 @@ mod transition_commit_failure_tests {
             )
             .await
             .expect("the successful restore generation should be installed");
-        let mut opts = ObjectOptions::default();
+        let mut opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
         opts.transition.restore_request.days = Some(1);
         opts.user_defined = restore_operation_id_metadata(operation_id);
         set_disks
@@ -18033,7 +18032,10 @@ mod transition_commit_failure_tests {
             )
             .await
             .expect("the restore generation should be installed");
-        let mut restore_opts = ObjectOptions::default();
+        let mut restore_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
         restore_opts.transition.restore_request.days = Some(1);
         restore_opts.user_defined = restore_operation_id_metadata(operation_id);
         set_disks
