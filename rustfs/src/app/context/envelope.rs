@@ -577,6 +577,10 @@ impl RequestEnvelope {
         self.post_object_policy_headers.as_ref()
     }
 
+    pub(crate) fn post_object_policy_headers_mut(&mut self) -> Option<&mut HeaderMap> {
+        self.post_object_policy_headers.as_mut().map(|headers| &mut headers.0)
+    }
+
     pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
         self.requested_object_legal_hold.as_ref()
     }

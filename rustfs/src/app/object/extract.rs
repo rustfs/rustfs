@@ -2453,10 +2453,17 @@ impl DefaultObjectUsecase {
                 extract_try!(ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth,));
                 legacy_quota_growth = next_legacy_quota_growth;
             }
+            // POST authorization reads the form projection, so PAX overrides
+            // must describe the same stored member in both authorization views.
             for (name, value) in &pax_authorization.headers {
                 extract_try!(auth_req.headers_mut().try_insert(name.clone(), value.clone()).map_err(|_| {
                     object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
                 }));
+                if let Some(headers) = auth_req.post_object_policy_headers_mut() {
+                    extract_try!(headers.try_insert(name.clone(), value.clone()).map_err(|_| {
+                        object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
+                    }));
+                }
             }
             let explicit_version_id = pax_authorization.version_id.as_deref().or(outer_version_id.as_deref());
             let authorization_version_id = extract_try!(
@@ -3858,6 +3865,83 @@ mod tests {
                         .expect_err("denied member absent");
                     assert!(is_err_object_not_found(&missing), "{missing}");
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_pax_tags_override_post_policy_projection_for_member_iam() {
+        use crate::app::storage_api::context::{PostObjectPolicyHeaders, PostObjectRequestMarker};
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-pax-post-policy-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":["s3:PutObject", "s3:PutObjectTagging"],
+                 "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*"),
+                 "Condition":{"StringEquals":{"s3:RequestObjectTag/classification":"public"}}}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install bucket policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (projected, tag, allowed) in [(true, "public", false), (false, "public", false), (true, "private", true)] {
+            let member = format!("member-{projected}-{tag}");
+            let record = pax_record("minio.metadata.x-amz-tagging", format!("classification={tag}").as_bytes());
+            let mut builder = Builder::new(Vec::new());
+            let mut extension = Header::new_ustar();
+            extension.set_size(u64::try_from(record.len()).expect("PAX size"));
+            extension.set_entry_type(EntryType::XHeader);
+            builder
+                .append_data(&mut extension, "pax", &record[..])
+                .await
+                .expect("PAX record");
+            let mut header = Header::new_ustar();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, &member, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: "archive.tar".to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::POST);
+            request.extensions.insert(ReqInfo::default());
+            request.extensions.insert(PostObjectRequestMarker);
+            if projected {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-amz-tagging", HeaderValue::from_static("classification=private"));
+                request.extensions.insert(PostObjectPolicyHeaders(headers));
+            }
+            let envelope = RequestEnvelope::from_s3s(&request);
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
+            if allowed {
+                result.expect("private member is authorized");
+                assert_eq!(stored.expect("private member stored").user_tags.as_str(), "classification=private");
+            } else {
+                assert_eq!(result.err().expect("public member must be denied").code().as_str(), "AccessDenied");
+                assert!(is_err_object_not_found(&stored.expect_err("denied member must not be stored")));
             }
         }
     }
