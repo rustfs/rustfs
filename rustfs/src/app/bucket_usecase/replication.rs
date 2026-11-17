@@ -232,23 +232,12 @@ impl DefaultBucketUsecase {
             S3Operation::DeleteBucketReplication,
             StatusCode::OK,
             |envelope| async move {
-                let store = self
-                    .object_store()
-                    .ok_or_else(|| s3_error!(InternalError, "object store is unavailable"))?;
-                let usecase = self.clone();
-                let bucket = bucket.to_string();
-                crate::storage_api::site_replication::with_config_object_read_lock(
-                    store,
-                    crate::site_replication::SITE_REMOVE_V2_ADMISSION_LOCK.to_string(),
-                    move || async move {
-                        let (site_peers, contract) = prepare.await?;
-                        usecase
-                            .delete_bucket_replication(envelope, &bucket, site_peers, contract)
-                            .await
-                    },
-                )
-                .await
-                .map_err(|err| S3Error::from(ApiError::from(err)))?
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
+                let (site_peers, contract) = prepare.await?;
+                self.delete_bucket_replication(envelope, bucket, site_peers, contract).await
             },
         )
         .await
@@ -388,23 +377,13 @@ impl DefaultBucketUsecase {
             S3Operation::PutBucketReplication,
             StatusCode::OK,
             |envelope| async move {
-                let store = self
-                    .object_store()
-                    .ok_or_else(|| s3_error!(InternalError, "object store is unavailable"))?;
-                let usecase = self.clone();
-                let bucket = bucket.to_string();
-                crate::storage_api::site_replication::with_config_object_read_lock(
-                    store,
-                    crate::site_replication::SITE_REMOVE_V2_ADMISSION_LOCK.to_string(),
-                    move || async move {
-                        let (replication_configuration, site_peers, contract) = prepare.await?;
-                        usecase
-                            .put_bucket_replication(envelope, &bucket, replication_configuration, site_peers, contract)
-                            .await
-                    },
-                )
-                .await
-                .map_err(|err| S3Error::from(ApiError::from(err)))?
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
+                let (replication_configuration, site_peers, contract) = prepare.await?;
+                self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract)
+                    .await
             },
         )
         .await

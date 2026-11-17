@@ -5237,13 +5237,10 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         ));
     }
     let config = metadata.replication_config;
+    let original_targets = metadata.bucket_target_config.unwrap_or_default();
     let removed_arns = removed_site_replication_rule_arns(config.as_ref(), removed_deployment_ids);
-    let (mut targets, removed_targets) = prune_removed_site_replication_bucket_targets(
-        metadata.bucket_target_config.unwrap_or_default(),
-        bucket,
-        removed_deployment_ids,
-        &removed_arns,
-    );
+    let (mut targets, removed_targets) =
+        prune_removed_site_replication_bucket_targets(original_targets.clone(), bucket, removed_deployment_ids, &removed_arns);
     let (updated_config, removed_rules) = match config {
         Some(config) => prune_removed_site_replication_rules(config, removed_deployment_ids),
         None => (None, 0),
@@ -5251,13 +5248,9 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
     // A target shared with an operator rule remains operator-owned.
     if let Some(remaining) = &updated_config {
         let surviving_arns = remaining.filter_all_replication_target_arns();
-        for target in metadata_sys::list_bucket_targets(bucket)
-            .await
-            .map_err(ApiError::from)?
-            .targets
-        {
+        for target in original_targets.targets.iter() {
             if surviving_arns.contains(&target.arn) && !targets.targets.iter().any(|kept| kept.arn == target.arn) {
-                targets.targets.push(target);
+                targets.targets.push(target.clone());
             }
         }
     }
@@ -5267,8 +5260,16 @@ async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deploymen
         .as_ref()
         .map(|config| config.filter_all_replication_target_arns())
         .unwrap_or_default();
+    let mut canceled_arns = removed_arns;
+    canceled_arns.extend(
+        original_targets
+            .targets
+            .iter()
+            .filter(|original| !targets.targets.iter().any(|remaining| remaining.arn == original.arn))
+            .map(|target| target.arn.clone()),
+    );
     if let Some(pool) = current_replication_pool_handle() {
-        for arn in removed_arns.iter().filter(|arn| !surviving_arns.contains(arn)) {
+        for arn in canceled_arns.iter().filter(|arn| !surviving_arns.contains(arn)) {
             pool.cancel_bucket_resync_for_removed_target(bucket, arn)
                 .await
                 .map_err(ApiError::from)?;
@@ -7342,12 +7343,14 @@ impl Operation for SiteReplicationRemoveHandler {
                     }
 
                     validate_remove_sites_req(state, &remove_req)?;
+                    let removal_at = next_site_removal_timestamp(state, OffsetDateTime::now_utc())?;
                     let service_account_access_key = state.service_account_access_key.clone();
                     let secret_candidates = legacy_site_replicator_state_secret(state).into_iter().collect();
                     let original_peers = state.peers.clone();
                     let mut peer_remove_req = remove_req.clone();
                     peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
                     *state = remove_sites(std::mem::take(state), remove_req);
+                    state.updated_at = Some(removal_at);
                     // A permitted remove can include the endpoint being edited.
                     // Drop that obsolete journal before recording the removal;
                     // otherwise its resume path would commit the edited peer back
@@ -14495,7 +14498,7 @@ mod tests {
         let (updated, removed) = prune_removed_site_replication_rules(config, &removed_deployment_ids);
         let updated = updated.expect("config should keep non-removed rules");
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2, "the removed legacy role and derived rule are both persisted changes");
         assert!(updated.role.is_empty());
         assert_eq!(updated.rules.len(), 2);
         assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));

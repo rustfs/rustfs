@@ -1745,6 +1745,7 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     let transaction = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
+    validate_site_replication_bucket_runtime(state, &load_site_replication_state().await?)?;
     ensure_site_replication_bucket_targets_under_transaction(
         bucket,
         state,
@@ -1885,12 +1886,7 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
         .await
         .map_err(ApiError::from)?;
     let current = load_site_replication_state().await?;
-    if current.pending_remove_v2.is_some()
-        || current.updated_at != runtime.state.updated_at
-        || current.peers.keys().ne(runtime.state.peers.keys())
-    {
-        return Err(s3_error!(PreconditionFailed, "site replication topology changed before bucket setup"));
-    }
+    validate_site_replication_bucket_runtime(&runtime.state, &current)?;
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
     let targets_written = ensure_site_replication_bucket_targets_under_transaction(
         bucket,
@@ -1913,6 +1909,16 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
     drop(targets_guard);
     if targets_written || config_written {
         reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_setup", config_written).await;
+    }
+    Ok(())
+}
+
+fn validate_site_replication_bucket_runtime(snapshot: &SiteReplicationState, current: &SiteReplicationState) -> S3Result<()> {
+    if current.pending_remove_v2.is_some()
+        || current.updated_at != snapshot.updated_at
+        || current.peers.keys().ne(snapshot.peers.keys())
+    {
+        return Err(s3_error!(PreconditionFailed, "site replication topology changed before bucket setup"));
     }
     Ok(())
 }

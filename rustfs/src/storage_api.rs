@@ -367,6 +367,7 @@ pub(crate) mod site_replication {
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
     pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
+    pub(crate) use rustfs_storage_api::NamespaceLocking;
 
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
@@ -388,6 +389,7 @@ pub(crate) mod site_replication {
         ECStore, EndpointServerPools, StorageError, delete_config_no_lock, is_err_bucket_not_found, lock_bucket_targets_metadata,
         read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
     };
+    pub(crate) use crate::storage::storage_api::{RUSTFS_META_BUCKET, get_lock_acquire_timeout};
 
     pub(crate) mod metadata_sys {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{

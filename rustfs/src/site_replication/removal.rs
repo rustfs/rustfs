@@ -15,6 +15,7 @@
 //! Durable decommissioning contract shared by admin admission and peer delivery.
 
 use super::*;
+use crate::storage_api::site_replication::NamespaceLocking;
 use rustfs_madmin::{SRRemoveV2Req, SRRemoveV2Status};
 use rustfs_s3_types::s3_error;
 use sha2::{Digest, Sha256};
@@ -23,6 +24,18 @@ pub(crate) const SITE_PEER_REMOVE_V2_PATH: &str = "/rustfs/admin/v3/site-replica
 pub(crate) const SITE_REMOVE_V2_CAPABILITY_PATH: &str = "/rustfs/admin/v3/site-replication/remove-v2/capabilities";
 /// This lock precedes bucket admission and the state transaction. Join admission uses the same lock.
 pub(crate) const SITE_REMOVE_V2_ADMISSION_LOCK: &str = "config/site-replication/join-admission.lock";
+
+/// Acquire lifecycle read admission without moving the caller to another task.
+/// Notification context and cancellation/fault hooks belong to the calling task.
+pub(crate) async fn acquire_site_removal_read_admission(store: Arc<ECStore>) -> S3Result<rustfs_lock::NamespaceLockGuard> {
+    let lock = store
+        .new_ns_lock(crate::storage_api::site_replication::RUSTFS_META_BUCKET, SITE_REMOVE_V2_ADMISSION_LOCK)
+        .await
+        .map_err(ApiError::from)?;
+    lock.get_read_lock(crate::storage_api::site_replication::get_lock_acquire_timeout())
+        .await
+        .map_err(|error| S3Error::with_message(S3ErrorCode::SlowDown, format!("site removal admission unavailable: {error}")))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -195,19 +208,7 @@ pub(crate) fn plan_site_removal(
         }
     }
     let now = OffsetDateTime::now_utc();
-    let topology_at = state
-        .updated_at
-        .into_iter()
-        .chain(state.removal_v2_fence)
-        .max()
-        .filter(|stamp| *stamp >= now)
-        .map(|stamp| {
-            stamp
-                .checked_add(time::Duration::nanoseconds(1))
-                .ok_or_else(|| s3_error!(InvalidRequest, "topology timestamp exhausted"))
-        })
-        .transpose()?
-        .unwrap_or(now);
+    let topology_at = next_site_removal_timestamp(state, now)?;
     let base_fingerprint = removal_base_fingerprint(state)?;
     let identity = serde_json::to_vec(&(&local.deployment_id, &removed, &decommissioned, &base_fingerprint))
         .map_err(|_| s3_error!(InternalError, "cannot encode decommission identity"))?;
@@ -224,6 +225,22 @@ pub(crate) fn plan_site_removal(
         topology_at,
         base_fingerprint,
     })
+}
+
+pub(crate) fn next_site_removal_timestamp(state: &SiteReplicationState, now: OffsetDateTime) -> S3Result<OffsetDateTime> {
+    Ok(state
+        .updated_at
+        .into_iter()
+        .chain(state.removal_v2_fence)
+        .max()
+        .filter(|stamp| *stamp >= now)
+        .map(|stamp| {
+            stamp
+                .checked_add(time::Duration::nanoseconds(1))
+                .ok_or_else(|| s3_error!(InvalidRequest, "topology timestamp exhausted"))
+        })
+        .transpose()?
+        .unwrap_or(now))
 }
 
 fn validate_removal_request_matches(plan: &SiteRemovalPlan, req: &SRRemoveV2Req) -> S3Result<()> {
