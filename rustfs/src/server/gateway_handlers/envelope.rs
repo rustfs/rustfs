@@ -107,7 +107,11 @@ impl RequestEnvelope {
             region: scope.map(|scope| scope.region().to_owned()),
             service: scope.map(|scope| scope.service().to_owned()),
         };
-        Ok(Self::from_parts(head, extensions))
+        let mut envelope = Self::from_parts(head, extensions);
+        if context.operation() == "PostObject" {
+            envelope.mark_gateway_post();
+        }
+        Ok(envelope)
     }
 }
 
@@ -280,6 +284,22 @@ mod tests {
 
     fn signed_list_buckets(form: Signed) -> Request<Empty<Bytes>> {
         signed_request(form, Method::GET, "/", "", SIGNER_ACCESS_KEY, SIGNER_SECRET_KEY)
+    }
+
+    #[test]
+    fn from_gateway_marks_only_post_object_provenance() {
+        let server_ctx = ServerContextSlot::new();
+        for (operation, expected) in [("PostObject", true), ("PutObject", false)] {
+            let context = RequestContextView::detached(operation);
+            let envelope = RequestEnvelope::from_gateway(&context, &server_ctx, VerifiedSignature::default())
+                .expect("detached gateway context");
+            assert_eq!(envelope.is_gateway_post(), expected, "{operation}");
+            assert_eq!(
+                envelope.fork_for_authorization().is_gateway_post(),
+                expected,
+                "{operation} authorization fork"
+            );
+        }
     }
 
     #[tokio::test]

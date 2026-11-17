@@ -2010,6 +2010,9 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+        if envelope.is_gateway_post() {
+            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
+        }
         Box::pin(self.execute_put_object_extract_inner(envelope, input)).await
     }
 

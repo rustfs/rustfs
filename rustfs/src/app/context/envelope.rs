@@ -197,6 +197,7 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    gateway_post: bool,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
@@ -248,6 +249,7 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            gateway_post: false,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
@@ -297,6 +299,7 @@ impl RequestEnvelope {
             verified_presigned: self.verified_presigned,
             website_read: self.website_read.clone(),
             post_object: self.post_object.clone(),
+            gateway_post: self.gateway_post,
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
             bucket_generation: self.bucket_generation.clone(),
@@ -480,6 +483,15 @@ impl RequestEnvelope {
 
     pub(crate) fn post_object(&self) -> Option<&PostObjectRequestMarker> {
         self.post_object.as_ref()
+    }
+
+    pub(crate) fn is_gateway_post(&self) -> bool {
+        self.gateway_post
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    pub(crate) fn mark_gateway_post(&mut self) {
+        self.gateway_post = true;
     }
 
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {

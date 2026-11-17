@@ -4177,6 +4177,41 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "gateway-stack")]
+    async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
+        for direct_extract in [false, true] {
+            let (body, polls) = PollCountingBody::streaming_blob();
+            let input = PutObjectInput::builder()
+                .bucket("test-bucket".to_owned())
+                .key("archive.tar".to_owned())
+                .body(Some(body))
+                .build()
+                .expect("archive input");
+            let mut request = build_request(input, Method::POST);
+            request.extensions.insert(PostObjectRequestMarker);
+            request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            let mut envelope = RequestEnvelope::from_s3s(&request);
+            assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
+            envelope.mark_gateway_post();
+            assert!(envelope.fork_for_authorization().is_gateway_post());
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let usecase = DefaultObjectUsecase::without_context();
+            let result = if direct_extract {
+                Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
+            } else {
+                Box::pin(usecase.execute_put_object_owned(envelope, input)).await
+            };
+            let error = result.err().expect("unbound gateway archive must be refused");
+            assert_eq!(error.code().as_str(), "NotImplemented", "direct={direct_extract}");
+            assert_eq!(
+                polls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "direct={direct_extract}: refused archive must not poll its body"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn execute_put_object_rejects_post_object_sse_kms_from_input() {
         let input = PutObjectInput::builder()
             .bucket("test-bucket".to_string())
