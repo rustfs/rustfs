@@ -1,0 +1,44 @@
+name: Agent v1 protocol regression
+
+on:
+  pull_request:
+    paths:
+      - "protocol/agent/v1/**"
+      - "scripts/test_agent_v1_*.py"
+      - "scripts/verify_agent_v1_fixtures.py"
+      - "scripts/run_agent_v1_regression.sh"
+      - "rustfs/src/connect/diagnostics/job.rs"
+      - "rustfs/src/connect/diagnostics/job_delivery.rs"
+      - ".github/workflows/agent-v1-protocol-regression.yml"
+  push:
+    paths:
+      - "protocol/agent/v1/**"
+      - "scripts/test_agent_v1_*.py"
+      - "scripts/verify_agent_v1_fixtures.py"
+      - "scripts/run_agent_v1_regression.sh"
+      - "rustfs/src/connect/diagnostics/job.rs"
+      - "rustfs/src/connect/diagnostics/job_delivery.rs"
+      - ".github/workflows/agent-v1-protocol-regression.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-v1-protocol-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: protocol/agent/v1/requirements.txt
+      - name: Install test dependencies
+        run: python -m pip install -r protocol/agent/v1/requirements.txt
+      - name: Run Agent v1 contract regression suite
+        run: scripts/run_agent_v1_regression.sh
