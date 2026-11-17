@@ -336,31 +336,21 @@ pub(in crate::disk) fn generation(mut canonical: FileInfo) -> Result<crate::disk
         if !compat::contains_key_str(&canonical.metadata, suffix) {
             continue;
         }
-        // The inline marker is a presence flag whose persisted value is empty.
-        // Compare both declared aliases explicitly before normalizing it; the
-        // general compatibility reader rejects empty strings by design.
-        let value = if suffix == compat::SUFFIX_INLINE_DATA {
-            let rustfs_key = compat::internal_key_rustfs(suffix);
-            let minio_key = format!("{}{suffix}", compat::MINIO_INTERNAL_PREFIX);
-            let mut value = None;
-            for (key, candidate) in &canonical.metadata {
-                if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
-                    continue;
-                }
-                if value.is_some_and(|current: &String| current != candidate) {
-                    return Err(DiskError::FileCorrupt);
-                }
-                value = Some(candidate);
+        // Identity compares persisted bytes, including a consistently empty field.
+        // Conflicting aliases still cannot identify a unique generation.
+        let rustfs_key = compat::internal_key_rustfs(suffix);
+        let minio_key = format!("{}{suffix}", compat::MINIO_INTERNAL_PREFIX);
+        let mut value = None;
+        for (key, candidate) in &canonical.metadata {
+            if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+                continue;
             }
-            value.ok_or(DiskError::FileCorrupt)?.clone()
-        } else {
-            compat::get_consistent_str(&canonical.metadata, suffix)
-                .ok_or(DiskError::FileCorrupt)?
-                .to_owned()
-        };
-        if value.is_empty() && suffix != compat::SUFFIX_INLINE_DATA {
-            continue;
+            if value.is_some_and(|current: &String| current != candidate) {
+                return Err(DiskError::FileCorrupt);
+            }
+            value = Some(candidate);
         }
+        let value = value.ok_or(DiskError::FileCorrupt)?.clone();
         compat::insert_str(&mut canonical.metadata, suffix, value);
     }
     fn sort_json_in_place(value: &mut serde_json::Value) {
@@ -4759,7 +4749,12 @@ mod tests {
         legacy
             .metadata
             .insert(format!("{}{}", compat::MINIO_INTERNAL_PREFIX, compat::SUFFIX_COMPRESSION), "gzip".into());
+        legacy.metadata.insert(
+            format!("{}{}", compat::MINIO_INTERNAL_PREFIX, compat::SUFFIX_REPLICA_STATUS),
+            String::new(),
+        );
         let mut modern = legacy.clone();
+        compat::insert_str(&mut modern.metadata, compat::SUFFIX_REPLICA_STATUS, String::new());
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_INLINE_DATA, String::new());
         compat::insert_str(&mut modern.metadata, compat::SUFFIX_COMPRESSION, "gzip".into());
         assert_eq!(
