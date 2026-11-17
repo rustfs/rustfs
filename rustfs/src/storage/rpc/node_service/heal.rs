@@ -54,7 +54,8 @@ fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> Timesta
 }
 
 fn jiff_to_chrono_datetime(timestamp: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::from(timestamp))
+    let system_time = std::time::SystemTime::try_from(timestamp).expect("heal timestamp should fit SystemTime");
+    chrono::DateTime::<chrono::Utc>::from(system_time)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

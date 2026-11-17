@@ -113,7 +113,7 @@ impl ObjectMetaUsecase {
         let mut eval_metadata = parse_object_lock_legal_hold_native(legal_hold)?;
         if dsc.replicate_any() {
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
         popts.eval_metadata = Some(eval_metadata);

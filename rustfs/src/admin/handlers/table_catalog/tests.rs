@@ -11576,7 +11576,7 @@ fn manifest_rewrite_metadata_bytes(bytes: Vec<u8>, case: &str) -> Vec<u8> {
         }
         data_fields.sort_by_key(|(name, _)| field_order.iter().position(|field| field == name).unwrap());
     }
-    let schema = apache_avro::Schema::parse(&schema_json).unwrap();
+    let schema = apache_avro::Schema::parse(schema_json).unwrap();
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
     for (key, value) in metadata {
         writer.add_user_metadata(key, value).unwrap();
