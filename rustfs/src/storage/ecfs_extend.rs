@@ -449,6 +449,12 @@ pub(crate) fn parse_object_lock_retention_native(
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
+        if v.mode.is_some() != v.retain_until.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::MalformedXML,
+                "Retention requires both Mode and RetainUntilDate".to_string(),
+            ));
+        }
         let mode = match v.mode {
             Some(mode) => match mode.as_str() {
                 ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE => mode.as_str().to_string(),
