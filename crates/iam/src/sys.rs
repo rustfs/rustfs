@@ -616,6 +616,9 @@ impl<T: Store> IamSys<T> {
     /// replicated edit's source time) instead of the local clock; see
     /// `IamCache::set_policy_at` (backlog#2291).
     pub async fn set_policy_at(&self, name: &str, policy: Policy, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
+        if name.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
+            return Err(IamError::InvalidArgument);
+        }
         let updated_at = self.store.set_policy_at(name, policy, updated_at).await?;
 
         if !self.has_watcher() {
@@ -975,6 +978,7 @@ impl<T: Store> IamSys<T> {
     ) -> Result<Credentials> {
         if !opts.access_key.is_empty()
             && (opts.access_key.trim() == "."
+                || opts.access_key.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX)
                 || opts.access_key.trim() == ".."
                 || opts.access_key.chars().any(|ch| ch.is_control() || matches!(ch, '/' | '\\')))
         {
@@ -1321,7 +1325,7 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidAccessKeyLength);
         }
 
-        if contains_reserved_chars(access_key) {
+        if contains_reserved_chars(access_key) || access_key.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
             return Err(IamError::ContainsReservedChars);
         }
 
@@ -1495,7 +1499,7 @@ impl<T: Store> IamSys<T> {
         users: Vec<String>,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        if contains_reserved_chars(group) {
+        if contains_reserved_chars(group) || group.ends_with(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
             return Err(IamError::GroupNameContainsReservedChars);
         }
         let updated_at = self.store.add_users_to_group_at(group, users, updated_at).await?;
@@ -4012,6 +4016,17 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn service_account_rejects_storage_directory_suffix() {
+        let iam = test_iam_sys().await;
+        let key = format!("example{}", rustfs_utils::path::GLOBAL_DIR_SUFFIX);
+        let err = iam
+            .new_service_account("parent", None, service_account_opts(&key, "test-secret"))
+            .await
+            .expect_err("directory marker cannot identify an IAM account");
+        assert_eq!(err, Error::InvalidArgument);
     }
 
     #[tokio::test]
