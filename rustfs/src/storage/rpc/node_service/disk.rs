@@ -32,6 +32,7 @@ use crate::storage::storage_api::{
     verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
+use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::InternodeRpcDurationGuard;
 use rustfs_io_metrics::internode_metrics::{
@@ -77,6 +78,13 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    fn object_requires_incarnation(&self, bucket: &str, object: &str) -> bool {
+        match self {
+            Self::Ready(store) => store.object_requires_incarnation(bucket, object),
+            Self::Bootstrap(_) | Self::Unbound => false,
+        }
+    }
+
     async fn write_local_format_control(&self, disk_ref: &str, path: &str, data: Bytes) -> Result<(), DiskError> {
         match self {
             Self::Ready(store) => store.write_local_format_control(disk_ref, path, data).await,
@@ -468,6 +476,18 @@ fn decode_multipart_rename_request_file_info(binary: &[u8]) -> Result<DecodedRpc
             Err(error)
         }
     }
+}
+
+fn decode_batch_rename_file_info(binary: &[u8]) -> Result<FileInfo, DiskError> {
+    if binary.is_empty() || binary.len() > rustfs_protos::DEFAULT_GRPC_SERVER_MESSAGE_LEN {
+        return Err(DiskError::FileCorrupt);
+    }
+    let mut cursor = Cursor::new(binary);
+    let value = rmp_serde::from_read(&mut cursor).map_err(|_| DiskError::FileCorrupt)?;
+    if cursor.position() != u64::try_from(binary.len()).map_err(DiskError::other)? {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(value)
 }
 
 fn encode_rename_data_response_payloads(
@@ -2086,6 +2106,126 @@ impl NodeService {
             service_return_started,
         );
         Ok(response)
+    }
+
+    pub(super) async fn handle_rename_data_batch(
+        &self,
+        request: Request<RenameDataBatchRequest>,
+    ) -> Result<Response<super::ResponseStream<RenameDataBatchResult>>, Status> {
+        const MAX_BATCH_ITEMS: usize = 16;
+
+        if request.get_ref().items.is_empty() || request.get_ref().items.len() > MAX_BATCH_ITEMS {
+            return Err(Status::invalid_argument("rename batch item count must be between 1 and 16"));
+        }
+        let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("rename batch body length cannot be represented"))?;
+        let has_body_digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.is_empty() && value != "UNSIGNED-PAYLOAD");
+        if !has_body_digest {
+            return Err(Status::permission_denied("rename batch requires a body-bound digest"));
+        }
+        crate::storage::storage_api::verify_tonic_canonical_body_digest(&request, &canonical_body)
+            .map_err(|_| Status::permission_denied("rename batch requires body-bound authentication"))?;
+        let request = request.into_inner();
+        if request.src_volume == RUSTFS_META_MULTIPART_BUCKET {
+            return Err(Status::invalid_argument("multipart source requires RenameMultipartData"));
+        }
+
+        let target = self.local_mutation_target();
+        if target.object_requires_incarnation(&request.dst_volume, &request.dst_path) {
+            return Err(Status::failed_precondition(
+                "incarnation-bound rename cannot use ordinary batch transport",
+            ));
+        }
+        let mut seen_indexes = 0_u16;
+        let mut prepared = Vec::with_capacity(request.items.len());
+        for item in request.items {
+            let item_index =
+                usize::try_from(item.item_index).map_err(|_| Status::invalid_argument("invalid rename batch item index"))?;
+            if item_index >= MAX_BATCH_ITEMS || seen_indexes & (1_u16 << item_index) != 0 {
+                return Err(Status::invalid_argument("rename batch item indexes must be unique and below 16"));
+            }
+            seen_indexes |= 1_u16 << item_index;
+            if item.disk.is_empty() || prepared.iter().any(|(_, disk, _)| disk == &item.disk) {
+                return Err(Status::invalid_argument("rename batch disk references must be non-empty and unique"));
+            }
+            let file_info = decode_batch_rename_file_info(&item.file_info_msgpack)
+                .map_err(|_| Status::invalid_argument("invalid rename batch FileInfo"))?;
+            if file_info.is_canonical_delete_marker() {
+                file_info
+                    .validate_for_metadata_read()
+                    .map_err(|_| Status::invalid_argument("invalid rename batch delete marker"))?;
+            } else {
+                file_info
+                    .validate_for_erasure_write()
+                    .map_err(|_| Status::invalid_argument("invalid rename batch FileInfo geometry"))?;
+            }
+            if rustfs_utils::http::metadata_compat::contains_key_str(&file_info.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX)
+                || rustfs_utils::http::metadata_compat::contains_key_str(
+                    &file_info.metadata,
+                    POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                )
+            {
+                return Err(Status::invalid_argument("protected rename cannot use ordinary batch transport"));
+            }
+            prepared.push((item.item_index, item.disk, file_info));
+        }
+        let src_volume = Arc::<str>::from(request.src_volume);
+        let src_path = Arc::<str>::from(request.src_path);
+        let dst_volume = Arc::<str>::from(request.dst_volume);
+        let dst_path = Arc::<str>::from(request.dst_path);
+        let (tx, rx) = tokio::sync::mpsc::channel(prepared.len());
+        tokio::spawn(async move {
+            let mut pending = FuturesUnordered::new();
+            for (item_index, disk, file_info) in prepared {
+                let target = target.clone();
+                let src_volume = Arc::clone(&src_volume);
+                let src_path = Arc::clone(&src_path);
+                let dst_volume = Arc::clone(&dst_volume);
+                let dst_path = Arc::clone(&dst_path);
+                pending.push(async move {
+                    let result = std::panic::AssertUnwindSafe(async {
+                        let result = target
+                            .rename_local_data(&disk, (&src_volume, &src_path), &file_info, (&dst_volume, &dst_path), None, None)
+                            .await;
+                        match result.and_then(|value| encode_msgpack_named(&value, "RenameDataResp")) {
+                            Ok(payload) => RenameDataBatchResult {
+                                item_index,
+                                success: true,
+                                error: None,
+                                rename_data_resp_msgpack: payload.into(),
+                            },
+                            Err(error) => RenameDataBatchResult {
+                                item_index,
+                                success: false,
+                                error: Some(error.into()),
+                                rename_data_resp_msgpack: Vec::new().into(),
+                            },
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    (item_index, result)
+                });
+            }
+            while let Some(outcome) = pending.next().await {
+                let (item_index, result) = outcome;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(_) => RenameDataBatchResult {
+                        item_index,
+                        success: false,
+                        error: Some(DiskError::Unexpected.into()),
+                        rename_data_resp_msgpack: Vec::new().into(),
+                    },
+                };
+                let _ = tx.send(Ok(response)).await;
+            }
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
     }
 
     pub(super) async fn handle_list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {

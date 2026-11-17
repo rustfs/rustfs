@@ -605,6 +605,7 @@ struct QuotaTopologyCacheEntry {
     fingerprint: String,
 }
 
+#[derive(Clone)]
 enum LocalMutationTarget {
     Ready(Arc<ECStore>),
     Bootstrap(BootstrapLocalTarget),
@@ -1925,6 +1926,19 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("incarnation-bound rename requires RenameDataAtIncarnation"));
         }
         self.handle_rename_data(request, false, false, false).await
+    }
+
+    type RenameDataBatchStream = ResponseStream<RenameDataBatchResult>;
+    async fn rename_data_batch(
+        &self,
+        request: Request<RenameDataBatchRequest>,
+    ) -> Result<Response<Self::RenameDataBatchStream>, Status> {
+        if !rustfs_utils::get_env_bool("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", false) {
+            // The feature gate is checked before authentication or mutation so
+            // mixed-version clients may safely use call-level UNIMPLEMENTED.
+            return Err(unimplemented_rpc("rename_data_batch"));
+        }
+        self.handle_rename_data_batch(request).await
     }
 
     async fn rename_multipart_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
@@ -3489,13 +3503,13 @@ mod tests {
         MakeVolumeRequest, MakeVolumesRequest, MrfLifecycleRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest,
         PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
         RecoverDeleteTransactionRequest, RecoverMultipartSourceRequest, ReloadPoolMetaRequest,
-        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
-        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
-        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
-        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
-        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteFormatControlRequest, WriteMetadataRequest, WriteRequest,
+        ReloadSiteReplicationConfigRequest, RenameDataBatchItem, RenameDataBatchRequest, RenameDataRequest, RenameFileRequest,
+        RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest,
+        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
+        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
+        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
+        VerifyFileRequest, WriteAllRequest, WriteFormatControlRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3513,8 +3527,9 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 35] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 36] = [
         "renamedata",
+        "renamedatabatch",
         "renamemultipartdata",
         "recovermultipartsource",
         "renamedataatincarnation",
@@ -3579,6 +3594,41 @@ mod tests {
         }
         assert!(!policies.is_empty(), "NodeService must declare RPC methods");
         policies
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_data_batch_requires_explicit_enable_and_body_digest() {
+        let request = || {
+            Request::new(RenameDataBatchRequest {
+                src_volume: "src".to_owned(),
+                src_path: "object".to_owned(),
+                dst_volume: "dst".to_owned(),
+                dst_path: "object".to_owned(),
+                items: vec![RenameDataBatchItem {
+                    item_index: 0,
+                    disk: "disk".to_owned(),
+                    file_info_msgpack: vec![0x80].into(),
+                }],
+            })
+        };
+
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("false"))], async {
+            let error = match make_server().rename_data_batch(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("disabled batch must be unimplemented"),
+            };
+            assert_eq!(error.code(), tonic::Code::Unimplemented);
+        })
+        .await;
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            let error = match make_server().rename_data_batch(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("unsigned batch must fail closed"),
+            };
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        })
+        .await;
     }
 
     #[test]

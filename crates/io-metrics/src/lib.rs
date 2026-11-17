@@ -448,6 +448,57 @@ pub const PUT_RENAME_QUORUM_FANOUT_STATE_PANIC: &str = "panic";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST: &str = "quorum_first";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL: &str = "quorum_tail";
 pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR: &str = "error";
+pub const ECSTORE_RENAME_RPC_KIND_ORDINARY: &str = "ordinary";
+pub const ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE: &str = "quota_fence";
+pub const ECSTORE_RENAME_RPC_KIND_INCARNATION: &str = "incarnation";
+pub const ECSTORE_RENAME_RPC_KIND_MULTIPART: &str = "multipart";
+pub const ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE: &str = "scanner_lease";
+pub const ECSTORE_RENAME_RPC_KIND_POOL_META_CAS: &str = "pool_meta_cas";
+pub const ECSTORE_RENAME_RPC_KINDS: [&str; 6] = [
+    ECSTORE_RENAME_RPC_KIND_ORDINARY,
+    ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE,
+    ECSTORE_RENAME_RPC_KIND_INCARNATION,
+    ECSTORE_RENAME_RPC_KIND_MULTIPART,
+    ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE,
+    ECSTORE_RENAME_RPC_KIND_POOL_META_CAS,
+];
+pub const ECSTORE_RENAME_PEER_WIDTHS: [&str; 18] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "gt16",
+];
+pub const ECSTORE_RENAME_COVERAGE: [&str; 3] = ["none", "partial", "full"];
+
+static ECSTORE_RENAME_RPC_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static ECSTORE_RENAME_REMOTE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+static ECSTORE_RENAME_COVERAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcstoreRenameDiagnosticsSnapshot {
+    pub rpc_counts: [u64; 6],
+    pub remote_width_counts: [u64; 18],
+    pub batchable_width_counts: [u64; 18],
+    pub coverage_counts: [u64; 3],
+}
+
+impl EcstoreRenameDiagnosticsSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.rpc_counts
+            .iter()
+            .chain(self.remote_width_counts.iter())
+            .chain(self.batchable_width_counts.iter())
+            .chain(self.coverage_counts.iter())
+            .all(|count| *count == 0)
+    }
+}
+
+pub fn snapshot_ecstore_rename_diagnostics() -> EcstoreRenameDiagnosticsSnapshot {
+    EcstoreRenameDiagnosticsSnapshot {
+        rpc_counts: std::array::from_fn(|index| ECSTORE_RENAME_RPC_COUNTS[index].load(Ordering::Relaxed)),
+        remote_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        batchable_width_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[index].load(Ordering::Relaxed)),
+        coverage_counts: std::array::from_fn(|index| ECSTORE_RENAME_COVERAGE_COUNTS[index].load(Ordering::Relaxed)),
+    }
+}
 
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
@@ -2662,6 +2713,45 @@ pub fn record_put_rename_quorum_wait_fanout(
     }
 }
 
+/// Records a rename RPC after its canonical request digest has been attached.
+///
+/// This uses the PUT-stage diagnostics switch because it is temporary hot-path
+/// evidence, but the metric is ECStore-scoped: scanner and pool metadata
+/// renames are not S3 PutObject operations.
+#[inline(always)]
+pub fn record_ecstore_rename_remote_rpc(kind: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let Some(index) = ECSTORE_RENAME_RPC_KINDS.iter().position(|candidate| *candidate == kind) else {
+        return;
+    };
+    ECSTORE_RENAME_RPC_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn rename_peer_width_index(width: usize) -> usize {
+    width.min(17)
+}
+
+/// Records the per-peer opportunity for a future body-bound rename batch.
+#[inline(always)]
+pub fn record_ecstore_rename_batch_candidate_peer(remote_disks: usize, batchable_disks: usize) {
+    if !put_stage_metrics_enabled() || remote_disks == 0 {
+        return;
+    }
+    ECSTORE_RENAME_REMOTE_WIDTH_COUNTS[rename_peer_width_index(remote_disks)].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCHABLE_WIDTH_COUNTS[rename_peer_width_index(batchable_disks)].fetch_add(1, Ordering::Relaxed);
+    let coverage_index = if batchable_disks == 0 {
+        0
+    } else if batchable_disks == remote_disks {
+        2
+    } else {
+        1
+    };
+    ECSTORE_RENAME_COVERAGE_COUNTS[coverage_index].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -4572,6 +4662,41 @@ mod tests {
                 PUT_RENAME_QUORUM_FANOUT_STATE_PANIC.to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn ecstore_rename_batch_candidate_metrics_are_gated_and_bounded() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        let disabled_before = snapshot_ecstore_rename_diagnostics();
+        record_ecstore_rename_remote_rpc(ECSTORE_RENAME_RPC_KIND_ORDINARY);
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        assert_eq!(snapshot_ecstore_rename_diagnostics(), disabled_before);
+
+        set_put_stage_metrics_enabled(true);
+        let before = snapshot_ecstore_rename_diagnostics();
+        for kind in ECSTORE_RENAME_RPC_KINDS {
+            record_ecstore_rename_remote_rpc(kind);
+        }
+        record_ecstore_rename_batch_candidate_peer(4, 4);
+        record_ecstore_rename_batch_candidate_peer(4, 3);
+        record_ecstore_rename_batch_candidate_peer(4, 0);
+        record_ecstore_rename_batch_candidate_peer(20, 20);
+        set_put_stage_metrics_enabled(false);
+
+        let after = snapshot_ecstore_rename_diagnostics();
+        for index in 0..ECSTORE_RENAME_RPC_KINDS.len() {
+            assert_eq!(after.rpc_counts[index] - before.rpc_counts[index], 1);
+        }
+        assert_eq!(after.remote_width_counts[4] - before.remote_width_counts[4], 3);
+        assert_eq!(after.remote_width_counts[17] - before.remote_width_counts[17], 1);
+        assert_eq!(after.batchable_width_counts[0] - before.batchable_width_counts[0], 1);
+        assert_eq!(after.batchable_width_counts[3] - before.batchable_width_counts[3], 1);
+        assert_eq!(after.batchable_width_counts[4] - before.batchable_width_counts[4], 1);
+        assert_eq!(after.batchable_width_counts[17] - before.batchable_width_counts[17], 1);
+        assert_eq!(after.coverage_counts[0] - before.coverage_counts[0], 1);
+        assert_eq!(after.coverage_counts[1] - before.coverage_counts[1], 1);
+        assert_eq!(after.coverage_counts[2] - before.coverage_counts[2], 2);
     }
 
     #[test]

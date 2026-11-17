@@ -72,10 +72,11 @@ use rustfs_protos::proto_gen::node_service::{
     PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
     ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
     RecoverMultipartSourceRequest as RecoverMultipartSourceRpcRequest,
-    RecoverMultipartSourceResponse as RecoverMultipartSourceRpcResponse, RenameDataRequest, RenameFileRequest,
-    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteAllResponse,
-    WriteFormatControlRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
+    RecoverMultipartSourceResponse as RecoverMultipartSourceRpcResponse, RenameDataBatchItem, RenameDataBatchRequest,
+    RenameDataBatchResult, RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+    SnapshotLeaseRenewRequest, SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest,
+    VerifyFileRequest, WriteAllRequest, WriteAllResponse, WriteFormatControlRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
 };
 use rustfs_protos::{
     ChannelClass, ChannelRebuildReason, ConnectionEvictionLogLevel, evict_failed_connection_with_reason, prewarm_channel_class,
@@ -103,7 +104,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, service::interceptor::InterceptedService};
+use tonic::{Code, Request, Streaming, service::interceptor::InterceptedService};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -1044,6 +1045,7 @@ pub struct RemoteDisk {
     /// Optional per-peer gate held through complete bulk-unary decoding and validation.
     bulk_body_admission: Option<Arc<Semaphore>>,
     bulk_body_wait_timeout: Duration,
+    rename_admission: Option<Arc<Semaphore>>,
 }
 
 /// Shortest gap between two failure warnings of one kind from one remote disk.
@@ -1058,6 +1060,199 @@ struct BulkBodyAdmissionRegistry {
 
 static BULK_BODY_ADMISSION_REGISTRY: std::sync::LazyLock<StdMutex<BulkBodyAdmissionRegistry>> =
     std::sync::LazyLock::new(|| StdMutex::new(BulkBodyAdmissionRegistry::default()));
+
+const ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH: &str = "RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH";
+const RENAME_ADMISSION_REGISTRY_CAPACITY: usize = 512;
+
+#[derive(Default)]
+struct RenameAdmissionRegistry {
+    peers: HashMap<String, Weak<Semaphore>>,
+    overflow: Option<Arc<Semaphore>>,
+}
+
+static RENAME_ADMISSION_REGISTRY: std::sync::LazyLock<StdMutex<RenameAdmissionRegistry>> =
+    std::sync::LazyLock::new(|| StdMutex::new(RenameAdmissionRegistry::default()));
+
+fn peer_rename_admission(addr: &str, enabled: bool) -> Option<Arc<Semaphore>> {
+    if !enabled {
+        return None;
+    }
+    let mut registry = RENAME_ADMISSION_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(semaphore) = registry.peers.get(addr).and_then(Weak::upgrade) {
+        return Some(semaphore);
+    }
+    if registry.peers.len() >= RENAME_ADMISSION_REGISTRY_CAPACITY {
+        registry.peers.retain(|_, semaphore| semaphore.strong_count() > 0);
+    }
+    if registry.peers.len() >= RENAME_ADMISSION_REGISTRY_CAPACITY {
+        return Some(Arc::clone(registry.overflow.get_or_insert_with(|| {
+            Arc::new(Semaphore::new(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT))
+        })));
+    }
+    let semaphore = Arc::new(Semaphore::new(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT));
+    registry.peers.insert(addr.to_owned(), Arc::downgrade(&semaphore));
+    Some(semaphore)
+}
+
+struct RenameAdmissionGrant {
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl RenameAdmissionGrant {
+    fn release_one(&mut self) -> bool {
+        self.permit.as_mut().is_some_and(|permit| permit.split(1).is_some())
+    }
+
+    fn release_all(mut self) {
+        drop(self.permit.take());
+    }
+
+    fn quarantine_until(mut self, deadline: tokio::time::Instant) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                drop(permit);
+            });
+        } else {
+            // Without a runtime there is no safe deadline task. Leaking until
+            // process exit is safer than admitting work over a still-running mutation.
+            std::mem::forget(permit);
+        }
+    }
+}
+
+struct RenameBatchCallGuard {
+    admission: Option<RenameAdmissionGrant>,
+    deadline: tokio::time::Instant,
+    quarantine_on_drop: bool,
+}
+
+impl RenameBatchCallGuard {
+    fn complete(mut self) {
+        self.quarantine_on_drop = false;
+        if let Some(admission) = self.admission.take() {
+            admission.release_all();
+        }
+    }
+
+    fn release_for_fallback(mut self) {
+        self.quarantine_on_drop = false;
+        if let Some(admission) = self.admission.take() {
+            admission.release_all();
+        }
+    }
+
+    fn into_stream(mut self, inner: Streaming<RenameDataBatchResult>, expected_mask: u16) -> RemoteRenameBatchStream {
+        self.quarantine_on_drop = false;
+        RemoteRenameBatchStream {
+            inner,
+            expected_mask,
+            seen_mask: 0,
+            admission: self.admission.take(),
+            deadline: self.deadline,
+            terminal: false,
+        }
+    }
+}
+
+impl Drop for RenameBatchCallGuard {
+    fn drop(&mut self) {
+        if self.quarantine_on_drop
+            && let Some(admission) = self.admission.take()
+        {
+            admission.quarantine_until(self.deadline);
+        }
+    }
+}
+
+pub(crate) struct RenameBatchClientItem<'a> {
+    pub slot: usize,
+    pub disk: String,
+    pub file_info: &'a FileInfo,
+}
+
+pub(crate) enum RenameBatchStartError {
+    NotDispatched(Error),
+    UnsupportedBeforeStream,
+    MayHavePublished(Error),
+}
+
+pub(crate) struct RemoteRenameBatchOutcome {
+    pub slot: usize,
+    pub result: Result<RenameDataResp>,
+}
+
+pub(crate) struct RemoteRenameBatchStream {
+    inner: Streaming<RenameDataBatchResult>,
+    expected_mask: u16,
+    seen_mask: u16,
+    admission: Option<RenameAdmissionGrant>,
+    deadline: tokio::time::Instant,
+    terminal: bool,
+}
+
+impl RemoteRenameBatchStream {
+    fn terminate_ambiguous(&mut self, error: Error) -> Error {
+        self.terminal = true;
+        if let Some(admission) = self.admission.take() {
+            admission.quarantine_until(self.deadline);
+        }
+        error
+    }
+
+    pub(crate) async fn next_outcome(&mut self) -> Result<Option<RemoteRenameBatchOutcome>> {
+        if self.terminal {
+            return Ok(None);
+        }
+        let response = match tokio::time::timeout_at(self.deadline, self.inner.message()).await {
+            Err(_) => return Err(self.terminate_ambiguous(DiskError::Timeout)),
+            Ok(Err(status)) => return Err(self.terminate_ambiguous(status.into())),
+            Ok(Ok(None)) if self.seen_mask == self.expected_mask => {
+                self.terminal = true;
+                return Ok(None);
+            }
+            Ok(Ok(None)) => return Err(self.terminate_ambiguous(DiskError::Unexpected)),
+            Ok(Ok(Some(response))) => response,
+        };
+        let Ok(slot) = usize::try_from(response.item_index) else {
+            return Err(self.terminate_ambiguous(DiskError::Unexpected));
+        };
+        if slot >= 16 {
+            return Err(self.terminate_ambiguous(DiskError::Unexpected));
+        }
+        let bit = 1_u16 << slot;
+        if self.expected_mask & bit == 0 || self.seen_mask & bit != 0 {
+            return Err(self.terminate_ambiguous(DiskError::Unexpected));
+        }
+        self.seen_mask |= bit;
+        if self.admission.as_mut().is_some_and(|admission| !admission.release_one()) {
+            return Err(self.terminate_ambiguous(DiskError::Unexpected));
+        }
+        let result = if response.success {
+            if response.error.is_some() {
+                Err(DiskError::FileCorrupt)
+            } else {
+                decode_msgpack_strict(&response.rename_data_resp_msgpack)
+            }
+        } else {
+            Err(response.error.unwrap_or_default().into())
+        };
+        Ok(Some(RemoteRenameBatchOutcome { slot, result }))
+    }
+}
+
+impl Drop for RemoteRenameBatchStream {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            admission.quarantine_until(self.deadline);
+        }
+    }
+}
 
 struct BulkBodyPermit {
     _metrics: rustfs_io_metrics::internode_metrics::InternodeBulkBodyAdmissionGuard,
@@ -1225,6 +1420,10 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    pub(crate) fn rename_stream_batch_enabled(&self) -> bool {
+        self.rename_admission.is_some()
+    }
+
     async fn guarded_delete_versions_rpc(
         &self,
         volume: &str,
@@ -1550,6 +1749,8 @@ impl RemoteDisk {
             rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
         let bulk_body_admission = peer_bulk_body_admission(&addr, bulk_body_concurrency_limit()?);
         let bulk_body_wait_timeout = bulk_body_wait_timeout();
+        let rename_admission =
+            peer_rename_admission(&addr, rustfs_utils::get_env_bool(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, false));
 
         let disk = Self {
             handle_id: Uuid::new_v4(),
@@ -1572,6 +1773,7 @@ impl RemoteDisk {
             network_error_logs: rustfs_utils::LogThrottle::new(REMOTE_DISK_RPC_FAILURE_LOG_INTERVAL_MS),
             bulk_body_admission,
             bulk_body_wait_timeout,
+            rename_admission,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -2480,6 +2682,29 @@ impl RemoteDisk {
         }))
     }
 
+    async fn acquire_rename_admission_until(
+        &self,
+        item_count: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<RenameAdmissionGrant>> {
+        let Some(semaphore) = &self.rename_admission else {
+            return Ok(None);
+        };
+        if item_count == 0 || item_count > rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT {
+            return Err(Error::other("invalid internode rename admission weight"));
+        }
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
+        let weight = u32::try_from(item_count).map_err(Error::other)?;
+        let permit = match tokio::time::timeout_at(deadline, Arc::clone(semaphore).acquire_many_owned(weight)).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())),
+            Err(_) => return Err(DiskError::DiskOngoingReq),
+        };
+        Ok(Some(RenameAdmissionGrant { permit: Some(permit) }))
+    }
+
     async fn get_bulk_client(&self) -> Result<NodeRpcClient> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
@@ -2570,6 +2795,18 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_
             Err(Error::from(err))
         }
     }
+}
+
+fn decode_msgpack_strict<T: DeserializeOwned>(binary: &[u8]) -> Result<T> {
+    if binary.is_empty() {
+        return Err(DiskError::FileCorrupt);
+    }
+    let mut cursor = Cursor::new(binary);
+    let value = rmp_serde::from_read(&mut cursor).map_err(|_| DiskError::FileCorrupt)?;
+    if cursor.position() != u64::try_from(binary.len()).map_err(Error::other)? {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(value)
 }
 
 fn decode_multipart_publication_response(binary: &[u8]) -> Result<RenameDataResp> {
@@ -2770,6 +3007,91 @@ impl RemoteDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn start_rename_data_batch(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        items: Vec<RenameBatchClientItem<'_>>,
+    ) -> std::result::Result<RemoteRenameBatchStream, RenameBatchStartError> {
+        if self.rename_admission.is_none() || items.is_empty() || items.len() > 16 {
+            return Err(RenameBatchStartError::NotDispatched(DiskError::UnsupportedDisk));
+        }
+        let deadline = tokio::time::Instant::now() + get_max_timeout_duration();
+        let mut expected_mask = 0_u16;
+        let mut request_items = Vec::with_capacity(items.len());
+        for item in items {
+            if item.slot >= 16 {
+                return Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected));
+            }
+            let bit = 1_u16 << item.slot;
+            if expected_mask & bit != 0 {
+                return Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected));
+            }
+            expected_mask |= bit;
+            let item_index = u32::try_from(item.slot)
+                .map_err(Error::other)
+                .map_err(RenameBatchStartError::NotDispatched)?;
+            let file_info_msgpack = encode_file_info_msgpack(item.file_info).map_err(RenameBatchStartError::NotDispatched)?;
+            request_items.push(RenameDataBatchItem {
+                item_index,
+                disk: item.disk,
+                file_info_msgpack: file_info_msgpack.into(),
+            });
+        }
+        let mut request = Request::new(RenameDataBatchRequest {
+            src_volume: src_volume.to_owned(),
+            src_path: src_path.to_owned(),
+            dst_volume: dst_volume.to_owned(),
+            dst_path: dst_path.to_owned(),
+            items: request_items,
+        });
+        let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
+            .map_err(Error::other)
+            .map_err(RenameBatchStartError::NotDispatched)?;
+        crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body)
+            .map_err(Error::other)
+            .map_err(RenameBatchStartError::NotDispatched)?;
+        let mut client = match tokio::time::timeout_at(deadline, self.get_client()).await {
+            Ok(result) => result.map_err(RenameBatchStartError::NotDispatched)?,
+            Err(_) => return Err(RenameBatchStartError::NotDispatched(DiskError::Timeout)),
+        };
+        let admission = self
+            .acquire_rename_admission_until(request.get_ref().items.len(), deadline)
+            .await
+            .map_err(RenameBatchStartError::NotDispatched)?;
+        let guard = RenameBatchCallGuard {
+            admission,
+            deadline,
+            quarantine_on_drop: true,
+        };
+        let call_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let response = match self
+            .execute_with_timeout_for_op(
+                "rename_data_batch",
+                || async {
+                    match client.rename_data_batch(request).await {
+                        Ok(response) => Ok(response),
+                        Err(status) if status.code() == Code::Unimplemented => Err(DiskError::UnsupportedDisk),
+                        Err(status) => Err(status.into()),
+                    }
+                },
+                call_timeout,
+            )
+            .await
+        {
+            Err(DiskError::UnsupportedDisk) => {
+                guard.release_for_fallback();
+                return Err(RenameBatchStartError::UnsupportedBeforeStream);
+            }
+            Err(error) => return Err(RenameBatchStartError::MayHavePublished(error)),
+            Ok(response) => response,
+        };
+        Ok(guard.into_stream(response.into_inner(), expected_mask))
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn rename_data_borrowed_with_fence(
         &self,
         src_volume: &str,
@@ -2887,6 +3209,27 @@ impl RemoteDisk {
                     canonical_body_digest_started,
                 );
                 canonical_body_digest?;
+                let rename_deadline = tokio::time::Instant::now() + get_max_timeout_duration();
+                let rename_admission = self.acquire_rename_admission_until(1, rename_deadline).await?;
+                let rename_admission_guard = RenameBatchCallGuard {
+                    admission: rename_admission,
+                    deadline: rename_deadline,
+                    quarantine_on_drop: true,
+                };
+                let rpc_kind = if multipart_rename {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_MULTIPART
+                } else if pool_meta_cas {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_POOL_META_CAS
+                } else if quota_fenced {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_QUOTA_FENCE
+                } else if incarnation_bound {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_INCARNATION
+                } else if scanner_publication_lease_token.is_some() {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_SCANNER_LEASE
+                } else {
+                    rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_ORDINARY
+                };
+                rustfs_io_metrics::record_ecstore_rename_remote_rpc(rpc_kind);
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
                     prepare_started,
@@ -2922,6 +3265,7 @@ impl RemoteDisk {
                         status.into()
                     }
                 })?;
+                rename_admission_guard.complete();
                 let response_process_started = rustfs_io_metrics::put_stage_timer();
                 let response_headers_started = rustfs_io_metrics::put_stage_timer();
                 let _ = response.metadata().len();
@@ -12762,6 +13106,72 @@ mod tests {
             .await
             .expect("released permit wakes waiter")
             .expect("shared gate remains open");
+    }
+
+    #[tokio::test]
+    async fn rename_admission_is_weighted_shared_and_released_per_item() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let first = peer_rename_admission("http://rename-peer-a", true).expect("enabled rename gate");
+        let same = peer_rename_admission("http://rename-peer-a", true).expect("same peer rename gate");
+        let other = peer_rename_admission("http://rename-peer-b", true).expect("other peer rename gate");
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(peer_rename_admission("http://rename-disabled", false).is_none());
+        assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+
+        let permit = Arc::clone(&first)
+            .acquire_many_owned(4)
+            .await
+            .expect("weighted batch admission");
+        let mut grant = RenameAdmissionGrant { permit: Some(permit) };
+        assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+        assert!(grant.release_one());
+        assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
+        drop(grant);
+        assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+
+        let held = Arc::clone(&first)
+            .acquire_many_owned(u32::try_from(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3).expect("small limit"))
+            .await
+            .expect("reserve all but three permits");
+        let mut waiting = Box::pin(Arc::clone(&same).acquire_many_owned(4));
+        assert!(matches!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+        assert_eq!(first.available_permits(), 0, "the FIFO waiter reserves currently available permits");
+        drop(waiting);
+        assert_eq!(
+            first.available_permits(),
+            3,
+            "cancelling a queued weighted acquire must return its reservation"
+        );
+        let waiting = Box::pin(Arc::clone(&same).acquire_many_owned(4));
+        drop(held);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("weighted waiter wakes")
+            .expect("rename gate remains open");
+        drop(acquired);
+        assert_eq!(first.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_admission_quarantine_holds_until_absolute_deadline() {
+        let gate = peer_rename_admission("http://rename-quarantine-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate)
+            .acquire_many_owned(4)
+            .await
+            .expect("weighted batch admission");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        RenameAdmissionGrant { permit: Some(permit) }.quarantine_until(deadline);
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
     }
 
     #[tokio::test]

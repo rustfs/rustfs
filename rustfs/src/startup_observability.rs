@@ -72,7 +72,8 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                 _ = ctx.cancelled() => break,
                 _ = interval.tick() => {
                     let rows = rustfs_io_metrics::take_get_stage_local_summary();
-                    if rows.is_empty() {
+                    let rename = rustfs_io_metrics::snapshot_ecstore_rename_diagnostics();
+                    if rows.is_empty() && rename.is_empty() {
                         continue;
                     }
                     let summary = rows.iter().map(|row| {
@@ -83,9 +84,13 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                         .unwrap_or_default()
                         .as_millis();
                     let line = format!(
-                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\n",
+                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=1\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\n",
                         rustfs_io_metrics::get_stage_local_summary_sample_rate(),
                         rows.len(),
+                        rustfs_io_metrics::ECSTORE_RENAME_RPC_KINDS.iter().zip(rename.rpc_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_PEER_WIDTHS.iter().zip(rename.remote_width_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_PEER_WIDTHS.iter().zip(rename.batchable_width_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_COVERAGE.iter().zip(rename.coverage_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
                     );
                     let Ok(mut file) = tokio::fs::OpenOptions::new()
                         .create(true)
