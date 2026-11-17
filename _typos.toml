@@ -53,6 +53,8 @@ RTO = "RTO"
 rto = "rto"
 # rustix OFlags variant (POSIX O_WRONLY equivalent).
 WRONLY = "WRONLY"
+# AWS S3 Vectors metadata filter operator: $nin (not in).
+nin = "nin"
 
 [files]
 extend-exclude = []

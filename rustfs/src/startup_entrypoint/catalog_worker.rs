@@ -3,7 +3,7 @@
 
 //! Private native-test IPC attached to the server's installed storage instance.
 
-use crate::app::{RequestEnvelope, object::ManagedEncryption};
+use crate::app::{RequestEnvelope, RequestHead, object::ManagedEncryption};
 use crate::startup_services::{ManagedLanceObjects, managed_lance_objects};
 use crate::storage_api::startup::services::{
     AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ECStore, MakeBucketOptions,
@@ -738,21 +738,19 @@ impl Worker {
             max_manifest_bytes: NonZeroU64::new(MAX_OBJECT_BYTES as u64).expect("positive budget"),
             max_concurrent_reads: NonZeroUsize::new(8).expect("positive concurrency"),
         };
-        let mut request = s3s::S3Request {
-            input: (),
+        let head = RequestHead {
             method: http::Method::POST,
             uri: http::Uri::from_static("/"),
             headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
             credentials: None,
             region: None,
             service: None,
-            trailing_headers: None,
         };
+        let mut extensions = http::Extensions::new();
         let context = RequestContext::fallback();
-        request.extensions.insert(context.clone());
-        request.extensions.insert(self.server_ctx.clone());
-        request.extensions.insert(ReqInfo {
+        extensions.insert(context.clone());
+        extensions.insert(self.server_ctx.clone());
+        extensions.insert(ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "native-catalog-test".into(),
                 ..Default::default()
@@ -763,7 +761,7 @@ impl Worker {
         });
         let objects = managed_lance_objects(
             access.clone(),
-            Arc::new(RequestEnvelope::from_s3s(&request)),
+            Arc::new(RequestEnvelope::from_parts(head, extensions)),
             identity.encryption.managed(),
             limits,
         )?;

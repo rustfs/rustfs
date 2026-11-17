@@ -2070,7 +2070,7 @@ impl DefaultObjectUsecase {
                 PutObjectCompletion::S3(
                     completion
                         .take()
-                        .ok_or_else(|| s3_error!(InternalError, "managed completion owner is missing"))?,
+                        .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "managed completion owner is missing"))?,
                 ),
                 context.request.request_context().cloned(),
             ),

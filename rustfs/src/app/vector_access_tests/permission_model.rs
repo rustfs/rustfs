@@ -292,8 +292,9 @@ fn ordinary_s3_authorization_refuses_vector_storage_for_the_real_owner() {
         ] {
             let mut request =
                 envelope_for_verified_identity(&source, &verified, owner, bucket, &object, "/raw-vector-object", "s3");
-            let error = authorize_request(&mut request, Action::S3Action(action)).await.unwrap_err();
-            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+            let error =
+                rustfs_s3_types::S3Error::from(authorize_request(&mut request, Action::S3Action(action)).await.unwrap_err());
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
         }
     });
 }
