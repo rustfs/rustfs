@@ -143,6 +143,7 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
+        #[cfg(test)]
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
@@ -472,10 +473,6 @@ pub(crate) mod startup {
 
         pub(crate) mod concurrency {
             pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
-        }
-
-        pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::storage_api::FS;
         }
     }
 

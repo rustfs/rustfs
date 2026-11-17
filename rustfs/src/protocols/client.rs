@@ -23,9 +23,11 @@ use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
+#[cfg(test)]
+use crate::storage_api::protocols::client::FS;
 #[cfg(feature = "webdav")]
 use crate::storage_api::protocols::client::capacity;
-use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
+use crate::storage_api::protocols::client::{MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
@@ -359,14 +361,22 @@ struct RequestParams<'a> {
 /// Protocol storage client that implements the StorageBackend trait
 #[derive(Clone, Debug)]
 pub struct ProtocolStorageClient {
-    /// FS instance for storage operations
-    fs: FS,
+    /// This server's late-bound application-context slot.
+    server_ctx: std::sync::Arc<crate::runtime_sources::ServerContextSlot>,
 }
 
 impl ProtocolStorageClient {
-    /// Create a new protocol storage client
-    pub fn new(fs: FS) -> Self {
-        Self { fs }
+    /// Create a protocol storage client bound to this server's context slot.
+    pub fn new(server_ctx: std::sync::Arc<crate::runtime_sources::ServerContextSlot>) -> Self {
+        rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
+        Self { server_ctx }
+    }
+
+    /// The legacy storage service over the same context slot, the oracle of differential tests.
+    #[cfg(test)]
+    fn legacy_fs(&self) -> FS {
+        FS::with_server_ctx(self.server_ctx.clone())
     }
 
     async fn authorize_protocol_request(
@@ -377,7 +387,7 @@ impl ProtocolStorageClient {
         object: Option<&str>,
         listing: Option<&gateway_dto::ListObjectsV2Input>,
     ) -> rustfs_s3_types::S3Result<()> {
-        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+        let context = self.server_ctx.installed_app_context().ok_or_else(|| {
             rustfs_s3_types::S3Error::with_message(
                 rustfs_s3_types::S3ErrorCode::InternalError,
                 "protocol server application context is not initialized",
@@ -403,7 +413,7 @@ impl ProtocolStorageClient {
                 credentials: &credentials,
             },
         )?;
-        request.extensions.insert(self.fs.server_ctx().clone());
+        request.extensions.insert(self.server_ctx.clone());
         if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
             info.is_owner = is_owner;
         }
@@ -735,7 +745,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+        let context = self.server_ctx.installed_app_context().ok_or_else(|| {
             rustfs_s3_types::S3Error::with_message(
                 rustfs_s3_types::S3ErrorCode::InternalError,
                 "protocol server application context is not initialized",
@@ -756,7 +766,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                     _ => e,
                 })?;
         let envelope = session_list_buckets_envelope(
-            self.fs.server_ctx().clone(),
+            self.server_ctx.clone(),
             session_context,
             request_headers,
             secure_transport,
@@ -1493,7 +1503,7 @@ mod tests {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
             let fs = FS::with_server_ctx(slot);
-            let backend = ProtocolStorageClient::new(fs.clone());
+            let backend = ProtocolStorageClient::new(fs.server_ctx().clone());
             for (bucket, key, data, versioned) in [
                 ("protocol-version-oracle", "versioned-key", b"versioned data".as_slice(), true),
                 ("protocol-marker-oracle", "folder/", b"".as_slice(), false),
@@ -2187,13 +2197,13 @@ mod put_tests {
             .expect("create bucket");
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let backend = ProtocolStorageClient::new(slot);
         let mut observations = Vec::new();
         for (case, expected) in cases.iter().cloned() {
             let old_key = format!("old/{case}");
             let current_key = format!("current/{case}");
             let before = put_count();
-            let old = legacy_put(&backend.fs, case_input(case, &old_key), &root).await;
+            let old = legacy_put(&backend.legacy_fs(), case_input(case, &old_key), &root).await;
             let old_count = put_count() - before;
             let old_state = object_state(&backend, &old_key, &root).await;
             let before = put_count();
@@ -2286,7 +2296,7 @@ mod bucket_tests {
             let (_target_temp, target, _target_iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
             let slot = ServerContextSlot::new();
             assert!(slot.install(target.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             let mut observations = Vec::new();
             for name in [
                 "protocol-created",
@@ -2310,7 +2320,7 @@ mod bucket_tests {
                 .get_bucket_info("protocol-created", &Default::default())
                 .await
                 .is_ok();
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let before = count(S3Operation::CreateBucket);
             let fallback = outcome(
                 &uninstalled
@@ -2355,7 +2365,7 @@ mod bucket_tests {
                 .expect("seed object");
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             let mut observations = Vec::new();
             for bucket in [
                 "protocol-bucket-full",
@@ -2456,7 +2466,7 @@ mod bucket_tests {
                 .expect("seed ambient-only bucket");
             let slot = ServerContextSlot::new();
             assert!(slot.install(target.clone()));
-            let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+            let backend = ProtocolStorageClient::new(slot);
             backend.head_bucket(bucket, &root).await.expect("bound bucket exists");
             assert_eq!(
                 backend
@@ -2478,7 +2488,7 @@ mod bucket_tests {
                 .await
                 .is_ok();
             assert_eq!((target_absent, ambient_present), (true, true), "only the bound store is changed");
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let mut heads = Vec::new();
             for name in [bucket, ""] {
                 heads.push((name, outcome(&uninstalled.head_bucket(name, &root).await)));
@@ -2500,7 +2510,7 @@ mod bucket_tests {
 
     #[tokio::test]
     async fn protocol_bucket_invalid_delete_names_match_legacy() {
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+        let backend = ProtocolStorageClient::new(ServerContextSlot::new());
         let credentials = rustfs_credentials::Credentials::default();
         let mut observations = Vec::new();
         for name in ["a", "a/b", "bad_bucket", "127.0.0.1", "bucket-"] {
@@ -2577,7 +2587,7 @@ mod listing_tests {
         }
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let backend = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let backend = ProtocolStorageClient::new(slot);
         (temp, root, backend)
     }
 
@@ -2697,7 +2707,7 @@ mod listing_tests {
                 .expect("create other bucket");
             let other_slot = ServerContextSlot::new();
             assert!(other_slot.install(other_context));
-            let other = ProtocolStorageClient::new(FS::with_server_ctx(other_slot));
+            let other = ProtocolStorageClient::new(other_slot);
             let other_buckets = other.list_buckets(&root).await.expect("bound bucket inventory");
             assert_eq!(
                 other_buckets
@@ -2707,7 +2717,7 @@ mod listing_tests {
                     .collect::<Vec<_>>(),
                 ["listing-context-other"]
             );
-            let uninstalled = ProtocolStorageClient::new(FS::with_server_ctx(ServerContextSlot::new()));
+            let uninstalled = ProtocolStorageClient::new(ServerContextSlot::new());
             let uninstalled_buckets = uninstalled.list_buckets(&root).await.expect("ambient bucket inventory");
             assert_eq!(
                 uninstalled_buckets
