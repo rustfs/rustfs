@@ -357,6 +357,9 @@ pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Erro
     let host = url
         .host_str()
         .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err(std::io::Error::other("tier endpoint must use HTTP or HTTPS"));
+    }
     let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
     if host.starts_with('[') && host.ends_with(']') {
         Ok(format!("{host}:{port}"))
@@ -2111,6 +2114,12 @@ mod tests {
         for bucket in ["a:b", "a/b", "a?b", "a#b", "a@b", "a%2Fb", "a\\b", "a..b"] {
             assert!(validate_tier_bucket(bucket).is_err());
         }
+    }
+
+    #[test]
+    fn endpoint_authority_requires_http_transport() {
+        let url = url::Url::parse("ftp://archive.example").expect("valid URL");
+        assert!(endpoint_authority(&url).is_err());
     }
 
     #[tokio::test]
