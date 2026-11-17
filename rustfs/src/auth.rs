@@ -601,7 +601,7 @@ pub fn get_condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
     get_condition_values_with_client_info(header, cred, version_id, region, remote_addr, None)
@@ -612,7 +612,7 @@ pub fn get_condition_values_with_client_info(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
@@ -635,7 +635,7 @@ pub fn get_condition_values_with_query(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     query: Option<&str>,
 ) -> HashMap<String, Vec<String>> {
@@ -649,7 +649,7 @@ fn condition_values(
     header: &HeaderMap,
     cred: &Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    region: Option<rustfs_s3_types::Region>,
     remote_addr: Option<SocketAddr>,
     query: Option<&str>,
     client_info: Option<&ClientInfo>,
@@ -3548,7 +3548,7 @@ pub(crate) mod legacy_condition_oracle {
         header: &HeaderMap,
         cred: &Credentials,
         version_id: Option<&str>,
-        region: Option<s3s::region::Region>,
+        region: Option<rustfs_s3_types::Region>,
         remote_addr: Option<SocketAddr>,
         query: Option<&str>,
         client_info: Option<&ClientInfo>,

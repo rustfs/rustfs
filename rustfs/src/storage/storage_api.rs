@@ -2386,8 +2386,8 @@ pub(crate) fn get_global_deployment_id() -> Option<String> {
     ecstore_runtime::deployment_id()
 }
 
-pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_runtime::region().map(Into::into)
+pub(crate) fn get_global_region() -> Option<rustfs_s3_types::Region> {
+    ecstore_runtime::region()
 }
 
 pub(crate) fn global_rustfs_port() -> u16 {

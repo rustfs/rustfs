@@ -476,7 +476,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(current_region)
+        .or_else(|| current_region().map(Into::into))
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -852,7 +852,7 @@ async fn authorize_object_lambda_request(req: &mut S3Request<Body>, bucket: &str
         bucket: Some(bucket.to_owned()),
         object: Some(object.to_owned()),
         version_id: None,
-        region: current_region(),
+        region: current_region().map(Into::into),
         ..Default::default()
     });
 
@@ -2079,7 +2079,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: current_region(),
+            region: current_region().map(Into::into),
             service: None,
             trailing_headers: None,
         };
