@@ -160,6 +160,7 @@ set -euo pipefail
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
 
 usage() {
     echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]" >&2
@@ -258,14 +259,14 @@ S3_ERROR_LABEL='s3s s3_error! lines'
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# CI workspaces may contain generated Rust files left by an earlier quality
+# Git workspaces may contain generated Rust files left by an earlier quality
 # check. They are not part of the submitted tree and must not change the
-# commit-to-base ratchet. Keep local fixture/self-test behavior unchanged while
-# making the CI measurement deterministic over tracked Rust files.
+# commit-to-base ratchet. Keep fixture/self-test behavior unchanged while
+# making repository measurements deterministic over tracked Rust files.
 declare -a SCANNED_RUST_PATHS ECSTORE_RUST_PATHS
-if [[ "${GITHUB_ACTIONS:-}" == 'true' ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    while IFS= read -r -d '' path; do SCANNED_RUST_PATHS+=("$path"); done < <(git ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
-    while IFS= read -r -d '' path; do ECSTORE_RUST_PATHS+=("$path"); done < <(git ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
+if [[ "$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || true)" == "$REPO_ROOT" ]]; then
+    while IFS= read -r -d '' path; do SCANNED_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
+    while IFS= read -r -d '' path; do ECSTORE_RUST_PATHS+=("$REPO_ROOT/$path"); done < <(git -C "$REPO_ROOT" ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
 else
     SCANNED_RUST_PATHS=("$E2E_TEST_GLOB" .)
     ECSTORE_RUST_PATHS=(crates/ecstore/src)
