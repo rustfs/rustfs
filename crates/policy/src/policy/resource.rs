@@ -160,40 +160,53 @@ pub enum Resource {
     Kms(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ResourceToken {
     Literal(u8),
     Star,
     Any,
+    Values(Vec<String>),
 }
 
-fn resource_tokens_match(pattern: &[ResourceToken], name: &str) -> bool {
+fn resource_tokens_match(pattern: &[ResourceToken], name: &str, wildcard: bool) -> bool {
     let name = name.as_bytes();
-    let (mut p, mut n) = (0, 0);
-    let mut star = None;
-    while n < name.len() {
-        match pattern.get(p) {
-            Some(ResourceToken::Literal(byte)) if *byte == name[n] => {
-                p += 1;
-                n += 1;
+    let mut reachable = vec![false; name.len() + 1];
+    let mut next = vec![false; name.len() + 1];
+    reachable[0] = true;
+    for token in pattern {
+        next.fill(false);
+        match token {
+            ResourceToken::Star if wildcard => {
+                if let Some(first) = reachable.iter().position(|&matched| matched) {
+                    next[first..].fill(true);
+                }
             }
-            Some(ResourceToken::Any) => {
-                p += 1;
-                n += 1;
+            ResourceToken::Any if wildcard => {
+                next[1..].copy_from_slice(&reachable[..name.len()]);
             }
-            Some(ResourceToken::Star) => {
-                star = Some((p, n));
-                p += 1;
+            ResourceToken::Literal(byte) => {
+                for (pos, &matched) in reachable[..name.len()].iter().enumerate() {
+                    next[pos + 1] = matched && name[pos] == *byte;
+                }
             }
-            _ => {
-                let Some((star_pattern, star_name)) = star else { return false };
-                n = star_name + 1;
-                p = star_pattern + 1;
-                star = Some((star_pattern, n));
+            ResourceToken::Values(values) => {
+                for (pos, &matched) in reachable.iter().enumerate() {
+                    if matched {
+                        for value in values {
+                            if name[pos..].starts_with(value.as_bytes()) {
+                                next[pos + value.len()] = true;
+                            }
+                        }
+                    }
+                }
             }
+            ResourceToken::Star | ResourceToken::Any => return false,
         }
+        if !next.iter().any(|&matched| matched) {
+            return false;
+        }
+        std::mem::swap(&mut reachable, &mut next);
     }
-    pattern[p..].iter().all(|token| *token == ResourceToken::Star)
+    reachable[name.len()]
 }
 
 /// Compile policy operators before interpolation so identity values remain literal data.
@@ -201,8 +214,8 @@ async fn resolve_resource_tokens(
     pattern: &str,
     conditions: &HashMap<String, Vec<String>>,
     resolver: Option<&dyn PolicyVariableResolver>,
-) -> Vec<Vec<ResourceToken>> {
-    let mut patterns = vec![Vec::new()];
+) -> Option<Vec<ResourceToken>> {
+    let mut tokens = Vec::new();
     let bytes = pattern.as_bytes();
     let mut pos = 0;
     while pos < bytes.len() {
@@ -222,7 +235,7 @@ async fn resolve_resource_tokens(
                 end += 1;
             }
             if depth != 0 {
-                return Vec::new();
+                return None;
             }
             let variable = &pattern[start..end];
             let names = if let Some(resolver) = resolver {
@@ -249,18 +262,12 @@ async fn resolve_resource_tokens(
             }
             // Missing variables invalidate this resource rather than matching the
             // placeholder's literal spelling, including for anonymous callers.
-            if values.is_empty() || patterns.len().saturating_mul(values.len()) > 1024 {
-                return Vec::new();
+            if values.is_empty() {
+                return None;
             }
-            let mut expanded = Vec::new();
-            for tokens in &patterns {
-                for value in &values {
-                    let mut next = tokens.clone();
-                    next.extend(value.bytes().map(ResourceToken::Literal));
-                    expanded.push(next);
-                }
-            }
-            patterns = expanded;
+            // Keep alternatives separate; expanding their Cartesian product can
+            // exhaust memory or silently suppress an explicit Deny.
+            tokens.push(ResourceToken::Values(values));
             pos = end + 1;
         } else {
             let token = match bytes[pos] {
@@ -268,13 +275,11 @@ async fn resolve_resource_tokens(
                 b'?' => ResourceToken::Any,
                 byte => ResourceToken::Literal(byte),
             };
-            for tokens in &mut patterns {
-                tokens.push(token);
-            }
+            tokens.push(token);
             pos += 1;
         }
     }
-    patterns
+    Some(tokens)
 }
 
 impl Resource {
@@ -310,11 +315,9 @@ impl Resource {
             Resource::Kms(s) => s.to_owned(),
         };
 
-        let patterns = resolve_resource_tokens(&pattern, conditions, resolver).await;
-
-        for pattern in patterns {
+        if let Some(pattern) = resolve_resource_tokens(&pattern, conditions, resolver).await {
             let cp = path::clean(resource);
-            if cp != "." && pattern.iter().copied().eq(cp.bytes().map(ResourceToken::Literal)) {
+            if cp != "." && resource_tokens_match(&pattern, &cp, false) {
                 return true;
             }
 
@@ -325,7 +328,7 @@ impl Resource {
             } else {
                 cp.clone()
             };
-            if cp != "." && resource_tokens_match(&pattern, &wildcard_resource) {
+            if cp != "." && resource_tokens_match(&pattern, &wildcard_resource, true) {
                 return true;
             }
         }
@@ -460,6 +463,22 @@ mod tests {
                 .is_match_with_resolver("bucket/team-other/file", &HashMap::new(), Some(&resolver))
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn resource_variable_alternatives_do_not_disappear_when_product_exceeds_limit() {
+        use super::KeyName;
+        let key = KeyName::COMMON_KEYS
+            .iter()
+            .find(|key| key.var_name() == "${aws:username}")
+            .expect("username common key")
+            .name()
+            .to_owned();
+        let values = (0..33).map(|index| format!("user-{index}")).collect();
+        let conditions = HashMap::from([(key, values)]);
+        let resource = Resource::S3("bucket/${aws:username}/${aws:username}/*".to_owned());
+        assert!(resource.is_match("bucket/user-32/user-31/object", &conditions).await);
+        assert!(!resource.is_match("bucket/user-32/not-listed/object", &conditions).await);
     }
 
     #[test_case("*", "mybucket" => true; "all buckets")]
