@@ -4229,6 +4229,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-types",
  "rustfs-signer",
  "rustfs-tokio-tar",
  "rustfs-utils",
