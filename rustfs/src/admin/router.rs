@@ -922,7 +922,7 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
         || is_control_plane_route(method, uri, headers)
 }
 
-/// Signed system-status reads, after object-lambda routing has had its existing priority.
+/// Signed system-status and catalog-configuration reads, after object-lambda routing.
 #[cfg(feature = "gateway-stack")]
 pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
     method == Method::GET
@@ -942,8 +942,12 @@ pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
                 | "/minio/admin/v4/plugins/catalog"
                 | "/rustfs/admin/v4/cluster/snapshot"
                 | "/minio/admin/v4/cluster/snapshot"
+                | "/rustfs/admin/v4/extensions/catalog"
+                | "/minio/admin/v4/extensions/catalog"
                 | "/rustfs/admin/v3/module-switches"
                 | "/minio/admin/v3/module-switches"
+                | "/iceberg/v1/config"
+                | "/_iceberg/v1/config"
         )
         && parse_object_lambda_request(method, uri).is_none()
 }

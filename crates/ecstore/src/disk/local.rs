@@ -11699,7 +11699,6 @@ impl LocalDisk {
         expected_current: Option<&CurrentDeleteGeneration>,
     ) -> Result<()> {
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
         let object_path = self.get_object_path(volume, path)?;
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
             Some(os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await);
@@ -11707,7 +11706,8 @@ impl LocalDisk {
             let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
             namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
         }
-        let xlpath = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
+        let (volume_dir, xlpath) =
+            self.io_get_bucket_and_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
         let object_dir = xlpath
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
@@ -14053,6 +14053,7 @@ fn validate_existing_local_disk_prefix_at(
         return Ok(());
     }
 
+    let has_dotdot = rustfs_utils::path::unix_path_has_dotdot_segment(relative.as_os_str().as_encoded_bytes());
     let mut candidate = relative;
     loop {
         match openat2(
@@ -14066,6 +14067,9 @@ fn validate_existing_local_disk_prefix_at(
             Err(Errno::NOSYS) => return Err(LocalDiskPathValidationAtError::Unsupported),
             Err(Errno::LOOP | Errno::XDEV) => return Err(LocalDiskPathValidationAtError::InvalidPath),
             Err(Errno::NOENT) => {
+                if !has_dotdot {
+                    return Ok(());
+                }
                 let Some(parent) =
                     rustfs_utils::path::unix_path_parent(candidate).filter(|parent| !parent.as_os_str().is_empty())
                 else {
@@ -25856,13 +25860,16 @@ mod test {
         assert!(!disk.io_get_object_path(bucket, "parent").expect("parent path").exists());
 
         let dst_meta_path = dst_object_dir.join(STORAGE_FORMAT_FILE);
-        let v5_meta_bytes = fs::read(&dst_meta_path).await.expect("read v5 xl.meta");
         let dst_vol_dir = disk.io_get_bucket_path(bucket).expect("bucket path");
         let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_meta_path, None).await;
         let guard =
             commit::lock_rename_commit_directories(&dst_object_dir, &dst_object_dir, &dst_vol_dir, &disk.publication_root, lease)
                 .await
                 .expect("lock commit guard");
+        let v5_read_file = os::read_destination_file_handle_with_commit_guard(&dst_meta_path, &guard)
+            .expect("read v5 handle")
+            .expect("v5 handle present");
+        let v5_meta_bytes = v5_read_file.bytes.to_vec();
         fs::create_dir_all(synthetic_backup_path.join("nested-child"))
             .await
             .expect("create conflicting directory at xl.meta.bkp");
@@ -25871,7 +25878,7 @@ mod test {
                 &dst_meta_path,
                 &synthetic_backup_parent,
                 &synthetic_backup_path,
-                &v5_meta_bytes,
+                &v5_read_file,
                 true,
                 true,
                 &guard,
@@ -25890,7 +25897,7 @@ mod test {
                 &dst_meta_path,
                 &synthetic_backup_parent,
                 &synthetic_backup_path,
-                &v5_meta_bytes,
+                &v5_read_file,
                 true,
                 true,
                 &guard,
@@ -25903,7 +25910,7 @@ mod test {
             &dst_meta_path,
             &synthetic_backup_parent,
             &synthetic_backup_path,
-            &v5_meta_bytes,
+            &v5_read_file,
             true,
             true,
             &guard,
@@ -25943,7 +25950,7 @@ mod test {
             &dst_meta_path,
             &synthetic_backup_parent,
             &synthetic_backup_path,
-            &v5_meta_bytes,
+            &v5_read_file,
             true,
             true,
             &guard,
@@ -26000,6 +26007,200 @@ mod test {
         );
         assert!(!replacement_dir.exists());
         assert_eq!(fs::read(&dst_meta_path).await.expect("restored"), v1_meta_bytes);
+
+        // Task 2 verification:
+        // 1. By-FD linkat (/proc/self/fd/<fd>) preserves the read predecessor inode even when
+        //    xl.meta on disk is replaced by another file, a symlink, or unlinked before linkat.
+        let v1_read_file = os::read_destination_file_handle_with_commit_guard(&dst_meta_path, &guard)
+            .expect("read restored v1 handle")
+            .expect("v1 handle present");
+        let v1_ino = v1_read_file.file.metadata().expect("stat v1 fd").ino();
+        fs::write(&staged_new_meta, b"impostor-regular-file")
+            .await
+            .expect("write impostor");
+        fs::rename(&staged_new_meta, &dst_meta_path)
+            .await
+            .expect("replace xl.meta with impostor inode while v1_read_file is open");
+        os::stage_inline_rollback_backup_with_commit_guard_std(
+            &dst_meta_path,
+            &synthetic_backup_parent,
+            &synthetic_backup_path,
+            &v1_read_file,
+            true,
+            true,
+            &guard,
+        )
+        .expect("by-FD linkat must stage the held v1_read_file when i_nlink == 0 via copy fallback");
+        assert_eq!(
+            fs::read(&synthetic_backup_path).await.expect("read fallback backup"),
+            v1_meta_bytes,
+            "unlinked old fd must fall back to writing captured v1_meta_bytes, never impostor bytes"
+        );
+        commit::discard_staged_inline_rollback_backup_std(synthetic_rollback, None, &guard);
+
+        // Keep a second hardlink to v1 so i_nlink >= 1 when xl.meta is replaced by a symlink.
+        fs::write(&dst_meta_path, &v1_meta_bytes).await.expect("restore v1 xl.meta");
+        let pinned_v1_read = os::read_destination_file_handle_with_commit_guard(&dst_meta_path, &guard)
+            .expect("read pinned v1")
+            .expect("pinned v1 present");
+        let pinned_v1_ino = pinned_v1_read.file.metadata().expect("stat pinned v1").ino();
+        let extra_link = dst_object_dir.join("extra-v1.link");
+        std::fs::hard_link(&dst_meta_path, &extra_link).expect("hardlink v1 so i_nlink stays > 0");
+        fs::remove_file(&dst_meta_path).await.expect("unlink xl.meta");
+        std::os::unix::fs::symlink(&extra_link, &dst_meta_path).expect("replace xl.meta with symlink");
+        os::stage_inline_rollback_backup_with_commit_guard_std(
+            &dst_meta_path,
+            &synthetic_backup_parent,
+            &synthetic_backup_path,
+            &pinned_v1_read,
+            true,
+            true,
+            &guard,
+        )
+        .expect("by-FD linkat must link the held regular file, never the symlink at dst_meta_path");
+        let bkp_symlink_meta = std::fs::symlink_metadata(&synthetic_backup_path).expect("lstat staged backup");
+        assert!(bkp_symlink_meta.is_file(), "staged backup must be a regular file, not a symlink");
+        assert_eq!(bkp_symlink_meta.ino(), pinned_v1_ino);
+        commit::discard_staged_inline_rollback_backup_std(synthetic_rollback, None, &guard);
+        fs::remove_file(&dst_meta_path).await.expect("remove symlink at xl.meta");
+        fs::rename(&extra_link, &dst_meta_path)
+            .await
+            .expect("restore regular xl.meta");
+        let _ = v1_ino;
+
+        // 2. Non-Windows write_file_for_path_access must unlink before create so a pre-existing
+        //    hardlinked .bkp is never truncated through its link.
+        fs::create_dir_all(&synthetic_backup_parent)
+            .await
+            .expect("create synthetic dir for legacy writer test");
+        let victim_path = dst_object_dir.join("victim-live-file");
+        fs::write(&victim_path, b"do-not-truncate").await.expect("write victim");
+        std::fs::hard_link(&victim_path, &synthetic_backup_path).expect("hardlink victim to .bkp");
+        let path_guard = guard
+            .create_destination_directory_for_path_access(&synthetic_backup_parent)
+            .expect("destination path guard");
+        path_guard
+            .write_file_for_path_access(&synthetic_backup_path, b"new-bkp-bytes", true, true)
+            .expect("legacy write_file_for_path_access");
+        assert_eq!(
+            fs::read(&victim_path).await.expect("read victim"),
+            b"do-not-truncate",
+            "write_file_for_path_access must unlink before create so hardlinked victim is untouched"
+        );
+        assert_eq!(fs::read(&synthetic_backup_path).await.expect("read new bkp"), b"new-bkp-bytes");
+        fs::remove_file(&victim_path).await.expect("remove victim");
+        commit::discard_staged_inline_rollback_backup_std(synthetic_rollback, None, &guard);
+
+        // 3. Deferred preflight error-classification and preflight_rejection parity on flat_inline_tmp:
+        let inline_probe_fi = test_file_info("probe-obj", version_id, None, Some(Bytes::from_static(b"probe")));
+        let missing_vol_obs = disk
+            .rename_data_observed(
+                RUSTFS_META_TMP_BUCKET,
+                "tmp-missing-vol",
+                &inline_probe_fi,
+                "missing-volume",
+                "probe-obj",
+                None,
+            )
+            .await;
+        assert!(matches!(missing_vol_obs.result, Err(DiskError::VolumeNotFound)));
+        assert!(
+            missing_vol_obs.rejected_before_publication(),
+            "missing destination volume on flat_inline_tmp must carry preflight_rejection proof"
+        );
+
+        let symlink_vol = dir.path().join("symlink-bucket");
+        std::os::unix::fs::symlink(dir.path().join(bucket), &symlink_vol).expect("live symlink bucket");
+        let symlink_obs = disk
+            .rename_data_observed(
+                RUSTFS_META_TMP_BUCKET,
+                "tmp-symlink-vol",
+                &inline_probe_fi,
+                "symlink-bucket",
+                "probe-obj",
+                None,
+            )
+            .await;
+        assert!(matches!(symlink_obs.result, Err(DiskError::InvalidPath)));
+        assert!(!symlink_obs.rejected_before_publication());
+
+        let dangling_vol = dir.path().join("dangling-bucket");
+        std::os::unix::fs::symlink(dir.path().join("nonexistent-target"), &dangling_vol).expect("dangling symlink bucket");
+        let dangling_obs = disk
+            .rename_data_observed(
+                RUSTFS_META_TMP_BUCKET,
+                "tmp-dangling-vol",
+                &inline_probe_fi,
+                "dangling-bucket",
+                "probe-obj",
+                None,
+            )
+            .await;
+        assert!(matches!(dangling_obs.result, Err(DiskError::InvalidPath)));
+        assert!(!dangling_obs.rejected_before_publication());
+
+        let file_vol = dir.path().join("file-bucket");
+        fs::write(&file_vol, b"not-a-dir").await.expect("regular file at bucket path");
+        let file_vol_obs = disk
+            .rename_data_observed(RUSTFS_META_TMP_BUCKET, "tmp-file-vol", &inline_probe_fi, "file-bucket", "probe-obj", None)
+            .await;
+        assert!(matches!(file_vol_obs.result, Err(DiskError::FileAccessDenied)));
+        assert!(!file_vol_obs.rejected_before_publication());
+
+        // 4. validate_existing_local_disk_prefix_at single-openat2 ENOENT shortcut:
+        assert!(
+            disk.io_get_bucket_and_object_path(bucket, "nonexistent-prefix/nonexistent-leaf")
+                .is_ok()
+        );
+        std::os::unix::fs::symlink(dir.path().join("nonexistent-target"), dir.path().join(bucket).join("dangling-prefix"))
+            .expect("dangling object prefix symlink");
+        assert!(matches!(
+            disk.io_get_bucket_and_object_path(bucket, "dangling-prefix/missing-leaf"),
+            Err(DiskError::InvalidPath)
+        ));
+        fs::write(dir.path().join(bucket).join("file-prefix"), b"file")
+            .await
+            .expect("file prefix");
+        assert!(matches!(
+            disk.io_get_bucket_and_object_path(bucket, "file-prefix/missing-leaf"),
+            Err(DiskError::FileAccessDenied)
+        ));
+
+        // 5. Replacing .rustfs.sys/tmp during prepare_destination()'s component-open hook on
+        //    a new-object flat-inline PUT must reject with FileCorrupt without consuming the moved source.
+        let hook_key = "hook-prefix/hook-leaf";
+        let hook_prefix_dir = disk
+            .io_get_object_open_path(bucket, "hook-prefix")
+            .expect("hook prefix io path");
+        let tmp_root_real = dir.path().join(RUSTFS_META_TMP_BUCKET);
+        let tmp_displaced = dir.path().join(".rustfs.sys/tmp-displaced-hook");
+        let tmp_root_for_hook = tmp_root_real.clone();
+        let tmp_displaced_for_hook = tmp_displaced.clone();
+        os::prepare_rename_test_hooks::queue_after_component_opened(&hook_prefix_dir, move || {
+            std::fs::rename(&tmp_root_for_hook, &tmp_displaced_for_hook).expect("displace tmp during prepare_destination");
+            std::fs::create_dir(&tmp_root_for_hook).expect("recreate empty tmp");
+        });
+        let hook_fi = test_file_info(hook_key, version_id, None, Some(Bytes::from_static(b"hook-inline")));
+        let hook_err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-hook-stage", hook_fi, bucket, hook_key)
+            .await
+            .expect_err("tmp replacement during prepare_destination must fail");
+        assert!(
+            matches!(hook_err, DiskError::FileCorrupt),
+            "expected FileCorrupt on mid-prepare tmp replacement, got: {hook_err:?}"
+        );
+        assert!(
+            tmp_displaced.join("tmp-hook-stage.xl.meta").is_file(),
+            "moved source in displaced tmp must not be consumed"
+        );
+        fs::remove_dir_all(&tmp_root_real)
+            .await
+            .expect("remove empty replacement tmp");
+        fs::rename(&tmp_displaced, &tmp_root_real)
+            .await
+            .expect("restore displaced tmp");
+        let _ = fs::remove_file(tmp_root_real.join("tmp-hook-stage.xl.meta")).await;
+
         println!("FUSED_OVERWRITE_OK");
     }
 
