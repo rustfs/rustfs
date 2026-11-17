@@ -2786,14 +2786,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // it is reacquired for the short final rename, so Complete/Abort are
         // not blocked behind a slow body upload.
         let _capped_staging_guard = if multipart_size_limit.is_some() {
+            let semaphore = capped_multipart_staging_semaphore(&upload_id_path);
+            let permit = if opts.multipart_copy_source_locked {
+                semaphore.try_acquire_owned().map_err(|_| Error::SlowDown)?
+            } else {
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::other("capped multipart staging semaphore closed"))?
+            };
             Some(CappedMultipartStagingGuard {
                 upload_id_path: upload_id_path.clone(),
-                permit: Some(
-                    capped_multipart_staging_semaphore(&upload_id_path)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::other("capped multipart staging semaphore closed"))?,
-                ),
+                permit: Some(permit),
             })
         } else {
             None
@@ -8926,6 +8930,18 @@ mod tests {
         });
         let input = tokio_util::io::StreamReader::new(stream);
         let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let copy_options = ObjectOptions {
+            multipart_copy_source_locked: true,
+            ..Default::default()
+        };
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks.put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &copy_options),
+        )
+        .await
+        .expect("source-locked copy must not queue");
+        assert!(matches!(refused, Err(Error::SlowDown)));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
         let task = tokio::spawn(async move {
             set_disks
                 .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
