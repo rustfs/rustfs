@@ -169,6 +169,33 @@ enum ResourceToken {
 
 fn resource_tokens_match(pattern: &[ResourceToken], name: &str, wildcard: bool) -> bool {
     let name = name.as_bytes();
+    if pattern.iter().all(|token| !matches!(token, ResourceToken::Values(_))) {
+        let (mut p, mut n) = (0, 0);
+        let mut star = None;
+        while n < name.len() {
+            match pattern.get(p) {
+                Some(ResourceToken::Literal(byte)) if *byte == name[n] => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Any) if wildcard => {
+                    p += 1;
+                    n += 1;
+                }
+                Some(ResourceToken::Star) if wildcard => {
+                    star = Some((p, n));
+                    p += 1;
+                }
+                _ => {
+                    let Some((star_pattern, star_name)) = star else { return false };
+                    n = star_name + 1;
+                    p = star_pattern + 1;
+                    star = Some((star_pattern, n));
+                }
+            }
+        }
+        return wildcard && pattern[p..].iter().all(|token| matches!(token, ResourceToken::Star)) || p == pattern.len();
+    }
     let mut reachable = vec![false; name.len() + 1];
     let mut next = vec![false; name.len() + 1];
     reachable[0] = true;
@@ -479,6 +506,42 @@ mod tests {
         let resource = Resource::S3("bucket/${aws:username}/${aws:username}/*".to_owned());
         assert!(resource.is_match("bucket/user-32/user-31/object", &conditions).await);
         assert!(!resource.is_match("bucket/user-32/not-listed/object", &conditions).await);
+    }
+
+    #[test]
+    fn authored_wildcard_matcher_agrees_with_existing_matcher() {
+        use super::{ResourceToken, resource_tokens_match};
+        fn strings(alphabet: &[u8], max_len: usize) -> Vec<String> {
+            let mut results = vec![String::new()];
+            for _ in 0..max_len {
+                let current = results.clone();
+                for prefix in current {
+                    for &byte in alphabet {
+                        results.push(format!("{prefix}{}", char::from(byte)));
+                    }
+                }
+            }
+            results.sort();
+            results.dedup();
+            results
+        }
+        for pattern in strings(b"ab*?", 4) {
+            let tokens: Vec<_> = pattern
+                .bytes()
+                .map(|byte| match byte {
+                    b'*' => ResourceToken::Star,
+                    b'?' => ResourceToken::Any,
+                    literal => ResourceToken::Literal(literal),
+                })
+                .collect();
+            for name in strings(b"ab", 4) {
+                assert_eq!(
+                    resource_tokens_match(&tokens, &name, true),
+                    crate::policy::utils::wildcard::is_match(&pattern, &name),
+                    "pattern={pattern:?} name={name:?}"
+                );
+            }
+        }
     }
 
     #[test_case("*", "mybucket" => true; "all buckets")]
