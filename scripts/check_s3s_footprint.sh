@@ -258,6 +258,19 @@ S3_ERROR_LABEL='s3s s3_error! lines'
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# CI workspaces may contain generated Rust files left by an earlier quality
+# check. They are not part of the submitted tree and must not change the
+# commit-to-base ratchet. Keep local fixture/self-test behavior unchanged while
+# making the CI measurement deterministic over tracked Rust files.
+declare -a SCANNED_RUST_PATHS ECSTORE_RUST_PATHS
+if [[ "${GITHUB_ACTIONS:-}" == 'true' ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    while IFS= read -r -d '' path; do SCANNED_RUST_PATHS+=("$path"); done < <(git ls-files -z -- ':(glob)**/*.rs' ':(exclude)crates/e2e_test/**')
+    while IFS= read -r -d '' path; do ECSTORE_RUST_PATHS+=("$path"); done < <(git ls-files -z -- ':(glob)crates/ecstore/src/**/*.rs')
+else
+    SCANNED_RUST_PATHS=("$E2E_TEST_GLOB" .)
+    ECSTORE_RUST_PATHS=(crates/ecstore/src)
+fi
+
 # Returns 0 when every s3s-referencing Rust file is allowlisted (or on a dry
 # run), 1 when files remain outside the allowlist; exits 1 on a broken input.
 run_allowlist_mode() {
@@ -753,13 +766,13 @@ run_rg_to() {
 }
 
 # Explicit '.' path is load-bearing — see header. Never drop it.
-run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust "$E2E_TEST_GLOB" .
+run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust "${SCANNED_RUST_PATHS[@]}"
 run_rg_to "$TMP_DIR/error_lines" --with-filename --no-heading --no-line-number 's3_error!' \
-    --type rust "$E2E_TEST_GLOB" .
-run_rg_to "$TMP_DIR/s3s_macro_files" -l -U -e "$S3S_MACRO_IMPORT_PATTERN" --type rust "$E2E_TEST_GLOB" .
+    --type rust "${SCANNED_RUST_PATHS[@]}"
+run_rg_to "$TMP_DIR/s3s_macro_files" -l -U -e "$S3S_MACRO_IMPORT_PATTERN" --type rust "${SCANNED_RUST_PATHS[@]}"
 run_rg_to "$TMP_DIR/cleared_files" -l -U -e "$RUSTFS_MACRO_IMPORT_PATTERN" -e "$S3_ERROR_DEFINITION_PATTERN" \
-    --type rust "$E2E_TEST_GLOB" .
-run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust crates/ecstore/src
+    --type rust "${SCANNED_RUST_PATHS[@]}"
+run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust "${ECSTORE_RUST_PATHS[@]}"
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
 # Rules 1-3 of the header, one rg output line ("path:text") at a time. The path
