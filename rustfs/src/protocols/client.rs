@@ -43,11 +43,13 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 #[cfg(test)]
 use s3s::S3;
+use s3s::S3Request;
+#[cfg(test)]
+use s3s::S3Result;
 #[cfg(test)]
 use s3s::dto::*;
 #[cfg(test)]
 use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
-use s3s::{S3Request, S3Result};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -101,9 +103,13 @@ fn append_query_param(uri: &mut String, first: &mut bool, key: &str, value: Opti
     }
 }
 
-fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
-    uri.parse()
-        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
+fn parse_protocol_uri(uri: String, context: String) -> rustfs_s3_types::S3Result<http::Uri> {
+    uri.parse().map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InvalidRequest,
+            format!("invalid URI for {context}: {e}"),
+        )
+    })
 }
 
 fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3Error {
@@ -308,7 +314,7 @@ async fn cluster_usable_capacity() -> Option<(u64, u64)> {
     Some(value)
 }
 
-fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> rustfs_s3_types::S3Result<http::Uri> {
     let mut uri = format!("/{}", encode_path_segment(bucket));
     let mut first = true;
     for (key, value) in query {
@@ -317,7 +323,7 @@ fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<ht
     parse_protocol_uri(uri, format!("bucket={bucket}"))
 }
 
-fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> rustfs_s3_types::S3Result<http::Uri> {
     let mut uri = format!("/{}/{}", encode_path_segment(bucket), encode_object_key_path(key));
     let mut first = true;
     for (query_key, value) in query {
@@ -326,7 +332,7 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
 }
 
-fn build_list_objects_uri(input: &gateway_dto::ListObjectsV2Input) -> S3Result<http::Uri> {
+fn build_list_objects_uri(input: &gateway_dto::ListObjectsV2Input) -> rustfs_s3_types::S3Result<http::Uri> {
     let max_keys = input.max_keys.map(|value| value.to_string());
     let query: Vec<_> = [
         ("list-type", Some("2")),
@@ -370,12 +376,16 @@ impl ProtocolStorageClient {
         bucket: &str,
         object: Option<&str>,
         listing: Option<&gateway_dto::ListObjectsV2Input>,
-    ) -> S3Result<()> {
+    ) -> rustfs_s3_types::S3Result<()> {
         let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+            rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::InternalError,
+                "protocol server application context is not initialized",
+            )
         })?;
-        let (credentials, is_owner) =
-            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
+        let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)?;
         let uri = if let Some(input) = listing {
             build_list_objects_uri(input)?
         } else if let Some(key) = object {
@@ -412,11 +422,18 @@ impl ProtocolStorageClient {
         } else {
             action.clone().into()
         };
-        authorize_request(&mut request, policy_action).await
+        authorize_request(&mut request, policy_action)
+            .await
+            .map_err(rustfs_s3_types::S3Error::from)
     }
 
     /// Create a proper S3Request with ReqInfo extension for authorization
-    fn create_request<T>(input: T, method: Method, uri: http::Uri, params: RequestParams<'_>) -> S3Result<S3Request<T>> {
+    fn create_request<T>(
+        input: T,
+        method: Method,
+        uri: http::Uri,
+        params: RequestParams<'_>,
+    ) -> rustfs_s3_types::S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
 
         let is_owner = if let Some(global_cred) = current_action_credentials() {
@@ -477,7 +494,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         self.authorize_protocol_request(session, action, bucket, object, None)
             .await
             .map_err(|error| match error.code() {
-                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                rustfs_s3_types::S3ErrorCode::AccessDenied | rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                    AuthorizationError::AccessDenied
+                }
                 _ => AuthorizationError::IamUnavailable,
             })
     }
@@ -493,7 +512,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         self.authorize_protocol_request(session, &S3Action::ListBucket, input.bucket.as_str(), None, Some(input))
             .await
             .map_err(|error| match error.code() {
-                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                rustfs_s3_types::S3ErrorCode::AccessDenied | rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                    AuthorizationError::AccessDenied
+                }
                 _ => AuthorizationError::IamUnavailable,
             })
     }
@@ -715,7 +736,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         );
 
         let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+            rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::InternalError,
+                "protocol server application context is not initialized",
+            )
         })?;
         // The session identity is captured at login. Re-check the key as
         // authorize_protocol_request does for every other operation, so a key
@@ -724,8 +748,11 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
                 .await
+                .map_err(rustfs_s3_types::S3Error::from)
                 .map_err(|e| match e.code() {
-                    s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
+                    rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
+                        rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied)
+                    }
                     _ => e,
                 })?;
         let envelope = session_list_buckets_envelope(
@@ -771,11 +798,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                     None
                 }
                 Err(e) => {
-                    return Err(s3s::S3Error::with_message(
-                        s3s::S3ErrorCode::InternalError,
+                    return Err(rustfs_s3_types::S3Error::with_message(
+                        rustfs_s3_types::S3ErrorCode::InternalError,
                         format!("Failed to read bucket quota config: {e}"),
-                    )
-                    .into());
+                    ));
                 }
             };
             let usage = match capacity::get_bucket_usage_memory(&name).await {
