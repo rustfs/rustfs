@@ -1026,3 +1026,108 @@ fn gateway_upload_part_copy_checks_source_owner() {
         server.shutdown().await;
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn gateway_copy_object_checks_source_owner_before_overwriting() {
+    with_stack(super::GATEWAY, copy_object_checks_source_owner_before_overwriting);
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_copy_object_checks_source_owner_before_overwriting() {
+    with_stack(LEGACY, copy_object_checks_source_owner_before_overwriting);
+}
+
+async fn copy_object_checks_source_owner_before_overwriting(server: rustfs::embedded::RustFSServer) {
+    const SOURCE: &str = "copy-object-source-owner";
+    const DESTINATION: &str = "copy-object-owner-target";
+    create_bucket_in_the_store(SOURCE).await;
+    create_bucket_in_the_store(DESTINATION).await;
+    let root = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+    let owner = root
+        .get_bucket_acl()
+        .bucket(SOURCE)
+        .send()
+        .await
+        .expect("read source bucket owner")
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("source owner ID")
+        .to_owned();
+    for (bucket, key, bytes) in [
+        (SOURCE, "source", b"source-data".as_slice()),
+        (DESTINATION, "existing", b"original".as_slice()),
+    ] {
+        root.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .expect("write copy fixture");
+    }
+    let denied = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must be denied");
+    assert_eq!(super::refusal(&denied), (Some("AccessDenied".to_owned()), Some(403)));
+    let original = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read destination after denial")
+        .body
+        .collect()
+        .await
+        .expect("read original bytes")
+        .into_bytes();
+    assert_eq!(original.as_ref(), b"original");
+    let denied_new = root
+        .copy_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner("different-owner")
+        .send()
+        .await
+        .expect_err("wrong source owner must not create a destination");
+    assert_eq!(super::refusal(&denied_new), (Some("AccessDenied".to_owned()), Some(403)));
+    let missing = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("not-created")
+        .send()
+        .await
+        .expect_err("the denied copy must leave no object");
+    assert_eq!(super::refusal(&missing).1, Some(404));
+    root.copy_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .copy_source(format!("{SOURCE}/source"))
+        .expected_source_bucket_owner(owner)
+        .send()
+        .await
+        .expect("matching source owner permits copy");
+    let copied = root
+        .get_object()
+        .bucket(DESTINATION)
+        .key("existing")
+        .send()
+        .await
+        .expect("read matching-owner copy")
+        .body
+        .collect()
+        .await
+        .expect("read copied bytes")
+        .into_bytes();
+    assert_eq!(copied.as_ref(), b"source-data");
+    server.shutdown().await;
+}
