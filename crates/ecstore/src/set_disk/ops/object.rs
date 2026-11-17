@@ -5063,6 +5063,9 @@ impl SetDisks {
                     }
 
                     pfi.set_inline_data();
+                } else {
+                    // Layout belongs to this encoding, not to inherited source metadata.
+                    rustfs_utils::http::remove_str(&mut pfi.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA);
                 }
                 parts_metadatas.push(pfi);
             }
@@ -15020,6 +15023,47 @@ mod inline_put_commit_path_tests {
                 "a multi-block object must keep part files (transformed={transformed})"
             );
             assert_eq!(read_back(&set_disks, bucket, object).await, plaintext);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_put_clears_inherited_inline_markers_and_reclaims_parts() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "external-inline-marker";
+        let object = "object.bin";
+        let payload = vec![42; 512 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+        let mut opts = ObjectOptions::default();
+        rustfs_utils::http::insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_INLINE_DATA, "true".to_owned());
+        opts.user_defined.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, rustfs_utils::http::SUFFIX_INLINE_DATA)
+                .to_ascii_uppercase(),
+            "true".to_owned(),
+        );
+        for _ in 0..2 {
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("external PUT commits");
+            for disk in &disk_stores {
+                let fi = disk
+                    .read_version(
+                        "",
+                        bucket,
+                        object,
+                        "",
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read persisted layout");
+                assert!(!fi.inline_data(), "external shards must not inherit the inline marker");
+            }
+            assert_eq!(count_part_files(&temp_dirs), disk_stores.len(), "overwrite must reclaim the prior parts");
+            assert_eq!(read_back(&set_disks, bucket, object).await, payload);
         }
     }
 

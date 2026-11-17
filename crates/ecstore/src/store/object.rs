@@ -2859,6 +2859,7 @@ fn check_batch_delete_condition(object: &ObjectToDelete, snapshot: &ConditionalD
 fn materialized_copy_user_defined(source: &HashMap<String, String>) -> HashMap<String, String> {
     let mut metadata = source.clone();
     for suffix in [
+        rustfs_utils::http::SUFFIX_INLINE_DATA,
         rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
         rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
         rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
@@ -7739,6 +7740,7 @@ mod tests {
     #[test]
     fn materialized_copy_drops_remote_tuple_and_free_version_compatibility_keys() {
         let protected_suffixes = [
+            rustfs_utils::http::SUFFIX_INLINE_DATA,
             rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
             rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
             rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
@@ -7763,6 +7765,10 @@ mod tests {
                 rustfs_utils::http::SUFFIX_TRANSITION_STATUS.to_ascii_uppercase()
             ),
             "complete".to_string(),
+        );
+        source.insert(
+            rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_INLINE_DATA).to_ascii_uppercase(),
+            "true".to_string(),
         );
 
         let copied = materialized_copy_user_defined(&source);
