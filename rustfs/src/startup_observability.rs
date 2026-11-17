@@ -84,7 +84,7 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                         .unwrap_or_default()
                         .as_millis();
                     let line = format!(
-                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=3\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\trename_batch_execution={}\trename_admission={}\trename_quarantine={}\n",
+                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=4\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\trename_batch_execution={}\trename_admission={}\trename_quarantine={}\trename_batch_timing_count={}\trename_batch_timing_total_ns={}\trename_batch_timing_max_ns={}\n",
                         rustfs_io_metrics::get_stage_local_summary_sample_rate(),
                         rows.len(),
                         rustfs_io_metrics::ECSTORE_RENAME_RPC_KINDS.iter().zip(rename.rpc_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
@@ -94,6 +94,9 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                         rustfs_io_metrics::ECSTORE_RENAME_BATCH_EXECUTION.iter().zip(rename.batch_execution_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
                         rustfs_io_metrics::ECSTORE_RENAME_ADMISSION.iter().zip(rename.admission_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
                         rustfs_io_metrics::ECSTORE_RENAME_QUARANTINE.iter().zip(rename.quarantine_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_total_ns).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
+                        rustfs_io_metrics::ECSTORE_RENAME_BATCH_TIMING.iter().zip(rename.batch_timing_max_ns).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
                     );
                     let Ok(mut file) = tokio::fs::OpenOptions::new()
                         .create(true)

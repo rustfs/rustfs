@@ -2202,8 +2202,12 @@ impl NodeService {
         let dst_volume = Arc::<str>::from(request.dst_volume);
         let dst_path = Arc::<str>::from(request.dst_path);
         let (tx, rx) = tokio::sync::mpsc::channel(prepared.len());
+        let prepared_items = prepared.len();
         let resource_context = crate::storage::storage_api::RemoteBackgroundIo::take_current();
         tokio::spawn(crate::storage::storage_api::with_remote_background_io(resource_context, async move {
+            let dispatch_started_at = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
+            let mut first_item_at = None;
+            let mut completed_items = 0usize;
             let mut pending = FuturesUnordered::new();
             for (item_index, disk, file_info) in prepared {
                 let target = target.clone();
@@ -2247,6 +2251,27 @@ impl NodeService {
                         rename_data_resp_msgpack: Vec::new().into(),
                     },
                 };
+                if let Some(dispatch_started_at) = dispatch_started_at {
+                    let completed_at = Instant::now();
+                    completed_items += 1;
+                    match first_item_at {
+                        Some(first_item_at) if completed_items == prepared_items => {
+                            rustfs_io_metrics::record_ecstore_rename_batch_server_first_to_last(
+                                completed_at.saturating_duration_since(first_item_at),
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            rustfs_io_metrics::record_ecstore_rename_batch_server_dispatch_to_first(
+                                completed_at.saturating_duration_since(dispatch_started_at),
+                            );
+                            first_item_at = Some(completed_at);
+                            if completed_items == prepared_items {
+                                rustfs_io_metrics::record_ecstore_rename_batch_server_first_to_last(std::time::Duration::ZERO);
+                            }
+                        }
+                    }
+                }
                 let _ = tx.send(Ok(response)).await;
             }
         }));

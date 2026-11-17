@@ -1176,6 +1176,8 @@ impl RenameBatchCallGuard {
             admission: self.admission.take(),
             deadline: self.deadline,
             terminal: false,
+            stream_started_at: rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now),
+            first_item_at: None,
         }
     }
 }
@@ -1214,6 +1216,8 @@ pub(crate) struct RemoteRenameBatchStream {
     admission: Option<RenameAdmissionGrant>,
     deadline: tokio::time::Instant,
     terminal: bool,
+    stream_started_at: Option<Instant>,
+    first_item_at: Option<Instant>,
 }
 
 impl RemoteRenameBatchStream {
@@ -1256,6 +1260,26 @@ impl RemoteRenameBatchStream {
         self.seen_mask |= bit;
         if self.admission.as_mut().is_some_and(|admission| !admission.release_one()) {
             return Err(self.terminate_ambiguous(DiskError::Unexpected));
+        }
+        if let Some(stream_started_at) = self.stream_started_at {
+            let completed_at = Instant::now();
+            match self.first_item_at {
+                Some(first_item_at) if self.seen_mask == self.expected_mask => {
+                    rustfs_io_metrics::record_ecstore_rename_batch_client_first_to_last(
+                        completed_at.saturating_duration_since(first_item_at),
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    rustfs_io_metrics::record_ecstore_rename_batch_client_stream_to_first(
+                        completed_at.saturating_duration_since(stream_started_at),
+                    );
+                    self.first_item_at = Some(completed_at);
+                    if self.seen_mask == self.expected_mask {
+                        rustfs_io_metrics::record_ecstore_rename_batch_client_first_to_last(Duration::ZERO);
+                    }
+                }
+            }
         }
         rustfs_io_metrics::record_ecstore_rename_batch_item_completed();
         let result = if response.success {

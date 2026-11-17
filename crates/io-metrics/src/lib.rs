@@ -506,6 +506,12 @@ pub const ECSTORE_RENAME_QUARANTINE: [&str; 12] = [
     "batch_released_items",
     "batch_no_runtime_items",
 ];
+pub const ECSTORE_RENAME_BATCH_TIMING: [&str; 4] = [
+    "client_stream_to_first",
+    "client_first_to_last",
+    "server_dispatch_to_first",
+    "server_first_to_last",
+];
 
 static ECSTORE_RENAME_RPC_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static ECSTORE_RENAME_REMOTE_WIDTH_COUNTS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
@@ -514,6 +520,9 @@ static ECSTORE_RENAME_COVERAGE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(
 static ECSTORE_RENAME_BATCH_EXECUTION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static ECSTORE_RENAME_ADMISSION_COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static ECSTORE_RENAME_QUARANTINE_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static ECSTORE_RENAME_BATCH_TIMING_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static ECSTORE_RENAME_BATCH_TIMING_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcstoreRenameDiagnosticsSnapshot {
@@ -524,6 +533,9 @@ pub struct EcstoreRenameDiagnosticsSnapshot {
     pub batch_execution_counts: [u64; 10],
     pub admission_counts: [u64; 10],
     pub quarantine_counts: [u64; 12],
+    pub batch_timing_counts: [u64; 4],
+    pub batch_timing_total_ns: [u64; 4],
+    pub batch_timing_max_ns: [u64; 4],
 }
 
 impl EcstoreRenameDiagnosticsSnapshot {
@@ -536,6 +548,9 @@ impl EcstoreRenameDiagnosticsSnapshot {
             .chain(self.batch_execution_counts.iter())
             .chain(self.admission_counts.iter())
             .chain(self.quarantine_counts.iter())
+            .chain(self.batch_timing_counts.iter())
+            .chain(self.batch_timing_total_ns.iter())
+            .chain(self.batch_timing_max_ns.iter())
             .all(|count| *count == 0)
     }
 }
@@ -549,6 +564,9 @@ pub fn snapshot_ecstore_rename_diagnostics() -> EcstoreRenameDiagnosticsSnapshot
         batch_execution_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_EXECUTION_COUNTS[index].load(Ordering::Relaxed)),
         admission_counts: std::array::from_fn(|index| ECSTORE_RENAME_ADMISSION_COUNTS[index].load(Ordering::Relaxed)),
         quarantine_counts: std::array::from_fn(|index| ECSTORE_RENAME_QUARANTINE_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_counts: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].load(Ordering::Relaxed)),
+        batch_timing_total_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].load(Ordering::Relaxed)),
+        batch_timing_max_ns: std::array::from_fn(|index| ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].load(Ordering::Relaxed)),
     }
 }
 
@@ -2897,6 +2915,37 @@ pub fn record_ecstore_rename_quarantine_no_runtime(batch: bool, items: usize) {
     }
 }
 
+#[inline(always)]
+fn record_ecstore_rename_batch_timing(index: usize, duration: Duration) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    let duration_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    ECSTORE_RENAME_BATCH_TIMING_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_TOTAL_NS[index].fetch_add(duration_ns, Ordering::Relaxed);
+    ECSTORE_RENAME_BATCH_TIMING_MAX_NS[index].fetch_max(duration_ns, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_stream_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(0, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_client_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(1, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_dispatch_to_first(duration: Duration) {
+    record_ecstore_rename_batch_timing(2, duration);
+}
+
+#[inline(always)]
+pub fn record_ecstore_rename_batch_server_first_to_last(duration: Duration) {
+    record_ecstore_rename_batch_timing(3, duration);
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -4828,6 +4877,7 @@ mod tests {
         record_ecstore_rename_batch_candidate_peer(4, 4);
         record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
         record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
         assert_eq!(snapshot_ecstore_rename_diagnostics(), disabled_before);
 
         set_put_stage_metrics_enabled(true);
@@ -4851,6 +4901,10 @@ mod tests {
         record_ecstore_rename_quarantine(true, 4, Duration::from_nanos(30));
         record_ecstore_rename_quarantine_released(true, 3);
         record_ecstore_rename_quarantine_no_runtime(true, 1);
+        record_ecstore_rename_batch_client_stream_to_first(Duration::from_nanos(10));
+        record_ecstore_rename_batch_client_first_to_last(Duration::from_nanos(20));
+        record_ecstore_rename_batch_server_dispatch_to_first(Duration::from_nanos(30));
+        record_ecstore_rename_batch_server_first_to_last(Duration::from_nanos(40));
         set_put_stage_metrics_enabled(false);
 
         let after = snapshot_ecstore_rename_diagnostics();
@@ -4880,6 +4934,17 @@ mod tests {
             std::array::from_fn::<_, 12, _>(|index| after.quarantine_counts[index] - before.quarantine_counts[index]),
             [0, 0, 0, 0, 0, 0, 1, 4, 30, 30, 3, 1]
         );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| after.batch_timing_counts[index] - before.batch_timing_counts[index]),
+            [1, 1, 1, 1]
+        );
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|index| { after.batch_timing_total_ns[index] - before.batch_timing_total_ns[index] }),
+            [10, 20, 30, 40]
+        );
+        for (actual, expected) in after.batch_timing_max_ns.into_iter().zip([10, 20, 30, 40]) {
+            assert!(actual >= expected);
+        }
     }
 
     #[test]
