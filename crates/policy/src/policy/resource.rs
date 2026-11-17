@@ -254,7 +254,11 @@ async fn resolve_resource_tokens(
     pattern: &str,
     conditions: &HashMap<String, Vec<String>>,
     resolver: Option<&dyn PolicyVariableResolver>,
+    depth: usize,
 ) -> Option<Vec<ResourceToken>> {
+    if depth >= 10 {
+        return None;
+    }
     let mut tokens = Vec::new();
     let bytes = pattern.as_bytes();
     let mut pos = 0;
@@ -278,15 +282,24 @@ async fn resolve_resource_tokens(
                 return None;
             }
             let variable = &pattern[start..end];
-            let names = if let Some(resolver) = resolver {
-                super::variables::resolve_aws_variables(variable, resolver).await
-            } else {
-                vec![variable.to_owned()]
-            };
             let mut values = Vec::new();
-            for name in names {
+            if variable.contains("${") {
+                // Historical nested syntax substitutes the inner expression as
+                // the value itself, rather than looking it up again. Compile it
+                // recursively without expanding its Cartesian product or treating
+                // resulting wildcard characters as policy operators.
+                let nested = Box::pin(resolve_resource_tokens(variable, conditions, resolver, depth + 1)).await?;
+                tokens.extend(nested.into_iter().map(|token| match token {
+                    ResourceToken::Star => ResourceToken::Literal(b'*'),
+                    ResourceToken::Any => ResourceToken::Literal(b'?'),
+                    other => other,
+                }));
+                pos = end + 1;
+                continue;
+            } else {
+                let name = variable;
                 let resolved = if let Some(resolver) = resolver {
-                    resolver.resolve_multiple(&name).await
+                    resolver.resolve_multiple(name).await
                 } else {
                     None
                 };
@@ -356,7 +369,7 @@ impl Resource {
             Resource::Kms(s) => s.to_owned(),
         };
 
-        if let Some(pattern) = resolve_resource_tokens(&pattern, conditions, resolver).await {
+        if let Some(pattern) = resolve_resource_tokens(&pattern, conditions, resolver, 0).await {
             let cp = path::clean(resource);
             if cp != "." && resource_tokens_match(&pattern, &cp, false) {
                 return true;
@@ -540,6 +553,26 @@ mod tests {
         let resource = Resource::S3("bucket/${aws:username}/${aws:username}/*".to_owned());
         assert!(resource.is_match("bucket/user-32/user-31/object", &conditions).await);
         assert!(!resource.is_match("bucket/user-32/not-listed/object", &conditions).await);
+    }
+
+    #[tokio::test]
+    async fn nested_resource_variables_preserve_compatibility_without_glob_injection() {
+        use crate::policy::variables::{VariableContext, VariableResolver};
+        let resolver = VariableResolver::new(VariableContext {
+            claims: Some(HashMap::from([("sub".to_owned(), serde_json::json!("user*"))])),
+            ..Default::default()
+        });
+        let resource = Resource::S3("bucket/${${aws:PrincipalType}-${aws:userid}}/*".to_owned());
+        assert!(
+            resource
+                .is_match_with_resolver("bucket/User-user*/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
+        assert!(
+            !resource
+                .is_match_with_resolver("bucket/User-user-other/file", &HashMap::new(), Some(&resolver))
+                .await
+        );
     }
 
     #[tokio::test]
