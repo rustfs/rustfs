@@ -23,8 +23,7 @@ use crate::global::{
     METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES, METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
     METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL, METRIC_LOG_CLEANER_ROTATION_TOTAL,
 };
-use chrono::{Local, TimeZone as _};
-use jiff::ZonedDateTime;
+use jiff::{Timestamp, ZonedDateTime, tz::TimeZone};
 use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -58,8 +57,12 @@ impl Rotation {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
             Rotation::Daily => {
-                let last_day = Local.timestamp_opt(last, 0).single().map(|ts| ts.date_naive());
-                let now_day = Local.timestamp_opt(now, 0).single().map(|ts| ts.date_naive());
+                let last_day = Timestamp::new(last, 0)
+                    .ok()
+                    .map(|ts| ts.to_zoned_datetime(TimeZone::system()).date());
+                let now_day = Timestamp::new(now, 0)
+                    .ok()
+                    .map(|ts| ts.to_zoned_datetime(TimeZone::system()).date());
 
                 match (last_day, now_day) {
                     (Some(last_day), Some(now_day)) => last_day != now_day,

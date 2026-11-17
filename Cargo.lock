@@ -10171,7 +10171,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "bytesize",
- "chrono",
  "criterion",
  "faster-hex",
  "flatbuffers",
@@ -10506,11 +10505,11 @@ dependencies = [
  "async-trait",
  "base64-simd",
  "bytes",
- "chrono",
  "crc-fast",
  "futures",
  "hotpath",
  "http 1.5.0",
+ "jiff 1.0.0",
  "metrics",
  "rustfs-common",
  "rustfs-concurrency",
@@ -10810,8 +10809,8 @@ dependencies = [
 name = "rustfs-log-analyzer"
 version = "1.0.5"
 dependencies = [
- "chrono",
  "flate2",
+ "jiff 1.0.0",
  "regex",
  "serde",
  "serde_json",
@@ -10949,7 +10948,6 @@ dependencies = [
 name = "rustfs-obs"
 version = "1.0.5"
 dependencies = [
- "chrono",
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-utils",
@@ -11310,6 +11308,7 @@ dependencies = [
  "futures-core",
  "hotpath",
  "http 1.5.0",
+ "jiff 1.0.0",
  "lz4",
  "lz4_flex",
  "memchr",
@@ -11410,7 +11409,6 @@ dependencies = [
 name = "rustfs-scanner-metrics"
 version = "1.0.5"
 dependencies = [
- "chrono",
  "jiff 1.0.0",
  "metrics",
  "rmp-serde",

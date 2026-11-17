@@ -2871,7 +2871,7 @@ mod tests {
     }
 
     fn w13_timestamp() -> String {
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     fn w13_selection_contains(selection: &str, lane: &str) -> bool {
