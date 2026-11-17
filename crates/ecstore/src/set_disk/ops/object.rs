@@ -10387,34 +10387,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // already held; sequencing one metadata fan-out per key made a
         // 1000-key batch pay a full round of drive reads at a time.
         const DELETE_OBJECTS_SOURCE_READ_CONCURRENCY: usize = 16;
-        let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> = HashMap::with_capacity(objects.len());
-        {
-            let mut pending = Vec::new();
-            for (i, source) in source_inputs.iter().enumerate() {
-                if del_errs[i].is_some() {
-                    continue;
-                }
-                let Some(source) = source else {
-                    continue;
-                };
-                if !source.needs_source_read {
-                    continue;
-                }
-                let object_name = objects[i].object_name.clone();
-                let check_opts = &source.check_opts;
-                pending.push(async move {
-                    let (goi, file_info, _write_quorum, gerr) = self
-                        .get_object_info_fileinfo_and_quorum(bucket, &object_name, check_opts)
-                        .await;
-                    (i, (goi, file_info, gerr))
-                });
-            }
-            let reads = futures::stream::iter(pending)
-                .buffer_unordered(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-            source_reads.extend(reads);
-        }
+        let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> =
+            HashMap::with_capacity(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY);
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
@@ -10423,6 +10397,39 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut deferred_recovery_indices = Vec::new();
 
         for (i, dobj) in objects.iter().enumerate() {
+            if i.is_multiple_of(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY) {
+                source_reads.clear();
+                let mut pending = Vec::new();
+                for (i, source) in source_inputs
+                    .iter()
+                    .enumerate()
+                    .skip(i)
+                    .take(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
+                {
+                    if del_errs[i].is_some() {
+                        continue;
+                    }
+                    let Some(source) = source else {
+                        continue;
+                    };
+                    if !source.needs_source_read {
+                        continue;
+                    }
+                    let object_name = objects[i].object_name.clone();
+                    let check_opts = &source.check_opts;
+                    pending.push(async move {
+                        let (goi, file_info, _write_quorum, gerr) = self
+                            .get_object_info_fileinfo_and_quorum(bucket, &object_name, check_opts)
+                            .await;
+                        (i, (goi, file_info, gerr))
+                    });
+                }
+                let reads = futures::stream::iter(pending)
+                    .buffer_unordered(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
+                source_reads.extend(reads);
+            }
             if del_errs[i].is_some() {
                 continue;
             }
@@ -10482,11 +10489,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 // duplicate of the same name would still report the stale
                 // miss and skip its object-lock check — bypassing retention —
                 // so evict those entries and let the loop re-read them live.
-                for (other_index, other) in objects.iter().enumerate() {
-                    if other_index != i && other.object_name == dobj.object_name {
-                        source_reads.remove(&other_index);
-                    }
-                }
+                source_reads.retain(|index, _| objects[*index].object_name != dobj.object_name);
                 let recovery = self
                     .recover_delete_key(
                         bucket,
@@ -26887,7 +26890,7 @@ mod delete_objects_lock_gating_tests {
         put_plain_object(&set_disks, bucket, "obj-a").await;
         put_plain_object(&set_disks, bucket, "obj-c").await;
 
-        let objects = vec![
+        let mut objects = vec![
             ObjectToDelete {
                 object_name: "obj-a".to_string(),
                 ..Default::default()
@@ -26902,6 +26905,12 @@ mod delete_objects_lock_gating_tests {
             },
         ];
 
+        for index in 0..16 {
+            objects.push(ObjectToDelete {
+                object_name: format!("also-missing-{index}"),
+                ..Default::default()
+            });
+        }
         let (deleted, errs) = set_disks
             .delete_objects(
                 bucket,
@@ -26915,8 +26924,8 @@ mod delete_objects_lock_gating_tests {
             )
             .await;
 
-        assert_eq!(deleted.len(), 3);
-        assert_eq!(errs.len(), 3);
+        assert_eq!(deleted.len(), 19);
+        assert_eq!(errs.len(), 19);
         assert!(
             errs.iter().all(Option::is_none),
             "S3 batch delete reports missing keys as deleted, not as errors: {errs:?}"
@@ -26924,6 +26933,7 @@ mod delete_objects_lock_gating_tests {
         assert_eq!(deleted[0].object_name, "obj-a");
         assert_eq!(deleted[1].object_name, "missing-b");
         assert_eq!(deleted[2].object_name, "obj-c");
+        assert_eq!(deleted[18].object_name, "also-missing-15");
         assert!(deleted[0].found, "existing key must be reported as found");
         assert!(!deleted[1].found, "missing key must be reported as not found");
         assert!(deleted[2].found, "existing key must be reported as found");
