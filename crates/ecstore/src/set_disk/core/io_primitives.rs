@@ -4443,7 +4443,6 @@ impl SetDisks {
                     });
                 }
                 for group in fanout_plan.batch_groups {
-                    rustfs_io_metrics::record_ecstore_rename_batch_planned(group.slots.len());
                     let outcome_tx = outcome_tx.clone();
                     let paths = paths.clone();
                     let file_infos = file_infos.clone();
@@ -4509,6 +4508,7 @@ impl SetDisks {
                             }
                             return;
                         }
+                        rustfs_io_metrics::record_ecstore_rename_batch_planned(entries.len());
                         let start = {
                             let items = entries
                                 .iter()
@@ -4560,6 +4560,8 @@ impl SetDisks {
                                         Err(_) => break,
                                     }
                                 }
+                                let remaining_items = remaining.iter().flatten().count();
+                                rustfs_io_metrics::record_ecstore_rename_batch_may_have_published(remaining_items);
                                 for (slot, observation) in remaining.into_iter().flatten() {
                                     let result = Err(DiskError::Unexpected);
                                     observation.finish(&result);
