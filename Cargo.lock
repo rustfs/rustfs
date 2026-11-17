@@ -11359,12 +11359,12 @@ version = "1.0.5"
 dependencies = [
  "async-trait",
  "bytes",
- "chrono",
  "futures",
  "hex-simd",
  "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
+ "jiff 1.0.0",
  "metrics",
  "opentelemetry-proto",
  "opentelemetry_sdk",
