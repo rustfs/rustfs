@@ -140,6 +140,12 @@ With list syntax, use `- RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/` or quote the
 
 ---
 
+## Local storage pool expansion
+
+To append a second four-drive pool, set `RUSTFS_VOLUMES: "/data/rustfs0/{0...3} /data/rustfs1/{0...3}"` and keep the original pool's drives, order, and erasure set width. The container prepares each drive directory and passes one argument per pool to RustFS.
+
+If an older image already formatted both ranges together as a single eight-drive pool, list the eight individual paths in their original order to keep that layout when upgrading.
+
 ## 🔧 Common Operations
 
 ### Cleaning Up

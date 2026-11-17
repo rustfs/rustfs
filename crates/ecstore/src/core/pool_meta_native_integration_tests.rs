@@ -628,7 +628,7 @@ async fn pool_meta_native_physical_runtime_fork_after_apply_latches_original_gat
     let fork = identity_epoch_fork(&fixture).await;
     let since = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed original failure timestamp should be valid");
     {
-        let mut state = fixture.store.pool_meta_save_gate.lock().await;
+        let mut state = fixture.store.pool_meta_save_gate.write().await;
         assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
         state.write_blocked = false;
         state.block_context = None;
@@ -685,7 +685,7 @@ async fn pool_meta_native_physical_runtime_fork_after_apply_latches_original_gat
     );
     assert_committed(&fixture).await;
     {
-        let state = fixture.store.pool_meta_save_gate.lock().await;
+        let state = fixture.store.pool_meta_save_gate.write().await;
         assert!(
             state.write_blocked,
             "candidate validation must propagate its permanent latch to the original state"
@@ -706,7 +706,7 @@ async fn pool_meta_native_physical_runtime_fork_after_apply_latches_original_gat
             .expect("permanently blocked recovery should return without mutation"),
         "ordinary-readable repaired heads must not clear the original known-fork latch"
     );
-    let state = fixture.store.pool_meta_save_gate.lock().await;
+    let state = fixture.store.pool_meta_save_gate.write().await;
     assert!(state.write_blocked);
     assert_eq!(
         state
@@ -979,7 +979,7 @@ async fn pool_meta_native_heal_v1_with_all_upgrade_gates_disabled_keeps_exact_ra
         async {
             let (fixture, raw) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
             let guard = owner(&fixture.store).await;
-            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let mut state = fixture.store.pool_meta_save_gate.write().await;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 fixture.store.heal_pool_meta_replica_under_fence(0, guard, &mut state),
@@ -1036,7 +1036,7 @@ async fn pool_meta_native_heal_rejects_legacy_source_with_trailing_bytes_without
                 let before = snapshots(&fixture.store).await;
                 let identities = owner_repair_identity_heads(&fixture.store).await;
                 let guard = owner(&fixture.store).await;
-                let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                let mut state = fixture.store.pool_meta_save_gate.write().await;
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),
@@ -1110,7 +1110,7 @@ async fn pool_meta_native_heal_mixed_v1_v2_preserves_observed_format_floor() {
                     assert_eq!(selection.revision.version, POOL_META_VERSION, "the observed V2 format floor must be retained");
                     assert_eq!(selection.canonical.as_deref(), Some(semantic_v2.as_slice()));
                     let guard = owner(&fixture.store).await;
-                    let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                    let mut state = fixture.store.pool_meta_save_gate.write().await;
                     tokio::time::timeout(std::time::Duration::from_secs(30),
                         fixture.store.heal_pool_meta_replica_under_fence(target_pool, guard, &mut state))
                         .await.expect("mixed legacy heal must terminate")
@@ -1199,7 +1199,7 @@ async fn pool_meta_native_heal_rejects_v1_and_v3_prepare_in_either_pool_order() 
                 let before = snapshots(&fixture.store).await;
                 let identities = owner_repair_identity_heads(&fixture.store).await;
                 let guard = owner(&fixture.store).await;
-                let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                let mut state = fixture.store.pool_meta_save_gate.write().await;
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     fixture
@@ -1301,7 +1301,7 @@ async fn pool_meta_native_heal_rejects_v1_legacy_dont_save_true_without_writes()
             let before = snapshots(&fixture.store).await;
             let identities = owner_repair_identity_heads(&fixture.store).await;
             let guard = owner(&fixture.store).await;
-            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let mut state = fixture.store.pool_meta_save_gate.write().await;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),
@@ -1410,7 +1410,7 @@ async fn pool_meta_native_heal_rejects_target_v1_dont_save_true_without_writes()
             let before = snapshots(&fixture.store).await;
             let identities = owner_repair_identity_heads(&fixture.store).await;
             let guard = owner(&fixture.store).await;
-            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let mut state = fixture.store.pool_meta_save_gate.write().await;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),

@@ -92,6 +92,9 @@ pub const O_APPEND: FileMode = 0x00400;
 //     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
+    if mode & O_CREATE != 0 {
+        super::os::record_native_publication(path.as_ref());
+    }
     let path = path.as_ref().to_path_buf();
     native_io(move || {
         let mut options = std::fs::OpenOptions::new();
@@ -144,51 +147,64 @@ pub fn create_dir_all_std(path: &Path) -> io::Result<()> {
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     let path = path.as_ref().to_path_buf();
     native_io(move || create_dir_all_std(&path)).await
 }
 
-fn is_dir_error(e: &io::Error) -> bool {
+fn is_dir_error(path: &Path, e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EISDIR)
         || e.kind() == io::ErrorKind::IsADirectory
         // macOS: remove_file on a directory returns EPERM
         || (cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EPERM))
+        || is_windows_dir_access_denied(path, e)
 }
 
+/// Windows reports `remove_file` on a directory (or directory symlink) as
+/// ERROR_ACCESS_DENIED, which is indistinguishable from a real permission
+/// failure without inspecting the entry itself.
+#[cfg(windows)]
+fn is_windows_dir_access_denied(path: &Path, e: &io::Error) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+
+    e.kind() == io::ErrorKind::PermissionDenied
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+            let file_type = metadata.file_type();
+            file_type.is_dir() || file_type.is_symlink_dir()
+        })
+}
+
+#[cfg(not(windows))]
+fn is_windows_dir_access_denied(_path: &Path, _e: &io::Error) -> bool {
+    false
+}
+
+#[cfg(test)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
-    // Try remove_file first; fall back to remove_dir if it's a directory
-    let file_path = path.as_ref().to_path_buf();
-    match native_io(move || std::fs::remove_file(file_path)).await {
-        Ok(()) => Ok(()),
-        Err(e) if is_dir_error(&e) => {
-            let path = path.as_ref().to_path_buf();
-            native_io(move || std::fs::remove_dir(path)).await
-        }
-        Err(e) => Err(e),
-    }
+    let path = path.as_ref().to_path_buf();
+    native_io(move || remove_std(path)).await
 }
 
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir_all if it's a directory
-    let file_path = path.as_ref().to_path_buf();
-    match native_io(move || std::fs::remove_file(file_path)).await {
+    let path = path.as_ref().to_path_buf();
+    native_io(move || match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
-        Err(e) if is_dir_error(&e) => {
-            let path = path.as_ref().to_path_buf();
-            native_io(move || std::fs::remove_dir_all(path)).await
-        }
+        Err(e) if is_dir_error(&path, &e) => std::fs::remove_dir_all(&path),
         Err(e) => Err(e),
-    }
+    })
+    .await
 }
 
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir if it's a directory
-    match std::fs::remove_file(path.as_ref()) {
+    let path = path.as_ref();
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(e) if is_dir_error(&e) => std::fs::remove_dir(path.as_ref()),
+        Err(e) if is_dir_error(path, &e) => std::fs::remove_dir(path),
         Err(e) => Err(e),
     }
 }
@@ -205,11 +221,13 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
 
 #[cfg(test)]
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(path.as_ref());
     let path = path.as_ref().to_path_buf();
     native_io(move || std::fs::create_dir(path)).await
 }
 
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     let from = from.as_ref().to_path_buf();
     let to = to.as_ref().to_path_buf();
     native_io(move || std::fs::rename(from, to)).await
@@ -217,6 +235,7 @@ pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<
 
 #[cfg(any(not(windows), test))]
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    super::os::record_native_publication(to.as_ref());
     std::fs::rename(from, to)
 }
 

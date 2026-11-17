@@ -72,6 +72,7 @@ async fn owned_mrf_shutdown_drains_and_persists_before_ack_and_join() {
             after: None,
             limit: 1,
             response,
+            _permit: crate::heal::mrf_queue::management::read_permit().expect("MRF management read permit"),
         })
         .await
         .expect("queued lifecycle query");

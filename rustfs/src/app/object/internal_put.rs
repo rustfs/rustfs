@@ -22,6 +22,7 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -138,7 +139,7 @@ async fn validate_internal_write_target(key: &str, bucket: &str, headers: &Heade
         headers.get("content-type").and_then(|value| value.to_str().ok()),
         headers.get("content-encoding").and_then(|value| value.to_str().ok()),
     )
-    .map_err(api_error_from_s3)
+    .map_err(|err| api_error_from_s3(err.into()))
 }
 
 fn internal_events_wanted() -> bool {
@@ -214,16 +215,22 @@ impl InternalPutObjectEvent {
 
     /// Publish the event when `result` is a success; failures publish nothing.
     pub(super) fn complete<T>(self, result: &S3Result<S3Response<T>>) {
-        let Ok(response) = result else {
+        if let Ok(response) = result {
+            self.complete_owned(&Ok(()), &response.headers);
+        }
+    }
+
+    pub(super) fn complete_owned<T>(self, result: &rustfs_s3_types::S3Result<T>, headers: &HeaderMap) {
+        if result.is_err() {
             return;
-        };
+        }
         let Self {
             builder,
             notify,
             request_context,
         } = self;
         let event_args = builder
-            .resp_elements(build_event_resp_elements(response, &request_context.request_id))
+            .resp_elements(build_owned_event_resp_elements(headers, &request_context.request_id))
             .build();
         spawn_background_with_context(Some(request_context), async move {
             notify.notify(event_args).await;
@@ -243,10 +250,7 @@ impl DefaultObjectUsecase {
             .clone()
             .or_else(current_app_context)
             .ok_or_else(not_initialized)?;
-        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-            context.object_store(),
-            context.table_catalog_strong_runtime(),
-        );
+        let backend = EcStoreTableCatalogObjectBackend::new(context.object_store());
         let guard = backend
             .acquire_read_lock(bucket, &default_table_bucket_publication_lock_path())
             .await
@@ -305,6 +309,7 @@ impl DefaultObjectUsecase {
             headers: &headers,
             query: None,
             trailing_headers: None,
+            max_content_length: None,
             version_id: None,
             sse: PutObjectSseInput {
                 server_side_encryption: None,
@@ -332,13 +337,17 @@ impl DefaultObjectUsecase {
             },
         };
         let committed = self
-            .put_object_core(write, StreamingBlob::wrap(body), start_time)
+            .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
-            .map_err(api_error_from_s3)?;
+            .map_err(|error| ApiError {
+                code: error.code().clone().into(),
+                message: error.message().unwrap_or_default().to_owned(),
+                source: None,
+            })?;
 
         let obj_info = committed.obj_info.clone();
-        let result: S3Result<S3Response<()>> = Ok(S3Response::new(()));
-        committed.finish(&result);
+        let result = Ok(());
+        committed.finish(&result, http::StatusCode::OK, &HeaderMap::new());
         Ok(obj_info)
     }
 
@@ -791,8 +800,8 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
     };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
@@ -883,27 +892,27 @@ mod tests {
         };
         let mut metadata = (*metadata).clone();
         metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
-        metadata.versioning_config = Some(VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        metadata.versioning_config = Some(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
 
         if let Some(target) = target {
-            let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
-                tag: Some(Tag {
+            let filter = required_tag.map(|(key, value)| PersistedReplicationFilter {
+                tag: Some(PersistedReplicationTag {
                     key: Some(key.to_string()),
                     value: Some(value.to_string()),
                 }),
                 ..Default::default()
             });
-            let config = ReplicationConfiguration {
+            let config = PersistedReplicationConfiguration {
                 role: String::new(),
-                rules: vec![ReplicationRule {
-                    delete_marker_replication: Some(DeleteMarkerReplication {
-                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+                rules: vec![PersistedReplicationRule {
+                    delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                        status: Some(Status::DISABLED.to_string()),
                     }),
                     delete_replication: None,
-                    destination: Destination {
+                    destination: PersistedReplicationDestination {
                         bucket: target.to_string(),
                         ..Default::default()
                     },
@@ -913,7 +922,7 @@ mod tests {
                     prefix: Some(String::new()),
                     priority: Some(1),
                     source_selection_criteria: None,
-                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                    status: Status::ENABLED.to_string(),
                 }],
             };
             metadata.replication_config_xml = serialize(&config).expect("replication test config should serialize");

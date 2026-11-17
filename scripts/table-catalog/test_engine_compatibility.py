@@ -519,7 +519,7 @@ class EngineCompatibilityTest(unittest.TestCase):
             scenario="create-append-reload-scan-direct-rest-probes",
             rustfs_build="rustfs-test",
             git_sha="abc123",
-            catalog_backing="durable-strong",
+            catalog_backing="object",
             endpoint="http://127.0.0.1:9000",
             warehouse="rustfs-s3table-smoke",
             rest_path="/iceberg",
@@ -552,7 +552,7 @@ class EngineCompatibilityTest(unittest.TestCase):
                 self.assertNotIn("catalog_probes", historical)
 
     def test_backing_probe_evidence_rejects_missing_or_overstated_results(self) -> None:
-        for backing in ("object", "durable-strong"):
+        for backing in ("object",):
             for skipped in (False, True):
                 for vended in (False, True):
                     with self.subTest(backing=backing, skipped=skipped, vended=vended):
@@ -598,7 +598,7 @@ class EngineCompatibilityTest(unittest.TestCase):
             scenario="create-namespace-staged-ctas-refresh-count-cleanup",
             rustfs_build="rustfs-test",
             git_sha="abc123",
-            catalog_backing="durable-strong",
+            catalog_backing="object",
             endpoint="http://127.0.0.1:9000",
             warehouse="rustfs-s3table-smoke",
             rest_path="/iceberg",
@@ -662,15 +662,15 @@ class EngineCompatibilityTest(unittest.TestCase):
         section_by_name = {section["name"]: section for section in guide["sections"]}
 
         self.assertIn("live-client-conformance", section_by_name)
-        self.assertIn("catalog-backing-cutover", section_by_name)
+        self.assertIn("catalog-backup-restore", section_by_name)
         self.assertIn("maintenance-operations", section_by_name)
         self.assertIn("recovery-and-disaster-rehearsal", section_by_name)
         self.assertIn("permissions-and-credentials", section_by_name)
         self.assertIn("unsupported-claim-governance", section_by_name)
 
-        cutover = section_by_name["catalog-backing-cutover"]
-        self.assertIn("GET /iceberg/v1/rustfs-s3table-smoke/catalog/migration", cutover["commands"])
-        self.assertIn("blockers is empty", " ".join(cutover["pass_criteria"]))
+        backup_restore = section_by_name["catalog-backup-restore"]
+        self.assertIn("POST /iceberg/v1/rustfs-s3table-smoke/catalog/backup", backup_restore["commands"])
+        self.assertIn("idempotent", " ".join(backup_restore["pass_criteria"]))
 
         maintenance = section_by_name["maintenance-operations"]
         self.assertIn("quarantine", " ".join(maintenance["fail_closed_signals"]))
@@ -710,12 +710,12 @@ class EngineCompatibilityTest(unittest.TestCase):
         )
 
         section_by_name = {section["name"]: section for section in guide["sections"]}
-        cutover = section_by_name["catalog-backing-cutover"]
+        backup_restore = section_by_name["catalog-backup-restore"]
         maintenance = section_by_name["maintenance-operations"]
         recovery = section_by_name["recovery-and-disaster-rehearsal"]
         credentials = section_by_name["permissions-and-credentials"]
 
-        self.assertIn("GET /_iceberg/v1/lake%20bucket/catalog/migration", cutover["commands"])
+        self.assertIn("POST /_iceberg/v1/lake%20bucket/catalog/backup", backup_restore["commands"])
         encoded_table_path = "/_iceberg/v1/lake%20bucket/namespaces/sales%2Fprod/tables/orders%20table"
         for commands in [maintenance["commands"], recovery["commands"], credentials["commands"]]:
             rendered = "\n".join(commands)

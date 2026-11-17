@@ -1,0 +1,1 @@
+<ReplicationConfiguration><Role></Role><Rule><Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination><ID>unknown</ID><Status>Enabled</Status></Rule></ReplicationConfiguration>

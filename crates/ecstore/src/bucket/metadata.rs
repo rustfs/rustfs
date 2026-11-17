@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
-use super::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
@@ -25,12 +25,17 @@ use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use rustfs_policy::policy::BucketPolicy;
-use s3s::dto::{
-    AccelerateConfiguration, BucketLifecycleConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration,
-    NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration, ReplicationConfiguration,
-    RequestPaymentConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration as CORSConfiguration, PersistedTagging as Tagging};
+use rustfs_gateway_types::persistence::{
+    PersistedAccelerateConfiguration as AccelerateConfiguration,
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+    PersistedBucketLoggingStatus as BucketLoggingStatus, PersistedLifecycleConfiguration,
+    PersistedNotificationConfiguration as NotificationConfiguration, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+    PersistedPublicAccessBlockConfiguration as PublicAccessBlockConfiguration, PersistedReplicationConfiguration,
+    PersistedRequestPaymentConfiguration as RequestPaymentConfiguration,
+    PersistedVersioningConfiguration as VersioningConfiguration, PersistedWebsiteConfiguration as WebsiteConfiguration,
 };
+use rustfs_policy::policy::BucketPolicy;
 use serde::Serializer;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -40,23 +45,11 @@ use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset
 use tracing::error;
 use uuid::Uuid;
 
-// The serving-layer DTO impls for the storage-level Object Lock traits live
-// here because this module owns the persisted `ObjectLockConfiguration`
-// during the s3s ratchet migration (rustfs/backlog#1842).
+// The persisted Object Lock configuration answers the storage-level trait
+// here because this module owns the persisted `ObjectLockConfiguration`.
 impl ObjectLockApi for ObjectLockConfiguration {
     fn enabled(&self) -> bool {
-        self.object_lock_enabled
-            .as_ref()
-            .is_some_and(|v| v.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)
-    }
-}
-
-impl ObjectLockStatusExt for s3s::dto::ObjectLockLegalHoldStatus {
-    fn valid(&self) -> bool {
-        matches!(
-            self.as_str(),
-            s3s::dto::ObjectLockLegalHoldStatus::ON | s3s::dto::ObjectLockLegalHoldStatus::OFF
-        )
+        self.object_lock_enabled.as_deref() == Some("Enabled")
     }
 }
 
@@ -256,15 +249,17 @@ pub const BUCKET_POLICY_CONFIG: &str = "policy.json";
 pub const BUCKET_NOTIFICATION_CONFIG: &str = "notification.xml";
 pub const BUCKET_LIFECYCLE_CONFIG: &str = "lifecycle.xml";
 pub const BUCKET_SSECONFIG: &str = "bucket-encryption.xml";
-/// Shared tag-entry validation for object requests and persisted bucket tags.
-pub fn validate_tag_set_entries(tag_set: &[s3s::dto::Tag]) -> std::result::Result<(), &'static str> {
-    fn is_valid_tag_text(value: &str) -> bool {
-        static VALID_TAG_TEXT: std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>> = std::sync::OnceLock::new();
-        VALID_TAG_TEXT
-            .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$"))
-            .as_ref()
-            .is_ok_and(|pattern| pattern.is_match(value))
-    }
+/// Validate tag entries supplied to the S3 API.
+pub fn validate_tag_set_entries(
+    tag_set: &[rustfs_gateway_types::cors_tagging::PersistedTag],
+) -> std::result::Result<(), &'static str> {
+    validate_tag_entries(tag_set, validate_s3_tag_entry)
+}
+
+fn validate_tag_entries(
+    tag_set: &[rustfs_gateway_types::cors_tagging::PersistedTag],
+    mut validate_entry: impl FnMut(&str, &str) -> std::result::Result<(), &'static str>,
+) -> std::result::Result<(), &'static str> {
     let mut keys = std::collections::HashSet::with_capacity(tag_set.len());
     for tag in tag_set {
         let key = tag
@@ -272,13 +267,8 @@ pub fn validate_tag_set_entries(tag_set: &[s3s::dto::Tag]) -> std::result::Resul
             .as_deref()
             .filter(|key| !key.is_empty())
             .ok_or("Tag key cannot be empty")?;
-        if key.encode_utf16().count() > 128 || !is_valid_tag_text(key) {
-            return Err("The TagKey you have provided is invalid");
-        }
         let value = tag.value.as_deref().ok_or("Tag value cannot be null")?;
-        if value.encode_utf16().count() > 256 || !is_valid_tag_text(value) {
-            return Err("The TagValue you have provided is invalid");
-        }
+        validate_entry(key, value)?;
         if !keys.insert(key) {
             return Err("Cannot provide multiple Tags with the same key");
         }
@@ -286,7 +276,104 @@ pub fn validate_tag_set_entries(tag_set: &[s3s::dto::Tag]) -> std::result::Resul
     Ok(())
 }
 
+fn validate_s3_tag_entry(key: &str, value: &str) -> std::result::Result<(), &'static str> {
+    fn is_valid_tag_text(value: &str) -> bool {
+        static VALID_TAG_TEXT: std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>> = std::sync::OnceLock::new();
+        VALID_TAG_TEXT
+            .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$"))
+            .as_ref()
+            .is_ok_and(|pattern| pattern.is_match(value))
+    }
+    if key.encode_utf16().count() > 128 || !is_valid_tag_text(key) {
+        return Err("The TagKey you have provided is invalid");
+    }
+    if value.encode_utf16().count() > 256 || !is_valid_tag_text(value) {
+        return Err("The TagValue you have provided is invalid");
+    }
+    Ok(())
+}
+
 pub const MAX_BUCKET_TAGS: usize = 50;
+
+/// Maximum number of metadata headers on a Swift resource.
+pub const MAX_SWIFT_METADATA_COUNT: usize = 90;
+/// Maximum byte length of a Swift metadata value.
+pub const MAX_SWIFT_METADATA_VALUE_SIZE: usize = 256;
+
+/// Prefix for Swift account metadata persisted in tagging.xml.
+pub const SWIFT_ACCOUNT_META_TAG_PREFIX: &str = "swift-account-meta-";
+/// Prefix for Swift container metadata persisted in tagging.xml.
+pub const SWIFT_CONTAINER_META_TAG_PREFIX: &str = "swift-meta-";
+
+/// Marks a bucket whose shared tag config contains Swift-owned metadata.
+/// The key cannot be supplied through S3's tag alphabet.
+pub const SWIFT_TAGGING_MARKER: &str = "!rustfs-swift-metadata";
+
+/// Whether a persisted tag belongs to Swift's internal metadata namespace.
+pub fn is_swift_bucket_metadata_tag_key(key: &str) -> bool {
+    matches!(
+        key,
+        "swift-acl-read" | "swift-acl-write" | "swift-versions-location" | SWIFT_TAGGING_MARKER
+    ) || key.starts_with(SWIFT_ACCOUNT_META_TAG_PREFIX)
+        || key.starts_with(SWIFT_CONTAINER_META_TAG_PREFIX)
+}
+
+fn validate_persisted_bucket_tags(
+    tags: &[rustfs_gateway_types::cors_tagging::PersistedTag],
+) -> std::result::Result<(), &'static str> {
+    const SWIFT_ACL_MAX_BYTES: usize = 8192;
+    const SWIFT_META_NAME_MAX_BYTES: usize = 128;
+    const MAX_PERSISTED_TAGS: usize = MAX_BUCKET_TAGS + 2 * MAX_SWIFT_METADATA_COUNT + 4;
+    if tags.len() > MAX_PERSISTED_TAGS {
+        return Err("Too many persisted bucket tags");
+    }
+
+    // Swift stores ACLs, versioning and metadata in the same XML as S3 tags.
+    // Only those known keys may carry values outside the S3 tag alphabet.
+    let mut account_metadata = 0;
+    let mut container_metadata = 0;
+    let mut s3_tags = 0;
+    validate_tag_entries(tags, |key, value| {
+        let swift_metadata = key
+            .strip_prefix(SWIFT_ACCOUNT_META_TAG_PREFIX)
+            .map(|name| (name, &mut account_metadata))
+            .or_else(|| {
+                key.strip_prefix(SWIFT_CONTAINER_META_TAG_PREFIX)
+                    .map(|name| (name, &mut container_metadata))
+            });
+        if let Some((name, count)) = swift_metadata
+            && name.len() <= SWIFT_META_NAME_MAX_BYTES
+            && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && value.len() <= MAX_SWIFT_METADATA_VALUE_SIZE
+            && http::HeaderValue::from_str(value).is_ok()
+        {
+            *count += 1;
+            if *count > MAX_SWIFT_METADATA_COUNT {
+                return Err("Too many Swift metadata tags");
+            }
+            return Ok(());
+        }
+
+        if key == SWIFT_TAGGING_MARKER && value == "1" {
+            return Ok(());
+        }
+
+        let valid_swift_header = match key {
+            "swift-acl-read" | "swift-acl-write" => value.len() <= SWIFT_ACL_MAX_BYTES,
+            "swift-versions-location" => value.len() <= 256 && !value.is_empty() && !value.contains('/'),
+            _ => false,
+        };
+        if valid_swift_header && http::HeaderValue::from_str(value).is_ok() {
+            return Ok(());
+        }
+
+        s3_tags += 1;
+        if s3_tags > MAX_BUCKET_TAGS {
+            return Err("Cannot have more than 50 tags per bucket");
+        }
+        validate_s3_tag_entry(key, value)
+    })
+}
 
 pub const BUCKET_TAGGING_CONFIG: &str = "tagging.xml";
 pub const BUCKET_QUOTA_CONFIG_FILE: &str = "quota.json";
@@ -303,6 +390,7 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
+pub const BUCKET_ETAG_CONFIG: &str = "etag.json";
 pub const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = "on-demand-migration.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
@@ -471,6 +559,8 @@ pub struct BucketMetadata {
     pub bucket_incarnation_id: Uuid,
     pub(crate) bucket_incarnation_sidecar: bool,
     pub(crate) bucket_creation_committed: bool,
+    // A legacy default is not proof of an interrupted creation.
+    pub(crate) bucket_creation_commit_record_present: bool,
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -492,6 +582,7 @@ pub struct BucketMetadata {
     pub table_bucket_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
     pub on_demand_migration_config_json: Vec<u8>,
+    pub etag_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -514,18 +605,19 @@ pub struct BucketMetadata {
     pub table_bucket_config_updated_at: OffsetDateTime,
     pub durability_config_updated_at: OffsetDateTime,
     pub on_demand_migration_config_updated_at: OffsetDateTime,
+    pub etag_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
     pub policy_config: Option<BucketPolicy>,
     pub notification_config: Option<NotificationConfiguration>,
-    pub lifecycle_config: Option<BucketLifecycleConfiguration>,
+    pub lifecycle_config: Option<PersistedLifecycleConfiguration>,
     pub object_lock_config: Option<ObjectLockConfiguration>,
     pub versioning_config: Option<VersioningConfiguration>,
     pub sse_config: Option<ServerSideEncryptionConfiguration>,
     pub tagging_config: Option<Tagging>,
     pub quota_config: Option<BucketQuota>,
-    pub replication_config: Option<ReplicationConfiguration>,
+    pub replication_config: Option<PersistedReplicationConfiguration>,
     pub bucket_target_config: Option<BucketTargets>,
     pub bucket_target_config_meta: Option<HashMap<String, String>>,
     pub cors_config: Option<CORSConfiguration>,
@@ -546,6 +638,7 @@ impl Default for BucketMetadata {
             bucket_incarnation_id: Uuid::nil(),
             bucket_incarnation_sidecar: false,
             bucket_creation_committed: false,
+            bucket_creation_commit_record_present: false,
             policy_config_json: Default::default(),
             notification_config_xml: Default::default(),
             lifecycle_config_xml: Default::default(),
@@ -567,6 +660,7 @@ impl Default for BucketMetadata {
             table_bucket_config_json: Default::default(),
             durability_config_json: Default::default(),
             on_demand_migration_config_json: Default::default(),
+            etag_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -588,6 +682,7 @@ impl Default for BucketMetadata {
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             on_demand_migration_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            etag_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -714,6 +809,29 @@ impl BucketMetadata {
         }
     }
 
+    /// Parsed per-bucket ETag algorithm, if one is stored. Invalid payloads
+    /// keep MD5 ETags after logging a parse failure.
+    pub fn etag_config(&self) -> Option<super::etag::BucketEtagConfig> {
+        if self.etag_config_json.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice(&self.etag_config_json) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(
+                    event = "bucket_metadata_parse_failed",
+                    component = "ecstore",
+                    subsystem = "bucket_metadata",
+                    bucket = %self.name,
+                    config = "etag",
+                    error = %e,
+                    "Failed to parse bucket metadata config"
+                );
+                None
+            }
+        }
+    }
+
     /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn decode_from<R: Read>(&mut self, rd: &mut R) -> Result<()> {
         let mut fields = rmp::decode::read_map_len(rd)?;
@@ -774,6 +892,7 @@ impl BucketMetadata {
                 "OnDemandMigrationConfigJSON" | "OnDemandMigrationConfigJson" => {
                     self.on_demand_migration_config_json = read_msgp_bin(rd)?
                 }
+                "EtagConfigJSON" | "EtagConfigJson" => self.etag_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -784,7 +903,11 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
-                "BucketCreationCommitted" => self.bucket_creation_committed = read_msgp_bool(rd)?,
+                "EtagConfigUpdatedAt" => self.etag_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketCreationCommitted" => {
+                    self.bucket_creation_committed = read_msgp_bool(rd)?;
+                    self.bucket_creation_commit_record_present = true;
+                }
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -797,8 +920,10 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (22)
-        let map_len: u32 = 47;
+        // Preserve the absence of a legacy commit record across config rewrites.
+        let commit_record_present = self.bucket_creation_commit_record_present || self.bucket_creation_committed;
+        // Map size: MinIO fields (25) + RustFS extensions (23) + optional commit record.
+        let map_len: u32 = 48 + u32::from(commit_record_present);
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -859,6 +984,7 @@ impl BucketMetadata {
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
         write_bin_field(wr, "OnDemandMigrationConfigJSON", &self.on_demand_migration_config_json)?;
+        write_bin_field(wr, "EtagConfigJSON", &self.etag_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -879,8 +1005,12 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
-        rmp::encode::write_str(wr, "BucketCreationCommitted")?;
-        rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
+        rmp::encode::write_str(wr, "EtagConfigUpdatedAt")?;
+        write_msgp_time(wr, self.etag_config_updated_at)?;
+        if commit_record_present {
+            rmp::encode::write_str(wr, "BucketCreationCommitted")?;
+            rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
+        }
 
         Ok(())
     }
@@ -985,6 +1115,9 @@ impl BucketMetadata {
         if self.on_demand_migration_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.on_demand_migration_config_updated_at = self.created
         }
+        if self.etag_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.etag_config_updated_at = self.created
+        }
     }
 
     /// Replace one config payload and stamp its `*_config_updated_at` with the
@@ -1026,14 +1159,7 @@ impl BucketMetadata {
                     let tagging = deserialize::<Tagging>(&data).map_err(|_| {
                         Error::InvalidArgument(self.name.clone(), String::new(), "Invalid bucket tagging XML".to_owned())
                     })?;
-                    if tagging.tag_set.len() > MAX_BUCKET_TAGS {
-                        return Err(Error::InvalidArgument(
-                            self.name.clone(),
-                            String::new(),
-                            "Cannot have more than 50 tags per bucket".to_owned(),
-                        ));
-                    }
-                    validate_tag_set_entries(&tagging.tag_set)
+                    validate_persisted_bucket_tags(&tagging.tag_set)
                         .map_err(|message| Error::InvalidArgument(self.name.clone(), String::new(), message.to_owned()))?;
                 }
                 self.tagging_config_xml = data;
@@ -1064,9 +1190,11 @@ impl BucketMetadata {
                     None
                 } else {
                     let config = deserialize::<VersioningConfiguration>(&data)?;
-                    if config.status.as_ref().is_some_and(|status| {
-                        !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED)
-                    }) {
+                    if config
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| !matches!(status.as_str(), "Enabled" | "Suspended"))
+                    {
                         return Err(Error::other("bucket versioning configuration has an invalid status"));
                     }
                     Some(config)
@@ -1079,7 +1207,7 @@ impl BucketMetadata {
                 let config = if data.is_empty() {
                     None
                 } else {
-                    let config = deserialize::<ReplicationConfiguration>(&data)?;
+                    let config = deserialize::<PersistedReplicationConfiguration>(&data)?;
                     if let Some(field) = invalid_replication_config_status_field(&config) {
                         return Err(Error::other(format!("replication field {field} has an invalid status")));
                     }
@@ -1135,6 +1263,10 @@ impl BucketMetadata {
             BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
                 self.on_demand_migration_config_json = data;
                 self.on_demand_migration_config_updated_at = updated;
+            }
+            BUCKET_ETAG_CONFIG => {
+                self.etag_config_json = data;
+                self.etag_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -1273,8 +1405,8 @@ impl BucketMetadata {
         }
         self.lifecycle_config = None;
         if !self.lifecycle_config_xml.is_empty()
-            && let Err(e) =
-                deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
+            && let Err(e) = deserialize::<PersistedLifecycleConfiguration>(&self.lifecycle_config_xml)
+                .map(|c| self.lifecycle_config = Some(c))
         {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1360,8 +1492,8 @@ impl BucketMetadata {
         }
         self.replication_config = None;
         if !self.replication_config_xml.is_empty()
-            && let Err(e) =
-                deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
+            && let Err(e) = deserialize::<PersistedReplicationConfiguration>(&self.replication_config_xml)
+                .map(|c| self.replication_config = Some(c))
         {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1741,6 +1873,13 @@ mod test {
         let mut bm = BucketMetadata::unmarshal(&body[4..]).expect("unmarshal recovered blob");
         assert_eq!(bm.name, "interop");
         assert!(!bm.bucket_creation_committed, "legacy metadata must default to uncommitted");
+        assert!(!bm.bucket_creation_commit_record_present, "legacy metadata has no creation-commit record");
+        let rewritten = BucketMetadata::unmarshal(&bm.marshal_msg().expect("rewrite legacy metadata"))
+            .expect("read rewritten legacy metadata");
+        assert!(
+            !rewritten.bucket_creation_commit_record_present,
+            "rewriting legacy metadata must not fabricate a creation intent"
+        );
         bm.parse_all_configs().expect("parse recovered configs");
         assert!(bm.lifecycle_config.is_some());
     }
@@ -1758,6 +1897,7 @@ mod test {
 
         assert_eq!(bm.name, new.name);
         assert!(new.bucket_creation_committed);
+        assert!(new.bucket_creation_commit_record_present);
         assert!(!bm.bucket_incarnation_id.is_nil());
         assert_eq!(bm.bucket_incarnation_id, new.bucket_incarnation_id);
     }
@@ -1827,6 +1967,40 @@ mod test {
         assert_eq!(metadata.bucket_incarnation_id, incarnation);
     }
 
+    #[test]
+    fn persisted_bucket_tags_keep_separate_s3_and_swift_limits() {
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
+
+        let tag = |key: String, value: &str| Tag {
+            key: Some(key),
+            value: Some(value.to_owned()),
+        };
+        let acl = tag("swift-acl-read".to_owned(), ".r:*,AUTH_other");
+        assert_eq!(
+            validate_tag_set_entries(std::slice::from_ref(&acl)),
+            Err("The TagValue you have provided is invalid")
+        );
+
+        let mut tags = vec![acl.clone()];
+        tags.extend((0..MAX_BUCKET_TAGS).map(|i| tag(format!("team-{i}"), "blue")));
+        tags.extend((0..MAX_SWIFT_METADATA_COUNT).map(|i| tag(format!("{SWIFT_CONTAINER_META_TAG_PREFIX}item!{i}"), "a,b")));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Ok(()));
+
+        tags.push(tag(format!("{SWIFT_CONTAINER_META_TAG_PREFIX}overflow"), "a,b"));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Err("Too many Swift metadata tags"));
+        tags.pop();
+
+        tags.push(acl);
+        assert_eq!(
+            validate_persisted_bucket_tags(&tags),
+            Err("Cannot provide multiple Tags with the same key")
+        );
+        tags.pop();
+
+        tags[0].value = Some(".r:*,".repeat(1700));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Err("The TagValue you have provided is invalid"));
+    }
+
     /// backlog#2292: a replicated config is stamped with the source
     /// `updated_at` it was given, not the local clock, while the plain
     /// `update_config` entry keeps stamping the local clock.
@@ -1887,17 +2061,15 @@ mod test {
 
     #[test]
     fn object_locking_requires_lock_metadata_not_plain_versioning() {
-        use s3s::dto::ObjectLockEnabled;
-
         let mut bm = BucketMetadata::new("test-bucket");
         bm.versioning_config = Some(VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static("Enabled")),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         assert!(!bm.object_locking());
 
         bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         });
         assert!(bm.object_locking());
@@ -2588,6 +2760,28 @@ mod test {
 
     /// HP-5b (rustfs/backlog#938): the durability override is a RustFS
     /// extension entry and must survive an encode/decode round trip.
+    #[test]
+    fn etag_config_round_trips_and_tracks_updates() {
+        let mut bm = BucketMetadata::new("etag-bucket");
+        assert!(bm.etag_config().is_none());
+        bm.update_config(BUCKET_ETAG_CONFIG, br#"{"algorithm":"xxh3"}"#.to_vec())
+            .expect("set etag config");
+        assert_ne!(bm.etag_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+        assert!(bm.etag_config().expect("parsed").uses_xxh3());
+
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().expect("marshal")).expect("unmarshal");
+        assert_eq!(back.etag_config_json, bm.etag_config_json);
+        assert_eq!(back.etag_config_updated_at.unix_timestamp(), bm.etag_config_updated_at.unix_timestamp());
+        // The durability entry is independent of the ETag entry.
+        assert!(back.durability_config_json.is_empty());
+
+        bm.update_config(BUCKET_ETAG_CONFIG, Vec::new()).expect("clear etag config");
+        assert!(bm.etag_config().is_none());
+
+        bm.etag_config_json = b"not-json".to_vec();
+        assert!(bm.etag_config().is_none(), "garbage must keep MD5 ETags");
+    }
+
     #[test]
     fn durability_config_round_trips_and_tracks_updates() {
         let mut bm = BucketMetadata::new("durability-bucket");

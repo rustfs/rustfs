@@ -826,12 +826,17 @@ pub(crate) async fn begin(
 ) -> Result<QuotaContext> {
     let snapshot_admission = opts.quota_admission;
     let data_movement = opts.data_movement;
-    if crate::bucket::utils::is_meta_bucketname(bucket) {
-        let meta_bucket_fast_path_started = rustfs_io_metrics::put_stage_timer();
-        rustfs_io_metrics::record_put_object_stage_duration_from(
-            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
-            meta_bucket_fast_path_started,
-        );
+    // A lockless cache PUT is only taken when the bucket has no quota, so it
+    // reserves nothing and needs no metadata-transaction lock.
+    let lockless_cache = opts.is_lockless_cache_write() && snapshot_admission.is_none();
+    if lockless_cache || crate::bucket::utils::is_meta_bucketname(bucket) {
+        if !lockless_cache {
+            let meta_bucket_fast_path_started = rustfs_io_metrics::put_stage_timer();
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_META_BUCKET_FAST_PATH,
+                meta_bucket_fast_path_started,
+            );
+        }
         return Ok(QuotaContext {
             store: None,
             bucket: bucket.to_string(),

@@ -917,9 +917,10 @@ mod tests {
 
     #[test]
     fn test_configure_request_development_defaults_require_opt_in() {
+        let key_dir = std::env::temp_dir().join("kms-key-dir");
         let local_raw = serde_json::json!({
             "backend_type": "local",
-            "key_dir": "/tmp/kms-key-dir"
+            "key_dir": key_dir
         });
         let request: ConfigureKmsRequest = serde_json::from_value(local_raw).expect("local request should deserialize");
         let config = request.to_kms_config();
@@ -927,7 +928,7 @@ mod tests {
 
         let local_opt_in_raw = serde_json::json!({
             "backend_type": "local",
-            "key_dir": "/tmp/kms-key-dir",
+            "key_dir": key_dir,
             "allow_insecure_dev_defaults": true
         });
         let request: ConfigureKmsRequest = serde_json::from_value(local_opt_in_raw).expect("local request should deserialize");
@@ -1347,7 +1348,7 @@ mod tests {
             let summary = KmsConfigSummary::from(&config);
             let response = KmsStatusResponse {
                 status: KmsServiceStatus::Configured,
-                backend_type: Some(config.backend.clone()),
+                backend_type: Some(config.backend),
                 healthy: None,
                 config_summary: Some(summary),
             };

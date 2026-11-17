@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use super::object::{
-    next_table_catalog_update_time, table_warehouse_index_state_ready, validate_table_warehouse_index_entry_object,
+    next_table_catalog_update_time, table_warehouse_index_state_ready, validate_commit_idempotency_entry_object,
+    validate_commit_log_entry_object, validate_table_maintenance_report_path, validate_table_warehouse_index_entry_object,
 };
 use super::*;
 
@@ -49,7 +50,57 @@ fn cleanup_conflict(message: impl Into<String>) -> TableCatalogStoreError {
     TableCatalogStoreError::Conflict(message.into())
 }
 
+impl TableCatalogCleanupObject {
+    fn ensure_unversioned_catalog_record(&self) -> TableCatalogStoreResult<()> {
+        if self.delete_marker || self.version_id.as_deref().is_some_and(|v| !v.is_empty() && v != "null") {
+            return Err(cleanup_conflict("catalog contains versioned or deleted records"));
+        }
+        Ok(())
+    }
+}
+
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
+    async fn commit_history_cleanup_etag(&self, bucket: &str, key: &str, idempotency: bool) -> TableCatalogStoreResult<String> {
+        let value = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), key, TABLE_METADATA_JSON_MAX_SIZE)
+            .await?
+            .ok_or_else(|| cleanup_conflict("commit history changed during cleanup"))?;
+        let record: CommitLogEntry = serde_json::from_slice(&value.data)
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid commit history: {err}")))?;
+        if record.table_id.is_empty() || record.commit_id.is_empty() {
+            return Err(cleanup_conflict("commit history has no table or commit identity"));
+        }
+        if idempotency {
+            validate_commit_idempotency_entry_object(&self.paths, key, bucket, &record.table_id, &record)?;
+        } else {
+            validate_commit_log_entry_object(&self.paths, key, bucket, &record.table_id, &record)?;
+        }
+        value.etag.ok_or_else(|| cleanup_conflict("commit history has no ETag"))
+    }
+
+    pub(super) async fn prepare_dropped_table_commit_cleanup(
+        &self,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<Vec<(String, String)>> {
+        let bucket = &entry.table_bucket;
+        let mut records = Vec::new();
+        for (prefix, idempotency) in [
+            (self.paths.commit_log_entries_prefix(bucket, &entry.table_id), false),
+            (self.paths.commit_idempotency_entries_prefix(bucket, &entry.table_id), true),
+        ] {
+            for object in self.backend.list_objects_for_cleanup(self.catalog_bucket(), &prefix).await? {
+                object.ensure_unversioned_catalog_record()?;
+                if !object.key.starts_with(&prefix) {
+                    return Err(cleanup_conflict("commit history listing returned a different table"));
+                }
+                let etag = self.commit_history_cleanup_etag(bucket, &object.key, idempotency).await?;
+                records.push((object.key, etag));
+            }
+        }
+        Ok(records)
+    }
+
     pub(super) async fn begin_table_bucket_disablement(
         &self,
         mut entry: TableBucketEntry,
@@ -58,14 +109,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         validate_table_bucket_entry(&entry)?;
         let mut guards = Vec::new();
         if publication.is_some_and(|publication| publication.catalog_migration_read_permit_status() == Some(true)) {
-            if self
-                .backend
-                .read_object(self.catalog_bucket(), &self.paths.backing_migration_global_fence_path())
-                .await?
-                .is_some()
-            {
-                return Err(cleanup_conflict("table bucket registry migration is in progress"));
-            }
+            self.reject_legacy_catalog_global_state().await?;
             self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
                 .await?;
         } else {
@@ -132,16 +176,12 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let index_state_path = self.paths.warehouse_index_state_path(bucket);
         let index_prefix = self.paths.warehouse_index_entries_prefix(bucket);
         let directory_prefix = self.paths.table_directory_prefix(bucket);
+        let catalog_root = self.paths.table_bucket_root_prefix(bucket);
+        let commits = format!("{catalog_root}{COMMIT_LOG_ROOT}/");
+        let receipts = format!("{catalog_root}{COMMIT_IDEMPOTENCY_ROOT}/");
         let mut indexes = Vec::new();
         for object in catalog_objects {
-            if object.delete_marker
-                || object
-                    .version_id
-                    .as_deref()
-                    .is_some_and(|version| !version.is_empty() && version != "null")
-            {
-                return Err(cleanup_conflict("catalog contains versioned or deleted records"));
-            }
+            object.ensure_unversioned_catalog_record()?;
             if object.key == bucket_path {
                 continue;
             }
@@ -182,6 +222,34 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     return Err(cleanup_conflict("table directory candidate references a retained table entry"));
                 }
                 etag
+            } else if object.key.starts_with(&commits) || object.key.starts_with(&receipts) {
+                Some(
+                    self.commit_history_cleanup_etag(bucket, &object.key, object.key.starts_with(&receipts))
+                        .await?,
+                )
+            } else if let Some((_, suffix)) = self.paths.historical_table_maintenance_path(bucket, &object.key) {
+                // The full inventory rejects every retained table entry before any deletion.
+                let value = self
+                    .backend
+                    .read_object_limited(self.catalog_bucket(), &object.key, TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE)
+                    .await?
+                    .ok_or_else(|| cleanup_conflict("table maintenance record changed during cleanup"))?;
+                if suffix == MAINTENANCE_CONFIG_FILE {
+                    let config = serde_json::from_slice(&value.data)
+                        .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table maintenance config: {err}")))?;
+                    validate_table_maintenance_config(&config)?;
+                } else {
+                    let report: TableMetadataMaintenanceReport = serde_json::from_slice(&value.data)
+                        .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table maintenance report: {err}")))?;
+                    validate_table_maintenance_report_path(&self.paths, bucket, &object.key, suffix, &report)?;
+                    if matches!(
+                        report.job.status,
+                        TableMetadataMaintenanceJobStatus::Queued | TableMetadataMaintenanceJobStatus::Running
+                    ) {
+                        return Err(cleanup_conflict("table bucket contains a queued or running maintenance job"));
+                    }
+                }
+                value.etag
             } else {
                 return Err(cleanup_conflict("table bucket contains namespaces or retained catalog resources"));
             };
@@ -253,12 +321,8 @@ impl<B: TableCatalogObjectBackend> ConfiguredTableCatalogStore<B> {
         entry: TableBucketEntry,
         publication: &impl TableCatalogObjectBackend,
     ) -> TableCatalogStoreResult<EmptyTableBucketCleanup> {
-        match self {
-            Self::ObjectBacked(store) => store.prepare_empty_table_bucket_cleanup(entry, publication).await,
-            Self::DurableStrong(_) => Err(TableCatalogStoreError::Unsupported(
-                "empty table bucket cleanup requires object-backed catalog storage".to_string(),
-            )),
-        }
+        let Self::ObjectBacked(store) = self;
+        store.prepare_empty_table_bucket_cleanup(entry, publication).await
     }
 
     pub(crate) async fn execute_empty_table_bucket_cleanup(
@@ -266,11 +330,7 @@ impl<B: TableCatalogObjectBackend> ConfiguredTableCatalogStore<B> {
         cleanup: &mut EmptyTableBucketCleanup,
         incarnation: Uuid,
     ) -> TableCatalogStoreResult<()> {
-        match self {
-            Self::ObjectBacked(store) => store.execute_empty_table_bucket_cleanup(cleanup, incarnation).await,
-            Self::DurableStrong(_) => Err(TableCatalogStoreError::Unsupported(
-                "empty table bucket cleanup requires object-backed catalog storage".to_string(),
-            )),
-        }
+        let Self::ObjectBacked(store) = self;
+        store.execute_empty_table_bucket_cleanup(cleanup, incarnation).await
     }
 }

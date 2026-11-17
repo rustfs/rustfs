@@ -48,6 +48,10 @@ const ORPHAN_TMP_GRACE_SECONDS: u64 = 60;
 pub(super) struct LogScanResult {
     /// Regular log files eligible for deletion/compression.
     pub logs: Vec<FileInfo>,
+    /// Regular log files younger than `min_file_age_seconds`. They occupy the
+    /// directory like any other rolled file, so the caller counts them against
+    /// the byte budget and may process them when that budget is exceeded.
+    pub recent_logs: Vec<FileInfo>,
     /// Already compressed files eligible for expiry deletion.
     pub compressed_archives: Vec<FileInfo>,
 }
@@ -83,11 +87,13 @@ pub(super) fn scan_log_directory(
     if file_pattern.is_empty() {
         return Ok(LogScanResult {
             logs: Vec::new(),
+            recent_logs: Vec::new(),
             compressed_archives: Vec::new(),
         });
     }
 
     let mut logs = Vec::new();
+    let mut recent_logs = Vec::new();
     let mut compressed_archives = Vec::new();
     let now = SystemTime::now();
 
@@ -99,6 +105,7 @@ pub(super) fn scan_log_directory(
             // as "no files found" instead of failing the whole cleanup pass.
             return Ok(LogScanResult {
                 logs,
+                recent_logs,
                 compressed_archives,
             });
         }
@@ -230,10 +237,7 @@ pub(super) fn scan_log_directory(
         // 6. Age gate regular logs only.
         // Compressed files deliberately bypass this check because archive
         // expiry is driven by a dedicated retention horizon in the caller.
-        if !is_compressed && !is_old_enough_for_cleanup(age, min_file_age_seconds) {
-            // Too young to be touched.
-            continue;
-        }
+        let recent = !is_compressed && !is_old_enough_for_cleanup(age, min_file_age_seconds);
 
         let info = FileInfo {
             path,
@@ -244,6 +248,9 @@ pub(super) fn scan_log_directory(
 
         if is_compressed {
             compressed_archives.push(info);
+        } else if recent {
+            // Too young to be touched while the directory is within budget.
+            recent_logs.push(info);
         } else {
             logs.push(info);
         }
@@ -251,6 +258,7 @@ pub(super) fn scan_log_directory(
 
     Ok(LogScanResult {
         logs,
+        recent_logs,
         compressed_archives,
     })
 }
@@ -308,6 +316,42 @@ mod tests {
 
         assert!(dir.join(filename).exists());
         assert!(result.logs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_nonempty_log_is_reported_as_recent_not_as_a_candidate() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path();
+        std::fs::write(dir.join("fresh.rustfs.log"), b"fresh")?;
+        std::fs::write(dir.join("aged.rustfs.log"), b"aged!!")?;
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        File::options()
+            .write(true)
+            .open(dir.join("aged.rustfs.log"))?
+            .set_modified(old)?;
+        std::fs::write(dir.join("active.rustfs.log"), b"active")?;
+
+        let result = scan_log_directory(
+            dir,
+            ".rustfs.log",
+            Some("active.rustfs.log"),
+            FileMatchMode::Suffix,
+            &[],
+            3600,
+            true,
+            false,
+        )?;
+
+        let names = |files: &[FileInfo]| -> Vec<String> {
+            files
+                .iter()
+                .map(|file| file.path.file_name().expect("file name").to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(&result.logs), vec!["aged.rustfs.log"]);
+        assert_eq!(names(&result.recent_logs), vec!["fresh.rustfs.log"], "the active file is in neither list");
+        assert_eq!(result.recent_logs[0].size, 5);
         Ok(())
     }
 

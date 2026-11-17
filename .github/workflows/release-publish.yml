@@ -1,0 +1,193 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+name: Publish accepted release
+on:
+  workflow_dispatch:
+    inputs:
+      complete_run_id:
+        description: Successful completed candidate run ID
+        type: string
+        required: true
+      manifest_sha256:
+        description: Exact approved final manifest SHA-256 (authorizes publication)
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-publish-${{ inputs.complete_run_id }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck approved bytes and trusted certification
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPLETE_RUN: ${{ inputs.complete_run_id }}
+          MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+        run: python3 scripts/release/publish.py verify --run-id "$COMPLETE_RUN" --digest "$MANIFEST_SHA" --directory sealed
+  version:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: release-version-${{ needs.verify.outputs.version }}
+      cancel-in-progress: false
+    environment: release-publication
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+      security-events: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMPLETE_RUN: ${{ inputs.complete_run_id }}
+      MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install promotion tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          aws --version
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: rustfs
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PASSWORD }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+      - name: Share registry credentials with the OCI copier
+        run: |
+          install -m 600 "$HOME/.docker/config.json" "$RUNNER_TEMP/registry-auth.json"
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/registry-auth.json" >> "$GITHUB_ENV"
+      - name: Promote verified version
+        run: python3 scripts/release/publish.py version --run-id "$COMPLETE_RUN" --digest "$MANIFEST_SHA" --directory sealed
+      - name: Publish accepted musl amd64 scan
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        with:
+          sarif_file: sealed/scan-musl-amd64.sarif
+          category: container-image-musl-amd64
+      - name: Publish accepted musl arm64 scan
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        with:
+          sarif_file: sealed/scan-musl-arm64.sarif
+          category: container-image-musl-arm64
+      - name: Publish accepted GNU amd64 scan
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        with:
+          sarif_file: sealed/scan-gnu-amd64.sarif
+          category: container-image-gnu-amd64
+      - name: Publish accepted GNU arm64 scan
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        with:
+          sarif_file: sealed/scan-gnu-arm64.sarif
+          category: container-image-gnu-arm64
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-version-receipt-${{ github.run_attempt }}
+          path: publication.json
+          if-no-files-found: error
+          retention-days: 90
+  channels:
+    needs: [verify, version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: rustfs-release-channels
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMPLETE_RUN: ${{ inputs.complete_run_id }}
+      MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install promotion tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          aws --version
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: rustfs
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PASSWORD }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+      - name: Share registry credentials with the OCI copier
+        run: |
+          install -m 600 "$HOME/.docker/config.json" "$RUNNER_TEMP/registry-auth.json"
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/registry-auth.json" >> "$GITHUB_ENV"
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+      - name: Install pinned OSS client
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/ossutil.zip" https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip
+          printf '%s  %s\n' 60f3a808cbbdfd4b5269b8f967c6a66f564c9dacff52d93a5d21a588976ab5a2 "$RUNNER_TEMP/ossutil.zip" | sha256sum --check -
+          unzip -q "$RUNNER_TEMP/ossutil.zip" -d "$RUNNER_TEMP/ossutil-extract"
+          install -m 755 "$RUNNER_TEMP/ossutil-extract/ossutil-2.1.1-linux-amd64/ossutil" "$RUNNER_TEMP/ossutil"
+          echo "OSSUTIL_BIN=$RUNNER_TEMP/ossutil" >> "$GITHUB_ENV"
+      - name: Promote verified channels
+        env:
+          HELM_TOKEN: ${{ secrets.RUSTFS_HELM_PACKAGE }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+        run: python3 scripts/release/publish.py channels --run-id "$COMPLETE_RUN" --digest "$MANIFEST_SHA" --directory sealed
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-channels-receipt-${{ github.run_attempt }}
+          path: publication.json
+          if-no-files-found: error
+          retention-days: 90

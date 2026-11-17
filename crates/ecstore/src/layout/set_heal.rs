@@ -47,7 +47,7 @@ pub(crate) fn formats_to_drives_info(
         before_drives.push(HealDriveInfo {
             uuid,
             endpoint: drive,
-            state: state.to_string(),
+            state,
         });
     }
     before_drives

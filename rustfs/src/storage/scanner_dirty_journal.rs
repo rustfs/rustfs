@@ -307,7 +307,7 @@ pub(crate) async fn start_durable_dirty_usage_journal(store: Arc<ECStore>) -> Du
 
 async fn replay_durable_dirty_usage_journal(store: Arc<ECStore>, owner: &str) -> JournalState {
     let path = durable_dirty_usage_replay_object(owner);
-    let bytes = match super::read_config(store, &path).await {
+    let bytes = match super::read_config(store.clone(), &path).await {
         Ok(bytes) if !bytes.is_empty() => bytes,
         Ok(_) | Err(Error::ConfigNotFound) => return JournalState::default(),
         Err(err) => {
@@ -338,7 +338,12 @@ async fn replay_durable_dirty_usage_journal(store: Arc<ECStore>, owner: &str) ->
             ..Default::default()
         };
     };
-    match replay.replay() {
+    // Journal generations never become same-session watch revisions. Revoke
+    // tokens on both sides so a concurrent install cannot bridge the replay.
+    store.invalidate_scanner_usage_watches();
+    let replayed = replay.replay();
+    store.invalidate_scanner_usage_watches();
+    match replayed {
         Ok(replayed) => {
             debug!(
                 event = EVENT_SCANNER_DIRTY_USAGE_JOURNAL,

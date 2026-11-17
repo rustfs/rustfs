@@ -495,6 +495,8 @@ pub enum AdminAction {
     SiteReplicationOperationAction,
     #[strum(serialize = "admin:CreateServiceAccount")]
     CreateServiceAccountAdminAction,
+    #[strum(serialize = "admin:CreateServiceAccountForUser")]
+    CreateServiceAccountForUserAdminAction,
     #[strum(serialize = "admin:UpdateServiceAccount")]
     UpdateServiceAccountAdminAction,
     #[strum(serialize = "admin:RemoveServiceAccount")]
@@ -642,6 +644,7 @@ impl AdminAction {
             self,
             AdminAction::GetTableBucketAction
                 | AdminAction::SetTableBucketAction
+                | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableNamespaceAction
                 | AdminAction::SetTableNamespaceAction
                 | AdminAction::UpdateTableNamespacePropertiesAction
@@ -704,6 +707,7 @@ impl AdminAction {
                 | AdminAction::SiteReplicationInfoAction
                 | AdminAction::SiteReplicationOperationAction
                 | AdminAction::CreateServiceAccountAdminAction
+                | AdminAction::CreateServiceAccountForUserAdminAction
                 | AdminAction::UpdateServiceAccountAdminAction
                 | AdminAction::RemoveServiceAccountAdminAction
                 | AdminAction::ListServiceAccountsAdminAction

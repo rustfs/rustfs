@@ -593,7 +593,7 @@ impl ECStore {
         #[cfg(test)]
         crate::core::pools::observe_pool_activation_start_attempt(crate::core::pools::PoolActivationStartKind::Rebalance);
         let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
-        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        let mut pool_meta_guard = self.pool_meta_save_gate.write().await;
         pool_meta_guard.ensure_write_safe(stage)?;
         let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), fleet_proof).await?;
         let pool_meta = self
@@ -625,7 +625,7 @@ impl ECStore {
     {
         // Lock order: pool_meta_save_gate -> rebalance.bin -> pool.bin. These
         // shared fences admit a peer without waiting for the run's own entries.
-        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        let mut pool_meta_guard = self.pool_meta_save_gate.write().await;
         pool_meta_guard.ensure_write_safe("rebalance worker activation")?;
         let mut worker_fence = acquire_pool_rebalance_worker_locks(pool.clone()).await?;
         let pool_meta = self
@@ -654,7 +654,7 @@ impl ECStore {
     {
         // The admission read fences must already be dropped. Reacquire in the
         // original order and revalidate every durable boundary across that gap.
-        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        let mut pool_meta_guard = self.pool_meta_save_gate.write().await;
         pool_meta_guard.ensure_write_safe("rebalance worker metadata update")?;
         let mut activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), None).await?;
         let pool_meta = self
@@ -1714,7 +1714,7 @@ mod tests {
         persist_pool_meta_identity_for_startup(store.pools.clone(), &mut write_state, true)
             .await
             .expect("initialized pool metadata identity should persist");
-        *store.pool_meta_save_gate.lock().await = write_state;
+        *store.pool_meta_save_gate.write().await = write_state;
         // Simulate physical loss; raw deletion of authoritative pool.bin is
         // deliberately rejected by the native metadata mutation guard.
         for pool in &store.pools {

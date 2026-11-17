@@ -19,13 +19,13 @@ mod integration_tests {
         array::{Array, Int64Array, StringArray},
         record_batch::RecordBatch,
     };
+    use rustfs_s3select_api::request::{
+        CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType,
+        OutputSerialization, ParquetInput, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+    };
     use rustfs_s3select_api::{
         QueryError,
         query::{Context, Query},
-    };
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, ParquetInput, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
 
@@ -85,16 +85,16 @@ mod integration_tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
-                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                    csv: Some(CsvInput {
+                        file_header_info: Some(FileHeaderInfo::USE),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -104,7 +104,7 @@ mod integration_tests {
     }
 
     /// Build a `SelectObjectContentInput` targeting a JSON DOCUMENT file.
-    /// Uses `JSONType::DOCUMENT`, which keeps the document-style validation path.
+    /// Uses `JsonType::DOCUMENT`, which keeps the document-style validation path.
     fn create_test_json_input(sql: &str) -> SelectObjectContentInput {
         SelectObjectContentInput {
             bucket: "test-bucket".to_string(),
@@ -115,15 +115,15 @@ mod integration_tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    json: Some(JSONInput {
-                        type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                    json: Some(JsonInput {
+                        r#type: Some(JsonType::DOCUMENT),
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    json: Some(JSONOutput::default()),
+                    json: Some(JsonOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -142,15 +142,15 @@ mod integration_tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    json: Some(JSONInput {
-                        type_: Some(JSONType::from_static(JSONType::LINES)),
+                    json: Some(JsonInput {
+                        r#type: Some(JsonType::LINES),
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    json: Some(JSONOutput::default()),
+                    json: Some(JsonOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -169,13 +169,13 @@ mod integration_tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
                     parquet: Some(ParquetInput {}),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    json: Some(JSONOutput::default()),
+                    json: Some(JsonOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -259,7 +259,7 @@ mod integration_tests {
                 .csv
                 .as_mut()
                 .expect("CSV input should be configured")
-                .file_header_info = Some(FileHeaderInfo::from_static(header));
+                .file_header_info = Some(header.clone());
             let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
             let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
             let batches = db

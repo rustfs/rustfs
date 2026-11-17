@@ -47,8 +47,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: oidc-keycloak-live-${{ github.ref }}
-  cancel-in-progress: true
+  group: oidc-keycloak-live-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   oidc-keycloak-live:

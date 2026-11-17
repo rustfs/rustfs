@@ -81,7 +81,7 @@ async fn exhausted_budget_still_proves_peer_movement_without_namespace_authority
 }
 
 #[tokio::test]
-async fn emitted_updates_keep_budget_cancellation_and_publication_purpose() {
+async fn emitted_updates_keep_owner_authority_during_budget_drain() {
     for (status, expected_plan) in [
         (ScannerCycleStatus::Complete, ScannerCyclePublicationPlan::Authoritative),
         (ScannerCycleStatus::Incomplete, ScannerCyclePublicationPlan::Observational),
@@ -106,14 +106,19 @@ async fn emitted_updates_keep_budget_cancellation_and_publication_purpose() {
         assert!(matches!(ready, ScannerPublicationProofWait::Ready(observational) if observational == plan.is_observational()));
         budget.cancel_for_runtime();
         let calls = AtomicUsize::new(0);
-        let cancelled = plan
+        let drained = plan
             .await_leases(&ctx, &budget, 352, |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async { Ok::<(), String>(()) }
             })
             .await;
+        assert!(matches!(drained, ScannerPublicationProofWait::Ready(())));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        ctx.cancel();
+        let cancelled = plan
+            .await_leases(&ctx, &budget, 352, |_| async { Ok::<(), String>(()) })
+            .await;
         assert!(matches!(cancelled, ScannerPublicationProofWait::Cancelled));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -180,7 +185,7 @@ async fn coordinator_preserves_checkpoint_when_bucket_identity_is_unavailable() 
 
 #[tokio::test]
 #[serial]
-async fn coordinator_persists_mixed_plan_tail_without_usage_or_dirty_acknowledgement() {
+async fn coordinator_persists_mixed_plan_observation_without_canonical_usage_or_dirty_acknowledgement() {
     assert_coordinator_partial_progress(true, None, false).await;
 }
 
@@ -435,11 +440,24 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
                 .expect("root retained"),
             baseline
         );
-        assert!(
-            read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+        let observed: DataUsageInfo = serde_json::from_slice(
+            &read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
                 .await
-                .is_err()
+                .expect("a complete mixed traversal persists its diagnostic companion"),
+        )
+        .expect("valid observed usage JSON");
+        assert!(!observed.usage_snapshot_complete);
+        assert!(observed.usage_snapshot_partial);
+        assert!(!observed.buckets_usage.contains_key(bucket), "mixed data has no eligible primary value");
+        let companion = &observed.usage_snapshot_bucket_observations[bucket];
+        assert_eq!(companion.usage.objects_count, 3);
+        assert_eq!(companion.usage.size, 15);
+        assert_eq!(
+            companion.usage.usage_value_state,
+            Some(rustfs_data_usage::BucketUsageValueState::Observed)
         );
+        assert!(companion.usage.usage_certification.is_none());
+        assert_eq!(companion.sources.len(), 1);
         assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
         if let Some(after_commit) = fail_cycle_save {
             assert!(super::cycle_persist_failure::take_failure(1).is_none(), "injected fault must have fired");
@@ -536,4 +554,194 @@ fn partial_progress_does_not_mask_missing_updates_or_persistence_failure() {
             "partial progress cannot stand in for an expected root update: {result:?}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_budget_all_count_stops_share_one_bounded_drain() {
+    let mut observed = Vec::new();
+    for config in [
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+        ScannerCycleBudgetConfig {
+            max_directories: Some(0),
+            ..Default::default()
+        },
+        ScannerCycleBudgetConfig {
+            max_entries: Some(1),
+            ..Default::default()
+        },
+    ] {
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, config);
+        budget.record_object_scanned();
+        budget.try_start_directory();
+        budget.try_charge_raw_entry(1, 1);
+        assert!(budget.budget_elapsed());
+        let started = Instant::now();
+        // Entering a later finalize phase must consume the original window.
+        tokio::time::advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT / 2).await;
+        let first_reason = budget.reason();
+        budget.cancel_for_runtime();
+        assert_eq!(budget.reason(), first_reason, "a later budget phase must retain the first stop");
+        let (result, lease) = tokio::join!(
+            await_scanner_cycle_with_budget_fence(&ctx, &budget, std::future::pending::<()>(), std::future::pending(),),
+            ScannerCyclePublicationPlan::Authoritative
+                .await_leases(&ctx, &budget, 352, |_| { std::future::pending::<Result<(), String>>() }),
+        );
+        assert_eq!(result, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+        assert!(matches!(lease, ScannerPublicationProofWait::Cancelled));
+        assert_eq!(started.elapsed(), SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+        assert!(ctx.is_cancelled());
+        observed.push(serde_json::json!({
+            "first_stop": format!("{first_reason:?}"),
+            "drain_milliseconds": started.elapsed().as_millis(),
+            "grace_milliseconds": SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT.as_millis(),
+            "lease_cancelled": matches!(lease, ScannerPublicationProofWait::Cancelled),
+        }));
+    }
+    println!(
+        "usage_assertion: {}",
+        serde_json::json!({
+            "case_id": "USAGE-13", "assertion_id": "USAGE-13-A01", "status": "PASS",
+            "evidence": {"observed_count_stops": observed},
+        })
+    );
+    println!(
+        "usage_cleanup: {}",
+        serde_json::json!({"case_id": "USAGE-13", "status": "PASS", "scope": "process-local virtual clock"})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_budget_count_drain_completion_keeps_cycle_owner() {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+    );
+    budget.record_object_scanned();
+    let result = await_scanner_cycle_with_budget_fence(&ctx, &budget, std::future::ready(17), std::future::pending()).await;
+    assert_eq!(result, ScannerCycleWaitOutcome::Completed(17));
+    assert!(!ctx.is_cancelled(), "a cooperative count stop does not force a new epoch");
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_budget_lease_phase_cannot_extend_prior_drain() {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+    );
+    budget.record_object_scanned();
+    let started = Instant::now();
+    tokio::time::advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT / 2).await;
+    let result = ScannerCyclePublicationPlan::Authoritative
+        .await_leases(&ctx, &budget, 352, |_| std::future::pending::<Result<(), String>>())
+        .await;
+    assert!(matches!(result, ScannerPublicationProofWait::Cancelled));
+    assert_eq!(started.elapsed(), SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_budget_lock_loss_during_drain_cannot_restart_grace() {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(1),
+            ..Default::default()
+        },
+    );
+    budget.record_object_scanned();
+    let started = Instant::now();
+    let result = await_scanner_cycle_with_budget_fence(
+        &ctx,
+        &budget,
+        std::future::pending::<()>(),
+        tokio::time::sleep(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT / 2),
+    )
+    .await;
+    assert_eq!(result, ScannerCycleWaitOutcome::LockLost);
+    assert_eq!(started.elapsed(), SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+    assert!(ctx.is_cancelled());
+}
+
+#[tokio::test]
+async fn usage_display_projection_and_invalid_partial_never_enter_persistence() {
+    for observational in [false, true] {
+        for projection in [false, true] {
+            let store = Arc::new(MemoryConfigStore::default());
+            let mut candidate = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
+            let baseline = serde_json::to_vec(&candidate).expect("baseline encodes");
+            save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), baseline)
+                .await
+                .expect("seed canonical baseline");
+            let before = store.objects.lock().await.clone();
+            candidate.usage_snapshot_admin_projection = projection;
+            candidate.usage_snapshot_observational = observational;
+            if !projection {
+                candidate.usage_snapshot_complete = false;
+                candidate.usage_snapshot_partial = true;
+                candidate.usage_snapshot_set_states.clear();
+            }
+            let (sender, receiver) = mpsc::channel(1);
+            sender.send(candidate).await.expect("enqueue forbidden candidate");
+            drop(sender);
+            let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+            assert_eq!(outcome, DataUsagePersistOutcome::Failed);
+            assert_eq!(
+                *store.objects.lock().await,
+                before,
+                "neither canonical nor observed storage accepts display or malformed values"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_owner_after_ack_barrier_never_polls_a_new_ack() {
+    let owner = CancellationToken::new();
+    let polls = AtomicUsize::new(0);
+    // Models ownership lost while the already-durable cycle waited at ack_send.
+    owner.cancel();
+    let result = await_scanner_dirty_ack_with_owner(&owner, async {
+        polls.fetch_add(1, Ordering::Relaxed);
+        false
+    })
+    .await;
+    assert_eq!(result, None);
+    assert_eq!(polls.load(Ordering::Relaxed), 0, "a cancelled owner cannot begin another ACK operation");
+}
+
+#[tokio::test]
+async fn owner_cancellation_stops_waiting_for_ack_without_reporting_completion() {
+    let owner = CancellationToken::new();
+    let polls = AtomicUsize::new(0);
+    let started = tokio::sync::Notify::new();
+    let (result, ()) = tokio::join!(
+        await_scanner_dirty_ack_with_owner(&owner, async {
+            polls.fetch_add(1, Ordering::Relaxed);
+            started.notify_one();
+            std::future::pending::<bool>().await
+        }),
+        async {
+            started.notified().await;
+            owner.cancel();
+        },
+    );
+    assert_eq!(polls.load(Ordering::Relaxed), 1, "the ACK had already started");
+    assert_eq!(
+        result, None,
+        "cancelling the wait does not claim that an already-sent request was revoked"
+    );
+    let live_owner = CancellationToken::new();
+    assert_eq!(await_scanner_dirty_ack_with_owner(&live_owner, async { false }).await, Some(false));
 }

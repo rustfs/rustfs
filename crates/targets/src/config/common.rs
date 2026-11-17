@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::TargetError;
+use crate::store::resolve_queue_dir;
 use crate::target::nats::validate_jetstream_settings;
 use crate::target::pulsar::validate_pulsar_broker;
 use async_nats::ServerAddr;
@@ -28,6 +29,12 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 use url::Url;
+
+/// Return the queue directory this node opens for a target, with logical defaults resolved.
+pub(super) fn queue_dir_or_default(config: &KVS, key: &str, default_queue_dir: &str) -> String {
+    let queue_dir = config.lookup(key).unwrap_or_else(|| default_queue_dir.to_string());
+    resolve_queue_dir(&queue_dir).into_owned()
+}
 
 pub(super) fn split_env_field_and_instance(rest: &str, valid_fields: &HashSet<String>) -> Option<(String, String)> {
     let normalized = rest.to_lowercase();
@@ -124,7 +131,7 @@ pub(super) fn validate_nats_server_config(server: &ServerAddr, config: &KVS, def
         ));
     }
 
-    let queue_dir = config.lookup(NATS_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string());
+    let queue_dir = queue_dir_or_default(config, NATS_QUEUE_DIR, default_queue_dir);
     if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
         return Err(TargetError::Configuration("NATS queue directory must be an absolute path".to_string()));
     }
@@ -204,9 +211,7 @@ pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_
         ));
     }
 
-    let queue_dir = config
-        .lookup(PULSAR_QUEUE_DIR)
-        .unwrap_or_else(|| default_queue_dir.to_string());
+    let queue_dir = queue_dir_or_default(config, PULSAR_QUEUE_DIR, default_queue_dir);
     if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
         return Err(TargetError::Configuration("Pulsar queue directory must be an absolute path".to_string()));
     }

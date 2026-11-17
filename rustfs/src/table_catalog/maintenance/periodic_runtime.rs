@@ -16,11 +16,11 @@ use super::periodic::PeriodicMaintenanceScheduler;
 use crate::storage_api::startup::services::ServerContextSlot;
 use crate::storage_api::table::check_valid_bucket_name_strict;
 use crate::table_catalog::{
-    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, StrongTableCatalogStore,
-    TableCatalogBackingMode, TableCatalogStoreError, TableCatalogStoreResult,
+    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, TableCatalogBackingMode,
+    TableCatalogStoreError, TableCatalogStoreResult,
 };
 use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -91,38 +91,11 @@ impl PeriodicMaintenanceConfig {
     }
 }
 
-/// Owns queueing until completion; never runs a worker or deletes table objects.
-pub(crate) struct PeriodicMaintenanceRuntime {
-    cancellation: CancellationToken,
-    task: Option<JoinHandle<()>>,
-}
-
-impl Drop for PeriodicMaintenanceRuntime {
-    fn drop(&mut self) {
-        // Detach, never abort: in-flight sidecar writes retain their publication owner.
-        self.cancellation.cancel();
-    }
-}
+pub(crate) type PeriodicMaintenanceRuntime = crate::table_catalog::CatalogBackgroundTask;
 
 impl PeriodicMaintenanceRuntime {
     pub(crate) fn spawn(config: PeriodicMaintenanceConfig, server: Arc<ServerContextSlot>, shutdown: &CancellationToken) -> Self {
-        let cancellation = shutdown.child_token();
-        let task = tokio::spawn(run(config, server, cancellation.clone()));
-        Self {
-            cancellation,
-            task: Some(task),
-        }
-    }
-
-    pub(crate) fn request_stop(&self) {
-        self.cancellation.cancel();
-    }
-
-    pub(crate) async fn join(&mut self) -> Option<Result<(), tokio::task::JoinError>> {
-        // A cancelled waiter leaves the actual task in this owner.
-        let result = self.task.as_mut()?.await;
-        self.task = None;
-        Some(result)
+        Self::start(shutdown, move |cancellation| run(config, server, cancellation))
     }
 }
 
@@ -166,16 +139,10 @@ async fn run(config: PeriodicMaintenanceConfig, server: Arc<ServerContextSlot>, 
             let Some(context) = server.installed_app_context() else {
                 continue;
             };
-            let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-                context.object_store(),
-                context.table_catalog_strong_runtime(),
-            );
+            let backend = EcStoreTableCatalogObjectBackend::new(context.object_store());
             let store = match config.backing {
                 TableCatalogBackingMode::ObjectBacked => {
                     ConfiguredTableCatalogStore::ObjectBacked(ObjectTableCatalogStore::new(backend))
-                }
-                TableCatalogBackingMode::DurableStrong => {
-                    ConfiguredTableCatalogStore::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
                 }
             };
             scheduler = Some(PeriodicMaintenanceScheduler::new(store, config.buckets.clone(), config.interval));
@@ -225,7 +192,7 @@ mod tests {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| value.to_string()))
             },
-            || Ok(TableCatalogBackingMode::DurableStrong),
+            || Ok(TableCatalogBackingMode::ObjectBacked),
         )
     }
 
@@ -365,7 +332,7 @@ mod tests {
             task: Some(task),
         };
         started.await.expect("real owned pass must be held");
-        let mut stopping = Box::pin(crate::startup_shutdown::stop_table_maintenance(Some(runtime)));
+        let mut stopping = Box::pin(crate::startup_shutdown::stop_catalog_background_task(Some(runtime)));
         tokio::select! {
             biased;
             result = stopping.as_mut() => panic!("held pass returned before shutdown was observed: {result:?}"),
@@ -403,7 +370,7 @@ mod tests {
                 task: Some(task),
             };
             started.await.expect("actual task is held");
-            let mut stopping = Box::pin(crate::startup_shutdown::stop_table_maintenance(Some(runtime)));
+            let mut stopping = Box::pin(crate::startup_shutdown::stop_catalog_background_task(Some(runtime)));
             tokio::select! {
                 biased;
                 result = stopping.as_mut() => panic!("held task returned before stop: {result:?}"),
@@ -457,7 +424,7 @@ mod tests {
                 task: Some(task),
             };
             entered_rx.await.expect("the original task must start before observation");
-            let mut stopping = Box::pin(crate::startup_shutdown::stop_table_maintenance(Some(runtime)));
+            let mut stopping = Box::pin(crate::startup_shutdown::stop_catalog_background_task(Some(runtime)));
             let first = std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(stopping.as_mut(), cx))).await;
             let initially_pending = first.is_pending();
             // Do not poll the owner again until the deadline and actual task exit.
@@ -491,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_shutdown_accepts_ready_and_disabled_but_rejects_missing_join() {
-        crate::startup_shutdown::stop_table_maintenance(None)
+        crate::startup_shutdown::stop_catalog_background_task(None)
             .await
             .expect("disabled maintenance has no owner to drain");
         let task = tokio::spawn(async {});
@@ -502,14 +469,14 @@ mod tests {
             cancellation: CancellationToken::new(),
             task: Some(task),
         };
-        crate::startup_shutdown::stop_table_maintenance(Some(runtime))
+        crate::startup_shutdown::stop_catalog_background_task(Some(runtime))
             .await
             .expect("actual promptly completed task must join");
         let runtime = PeriodicMaintenanceRuntime {
             cancellation: CancellationToken::new(),
             task: None,
         };
-        let error = crate::startup_shutdown::stop_table_maintenance(Some(runtime))
+        let error = crate::startup_shutdown::stop_catalog_background_task(Some(runtime))
             .await
             .expect_err("configured runtime with no join observation must fail closed");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);

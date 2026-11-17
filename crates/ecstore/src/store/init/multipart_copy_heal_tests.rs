@@ -318,7 +318,10 @@ mod multipart_copy_heal_tests {
             let mut corrupt = original.clone();
             corrupt[0] ^= 0x80;
             std::fs::write(&shard, &corrupt).expect("actual bitrot corruption in shared physical shard");
-            std::fs::File::open(&shard)
+            // Windows only flushes a handle opened for writing.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&shard)
                 .expect("open corrupted actual shard")
                 .sync_all()
                 .expect("persist actual fault bytes");

@@ -291,7 +291,7 @@ pub enum HealTaskStatus {
     Running,
     /// Retrying after a recoverable failure
     Retrying { error: String, retry_attempt: u32 },
-    /// Completed
+    /// Execution completed; the outcome and durable MRF ledger retain any unverified responsibility.
     Completed,
     /// Failed
     Failed { error: String },
@@ -1232,6 +1232,22 @@ impl HealTask {
                     "Heal task completed"
                 });
             }
+            Err(Error::LegacyMrfUnverified { .. }) => {
+                // The qualified Deep attempt finished, but its Unknown outcome
+                // cannot discharge the separately owned durable responsibility.
+                self.progress.write().await.mark_completed();
+                *self.status.write().await = HealTaskStatus::Completed;
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    state = "verification_unavailable",
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    "Heal attempt completed without independent verification"
+                );
+            }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Cancelled;
@@ -1281,11 +1297,16 @@ impl HealTask {
 
         let terminal_state = match &result {
             Ok(_) => "completed",
+            Err(Error::LegacyMrfUnverified { .. }) => "verification_unavailable",
             Err(Error::TaskCancelled) => "cancelled",
             Err(Error::TaskTimeout) => "timed_out",
             Err(_) => "failed",
         };
-        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), result.as_ref().err());
+        let terminal_error = result
+            .as_ref()
+            .err()
+            .filter(|error| !matches!(error, Error::LegacyMrfUnverified { .. }));
+        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), terminal_error);
 
         result
     }

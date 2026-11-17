@@ -61,11 +61,9 @@ pub use errors::{SwiftError, SwiftResult};
 pub use metadata_update::MetadataUpdate;
 pub use router::{SwiftRoute, SwiftRouter};
 
-/// Maximum number of metadata headers allowed per resource (Swift standard)
-pub(crate) const MAX_METADATA_COUNT: usize = 90;
-
-/// Maximum size in bytes for a single metadata value (Swift standard)
-pub(crate) const MAX_METADATA_VALUE_SIZE: usize = 256;
+pub(crate) use storage_api::tagging::{
+    MAX_SWIFT_METADATA_COUNT as MAX_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE as MAX_METADATA_VALUE_SIZE,
+};
 
 /// Validate metadata against Swift limits
 ///

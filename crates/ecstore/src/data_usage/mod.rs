@@ -56,6 +56,8 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+const ADMIN_USAGE_INCARNATION_CONCURRENCY: usize = 4;
+const ADMIN_USAGE_INCARNATION_TIMEOUT: Duration = Duration::from_secs(2);
 // A scanner save invalidates only the saving process's snapshot cache; every
 // other node sees it only after reloading. A fail-closed usage lookup for a
 // bucket the cached snapshot does not mention at all may reload a copy this
@@ -505,6 +507,7 @@ fn stale_data_usage_persist_reason_for_source(
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+    reject_admin_usage_projection(&data_usage_info)?;
     if data_usage_info.usage_snapshot_converged == Some(false) {
         return Err(Error::other(
             "nonconverged data usage observations cannot replace the quota-authoritative snapshot",
@@ -534,6 +537,7 @@ async fn save_data_usage_in_backend(
     store: Arc<ECStore>,
     expected_publication_epoch: u64,
 ) -> Result<(), Error> {
+    reject_admin_usage_projection(&data_usage_info)?;
     let data =
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
@@ -663,8 +667,9 @@ fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &s
 
     let removed_usage = data_usage_info.buckets_usage.remove(bucket).is_some();
     let removed_size = data_usage_info.bucket_sizes.remove(bucket).is_some();
+    let removed_observation = data_usage_info.usage_snapshot_bucket_observations.remove(bucket).is_some();
 
-    if !removed_usage && !removed_size {
+    if !removed_usage && !removed_size && !removed_observation {
         return false;
     }
 
@@ -685,12 +690,8 @@ async fn clear_bucket_usage_memory(bucket: &str, guard: Option<&rustfs_lock::Nam
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    remove_bucket_usage_for_namespace_change(store.as_ref(), bucket).await
-}
-
-pub(crate) async fn remove_bucket_usage_for_namespace_change(store: &ECStore, bucket: &str) -> Result<(), Error> {
     prepare_bucket_usage_for_namespace_change(bucket, None).await?;
-    remove_bucket_usage_from_backend_with_guard_fenced(store, bucket, None).await
+    remove_bucket_usage_with_owned_namespace(store, bucket, None).await
 }
 
 pub(crate) async fn prepare_bucket_usage_for_namespace_change(
@@ -730,11 +731,37 @@ where
 pub(crate) async fn remove_bucket_usage_from_backend_with_guard_fenced(
     store: &ECStore,
     bucket: &str,
-    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>,
 ) -> Result<(), Error> {
-    let result = remove_bucket_usage_from_backend_with_store_and_guard_and_publication(store, bucket, guard, Some(store)).await;
-    invalidate_bucket_usage_snapshot_caches(guard, bucket).await?;
-    result
+    let owned_store = crate::bucket::metadata_sys::object_store_in(&store.ctx).await?;
+    if !std::ptr::eq(store, owned_store.as_ref()) {
+        return Err(Error::other("usage cleanup requires its own metadata store"));
+    }
+    remove_bucket_usage_with_owned_namespace(owned_store, bucket, guard.cloned()).await
+}
+
+async fn remove_bucket_usage_with_owned_namespace(
+    store: Arc<ECStore>,
+    bucket: &str,
+    guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+) -> Result<(), Error> {
+    let bucket = bucket.to_owned();
+    let ctx = Arc::clone(&store.ctx);
+    // Retain the bucket generation and movement/object guards through every
+    // physical commit even when the namespace request stops waiting.
+    ctx.run_detached_mutation(async move {
+        let result = remove_bucket_usage_from_backend_with_store_and_guard_and_publication(
+            store.as_ref(),
+            &bucket,
+            guard.as_deref(),
+            Some(store.as_ref()),
+        )
+        .await;
+        invalidate_bucket_usage_snapshot_caches(guard.as_deref(), &bucket).await?;
+        result
+    })
+    .await
+    .map_err(Error::from)?
 }
 
 async fn invalidate_bucket_usage_snapshot_caches(
@@ -794,7 +821,9 @@ fn map_data_usage_metadata_read_error(err: Error, object: &str) -> Error {
 }
 
 fn data_usage_contains_bucket(data_usage_info: &DataUsageInfo, bucket: &str) -> bool {
-    data_usage_info.buckets_usage.contains_key(bucket) || data_usage_info.bucket_sizes.contains_key(bucket)
+    data_usage_info.buckets_usage.contains_key(bucket)
+        || data_usage_info.bucket_sizes.contains_key(bucket)
+        || data_usage_info.usage_snapshot_bucket_observations.contains_key(bucket)
 }
 
 fn advance_data_usage_last_update(data_usage_info: &mut DataUsageInfo) {
@@ -849,9 +878,9 @@ where
     let primary_seed_epoch = match publication_store {
         Some(publication_store) => Some(
             publication_store
-                .scanner_data_usage_publication_epoch()
+                .data_usage_namespace_cleanup_epoch()
                 .await
-                .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?,
+                .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?,
         ),
         None => None,
     };
@@ -871,9 +900,9 @@ where
     let backup_seed_epoch = match publication_store {
         Some(publication_store) => Some(
             publication_store
-                .scanner_data_usage_publication_epoch()
+                .data_usage_namespace_cleanup_epoch()
                 .await
-                .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?,
+                .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?,
         ),
         None => None,
     };
@@ -985,9 +1014,9 @@ where
         let read_epoch = match publication {
             Some((publication_store, expected_publication_epoch)) => {
                 let epoch = publication_store
-                    .scanner_data_usage_publication_epoch()
+                    .data_usage_namespace_cleanup_epoch()
                     .await
-                    .ok_or_else(|| Error::other("data usage publication is blocked by data movement"))?;
+                    .ok_or_else(|| Error::other("data usage namespace cleanup epoch is unavailable"))?;
                 if expected_publication_epoch.is_some_and(|expected| expected != epoch) {
                     return Err(Error::other("data usage publication epoch changed before snapshot read"));
                 }
@@ -1022,9 +1051,8 @@ where
         ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot commit")?;
         let publication_guard = match publication {
             Some((publication_store, expected_publication_epoch)) => {
-                let Some((guard, publication_epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await
-                else {
-                    return Err(Error::other("data usage publication is blocked by data movement"));
+                let Some((guard, publication_epoch)) = publication_store.data_usage_namespace_cleanup_guard().await else {
+                    return Err(Error::other("data usage namespace cleanup epoch is unavailable"));
                 };
                 if expected_publication_epoch
                     .or(read_epoch)
@@ -1036,18 +1064,27 @@ where
             }
             None => None,
         };
-        let save_result = store
-            .put_object(
-                RUSTFS_META_BUCKET,
-                object,
-                &mut put_data,
-                &ObjectOptions {
-                    max_parity: true,
-                    http_preconditions: Some(http_preconditions),
-                    ..Default::default()
-                },
-            )
-            .await;
+        let save_result = match publication {
+            Some((publication_store, _)) => {
+                publication_store
+                    .put_usage_snapshot_for_namespace_cleanup(object, revision.as_deref(), &mut put_data, guard)
+                    .await
+            }
+            None => {
+                store
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut put_data,
+                        &ObjectOptions {
+                            max_parity: true,
+                            http_preconditions: Some(http_preconditions),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        };
         drop(publication_guard);
         match save_result.map_err(|err| crate::config::com::map_system_metadata_write_error(err, object)) {
             Ok(_) => return Ok(()),
@@ -1107,14 +1144,26 @@ fn record_usage_snapshot_decode_failure(operation: &'static str, object: &str, e
 }
 
 fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
-    serde_json::from_slice(buf).map_err(|e| {
+    let mut info: DataUsageInfo = serde_json::from_slice(buf).map_err(|e| {
         Error::other(format!(
             "Failed to deserialize data usage info: {:?} at line {} column {}",
             e.classify(),
             e.line(),
             e.column()
         ))
-    })
+    })?;
+    reject_admin_usage_projection(&info)?;
+    for usage in info.buckets_usage.values_mut() {
+        usage.normalize_usage_provenance();
+    }
+    Ok(info)
+}
+
+fn reject_admin_usage_projection(info: &DataUsageInfo) -> Result<(), Error> {
+    if info.usage_snapshot_admin_projection {
+        return Err(Error::other("admin usage projections cannot be persisted or used as a storage baseline"));
+    }
+    Ok(())
 }
 
 /// Decide which usage snapshot to serve: a primary usage object or its
@@ -1297,6 +1346,9 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
 /// Fill quota-baseline gaps from an observed (nonconverged) snapshot without
 /// overriding any bucket the authoritative baseline already covers.
 fn backfill_degraded_baseline_from_observed(degraded_baseline: &mut HashMap<String, u64>, observed: &DataUsageInfo) {
+    if observed.usage_snapshot_admin_projection {
+        return;
+    }
     for (bucket, usage) in &observed.buckets_usage {
         degraded_baseline.entry(bucket.clone()).or_insert(usage.size);
     }
@@ -1389,6 +1441,7 @@ fn merge_partial_observation_for_admin(mut authoritative: DataUsageInfo, observe
     authoritative.usage_snapshot_converged = Some(false);
     authoritative.usage_snapshot_authoritative_baseline = observed.usage_snapshot_authoritative_baseline;
     authoritative.usage_snapshot_set_states = observed.usage_snapshot_set_states;
+    authoritative.usage_snapshot_bucket_observations = observed.usage_snapshot_bucket_observations;
     authoritative.usage_snapshot_bootstrap_pending = false;
     authoritative.buckets_count = authoritative.buckets_usage.len() as u64;
     authoritative.bucket_sizes = authoritative
@@ -1407,10 +1460,48 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
     let (authoritative, source) = load_data_usage_snapshot(store.clone()).await?;
     // For the one-shot admin view a failed observed read degrades to "no
     // observation", same as before the read was fallible.
-    let observed = load_observed_data_usage_snapshot(store).await.ok().flatten();
+    let observed = load_observed_data_usage_snapshot(store.clone()).await.ok().flatten();
     let (selected, selected_is_current_format) =
         select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
-    Ok(normalize_loaded_data_usage(selected, selected_is_current_format).await.0)
+    let mut response = normalize_loaded_data_usage(selected, selected_is_current_format).await.0;
+    use futures::StreamExt as _;
+    let deadline = tokio::time::Instant::now() + ADMIN_USAGE_INCARNATION_TIMEOUT;
+    let mut incarnations = HashMap::new();
+    {
+        // Display-only identity reads must not serialize every bucket behind a
+        // slow metadata lock while holding the shared admin refresh permit.
+        // The common deadline bounds their total added latency; dropping this
+        // stream cancels all unfinished reads without spawning detached work.
+        // Own the names and store across awaits so this future remains Send
+        // when composed into spawned metrics collectors.
+        let buckets = response
+            .usage_snapshot_bucket_observations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut identities = futures::stream::iter(buckets)
+            .map(move |bucket| {
+                let store = store.clone();
+                async move {
+                    let identity = store.bucket_incarnation_id_from_disk(&bucket).await;
+                    (bucket, identity)
+                }
+            })
+            .buffer_unordered(ADMIN_USAGE_INCARNATION_CONCURRENCY);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some((bucket, identity))) = tokio::time::timeout_at(deadline, identities.next()).await else {
+                break;
+            };
+            // Unavailable, timed-out or recreated buckets retain canonical values.
+            if let Ok(incarnation) = identity
+                && !incarnation.is_nil()
+            {
+                incarnations.insert(bucket, incarnation.to_string());
+            }
+        }
+    }
+    response.project_bucket_observations_for_admin(&incarnations);
+    Ok(response)
 }
 
 fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
@@ -1482,7 +1573,7 @@ async fn normalize_loaded_data_usage(
             && !cfg.role.is_empty()
         {
             data_usage_info.replication_info.insert(
-                cfg.role.clone(),
+                cfg.role,
                 BucketTargetUsageInfo {
                     replication_failed_size: bui.replication_failed_size_v1,
                     replication_failed_count: bui.replication_failed_count_v1,
@@ -1695,7 +1786,7 @@ fn merge_snapshot(aggregated: &mut DataUsageInfo, mut snapshot: LocalUsageSnapsh
         match aggregated.buckets_usage.entry(bucket.clone()) {
             Entry::Occupied(mut entry) => entry.get_mut().merge(&usage),
             Entry::Vacant(entry) => {
-                entry.insert(usage.clone());
+                entry.insert(usage);
             }
         }
 
@@ -2052,7 +2143,9 @@ where
 fn apply_live_bucket_usage_to_response(data_usage_info: &mut DataUsageInfo, bucket: &str, usage: &BucketUsageInfo) {
     let inserted_bucket = !data_usage_info.buckets_usage.contains_key(bucket);
     data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
-    data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
+    let mut observed = usage.clone();
+    observed.mark_observed();
+    data_usage_info.buckets_usage.insert(bucket.to_string(), observed);
     if inserted_bucket {
         data_usage_info.usage_snapshot_complete = false;
     }
@@ -2744,7 +2837,9 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
         }
 
         added_bucket |= !data_usage_info.buckets_usage.contains_key(bucket);
-        data_usage_info.buckets_usage.insert(bucket.clone(), cached.usage.clone());
+        let mut observed = cached.usage.clone();
+        observed.mark_observed();
+        data_usage_info.buckets_usage.insert(bucket.clone(), observed);
         data_usage_info.bucket_sizes.insert(bucket.clone(), cached.usage.size);
         changed = true;
     }
@@ -2994,6 +3089,7 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 
 #[cfg(test)]
 mod tests {
+    mod companion_projection;
     mod snapshot_projection;
 
     use super::*;
@@ -3436,7 +3532,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: TokioMutex::new(()),
-            pool_meta_save_gate: TokioMutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

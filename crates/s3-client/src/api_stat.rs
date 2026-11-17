@@ -27,6 +27,8 @@ use tokio::io::BufReader;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
+use crate::remote_error_code::RemoteErrorCode;
 use crate::{
     api_error_response::{ErrorResponse, err_invalid_argument, http_resp_to_error_response},
     api_get_options::GetObjectOptions,
@@ -34,10 +36,7 @@ use crate::{
         ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, collect_response_body, to_object_info_for_provider,
     },
 };
-use s3s::{
-    dto::{BucketVersioningStatus, MFADelete, VersioningConfiguration},
-    header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID},
-};
+use rustfs_gateway_types::dto::{MfaDelete, Status, VersioningConfiguration};
 
 const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -80,8 +79,8 @@ fn parse_bucket_versioning_response(
         ));
     }
     Ok(VersioningConfiguration {
-        mfa_delete: parsed.mfa_delete.map(MFADelete::from),
-        status: parsed.status.map(BucketVersioningStatus::from),
+        mfa_delete: parsed.mfa_delete.map(MfaDelete::custom),
+        status: parsed.status.map(Status::custom),
         ..Default::default()
     })
 }
@@ -230,7 +229,7 @@ impl TransitionClient {
                     if resp.status() == http::StatusCode::METHOD_NOT_ALLOWED && opts.version_id != "" && delete_marker {
                         let err_resp = ErrorResponse {
                             status_code: resp.status(),
-                            code: s3s::S3ErrorCode::MethodNotAllowed,
+                            code: RemoteErrorCode::METHOD_NOT_ALLOWED,
                             message: "the specified method is not allowed against this resource.".to_string(),
                             bucket_name: bucket_name.to_string(),
                             key: object_name.to_string(),
@@ -275,7 +274,7 @@ mod tests {
         transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts},
     };
     use http::{HeaderMap, StatusCode};
-    use s3s::dto::BucketVersioningStatus;
+    use rustfs_gateway_types::dto::Status;
     use std::time::Duration;
     use tokio::{io::AsyncReadExt, net::TcpListener};
 
@@ -285,12 +284,12 @@ mod tests {
             (
                 br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#
                     .as_slice(),
-                Some(BucketVersioningStatus::ENABLED),
+                Some(Status::ENABLED.as_str()),
             ),
             (
                 br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Suspended</Status></VersioningConfiguration>"#
                     .as_slice(),
-                Some(BucketVersioningStatus::SUSPENDED),
+                Some(Status::SUSPENDED.as_str()),
             ),
             (
                 br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#.as_slice(),

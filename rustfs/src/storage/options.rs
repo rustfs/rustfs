@@ -30,16 +30,14 @@ use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
-use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
-use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
 use rustfs_policy::service_type::ServiceType;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
@@ -51,7 +49,7 @@ use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
-use s3s::dto::VersioningConfiguration;
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
 /// Test-only counter of versioning-config fetches, used to pin that batch
 /// handlers resolve the configuration once per request, not once per key
@@ -925,8 +923,8 @@ fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&
 
     // Skip empty object lock values
     if value.is_empty()
-        && (key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_MODE.as_str())
-            || key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()))
+        && (key.eq_ignore_ascii_case(AMZ_OBJECT_LOCK_MODE_LOWER)
+            || key.eq_ignore_ascii_case(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER))
     {
         return true;
     }
@@ -1238,6 +1236,7 @@ mod tests {
     use temp_env;
 
     use super::super::StorageError;
+    use super::VersioningConfiguration;
     use super::{
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
@@ -1248,14 +1247,13 @@ mod tests {
         put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
         SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
         SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
-    use s3s::S3ErrorCode;
-    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1420,10 +1418,8 @@ mod tests {
     #[test]
     fn test_del_opts_treats_excluded_prefix_as_unversioned() {
         let versioning = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("archive/".to_string()),
-            }]),
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(vec![Some("archive/".to_string())]),
             ..Default::default()
         };
 
@@ -2574,6 +2570,21 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+    }
+
+    /// An empty Object Lock mode or retain-until date is never handed back as
+    /// user metadata, whatever its casing; an empty user value is.
+    #[test]
+    fn empty_object_lock_values_are_not_user_metadata() {
+        for key in [
+            "x-amz-object-lock-mode",
+            "X-Amz-Object-Lock-Mode",
+            "x-amz-object-lock-retain-until-date",
+            "X-AMZ-OBJECT-LOCK-RETAIN-UNTIL-DATE",
+        ] {
+            assert!(should_skip_object_metadata_key(key, "", &[]), "{key:?} must be skipped");
+        }
+        assert!(!should_skip_object_metadata_key("object-lock-mode", "", &[]));
     }
 
     /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:

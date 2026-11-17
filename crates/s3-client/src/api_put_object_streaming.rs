@@ -42,9 +42,9 @@ use crate::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 
+use crate::constants::X_AMZ_EXPIRATION;
 use crate::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
-use s3s::header::X_AMZ_EXPIRATION;
 
 fn lock_md5_hasher(
     md5_hasher: &Mutex<Option<rustfs_utils::hash::HashAlgorithm>>,

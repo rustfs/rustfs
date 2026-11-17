@@ -444,6 +444,171 @@ mod tests {
         Ok(())
     }
 
+    /// Rolled files inside `min_file_age_seconds` occupy the disk too: once
+    /// they push the directory over the byte budget, the oldest are processed
+    /// regardless of age until the budget holds again.
+    #[test]
+    fn byte_budget_overrides_min_age_for_fresh_logs() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..6u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            // All well inside the age gate, oldest first by name.
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(60 - i * 5));
+        }
+        create_log_file(&dir, "app.log", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(3 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!((deleted, freed), (3, 3 * 1024), "the three oldest fresh logs go; the budget then holds");
+        for i in 0..3 {
+            assert!(!dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+        for i in 3..6 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists(), "the newest fresh logs stay");
+        }
+        assert!(dir.join("app.log").exists(), "the active file is never touched");
+        Ok(())
+    }
+
+    /// Within the byte budget the age gate is unchanged: fresh logs are not
+    /// touched, even above `keep_files`.
+    #[test]
+    fn min_age_still_protects_fresh_logs_within_the_byte_budget() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..4 {
+            create_log_file(&dir, &format!("app.log.2024-01-0{i}"), 1024)?;
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_total_size_bytes(4 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        assert_eq!(cleaner.cleanup()?, (0, 0), "exactly at the budget nothing is over it");
+        for i in 0..4 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+
+        // No byte budget configured: fresh files are never counted.
+        let unbounded = LogCleaner::builder(dir, "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_total_size_bytes(0)
+            .min_file_age_seconds(3600)
+            .build();
+        assert_eq!(unbounded.cleanup()?, (0, 0));
+        Ok(())
+    }
+
+    /// The budget override is a byte trim only: `keep_files` is not applied
+    /// to fresh files, so one byte over the budget costs one file, not all
+    /// but `keep_files` of them.
+    #[test]
+    fn byte_budget_override_removes_only_what_the_budget_needs() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..5u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(50 - i * 10));
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_single_file_size_bytes(512)
+            .max_total_size_bytes(4 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!(
+            (deleted, freed),
+            (1, 1024),
+            "neither keep_files nor the per-file limit applies to fresh files"
+        );
+        assert!(!dir.join("app.log.2024-01-00").exists(), "the oldest fresh file goes");
+        for i in 1..5 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+        Ok(())
+    }
+
+    /// Aged files keep their regular selection; the byte trim then counts the
+    /// fresh files and takes the oldest remaining files first.
+    #[test]
+    fn regular_selection_and_budget_override_compose() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..3u64 {
+            let name = format!("app.log.aged-{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs((5 - i) * 3600));
+        }
+        for i in 0..3u64 {
+            let name = format!("app.log.fresh-{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(30 - i * 10));
+        }
+
+        // keep_files(2) takes aged-0. Five files remain against a budget of
+        // three, so the two oldest of them go as well: aged-1 and aged-2.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(2)
+            .max_total_size_bytes(3 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!((deleted, freed), (3, 3 * 1024));
+        for i in 0..3 {
+            assert!(!dir.join(format!("app.log.aged-{i}")).exists());
+            assert!(dir.join(format!("app.log.fresh-{i}")).exists());
+        }
+        Ok(())
+    }
+
+    /// Aged and fresh logs share one budget: aged files alone fit, the fresh
+    /// ones put the directory over it, and the oldest files overall go first.
+    #[test]
+    fn aged_and_fresh_logs_share_the_byte_budget() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.aged-0", 1024)?;
+        create_log_file(&dir, "app.log.aged-1", 1024)?;
+        set_mtime_ago(&dir.join("app.log.aged-0"), Duration::from_secs(3 * 3600));
+        set_mtime_ago(&dir.join("app.log.aged-1"), Duration::from_secs(2 * 3600));
+        create_log_file(&dir, "app.log.fresh-0", 1024)?;
+        create_log_file(&dir, "app.log.fresh-1", 1024)?;
+        set_mtime_ago(&dir.join("app.log.fresh-0"), Duration::from_secs(30));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(2 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 2);
+        assert!(!dir.join("app.log.aged-0").exists());
+        assert!(!dir.join("app.log.aged-1").exists());
+        assert!(dir.join("app.log.fresh-0").exists());
+        assert!(dir.join("app.log.fresh-1").exists());
+        Ok(())
+    }
+
     #[test]
     fn active_file_matching_pattern_is_protected() -> std::io::Result<()> {
         let tmp = TempDir::new()?;

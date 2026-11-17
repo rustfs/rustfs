@@ -20,18 +20,30 @@ mod generated;
 pub mod heal_control;
 mod runtime_sources;
 
+use hyper_util::client::legacy::connect::HttpConnector;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{cache_connection, cached_connection, evict_connection_with_log_level};
+use rustfs_common::{
+    GrpcConnectionSnapshot, GrpcConnectionState, cache_connection_with_state, cached_connection_with_state,
+    remove_connection_with_log_level,
+};
+#[cfg(test)]
+use rustfs_common::{cache_connection, evict_connection_with_log_level};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     error::Error,
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
-    sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
+    sync::{Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock, Weak},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tonic::{
     Request, Status,
+    body::Body,
+    codegen::{Service, http::Request as HttpRequest, http::Uri},
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
@@ -89,7 +101,7 @@ const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
-static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static TLS_GENERATION_CACHE: LazyLock<RwLock<HashMap<String, u64>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 // Lock order: generation metadata, then the common connection cache. The dial
 // registry's standard mutex is released before waiting on any async lock.
 static DIAL_LOCK_REGISTRY: LazyLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
@@ -129,6 +141,7 @@ impl Drop for DialLock {
 }
 
 static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
+static INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -247,6 +260,7 @@ pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
 // newly validated request semantics during a rolling upgrade.
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
+pub const RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-restore-copyback-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
 pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
@@ -289,6 +303,18 @@ pub fn remote_version_state_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
 pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
     command.len() == REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn restore_copyback_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_restore_copyback_capability_probe(command: &[u8]) -> bool {
+    command.len() == RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX)
 }
 
 pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
@@ -667,6 +693,7 @@ pub fn canonical_scanner_activity_v7_response_body(
 }
 
 pub mod scoped_dirty_usage;
+pub mod usage_watch;
 
 pub fn canonical_scanner_dirty_usage_snapshot_request_body(
     request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
@@ -889,6 +916,35 @@ pub const PEER_RESTDRY_RUN: &str = "dry-run";
 /// protobuf message, whose unknown fields and map order are not a mixed-version contract.
 pub trait CanonicalMutationBody {
     fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError>;
+}
+
+pub const MRF_LIFECYCLE_PROTOCOL_VERSION: u32 = 1;
+pub const MRF_LIFECYCLE_MAX_COMMAND_BYTES: usize = 16 * 1024;
+pub const MRF_LIFECYCLE_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+impl CanonicalMutationBody for proto_gen::node_service::MrfLifecycleRequest {
+    fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+        let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-request-v1\0");
+        body.push_u32(self.protocol_version);
+        body.push_str(&self.topology_fingerprint)?;
+        body.push_str(&self.node_id)?;
+        body.push_bytes(&self.command)?;
+        body.push_bytes(&self.challenge)?;
+        Ok(body.finish())
+    }
+}
+
+/// Binds a node observation or action acknowledgement to the exact challenged request.
+/// Returns a length conversion error if a field cannot be represented on the wire.
+pub fn canonical_mrf_lifecycle_response_body(
+    request: &proto_gen::node_service::MrfLifecycleRequest,
+    response: &proto_gen::node_service::MrfLifecycleResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-response-v1\0");
+    body.push_bytes(&request.canonical_body()?)?;
+    body.push_u32(response.protocol_version);
+    body.push_bytes(&response.result)?;
+    Ok(body.finish())
 }
 
 macro_rules! impl_canonical_mutation_body {
@@ -1414,6 +1470,20 @@ pub fn canonical_write_all_request_body(
     let mut body = CanonicalBodyBuilder::new(b"rustfs-write-all-request-v1\0");
     body.push_str(&request.disk)?;
     body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+/// Build the signed semantic body for atomic format-control publication.
+///
+/// # Errors
+/// Returns a length conversion error when a field exceeds the canonical wire limit.
+pub fn canonical_write_format_control_request_body(
+    request: &proto_gen::node_service::WriteFormatControlRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-format-control-request-v1\0");
+    body.push_str(&request.disk)?;
     body.push_str(&request.path)?;
     body.push_bytes(&request.data)?;
     Ok(body.finish())
@@ -2719,18 +2789,138 @@ mod scanner_activity_tests {
 }
 
 #[cfg(test)]
+mod mrf_lifecycle_canonical_tests {
+    use super::{CanonicalMutationBody as _, canonical_mrf_lifecycle_response_body};
+    use crate::proto_gen::node_service::{MrfLifecycleRequest, MrfLifecycleResponse};
+
+    fn request() -> MrfLifecycleRequest {
+        MrfLifecycleRequest {
+            protocol_version: 1,
+            topology_fingerprint: "ab".into(),
+            node_id: "c".into(),
+            command: b"de".to_vec().into(),
+            challenge: b"f".to_vec().into(),
+        }
+    }
+
+    fn changed_requests(baseline: &MrfLifecycleRequest) -> Vec<MrfLifecycleRequest> {
+        [
+            |r: &mut MrfLifecycleRequest| r.protocol_version += 1,
+            |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "ac".into(),
+            |r: &mut MrfLifecycleRequest| r.node_id = "d".into(),
+            |r: &mut MrfLifecycleRequest| r.command = b"df".to_vec().into(),
+            |r: &mut MrfLifecycleRequest| r.challenge = b"g".to_vec().into(),
+        ]
+        .into_iter()
+        .map(|change| {
+            let mut request = baseline.clone();
+            change(&mut request);
+            request
+        })
+        .collect()
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_binds_every_field_and_wire_layout() {
+        let request = request();
+        let actual = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-request-v1\0".to_vec();
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        for field in [b"ab".as_slice(), b"c", b"de", b"f"] {
+            expected.extend_from_slice(&u64::try_from(field.len()).expect("fixture length").to_be_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(actual, expected);
+        for changed in changed_requests(&request) {
+            assert_ne!(actual, changed.canonical_body().expect("changed MRF request"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_separates_adjacent_field_boundaries() {
+        let baseline = request();
+        let baseline_body = baseline.canonical_body().expect("MRF request canonical body");
+        let changes = [
+            MrfLifecycleRequest {
+                topology_fingerprint: "a".into(),
+                node_id: "bc".into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                node_id: "cd".into(),
+                command: b"e".to_vec().into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                command: b"d".to_vec().into(),
+                challenge: b"ef".to_vec().into(),
+                ..baseline
+            },
+        ];
+        for changed in changes {
+            assert_ne!(baseline_body, changed.canonical_body().expect("shifted MRF fields"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_response_canonical_body_binds_request_and_response_fields() {
+        let request = request();
+        let response = MrfLifecycleResponse {
+            protocol_version: 1,
+            result: b"result".to_vec().into(),
+            response_proof: b"proof".to_vec().into(),
+        };
+        let actual = canonical_mrf_lifecycle_response_body(&request, &response).expect("MRF response canonical body");
+        let request_body = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-response-v1\0".to_vec();
+        expected.extend_from_slice(&u64::try_from(request_body.len()).expect("fixture length").to_be_bytes());
+        expected.extend_from_slice(&request_body);
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        expected.extend_from_slice(&6_u64.to_be_bytes());
+        expected.extend_from_slice(b"result");
+        assert_eq!(actual, expected);
+        assert_ne!(actual, request_body, "request and response domains must differ");
+        for changed in changed_requests(&request) {
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&changed, &response).expect("changed response context")
+            );
+        }
+        for change in [
+            |r: &mut MrfLifecycleResponse| r.protocol_version += 1,
+            |r: &mut MrfLifecycleResponse| r.result = b"changed".to_vec().into(),
+        ] {
+            let mut changed = response.clone();
+            change(&mut changed);
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&request, &changed).expect("changed response")
+            );
+        }
+        let mut changed_proof = response;
+        changed_proof.response_proof = b"other-proof".to_vec().into();
+        assert_eq!(
+            actual,
+            canonical_mrf_lifecycle_response_body(&request, &changed_proof).expect("proof excluded from its own input")
+        );
+    }
+}
+
+#[cfg(test)]
 mod heal_control_tests {
     use super::{
         CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
         ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
-        TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack,
-        canonical_heal_control_request_body, canonical_heal_control_response_body, decode_remote_version_state_capability,
-        encode_cross_pool_fence_capability, encode_remote_version_state_capability, heal_control_capability_probe,
-        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        ilm_recovery_export_capability_probe, internode_rpc_timeout, is_cross_pool_fence_capability_probe,
-        is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe, is_remote_version_state_capability_probe,
+        RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX, TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
+        decode_remote_version_state_capability, encode_cross_pool_fence_capability, encode_remote_version_state_capability,
+        heal_control_capability_probe, heal_control_coordinator_epoch, heal_control_execution_timeout,
+        heal_control_execution_timeout_for, ilm_recovery_export_capability_probe, internode_rpc_timeout,
+        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe,
+        is_remote_version_state_capability_probe, is_restore_copyback_capability_probe,
         is_transition_transaction_compaction_capability_probe, normalize_internode_rpc_timeout,
-        remote_version_state_capability_probe, transition_transaction_compaction_capability_probe,
+        remote_version_state_capability_probe, restore_copyback_capability_probe,
+        transition_transaction_compaction_capability_probe,
     };
     use crate::heal_control;
     use std::time::Duration;
@@ -2827,6 +3017,19 @@ mod heal_control_tests {
         let probe = remote_version_state_capability_probe(&[7; 16]);
         assert!(is_remote_version_state_capability_probe(&probe));
         assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn restore_copyback_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = restore_copyback_capability_probe(&[7; 16]);
+        assert!(is_restore_copyback_capability_probe(&probe));
+        assert!(!is_restore_copyback_capability_probe(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_restore_copyback_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_restore_copyback_capability_probe(&extra));
     }
 
     #[test]
@@ -3220,9 +3423,35 @@ pub fn internode_rpc_msgpack_only() -> bool {
     enabled
 }
 
+/// Whether msgpack-only was requested and the default-off per-peer capability gate is enabled.
+pub fn internode_rpc_msgpack_peer_capability_enabled() -> bool {
+    match INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+    );
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
 #[doc(hidden)]
 pub fn reset_internode_rpc_msgpack_only_cache() {
     INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
 }
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
@@ -3248,8 +3477,190 @@ pub enum ChannelClass {
     Bulk,
 }
 
-// Keep multiplexed unary RPCs below h2's per-connection small-frame budget.
+/// A cached tonic channel paired with the physical transport generation used by its clones.
+#[derive(Clone)]
+pub struct InternodeChannel {
+    channel: Channel,
+    connection_state: Option<GrpcConnectionState>,
+}
+
+impl InternodeChannel {
+    fn tracked(channel: Channel, connection_state: GrpcConnectionState) -> Self {
+        Self {
+            channel,
+            connection_state: Some(connection_state),
+        }
+    }
+
+    fn untracked(channel: Channel) -> Self {
+        Self {
+            channel,
+            connection_state: None,
+        }
+    }
+
+    /// Return the shared state used to observe this channel's physical reconnects.
+    pub fn connection_state(&self) -> Option<GrpcConnectionState> {
+        self.connection_state.clone()
+    }
+
+    /// Snapshot the currently connected physical transport, if the channel is tracked and ready.
+    pub fn connection_snapshot(&self) -> Option<GrpcConnectionSnapshot> {
+        self.connection_state.as_ref().and_then(GrpcConnectionState::snapshot)
+    }
+
+    /// Return the underlying tonic channel without exposing its observation handle to the caller.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+}
+
+impl std::fmt::Debug for InternodeChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InternodeChannel")
+            .field("connection", &self.connection_snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Service<HttpRequest<Body>> for InternodeChannel {
+    type Response = <Channel as Service<HttpRequest<Body>>>::Response;
+    type Error = <Channel as Service<HttpRequest<Body>>>::Error;
+    type Future = <Channel as Service<HttpRequest<Body>>>::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.channel.poll_ready(context)
+    }
+
+    fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+        self.channel.call(request)
+    }
+}
+
+struct ConnectionGenerationConnector<C> {
+    inner: C,
+    connection_state: GrpcConnectionState,
+}
+
+impl<C> ConnectionGenerationConnector<C> {
+    fn new(inner: C, connection_state: GrpcConnectionState) -> Self {
+        Self { inner, connection_state }
+    }
+}
+
+impl<C> Service<Uri> for ConnectionGenerationConnector<C>
+where
+    C: Service<Uri>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let future = self.inner.call(uri);
+        let connection_state = self.connection_state.clone();
+        Box::pin(async move {
+            let io = future.await?;
+            connection_state.record_connected();
+            Ok(io)
+        })
+    }
+}
+
+/// Bounded reasons that make RustFS discard a cached channel and establish another one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRebuildReason {
+    RpcFailure,
+    OperationTimeout,
+    TransportFailure,
+    LockTimeout,
+    LockTransport,
+    PeerProbe,
+    TlsGenerationChanged,
+    Manual,
+}
+
+impl ChannelRebuildReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RpcFailure => "rpc_failure",
+            Self::OperationTimeout => "operation_timeout",
+            Self::TransportFailure => "transport_failure",
+            Self::LockTimeout => "lock_timeout",
+            Self::LockTransport => "lock_transport",
+            Self::PeerProbe => "peer_probe",
+            Self::TlsGenerationChanged => "tls_generation_changed",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+const CHANNEL_REBUILD_REASON_CAPACITY: usize = 1024;
+static CHANNEL_REBUILD_REASONS: LazyLock<StdMutex<HashMap<String, ChannelRebuildReason>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn mark_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.len() >= CHANNEL_REBUILD_REASON_CAPACITY
+        && !reasons.contains_key(cache_key)
+        && let Some(victim) = reasons.keys().next().cloned()
+    {
+        reasons.remove(&victim);
+    }
+    reasons.insert(cache_key.to_owned(), reason);
+}
+
+fn pending_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .copied()
+}
+
+fn take_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(cache_key)
+}
+
+#[cfg(test)]
+fn clear_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.get(cache_key).copied() == Some(reason) {
+        reasons.remove(cache_key);
+    }
+}
+
+fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bool {
+    if let Some(reason) = take_channel_rebuild(cache_key) {
+        runtime_sources::record_channel_rebuild_attempt(channel_cache_class(dial_addr, cache_key), reason.as_str(), true);
+        true
+    } else {
+        false
+    }
+}
+
+// Limits transport response futures; client RPC metrics separately cover unary body decoding.
 const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+
+// Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
+// for their in-flight replies without spending the connection's protocol-error
+// budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
@@ -3264,10 +3675,64 @@ fn bulk_channel_pool_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_BULK_CHANNELS, rustfs_config::DEFAULT_INTERNODE_BULK_CHANNELS).max(1)
 }
 
-/// Round-robin cursor for selecting a bulk channel within a peer's pool. A single global cursor
-/// is sufficient: it advances once per bulk acquisition and `% pool_size` spreads consecutive
-/// acquisitions across the pool.
-static BULK_CHANNEL_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// Bounds peer-selection bookkeeping across topology changes. Evicting a cursor
+/// only resets its next slot; established channels keep their existing cache identity.
+const BULK_CHANNEL_CURSOR_CACHE_CAPACITY: usize = 512;
+// Cover the default pool and common tuning pools without allocating
+// from an arbitrarily large environment-configured pool size.
+const BULK_CHANNEL_CACHED_KEYS: usize = 4;
+static BULK_CHANNEL_CURSORS: LazyLock<BulkChannelCursors> = LazyLock::new(BulkChannelCursors::default);
+
+#[derive(Default)]
+struct BulkChannelCursors {
+    peers: StdRwLock<HashMap<String, Arc<BulkChannelCursor>>>,
+}
+
+impl BulkChannelCursors {
+    fn for_peer(&self, addr: &str) -> Arc<BulkChannelCursor> {
+        let cached = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(addr)
+            .cloned();
+        cached.unwrap_or_else(|| {
+            let mut peers = self.peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cursor) = peers.get(addr) {
+                return Arc::clone(cursor);
+            }
+            if peers.len() >= BULK_CHANNEL_CURSOR_CACHE_CAPACITY
+                && let Some(victim) = peers.keys().next().cloned()
+            {
+                peers.remove(&victim);
+            }
+            let cursor = Arc::new(BulkChannelCursor {
+                next: AtomicUsize::new(0),
+                keys: std::array::from_fn(|index| bulk_cache_key(addr, index)),
+            });
+            peers.insert(addr.to_owned(), Arc::clone(&cursor));
+            cursor
+        })
+    }
+}
+
+struct BulkChannelCursor {
+    next: AtomicUsize,
+    keys: [String; BULK_CHANNEL_CACHED_KEYS],
+}
+
+impl BulkChannelCursor {
+    fn next(&self, pool_size: usize) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % pool_size
+    }
+
+    fn cache_key(&self, addr: &str, index: usize) -> Cow<'_, str> {
+        match self.keys.get(index) {
+            Some(key) => Cow::Borrowed(key),
+            None => Cow::Owned(bulk_cache_key(addr, index)),
+        }
+    }
+}
 
 /// Connection-cache key for the `idx`-th bulk channel to `addr`. The NUL separator cannot appear
 /// in a URL, so a bulk key never collides with the control key (the bare `addr`).
@@ -3275,38 +3740,68 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
     format!("{addr}\u{0}bulk\u{0}{idx}")
 }
 
-async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<Channel> {
+async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<InternodeChannel> {
     if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        return cached_connection(cache_key).await;
+        return cached_connection_with_state(cache_key)
+            .await
+            .map(|(channel, state)| match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
     }
-    let mut generations = TLS_GENERATION_CACHE.lock().await;
-    let Some(channel) = cached_connection(cache_key).await else {
+    // Cache readers share the generation lock. Both publication and eviction take it before
+    // the common connection cache, preserving the lock order and the generation/channel pair.
+    {
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let generation = runtime_sources::outbound_tls_generation();
+        if generations.get(cache_key).copied() == Some(generation)
+            && let Some((channel, state)) = cached_connection_with_state(cache_key).await
+            && runtime_sources::outbound_tls_generation() == generation
+        {
+            return Some(match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
+        }
+    }
+    let mut generations = TLS_GENERATION_CACHE.write().await;
+    let Some((channel, state)) = cached_connection_with_state(cache_key).await else {
         generations.remove(cache_key);
         return None;
     };
     if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
-        return Some(channel);
+        return Some(match state {
+            Some(state) => InternodeChannel::tracked(channel, state),
+            None => InternodeChannel::untracked(channel),
+        });
     }
-    evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+    if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+        mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+    }
     generations.remove(cache_key);
     runtime_sources::record_stale_grpc_channel_tls_generation();
     None
 }
 
-async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channel, generation: Option<u64>) -> bool {
+async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &InternodeChannel, generation: Option<u64>) -> bool {
+    let Some(connection_state) = channel.connection_state() else {
+        return false;
+    };
     if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        cache_connection(cache_key.to_string(), channel.clone()).await;
+        cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
         return true;
     }
-    let mut generations = TLS_GENERATION_CACHE.lock().await;
+    let mut generations = TLS_GENERATION_CACHE.write().await;
     if generation != Some(runtime_sources::outbound_tls_generation()) {
         runtime_sources::record_stale_grpc_channel_tls_generation();
         return false;
     }
-    cache_connection(cache_key.to_string(), channel.clone()).await;
+    cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
     // Publication can advance while the common cache's async lock is awaited.
     if generation != Some(runtime_sources::outbound_tls_generation()) {
-        evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+        if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+            mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+        }
         generations.remove(cache_key);
         runtime_sources::record_stale_grpc_channel_tls_generation();
         return false;
@@ -3322,6 +3817,33 @@ fn channel_acquisition_timeout(_: tokio::time::error::Elapsed) -> std::io::Error
     std::io::Error::new(std::io::ErrorKind::TimedOut, "internode channel acquisition deadline elapsed")
 }
 
+fn checked_rpc_window(value: Option<u32>) -> std::io::Result<Option<u32>> {
+    if value.is_some_and(|bytes| bytes > 0x7fff_ffff) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internode HTTP/2 receive window exceeds the 31-bit flow-control limit",
+        ));
+    }
+    Ok(value.filter(|bytes| *bytes != 0))
+}
+
+fn bulk_window_override(name: &str, inherited: Option<u32>) -> Option<u32> {
+    match rustfs_utils::get_env_u32(name, inherited.unwrap_or(0)) {
+        0 => None,
+        value => Some(value),
+    }
+}
+
+fn checked_rpc_capacity(value: usize) -> std::io::Result<usize> {
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internode bulk admission exceeds the semaphore capacity limit",
+        ));
+    }
+    Ok(value.max(1))
+}
+
 /// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
 ///
 /// For [`ChannelClass::Control`] (or whenever isolation is disabled) this is exactly the legacy
@@ -3330,27 +3852,57 @@ fn channel_acquisition_timeout(_: tokio::time::error::Elapsed) -> std::io::Error
 /// per-peer bulk pool and dialed on demand, physically isolating large transfers from
 /// control-plane RPCs.
 pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
+    get_internode_channel_for_class(addr, class)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Acquire a cached-or-new channel together with its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns an error when the peer URI or transport configuration is invalid, the connection
+/// deadline expires, TLS setup fails, or the initial physical connection cannot be established.
+pub async fn get_internode_channel_for_class(addr: &str, class: ChannelClass) -> Result<InternodeChannel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     tokio::time::timeout_at(deadline, async {
         if class == ChannelClass::Control || !channel_isolation_enabled() {
             if let Some(channel) = cached_channel_for_tls_generation(addr, addr).await {
-                debug!("Using cached control gRPC channel for: {}", addr);
                 return Ok(channel);
             }
             return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
         }
 
         let pool_size = bulk_channel_pool_size();
-        let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
-        let cache_key = bulk_cache_key(addr, idx);
+        let cursor = BULK_CHANNEL_CURSORS.for_peer(addr);
+        let idx = cursor.next(pool_size);
+        let cache_key = cursor.cache_key(addr, idx);
         if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
-            debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
             return Ok(channel);
         }
         build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
     })
     .await
     .map_err(channel_acquisition_timeout)?
+}
+
+/// Prewarms every cached channel used by a peer and channel class.
+///
+/// Control prewarm performs one dial. When isolation is enabled, bulk prewarm
+/// fills the configured per-peer pool so the first large RPC does not pay a
+/// connection setup cost. With isolation disabled, bulk resolves to the
+/// existing control cache and keeps the legacy connection count.
+pub async fn prewarm_channel_class(addr: &str, class: ChannelClass) -> Result<(), Box<dyn Error>> {
+    let count = if class == ChannelClass::Bulk && channel_isolation_enabled() {
+        bulk_channel_pool_size()
+    } else {
+        1
+    };
+
+    for _ in 0..count {
+        get_channel_for_class(addr, class).await?;
+    }
+    Ok(())
 }
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
@@ -3360,11 +3912,11 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
 /// - Connect timeout: `DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS` (3s)
 /// - TCP keepalive: `DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS` (10s)
 /// - HTTP/2 keepalive interval: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS` (5s)
-/// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (3s)
-/// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (10s)
+/// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (20s)
+/// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (30s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     // The control channel is cached under the bare address, preserving the legacy key.
-    build_channel(addr, addr).await
+    build_channel(addr, addr).await.map(InternodeChannel::into_channel)
 }
 
 /// Dial a new gRPC channel to `dial_addr` and cache it under `cache_key`.
@@ -3373,7 +3925,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// `cache_key` is the connection-cache key. They are identical for control channels and differ
 /// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
 /// channels to the same peer be cached independently.
-async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
+async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<InternodeChannel, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
 }
@@ -3402,6 +3954,21 @@ impl Error for DeleteRecoveryChannelError {
 }
 
 pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
+    create_internode_channel_with_timeout(addr, rpc_timeout)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Create a recovery channel while retaining its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns [`DeleteRecoveryChannelError`] when the peer cannot be connected before the shared
+/// internode acquisition deadline or its transport/TLS configuration is invalid.
+pub async fn create_internode_channel_with_timeout(
+    addr: &str,
+    rpc_timeout: Duration,
+) -> Result<InternodeChannel, DeleteRecoveryChannelError> {
     let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
     let deadline = tokio::time::Instant::now() + internode_connect_timeout();
     build_channel_until(addr, &cache_key, deadline, rpc_timeout)
@@ -3414,9 +3981,10 @@ async fn build_channel_until(
     cache_key: &str,
     deadline: tokio::time::Instant,
     rpc_timeout: Duration,
-) -> Result<Channel, Box<dyn Error>> {
+) -> Result<InternodeChannel, Box<dyn Error>> {
     tokio::time::timeout_at(deadline, async {
         if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+            let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
             return Ok(channel);
         }
         let slot = DialLock::for_key(cache_key);
@@ -3424,17 +3992,21 @@ async fn build_channel_until(
         loop {
             // A successful concurrent miss has already populated this exact key.
             if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
                 return Ok(channel);
             }
+            let mut rebuild_metrics =
+                ChannelRebuildMetricsGuard::new(channel_cache_class(dial_addr, cache_key), pending_channel_rebuild(cache_key));
             let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
-            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
-                && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
-            {
-                debug!(
-                    "Successfully created and cached gRPC channel to: {} (cache key: {})",
-                    dial_addr, cache_key
-                );
-                return Ok(channel);
+            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await {
+                rebuild_metrics.published(dial_addr, cache_key);
+                if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                    debug!(
+                        "Successfully created and cached gRPC channel to: {} (cache key: {})",
+                        dial_addr, cache_key
+                    );
+                    return Ok(channel);
+                }
             }
             // A generation published during dial cannot be returned; rebuilding
             // shares the original deadline with lock wait and all earlier dials.
@@ -3444,21 +4016,106 @@ async fn build_channel_until(
     .map_err(channel_acquisition_timeout)?
 }
 
-async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
+struct GrpcDialMetricsGuard {
+    started_at: Instant,
+    connected: bool,
+}
+
+impl Drop for GrpcDialMetricsGuard {
+    fn drop(&mut self) {
+        runtime_sources::record_grpc_dial_result(self.started_at.elapsed(), self.connected);
+    }
+}
+
+struct ChannelRebuildMetricsGuard {
+    channel_class: &'static str,
+    reason: Option<ChannelRebuildReason>,
+    finished: bool,
+}
+
+impl ChannelRebuildMetricsGuard {
+    fn new(channel_class: &'static str, reason: Option<ChannelRebuildReason>) -> Self {
+        Self {
+            channel_class,
+            reason,
+            finished: false,
+        }
+    }
+
+    fn published(&mut self, dial_addr: &str, cache_key: &str) {
+        let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+        self.finished = true;
+    }
+}
+
+impl Drop for ChannelRebuildMetricsGuard {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Some(reason) = self.reason
+        {
+            runtime_sources::record_channel_rebuild_attempt(self.channel_class, reason.as_str(), false);
+        }
+    }
+}
+
+fn channel_cache_class(dial_addr: &str, cache_key: &str) -> &'static str {
+    if cache_key
+        .strip_prefix(dial_addr)
+        .is_some_and(|suffix| suffix.starts_with("\0bulk\0"))
+    {
+        "bulk"
+    } else if cache_key.starts_with("delete-recovery:") {
+        "recovery"
+    } else {
+        "control"
+    }
+}
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+#[derive(Clone, Copy, Debug, Default)]
+struct InternodeHttp2TracingExecutor;
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+impl hyper::rt::Executor<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> for InternodeHttp2TracingExecutor {
+    fn execute(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        // Match tonic's default executor: dropping the handle detaches the connection task.
+        drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+            future,
+        )));
+    }
+}
+
+async fn dial_channel(
+    dial_addr: &str,
+    cache_key: &str,
+    rpc_timeout: Duration,
+) -> Result<(InternodeChannel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
     let http2_keepalive_interval = internode_http2_keep_alive_interval();
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
-    let mut connector = Endpoint::from_shared(dial_addr.to_string())?
-        // Fast connection timeout for dead peer detection
-        .connect_timeout(connect_timeout)
-        .concurrency_limit(INTERNODE_RPC_CONCURRENCY_LIMIT)
-        // TCP-level keepalive - OS will probe connection
-        .tcp_keepalive(Some(tcp_keepalive))
-        // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
-        .tcp_nodelay(internode_rpc_tcp_nodelay())
+    let is_bulk = cache_key
+        .strip_prefix(dial_addr)
+        .is_some_and(|suffix| suffix.starts_with("\0bulk\0"));
+    let mut stream_window = internode_rpc_http2_stream_window();
+    let mut conn_window = internode_rpc_http2_conn_window();
+    let concurrency_limit = if is_bulk {
+        stream_window = bulk_window_override(rustfs_config::ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE, stream_window);
+        conn_window = bulk_window_override(rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE, conn_window);
+        checked_rpc_capacity(rustfs_utils::get_env_usize(
+            rustfs_config::ENV_INTERNODE_BULK_CONCURRENCY_LIMIT,
+            rustfs_config::DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT,
+        ))?
+    } else {
+        INTERNODE_RPC_CONCURRENCY_LIMIT
+    };
+    let stream_window = checked_rpc_window(stream_window)?;
+    let conn_window = checked_rpc_window(conn_window)?;
+    let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
+        .concurrency_limit(concurrency_limit)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS)
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -3468,78 +4125,111 @@ async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
 
-    // Raise HTTP/2 flow-control windows above the 64KiB library default so larger unary
-    // responses (ReadMultiple/BatchReadVersion) are not throttled by the BDP. Mirrors the
-    // server-side window tuning in `rustfs/src/server/http.rs`.
-    if let Some(stream_window) = internode_rpc_http2_stream_window() {
-        connector = connector.initial_stream_window_size(stream_window);
+    // Apply the selected receive-credit policy. A zero setting delegates to the linked
+    // library's defaults; isolated bulk channels can override the common RPC settings.
+    if is_bulk {
+        endpoint = endpoint.buffer_size(checked_rpc_capacity(rustfs_utils::get_env_usize(
+            rustfs_config::ENV_INTERNODE_BULK_BUFFER_SIZE,
+            rustfs_config::DEFAULT_INTERNODE_BULK_BUFFER_SIZE,
+        ))?);
     }
-    if let Some(conn_window) = internode_rpc_http2_conn_window() {
-        connector = connector.initial_connection_window_size(conn_window);
+    if let Some(stream_window) = stream_window {
+        endpoint = endpoint.initial_stream_window_size(stream_window);
+    }
+    if let Some(conn_window) = conn_window {
+        endpoint = endpoint.initial_connection_window_size(conn_window);
+    }
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    {
+        endpoint = endpoint.executor(InternodeHttp2TracingExecutor);
     }
 
+    let mut dial_metrics = GrpcDialMetricsGuard {
+        started_at: dial_started_at,
+        connected: false,
+    };
     let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         let outbound_tls = runtime_sources::outbound_tls_state().await;
         generation = Some(outbound_tls.generation.0);
-        if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
-            let ca = Certificate::from_pem(cert_pem);
-            // Derive the hostname from the HTTPS URL for TLS hostname verification.
-            let domain = dial_addr
-                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
-            let tls = if !domain.is_empty() {
-                let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
-                    let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
-                    cfg = cfg.identity(identity);
-                }
-                cfg
-            } else {
-                // Fallback: configure TLS without explicit domain if parsing fails.
-                ClientTlsConfig::new().ca_certificate(ca)
-            };
-            connector = connector.tls_config(tls)?;
-            debug!("Configured TLS with custom root certificate for: {}", dial_addr);
+        let mut tls = if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert_pem))
         } else {
-            // No custom root CA published — fall back to system roots.
-            // This is the expected path when no TLS path is configured.
-            debug!("No custom root certificate configured; using system roots for TLS: {}", dial_addr);
-            connector = connector.tls_config(ClientTlsConfig::new())?;
+            ClientTlsConfig::new().with_native_roots()
+        };
+        if let Some(id) = outbound_tls.mtls_identity.as_ref() {
+            tls = tls.identity(tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone()));
         }
+        // Tonic derives certificate names and SNI from the URI, including IPv6. Native-root
+        // loading and certificate parsing run off the async workers under the same deadline.
+        endpoint = tokio::task::spawn_blocking(move || endpoint.tls_config(tls)).await??;
     }
 
-    let channel = match connector.connect().await {
+    // Tonic invokes this connector for both the initial dial and every transparent reconnect.
+    // Mirror Endpoint's default HttpConnector options so generation observation does not change
+    // TCP behavior or the per-address connect deadline.
+    let connection_state = GrpcConnectionState::new();
+    let mut tcp_connector = HttpConnector::new();
+    tcp_connector.enforce_http(false);
+    tcp_connector.set_connect_timeout(Some(connect_timeout));
+    tcp_connector.set_keepalive(Some(tcp_keepalive));
+    tcp_connector.set_nodelay(internode_rpc_tcp_nodelay());
+    let generation_connector = ConnectionGenerationConnector::new(tcp_connector, connection_state.clone());
+    let channel = match endpoint.connect_with_connector(generation_connector).await {
         Ok(channel) => {
-            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), true);
+            dial_metrics.connected = true;
             // A successful dial marks the peer online (grpc-optimization P3). Keyed by the real
             // peer address, so control and bulk channels to one peer share health state.
             runtime_sources::record_peer_reachable(dial_addr);
             channel
         }
         Err(err) => {
-            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), false);
             runtime_sources::record_peer_unreachable(dial_addr, internode_offline_failure_threshold());
             return Err(err.into());
         }
     };
 
-    Ok((channel, generation))
+    Ok((InternodeChannel::tracked(channel, connection_state), generation))
 }
 
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Warn).await;
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, ConnectionEvictionLogLevel::Warn).await;
+}
+
+#[cfg(test)]
+async fn evict_cached_channel(cache_key: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_cached_channel_for_reason(cache_key, log_level, None).await;
+}
+
+async fn evict_cached_channel_for_reason(
+    cache_key: &str,
+    log_level: ConnectionEvictionLogLevel,
+    reason: Option<ChannelRebuildReason>,
+) {
+    // Match publication's lock order. Holding the generation guard across the short in-memory
+    // cache mutation prevents an older eviction from deleting a replacement's generation.
+    let mut generations = TLS_GENERATION_CACHE.write().await;
+    if remove_connection_with_log_level(cache_key, log_level).await
+        && let Some(reason) = reason
+    {
+        mark_channel_rebuild(cache_key, reason);
+    }
+    generations.remove(cache_key);
 }
 
 /// Evict a connection from the cache after a failure with an explicit log level.
 pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, log_level).await;
+}
+
+/// Evict every cached channel for one peer and retain a bounded reason for the next dial attempt.
+pub async fn evict_failed_connection_with_reason(
+    addr: &str,
+    reason: ChannelRebuildReason,
+    log_level: ConnectionEvictionLogLevel,
+) {
     match log_level {
         ConnectionEvictionLogLevel::Warn => {
             warn!(
@@ -3565,8 +4255,7 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
         ConnectionEvictionLogLevel::Warn => ConnectionEvictionLogLevel::Info,
         level => level,
     };
-    evict_connection_with_log_level(addr, cache_log_level).await;
-    TLS_GENERATION_CACHE.lock().await.remove(addr);
+    evict_cached_channel_for_reason(addr, cache_log_level, Some(reason)).await;
 
     // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
     // the peer flips offline after enough consecutive failures (grpc-optimization P3).
@@ -3578,11 +4267,13 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
     if channel_isolation_enabled() {
         for idx in 0..bulk_channel_pool_size() {
             let cache_key = bulk_cache_key(addr, idx);
-            evict_connection_with_log_level(&cache_key, cache_log_level).await;
-            TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+            evict_cached_channel_for_reason(&cache_key, cache_log_level, Some(reason)).await;
         }
     }
 }
+
+#[cfg(test)]
+mod reset_stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3593,6 +4284,268 @@ mod tests {
     static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tracked_test_channel(channel: Channel) -> InternodeChannel {
+        let connection_state = GrpcConnectionState::new();
+        connection_state.record_connected();
+        InternodeChannel::tracked(channel, connection_state)
+    }
+
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    mod http2_ping_observability {
+        use super::*;
+        use std::{
+            future::Future,
+            io,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::{Event, Subscriber, field::Visit};
+        use tracing_subscriber::{Layer, Registry, layer::Context as LayerContext, layer::SubscriberExt};
+
+        const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const FRAME_SETTINGS: u8 = 0x4;
+        const FRAME_PING: u8 = 0x6;
+        const FLAG_ACK: u8 = 0x1;
+        const KEEPALIVE_TIMEOUT_MESSAGE: &str = "connection keep-alive timed out";
+
+        #[derive(Clone, Copy)]
+        enum PingBehavior {
+            AckThree,
+            Ignore,
+            CloseBeforePing,
+        }
+
+        struct Frame {
+            kind: u8,
+            flags: u8,
+            payload: Vec<u8>,
+        }
+
+        async fn read_frame(stream: &mut tokio::net::TcpStream) -> io::Result<Option<Frame>> {
+            let mut header = [0_u8; 9];
+            match stream.read_exact(&mut header).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let length = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]]))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP/2 frame length overflow"))?;
+            if length > 64 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpectedly large test HTTP/2 frame"));
+            }
+            let mut payload = vec![0_u8; length];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(Frame {
+                kind: header[3],
+                flags: header[4],
+                payload,
+            }))
+        }
+
+        async fn write_frame(stream: &mut tokio::net::TcpStream, kind: u8, flags: u8, payload: &[u8]) -> io::Result<()> {
+            let length = u32::try_from(payload.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "test HTTP/2 frame is too large"))?;
+            let length_bytes = length.to_be_bytes();
+            let header = [length_bytes[1], length_bytes[2], length_bytes[3], kind, flags, 0, 0, 0, 0];
+            stream.write_all(&header).await?;
+            stream.write_all(payload).await?;
+            stream.flush().await
+        }
+
+        async fn serve_peer(
+            listener: tokio::net::TcpListener,
+            behavior: PingBehavior,
+            first_ping: tokio::sync::oneshot::Sender<()>,
+        ) -> io::Result<()> {
+            let (mut stream, _) = listener.accept().await?;
+            let mut preface = [0_u8; CLIENT_PREFACE.len()];
+            stream.read_exact(&mut preface).await?;
+            if &preface != CLIENT_PREFACE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 client preface"));
+            }
+
+            let settings = read_frame(&mut stream)
+                .await?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing client SETTINGS"))?;
+            if settings.kind != FRAME_SETTINGS || settings.flags & FLAG_ACK != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "first HTTP/2 frame was not SETTINGS"));
+            }
+            write_frame(&mut stream, FRAME_SETTINGS, 0, &[]).await?;
+            write_frame(&mut stream, FRAME_SETTINGS, FLAG_ACK, &[]).await?;
+
+            if matches!(behavior, PingBehavior::CloseBeforePing) {
+                return stream.shutdown().await;
+            }
+
+            let mut first_ping = Some(first_ping);
+            let mut acknowledged = 0_usize;
+            while let Some(frame) = read_frame(&mut stream).await? {
+                if frame.kind != FRAME_PING || frame.flags & FLAG_ACK != 0 {
+                    continue;
+                }
+                if frame.payload.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 PING payload"));
+                }
+                if let Some(sender) = first_ping.take() {
+                    let _ = sender.send(());
+                }
+                match behavior {
+                    PingBehavior::AckThree => {
+                        write_frame(&mut stream, FRAME_PING, FLAG_ACK, &frame.payload).await?;
+                        acknowledged += 1;
+                        if acknowledged == 3 {
+                            return stream.shutdown().await;
+                        }
+                    }
+                    PingBehavior::Ignore => {}
+                    PingBehavior::CloseBeforePing => unreachable!("close behavior returns before the frame loop"),
+                }
+            }
+            Ok(())
+        }
+
+        #[derive(Default)]
+        struct TimeoutVisitor {
+            matched: bool,
+        }
+
+        impl Visit for TimeoutVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && format!("{value:?}") == KEEPALIVE_TIMEOUT_MESSAGE {
+                    self.matched = true;
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct TimeoutLayer(Arc<AtomicUsize>);
+
+        impl<S: Subscriber> Layer<S> for TimeoutLayer {
+            fn on_event(&self, event: &Event<'_>, _context: LayerContext<'_, S>) {
+                if event.metadata().target() != "hyper::proto::h2::client"
+                    || !rustfs_io_metrics::internode_metrics::is_internode_http2_client_task()
+                {
+                    return;
+                }
+                let mut visitor = TimeoutVisitor::default();
+                event.record(&mut visitor);
+                if visitor.matched {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        struct WithDispatch {
+            future: Pin<Box<dyn Future<Output = ()> + Send>>,
+            dispatch: tracing::Dispatch,
+        }
+
+        impl Future for WithDispatch {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                let dispatch = self.dispatch.clone();
+                tracing::dispatcher::with_default(&dispatch, || self.future.as_mut().poll(context))
+            }
+        }
+
+        #[derive(Clone)]
+        struct DispatchExecutor(tracing::Dispatch);
+
+        impl hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for DispatchExecutor {
+            fn execute(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+                let wrapped = WithDispatch {
+                    future,
+                    dispatch: self.0.clone(),
+                };
+                drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+                    wrapped,
+                )));
+            }
+        }
+
+        async fn connect_to_peer(
+            behavior: PingBehavior,
+            dispatch: tracing::Dispatch,
+        ) -> (
+            tonic::transport::Channel,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::task::JoinHandle<io::Result<()>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake HTTP/2 peer");
+            let addr = format!("http://{}", listener.local_addr().expect("fake peer address"));
+            let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(serve_peer(listener, behavior, ping_tx));
+            let channel = tonic::transport::Endpoint::from_shared(addr)
+                .expect("fake peer endpoint")
+                .http2_keep_alive_interval(Duration::from_millis(20))
+                .keep_alive_timeout(Duration::from_millis(40))
+                .keep_alive_while_idle(true)
+                .executor(DispatchExecutor(dispatch))
+                .connect()
+                .await
+                .expect("connect fake HTTP/2 peer");
+            (channel, ping_rx, peer)
+        }
+
+        #[tokio::test]
+        async fn hyper_timeout_event_distinguishes_ack_timeout_from_ack_and_close() {
+            let timeouts = Arc::new(AtomicUsize::new(0));
+            let subscriber = Registry::default().with(TimeoutLayer(Arc::clone(&timeouts)));
+            let dispatch = tracing::Dispatch::new(subscriber);
+
+            let (closed_channel, _, closed_peer) = connect_to_peer(PingBehavior::CloseBeforePing, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), closed_peer)
+                .await
+                .expect("close-before-PING peer completes")
+                .expect("close-before-PING peer task")
+                .expect("close-before-PING peer protocol");
+            drop(closed_channel);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "generic connection close is not a PING timeout");
+
+            let (ack_channel, first_ack_ping, ack_peer) = connect_to_peer(PingBehavior::AckThree, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), first_ack_ping)
+                .await
+                .expect("ACK peer observes PING")
+                .expect("ACK peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), ack_peer)
+                .await
+                .expect("ACK peer completes")
+                .expect("ACK peer task")
+                .expect("ACK peer protocol");
+            drop(ack_channel);
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "acknowledged PING is not a timeout");
+
+            let (ignored_channel, ignored_ping, ignored_peer) = connect_to_peer(PingBehavior::Ignore, dispatch).await;
+            tokio::time::timeout(Duration::from_secs(2), ignored_ping)
+                .await
+                .expect("ignoring peer observes PING")
+                .expect("ignoring peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while timeouts.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Hyper emits exact keepalive timeout event");
+            assert_eq!(timeouts.load(Ordering::Relaxed), 1, "one physical timeout emits one exact event");
+            drop(ignored_channel);
+            tokio::time::timeout(Duration::from_secs(2), ignored_peer)
+                .await
+                .expect("ignoring peer observes connection close")
+                .expect("ignoring peer task")
+                .expect("ignoring peer protocol");
+        }
+    }
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct BackgroundHealStatusRequestV1 {}
@@ -3652,6 +4605,36 @@ mod tests {
     }
 
     #[test]
+    fn format_control_canonical_body_binds_every_field_and_operation() {
+        use proto_gen::node_service::{WriteAllRequest, WriteFormatControlRequest};
+        let request = WriteFormatControlRequest {
+            disk: "http://node-a:9000/data".into(),
+            path: "format.json.bootstrap".into(),
+            data: vec![1, 2, 3].into(),
+        };
+        let canonical = canonical_write_format_control_request_body(&request).expect("canonical format control");
+        for mutate in [
+            |r: &mut WriteFormatControlRequest| r.disk = "http://node-b:9000/data".into(),
+            |r: &mut WriteFormatControlRequest| r.path = "format.json".into(),
+            |r: &mut WriteFormatControlRequest| r.data = vec![1, 2, 4].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                canonical_write_format_control_request_body(&changed).expect("changed canonical body"),
+                canonical
+            );
+        }
+        let ordinary = WriteAllRequest {
+            disk: request.disk,
+            volume: ".rustfs.sys".into(),
+            path: request.path,
+            data: request.data,
+        };
+        assert_ne!(canonical_write_all_request_body(&ordinary).expect("ordinary canonical body"), canonical);
+    }
+
+    #[test]
     fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
         let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
             .iter()
@@ -3686,8 +4669,8 @@ mod tests {
                 ),
                 ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
                 ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
-                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
-                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
@@ -3723,7 +4706,7 @@ mod tests {
         let stale_generation = generation.checked_add(1).unwrap_or(0);
         for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
-            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), stale_generation);
+            TLS_GENERATION_CACHE.write().await.insert(key.clone(), stale_generation);
             assert!(
                 cached_channel_for_tls_generation(addr, &key).await.is_none(),
                 "TLS02_INVARIANT stale HTTPS cache entry cannot be returned"
@@ -3741,7 +4724,7 @@ mod tests {
         let addr = "https://tls02-missing-generation.invalid:9000";
         for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
-            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            TLS_GENERATION_CACHE.write().await.remove(&key);
             assert!(
                 cached_channel_for_tls_generation(addr, &key).await.is_none(),
                 "TLS02_INVARIANT HTTPS channel without a generation cannot be returned"
@@ -3765,16 +4748,16 @@ mod tests {
         for cached_generation in [None, Some(generation.checked_add(1).unwrap_or(0))] {
             cache_connection(cache_key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             if let Some(generation) = cached_generation {
-                TLS_GENERATION_CACHE.lock().await.insert(cache_key.clone(), generation);
+                TLS_GENERATION_CACHE.write().await.insert(cache_key.clone(), generation);
             } else {
-                TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+                TLS_GENERATION_CACHE.write().await.remove(&cache_key);
             }
             assert!(
                 create_channel_with_timeout(&addr, rpc_timeout).await.is_err(),
                 "recovery must dial the unavailable HTTPS peer instead of returning an unbound or stale cached channel"
             );
             assert!(!rustfs_common::has_cached_connection(&cache_key).await);
-            assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(&cache_key));
+            assert!(!TLS_GENERATION_CACHE.write().await.contains_key(&cache_key));
         }
     }
 
@@ -3785,14 +4768,14 @@ mod tests {
         let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
         for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
-            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), generation);
+            TLS_GENERATION_CACHE.write().await.insert(key.clone(), generation);
             assert!(
                 cached_channel_for_tls_generation(addr, &key).await.is_some(),
                 "TLS02_INVARIANT HTTPS channel at the canonical generation is reused"
             );
             assert!(rustfs_common::has_cached_connection(&key).await);
             evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
-            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            TLS_GENERATION_CACHE.write().await.remove(&key);
         }
     }
 
@@ -3804,14 +4787,14 @@ mod tests {
         for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
             cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
             TLS_GENERATION_CACHE
-                .lock()
+                .write()
                 .await
                 .insert(key.clone(), generation.checked_add(1).unwrap_or(0));
             assert!(
                 cached_channel_for_tls_generation(addr, &key).await.is_some(),
                 "TLS02_INVARIANT HTTP cache is independent of TLS generations"
             );
-            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            TLS_GENERATION_CACHE.write().await.remove(&key);
             assert!(
                 cached_channel_for_tls_generation(addr, &key).await.is_some(),
                 "TLS02_INVARIANT HTTP cache needs no TLS generation metadata"
@@ -3846,7 +4829,7 @@ mod tests {
         publish_global_outbound_tls_state(TlsGeneration(first_generation + 1), &second).await;
         let current = runtime_sources::outbound_tls_state().await;
         let addr = "https://tls02-late-dial.invalid:9000";
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
         let cached = cache_dialed_channel(addr, addr, &channel, Some(captured.generation.0)).await;
         let original_key = captured.mtls_identity.as_ref().expect("captured identity").key_pem.clone();
         let current_key = current.mtls_identity.as_ref().expect("current identity").key_pem.clone();
@@ -3866,13 +4849,341 @@ mod tests {
             !rustfs_common::has_cached_connection(addr).await,
             "TLS02_INVARIANT late stale dial is never cached"
         );
-        assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(addr));
+        assert!(!TLS_GENERATION_CACHE.write().await.contains_key(addr));
+    }
+
+    #[tokio::test]
+    async fn tls02_custom_ca_uses_ipv6_uri_and_rejects_wrong_certificate_names() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        use tonic::transport::ServerTlsConfig;
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let cases = [
+            ("DNS", "127.0.0.1:0", "localhost", "localhost", true),
+            ("IPv4", "127.0.0.1:0", "127.0.0.1", "127.0.0.1", true),
+            ("IPv6", "[::1]:0", "[::1]", "::1", true),
+            ("IPv6 name mismatch", "[::1]:0", "[::1]", "localhost", false),
+        ];
+        let restore_offset = u64::try_from(cases.len() + 1).expect("bounded TLS case count");
+        let restore_generation = previous
+            .generation
+            .0
+            .checked_add(restore_offset)
+            .expect("test generation capacity");
+        let mut observations = Vec::new();
+        for (index, (case, listen_addr, dial_host, certificate_name, expected)) in cases.into_iter().enumerate() {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec![certificate_name.to_owned()]).expect("ephemeral TLS test certificate");
+            let certificate_pem = certificate.cert.pem();
+            let server_tls = ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+                &certificate_pem,
+                certificate.signing_key.serialize_pem(),
+            ));
+            let listener = tokio::net::TcpListener::bind(listen_addr)
+                .await
+                .expect("loopback TLS listener");
+            let port = listener.local_addr().expect("TLS test server address").port();
+            let addr = format!("https://{dial_host}:{port}/data");
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                if stream.is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                stream
+            });
+            let mut server = tonic::transport::Server::builder()
+                .tls_config(server_tls)
+                .expect("valid TLS server configuration");
+            let server = tokio::spawn(async move {
+                server
+                    .add_routes(tonic::service::Routes::default())
+                    .serve_with_incoming(incoming)
+                    .await
+            });
+            let material = OutboundTlsMaterial {
+                root_ca_pem: certificate_pem.into_bytes(),
+                mtls_identity: None,
+            };
+            let offset = u64::try_from(index + 1).expect("bounded generation offset");
+            publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+            let mut results = Vec::new();
+            for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+                let (connected, reached_rpc) = match build_channel(&addr, &key).await {
+                    Ok(channel) => {
+                        let mut client = NodeServiceClient::new(channel);
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client.ping(proto_gen::node_service::PingRequest::default()),
+                        )
+                        .await;
+                        // The empty router answers only after TLS and HTTP/2 reach the server.
+                        let reached_rpc = matches!(response, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented);
+                        (Ok(()), reached_rpc)
+                    }
+                    Err(error) => (Err(error.to_string()), false),
+                };
+                results.push((connected, reached_rpc));
+                evict_cached_channel(&key, ConnectionEvictionLogLevel::Debug).await;
+            }
+            server.abort();
+            let _ = server.await;
+            observations.push((case, expected, results, accepted.load(Ordering::SeqCst)));
+        }
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+
+        let restored = runtime_sources::outbound_tls_state().await;
+        assert_eq!(restored.root_ca_pem.as_deref().unwrap_or_default(), restore.root_ca_pem.as_slice());
+        assert_eq!(
+            restored
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
+            restore
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
+        );
+        assert!(restored.generation.0 > previous.generation.0);
+
+        for (case, expected, results, accepted) in observations {
+            for (connected, reached_rpc) in results {
+                assert_eq!(
+                    connected.is_ok(),
+                    expected,
+                    "{case} must verify the URI certificate identity: {connected:?}"
+                );
+                assert_eq!(reached_rpc, expected, "{case} must reach the RPC service only after successful TLS");
+            }
+            assert_eq!(accepted, 2, "{case} must exercise actual control and bulk connections");
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_native_roots_preserve_mtls_identity_and_private_ca_scope() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::{Identity, ServerTlsConfig};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA parameters");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let server_key = rcgen::KeyPair::generate().expect("server key");
+        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .expect("server parameters")
+            .signed_by(&server_key, &issuer)
+            .expect("server certificate");
+        let mut client_params = rcgen::CertificateParams::new(vec!["client.example".into()]).expect("client parameters");
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = rcgen::KeyPair::generate().expect("client key");
+        let client_cert = client_params.signed_by(&client_key, &issuer).expect("client certificate");
+        let identity = MtlsIdentityPem {
+            cert_pem: client_cert.pem().into_bytes(),
+            key_pem: client_key.serialize_pem().into_bytes(),
+        };
+        let other_ca = rcgen::generate_simple_self_signed(vec!["other-ca.example".into()]).expect("other CA");
+        let directory = tempfile::tempdir().expect("native root fixture directory");
+        let roots_file = directory.path().join("roots.pem");
+        let roots_directory = directory.path().join("empty");
+        std::fs::write(&roots_file, ca.pem()).expect("native trust fixture");
+        std::fs::create_dir(&roots_directory).expect("empty native trust directory");
+
+        temp_env::async_with_vars(
+            [
+                ("SSL_CERT_FILE", roots_file.to_str()),
+                ("SSL_CERT_DIR", roots_directory.to_str()),
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("1")),
+            ],
+            async {
+                let previous = runtime_sources::outbound_tls_state().await;
+                let restore_generation = previous.generation.0.checked_add(5).expect("test generation capacity");
+                let cases = [
+                    ("native server trust", false, false, false, true),
+                    ("native mTLS identity", true, true, false, true),
+                    ("required client identity", true, false, false, false),
+                    ("explicit private trust", false, false, true, false),
+                ];
+                let mut observations = Vec::new();
+                for (index, (case, require_identity, send_identity, private_root, expected)) in cases.into_iter().enumerate() {
+                    let mut tls =
+                        ServerTlsConfig::new().identity(Identity::from_pem(server_cert.pem(), server_key.serialize_pem()));
+                    if require_identity {
+                        tls = tls
+                            .client_ca_root(Certificate::from_pem(ca.pem()))
+                            .client_auth_optional(false);
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("TLS listener");
+                    let addr = format!("https://{}", listener.local_addr().expect("TLS test address"));
+                    let mut server = tonic::transport::Server::builder()
+                        .tls_config(tls)
+                        .expect("TLS server configuration");
+                    let server = tokio::spawn(async move {
+                        server
+                            .add_routes(tonic::service::Routes::default())
+                            .serve_with_incoming(TcpListenerStream::new(listener))
+                            .await
+                    });
+                    let material = OutboundTlsMaterial {
+                        root_ca_pem: if private_root {
+                            other_ca.cert.pem().into_bytes()
+                        } else {
+                            Vec::new()
+                        },
+                        mtls_identity: send_identity.then(|| identity.clone()),
+                    };
+                    let offset = u64::try_from(index + 1).expect("bounded generation offset");
+                    publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+                    for class in [ChannelClass::Control, ChannelClass::Bulk] {
+                        let reached_rpc = match get_channel_for_class(&addr, class).await {
+                            Ok(channel) => {
+                                let mut client = NodeServiceClient::new(channel);
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    client.ping(proto_gen::node_service::PingRequest::default()),
+                                )
+                                .await;
+                                // The empty router returns Unimplemented only after the peer completes TLS.
+                                matches!(result, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented)
+                            }
+                            Err(_) => false,
+                        };
+                        observations.push((case, class, reached_rpc, expected));
+                    }
+                    evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+                    evict_cached_channel(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+                    server.abort();
+                    let _ = server.await;
+                }
+                let restore = OutboundTlsMaterial {
+                    root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                    mtls_identity: previous.mtls_identity,
+                };
+                publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+                for (case, class, actual, expected) in observations {
+                    assert_eq!(actual, expected, "{case} on {class:?}");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tls02_invalid_tls_configuration_records_one_failure_per_attempt() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+        publish_global_outbound_tls_state(
+            TlsGeneration(generation - 1),
+            &OutboundTlsMaterial {
+                root_ca_pem: b"invalid certificate fixture".to_vec(),
+                mtls_identity: Some(rustfs_common::MtlsIdentityPem {
+                    cert_pem: b"invalid client certificate fixture".to_vec(),
+                    key_pem: b"invalid client key fixture".to_vec(),
+                }),
+            },
+        )
+        .await;
+        let before = runtime_sources::grpc_dial_errors_total();
+        let addr = "https://127.0.0.1:1";
+        let control = build_channel(addr, addr).await;
+        let bulk = build_channel(addr, &bulk_cache_key(addr, 0)).await;
+        let recorded = runtime_sources::grpc_dial_errors_total() - before;
+        let cached = rustfs_common::has_cached_connection(addr).await;
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+        assert!(
+            control.is_err() && bulk.is_err(),
+            "malformed client identity rejects both channel classes"
+        );
+        assert!(!cached, "failed configuration leaves no cached control channel");
+        assert_eq!(recorded, 2, "each failed TLS setup contributes exactly one dial failure");
+    }
+
+    #[test]
+    fn tls02_queued_tls_configuration_obeys_acquisition_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single blocking-worker runtime");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("connection observation listener");
+        listener.set_nonblocking(true).expect("nonblocking connection observation");
+        let addr = format!("https://{}", listener.local_addr().expect("observation address"));
+        runtime.block_on(async {
+            use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+            let _test_guard = TLS02_TEST_LOCK.lock().await;
+            let previous = runtime_sources::outbound_tls_state().await;
+            let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+            let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).expect("test certificate");
+            publish_global_outbound_tls_state(
+                TlsGeneration(generation - 1),
+                &OutboundTlsMaterial {
+                    root_ca_pem: certificate.cert.pem().into_bytes(),
+                    mtls_identity: None,
+                },
+            )
+            .await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report occupied blocking worker");
+                release_rx.recv().expect("release occupied blocking worker");
+            });
+            started_rx.await.expect("blocking worker is occupied");
+            let errors_before = runtime_sources::grpc_dial_errors_total();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let result = build_channel_until(&addr, &addr, deadline, internode_rpc_timeout()).await;
+            let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
+            let timed_out = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<std::io::Error>())
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
+            let cached = rustfs_common::has_cached_connection(&addr).await;
+            let registered = DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&addr);
+            release_tx.send(()).expect("release blocking worker before assertions");
+            blocker.await.expect("original blocking worker joined");
+            let restore = OutboundTlsMaterial {
+                root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                mtls_identity: previous.mtls_identity,
+            };
+            publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+            assert!(timed_out, "queued TLS configuration shares the original acquisition deadline");
+            assert!(!cached, "timed-out TLS setup leaves no published channel");
+            assert!(!registered, "timed-out TLS setup releases its dial registry entry");
+            assert_eq!(dial_failures, 1, "a cancelled TLS setup contributes one dial failure");
+        });
+        // Runtime retirement joins the queued certificate work before inspecting its side effects.
+        drop(runtime);
+        let accepted = listener.accept();
+        assert!(
+            matches!(accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a timed-out queued TLS configuration must retire before opening a connection"
+        );
     }
 
     #[tokio::test]
     async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
         use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
         let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let errors_before = runtime_sources::grpc_dial_errors_total();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind HTTP/2 test server");
@@ -3914,11 +5225,13 @@ mod tests {
         // already-established sockets out of the listener's accept queue.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let connections = accepted.load(Ordering::SeqCst);
+        let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
         evict_connection_with_log_level(&addr, ConnectionEvictionLogLevel::Debug).await;
         evict_connection_with_log_level(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
         server.abort();
         let _ = server.await;
         assert_eq!(connections, 2, "TLS02_INVARIANT 32 misses per control/bulk key dial once each");
+        assert_eq!(dial_failures, 0, "successful coalesced dials keep the error counter flat");
     }
 
     #[tokio::test]
@@ -3990,13 +5303,149 @@ mod tests {
 
     #[tokio::test]
     async fn evict_failed_connection_with_log_level_removes_cached_connection() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
         let addr = "http://evict-failed-connection-debug-test";
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         cache_connection(addr.to_string(), channel).await;
 
-        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+        evict_failed_connection_with_reason(addr, ChannelRebuildReason::TransportFailure, ConnectionEvictionLogLevel::Debug)
+            .await;
 
         assert!(!rustfs_common::has_cached_connection(addr).await);
+        assert_eq!(pending_channel_rebuild(addr), Some(ChannelRebuildReason::TransportFailure));
+        clear_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+    }
+
+    #[tokio::test]
+    async fn channel_rebuild_reason_survives_until_replacement_is_published() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind h2 peer");
+        let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        build_channel(&addr, &addr).await.expect("initial channel");
+        evict_failed_connection_with_reason(&addr, ChannelRebuildReason::OperationTimeout, ConnectionEvictionLogLevel::Debug)
+            .await;
+        assert_eq!(pending_channel_rebuild(&addr), Some(ChannelRebuildReason::OperationTimeout));
+        build_channel(&addr, &addr).await.expect("replacement channel");
+        assert_eq!(pending_channel_rebuild(&addr), None);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer accepts replacement connection");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connection_generation_advances_on_tonic_transparent_reconnect() {
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+
+        async fn serve_until_shutdown(
+            listener: std::net::TcpListener,
+            shutdown: tokio::sync::oneshot::Receiver<()>,
+        ) -> Result<(), tonic::transport::Error> {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener from nonblocking socket");
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown.await;
+                })
+                .await
+        }
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind reconnect peer");
+        listener.set_nonblocking(true).expect("nonblocking reconnect peer");
+        let first_listener = listener.try_clone().expect("clone first reconnect listener");
+        let second_listener = listener.try_clone().expect("clone second reconnect listener");
+        let addr = format!("http://{}", listener.local_addr().expect("reconnect peer address"));
+        drop(listener);
+
+        let (first_shutdown, first_stopped) = tokio::sync::oneshot::channel();
+        let first_server = tokio::spawn(serve_until_shutdown(first_listener, first_stopped));
+        let channel = build_channel(&addr, &addr).await.expect("initial tracked channel");
+        let first = channel.connection_snapshot().expect("initial physical generation");
+        let mut client = NodeServiceClient::new(channel.clone());
+        let first_status = client
+            .ping(proto_gen::node_service::PingRequest::default())
+            .await
+            .expect_err("empty router response");
+        assert_eq!(first_status.code(), tonic::Code::Unimplemented);
+
+        first_shutdown.send(()).expect("stop first reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), first_server)
+            .await
+            .expect("first reconnect server stops")
+            .expect("first reconnect server task")
+            .expect("first reconnect server result");
+
+        let (second_shutdown, second_stopped) = tokio::sync::oneshot::channel();
+        let second_server = tokio::spawn(serve_until_shutdown(second_listener, second_stopped));
+        let second_status =
+            tokio::time::timeout(Duration::from_secs(3), client.ping(proto_gen::node_service::PingRequest::default()))
+                .await
+                .expect("transparent reconnect completes")
+                .expect_err("empty replacement router response");
+        assert_eq!(second_status.code(), tonic::Code::Unimplemented);
+        let second = channel.connection_snapshot().expect("replacement physical generation");
+        assert_eq!(first.channel_id, second.channel_id);
+        assert_ne!(first.generation, second.generation);
+
+        second_shutdown.send(()).expect("stop replacement reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), second_server)
+            .await
+            .expect("replacement reconnect server stops")
+            .expect("replacement reconnect server task")
+            .expect("replacement reconnect server result");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_publication_consumes_pending_rebuild_reason_on_cache_hit() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://overlapping-rebuild-publication.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+        build_channel(addr, addr).await.expect("cache hit completes pending rebuild");
+        assert_eq!(pending_channel_rebuild(addr), None);
+        evict_cached_channel(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_hits_consume_one_rebuild_reason_once() {
+        let addr = "http://concurrent-rebuild-publication.invalid:9000";
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+
+        let mut hits = Vec::new();
+        for _ in 0..32 {
+            hits.push(tokio::spawn(async move { complete_pending_rebuild_on_cache_hit(addr, addr) }));
+        }
+
+        let mut completed = 0;
+        for hit in hits {
+            completed += usize::from(hit.await.expect("cache-hit attribution task"));
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(pending_channel_rebuild(addr), None);
     }
 
     #[test]
@@ -4015,6 +5464,275 @@ mod tests {
     fn bulk_channel_pool_size_is_at_least_one() {
         // Even without env configuration the pool size is clamped to a usable minimum.
         assert!(bulk_channel_pool_size() >= 1);
+    }
+
+    #[test]
+    fn bulk_round_robin_is_independent_for_interleaved_peers() {
+        let cursors = BulkChannelCursors::default();
+        for round in 0..12 {
+            for peer in ["peer-a", "peer-b"] {
+                assert_eq!(cursors.for_peer(peer).next(2), round % 2, "each peer must use both slots");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_round_robin_balances_concurrent_acquisitions() {
+        let cursors = Arc::new(BulkChannelCursors::default());
+        let tasks = (0..8)
+            .map(|_| {
+                let cursors = Arc::clone(&cursors);
+                std::thread::spawn(move || {
+                    let mut counts = [[0; 4]; 2];
+                    for _ in 0..100 {
+                        for (peer, counts) in ["peer-a", "peer-b"].into_iter().zip(&mut counts) {
+                            counts[cursors.for_peer(peer).next(4)] += 1;
+                        }
+                    }
+                    counts
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut total = [[0; 4]; 2];
+        for task in tasks {
+            for (total, counts) in total.iter_mut().zip(task.join().expect("selection worker")) {
+                for (total, count) in total.iter_mut().zip(counts) {
+                    *total += count;
+                }
+            }
+        }
+        assert_eq!(total, [[200; 4]; 2]);
+    }
+
+    #[test]
+    fn bulk_round_robin_bounds_retired_peer_bookkeeping() {
+        let cursors = BulkChannelCursors::default();
+        for index in 0..BULK_CHANNEL_CURSOR_CACHE_CAPACITY * 3 {
+            assert_eq!(cursors.for_peer(&format!("peer-{index}")).next(2), 0);
+        }
+        assert_eq!(cursors.peers.read().expect("cursor cache").len(), BULK_CHANNEL_CURSOR_CACHE_CAPACITY);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 0);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 1);
+    }
+
+    #[test]
+    fn bulk_pool_hits_borrow_stable_keys_and_large_pools_remain_bounded() {
+        let cursors = BulkChannelCursors::default();
+        let peer = cursors.for_peer("https://peer.example:9000");
+        let same_peer = cursors.for_peer("https://peer.example:9000");
+        assert!(Arc::ptr_eq(&peer, &same_peer));
+        for index in 0..BULK_CHANNEL_CACHED_KEYS {
+            let first = peer.cache_key("https://peer.example:9000", index);
+            let second = same_peer.cache_key("https://peer.example:9000", index);
+            assert!(matches!(first, Cow::Borrowed(_)));
+            assert_eq!(first, bulk_cache_key("https://peer.example:9000", index));
+            assert_eq!(first.as_ptr(), second.as_ptr(), "cache hits reuse the established key allocation");
+        }
+        let key = peer.cache_key("https://peer.example:9000", usize::MAX - 1);
+        assert!(matches!(key, Cow::Owned(_)));
+        assert_eq!(key, bulk_cache_key("https://peer.example:9000", usize::MAX - 1));
+        assert_eq!(peer.keys.len(), BULK_CHANNEL_CACHED_KEYS);
+        for (sequence, size) in [1, 2, 4, usize::MAX, 2].into_iter().enumerate() {
+            assert_eq!(peer.next(size), sequence % size, "pool changes preserve the peer's selection sequence");
+        }
+    }
+
+    #[test]
+    fn grpc_receive_windows_reject_overflow_and_preserve_library_default() {
+        assert_eq!(checked_rpc_window(None).expect("unset window"), None);
+        assert_eq!(checked_rpc_window(Some(0)).expect("default window"), None);
+        assert_eq!(checked_rpc_window(Some(1)).expect("minimum window"), Some(1));
+        assert_eq!(checked_rpc_window(Some(0x7fff_ffff)).expect("maximum window"), Some(0x7fff_ffff));
+        assert_eq!(
+            checked_rpc_window(Some(0x8000_0000)).expect_err("overflow window").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn grpc_bulk_capacity_rejects_overflow_and_normalizes_zero() {
+        assert_eq!(checked_rpc_capacity(0).expect("minimum capacity"), 1);
+        assert_eq!(checked_rpc_capacity(64).expect("default concurrency"), 64);
+        assert_eq!(checked_rpc_capacity(1024).expect("default buffer"), 1024);
+        assert_eq!(
+            checked_rpc_capacity(usize::MAX).expect_err("oversized capacity").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn grpc_bulk_windows_inherit_legacy_settings_and_allow_library_default() {
+        let name = rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE;
+        for (setting, expected) in [(None, Some(2097152)), (Some("0"), None), (Some("8388608"), Some(8388608))] {
+            temp_env::with_var(name, setting, || {
+                assert_eq!(
+                    checked_rpc_window(bulk_window_override(name, Some(2097152))).expect("valid bulk window"),
+                    expected
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_cache_hits_allow_concurrent_generation_readers() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-shared-cache.invalid:9000";
+        let generation = runtime_sources::outbound_tls_generation();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let cached = tokio::time::timeout(Duration::from_secs(1), cached_channel_for_tls_generation(addr, addr))
+            .await
+            .expect("cache hit must not acquire an exclusive generation lock");
+        assert!(cached.is_some());
+        drop(generations);
+        evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+        TLS_GENERATION_CACHE.write().await.remove(addr);
+    }
+
+    #[tokio::test]
+    async fn tls02_eviction_cannot_remove_a_replacement_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-replacement-race.invalid:9000";
+        let generation = runtime_sources::outbound_tls_generation();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
+
+        // Pause eviction on generation metadata. It must retain the cached channel until it
+        // owns that metadata, then allow the queued replacement to publish a matching pair.
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let mut eviction = Box::pin(evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug));
+        let mut replacement = Box::pin(cache_dialed_channel(addr, addr, &channel, Some(generation)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(eviction.as_mut().poll(&mut context).is_pending());
+        assert!(replacement.as_mut().poll(&mut context).is_pending());
+        assert!(
+            rustfs_common::has_cached_connection(addr).await,
+            "eviction must acquire generation metadata before removing the channel"
+        );
+        drop(generations);
+        let (_, published) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(eviction, replacement) })
+            .await
+            .expect("eviction and replacement must make progress");
+        assert!(published);
+        assert!(
+            cached_channel_for_tls_generation(addr, addr).await.is_some(),
+            "replacement keeps its TLS generation"
+        );
+        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_pool_interleaving_reuses_two_real_connections_per_peer() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("2")),
+                (rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE, Some("8388608")),
+                (rustfs_config::ENV_INTERNODE_BULK_CONCURRENCY_LIMIT, Some("2")),
+                (rustfs_config::ENV_INTERNODE_BULK_BUFFER_SIZE, Some("4")),
+            ],
+            async {
+                let mut peers = Vec::new();
+                for _ in 0..2 {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+                    let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+                    let accepted = Arc::new(AtomicUsize::new(0));
+                    let changed = Arc::new(tokio::sync::Notify::new());
+                    let count = Arc::clone(&accepted);
+                    let notify = Arc::clone(&changed);
+                    let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                        if stream.is_ok() {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                        stream
+                    });
+                    let task = tokio::spawn(async move {
+                        tonic::transport::Server::builder()
+                            .add_routes(tonic::service::Routes::default())
+                            .serve_with_incoming(incoming)
+                            .await
+                    });
+                    peers.push((addr, accepted, changed, task));
+                }
+                for _ in 0..8 {
+                    for (addr, _, _, _) in &peers {
+                        get_channel_for_class(addr, ChannelClass::Bulk).await.expect("bulk channel");
+                    }
+                }
+                for (addr, accepted, changed, task) in peers {
+                    get_channel_for_class(&addr, ChannelClass::Control)
+                        .await
+                        .expect("control channel");
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while accepted.load(Ordering::SeqCst) < 3 {
+                            changed.notified().await;
+                        }
+                    })
+                    .await
+                    .expect("server accepts all three pooled sockets");
+                    assert_eq!(accepted.load(Ordering::SeqCst), 3, "two bulk connections plus one control connection");
+                    for key in [addr.clone(), bulk_cache_key(&addr, 0), bulk_cache_key(&addr, 1)] {
+                        assert!(rustfs_common::has_cached_connection(&key).await);
+                        evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+                    }
+                    task.abort();
+                    let _ = task.await;
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_channel_class_reuses_legacy_cache_when_isolation_is_disabled() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://prewarm-legacy-cache.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("false"))], async {
+            prewarm_channel_class(addr, ChannelClass::Control)
+                .await
+                .expect("control prewarm cache hit");
+            prewarm_channel_class(addr, ChannelClass::Bulk)
+                .await
+                .expect("bulk prewarm reuses legacy cache");
+            assert!(rustfs_common::has_cached_connection(addr).await);
+        })
+        .await;
+
+        evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_bulk_window_fails_before_dial_and_control_keeps_its_settings() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE, Some("4294967295"))],
+            async {
+                let addr = "http://127.0.0.1:1";
+                let error = dial_channel(addr, &bulk_cache_key(addr, 0), Duration::from_secs(1))
+                    .await
+                    .expect_err("reject overflowing bulk window");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("typed configuration error")
+                        .kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    checked_rpc_window(internode_rpc_http2_stream_window()).expect("control setting"),
+                    Some(1024 * 1024)
+                );
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -4075,8 +5793,36 @@ mod tests {
         reset_internode_rpc_msgpack_only_cache();
     }
 
+    #[test]
+    fn internode_rpc_msgpack_peer_capability_requires_request_and_peer_gate() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (requested, peer_capability, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY, peer_capability),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_peer_capability_enabled(), expected);
+                },
+            );
+        }
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
     #[tokio::test]
     async fn get_channel_for_class_bulk_reuses_control_cache_when_isolation_disabled() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
         // Isolation defaults off, so a Bulk request must reuse the control channel keyed by the
         // bare address and must NOT create a separate bulk-keyed entry (zero behavior change).
         let addr = "http://get-channel-isolation-off-test";
@@ -4093,7 +5839,7 @@ mod tests {
 
 #[cfg(test)]
 mod lock_release_tests {
-    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockReleaseStatus};
+    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockAcquireStatus, LockReleaseStatus};
     use prost::Message;
 
     /// The release response schema before structured outcomes were added.
@@ -4134,12 +5880,14 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                cache_fence_stamp: None,
             };
             let result = GenerallyLockResult {
                 success,
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                ..Default::default()
             };
             for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
                 let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive outcome");
@@ -4148,5 +5896,82 @@ mod lock_release_tests {
                 assert!(legacy.lock_info.is_none());
             }
         }
+    }
+
+    #[test]
+    fn batch_acquire_outcomes_are_additive_and_preserve_legacy_grants() {
+        for success in [false, true] {
+            let legacy = LegacyReleaseResponse {
+                success,
+                error_info: (!success).then(|| "legacy failure".to_string()),
+                lock_info: None,
+            };
+            let result = GenerallyLockResult::decode(legacy.encode_to_vec().as_slice()).expect("decode legacy acquire");
+            assert_eq!(result.success, success);
+            assert_eq!(result.acquire_status(), LockAcquireStatus::Unspecified);
+        }
+        for status in [LockAcquireStatus::RetryableNoGrant, LockAcquireStatus::RejectedNoGrant] {
+            let result = GenerallyLockResult {
+                success: false,
+                error_info: Some("not granted".to_string()),
+                acquire_status: status.into(),
+                ..Default::default()
+            };
+            let legacy = LegacyReleaseResponse::decode(result.encode_to_vec().as_slice()).expect("decode additive acquire");
+            assert!(!legacy.success);
+            assert_eq!(legacy.error_info, result.error_info);
+            let single =
+                GenerallyLockResponse::decode(result.encode_to_vec().as_slice()).expect("single schema ignores batch field");
+            assert_eq!(single.release_status(), LockReleaseStatus::Unspecified);
+        }
+    }
+
+    #[test]
+    fn batch_acquire_unknown_status_is_preserved_for_conservative_classification() {
+        let result = GenerallyLockResult {
+            acquire_status: 99,
+            ..Default::default()
+        };
+        let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
+        assert_eq!(decoded.acquire_status, 99);
+        assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
+    }
+
+    #[test]
+    fn cache_fence_stamp_is_additive_for_single_and_batch_lock_responses() {
+        let stamp = prost::bytes::Bytes::from_static(b"fixed-width-cache-fence-proof");
+        let response = GenerallyLockResponse {
+            success: true,
+            cache_fence_stamp: Some(stamp.clone()),
+            ..Default::default()
+        };
+        let result = GenerallyLockResult {
+            success: true,
+            cache_fence_stamp: Some(stamp),
+            ..Default::default()
+        };
+        for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+            let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive cache proof");
+            assert!(legacy.success);
+        }
+
+        let legacy = LegacyReleaseResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        }
+        .encode_to_vec();
+        assert!(
+            GenerallyLockResponse::decode(legacy.as_slice())
+                .expect("new single response decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
+        assert!(
+            GenerallyLockResult::decode(legacy.as_slice())
+                .expect("new batch result decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
     }
 }

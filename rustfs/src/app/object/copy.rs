@@ -14,13 +14,20 @@
 
 //! CopyObject path.
 
+use super::copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput};
 use super::*;
-use crate::app::storage_api::object_usecase::object_utils::to_s3s_xml_etag;
+use crate::app::RequestEnvelope;
+use crate::app::storage_api::object_usecase::access::CopySourceObject;
+use crate::app::storage_api::s3::dto::Timestamp;
+#[cfg(test)]
+use crate::app::storage_api::s3::dto::{CopyObjectInput, CopySource, MetadataDirective, StorageClass};
 use futures::FutureExt;
+use rustfs_gateway_types::CopySourceValue;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::path::fold_object_name_path_separators;
 use tracing::Instrument;
 
-use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
+use crate::auth::reject_presigned_put_max_content_length_for_other_operation;
 use crate::error::ServerSideSourceReadError;
 
 struct CopySourceReadStream<R> {
@@ -126,11 +133,12 @@ where
 }
 
 impl DefaultObjectUsecase {
-    pub fn execute_copy_object(
+    pub(crate) fn execute_copy_object_owned(
         &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
-        let body = self.execute_copy_object_body_boxed(req);
+        envelope: RequestEnvelope,
+        input: CopyObjectWriteInput,
+    ) -> impl std::future::Future<Output = S3Result<CopyObjectWriteOutput>> + Send + Unpin + '_ {
+        let body = self.execute_copy_object_body_boxed(envelope, input);
         futures::future::lazy(move |_| body.instrument(tracing::debug_span!("execute_copy_object"))).flatten()
     }
 
@@ -138,24 +146,30 @@ impl DefaultObjectUsecase {
     #[inline(never)]
     fn execute_copy_object_body_boxed(
         &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
-        Box::pin(self.execute_copy_object_body(req))
+        envelope: RequestEnvelope,
+        input: CopyObjectWriteInput,
+    ) -> impl std::future::Future<Output = S3Result<CopyObjectWriteOutput>> + Send + Unpin + '_ {
+        Box::pin(self.execute_copy_object_body(envelope, input))
     }
 
-    async fn execute_copy_object_body(&self, mut req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn execute_copy_object_body(
+        &self,
+        mut envelope: RequestEnvelope,
+        input: CopyObjectWriteInput,
+    ) -> S3Result<CopyObjectWriteOutput> {
         reject_presigned_put_max_content_length_for_other_operation(
-            &req.headers,
-            req.uri.query(),
-            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+            envelope.headers(),
+            envelope.uri().query(),
+            envelope.verified_presigned().is_some(),
         )?;
-        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
+        reject_non_wildcard_write_if_none_match_native(input.specific_if_none_match, envelope.headers())?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, S3Operation::CopyObject);
-        let CopyObjectInput {
+        let mut helper =
+            OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectCreatedCopy, S3Operation::CopyObject);
+        let CopyObjectWriteInput {
             copy_source,
             bucket,
             key,
@@ -187,28 +201,27 @@ impl DefaultObjectUsecase {
             storage_class,
             checksum_algorithm,
             ..
-        } = req.input.clone();
+        } = input;
         let requested_checksum_type = checksum_algorithm
             .as_ref()
             .map(|algorithm| rustfs_rio::ChecksumType::from_string(algorithm.as_str()));
         if requested_checksum_type.is_some_and(|checksum_type| !checksum_type.is_set()) {
             return Err(s3_error!(InvalidArgument, "Unsupported checksum algorithm"));
         }
-        let (src_bucket, src_key, version_id) = match copy_source {
-            CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
-            CopySource::Bucket {
-                ref bucket,
-                ref key,
-                version_id,
-            } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
+        let Some(CopySourceValue::Bucket {
+            bucket: src_bucket,
+            key: src_key,
+            version_id: requested_src_version_id,
+        }) = copy_source
+        else {
+            return Err(s3_error!(NotImplemented));
         };
 
         // Normalize the copy-source version id like GET/HEAD do: trim, treat "null" as the
         // nil UUID, and reject malformed ids up front (issue #4238).
-        let version_id = match version_id {
-            Some(v) => {
-                let trimmed = v.trim();
+        let version_id = match requested_src_version_id.as_deref() {
+            Some(version) => {
+                let trimmed = version.trim();
                 if trimmed.eq_ignore_ascii_case("null") {
                     Some(Uuid::nil().to_string())
                 } else if Uuid::parse_str(trimmed).is_ok() {
@@ -225,9 +238,9 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
-        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
+        let ssekms_context = extract_ssekms_context_from_headers(envelope.headers())?;
         validate_sse_headers_for_write(
-            requested_sse.as_ref(),
+            requested_sse.as_deref(),
             requested_kms_key_id.as_ref(),
             ssekms_context.as_ref(),
             sse_customer_algorithm.as_ref(),
@@ -242,9 +255,9 @@ impl DefaultObjectUsecase {
         validate_new_object_key(&key, "COPY (dest)")?;
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
-        let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
-            None | Some(MetadataDirective::COPY) => false,
-            Some(MetadataDirective::REPLACE) => true,
+        let replaces_metadata = match metadata_directive.as_deref() {
+            None | Some("COPY") => false,
+            Some("REPLACE") => true,
             Some(_) => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidArgument,
@@ -260,7 +273,7 @@ impl DefaultObjectUsecase {
             // s3s parsed `input.metadata` before the query hoist ran, so a
             // hoisted `x-amz-meta-*` is only visible on the headers now.
             super::super::storage_api::object_usecase::options::extract_metadata_from_mime(
-                &req.headers,
+                envelope.headers(),
                 &mut replacement_metadata,
             );
             apply_standard_object_metadata(
@@ -284,11 +297,11 @@ impl DefaultObjectUsecase {
         // where none of these apply (issue #4238).
         let replacement_tags = crate::app::storage_api::object_usecase::s3_api::tagging::resolve_copy_object_tags(
             tagging.as_deref(),
-            tagging_directive.as_ref(),
+            tagging_directive.as_deref(),
         )?;
 
         if !replaces_metadata
-            && tagging_directive.as_ref().map(TaggingDirective::as_str) != Some(TaggingDirective::REPLACE)
+            && tagging_directive.as_deref() != Some("REPLACE")
             && storage_class.is_none()
             && version_id.is_none()
             && src_bucket == bucket
@@ -305,7 +318,7 @@ impl DefaultObjectUsecase {
 
         let src_versioned_enabled = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
         let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
-        let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
+        let mut src_opts = copy_src_opts(&src_bucket, &src_key, envelope.headers()).map_err(ApiError::from)?;
 
         src_opts.version_id = version_id.clone();
         src_opts.versioned = src_versioned_enabled;
@@ -317,26 +330,26 @@ impl DefaultObjectUsecase {
             version_suspended: src_opts.version_suspended,
             ..Default::default()
         };
-        apply_copy_source_bucket_generation_guard(&req, &src_bucket, &mut src_get_opts)?;
+        apply_copy_source_bucket_generation_guard(&envelope, &src_bucket, &mut src_get_opts)?;
 
         let mut dst_opts = copy_dst_opts_with_replication_authorization(
             &bucket,
             &key,
             dest_version_id.clone(),
-            &req.headers,
+            envelope.headers(),
             HashMap::new(),
-            replication_request_authorized(&req),
+            replication_request_authorized(&envelope),
         )
         .await
         .map_err(ApiError::from)?;
-        apply_bucket_generation_guard(&req, &bucket, &mut dst_opts)?;
+        apply_bucket_generation_guard(&envelope, &bucket, &mut dst_opts)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
         let backslash_is_separator = cfg!(target_os = "windows");
         let dst_lock_object = copy_namespace_lock_object(&key, backslash_is_separator);
         let self_copy_lock = cp_src_dst_same
             || (src_bucket == bucket && copy_namespace_lock_object(&src_key, backslash_is_separator) == dst_lock_object);
-        let expected_current_version_id = expected_current_version_id(&req.headers)?;
+        let expected_current_version_id = expected_current_version_id(envelope.headers())?;
         if expected_current_version_id.is_some()
             && (!cp_src_dst_same || version_id.is_none() || dest_version_id.is_some() || !dst_opts.versioned)
         {
@@ -418,7 +431,7 @@ impl DefaultObjectUsecase {
                 && object_lock_checks_required_for_state(&object_lock_config_state));
         let previous_current_sizes: Option<Option<(u64, Result<u64, StorageError>)>> = if copy_prelookup_required {
             let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
-                get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                get_opts(&bucket, &key, dest_version_id.clone(), None, envelope.headers())
                     .await
                     .map_err(ApiError::from)?,
             );
@@ -462,7 +475,7 @@ impl DefaultObjectUsecase {
             copy_source_sse_customer_key_md5.as_ref(),
         );
 
-        let copy_principal = SseKmsPrincipal::from_request(&req);
+        let copy_principal = SseKmsPrincipal::from_request(&envelope);
 
         if source_bucket_lifecycle_guard.is_lock_lost() {
             return Err(ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
@@ -488,9 +501,16 @@ impl DefaultObjectUsecase {
         let _source_cancellation_guard = source_cancellation.clone().drop_guard();
 
         let mut src_info = gr.object_info.clone();
+        let copies_tags = replacement_tags.is_none();
         let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
         crate::app::storage_api::object_usecase::access::authorize_copy_object_tags(
-            &mut req,
+            &mut envelope,
+            CopySourceObject {
+                bucket: &src_bucket,
+                key: &src_key,
+                version_id: requested_src_version_id.as_deref(),
+            },
+            copies_tags,
             &src_info.user_tags,
             &effective_tags,
         )
@@ -519,25 +539,13 @@ impl DefaultObjectUsecase {
         });
 
         // Validate copy source conditions
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    // Weak ETag or Any (*) in If-Match should fail per RFC 9110
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
+        if let Some(condition) = copy_source_if_match
+            && !condition.strong().is_some_and(|tag| Some(tag) == src_info.etag.as_deref())
+        {
+            return Err(s3_error!(PreconditionFailed));
         }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
+        if let Some(condition) = copy_source_if_none_match
+            && condition.strong().is_some_and(|tag| Some(tag) == src_info.etag.as_deref())
         {
             return Err(s3_error!(PreconditionFailed));
         }
@@ -584,10 +592,7 @@ impl DefaultObjectUsecase {
         strip_managed_encryption_metadata(&mut user_defined);
         remove_str(&mut user_defined, SUFFIX_PLAINTEXT_CHECKSUM);
 
-        let destination_storage_class = storage_class
-            .as_ref()
-            .map(StorageClass::as_str)
-            .unwrap_or(storageclass::STANDARD);
+        let destination_storage_class = storage_class.as_deref().unwrap_or(storageclass::STANDARD);
         src_info.storage_class = Some(destination_storage_class.to_string());
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
@@ -596,7 +601,7 @@ impl DefaultObjectUsecase {
 
         let mut compress_metadata = HashMap::new();
 
-        let should_compress = is_disk_compressible(&req.headers, &key) && actual_size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
+        let should_compress = is_disk_compressible(envelope.headers(), &key) && actual_size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
 
         if should_compress {
             insert_str(
@@ -646,7 +651,7 @@ impl DefaultObjectUsecase {
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         remove_object_lock_metadata_for_copy(&mut user_defined);
-        if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+        if let Some(object_lock_metadata) = build_put_like_object_lock_metadata_native(
             &bucket,
             &object_lock_config_state,
             object_lock_legal_hold_status,
@@ -790,7 +795,7 @@ impl DefaultObjectUsecase {
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
-        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&envelope);
 
         let copy_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -873,7 +878,7 @@ impl DefaultObjectUsecase {
         // Report the destination object's checksum in the response, decoded the same way GetObject
         // / HeadObject do so the value is identical to a later checksum-mode HEAD/GET (#4996).
         let response_checksums = oi
-            .decrypt_checksums(0, &req.headers)
+            .decrypt_checksums(0, envelope.headers())
             .map(|(pairs, is_multipart)| classify_response_checksums(pairs, is_multipart))
             .unwrap_or_default();
 
@@ -894,9 +899,15 @@ impl DefaultObjectUsecase {
                 _ => {}
             }
         }
-        let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.as_ref().map(|etag| to_s3s_xml_etag(etag)),
-            last_modified: oi.mod_time.map(Timestamp::from),
+        let output = CopyObjectWriteOutput {
+            e_tag: oi.etag,
+            last_modified: oi.mod_time,
+            copy_source_version_id,
+            version_id: dest_version,
+            server_side_encryption: effective_sse,
+            ssekms_key_id: effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
             checksum_crc32: response_checksums.crc32,
             checksum_crc32c: response_checksums.crc32c,
             checksum_sha1: response_checksums.sha1,
@@ -910,22 +921,9 @@ impl DefaultObjectUsecase {
             checksum_type: response_checksums.checksum_type,
         };
 
-        let output = CopyObjectOutput {
-            copy_object_result: Some(copy_object_result),
-            copy_source_version_id,
-            server_side_encryption: effective_sse,
-            ssekms_key_id: effective_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            version_id: dest_version,
-            ..Default::default()
-        };
-
-        let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(object_info).version_id(version_id);
-
-        let result = Ok(S3Response::new(output));
-        let _ = helper.complete(&result);
+        helper = helper.object(object_info).version_id(dest_version_id.unwrap_or_default());
+        let result = Ok(output);
+        let _ = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
         result
     }
 }
@@ -933,8 +931,13 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::S3ErrorCode;
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
-    use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -996,7 +999,7 @@ mod tests {
         let config = ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
+                    sse_algorithm: "garbage".to_owned(),
                     kms_master_key_id: None,
                 }),
                 blocked_encryption_types: None,
@@ -1010,7 +1013,7 @@ mod tests {
             .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
             .map(bucket_default_write_sse);
 
-        assert_eq!(effective_sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(effective_sse.as_deref(), Some(ServerSideEncryption::AES256));
 
         // Valid algorithms map to themselves, byte-identical to the PUT path.
         for (configured, expected) in [
@@ -1018,7 +1021,7 @@ mod tests {
             (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
         ] {
             let sse = ServerSideEncryptionByDefault {
-                sse_algorithm: ServerSideEncryption::from_static(configured),
+                sse_algorithm: configured.to_owned(),
                 kms_master_key_id: None,
             };
             assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);

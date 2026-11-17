@@ -58,6 +58,10 @@ mod stream;
 
 #[cfg(test)]
 pub(crate) use stream::checkpoint_fixture_partial_return;
+#[cfg(test)]
+pub(crate) use stream::remote_scanner_budget_wire_round_trip_for_test;
+#[cfg(test)]
+pub(crate) use stream::write_budget_drain_fixture_frames;
 
 pub use stream::{
     RemoteScannerAdmission, RemoteScannerRequest, serve_remote_scanner_request, serve_remote_scanner_request_with_memory,
@@ -92,6 +96,11 @@ pub fn decode_remote_scanner_request(body: &[u8]) -> Result<RemoteScannerRequest
     }
     if request.bucket.contains(['/', '\\']) || is_reserved_or_invalid_bucket(&request.bucket, false) {
         return Err(ScannerError::Other("remote namespace scanner bucket is invalid".to_string()));
+    }
+    if let Some(proof) = request.usage_watch.as_deref()
+        && (!proof.is_well_formed() || proof.bucket != request.bucket)
+    {
+        return Err(ScannerError::Other("remote namespace scanner usage watch is invalid".to_string()));
     }
 
     Ok(RemoteScannerRequest(request))

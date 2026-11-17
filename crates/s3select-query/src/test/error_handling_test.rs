@@ -15,12 +15,12 @@
 #[cfg(test)]
 mod error_handling_tests {
     use crate::get_global_db;
+    use rustfs_s3select_api::request::{
+        CsvInput, ExpressionType, FileHeaderInfo, InputSerialization, SelectObjectContentInput, SelectObjectContentRequest,
+    };
     use rustfs_s3select_api::{
         QueryError, SelectError,
         query::{Context, Query},
-    };
-    use s3s::dto::{
-        CSVInput, ExpressionType, FileHeaderInfo, InputSerialization, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
 
@@ -34,15 +34,15 @@ mod error_handling_tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: sql.to_string(),
-                expression_type: ExpressionType::from_static("SQL"),
+                expression_type: ExpressionType::from("SQL"),
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
-                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                    csv: Some(CsvInput {
+                        file_header_info: Some(FileHeaderInfo::USE),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
-                output_serialization: s3s::dto::OutputSerialization::default(),
+                output_serialization: rustfs_s3select_api::request::OutputSerialization::default(),
                 request_progress: None,
                 scan_range: None,
             },

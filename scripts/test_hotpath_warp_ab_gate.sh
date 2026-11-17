@@ -88,4 +88,66 @@ if "$GATE" --require-tail-error --compare-csv "$TMP_DIR/extra-column.csv" >/dev/
   exit 1
 fi
 
+printf '%s\n' "$header" >"$TMP_DIR/stable.csv"
+printf '%s\n' '100KiB,warp,128,100,100,0,1,1,0,100,100,0,2,2,0,3,3,0,3,3,0,0,0,0,0' >>"$TMP_DIR/stable.csv"
+"$GATE" --baseline-drift --require-tail-error --compare-csv "$TMP_DIR/stable.csv" >"$TMP_DIR/stable.md"
+rg -qF 'baseline drift gate — ✅ PASS' "$TMP_DIR/stable.md"
+
+for metric_spec in 'reqps:4:6:higher' 'latency:7:9:lower' 'throughput:10:12:higher' 'p90-latency:13:15:lower' 'p99-latency:16:18:lower'; do
+  IFS=: read -r metric value_column delta_column direction <<<"$metric_spec"
+  for delta in -20 20; do
+    csv="$TMP_DIR/drift-${metric}-${delta}.csv"
+    awk -F, -v OFS=, -v value_column="$value_column" -v delta_column="$delta_column" -v delta="$delta" '
+      NR > 1 { $value_column = $(value_column + 1) * (1 + delta / 100); $delta_column = delta }
+      { print }
+    ' "$TMP_DIR/stable.csv" >"$csv"
+    if "$GATE" --baseline-drift --require-tail-error --compare-csv "$csv" >"$TMP_DIR/drift.md"; then
+      echo "expected ${metric} delta ${delta}% to fail baseline stability" >&2
+      exit 1
+    fi
+    rg -qF "| $metric | ${delta}% | ❌ FAIL |" "$TMP_DIR/drift.md"
+    if [[ "$direction" == higher && "$delta" -gt 0 ]] || [[ "$direction" == lower && "$delta" -lt 0 ]]; then
+      "$GATE" --require-tail-error --compare-csv "$csv" >"$TMP_DIR/candidate.md"
+      rg -qF "| $metric | ${delta}% | ✅ PASS |" "$TMP_DIR/candidate.md"
+    elif "$GATE" --require-tail-error --compare-csv "$csv" >/dev/null; then
+      echo "expected candidate ${metric} regression ${delta}% to retain its failure" >&2
+      exit 1
+    fi
+  done
+done
+
+# Error-rate deltas use percentage points and retain their round-count contract.
+printf '%s\n' "$header" >"$TMP_DIR/error-improvement.csv"
+printf '%s\n' '100KiB,warp,128,100,100,0,1,1,0,100,100,0,2,2,0,3,3,0,10,8,0,2,0,20,-20' >>"$TMP_DIR/error-improvement.csv"
+"$GATE" --require-tail-error --compare-csv "$TMP_DIR/error-improvement.csv" >/dev/null
+if "$GATE" --baseline-drift --require-tail-error --compare-csv "$TMP_DIR/error-improvement.csv" >"$TMP_DIR/error-drift.md"; then
+  echo "expected falling baseline error rate beyond budget to fail stability" >&2
+  exit 1
+fi
+rg -qF '| error-rate | -20% | ❌ FAIL |' "$TMP_DIR/error-drift.md"
+
+for delta in -10 -5 5 10; do
+  awk -F, -v OFS=, -v delta="$delta" 'NR > 1 { $4 = $5 * (1 + delta / 100); $6 = delta } { print }' \
+    "$TMP_DIR/stable.csv" >"$TMP_DIR/boundary.csv"
+  "$GATE" --baseline-drift --require-tail-error --compare-csv "$TMP_DIR/boundary.csv" >"$TMP_DIR/boundary.md"
+  verdict='✅ PASS'
+  [[ "$delta" == -10 || "$delta" == 10 ]] && verdict='⚠️ WARN'
+  rg -qF "| reqps | ${delta}% | $verdict |" "$TMP_DIR/boundary.md"
+done
+
+for invalid_csv in missing-evidence old-schema header-only malformed-number out-of-range-error inconsistent-error extra-column; do
+  if "$GATE" --baseline-drift --require-tail-error --compare-csv "$TMP_DIR/${invalid_csv}.csv" >/dev/null 2>&1; then
+    echo "expected baseline drift mode to reject invalid ${invalid_csv} evidence" >&2
+    exit 1
+  fi
+done
+
+if "$GATE" --baseline-drift --allow-regression --compare-csv "$TMP_DIR/stable.csv" >"$TMP_DIR/drift-exemption.log" 2>&1; then
+  echo "expected baseline drift mode to reject a regression exemption" >&2
+  exit 1
+fi
+rg -qF -- '--baseline-drift cannot be combined with --allow-regression' "$TMP_DIR/drift-exemption.log"
+"$GATE" --require-tail-error --allow-regression --compare-csv "$TMP_DIR/p99-regression.csv" >"$TMP_DIR/candidate-exemption.md"
+rg -qF 'Gate FAIL exempted via' "$TMP_DIR/candidate-exemption.md"
+
 echo "hotpath warp A/B gate tests passed"

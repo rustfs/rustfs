@@ -93,6 +93,8 @@ pub struct WriteLockContext {
 enum WriteLockMode {
     Borrowed(Vec<WriteCommitGuard>),
     OfflineRecovery,
+    /// A PUT into a lockless cache bucket (`crate::bucket::lockless_cache`).
+    LocklessCache,
 }
 
 pub(crate) enum WriteCommitContext {
@@ -100,6 +102,7 @@ pub(crate) enum WriteCommitContext {
     Borrowed(Vec<WriteCommitGuard>),
     Publication,
     OfflineRecovery,
+    LocklessCache,
     #[cfg(test)]
     UnlockedFixture,
 }
@@ -126,6 +129,9 @@ impl WriteCommitContext {
                 Ok(Self::Borrowed(guards.clone()))
             }
             (true, Some(WriteLockMode::OfflineRecovery)) => Ok(Self::OfflineRecovery),
+            (true, Some(WriteLockMode::LocklessCache)) if crate::bucket::lockless_cache::is_lockless_cache_bucket(bucket) => {
+                Ok(Self::LocklessCache)
+            }
             #[cfg(test)]
             (true, None) if !opts.metadata_cache_safe => Ok(Self::UnlockedFixture),
             _ => Err(Error::InvalidArgument(
@@ -184,6 +190,35 @@ impl ObjectOptions {
         self.add_write_commit_guard(&WriteCommitGuard::from_guard(guard, bucket, object));
     }
 
+    /// Commit a PUT into `bucket` without a namespace owner when the server lists
+    /// it as a lockless cache bucket; returns whether the lockless path applies.
+    pub fn use_lockless_cache_write(&mut self, bucket: &str) -> bool {
+        if !crate::bucket::lockless_cache::is_lockless_cache_bucket(bucket) || self.write_lock_context.is_some() {
+            return false;
+        }
+        self.no_lock = true;
+        self.write_lock_context = Some(WriteLockContext {
+            mode: WriteLockMode::LocklessCache,
+        });
+        true
+    }
+
+    /// Return a lockless cache PUT to the locked path (for example once it is
+    /// known to need replication).
+    pub fn drop_lockless_cache_write(&mut self) {
+        if self.is_lockless_cache_write() {
+            self.no_lock = false;
+            self.write_lock_context = None;
+        }
+    }
+
+    pub fn is_lockless_cache_write(&self) -> bool {
+        matches!(
+            self.write_lock_context.as_ref().map(|context| &context.mode),
+            Some(WriteLockMode::LocklessCache)
+        )
+    }
+
     /// Only startup migration may publish without a running namespace owner.
     pub(crate) fn use_offline_recovery_write(&mut self) {
         self.no_lock = true;
@@ -191,5 +226,25 @@ impl ObjectOptions {
             mode: WriteLockMode::OfflineRecovery,
         });
         self.write_completion = WriteCompletion::TailDrained;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlisted_bucket_never_takes_the_lockless_write_path() {
+        let mut opts = ObjectOptions::default();
+        assert!(
+            !opts.use_lockless_cache_write("ordinary-bucket"),
+            "only buckets named in the server's lockless list may skip the namespace lock"
+        );
+        assert!(!opts.is_lockless_cache_write());
+        assert!(!opts.no_lock, "a refused lockless request must leave the locked path intact");
+        assert!(matches!(
+            WriteCommitContext::from_options(&opts, "ordinary-bucket", "object", false),
+            Ok(WriteCommitContext::Owned)
+        ));
     }
 }

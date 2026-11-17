@@ -28,7 +28,7 @@ DEFAULT_PROFILE = "rustfs"
 CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
 VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
 CATALOG_BACKING_KEY = "rustfs.catalog-backing"
-CATALOG_BACKINGS = {"object", "durable-strong"}
+CATALOG_BACKINGS = {"object"}
 SMOKE_ROWS = [{"id": 1, "payload": "alpha"}, {"id": 2, "payload": "beta"}]
 REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.access-key-id",
@@ -245,9 +245,9 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
 
 PRODUCTION_READINESS_INVENTORY: list[dict[str, str]] = [
     {
-        "capability": "strong-catalog-backing",
-        "status": "state-transfer-supported",
-        "validation": "preflight exposes recovery blockers and target agreement; migration execution fences object-backed writes, drains in-flight catalog mutations, and idempotently materializes table bucket, namespace, table, view, commit-log, and idempotency state before cutover",
+        "capability": "object-catalog-backup-restore",
+        "status": "controlled-recovery-supported",
+        "validation": "backup and restore validate the catalog pointer, commit-log, idempotency, maintenance, and referenced Iceberg object graph while preserving CAS, write-fence, and retryable recovery guarantees",
     },
     {
         "capability": "single-active-writer-ha",
@@ -1466,26 +1466,6 @@ def run_load_table_delegation_probe(args: argparse.Namespace, deps: RuntimeDeps)
         verify_vended_credential_data_plane_scope(args, deps, credential, warehouse)
 
 
-def run_strong_backing_boundaries(args: argparse.Namespace, deps: RuntimeDeps) -> None:
-    pointer_path = table_endpoint_path(args, "/metadata-location")
-    before = signed_rest_request(args, deps, "GET", pointer_path)
-    for key in ("metadata-location", "version-token", "generation"):
-        if key not in before:
-            raise RuntimeError("metadata-location response is missing the commit state")
-    path = table_endpoint_path(args, "/maintenance/metadata")
-    error = signed_rest_request_expect_error(
-        args, deps, "POST", path,
-        {"retain-recent-metadata-files": 1, "delete": False}, expected_statuses={400},
-    )
-    envelope = json.loads(error.response_body).get("error")
-    if not isinstance(envelope, dict) or (envelope.get("code"), envelope.get("type"), envelope.get("message")) != (
-        400, "BadRequestException", "operation is not supported with durable-strong table catalog backing"
-    ):
-        raise RuntimeError("strong metadata maintenance did not return the expected Iceberg error envelope")
-    if signed_rest_request(args, deps, "GET", pointer_path) != before:
-        raise RuntimeError("unsupported strong backing operation changed the table commit state")
-
-
 def maintenance_job_id(job: object) -> str | None:
     if not isinstance(job, dict):
         return None
@@ -1509,22 +1489,19 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps, backing: 
     if any(config.get(key) != value for key, value in safe_config.items()):
         raise RuntimeError("maintenance config endpoint did not persist the smoke config")
 
-    if backing == "durable-strong":
-        run_strong_backing_boundaries(args, deps)
-    elif backing == "object":
-        report = signed_rest_request(
-            args, deps, "POST", table_endpoint_path(args, "/maintenance/metadata"),
-            {"retain-recent-metadata-files": 1, "delete": False},
-        )
-        if maintenance_job_id(report.get("job")) is None:
-            raise RuntimeError("maintenance metadata endpoint did not return a job id")
-        audit_events = report.get("audit-events")
-        if not isinstance(audit_events, list) or not any(
-            isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events
-        ):
-            raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
-    else:
-        raise RuntimeError("maintenance probes require a known backing")
+    if backing != "object":
+        raise RuntimeError("maintenance probes require the object catalog backing")
+    report = signed_rest_request(
+        args, deps, "POST", table_endpoint_path(args, "/maintenance/metadata"),
+        {"retain-recent-metadata-files": 1, "delete": False},
+    )
+    if maintenance_job_id(report.get("job")) is None:
+        raise RuntimeError("maintenance metadata endpoint did not return a job id")
+    audit_events = report.get("audit-events")
+    if not isinstance(audit_events, list) or not any(
+        isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events
+    ):
+        raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
 
     scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
     expected_statuses = {"READY", "QUEUED", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}

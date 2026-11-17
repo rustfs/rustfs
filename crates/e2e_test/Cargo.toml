@@ -99,10 +99,8 @@ rustfs-filemeta.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-config = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 aws-smithy-types.workspace = true
-async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
@@ -129,24 +127,26 @@ rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 hex-simd = { workspace = true }
 md-5 = { workspace = true }
-opentelemetry-proto = { workspace = true }
 prost.workspace = true
 sha2 = { workspace = true }
-rustfs-tokio-tar = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 zstd.workspace = true
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
-suppaftp = { workspace = true, features = ["rustls-aws-lc-rs", "tokio-rustls-aws-lc-rs"] }
 rcgen.workspace = true
 local-ip-address.workspace = true
 anyhow.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
-russh = { workspace = true, features = ["serde"] }
-russh-sftp = { workspace = true }
-zip.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
+aws-config = { workspace = true }
+opentelemetry-proto = { workspace = true }
+russh = { workspace = true, features = ["serde"] }
+russh-sftp = { workspace = true }
+suppaftp = { workspace = true, features = ["rustls-aws-lc-rs", "tokio-rustls-aws-lc-rs"] }
+rustfs-tokio-tar = { workspace = true }
+zip.workspace = true
 same-file.workspace = true
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
 rustfs-heal.workspace = true

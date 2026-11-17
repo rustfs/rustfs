@@ -1009,11 +1009,26 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
             assert!(saved.info.scan_raw_enumeration_cursor.is_none());
             assert!(saved.info.scan_raw_enumeration_page_index.is_none());
             assert!(saved.info.scan_coverage_receipt.is_none());
+            let observation = saved
+                .completed_bucket_observation()
+                .expect("mixed EOF stores a separate complete observation");
+            assert_eq!((observation.entry.objects, observation.entry.size), (25, 25));
+            assert_eq!(observation.completed_epoch, leader_epoch);
+            assert_eq!(observation.completed_cycle, cycle);
+            assert_ne!(observation.started_plan, observation.requested_plan);
+            assert!(
+                !saved.info.lkg_snapshot_complete,
+                "mixed EOF must not masquerade as a legacy canonical value"
+            );
             let progress = saved.info.scan_progress.expect("mixed tail retains a verification plan");
             assert_eq!(progress.started_plan, plan);
             assert_eq!(progress.requested_plan, plan);
         }
         if expect_complete {
+            assert!(
+                saved.info.scan_bucket_observations.is_empty(),
+                "fresh complete supersedes the older mixed observation"
+            );
             assert_eq!(saved.info.scan_plan_digest, Some(plan), "round {round} certifies its own plan");
             assert!(saved.info.scan_progress.is_none());
             let total = saved.checked_flatten("bucket").expect("complete bucket root");

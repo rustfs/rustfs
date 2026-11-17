@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::authorize_admin_request,
+    auth::authorize_admin_envelope,
     handlers::notify_runtime_access::{get_notification_system, load_notification_mutation_snapshot},
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
-        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
-        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
+        build_enabled_target_kvs, collect_runtime_statuses, extract_supported_target_params,
+        merge_target_endpoints as shared_merge_target_endpoints, owned_build_json_response, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     handlers::target_read::{collect_notification_runtime_statuses, load_target_read_snapshot},
-    router::{AdminOperation, Operation, S3Router},
-    runtime_sources::object_store_from_extensions,
-    runtime_sources::{AppContext, app_context_from_req},
+    router::{AdminOperation, S3Router},
+    runtime_sources::object_store_from_envelope,
+    runtime_sources::{AppContext, app_context_from_envelope},
     service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
     storage_api::contract::bucket::{BucketOperations, BucketOptions},
 };
@@ -39,11 +40,11 @@ use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::server_config::Config;
 use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_gateway_types::persistence::PersistedNotificationConfiguration;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::{error, info, warn};
@@ -276,64 +277,43 @@ fn subscription_target_arn(params: &Params<'_, '_>, region: &str) -> S3Result<St
 
 fn collect_target_subscriptions(
     bucket: &str,
-    config: s3s::dto::NotificationConfiguration,
+    config: &PersistedNotificationConfiguration,
     target_arn: &str,
-) -> S3Result<Vec<TargetSubscription>> {
-    let value = serde_json::to_value(config).map_err(|e| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification config: {e}"))
-    })?;
-    let mut subscriptions = Vec::new();
-    for key in [
-        "queue_configurations",
-        "topic_configurations",
-        "lambda_function_configurations",
-    ] {
-        if let Some(entries) = value.get(key).and_then(Value::as_array) {
-            for entry in entries {
-                let arn = ["queue_arn", "topic_arn", "lambda_function_arn"]
+) -> Vec<TargetSubscription> {
+    let routes = config.behavior();
+    [routes.queue_routes, routes.topic_routes, routes.lambda_routes]
+        .into_iter()
+        .flatten()
+        .filter(|route| route.destination == target_arn)
+        .map(|route| {
+            let filter_value = |name: &str| {
+                route
+                    .filter_rules
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .find_map(|field| entry.get(field).and_then(Value::as_str));
-                if arn != Some(target_arn) {
-                    continue;
-                }
-                let filters = entry
-                    .get("filter")
-                    .and_then(|v| v.get("key"))
-                    .and_then(|v| v.get("filter_rules"))
-                    .and_then(Value::as_array);
-                let filter_value = |name: &str| {
-                    filters.and_then(|rules| {
-                        rules.iter().find_map(|rule| {
-                            (rule.get("name").and_then(Value::as_str) == Some(name))
-                                .then(|| rule.get("value").and_then(Value::as_str).map(str::to_string))
-                                .flatten()
-                        })
-                    })
-                };
-                subscriptions.push(TargetSubscription {
-                    bucket: bucket.to_string(),
-                    id: entry.get("id").and_then(Value::as_str).map(str::to_string),
-                    events: entry
-                        .get("events")
-                        .and_then(Value::as_array)
-                        .map(|events| events.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                        .unwrap_or_default(),
-                    prefix: filter_value("Prefix").or_else(|| filter_value("prefix")),
-                    suffix: filter_value("Suffix").or_else(|| filter_value("suffix")),
-                });
+                    .find_map(|(rule_name, value)| (rule_name.as_deref() == Some(name)).then(|| value.clone()).flatten())
+            };
+            let prefix = filter_value("Prefix").or_else(|| filter_value("prefix"));
+            let suffix = filter_value("Suffix").or_else(|| filter_value("suffix"));
+            TargetSubscription {
+                bucket: bucket.to_string(),
+                id: route.id,
+                events: route.events,
+                prefix,
+                suffix,
             }
-        }
-    }
-    Ok(subscriptions)
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
 impl Operation for ListTargetSubscriptions {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-        let region = req.region.as_ref().map(ToString::to_string).unwrap_or_default();
+        let region = req.region().map(ToString::to_string).unwrap_or_default();
         let target_arn = subscription_target_arn(&params, &region)?;
-        let Some(store) = object_store_from_extensions(&req.extensions) else {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
         let buckets = store
@@ -348,11 +328,15 @@ impl Operation for ListTargetSubscriptions {
             else {
                 continue;
             };
-            subscriptions.extend(collect_target_subscriptions(&bucket.name, config, &target_arn)?);
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, &config, &target_arn));
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -398,11 +382,11 @@ fn notification_target_specs() -> &'static [AdminTargetSpec] {
 
 /// The pre-check keeps these endpoints' historical missing-credentials message;
 /// the shared gate reports "get cred failed".
-async fn authorize_notification_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize_notification_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
     }
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -464,9 +448,9 @@ fn collect_online_target_arns(region: &str, target_statuses: Vec<(rustfs_targets
 pub struct NotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for NotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
-        let context = app_context_from_req(&req);
+        let context = app_context_from_envelope(req.envelope());
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
@@ -479,7 +463,7 @@ impl Operation for NotificationTarget {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
             log_notification_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
@@ -523,14 +507,18 @@ impl Operation for NotificationTarget {
         })?;
         log_notification_target_config_updated!("set_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct ListNotificationTargets {}
 #[async_trait::async_trait]
 impl Operation for ListNotificationTargets {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         refresh_persisted_module_switches_from_store().await.map_err(|err| {
             warn!(
@@ -558,14 +546,18 @@ impl Operation for ListNotificationTargets {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct ListTargetsArns {}
 #[async_trait::async_trait]
 impl Operation for ListTargetsArns {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason(
             "querying notification target ARNs for bucket associations from the console",
@@ -577,7 +569,7 @@ impl Operation for ListTargetsArns {
         }
         let ns = get_notification_system().await?;
 
-        let region = req.region.clone().ok_or_else(|| {
+        let region = req.region().map(str::to_owned).ok_or_else(|| {
             warn!(
                 event = EVENT_ADMIN_REQUEST_REJECTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -602,16 +594,20 @@ impl Operation for ListTargetsArns {
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
 
-        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::from(data),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
 pub struct RemoveNotificationTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveNotificationTarget {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let (target_type, target_name) = extract_target_params(&params)?;
-        let context = app_context_from_req(&req);
+        let context = app_context_from_envelope(req.envelope());
 
         authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
@@ -644,7 +640,11 @@ impl Operation for RemoveNotificationTarget {
         })?;
         log_notification_target_config_updated!("remove_target_config", target_type, target_name);
 
-        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(owned_build_json_response(
+            StatusCode::OK,
+            Body::empty(),
+            req.headers().get("x-request-id"),
+        ))
     }
 }
 
@@ -663,6 +663,7 @@ mod tests {
     use rustfs_config::server_config::{KV, KVS};
     use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
     use rustfs_targets::arn::TargetID;
+    use serde_json::Value;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
@@ -702,19 +703,14 @@ mod tests {
         use std::time::Duration;
 
         async fn response_json(
-            call: impl std::future::Future<Output = S3Result<S3Response<(StatusCode, Body)>>>,
+            call: impl std::future::Future<Output = S3Result<crate::admin::operation::AdminResponse>>,
         ) -> S3Result<Value> {
             let response = tokio::time::timeout(Duration::from_secs(10), call)
                 .await
                 .expect("destination inventory must not wait for runtime reconciliation")?;
-            assert_eq!(response.output.0, StatusCode::OK);
-            let body = response
-                .output
-                .1
-                .collect()
-                .await
-                .expect("collect inventory response")
-                .to_bytes();
+            let (status, _headers, body) = response.into_parts();
+            assert_eq!(status, StatusCode::OK);
+            let body = body.collect().await.expect("collect inventory response").to_bytes();
             Ok(serde_json::from_slice(&body).expect("decode inventory response"))
         }
 
@@ -732,20 +728,12 @@ mod tests {
         crate::runtime_sources::install_test_app_context(Arc::clone(&env.ecstore)).await;
 
         let credentials = crate::runtime_sources::current_action_credentials().expect("test root credentials");
-        let request = |uri: &str| S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: uri.parse().expect("target inventory URI"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
-                access_key: credentials.access_key.clone(),
-                secret_key: credentials.secret_key.clone().into(),
-            }),
-            region: None,
-            service: None,
-            trailing_headers: None,
+        let request = |uri: &str| {
+            crate::admin::operation::test_support::TestRequest::new(Method::GET, uri)
+                .credentials(&credentials.access_key, &credentials.secret_key, None)
+                .build()
         };
+        let unsigned_request = |uri: &str| crate::admin::operation::test_support::TestRequest::new(Method::GET, uri).build();
 
         temp_env::async_with_vars([(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"))], async {
             let mut config = Config::new();
@@ -962,22 +950,26 @@ mod tests {
             );
             assert_eq!(detail["config"]["auth_token"], "***redacted***");
             drop(transaction_guard);
-            let mut put = request("/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable");
-            put.method = Method::PUT;
-            put.input = Body::from(
+            let put = crate::admin::operation::test_support::TestRequest::new(
+                Method::PUT,
+                "/rustfs/admin/v4/plugins/instances/builtin:webhook:notify:unavailable",
+            )
+            .credentials(&credentials.access_key, &credentials.secret_key, None)
+            .body(
                 serde_json::to_vec(&serde_json::json!({
                     "expected_config": detail["config"],
                     "expected_revision": "stale",
                     "key_values": [{"key":"auth_token", "value":"replacement-secret"}]
                 }))
                 .expect("encode conditional edit"),
-            );
+            )
+            .build();
             let matched = router.at("/builtin:webhook:notify:unavailable").expect("plugin params");
             let err = PutPluginInstanceHandler {}
                 .call(put, matched.params)
                 .await
                 .expect_err("stale revision must be rejected");
-            assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
             let after = crate::admin::storage_api::config::read_admin_config_without_migrate(env.ecstore.clone())
                 .await
                 .expect("read unchanged config");
@@ -1107,8 +1099,7 @@ mod tests {
                         .expect_err("config read failure must remain visible");
                 assert_eq!(error.code(), &S3ErrorCode::InternalError);
 
-                let mut unsigned = request("/rustfs/admin/v3/target/list");
-                unsigned.credentials = None;
+                let unsigned = unsigned_request("/rustfs/admin/v3/target/list");
                 let error = ListNotificationTargets {}
                     .call(unsigned, Params::new())
                     .await
@@ -1128,8 +1119,7 @@ mod tests {
                 .await
                 .expect_err("plugin diagnostics must not silently reuse stale module switches");
                 assert_eq!(error.code(), &S3ErrorCode::InternalError);
-                let mut unsigned = request("/rustfs/admin/v4/plugins/instances");
-                unsigned.credentials = None;
+                let unsigned = unsigned_request("/rustfs/admin/v4/plugins/instances");
                 let error = response_json(ListPluginInstancesHandler {}.call(unsigned, Params::new()))
                     .await
                     .expect_err("plugin authorization must precede module and config access");
@@ -1202,60 +1192,84 @@ mod tests {
         }
     }
 
+    /// A stored configuration as the handler loads it from bucket metadata.
+    fn stored_notification(xml: &str) -> PersistedNotificationConfiguration {
+        rustfs_gateway_types::persistence::parse_notification(xml.as_bytes()).expect("stored notification XML should parse")
+    }
+
+    fn subscriptions_json(bucket: &str, xml: &str, target_arn: &str) -> Value {
+        let config = stored_notification(xml);
+        let subscriptions = collect_target_subscriptions(bucket, &config, target_arn);
+        serde_json::to_value(subscriptions).expect("subscriptions should serialize")
+    }
+
     #[test]
     fn target_subscriptions_match_all_config_kinds_without_crossing_target_identity() {
-        let config: s3s::dto::NotificationConfiguration = serde_json::from_value(serde_json::json!({
-            "queue_configurations": [
-                {
-                    "id": "uploads",
-                    "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook",
-                    "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                    "filter": { "key": { "filter_rules": [
-                        { "name": "prefix", "value": "photos/" },
-                        { "name": "suffix", "value": ".jpg" }
-                    ] } }
-                },
-                { "id": "other-service", "queue_arn": "arn:rustfs:sqs:eu-west-1:primary:kafka", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-target", "queue_arn": "arn:rustfs:sqs:eu-west-1:secondary:webhook", "events": ["s3:ObjectCreated:*"] },
-                { "id": "other-region", "queue_arn": "arn:rustfs:sqs:us-east-1:primary:webhook", "events": ["s3:ObjectCreated:*"] }
-            ],
-            "topic_configurations": [
-                { "id": "topic", "topic_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectCreated:Put"] }
-            ],
-            "lambda_function_configurations": [
-                { "lambda_function_arn": "arn:rustfs:sqs:eu-west-1:primary:webhook", "events": ["s3:ObjectRemoved:Delete"] }
-            ]
-        }))
-        .expect("notification DTO should deserialize");
+        let xml = r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>uploads</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:webhook</Queue>
+                <Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>photos/</Value></FilterRule>
+                    <FilterRule><Name>suffix</Name><Value>.jpg</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>other-service</Id><Queue>arn:rustfs:sqs:eu-west-1:primary:kafka</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-target</Id><Queue>arn:rustfs:sqs:eu-west-1:secondary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>other-region</Id><Queue>arn:rustfs:sqs:us-east-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <TopicConfiguration><Id>topic</Id><Topic>arn:rustfs:sqs:eu-west-1:primary:webhook</Topic><Event>s3:ObjectCreated:Put</Event></TopicConfiguration>
+            <CloudFunctionConfiguration><CloudFunction>arn:rustfs:sqs:eu-west-1:primary:webhook</CloudFunction><Event>s3:ObjectRemoved:Delete</Event></CloudFunctionConfiguration>
+        </NotificationConfiguration>"#;
         let router = subscription_router();
         for target_type in ["webhook", "notify_webhook"] {
             let path = format!("/v3/target/{target_type}/primary/subscriptions");
             let params = router.at(&path).expect("subscription route should match").params;
             let arn = subscription_target_arn(&params, "eu-west-1").expect("webhook ARN should resolve");
-            let subscriptions =
-                collect_target_subscriptions("photos", config.clone(), &arn).expect("subscriptions should collect");
             assert_eq!(
-                serde_json::to_value(subscriptions).expect("subscriptions should serialize"),
+                subscriptions_json("photos", xml, &arn),
                 serde_json::json!([
                     { "bucket": "photos", "id": "uploads", "events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], "prefix": "photos/", "suffix": ".jpg" },
                     { "bucket": "photos", "id": "topic", "events": ["s3:ObjectCreated:Put"], "prefix": null, "suffix": null },
                     { "bucket": "photos", "id": null, "events": ["s3:ObjectRemoved:Delete"], "prefix": null, "suffix": null }
                 ])
             );
-            assert!(
-                collect_target_subscriptions("photos", config.clone(), "arn:rustfs:sqs:eu-west-1:unused:webhook")
-                    .expect("unmatched subscriptions should collect")
-                    .is_empty()
+            assert_eq!(
+                subscriptions_json("photos", xml, "arn:rustfs:sqs:eu-west-1:unused:webhook"),
+                serde_json::json!([])
             );
         }
-        assert!(
-            collect_target_subscriptions(
-                "empty",
-                s3s::dto::NotificationConfiguration::default(),
-                "arn:rustfs:sqs::primary:webhook"
-            )
-            .expect("empty configuration should collect")
-            .is_empty()
+        assert_eq!(
+            subscriptions_json("empty", "<NotificationConfiguration/>", "arn:rustfs:sqs::primary:webhook"),
+            serde_json::json!([])
+        );
+    }
+
+    /// The capitalized rule name wins over the lowercase one wherever it
+    /// stands, a rule without a value never supplies one, and the destination
+    /// is compared exactly.
+    #[test]
+    fn target_subscriptions_read_filter_rules_by_exact_name_and_skip_valueless_rules() {
+        const ARN: &str = "arn:rustfs:sqs:eu-west-1:primary:webhook";
+        let xml = format!(
+            r#"<NotificationConfiguration>
+            <QueueConfiguration><Id>ordered</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>lower/</Value></FilterRule>
+                    <FilterRule><Name>Prefix</Name></FilterRule>
+                    <FilterRule><Name>Prefix</Name><Value>upper/</Value></FilterRule>
+                    <FilterRule><Name>SUFFIX</Name><Value>.shout</Value></FilterRule>
+                    <FilterRule><Value>.nameless</Value></FilterRule>
+                </S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>valueless</Id><Queue>{ARN}</Queue><Event>s3:ObjectCreated:*</Event>
+                <Filter><S3Key><FilterRule><Name>suffix</Name></FilterRule></S3Key></Filter></QueueConfiguration>
+            <QueueConfiguration><Id>case</Id><Queue>ARN:rustfs:sqs:eu-west-1:primary:webhook</Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+            <QueueConfiguration><Id>padded</Id><Queue>{ARN} </Queue><Event>s3:ObjectCreated:*</Event></QueueConfiguration>
+        </NotificationConfiguration>"#
+        );
+        assert_eq!(
+            subscriptions_json("photos", &xml, ARN),
+            serde_json::json!([
+                { "bucket": "photos", "id": "ordered", "events": ["s3:ObjectCreated:*"], "prefix": "upper/", "suffix": null },
+                { "bucket": "photos", "id": "valueless", "events": ["s3:ObjectCreated:*"], "prefix": null, "suffix": null }
+            ])
         );
     }
 
@@ -1265,17 +1279,14 @@ mod tests {
         for target_type in ["webhook", "notify_webhook", "unknown"] {
             let path = format!("/v3/target/{target_type}/primary/subscriptions");
             let params = router.at(&path).expect("subscription route should match").params;
-            let req = S3Request {
-                input: Body::empty(),
-                method: Method::GET,
-                uri: path.parse().expect("subscription path should parse"),
-                headers: http::HeaderMap::new(),
-                extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            let req = crate::admin::operation::test_support::TestRequest::new(
+                Method::GET,
+                path.parse::<http::Uri>().expect("subscription path should parse"),
+            )
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build();
             let err = ListTargetSubscriptions {}
                 .call(req, params)
                 .await
@@ -1724,22 +1735,16 @@ mod tests {
     /// message they have always returned (rustfs/backlog#1829).
     #[tokio::test]
     async fn notification_target_gate_keeps_its_missing_credentials_message() {
-        let req = S3Request {
-            input: Body::from(String::new()),
-            method: Method::PUT,
-            uri: http::Uri::from_static("/rustfs/admin/v3/notification/target"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::PUT, "/rustfs/admin/v3/notification/target")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
 
         let err = authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction)
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("credentials not found"));
     }
 

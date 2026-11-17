@@ -314,6 +314,16 @@ mod tests {
         assert_eq!(scanner_kvs.get(SCANNER_DELAY), "");
         assert_eq!(scanner_kvs.get(SCANNER_MAX_WAIT), "");
         assert_eq!(scanner_kvs.get(SCANNER_CYCLE_MAX_OBJECTS), "0");
+        for key in [
+            rustfs_config::SCANNER_BUCKET_QUANTUM_DURATION,
+            rustfs_config::SCANNER_BUCKET_QUANTUM_OBJECTS,
+            rustfs_config::SCANNER_BUCKET_QUANTUM_DIRECTORIES,
+            rustfs_config::SCANNER_BUCKET_QUANTUM_ENTRIES,
+            rustfs_config::SCANNER_BUCKET_QUANTUM_NAME_BYTES,
+        ] {
+            assert!(rustfs_config::SCANNER_KEYS.contains(&key), "admin key {key} is registered");
+            assert_eq!(scanner_kvs.get(key), "0", "quantum dimension {key} stays disabled until rollout");
+        }
 
         let heal_kvs = cfg
             .get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER)

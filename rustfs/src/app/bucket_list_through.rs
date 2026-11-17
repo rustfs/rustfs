@@ -25,10 +25,11 @@
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 use super::storage_api::bucket_usecase::StorageObjectOptions;
+use super::storage_api::bucket_usecase::access::AuthorizationRequest;
 use super::storage_api::bucket_usecase::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket_usecase::contract::list::{ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _};
 use super::storage_api::bucket_usecase::contract::object::ObjectOperations as _;
-use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Request, S3Result};
+use super::storage_api::bucket_usecase::s3::{S3Error, S3ErrorCode, S3Result};
 use super::storage_api::bucket_usecase::s3_api::bucket::ListObjectsV2Params;
 use crate::app::object::shared::{odm_source_unavailable_error, odm_state_error_class};
 use crate::error::ApiError;
@@ -84,13 +85,13 @@ fn invalid_continuation_token(err: &ListThroughTokenError) -> S3Error {
 /// bucket has no source, `list_through` is off, or the request carries the
 /// `source-proxy-request` anti-loop marker and therefore comes from a peer
 /// that must be answered locally.
-pub(crate) async fn list_through_state<T>(
+pub(crate) async fn list_through_state<R: AuthorizationRequest + ?Sized>(
     store: &ECStore,
     bucket: &str,
-    req: &S3Request<T>,
+    req: &R,
     params: &ListObjectsV2Params,
 ) -> S3Result<Option<Arc<BucketOdmState>>> {
-    if get_header(&req.headers, SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
+    if get_header(req.headers(), SUFFIX_SOURCE_PROXY_REQUEST).is_some() {
         return Ok(None);
     }
     let sys = OnDemandMigrationSys::get();
@@ -471,7 +472,7 @@ mod tests {
     use crate::app::bucket_usecase::DefaultBucketUsecase;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ecstore};
     use crate::app::storage_api::bucket_usecase::s3::{
-        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response,
+        GetObjectInput, HeadObjectInput, ListObjectsInput, ListObjectsV2Input, ListObjectsV2Output, S3, S3Request, S3Response,
         XmlSerialize, XmlSerializer,
     };
     use crate::app::storage_api::test::StoragePutObjReader;
@@ -843,7 +844,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(10),
-            DefaultBucketUsecase::from_global().execute_list_objects_v2(request),
+            crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), request),
         )
         .await
         .expect("listing must complete within its bounded source budget")
@@ -1241,19 +1242,23 @@ mod tests {
                             let mut list = get.clone().map_input(|_| input.clone());
                             list.uri = http::Uri::from_static("/?list-type=2");
                             let usecase = crate::app::object::DefaultObjectUsecase::from_global();
-                            let get_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_get_object(get))
-                                .await
-                                .expect("GET stays local")
-                                .expect_err("local object is absent");
+                            let get_error =
+                                tokio::time::timeout(Duration::from_secs(10), crate::app::test_seams::get_object(&usecase, get))
+                                    .await
+                                    .expect("GET stays local")
+                                    .expect_err("local object is absent");
                             assert_eq!(*get_error.code(), S3ErrorCode::NoSuchKey);
-                            let head_error = tokio::time::timeout(Duration::from_secs(10), usecase.execute_head_object(head))
-                                .await
-                                .expect("HEAD stays local")
-                                .expect_err("local object is absent");
+                            let head_error = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                crate::app::test_seams::head_object(&usecase, head),
+                            )
+                            .await
+                            .expect("HEAD stays local")
+                            .expect_err("local object is absent");
                             assert_eq!(*head_error.code(), S3ErrorCode::NoSuchKey);
                             let listing = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                DefaultBucketUsecase::from_global().execute_list_objects_v2(list),
+                                crate::app::test_seams::list_objects_v2(&DefaultBucketUsecase::from_global(), list),
                             )
                             .await
                             .expect("LIST stays local")
@@ -1312,17 +1317,20 @@ mod tests {
                             let request_marker = input.marker.clone().unwrap_or_default();
                             let response = tokio::time::timeout(
                                 Duration::from_secs(10),
-                                DefaultBucketUsecase::from_global().execute_list_objects(S3Request {
-                                    input: input.clone(),
-                                    method: http::Method::GET,
-                                    uri: http::Uri::from_static("/"),
-                                    headers: HeaderMap::new(),
-                                    extensions: http::Extensions::new(),
-                                    credentials: None,
-                                    region: None,
-                                    service: None,
-                                    trailing_headers: None,
-                                }),
+                                S3::list_objects(
+                                    &crate::storage::ecfs::FS::new(),
+                                    S3Request {
+                                        input: input.clone(),
+                                        method: http::Method::GET,
+                                        uri: http::Uri::from_static("/"),
+                                        headers: HeaderMap::new(),
+                                        extensions: http::Extensions::new(),
+                                        credentials: None,
+                                        region: None,
+                                        service: None,
+                                        trailing_headers: None,
+                                    },
+                                ),
                             )
                             .await
                             .expect("v1 pagination must finish")
@@ -1729,9 +1737,7 @@ mod tests {
     // Freeze both its reader and writer; use real local storage and HTTP source
     // calls here, without claiming that this harness executes an old binary.
     async fn execute_e160_source_list(input: ListObjectsV2Input) -> S3Result<S3Response<ListObjectsV2Output>> {
-        use crate::app::storage_api::bucket_usecase::s3_api::bucket::{
-            build_list_objects_v2_output, parse_list_objects_v2_params,
-        };
+        use crate::app::storage_api::bucket_usecase::s3_api::bucket::parse_list_objects_v2_params;
         use crate::on_demand_migration::list_through::e160_framed_reader as old;
 
         let params = parse_list_objects_v2_params(
@@ -1785,17 +1791,17 @@ mod tests {
                 serde_json::from_str(raw.strip_prefix("\0odm-list:").unwrap_or(raw)).expect("merge output fields");
             *raw = old_token.encode();
         }
-        Ok(S3Response::new(build_list_objects_v2_output(
+        assert!(input.encoding_type.is_none(), "the frozen route models unencoded listings");
+        let output = crate::app::bucket_usecase::list_objects::list_objects_v2_output(
             outcome.info,
+            &input.bucket,
+            params,
             input.fetch_owner.unwrap_or_default(),
-            params.max_keys,
-            input.bucket,
-            params.prefix,
-            params.delimiter,
-            input.encoding_type,
-            params.response_continuation_token,
-            params.response_start_after,
-        )))
+            None,
+        )?;
+        let output = rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2::output_to_s3s(output)
+            .expect("the seam carries every member of a listing page");
+        Ok(S3Response::new(output))
     }
 
     fn e160_wire_cursor(wire: &str) -> crate::on_demand_migration::list_through::e160_framed_reader::ListThroughCursor {
@@ -2461,7 +2467,14 @@ mod tests {
                     ])
                     .await;
                     let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    // A literal key shaped like the list token's JSON. Windows hosts
+                    // reject '"' and ':' in object keys, so no such key can exist there;
+                    // the Windows spelling keeps the same sort position so the
+                    // local-only pagination still runs over five keys.
+                    #[cfg(not(windows))]
                     let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+                    #[cfg(windows)]
+                    let json_key = "{t=odm-list,v=1,local_done=true}";
                     let expected_local = ["a-local", "b-local", "z-local", json_key, "~last"];
                     let store = shared_gating_ecstore().await;
                     for key in ["a-local", "b-local", json_key, "~last"] {

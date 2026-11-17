@@ -120,7 +120,39 @@ pub enum RawEnumerationPageIndexError {
     CorruptIndex,
 }
 
+/// Compact committed-page identity used only for fair scheduling receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct RawEnumerationDurableProgress {
+    pub(crate) parent: String,
+    page_entry_limit: usize,
+    generation: u64,
+    pages: Vec<([u8; 32], usize)>,
+}
+
+impl RawEnumerationDurableProgress {
+    pub(crate) fn committed_entries(&self) -> usize {
+        self.pages.iter().map(|(_, entries)| *entries).sum()
+    }
+
+    pub(crate) fn extends(&self, previous: &Self) -> bool {
+        self.parent == previous.parent
+            && self.page_entry_limit == previous.page_entry_limit
+            && self.generation >= previous.generation
+            && self.pages.starts_with(&previous.pages)
+    }
+}
+
 impl RawEnumerationPageIndex {
+    pub(crate) fn durable_progress(&self) -> Option<RawEnumerationDurableProgress> {
+        let RawEnumerationPageIndexState::Supported(inner) = &self.state else { return None };
+        Some(RawEnumerationDurableProgress {
+            parent: inner.parent.clone(),
+            page_entry_limit: inner.page_entry_limit,
+            generation: inner.generation,
+            pages: inner.pages.iter().map(|page| (page.digest, page.entries.len())).collect(),
+        })
+    }
+
     pub fn unsupported() -> Self {
         Self {
             state: RawEnumerationPageIndexState::Unsupported,

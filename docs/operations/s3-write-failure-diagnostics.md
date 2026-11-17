@@ -45,15 +45,14 @@ The probe round timeout is configured independently; see [Admin peer probe timeo
 
 ## Correlate bounded diagnostics
 
-Normal operation does not require success logs at WARN. Request counters remain available with WARN logging, while runtime readiness diagnostics distinguish `pool_meta_write_blocked`, `pool_metadata_check_timeout`, and insufficient storage quorum. Do not clear a metadata write fence merely to make readiness green.
+Normal operation does not require success logs at WARN. Request counters remain available with WARN logging, while runtime readiness diagnostics distinguish `pool_meta_write_blocked` from insufficient storage quorum. Do not clear a metadata write fence merely to make readiness green.
 
-Query the authenticated `/rustfs/admin/v4/cluster/snapshot` endpoint on the affected node. `snapshot.pool_meta_write_gate` describes that node's metadata writer, not a fleet-wide aggregate. Its existing booleans are preserved; `state` and optional block details extend the same bounded, read-only gate inspection. This starts no recovery, disk reads, or additional RPCs. Runtime readiness and the gate are inspected separately, so a whole cluster snapshot is not atomic across sections.
+Query the authenticated `/rustfs/admin/v4/cluster/snapshot` endpoint on the affected node. `snapshot.pool_meta_write_gate` describes that node's metadata writer, not a fleet-wide aggregate. Its existing booleans are preserved; `state` and optional block details extend the same read-only inspection, which reads the authority published by the node's last metadata writer without waiting for the save gate. A block that an active writer installs appears when that writer releases the gate. Nodes running earlier releases can also report `check_timeout`, the `pool_metadata_check_timeout` readiness reason, and `rustfs_pool_metadata_check_timeouts_total` when their 100 ms gate inspection expired; current nodes emit none of them. This starts no recovery, disk reads, or additional RPCs. Runtime readiness and the gate are inspected separately, so a whole cluster snapshot is not atomic across sections.
 
 | `state` | Meaning |
 | --- | --- |
 | `writable` | No metadata write block was observed. Other dependencies may still make the node unready. |
 | `blocked` | A metadata write block was observed; `reason`, `phase`, and `sinceUnixSecs` describe its typed failure context. |
-| `check_timeout` | The existing 100 ms inspection budget expired. Readiness remains false, but a write block is not asserted. |
 | `unavailable` | The object store or a recognized metadata observation was unavailable; no block details are invented. |
 
 For `blocked`, `reason` reuses the metadata failure classification, `phase` identifies the operation stage that caused the block (not live recovery-worker progress), and `sinceUnixSecs` is the original block time in Unix seconds. Polling does not reset that time. Recovery replaces the observation with `writable` and removes the previous block details. An unavailable store reports `writesReady=false` with `state="unavailable"`. Older responses may omit `state` and block details; missing fields alone do not prove a healthy writer. Operation text, raw replica errors, disk paths, and credentials are excluded. See [Pool metadata recovery](pool-metadata-recovery.md) for recovery and escalation boundaries.

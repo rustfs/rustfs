@@ -23,9 +23,16 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
-      - 'scripts/release/create_or_update_release.sh'
-      - 'scripts/release/package_service_scripts.sh'
-      - 'scripts/release/package_versions.sh'
+      - 'scripts/release/**'
+      - 'scripts/security/generate_release_supply_chain_assets.py'
+      - '.config/release-validation-plan.json'
+      - '.github/scheduled-validations.json'
+      - 'scripts/test_helm_release_workflow.py'
+      - 'scripts/test_release_packages.py'
+      - 'scripts/test_release_images.py'
+      - 'Dockerfile*'
+      - 'entrypoint.sh'
+      - 'bootstrap/**'
       - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/test_docker_workflow.py'
@@ -41,9 +48,16 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
-      - 'scripts/release/create_or_update_release.sh'
-      - 'scripts/release/package_service_scripts.sh'
-      - 'scripts/release/package_versions.sh'
+      - 'scripts/release/**'
+      - 'scripts/security/generate_release_supply_chain_assets.py'
+      - '.config/release-validation-plan.json'
+      - '.github/scheduled-validations.json'
+      - 'scripts/test_helm_release_workflow.py'
+      - 'scripts/test_release_packages.py'
+      - 'scripts/test_release_images.py'
+      - 'Dockerfile*'
+      - 'entrypoint.sh'
+      - 'bootstrap/**'
       - 'scripts/test_package_service_scripts.sh'
       - 'scripts/test_package_versions.sh'
       - 'scripts/test_docker_workflow.py'
@@ -132,11 +146,37 @@ jobs:
     if: github.repository == 'rustfs/rustfs' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      release_changed: ${{ steps.scope.outputs.release_changed }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Scope native packaging checks to release changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          event, base = os.environ['GITHUB_EVENT_NAME'], os.environ.get('BASE_SHA', '')
+          changed = event == 'workflow_dispatch'
+          if event in ('push', 'pull_request'):
+              if not re.fullmatch(r'[0-9a-f]{40}', base) or base == '0' * 40:
+                  changed = True
+              else:
+                  paths = subprocess.check_output(['git', 'diff', '--name-only', base, os.environ['GITHUB_SHA']], text=True).splitlines()
+                  pattern = r'^(scripts/release/|scripts/test_release_|Dockerfile|entrypoint.sh$|bootstrap/|\.dockerignore$|\.config/release-validation-plan.json$|\.github/workflows/(audit|build|docker|package|helm-package|release-[^.]+)\.yml$)'
+                  changed = any(re.match(pattern, path) for path in paths)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'release_changed={str(changed).lower()}\n')
+          PY
 
       - name: Report unpinned GitHub Actions
         run: ./scripts/security/check_workflow_pins.sh --enforce
@@ -150,8 +190,35 @@ jobs:
       - name: Check checkouts clear their credentials
         run: ./scripts/security/check_persist_credentials.sh
 
-      - name: Check preview release workflow policy
-        run: ./scripts/security/check_preview_release_workflow.sh
+      - name: Check release candidate and promotion contracts
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+
+      - name: Prepare artifact transport rehearsal
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-transport"
+          printf '{"purpose":"transport contract, not release evidence"}\n' > "$RUNNER_TEMP/release-transport/transport.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-transport-contract-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-transport/transport.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify actual GitHub artifact metadata and downloaded bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import candidate as c
+          run = c.github(f"repos/{c.REPOSITORY}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+          destination = Path(os.environ['RUNNER_TEMP']) / 'release-transport-downloaded'
+          c.download_artifact(run, f"release-transport-contract-{os.environ['GITHUB_RUN_ATTEMPT']}", destination)
+          c.require(c.read_json(destination / 'transport.json') == {'purpose': 'transport contract, not release evidence'}, 'artifact round trip changed')
+          PY
 
       - name: Check tier evidence workflow isolation
         run: ./scripts/security/check_tier_artifact_workflow.sh
@@ -161,6 +228,80 @@ jobs:
 
       - name: Check package service lifecycle contract
         run: ./scripts/test_package_service_scripts.sh
+
+  release-package-contract:
+    name: Release package contract
+    needs: workflow-pin-report
+    if: needs.workflow-pin-report.outputs.release_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Install real package managers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm fakeroot cpio
+          sudo gem install fpm --version 1.17.0 --no-document
+      - name: Exercise accepted and substituted payloads through both recipes
+        run: python3 scripts/test_release_packages.py
+
+  release-image-contract:
+    name: Release image contract (${{ matrix.variant }})
+    needs: workflow-pin-report
+    if: needs.workflow-pin-report.outputs.release_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [musl, gnu]
+    env:
+      RELEASE_IMAGE_VARIANT: ${{ matrix.variant }}
+      NO_PROXY: 127.0.0.1,localhost,::1
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Install OCI tools
+        run: |
+          echo "RELEASE_IMAGE_OUTPUT=$RUNNER_TEMP/image-contract" >> "$GITHUB_ENV"
+          echo 'no_proxy=127.0.0.1,localhost,::1' >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          go version
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Exercise real OCI packaging, startup, registry retry and conflicts
+        run: python3 scripts/test_release_images.py
+      - name: Exercise amd64 OCI archive scanning
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          input: ${{ runner.temp }}/image-contract-scan/image-${{ matrix.variant }}-amd64.tar
+          format: sarif
+          output: ${{ runner.temp }}/image-contract/scan-${{ matrix.variant }}-amd64.sarif
+          exit-code: "0"
+      - name: Exercise arm64 OCI archive scanning
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          input: ${{ runner.temp }}/image-contract-scan/image-${{ matrix.variant }}-arm64.tar
+          format: sarif
+          output: ${{ runner.temp }}/image-contract/scan-${{ matrix.variant }}-arm64.sarif
+          exit-code: "0"
+      - name: Verify scan receipts before recording the archive
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import deliver, test_candidate
+          deliver.image_record(test_candidate.inputs(), os.environ['RELEASE_IMAGE_VARIANT'], Path(os.environ['RELEASE_IMAGE_OUTPUT']))
+          PY
 
   dependency-review:
     name: Dependency Review

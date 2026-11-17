@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.24.2 AS build
+ARG BINARY_SOURCE=download
+
+FROM alpine:3.24.2 AS download
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -74,6 +76,14 @@ COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
 RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /build/rc
 
 
+# Candidate packaging supplies the accepted executables from verified archives.
+# The default download stage remains available for local image builds.
+FROM scratch AS supplied
+ARG TARGETARCH
+COPY .release-inputs/${TARGETARCH}/ /build/
+
+FROM ${BINARY_SOURCE} AS build
+
 FROM alpine:3.24.2
 
 ARG RELEASE=latest
@@ -103,7 +113,6 @@ RUN apk upgrade --no-cache && \
     tzdata \
     && test "$(TZ=Asia/Kolkata date +%z)" = "+0530"
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
 COPY --from=build /build/rc /usr/bin/rc
 COPY entrypoint.sh /etc/rustfs/entrypoint.sh

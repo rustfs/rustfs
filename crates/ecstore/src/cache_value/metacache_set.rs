@@ -217,6 +217,8 @@ impl Drop for NotifyOnDrop {
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
+    /// Retain native listing admission through producer cancellation/draining.
+    pub read_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub disks: Vec<Option<DiskStore>>,
     pub fallback_disks: Vec<Option<DiskStore>>,
     pub bucket: String,
@@ -227,6 +229,7 @@ pub struct ListPathRawOptions {
     pub hidden_entry_budget: usize,
     pub pending_prefix: Option<String>,
     pub filter_prefix: Option<String>,
+    pub identifier_tree_leaf: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
     /// Deliver every replica to the partial callback, including matching headers.
@@ -255,6 +258,7 @@ pub struct ListPathRawOptions {
 impl Clone for ListPathRawOptions {
     fn clone(&self) -> Self {
         Self {
+            read_budget: self.read_budget.clone(),
             disks: self.disks.clone(),
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
@@ -265,6 +269,7 @@ impl Clone for ListPathRawOptions {
             hidden_entry_budget: self.hidden_entry_budget,
             pending_prefix: self.pending_prefix.clone(),
             filter_prefix: self.filter_prefix.clone(),
+            identifier_tree_leaf: self.identifier_tree_leaf.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
             preserve_replica_metadata: self.preserve_replica_metadata,
@@ -297,6 +302,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         pending_prefix: opts.pending_prefix.clone(),
         report_notfound: opts.report_not_found,
         filter_prefix: opts.filter_prefix.clone(),
+        identifier_tree_leaf: opts.identifier_tree_leaf.clone(),
         forward_to: opts.forward_to.clone(),
         limit: opts.per_disk_limit,
         skip_total_timeout: opts.skip_walkdir_total_timeout,
@@ -389,7 +395,9 @@ async fn list_path_raw_inner(
         let disk_io_context_clone = disk_io_context.clone();
         let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
+        let read_budget = opts.read_budget.clone();
         let producer = with_optional_disk_io_context(disk_io_context_clone, async move {
+            let _read_budget = read_budget;
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
             if let Some(observer) = &test_disk_io_context_observed {
@@ -1229,6 +1237,21 @@ mod tests {
     }
 
     #[test]
+    fn identifier_tree_selection_survives_job_clone_and_disk_request() {
+        let request = ListPathRawOptions {
+            path: "catalog/namespaces/".to_string(),
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            recursive: true,
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        let walk = walk_dir_options(&cloned);
+        assert_eq!(walk.identifier_tree_leaf, request.identifier_tree_leaf);
+        assert_eq!(walk.base_dir, request.path);
+        assert!(walk.recursive);
+    }
+
+    #[test]
     fn cloned_reader_options_preserve_hidden_scan_budget_and_pending_prefix() {
         let request = ListPathRawOptions {
             bucket: "versioned".to_owned(),
@@ -1895,6 +1918,42 @@ mod tests {
         .expect("stalled reader within failure budget should not fail a quorum listing");
 
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_is_retained_by_raw_producer_until_cancellation() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let grant = Arc::new(semaphore.clone().acquire_many_owned(4).await.expect("listing grant"));
+        let weak_grant = Arc::downgrade(&grant);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                read_budget: Some(grant),
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::StallWithSignals {
+                    entered: entered.clone(),
+                    stopped: stopped.clone(),
+                }],
+                ..Default::default()
+            },
+        ));
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("producer entered");
+        assert!(weak_grant.strong_count() >= 2, "producer must retain a grant independently of the parent");
+        assert_eq!(semaphore.available_permits(), 0);
+        worker.abort();
+        assert!(worker.await.expect_err("parent cancelled").is_cancelled());
+        timeout(Duration::from_secs(5), stopped.notified())
+            .await
+            .expect("producer stopped");
+        let _next = timeout(Duration::from_secs(5), semaphore.acquire_many(4))
+            .await
+            .expect("cancelled listing releases all permits")
+            .expect("budget stays open");
     }
 
     #[tokio::test]

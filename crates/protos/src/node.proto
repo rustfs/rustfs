@@ -116,6 +116,12 @@ message WriteAllRequest {
   bytes data = 4;
 }
 
+message WriteFormatControlRequest {
+  string disk = 1;
+  string path = 2;
+  bytes data = 3;
+}
+
 message WriteAllResponse {
   bool success = 1;
   optional Error error = 2;
@@ -577,8 +583,9 @@ message DeleteVersionsRequest {
   string volume = 2;
   repeated string versions = 3;
   string opts = 4;
-  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
-  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  // Senders dual-write for legacy peers. A nonempty versions_bin list determines
+  // the batch length and values. Malformed binary items reject the batch.
+  // An empty binary list selects the legacy versions list. Options decode independently.
   repeated bytes versions_bin = 5;
   bytes opts_bin = 6;
 }
@@ -656,10 +663,18 @@ message GenerallyLockResponse {
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Only populated by unlock RPCs.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockRequest {
   repeated string args = 1;
+}
+
+// Only explicit no-grant results permit a caller to retry without grant cleanup.
+enum LockAcquireStatus {
+  LOCK_ACQUIRE_STATUS_UNSPECIFIED = 0;
+  LOCK_ACQUIRE_STATUS_RETRYABLE_NO_GRANT = 1;
+  LOCK_ACQUIRE_STATUS_REJECTED_NO_GRANT = 2;
 }
 
 message GenerallyLockResult {
@@ -667,6 +682,8 @@ message GenerallyLockResult {
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Per-ID result for unlock batches.
+  LockAcquireStatus acquire_status = 5; // Only populated by lock batches.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockResponse {
@@ -1026,6 +1043,43 @@ message ScannerScopedDirtyUsageAckResponse {
   bytes response_proof = 8;
 }
 
+// Independent from dirty-list/ACK capability: each requested bucket yields
+// either a same-session watch proof or an explicit Unknown entry.
+message ScannerUsageWatchEntry {
+  string bucket = 1;
+  bytes bucket_incarnation = 2;
+  bytes watch_id = 3;
+  bool release = 4;
+  bytes session_id = 5;
+}
+
+message ScannerUsageWatchRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+  string owner_id = 3;
+  repeated ScannerUsageWatchEntry entries = 4;
+}
+
+message ScannerUsageWatchResult {
+  string bucket = 1;
+  bool known = 2;
+  bytes bucket_incarnation = 3;
+  bytes watch_id = 4;
+  uint64 revision = 5;
+  uint64 inflight = 6;
+  uint32 coverage_version = 7;
+  uint64 coverage_epoch = 8;
+  uint64 lease_remaining_ms = 9;
+}
+
+message ScannerUsageWatchResponse {
+  uint32 protocol_version = 1;
+  string owner_id = 2;
+  bytes session_id = 3;
+  repeated ScannerUsageWatchResult entries = 4;
+  bytes response_proof = 5;
+}
+
 // A short-lived storage-owned read admission used only around a final
 // scanner metadata publication.  It is intentionally separate from the
 // ScannerActivity observation wire so v6/v7 rolling compatibility remains
@@ -1074,6 +1128,21 @@ message ScannerPublicationLeaseReleaseResponse {
 
 message BackgroundHealStatusRequest {
   uint32 protocol_version = 1;
+}
+
+// The signed body binds the authenticated admin actor, target node and topology.
+message MrfLifecycleRequest {
+  uint32 protocol_version = 1;
+  string topology_fingerprint = 2;
+  string node_id = 3;
+  bytes command = 4;
+  bytes challenge = 5;
+}
+
+message MrfLifecycleResponse {
+  uint32 protocol_version = 1;
+  bytes result = 2;
+  bytes response_proof = 3;
 }
 
 message BackgroundHealStatusResponse {
@@ -1300,6 +1369,7 @@ service NodeService {
 
   rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
   rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
+  rpc WriteFormatControl(WriteFormatControlRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
   rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
@@ -1400,6 +1470,7 @@ service NodeService {
   rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
+  rpc MrfLifecycle(MrfLifecycleRequest) returns (MrfLifecycleResponse) {}; // auth-policy: body-bound
   rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
   rpc PeerDriveAdmission(PeerDriveAdmissionRequest) returns (PeerDriveAdmissionResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
@@ -1417,6 +1488,7 @@ service NodeService {
 
 service ScannerControlService {
   rpc ScannerScopedDirtyUsageAck(ScannerScopedDirtyUsageAckRequest) returns (ScannerScopedDirtyUsageAckResponse) {}; // auth-policy: body-bound
+  rpc ScannerUsageWatch(ScannerUsageWatchRequest) returns (ScannerUsageWatchResponse) {}; // auth-policy: body-bound
 }
 
 service HealControlService {

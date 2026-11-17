@@ -29,6 +29,7 @@ use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,6 +83,9 @@ pub struct RollingAppender {
     // Store as seconds since Unix epoch
     last_roll_ts: i64,
     rotation_retry_cooldown_until: Option<Instant>,
+    /// Woken after every successful roll so the cleaner can enforce the
+    /// directory budget on the file that was just rolled.
+    roll_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RollingAppender {
@@ -129,11 +133,18 @@ impl RollingAppender {
             size: 0,
             last_roll_ts: Zoned::now().timestamp().as_second(),
             rotation_retry_cooldown_until: None,
+            roll_signal: None,
         };
         // Eagerly open the file to validate the path and capture accurate
         // initial size / last-roll timestamp.
         appender.open_file()?;
         Ok(appender)
+    }
+
+    /// Notify `signal` after every successful roll.
+    pub(crate) fn with_roll_signal(mut self, signal: Arc<tokio::sync::Notify>) -> Self {
+        self.roll_signal = Some(signal);
+        self
     }
 
     pub(crate) fn active_file_path(&self) -> PathBuf {
@@ -289,6 +300,9 @@ impl RollingAppender {
                     counter!(METRIC_LOG_CLEANER_ROTATION_TOTAL).increment(1);
                     histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
                     gauge!(METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES).set(self.size as f64);
+                    if let Some(signal) = &self.roll_signal {
+                        signal.notify_one();
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -451,6 +465,80 @@ mod tests {
     }
 
     // ── Size-based rotation ────────────────────────────────────────────────────
+
+    /// A storm with the shipped roll behavior: the appender rolls by size and
+    /// wakes the cleaner, and the directory stays within the byte budget plus
+    /// the active file although every rolled file is younger than the age gate.
+    #[test]
+    fn log_directory_stays_bounded_under_a_storm() -> io::Result<()> {
+        use crate::cleaner::LogCleaner;
+
+        const ROLL_SIZE: u64 = 4 * 1024;
+        const BUDGET: u64 = 16 * 1024;
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut appender =
+            RollingAppender::new(&dir, "rustfs.log".to_string(), Rotation::Never, ROLL_SIZE, FileMatchMode::Suffix)?
+                .with_roll_signal(signal.clone());
+        let cleaner = LogCleaner::builder(dir.clone(), "rustfs.log".to_string(), "rustfs.log".to_string())
+            .match_mode(FileMatchMode::Suffix)
+            .keep_files(30)
+            .max_total_size_bytes(BUDGET)
+            .compress_old_files(false)
+            .min_file_age_seconds(3600)
+            .build();
+        let directory_bytes = |dir: &Path| -> io::Result<u64> {
+            let mut total = 0;
+            for entry in fs::read_dir(dir)? {
+                total += entry?.metadata()?.len();
+            }
+            Ok(total)
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+
+        let line = [b'x'; 512];
+        let mut passes = 0;
+        let mut peak = 0;
+        // 512 KiB of log lines, 32 times the budget.
+        for _ in 0..1024 {
+            appender.write_all(&line)?;
+            // The cleanup loop runs one pass per reported roll.
+            let rolled = runtime.block_on(async { tokio::time::timeout(Duration::ZERO, signal.notified()).await.is_ok() });
+            if rolled {
+                cleaner.cleanup()?;
+                passes += 1;
+            }
+            peak = peak.max(directory_bytes(&dir)?);
+        }
+        appender.flush()?;
+
+        assert!(passes > 100, "size rolls woke the cleaner {passes} times");
+        // One freshly rolled file may sit above the budget until its pass runs.
+        assert!(
+            peak <= BUDGET + 2 * ROLL_SIZE,
+            "peak directory size {peak} exceeded the budget {BUDGET} plus the active and one rolled file"
+        );
+        assert!(directory_bytes(&dir)? <= BUDGET + ROLL_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn every_successful_roll_wakes_the_roll_signal() {
+        let tmp = TempDir::new().unwrap();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut appender = RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 5, FileMatchMode::Suffix)
+            .unwrap()
+            .with_roll_signal(signal.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let woken = || runtime.block_on(async { tokio::time::timeout(Duration::ZERO, signal.notified()).await.is_ok() });
+
+        appender.write_all(b"12345").expect("write should succeed");
+        assert!(!woken(), "no roll yet");
+        appender.write_all(b"abcde").expect("write after rotation should succeed");
+        assert!(woken(), "the size roll is reported");
+        assert!(!woken(), "one roll is one wake-up");
+    }
 
     #[test]
     fn test_size_rotation_creates_archive() {

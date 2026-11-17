@@ -114,10 +114,10 @@ fn staged_commit(metadata: &Value, location: &str) -> Value {
     })
 }
 
-async fn location_claim_preserves_other_users_objects_after_drop_and_restart(backing: &str) -> TestResult {
+async fn location_claim_preserves_other_users_objects_after_drop_and_restart() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
-    let server_env = [("RUSTFS_TABLE_CATALOG_BACKING", backing)];
+    let server_env = [("RUSTFS_TABLE_CATALOG_BACKING", "object")];
     env.start_rustfs_server_without_cleanup_with_env(&[("RUSTFS_TABLE_CATALOG_BACKING", "object")])
         .await?;
     env.wait_for_server_ready().await?;
@@ -147,39 +147,6 @@ async fn location_claim_preserves_other_users_objects_after_drop_and_restart(bac
         StatusCode::OK,
     )
     .await?;
-    if backing == "durable-strong" {
-        catalog_request(
-            &env,
-            &root,
-            Method::POST,
-            &format!("/iceberg/v1/{bucket}/catalog/warehouse-index/backfill"),
-            None,
-            StatusCode::NO_CONTENT,
-        )
-        .await?;
-        let preflight = catalog_request(
-            &env,
-            &root,
-            Method::GET,
-            &format!("/iceberg/v1/{bucket}/catalog/migration"),
-            None,
-            StatusCode::OK,
-        )
-        .await?;
-        assert_eq!(preflight["blockers"], json!([]), "{preflight}");
-        let migration = catalog_request(
-            &env,
-            &root,
-            Method::POST,
-            &format!("/iceberg/v1/{bucket}/catalog/migration"),
-            None,
-            StatusCode::OK,
-        )
-        .await?;
-        assert_eq!(migration["ready_to_enable_durable_strong"], json!(true), "{migration}");
-        env.restart_server_preserving_data(vec![], &server_env).await?;
-        env.wait_for_server_ready().await?;
-    }
     admin_create_user(&env, &creator.0, &creator.1).await?;
     admin_create_user(&env, &reader.0, &reader.1).await?;
     let create_statement = json!({
@@ -341,7 +308,7 @@ async fn location_claim_preserves_other_users_objects_after_drop_and_restart(bac
         StatusCode::FORBIDDEN,
     )
     .await?;
-    if backing == "object" {
+    {
         catalog_request(
             &env,
             &creator,
@@ -408,10 +375,5 @@ async fn location_claim_preserves_other_users_objects_after_drop_and_restart(bac
 
 #[tokio::test]
 async fn object_catalog_location_claim_preserves_objects_after_drop_and_restart() -> TestResult {
-    location_claim_preserves_other_users_objects_after_drop_and_restart("object").await
-}
-
-#[tokio::test]
-async fn durable_strong_catalog_location_claim_preserves_objects_after_drop_and_restart() -> TestResult {
-    location_claim_preserves_other_users_objects_after_drop_and_restart("durable-strong").await
+    location_claim_preserves_other_users_objects_after_drop_and_restart().await
 }

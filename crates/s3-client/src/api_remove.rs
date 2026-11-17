@@ -18,13 +18,13 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::constants::{X_AMZ_BYPASS_GOVERNANCE_RETENTION, X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
+use crate::remote_error_code::RemoteErrorCode;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use hyper::body::Body;
 use hyper::body::Bytes;
+use rustfs_gateway_types::dto::ReplicationStatus;
 use rustfs_utils::HashAlgorithm;
-use s3s::S3ErrorCode;
-use s3s::dto::ReplicationStatus;
-use s3s::header::{X_AMZ_BYPASS_GOVERNANCE_RETENTION, X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use serde::Deserialize;
 use std::fmt::Display;
 use std::{
@@ -63,7 +63,7 @@ impl Default for AdvancedRemoveOptions {
     fn default() -> Self {
         Self {
             replication_delete_marker: false,
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: ReplicationStatus::PENDING,
             replication_mtime: None,
             replication_request: false,
             replication_validity_check: false,
@@ -297,7 +297,7 @@ impl TransitionClient {
                     let remove_result_clone = remove_result.clone();
                     if let Some(err) = &remove_result.err {
                         match to_error_response(err).code {
-                            S3ErrorCode::InvalidArgument | S3ErrorCode::NoSuchVersion => {
+                            RemoteErrorCode::INVALID_ARGUMENT | RemoteErrorCode::NO_SUCH_VERSION => {
                                 continue;
                             }
                             _ => (),
@@ -413,7 +413,7 @@ impl TransitionClient {
             match resp.status() {
                 StatusCode::NOT_FOUND => {
                     error_response = ErrorResponse {
-                        code: S3ErrorCode::NoSuchUpload,
+                        code: RemoteErrorCode::NO_SUCH_UPLOAD,
                         message: "The specified multipart upload does not exist.".to_string(),
                         bucket_name: bucket_name.to_string(),
                         key: object_name.to_string(),
@@ -566,7 +566,7 @@ pub async fn process_remove_multi_objects_response(
                             object_name: object.name.clone(),
                             object_version_id: version_id,
                             err: Some(std::io::Error::other(ErrorResponse {
-                                code: S3ErrorCode::Custom("ReadDeleteResponseFailed".into()),
+                                code: RemoteErrorCode::custom("ReadDeleteResponseFailed"),
                                 message: format!("read multi remove response failed: {err}"),
                                 bucket_name: bucket_name.to_string(),
                                 key: object.name.clone(),
@@ -635,7 +635,7 @@ pub async fn process_remove_multi_objects_response(
                         object_name: object.name.clone(),
                         object_version_id: version_id,
                         err: Some(std::io::Error::other(ErrorResponse {
-                            code: S3ErrorCode::Custom("UnmarshalDeleteResponseFailed".into()),
+                            code: RemoteErrorCode::custom("UnmarshalDeleteResponseFailed"),
                             message: format!(
                                 "unmarshal multi remove response failed: {err}; response_body={}",
                                 body.chars().take(DELETE_RESPONSE_PREVIEW_LEN).collect::<String>()
@@ -683,7 +683,7 @@ pub async fn process_remove_multi_objects_response(
                 object_name: removed.key.clone(),
                 object_version_id: removed.version_id,
                 err: Some(std::io::Error::other(ErrorResponse {
-                    code: S3ErrorCode::Custom(removed.code.into()),
+                    code: RemoteErrorCode::custom(removed.code),
                     message: removed.message,
                     bucket_name: "".to_string(),
                     key: removed.key,
@@ -713,7 +713,7 @@ pub async fn process_remove_multi_objects_response(
                 object_name: object_name.clone(),
                 object_version_id: object_version_id.clone(),
                 err: Some(std::io::Error::other(ErrorResponse {
-                    code: S3ErrorCode::Custom("UnmatchedDeleteResponseEntry".into()),
+                    code: RemoteErrorCode::custom("UnmatchedDeleteResponseEntry"),
                     message: error_message,
                     bucket_name,
                     key: object_name,

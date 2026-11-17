@@ -15,6 +15,7 @@
 use std::io::Write;
 
 fn main() -> shadow_rs::SdResult<()> {
+    println!("cargo:rustc-check-cfg=cfg(tokio_unstable)");
     println!("cargo:rerun-if-env-changed=RUSTFS_BUILD_VERSION");
     if let Ok(version) = std::env::var("RUSTFS_BUILD_VERSION")
         && !version.is_empty()

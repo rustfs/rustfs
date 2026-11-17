@@ -23,28 +23,27 @@
 //! backing infrastructure (in-process log ring buffer, cross-node object
 //! speedtest harness).
 
-use crate::admin::auth::authorize_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::s3::{self, S3ErrorCode};
-use crate::admin::utils::json_response;
+use crate::admin::utils::owned_json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, future::join_all};
+use futures::future::join_all;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, Uri, header::CONTENT_LENGTH};
+use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_lock::{LockLeaseInfo, LockMode, LockType, ObjectKey, get_global_lock_manager};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::header::CONTENT_TYPE;
-use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Error, S3Request, S3Response, S3Result, StdError, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -147,12 +146,12 @@ pub fn register_diagnostics_route(r: &mut S3Router<AdminOperation>) -> std::io::
 
 /// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
 /// response; the shared gate reports `InvalidRequest` "get cred failed".
-async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    if req.credentials.is_none() {
+async fn authorize(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
     }
 
-    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
     Ok(())
 }
 
@@ -183,6 +182,10 @@ pub struct LockEntry {
     #[serde(rename = "type")]
     pub lock_type: &'static str,
     pub owner: String,
+    /// Physical guards sampled for this node-local resource, version, mode and owner cohort.
+    /// Each node samples its cohorts independently.
+    /// Consumers must treat a missing count from older responses as unknown.
+    pub holder_count: u32,
     pub priority: &'static str,
     /// Wall-clock RFC3339 timestamp when the lock was acquired, if representable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,6 +198,7 @@ pub struct LockEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLocksResponse {
+    /// Resource, mode and owner rows before truncation.
     pub total: usize,
     pub truncated: bool,
     pub locks: Vec<LockEntry>,
@@ -244,6 +248,7 @@ struct LockHolderKey {
 struct TopLockState {
     acquired_at: SystemTime,
     ttl_secs: u64,
+    holder_count: u32,
     priority: &'static str,
 }
 
@@ -321,12 +326,14 @@ fn build_top_locks_response(
                     TopLockState {
                         acquired_at: lease.acquired_at,
                         ttl_secs: lease.ttl_secs,
+                        holder_count,
                         priority,
                     }
                 }
                 _ => TopLockState {
                     acquired_at: info.acquired_at,
                     ttl_secs: info.expires_at.duration_since(now).unwrap_or(Duration::ZERO).as_secs(),
+                    holder_count,
                     priority,
                 },
             };
@@ -348,6 +355,7 @@ fn build_top_locks_response(
             version: holder.resource.version.as_ref().map(|version| version.to_string()),
             lock_type: holder.mode.label(),
             owner: holder.owner,
+            holder_count: state.holder_count,
             priority: state.priority,
             since: system_time_to_rfc3339(state.acquired_at),
             elapsed_secs: now.duration_since(state.acquired_at).unwrap_or(Duration::ZERO).as_secs(),
@@ -414,11 +422,11 @@ pub struct TopLocksHandler {}
 
 #[async_trait::async_trait]
 impl Operation for TopLocksHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::TopLocksAdminAction).await?;
-        let limit = parse_top_locks_limit(&req.uri);
+        let limit = parse_top_locks_limit(req.uri());
         let response = collect_top_locks(limit).await;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -467,12 +475,12 @@ pub struct ForceUnlockHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ForceUnlockHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::ForceUnlockAdminAction).await?;
 
         // Resources may arrive as a JSON body or as repeated `resource` query params.
-        let mut resources: Vec<String> = query_values(&req.uri, "resource");
-        let body = read_body(req.input).await?;
+        let mut resources: Vec<String> = query_values(req.uri(), "resource");
+        let body = read_body(req.take_body()).await?;
         if !body.is_empty() {
             let parsed: ForceUnlockRequest = serde_json::from_slice(&body)
                 .map_err(|e| s3_error!(InvalidRequest, "invalid force-unlock request body: {}", e))?;
@@ -493,7 +501,7 @@ impl Operation for ForceUnlockHandler {
                     "namespace lock subsystem is disabled (RUSTFS_LOCK_ENABLED=false); nothing to unlock".to_string(),
                 ),
             };
-            return json_response(StatusCode::OK, &response);
+            return owned_json_response(StatusCode::OK, &response);
         };
 
         let mut results = Vec::with_capacity(resources.len());
@@ -515,7 +523,7 @@ impl Operation for ForceUnlockHandler {
             total_released,
             capability_note: None,
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -689,29 +697,16 @@ pub struct HealthInfoHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealthInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
         let response = collect_health_info().await?;
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
 // ---------------------------------------------------------------------------
 // #607 GET /v3/log — MinIO-compatible streaming log endpoint
 // ---------------------------------------------------------------------------
-
-struct ByteChannelStream {
-    inner: ReceiverStream<Result<Bytes, StdError>>,
-}
-
-impl Stream for ByteChannelStream {
-    type Item = Result<Bytes, StdError>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner.poll_next_unpin(cx)
-    }
-}
-
-impl ByteStream for ByteChannelStream {}
 
 /// A single console-log record, shaped after MinIO's `LogInfo`.
 #[derive(Debug, Clone, Serialize)]
@@ -729,7 +724,7 @@ pub struct ConsoleLogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ConsoleLogHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::ConsoleLogAdminAction).await?;
 
         // RustFS routes logs to the tracing pipeline (stdout / OTLP sinks) and
@@ -774,12 +769,13 @@ impl Operation for ConsoleLogHandler {
             }
         });
 
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_NDJSON));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(stream)), headers))
+        Ok(AdminResponse::with_headers(
+            StatusCode::OK,
+            Body::from_stream(ReceiverStream::new(rx)),
+            headers,
+        ))
     }
 }
 
@@ -1017,12 +1013,12 @@ pub struct SpeedtestHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         // MinIO gates speedtest behind the health-info (OBD) admin action.
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        let kind = speedtest_kind_from_path(req.uri.path());
+        let kind = speedtest_kind_from_path(req.uri().path());
         // Drain any request body so the connection is not left half-read.
-        let _ = read_body(req.input).await?;
+        let _ = read_body(req.take_body()).await?;
 
         let response = match kind {
             SpeedtestKind::Drive => run_drive_speedtest().await?,
@@ -1042,7 +1038,7 @@ impl Operation for SpeedtestHandler {
                 duration_secs: None,
             },
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1103,8 +1099,11 @@ async fn drain_client_devnull(input: Body, max_bytes: u64, max_duration: Duratio
     tokio::time::timeout(max_duration, async move {
         let mut input = input;
         let mut total = 0u64;
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+        while let Some(frame) = input.frame().await {
+            let frame = frame.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+            let Ok(chunk) = frame.into_data() else {
+                continue;
+            };
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|_| s3_error!(InternalError, "devnull stream chunk length exceeds supported range"))?;
             total = total
@@ -1132,13 +1131,13 @@ async fn drain_client_devnull_with_production_limits(input: Body) -> S3Result<u6
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestClientDevnullHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        validate_client_devnull_content_length(&req.headers)?;
+        validate_client_devnull_content_length(req.headers())?;
         let _permit = acquire_client_devnull_permit()?;
 
         let started = std::time::Instant::now();
-        let total = drain_client_devnull_with_production_limits(req.input).await?;
+        let total = drain_client_devnull_with_production_limits(req.take_body()).await?;
         let elapsed = started.elapsed();
 
         let response = SpeedtestResponse {
@@ -1156,18 +1155,18 @@ impl Operation for SpeedtestClientDevnullHandler {
             rx_bytes: Some(total),
             duration_secs: Some(elapsed.as_secs_f64()),
         };
-        json_response(StatusCode::OK, &response)
+        owned_json_response(StatusCode::OK, &response)
     }
 }
 
 #[async_trait::async_trait]
 impl Operation for SpeedtestClientSourceHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
-        let bytes = client_source_bytes(&req.uri)?;
+        let bytes = client_source_bytes(req.uri())?;
         let _permit = acquire_client_devnull_permit()?;
 
-        Ok(S3Response::new((StatusCode::OK, Body::from(vec![0_u8; bytes]))))
+        Ok(AdminResponse::new(StatusCode::OK, Body::from(vec![0_u8; bytes])))
     }
 }
 
@@ -1195,20 +1194,14 @@ fn query_values(uri: &Uri, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use http::{Extensions, Uri};
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
-    fn build_request(method: Method, uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     /// These endpoints authorize through the shared admin gate, which rejects a
@@ -1275,10 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn client_devnull_enforces_duration_limit() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
-        let body = Body::from(stream);
+        let body = Body::from_stream(ReceiverStream::new(rx));
 
         let err = drain_client_devnull(body, 4, Duration::ZERO)
             .await
@@ -1293,10 +1283,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn client_devnull_production_limits_enforce_advertised_timeout() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
-        let stream: DynByteStream = Box::pin(ByteChannelStream {
-            inner: ReceiverStream::new(rx),
-        });
-        let task = tokio::spawn(drain_client_devnull_with_production_limits(Body::from(stream)));
+        let task = tokio::spawn(drain_client_devnull_with_production_limits(Body::from_stream(ReceiverStream::new(rx))));
 
         tokio::task::yield_now().await;
         tokio::time::advance(CLIENT_DEVNULL_MAX_DURATION + Duration::from_millis(1)).await;
@@ -1606,6 +1593,7 @@ mod tests {
             .find(|entry| entry.object == "shared-object")
             .expect("lease-backed shared owner should be listed once");
         assert_eq!(leased.lock_type, "READ");
+        assert_eq!(leased.holder_count, 2);
         assert_eq!(leased.elapsed_secs, 50);
         assert_eq!(leased.ttl_secs, 20);
 
@@ -1615,6 +1603,7 @@ mod tests {
             .find(|entry| entry.object == "write-object")
             .expect("lease-backed exclusive holder should be listed");
         assert_eq!(exclusive.lock_type, "WRITE");
+        assert_eq!(exclusive.holder_count, 1);
         assert_eq!(exclusive.ttl_secs, 18);
 
         let direct = response
@@ -1623,6 +1612,7 @@ mod tests {
             .find(|entry| entry.object == "direct-object")
             .expect("direct fast lock should remain visible");
         assert_eq!(direct.ttl_secs, 7);
+        assert_eq!(direct.holder_count, 1);
 
         let mixed = response
             .locks
@@ -1630,6 +1620,7 @@ mod tests {
             .find(|entry| entry.object == "mixed-object")
             .expect("mixed direct and leased shared holders should remain visible");
         assert_eq!(mixed.ttl_secs, 9);
+        assert_eq!(mixed.holder_count, 2, "incomplete lease coverage must retain the physical holder count");
 
         let replaced = response
             .locks
@@ -1637,6 +1628,7 @@ mod tests {
             .find(|entry| entry.object == "replaced-object")
             .expect("a replaced lease holder should remain visible");
         assert_eq!(replaced.ttl_secs, 4);
+        assert_eq!(replaced.holder_count, 1);
 
         let remaining_shared = response
             .locks
@@ -1644,6 +1636,7 @@ mod tests {
             .find(|entry| entry.object == "remaining-shared-object")
             .expect("an older surviving shared lease should remain lease-backed");
         assert_eq!(remaining_shared.ttl_secs, 22);
+        assert_eq!(remaining_shared.holder_count, 1);
 
         let opaque = response
             .locks
@@ -1651,6 +1644,7 @@ mod tests {
             .find(|entry| entry.object == "opaque-object")
             .expect("generation-less holder should remain visible");
         assert_eq!(opaque.ttl_secs, 6);
+        assert_eq!(opaque.holder_count, 1);
     }
 
     #[test]
@@ -1685,6 +1679,76 @@ mod tests {
         let entry = response.locks.first().expect("replacement remains visible");
         assert_eq!(entry.ttl_secs, 4);
         assert_eq!(entry.elapsed_secs, 2);
+        assert_eq!(entry.holder_count, 1, "a stale lease identity must not change the physical holder count");
+    }
+
+    #[tokio::test]
+    async fn collect_top_locks_serializes_physical_holder_counts_by_owner() {
+        use rustfs_lock::{FastObjectLockManager, GlobalLockManager};
+
+        let manager = Arc::new(GlobalLockManager::Enabled(Arc::new(FastObjectLockManager::new())));
+        let fast = manager.as_fast_lock_manager().expect("enabled fixture lock manager");
+        let resource = ObjectKey::new("count-bucket", "shared-object");
+        let _first = fast
+            .acquire_read_lock(resource.clone(), "owner-a")
+            .await
+            .expect("first shared grant");
+        let _second = fast
+            .acquire_read_lock(resource.clone(), "owner-a")
+            .await
+            .expect("second shared grant for the same owner");
+        let _other_owner = fast
+            .acquire_read_lock(resource, "owner-b")
+            .await
+            .expect("shared grant for another owner");
+        let _exclusive = fast
+            .acquire_write_lock(ObjectKey::new("count-bucket", "write-object"), "owner-c")
+            .await
+            .expect("exclusive grant");
+
+        let response = collect_top_locks_with_clients(TOP_LOCKS_DEFAULT_LIMIT, manager, Vec::new()).await;
+        assert_eq!(response.total, 3, "total counts owner rows");
+        assert_eq!(response.locks.len(), 3);
+        assert!(!response.truncated);
+        let shared: Vec<_> = response
+            .locks
+            .iter()
+            .filter(|entry| entry.object == "shared-object")
+            .collect();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared.iter().map(|entry| entry.holder_count).sum::<u32>(), 3);
+        assert_eq!(
+            shared
+                .iter()
+                .find(|entry| entry.owner == "owner-a")
+                .expect("owner-a row")
+                .holder_count,
+            2,
+        );
+        assert_eq!(
+            shared
+                .iter()
+                .find(|entry| entry.owner == "owner-b")
+                .expect("owner-b row")
+                .holder_count,
+            1,
+        );
+        let exclusive = response
+            .locks
+            .iter()
+            .find(|entry| entry.object == "write-object")
+            .expect("exclusive row");
+        assert_eq!(exclusive.lock_type, "WRITE");
+        assert_eq!(exclusive.holder_count, 1);
+
+        let value = serde_json::to_value(&response).expect("serialize top locks");
+        assert_eq!(value["total"], 3);
+        let rows = value["locks"].as_array().expect("serialized lock rows");
+        let shared_owner = rows
+            .iter()
+            .find(|row| row["owner"] == "owner-a")
+            .expect("serialized owner-a row");
+        assert_eq!(shared_owner["holder_count"], 2);
     }
 
     #[tokio::test]

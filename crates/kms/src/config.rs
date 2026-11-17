@@ -1608,10 +1608,14 @@ mod tests {
         assert!(config.validate().is_err());
         assert!(config.with_insecure_development_defaults().validate().is_ok());
 
+        #[cfg(windows)]
+        let production_key_dir = PathBuf::from(r"C:\rustfs\kms");
+        #[cfg(not(windows))]
+        let production_key_dir = PathBuf::from("/var/lib/rustfs/kms");
         let production_config = KmsConfig {
             backend: KmsBackend::Local,
             backend_config: BackendConfig::Local(LocalConfig {
-                key_dir: PathBuf::from("/var/lib/rustfs/kms"),
+                key_dir: production_key_dir,
                 master_key: Some("production-master-key".to_string()),
                 file_permissions: Some(0o600),
             }),

@@ -221,7 +221,7 @@ impl NodeService {
 
     pub(super) async fn handle_local_storage_info(
         &self,
-        _request: Request<LocalStorageInfoRequest>,
+        request: Request<LocalStorageInfoRequest>,
     ) -> Result<Response<LocalStorageInfoResponse>, Status> {
         let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LocalStorageInfoResponse {
@@ -232,30 +232,104 @@ impl NodeService {
             }));
         };
 
-        let info = StorageAdminApi::local_storage_info(store.as_ref()).await;
-        match encode_msgpack_map(&info) {
-            Ok(buf) => Ok(Response::new(LocalStorageInfoResponse {
-                error_code: None,
-                success: true,
-                storage_info: buf.into(),
-                error_info: None,
-            })),
-            Err(err) => Ok(Response::new(LocalStorageInfoResponse {
-                error_code: None,
-                success: false,
-                storage_info: Bytes::new(),
-                error_info: Some(err.to_string()),
-            })),
-        }
+        Ok(Response::new(local_storage_info_response(store.as_ref(), request.into_inner()).await))
+    }
+}
+
+async fn local_storage_info_response<S>(store: &S, request: LocalStorageInfoRequest) -> LocalStorageInfoResponse
+where
+    S: StorageAdminApi<StorageInfo = rustfs_madmin::StorageInfo>,
+{
+    let info = store.local_storage_info_with_metrics(request.metrics).await;
+    match encode_msgpack_map(&info) {
+        Ok(buf) => LocalStorageInfoResponse {
+            error_code: None,
+            success: true,
+            storage_info: buf.into(),
+            error_info: None,
+        },
+        Err(err) => LocalStorageInfoResponse {
+            error_code: None,
+            success: false,
+            storage_info: Bytes::new(),
+            error_info: Some(err.to_string()),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{LocalStorageInfoRequest, StorageAdminApi, local_storage_info_response};
     use crate::storage::rpc::encode_msgpack_map;
+    use crate::storage::storage_api::contract::admin::DiskSetSelector;
     use rmp_serde::Deserializer;
     use serde::Deserialize;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[derive(Debug, Default)]
+    struct MetricsInventory {
+        requested_metrics: AtomicU8,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for MetricsInventory {
+        type BackendInfo = ();
+        type StorageInfo = rustfs_madmin::StorageInfo;
+        type Disk = ();
+        type Error = std::io::Error;
+
+        async fn backend_info(&self) {}
+
+        async fn storage_info(&self) -> Self::StorageInfo {
+            panic!("local inventory RPC must not query cluster inventory")
+        }
+
+        async fn local_storage_info(&self) -> Self::StorageInfo {
+            panic!("RPC must forward its metrics flag")
+        }
+
+        async fn local_storage_info_with_metrics(&self, include_metrics: bool) -> Self::StorageInfo {
+            self.requested_metrics.store(u8::from(include_metrics), Ordering::SeqCst);
+            rustfs_madmin::StorageInfo {
+                disks: vec![rustfs_madmin::Disk {
+                    endpoint: "/disk".to_string(),
+                    metrics: include_metrics.then(rustfs_madmin::DiskMetrics::default),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        async fn disk_set_inventory(&self, _selector: DiskSetSelector) -> Result<Vec<Option<Self::Disk>>, Self::Error> {
+            panic!("RPC must use the local storage inventory owner")
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn local_storage_info_rpc_preserves_metrics_request_flag() {
+        let store = MetricsInventory::default();
+        for include_metrics in [false, true] {
+            store.requested_metrics.store(2, Ordering::SeqCst);
+            let response = local_storage_info_response(
+                &store,
+                LocalStorageInfoRequest {
+                    metrics: include_metrics,
+                },
+            )
+            .await;
+            assert!(response.success);
+            assert_eq!(store.requested_metrics.load(Ordering::SeqCst), u8::from(include_metrics));
+            let decoded: rustfs_madmin::StorageInfo =
+                rmp_serde::from_slice(&response.storage_info).expect("local inventory RPC response must decode");
+            assert_eq!(decoded.disks[0].endpoint, "/disk");
+            assert_eq!(decoded.disks[0].metrics.is_some(), include_metrics);
+        }
+    }
 
     #[test]
     fn local_storage_info_rpc_payload_uses_msgpack_map_encoding() {

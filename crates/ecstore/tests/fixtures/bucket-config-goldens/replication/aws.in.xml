@@ -1,0 +1,12 @@
+
+<ReplicationConfiguration>
+  <Role></Role>
+  <FutureTopLevel>future</FutureTopLevel>
+  <Rule>
+    <ID>unknown</ID>
+    <Status>Enabled</Status>
+    <Destination>
+      <Bucket>arn:aws:s3:::destination</Bucket>
+    </Destination>
+  </Rule>
+</ReplicationConfiguration>

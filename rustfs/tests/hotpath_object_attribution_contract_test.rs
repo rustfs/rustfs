@@ -13,11 +13,11 @@
 // limitations under the License.
 
 const GET_OBJECT: &str = include_str!("../src/app/object/get.rs");
-const PUT_OBJECT: &str = include_str!("../src/app/object/put.rs");
+const PUT_OBJECT: &str = include_str!("../src/storage/legacy_edge/object_write.rs");
 const SELECT_OBJECT: &str = include_str!("../src/app/object/mod.rs");
 
 fn assert_async_method_is_measured(source: &str, method: &str) {
-    let method_marker = format!("pub async fn {method}");
+    let method_marker = format!("async fn {method}(");
     let method_start = source
         .find(&method_marker)
         .unwrap_or_else(|| panic!("missing method {method}"));
@@ -41,7 +41,15 @@ fn assert_async_method_is_measured(source: &str, method: &str) {
 
 #[test]
 fn object_request_profiling_is_attached_to_the_matching_operation() {
-    assert_async_method_is_measured(GET_OBJECT, "execute_get_object");
+    assert_async_method_is_measured(GET_OBJECT, "execute_get_object_fields");
+    assert!(
+        GET_OBJECT.contains("label = \"rustfs::app::object::get::DefaultObjectUsecase::execute_get_object\""),
+        "the native entry must retain the established profiling label"
+    );
     assert_async_method_is_measured(PUT_OBJECT, "execute_put_object");
-    assert_async_method_is_measured(SELECT_OBJECT, "execute_select_object_content");
+    assert_async_method_is_measured(SELECT_OBJECT, "execute_select_object_content_owned");
+    assert!(
+        SELECT_OBJECT.contains("label = \"rustfs::app::object::DefaultObjectUsecase::execute_select_object_content\""),
+        "Select must retain the established profiling label"
+    );
 }

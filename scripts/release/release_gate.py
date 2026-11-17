@@ -263,9 +263,12 @@ def validate_plan(plan):
         harness_repository = require_string(
             entry, "harness_repository", code, f"plan lane {lane}"
         )
-        harness_sha = require_hex(
-            entry.get("harness_sha"), HEX40, code, "harness_sha", f"plan lane {lane}"
-        )
+        harness_sha = entry.get("harness_sha")
+        if harness_sha == "candidate.workflow_sha":
+            if harness_repository != "rustfs/rustfs":
+                raise GateError(code, "dynamic harness identity is limited to the product repository")
+        else:
+            harness_sha = require_hex(harness_sha, HEX40, code, "harness_sha", f"plan lane {lane}")
         timeout_seconds = entry.get("timeout_seconds")
         if not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
             raise GateError(
@@ -500,7 +503,12 @@ def validate_candidate(candidate, plan_info, plan_sha256):
         )
         image = {"ref": ref, "digest": digest, "binary_sha256": image_binary}
 
+    workflow_sha = candidate.get("workflow_sha")
+    if any(lane["harness_sha"] == "candidate.workflow_sha" for lane in plan_info["lanes"].values()):
+        workflow_sha = require_hex(workflow_sha, HEX40, code, "workflow_sha", "candidate")
+
     return {
+        "workflow_sha": workflow_sha,
         "product_commit": product_commit,
         "version": version,
         "release_profile": release_profile,
@@ -616,7 +624,10 @@ def validate_envelope(envelope, plan_info, candidate_info, source_name):
 
     lane_info = plan_info["lanes"].get(lane)
     if lane_info is not None:
-        if harness_commit != lane_info["harness_sha"]:
+        expected_harness = lane_info["harness_sha"]
+        if expected_harness == "candidate.workflow_sha":
+            expected_harness = candidate_info["workflow_sha"]
+        if harness_commit != expected_harness:
             raise GateError(
                 "harness_mismatch",
                 f"{context}: harness_commit does not match the fixed harness SHA for lane {lane}",
@@ -658,6 +669,14 @@ def validate_envelope(envelope, plan_info, candidate_info, source_name):
         )
 
     artifact = envelope.get("artifact")
+    if state == "pass" and candidate_info.get("workflow_sha"):
+        if not isinstance(artifact, dict) or not artifact.get("archive_sha256") or not artifact.get("binary_sha256"):
+            raise GateError(code, f"{context}: candidate PASS must bind both archive and executable bytes")
+        target = "-".join(part for part in platform_key(platform) if part not in ("none", "msvc"))
+        name = f"rustfs-{target}-v{candidate_info['version']}.zip"
+        matches = [d for d in candidate_info["deliverables"] if d["name"] == name]
+        if len(matches) != 1 or matches[0]["sha256"] != artifact["archive_sha256"] or matches[0]["binary_sha256"] != artifact["binary_sha256"]:
+            raise GateError("digest_mismatch", f"{context}: evidence belongs to a different platform artifact")
     if artifact is not None:
         if not isinstance(artifact, dict):
             raise GateError(code, f"{context}: artifact must be an object")
@@ -734,7 +753,7 @@ def _validate_artifact_binding(artifact, candidate_info, context, case_id, lane)
 # ---------------------------------------------------------------------------
 
 
-def run_validate(plan_path, candidate_path, results_dir, output_dir):
+def run_validate(plan_path, candidate_path, results_dir, output_dir, scope="full"):
     findings = []
     plan_info = None
     candidate_info = None
@@ -755,6 +774,10 @@ def run_validate(plan_path, candidate_path, results_dir, output_dir):
         return 1
 
     required = expand_required(plan_info["lanes"], candidate_info["release_profile"])
+    if scope == "linux":
+        required = [case for case in required if case["platform"]["os"] == "linux"]
+    elif scope != "full":
+        raise GateError("plan_invalid", "unknown validation scope")
     expansion = {
         "schema_version": SCHEMA_VERSION,
         "plan_sha256": plan_info["plan_sha256"],
@@ -915,7 +938,7 @@ def run_validate(plan_path, candidate_path, results_dir, output_dir):
                 )
             )
 
-    _write_outputs(output, findings, plan_info, candidate_info, required, envelopes)
+    _write_outputs(output, findings, plan_info, candidate_info, required, envelopes, scope=scope)
     return 1 if findings else 0
 
 
@@ -939,12 +962,13 @@ def _validate_batch(document, candidate_info, source_name):
     return {"run_id": run_id, "run_attempt": run_attempt, "status": status}
 
 
-def _write_outputs(output, findings, plan_info, candidate_info, required, envelopes):
+def _write_outputs(output, findings, plan_info, candidate_info, required, envelopes, scope="full"):
     state = "blocked" if findings else "pass"
     summary = {
         "schema_version": SCHEMA_VERSION,
         "state": state,
-        "publish_allowed": not findings,
+        "scope": scope,
+        "publish_allowed": not findings and scope == "full",
         "plan_sha256": plan_info["plan_sha256"] if plan_info else None,
         "candidate_sha256": candidate_info["candidate_sha256"] if candidate_info else None,
         "product_commit": candidate_info["product_commit"] if candidate_info else None,
@@ -972,7 +996,7 @@ def _write_outputs(output, findings, plan_info, candidate_info, required, envelo
         "# Release gate summary",
         "",
         f"- state: {state}",
-        f"- publish_allowed: {str(not findings).lower()}",
+        f"- publish_allowed: {str(summary['publish_allowed']).lower()}",
         f"- plan_sha256: {summary['plan_sha256']}",
         f"- candidate_sha256: {summary['candidate_sha256']}",
         f"- required cases: {len(required)}",
@@ -1190,6 +1214,7 @@ def main(argv=None):
     validate_parser.add_argument("--candidate", required=True)
     validate_parser.add_argument("--results", required=True)
     validate_parser.add_argument("--output", required=True)
+    validate_parser.add_argument("--scope", choices=("full", "linux"), default="full")
 
     promote_parser = subparsers.add_parser(
         "verify-promotion", help="re-check to-be-published bytes against the passed list"
@@ -1216,6 +1241,7 @@ def main(argv=None):
                 arguments.candidate,
                 arguments.results,
                 arguments.output,
+                scope=arguments.scope,
             )
         except GateError as error:
             print(f"{error.code}: {error.message}", file=sys.stderr)

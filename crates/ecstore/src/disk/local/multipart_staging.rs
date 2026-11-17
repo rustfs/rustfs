@@ -221,6 +221,22 @@ impl MultipartSourceAdmission {
         super::multipart_source_state::validate_source_mutation(&self.source, &self.base, &self.publication_root, self.initial)
             .map_err(std::io::Error::other)
     }
+
+    pub(super) fn validate_part_settlement(&self, transaction: &Path) -> std::io::Result<bool> {
+        match self.validate() {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                // A cached parent FD can still name the transaction after Abort
+                // moved its upload to trash. With SourceRW held, an absent
+                // canonical transaction is already settled. Resolve beneath the
+                // publication root so aliases and access errors remain failures.
+                match os::pin_multipart_source_directory(transaction, &self.base, &self.publication_root) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    _ => Err(error),
+                }
+            }
+        }
+    }
 }
 
 /// The retirement record is native-only, even through raw file RPCs.
@@ -444,7 +460,6 @@ impl LocalDisk {
             {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "multipart source layout changed"));
             }
-            let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             if incoming.data.is_none() && !incoming.is_remote() {
                 let source_data_dir = source_object.join(source_dir.to_string());
                 let mut pinned_source_data = None;
@@ -455,8 +470,11 @@ impl LocalDisk {
                     }
                     let meta_name = format!("part.{}.meta", part.number);
                     let actual = if let Some(cached_part) =
-                        super::multipart_source_state::get_active_multipart_source_part(&source_object, part.number)
-                    {
+                        super::multipart_source_state::get_active_multipart_source_part_with_head(
+                            &source_object,
+                            part.number,
+                            from_active_cache,
+                        ) {
                         cached_part
                     } else {
                         if pinned_source_data.is_none() {
@@ -506,6 +524,8 @@ impl LocalDisk {
                     sync_directory,
                     cancelled,
                 )?;
+            } else {
+                let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             }
             let has_state = !from_active_cache
                 && (source_object.join(".mpu-source-state").exists()
@@ -1266,6 +1286,39 @@ mod tests {
             .await
             .expect("non-part empty hash cleanup must remain supported");
         assert!(!directory.exists(), "a per-upload safety guard must not strand empty hash directories");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multipart_source_settlement_admission_distinguishes_absence_from_aliases() {
+        let (root, disk, info, _) = fixture().await;
+        let part = format!("upload/{}/part.1", info.data_dir.expect("fixture data directory"));
+        let transaction = disk
+            .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(&part))
+            .expect("canonical transaction path");
+        let admission = disk
+            .multipart_source_admission(RUSTFS_META_MULTIPART_BUCKET, &part, true, false)
+            .expect("canonical source admission")
+            .expect("multipart admission");
+        std::fs::remove_file(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join("upload/xl.meta"))
+            .expect("retire the source head");
+        assert!(admission.validate().is_err(), "the closed source must reject mutations");
+        std::fs::create_dir_all(&transaction).expect("an existing transaction under the closed source");
+        assert!(
+            admission.validate_part_settlement(&transaction).is_err(),
+            "an existing transaction still requires active-source authority"
+        );
+        std::fs::remove_dir(&transaction).expect("remove only the fixture transaction");
+        assert!(
+            !admission
+                .validate_part_settlement(&transaction)
+                .expect("an absent transaction is already settled")
+        );
+        std::os::unix::fs::symlink(root.path().join("absent"), &transaction).expect("inject a dangling transaction alias");
+        assert!(
+            admission.validate_part_settlement(&transaction).is_err(),
+            "a dangling alias must retain the source admission failure"
+        );
     }
 
     #[tokio::test]

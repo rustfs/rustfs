@@ -708,7 +708,7 @@ pub fn create_multi_cert_resolver(
     for (domain, (certs, key)) in cert_key_pairs {
         let certified_key = validate_certified_key(&certs, &key, &domain, true).map_err(io::Error::other)?;
         if domain == "default" {
-            default_cert = Some(Arc::new(certified_key.clone()));
+            default_cert = Some(Arc::new(certified_key));
         } else {
             resolver
                 .add(&domain, certified_key)

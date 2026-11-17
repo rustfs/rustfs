@@ -74,7 +74,7 @@ impl ResolverState {
             let certified_key = CertifiedKey::new(certs, signing_key);
 
             if domain.as_str() == "default" {
-                default_cert = Some(Arc::new(certified_key.clone()));
+                default_cert = Some(Arc::new(certified_key));
             } else {
                 cert_resolver
                     .add(&domain, certified_key)

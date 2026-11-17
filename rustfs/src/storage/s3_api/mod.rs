@@ -17,12 +17,25 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
-pub(crate) use crate::app::object::{reject_veeam_sosapi_mutation, s3_response_version_id};
-use crate::app::{
-    bucket_usecase::DefaultBucketUsecase, multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase,
+use crate::app::bucket_usecase::DefaultBucketUsecase;
+pub(crate) use crate::app::bucket_usecase::{
+    NotificationDestination, PreparedLifecycleConfiguration, validate_lifecycle_rule_status,
+};
+pub(crate) use crate::app::multipart_usecase::{
+    AbortMultipartUploadTarget, CreateMultipartUploadFields, DefaultMultipartUsecase, ListPartsFields, ListPartsTarget,
+    UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput, reject_abort_capabilities,
+};
+pub(crate) use crate::app::object::shared::mark_on_demand_migration_list_local_only;
+pub(crate) use crate::app::object::{
+    CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, PutObjectWriteInput, PutObjectWriteOutput, legacy_put_body,
+};
+pub(crate) use crate::app::object_usecase::DefaultObjectUsecase;
+pub(crate) use crate::app::object_usecase::{
+    DeleteBatchETag, DeleteBatchEntry, DeleteBatchInput, DeleteBatchOutput, GetObjectAttributesFields,
+    GetObjectAttributesOutputFacts, GetObjectBody, GetObjectFields, GetObjectOutputFacts, HeadObjectFields,
+    HeadObjectOutputFacts,
 };
 
-pub(crate) mod acl;
 pub(crate) mod bucket;
 pub(crate) mod common;
 pub(crate) mod multipart;

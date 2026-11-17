@@ -1,0 +1,6 @@
+<testsuite name="rustfs" tests="4">
+  <testcase name="alpha" classname="rustfs::s3"/>
+  <testcase name="beta" classname="rustfs::s3"/>
+  <testcase name="gamma" classname="rustfs::s3"><skipped/></testcase>
+  <testcase name="delta" classname="rustfs::iam"/>
+</testsuite>

@@ -16,7 +16,7 @@
 //!
 //! These strings are part of the on-disk format, not HTTP header names. They
 //! happen to spell S3 header names, and some were historically taken from
-//! `s3s::header` or duplicated in `rustfs_utils::http::headers`, which let an
+//! the s3s `header` module or duplicated in `rustfs_utils::http::headers`, which let an
 //! HTTP-library or header-table edit silently change what is written to and
 //! looked up in xl.meta. Map lookups are exact, so every byte (including ASCII
 //! case) is load-bearing and existing xl.meta cannot be rewritten in bulk:
@@ -129,7 +129,7 @@ mod tests {
 
     /// Migration-period cross-check: the constants must equal the historical
     /// `rustfs_utils` sources callers used before this module existed. The
-    /// `s3s::header` half was dropped with filemeta's `s3s` dependency (A3c);
+    /// s3s `header` half was dropped with filemeta's `s3s` dependency (A3c);
     /// `PINNED` and the pre-module fixture keep pinning those bytes.
     #[test]
     fn persisted_metadata_keys_match_their_historical_sources() {

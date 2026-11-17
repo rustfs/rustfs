@@ -100,9 +100,47 @@ use std::io::Cursor;
 use std::io::Write;
 use std::mem;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::error;
+
+/// Whether a body of `size` bytes hashes its ETag MD5 off the request's task
+/// (`RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES`, read once).
+fn md5_offload_for(size: i64) -> bool {
+    static MIN_BYTES: OnceLock<u64> = OnceLock::new();
+    let min_bytes = *MIN_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+            rustfs_config::DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+        )
+    });
+    min_bytes > 0 && u64::try_from(size).is_ok_and(|size| size >= min_bytes)
+}
+
+/// Hash behind an object's ETag when the client sent no Content-MD5. A body
+/// with Content-MD5 always hashes with MD5 so the check stays exact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EtagAlgorithm {
+    /// The S3 convention.
+    #[default]
+    Md5,
+    /// XXH3-128 in the same 32-hex-digit form, for buckets whose clients never
+    /// treat the ETag as an MD5 (per-bucket `etag.json`).
+    Xxh3,
+}
+
+/// The ETag reader for a body of `size` bytes: XXH3 when requested and the
+/// client sent no Content-MD5, otherwise MD5, hashed off the request's task
+/// when the body is large.
+fn etag_reader<R>(inner: R, md5hex: &Option<String>, size: i64, algorithm: EtagAlgorithm) -> EtagReader<R> {
+    let reader = EtagReader::new(inner, md5hex.clone());
+    if md5hex.is_none() && algorithm == EtagAlgorithm::Xxh3 {
+        reader.with_xxh3_etag(true)
+    } else {
+        reader.with_md5_offload(md5_offload_for(size))
+    }
+}
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
@@ -163,12 +201,12 @@ impl HashReader {
         let inner = if size > 0 {
             let hard_limit_reader = HardLimitReader::new(inner, size);
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(hard_limit_reader, md5hex.clone()))
+                boxed_reader(etag_reader(hard_limit_reader, &md5hex, size, EtagAlgorithm::Md5))
             } else {
                 boxed_reader(hard_limit_reader)
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5))
         } else {
             boxed_reader(inner)
         };
@@ -201,15 +239,32 @@ impl HashReader {
     where
         R: crate::ReadStream + 'static,
     {
+        Self::from_stream_with_etag(inner, size, actual_size, md5hex, sha256hex, diskable_md5, EtagAlgorithm::Md5)
+    }
+
+    /// [`HashReader::from_stream`] with the hash behind the ETag of a body
+    /// that carries no Content-MD5.
+    pub fn from_stream_with_etag<R>(
+        inner: R,
+        size: i64,
+        actual_size: i64,
+        md5hex: Option<String>,
+        sha256hex: Option<String>,
+        diskable_md5: bool,
+        etag: EtagAlgorithm,
+    ) -> std::io::Result<Self>
+    where
+        R: crate::ReadStream + 'static,
+    {
         let inner = WarpReader::new(inner);
         let inner = if size > 0 {
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(HardLimitReader::new(inner, size), md5hex.clone()))
+                boxed_reader(etag_reader(HardLimitReader::new(inner, size), &md5hex, size, etag))
             } else {
                 boxed_reader(HardLimitReader::new(inner, size))
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size, etag))
         } else {
             boxed_reader(inner)
         };
@@ -306,11 +361,11 @@ impl HashReader {
                 inner = Box::new(hr);
 
                 if !diskable_md5 && !inner.is_hash_reader() {
-                    let er = EtagReader::new(inner, md5hex.clone());
+                    let er = etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5);
                     inner = Box::new(er);
                 }
             } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-                let er = EtagReader::new(inner, md5hex.clone());
+                let er = etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5);
                 inner = Box::new(er);
             }
 
@@ -669,6 +724,40 @@ mod tests {
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn from_stream_with_etag_selects_the_etag_hash() {
+        use md5::{Digest, Md5};
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7) as u8).collect();
+        let size = data.len() as i64;
+        let md5 = hex_simd::encode_to_string(Md5::digest(&data), hex_simd::AsciiCase::Lower);
+        let xxh3 = hex_simd::encode_to_string(xxhash_rust::xxh3::xxh3_128(&data).to_be_bytes(), hex_simd::AsciiCase::Lower);
+
+        let etag_of = |etag: EtagAlgorithm, content_md5: Option<String>| {
+            let data = data.clone();
+            async move {
+                let mut reader = HashReader::from_stream_with_etag(
+                    BufReader::new(Cursor::new(data)),
+                    size,
+                    size,
+                    content_md5,
+                    None,
+                    false,
+                    etag,
+                )
+                .expect("reader");
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).await.map(|_| reader.try_resolve_etag())
+            }
+        };
+
+        assert_eq!(etag_of(EtagAlgorithm::Xxh3, None).await.expect("read"), Some(xxh3));
+        assert_eq!(etag_of(EtagAlgorithm::Md5, None).await.expect("read"), Some(md5.clone()));
+        // Content-MD5 always gets MD5, and a wrong one still fails.
+        assert_eq!(etag_of(EtagAlgorithm::Xxh3, Some(md5.clone())).await.expect("read"), Some(md5));
+        let wrong = hex_simd::encode_to_string(Md5::digest(b"other"), hex_simd::AsciiCase::Lower);
+        assert!(etag_of(EtagAlgorithm::Xxh3, Some(wrong)).await.is_err());
+    }
 
     #[tokio::test]
     async fn test_hashreader_wrapping_logic() {
@@ -1268,5 +1357,105 @@ mod trailer_tests {
         let mut outer = HashReader::new(Box::new(inner), size, size, None, None, false).expect("outer hash reader");
         let err = read_all(&mut outer).await.expect_err("mismatch through a wrapper must fail");
         assert_checksum_mismatch(&err);
+    }
+
+    #[tokio::test]
+    async fn wrapping_hash_reader_rejects_already_read_conflicting_checksum_and_size() {
+        let data = b"wrapping validation payload";
+        let size = data.len() as i64;
+
+        // 1. Wrapping a HashReader that has already been partially read must fail.
+        let mut inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let mut one = [0u8; 1];
+        inner.read_exact(&mut one).await.expect("read one byte");
+        assert_eq!(inner.bytes_read(), 1);
+        let err = HashReader::new(Box::new(inner), size, size, None, None, false)
+            .err()
+            .expect("wrapping after read must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("already read"));
+
+        // 2. Wrapping a HashReader with a conflicting MD5 checksum must fail.
+        let inner = HashReader::from_stream(
+            Cursor::new(data.to_vec()),
+            size,
+            size,
+            Some("11111111111111111111111111111111".to_string()),
+            None,
+            false,
+        )
+        .expect("inner with md5");
+        let err = HashReader::new(
+            Box::new(inner),
+            size,
+            size,
+            Some("22222222222222222222222222222222".to_string()),
+            None,
+            false,
+        )
+        .err()
+        .expect("conflicting md5 checksum must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum mismatch"));
+
+        // 3. Wrapping a HashReader with a conflicting positive size must fail.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let err = HashReader::new(Box::new(inner), size + 10, size, None, None, false)
+            .err()
+            .expect("conflicting positive size must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("size mismatch"));
+
+        // 4. Wrapping an unbounded (-1) HashReader propagates newly discovered positive size and actual_size.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), -1, -1, None, None, false).expect("unbounded inner");
+        let outer = HashReader::new(Box::new(inner), size, size, Some("abcd".to_string()), None, false).expect("outer");
+        assert_eq!(outer.size(), size);
+        assert_eq!(outer.actual_size(), size);
+    }
+
+    #[tokio::test]
+    async fn hash_reader_checksum_helpers_reject_invalid_inputs() {
+        let data = b"checksum helper validation";
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("reader");
+
+        // add_calculated_checksum rejects both NONE and INVALID checksum types.
+        let err = reader
+            .add_calculated_checksum(ChecksumType::NONE)
+            .expect_err("NONE checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = reader
+            .add_calculated_checksum(ChecksumType::INVALID)
+            .expect_err("INVALID checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_non_trailing_checksum handles None as a no-op and rejects a Checksum with no hasher.
+        reader.add_non_trailing_checksum(None, false).expect("None is no-op");
+        let invalid_checksum = Checksum {
+            checksum_type: ChecksumType::INVALID,
+            encoded: "AAAA".to_string(),
+            raw: vec![1, 2, 3, 4],
+            want_parts: 0,
+        };
+        let err = reader
+            .add_non_trailing_checksum(Some(invalid_checksum), false)
+            .expect_err("invalid checksum_type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_checksum_no_trailer attaches a direct header checksum without trailer reader.
+        let mut reader =
+            HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("fresh reader");
+        assert!(reader.checksum().is_none(), "HashReader::checksum() is None when no content_hash is set");
+        let crc32_val = encoded(ChecksumType::CRC32C, data);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-crc32c", HeaderValue::from_str(&crc32_val).expect("header"));
+        reader
+            .add_checksum_no_trailer(&headers, false)
+            .expect("direct header checksum");
+        assert!(
+            reader.checksum().is_some(),
+            "HashReader::checksum() returns Some after add_checksum_no_trailer"
+        );
+        assert_eq!(read_all(&mut reader).await.expect("verified"), data);
     }
 }
