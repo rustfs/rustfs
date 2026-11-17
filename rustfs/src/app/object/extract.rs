@@ -2355,6 +2355,9 @@ impl DefaultObjectUsecase {
             extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);
 
             let mut auth_req = envelope.fork_for_authorization();
+            // The outer archive's cached tags may predate an overwrite of this
+            // same key; each member needs a fresh authorization snapshot.
+            let _ = auth_req.take_object_tag_conditions();
             {
                 let req_info = extract_try!(req_info_mut(&mut auth_req));
                 req_info.bucket = Some(bucket.clone());
@@ -3865,6 +3868,104 @@ mod tests {
                         .expect_err("denied member absent");
                     assert!(is_err_object_not_found(&missing), "{missing}");
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_member_iam_reloads_outer_cached_tags_after_change() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::BUCKET_POLICY_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::{StorageObjectOptions, StoragePutObjReader};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-stale-member-tags-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":"s3:PutObject",
+                 "Resource":format!("arn:aws:s3:::{bucket}/*"),
+                 "Condition":{"StringEquals":{"s3:ExistingObjectTag/classification":"private"}}}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install bucket policy");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (key, current_tag, allowed) in [("changed.tar", "private", false), ("unchanged.tar", "public", true)] {
+            let opts = |tag: &str| StorageObjectOptions {
+                user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_owned(), format!("classification={tag}"))]),
+                ..Default::default()
+            };
+            store
+                .put_object(&bucket, key, &mut StoragePutObjReader::from_vec(b"before".to_vec()), &opts("public"))
+                .await
+                .expect("create public original");
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_ustar();
+            header.set_size(1);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, key, &b"x"[..])
+                .await
+                .expect("archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let input = PutObjectInput {
+                bucket: bucket.clone(),
+                key: key.to_owned(),
+                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
+                ..Default::default()
+            };
+            let mut request = build_request(input, Method::PUT);
+            let req_info = ReqInfo {
+                bucket: Some(bucket.clone()),
+                object: Some(key.to_owned()),
+                ..Default::default()
+            };
+            request.extensions.insert(req_info);
+            let mut envelope = RequestEnvelope::from_s3s(&request);
+            authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectAction))
+                .await
+                .expect("outer authorization caches public tags");
+            assert!(envelope.object_tag_conditions().is_some(), "outer tag lookup must be exercised");
+            if !allowed {
+                store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut StoragePutObjReader::from_vec(b"private original".to_vec()),
+                        &opts(current_tag),
+                    )
+                    .await
+                    .expect("change the object after outer authorization");
+            }
+            let before = store
+                .get_object_info(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("object before");
+            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
+            let after = store
+                .get_object_info(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("object after");
+            if allowed {
+                result.expect("unchanged public member is allowed");
+                assert_eq!(after.size, 1);
+            } else {
+                assert_eq!(result.err().expect("private member must be denied").code().as_str(), "AccessDenied");
+                assert_eq!(after.etag, before.etag, "denied member must not overwrite");
+                assert_eq!(after.user_tags.as_str(), "classification=private");
             }
         }
     }
