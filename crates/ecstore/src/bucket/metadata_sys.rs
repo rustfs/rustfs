@@ -1794,9 +1794,12 @@ async fn get_delete_and_quota_config_from_disk_in(
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
             if let Some(expected) = expiry_policy {
-                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
-                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
-                if !expected.matches_configuration(current) {
+                let raw = &metadata.lifecycle_config_xml;
+                let current = (!raw.is_empty())
+                    .then(|| super::utils::deserialize::<PersistedLifecycleConfiguration>(raw))
+                    .transpose()
+                    .map_err(|_| unreadable_config_error(bucket, BUCKET_LIFECYCLE_CONFIG, raw.len()))?;
+                if !expected.matches_configuration(current.as_ref()) {
                     return Err(Error::PreconditionFailed);
                 }
             }
@@ -1832,7 +1835,9 @@ pub(crate) async fn integrity_migration_metadata_in(
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
-            Ok(metadata)
+            let mut metadata = Arc::unwrap_or_clone(metadata);
+            metadata.parse_all_configs()?;
+            Ok(Arc::new(metadata))
         }
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         _ => Err(Error::other("migration requires authoritative bucket metadata")),
@@ -3508,7 +3513,7 @@ impl BucketMetadataSys {
                 Some(guard),
                 bucket,
                 "bucket metadata authoritative snapshot",
-                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, true),
+                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
         match bucket_info_res {
@@ -3517,11 +3522,12 @@ impl BucketMetadataSys {
             Err(err) => return Err(err),
         }
 
-        let (metadata, persisted) = metadata_res?;
+        let (mut metadata, persisted) = metadata_res?;
         if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {
+            metadata.parse_admission_configs();
             let metadata = Arc::new(metadata);
             if can_use_local_authority_cache
                 && metadata.bucket_incarnation_sidecar
