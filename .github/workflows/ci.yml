@@ -713,8 +713,9 @@ jobs:
 
       # The gateway stack's own tests: the assembly, the operation table and
       # its completeness, the shared handler sequence, the stack selection, and
-      # the embedded server driven through the whole middleware stack. The
-      # filter names modules, never operations.
+      # the embedded server driven through the whole middleware stack, and the
+      # Vector protocol and application tests driven by the AWS SDK. The filter
+      # names modules, never operations.
       - name: Run tests with gateway-stack
         env:
           # The same bounded link concurrency as the other feature lanes.
@@ -722,7 +723,7 @@ jobs:
         run: |
           cargo nextest run --profile ci --locked -p rustfs --features gateway-stack --no-tests fail \
             --status-level all --final-status-level all \
-            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | binary(embedded_gateway_stack_test)'
+            -E 'test(/gateway_stack|gateway_handlers|server::stack::/) | test(vector::protocol::gateway) | test(app::vector_usecase::tests::) | binary(embedded_gateway_stack_test)'
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary

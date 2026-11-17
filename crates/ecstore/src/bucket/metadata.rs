@@ -896,6 +896,22 @@ impl BucketMetadata {
         .map_err(Error::other)
     }
 
+    pub(crate) fn validate_managed_bucket_delete_identity(&self, expected: &BucketHandle) -> Result<()> {
+        if self.bucket_kind()? != BucketKind::Vector {
+            return Err(Error::PreconditionFailed);
+        }
+        let binding = self
+            .identity_record()?
+            .and_then(|record| record.binding)
+            .ok_or_else(|| identity_config_error("vector bucket binding is missing"))?;
+        let account = AccountNamespaceId::try_new(binding.account_namespace_id).map_err(Error::other)?;
+        let current = self.bucket_handle(&account, &binding.region)?;
+        if current != *expected {
+            return Err(Error::PreconditionFailed);
+        }
+        Ok(())
+    }
+
     /// Compare the complete current binding with a previously resolved identity.
     /// # Errors
     /// Rejects changed identities, incomplete creation, and unsupported managed configuration.
@@ -928,6 +944,67 @@ impl BucketMetadata {
         })
         .map_err(Error::other)?;
         Ok(())
+    }
+
+    pub(crate) fn managed_config_mutation_data(
+        &self,
+        mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+    ) -> Result<Vec<u8>> {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        use rustfs_gateway_types::cors_tagging::PersistedTag;
+        use rustfs_policy::policy::Validator as _;
+
+        let invalid = |message: &str| Error::InvalidArgument(self.name.clone(), String::new(), message.to_owned());
+        let tagging = match mutation {
+            ManagedBucketConfigMutation::PutPolicy { policy_json } => {
+                let policy: BucketPolicy =
+                    serde_json::from_slice(&policy_json).map_err(|_| invalid("Invalid bucket policy JSON"))?;
+                policy.is_valid().map_err(|error| invalid(&error.to_string()))?;
+                return Ok(policy_json);
+            }
+            ManagedBucketConfigMutation::DeletePolicy => return Ok(Vec::new()),
+            ManagedBucketConfigMutation::Tag { tags } => {
+                let mut merged = ConfigState::of(&self.tagging_config_xml, &self.tagging_config)
+                    .require(&self.name, BUCKET_TAGGING_CONFIG)?
+                    .cloned()
+                    .unwrap_or_default();
+                merged
+                    .tag_set
+                    .retain(|tag| !tag.key.as_ref().is_some_and(|key| tags.contains_key(key)));
+                merged.tag_set.extend(tags.into_iter().map(|(key, value)| PersistedTag {
+                    key: Some(key),
+                    value: Some(value),
+                }));
+                merged
+            }
+            ManagedBucketConfigMutation::Untag { keys } => {
+                let removed = keys
+                    .iter()
+                    .map(|key| PersistedTag {
+                        key: Some(key.clone()),
+                        value: Some(String::new()),
+                    })
+                    .collect::<Vec<_>>();
+                validate_tag_set_entries(&removed).map_err(invalid)?;
+                let mut merged = ConfigState::of(&self.tagging_config_xml, &self.tagging_config)
+                    .require(&self.name, BUCKET_TAGGING_CONFIG)?
+                    .cloned()
+                    .unwrap_or_default();
+                merged
+                    .tag_set
+                    .retain(|tag| !tag.key.as_ref().is_some_and(|key| keys.contains(key)));
+                merged
+            }
+        };
+        if tagging.tag_set.len() > MAX_BUCKET_TAGS {
+            return Err(invalid("Cannot have more than 50 tags per bucket"));
+        }
+        validate_tag_set_entries(&tagging.tag_set).map_err(invalid)?;
+        if tagging.tag_set.is_empty() {
+            Ok(Vec::new())
+        } else {
+            super::utils::serialize(&tagging).map_err(Error::other)
+        }
     }
 
     pub(crate) fn validate_managed_configuration(&self) -> Result<()> {

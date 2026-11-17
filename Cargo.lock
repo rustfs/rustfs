@@ -1384,6 +1384,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-s3vectors"
+version = "1.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71aa949b63ee8d8451d678f4139b10d716990dd8b665c6ecfa4a4682b62ee645"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.121.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7337,12 +7362,11 @@ dependencies = [
 [[package]]
 name = "lance-bitpacking"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a49bf11e09df37ca96fe371287d719afade058a827f6f5fcee5fbb0b36b6d61"
+source = "git+https://github.com/GatewayJ/lance?rev=35a95d99a1f413d9cad0427837ee6939974a1570#35a95d99a1f413d9cad0427837ee6939974a1570"
 dependencies = [
  "arrayref",
  "crunchy",
- "paste",
+ "pastey",
  "seq-macro",
 ]
 
@@ -9664,12 +9688,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11611,6 +11629,8 @@ dependencies = [
  "atomic_enum",
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-s3vectors",
+ "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
@@ -12094,7 +12114,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway"
 version = "0.67.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -12141,7 +12161,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-core"
 version = "0.64.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "bytes",
  "futures-core",
@@ -12162,7 +12182,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-dialect-rustfs-admin"
 version = "0.13.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -12176,7 +12196,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -12194,7 +12214,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12204,7 +12224,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-sig"
 version = "0.16.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
@@ -12219,7 +12239,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -12230,7 +12250,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.42.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -12253,7 +12273,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=60c4e3af74214ca3a0aedd1678ffd6ba638f8d12#60c4e3af74214ca3a0aedd1678ffd6ba638f8d12"
+source = "git+https://github.com/rustfs/gateway.git?rev=2060fa3b138f875bdce9129703829b1e9ef68afa#2060fa3b138f875bdce9129703829b1e9ef68afa"
 dependencies = [
  "quick-xml 0.41.0",
 ]
@@ -14266,13 +14286,12 @@ dependencies = [
 [[package]]
 name = "simba"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c99284beb21666094ba2b75bbceda012e610f5479dfcc2d6e2426f53197ffd95"
+source = "git+https://github.com/GatewayJ/simba?rev=e2dbec306b6f30593d105c4410582a77196fda37#e2dbec306b6f30593d105c4410582a77196fda37"
 dependencies = [
  "approx",
  "num-complex",
  "num-traits",
- "paste",
+ "pastey",
  "wide",
 ]
 

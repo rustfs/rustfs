@@ -30,6 +30,22 @@ pub enum BucketKind {
     Vector,
 }
 
+/// Restricted configuration changes for a resolved Vector bucket.
+/// The caller authorizes the corresponding Vector operation before storage mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedBucketConfigMutation {
+    PutPolicy {
+        policy_json: Vec<u8>,
+    },
+    DeletePolicy,
+    Tag {
+        tags: std::collections::BTreeMap<String, String>,
+    },
+    Untag {
+        keys: std::collections::BTreeSet<String>,
+    },
+}
+
 /// Invalid identity syntax or an operation outside a managed object scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketIdentityError {

@@ -2600,8 +2600,200 @@ async fn catalog_vector_v3_parent_registration_rejects_retained_old_incarnation(
 
 type NativeVectorParentStorage = crate::storage_api::startup::services::ECStore;
 
+#[tokio::test]
+async fn catalog_vector_namespace_creation_rejects_inactive_exact_records() {
+    for state in [
+        TableCatalogEntryState::Renaming,
+        TableCatalogEntryState::Deleting,
+        TableCatalogEntryState::Deleted,
+    ] {
+        let fixture = prepared_fixture().await;
+        let bucket = fixture.bucket.storage_bucket_id().as_str();
+        let namespace = Namespace::parse("indexes").unwrap();
+        let path = fixture.store.paths.namespace_entry_path(bucket, &namespace);
+        let mut inactive = test_namespace_entry(bucket, &namespace);
+        inactive.state = state;
+        inactive.properties.insert("owner".into(), "original".into());
+        fixture
+            .backend
+            .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&inactive).unwrap())
+            .await;
+        let before = fixture.backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap();
+        assert_matches!(
+            fixture.store.create_namespace(test_namespace_entry(bucket, &namespace)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        let after = fixture.backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap();
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.etag, before.etag);
+        assert_eq!(after.body_revision, before.body_revision);
+    }
+}
+
+#[tokio::test]
+async fn catalog_vector_namespace_lookup_preserves_inactive_exact_records() {
+    for state in [
+        TableCatalogEntryState::Renaming,
+        TableCatalogEntryState::Deleting,
+        TableCatalogEntryState::Deleted,
+    ] {
+        for has_index in [false, true] {
+            let fixture = prepared_fixture().await;
+            let bucket = fixture.bucket.storage_bucket_id().as_str();
+            let namespace = Namespace::parse("indexes").unwrap();
+            if !has_index {
+                let table_path =
+                    fixture
+                        .store
+                        .paths
+                        .table_entry_path(bucket, &namespace, &CatalogName::parse("index.v1").unwrap());
+                assert!(
+                    fixture
+                        .backend
+                        .state
+                        .lock()
+                        .await
+                        .objects
+                        .remove(&(RUSTFS_META_BUCKET.into(), table_path))
+                        .is_some()
+                );
+            }
+            let path = fixture.store.paths.namespace_entry_path(bucket, &namespace);
+            let mut inactive = test_namespace_entry(bucket, &namespace);
+            inactive.state = state.clone();
+            inactive.properties.insert("owner".into(), "original".into());
+            fixture
+                .backend
+                .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&inactive).unwrap())
+                .await;
+            assert_eq!(fixture.store.get_namespace(bucket, "indexes").await.unwrap(), Some(inactive));
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_vector_namespace_lookup_requires_exact_record_with_active_children() {
+    for child_kind in ["index", "namespace"] {
+        let fixture = prepared_fixture().await;
+        let bucket = fixture.bucket.storage_bucket_id().as_str();
+        let namespace = Namespace::parse("indexes").unwrap();
+        let path = fixture.store.paths.namespace_entry_path(bucket, &namespace);
+        assert!(
+            fixture
+                .backend
+                .state
+                .lock()
+                .await
+                .objects
+                .remove(&(RUSTFS_META_BUCKET.into(), path.clone()))
+                .is_some()
+        );
+        if child_kind == "namespace" {
+            let table_path = fixture
+                .store
+                .paths
+                .table_entry_path(bucket, &namespace, &CatalogName::parse("index.v1").unwrap());
+            assert!(
+                fixture
+                    .backend
+                    .state
+                    .lock()
+                    .await
+                    .objects
+                    .remove(&(RUSTFS_META_BUCKET.into(), table_path))
+                    .is_some()
+            );
+            fixture
+                .store
+                .create_namespace(test_namespace_entry(bucket, &Namespace::parse("indexes.child").unwrap()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(fixture.store.get_namespace(bucket, "indexes").await.unwrap(), None, "{child_kind}");
+        assert!(
+            fixture
+                .backend
+                .read_object(RUSTFS_META_BUCKET, &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_table_namespace_recreation_and_inheritance_remain_available() {
+    for state in [
+        TableCatalogEntryState::Renaming,
+        TableCatalogEntryState::Deleting,
+        TableCatalogEntryState::Deleted,
+    ] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("indexes").unwrap();
+        let path = store.paths.namespace_entry_path(bucket, &namespace);
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        let mut inactive = test_namespace_entry(bucket, &namespace);
+        inactive.state = state;
+        store.create_namespace(inactive.clone()).await.unwrap();
+        assert_eq!(store.get_namespace(bucket, "indexes").await.unwrap(), None);
+        let active = test_namespace_entry(bucket, &namespace);
+        store.create_namespace(active.clone()).await.unwrap();
+        assert_eq!(store.get_namespace(bucket, "indexes").await.unwrap(), Some(active.clone()));
+        store
+            .create_namespace(test_namespace_entry(bucket, &Namespace::parse("indexes.child").unwrap()))
+            .await
+            .unwrap();
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&inactive).unwrap())
+            .await;
+        assert_eq!(store.get_namespace(bucket, "indexes").await.unwrap(), Some(active.clone()));
+        store.create_namespace(active.clone()).await.unwrap();
+        assert_eq!(store.get_namespace(bucket, "indexes").await.unwrap(), Some(active.clone()));
+        assert!(
+            backend
+                .state
+                .lock()
+                .await
+                .objects
+                .remove(&(RUSTFS_META_BUCKET.into(), path))
+                .is_some()
+        );
+        assert_eq!(store.get_namespace(bucket, "indexes").await.unwrap(), Some(active));
+        assert_matches!(
+            store.create_namespace(test_namespace_entry(bucket, &namespace)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_vector_namespace_exact_lookup_keeps_identity_validation() {
+    let fixture = prepared_fixture().await;
+    let bucket = fixture.bucket.storage_bucket_id().as_str();
+    let namespace = Namespace::parse("indexes").unwrap();
+    let path = fixture.store.paths.namespace_entry_path(bucket, &namespace);
+    let mut invalid = test_namespace_entry(bucket, &namespace);
+    invalid.namespace_id = "different-identity".into();
+    fixture
+        .backend
+        .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(&invalid).unwrap())
+        .await;
+    assert_matches!(
+        fixture.store.get_namespace(bucket, "indexes").await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_matches!(
+        fixture.store.create_namespace(test_namespace_entry(bucket, &namespace)).await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+}
+
 struct NativeVectorParentFixture {
     bucket: BucketHandle,
+    request: Arc<crate::app::RequestEnvelope>,
+    access: crate::storage_api::startup::services::ManagedObjectAccess,
     storage: Arc<NativeVectorParentStorage>,
     backend: EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>,
     catalog: ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
@@ -2626,6 +2818,8 @@ async fn native_vector_parent_fixture() -> (NativeVectorParentFixture, impl Send
     (
         NativeVectorParentFixture {
             bucket,
+            request,
+            access,
             storage,
             backend,
             catalog,
@@ -3001,4 +3195,934 @@ async fn catalog_vector_v3_creation_enumeration_rejects_another_incarnation() {
     assert_eq!(fixture.backend.state.lock().await.objects, before_objects);
     assert_eq!(fixture.backend.state.lock().await.put_attempts, before_puts);
     guard.check_held().unwrap();
+}
+
+#[derive(Clone)]
+struct VectorDeleteProbeBackend {
+    inner: EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>,
+    state: Arc<std::sync::Mutex<VectorDeleteProbeState>>,
+}
+
+#[derive(Default)]
+struct VectorDeleteProbeState {
+    pages: usize,
+    limited_reads: Vec<(String, usize)>,
+    override_pages: std::collections::VecDeque<TableCatalogCleanupPage>,
+    writes: Vec<String>,
+    deleted: Vec<String>,
+    native_delete_acquisitions: Vec<u64>,
+    fail_after_delete: Option<usize>,
+    replace_delete_etag: bool,
+    fail_listing: bool,
+    pause_listing: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+#[async_trait::async_trait]
+impl TableCatalogObjectBackend for VectorDeleteProbeBackend {
+    async fn revalidate_bucket_handle(&self, bucket: &BucketHandle) -> TableCatalogStoreResult<()> {
+        self.inner.revalidate_bucket_handle(bucket).await
+    }
+    async fn reuse_bucket_lifecycle_read(
+        &self,
+        bucket: &BucketHandle,
+        lifecycle: Arc<crate::storage_api::table::managed::BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.inner.reuse_bucket_lifecycle_read(bucket, lifecycle).await
+    }
+    async fn read_object(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.inner.read_object(bucket, key).await
+    }
+    async fn read_object_unlocked(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.inner.read_object_unlocked(bucket, key).await
+    }
+    async fn read_object_unlocked_limited(
+        &self,
+        bucket: &str,
+        key: &str,
+        max_size: usize,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.state.lock().unwrap().limited_reads.push((key.into(), max_size));
+        self.inner.read_object_unlocked_limited(bucket, key, max_size).await
+    }
+    async fn object_exists(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<bool> {
+        self.inner.object_exists(bucket, key).await
+    }
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        bytes: Vec<u8>,
+        condition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.inner.put_object(bucket, key, bytes, condition).await
+    }
+    async fn delete_object(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<()> {
+        self.inner.delete_object(bucket, key).await
+    }
+    async fn delete_object_if_match(&self, bucket: &str, key: &str, etag: &str) -> TableCatalogStoreResult<()> {
+        self.inner.delete_object_if_match(bucket, key, etag).await
+    }
+    async fn delete_object_if_match_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        let manager = crate::app::storage_api::test::bootstrap_instance_ctx()
+            .lock_manager()
+            .as_fast_lock_manager()
+            .unwrap();
+        let is_exact =
+            |info: &rustfs_lock::fast_lock::ObjectLockInfo| info.key.bucket.as_ref() == bucket && info.key.object.as_ref() == key;
+        assert!(
+            manager.list_locks().iter().all(|info| !is_exact(info)),
+            "Catalog must not pre-acquire the native conditional delete's object lock"
+        );
+        let etag = if self.state.lock().unwrap().replace_delete_etag {
+            "different-etag"
+        } else {
+            etag
+        };
+        // The native exact-delete path reads POOL_META_NAME (pool.bin) after
+        // acquiring its object writer. Hold that existing lock to observe the
+        // exact writer at a deterministic pending point in this fixture.
+        let pool_metadata = self.inner.acquire_write_lock(RUSTFS_META_BUCKET, "pool.bin").await?;
+        let waiting_before = manager.current_lock_counts().1;
+        let mut acquisitions = std::collections::BTreeSet::new();
+        let mut observe_exact = || {
+            let mut observed = false;
+            for (info, holders, generations) in manager.list_locks_with_holder_generations() {
+                if is_exact(&info) {
+                    assert_eq!(info.mode, rustfs_lock::fast_lock::LockMode::Exclusive);
+                    assert_eq!(holders, 1);
+                    let generations = generations.expect("native exact writer has a stable guard identity");
+                    assert_eq!(generations.len(), 1);
+                    acquisitions.extend(generations);
+                    observed = true;
+                }
+            }
+            observed
+        };
+        let mut deletion = Box::pin(self.inner.delete_object_if_match_fenced(bucket, key, etag, fence));
+        tokio::time::timeout(
+            StdDuration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(deletion.as_mut(), cx);
+                let exact_writer_held = observe_exact();
+                if let std::task::Poll::Ready(result) = result {
+                    return std::task::Poll::Ready(
+                        result.map(|()| panic!("native deletion must wait for its pool metadata reader")),
+                    );
+                }
+                if exact_writer_held && manager.current_lock_counts().1 == waiting_before + 1 {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("native exact writer must reach the pool metadata wait")?;
+        drop(pool_metadata);
+        std::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(deletion.as_mut(), cx);
+            observe_exact();
+            result
+        })
+        .await?;
+        assert!(manager.list_locks().iter().all(|info| !is_exact(info)));
+        let mut state = self.state.lock().unwrap();
+        state.deleted.push(key.into());
+        state
+            .native_delete_acquisitions
+            .push(u64::try_from(acquisitions.len()).unwrap());
+        if state.fail_after_delete == Some(state.deleted.len()) {
+            return Err(TableCatalogStoreError::Internal(
+                "injected response loss after native conditional deletion".into(),
+            ));
+        }
+        Ok(())
+    }
+    async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
+        self.inner.list_objects(bucket, prefix).await
+    }
+    async fn list_catalog_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogCleanupPage> {
+        let pause = {
+            let mut state = self.state.lock().unwrap();
+            state.pages += 1;
+            if state.fail_listing {
+                return Err(TableCatalogStoreError::Unavailable("injected authoritative listing failure".into()));
+            }
+            if let Some(page) = state.override_pages.pop_front() {
+                return Ok(page);
+            }
+            state.pause_listing.take()
+        };
+        if let Some((started, release)) = pause {
+            started.notify_one();
+            release.notified().await;
+        }
+        self.inner.list_catalog_objects_page(bucket, prefix, after, limit).await
+    }
+    async fn acquire_write_lock(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.state.lock().unwrap().writes.push(key.into());
+        self.inner.acquire_write_lock(bucket, key).await
+    }
+    async fn acquire_read_lock(&self, bucket: &str, key: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.inner.acquire_read_lock(bucket, key).await
+    }
+}
+
+struct NativeVectorDeleteFixture {
+    bucket: BucketHandle,
+    request: Arc<crate::app::RequestEnvelope>,
+    access: crate::storage_api::startup::services::ManagedObjectAccess,
+    storage: Arc<NativeVectorParentStorage>,
+    backend: VectorDeleteProbeBackend,
+    catalog: ObjectTableCatalogStore<VectorDeleteProbeBackend>,
+    parent: String,
+    namespace: String,
+}
+
+async fn native_vector_delete_fixture() -> (NativeVectorDeleteFixture, impl Send) {
+    let (fixture, reset) = native_vector_parent_fixture().await;
+    fixture
+        .catalog
+        .ensure_vector_catalog_parent(&fixture.bucket, fixture.guard.clone())
+        .await
+        .unwrap();
+    let parent = fixture
+        .catalog
+        .paths
+        .table_bucket_entry_path(fixture.bucket.storage_bucket_id().as_str());
+    let namespace = fixture
+        .catalog
+        .paths
+        .namespace_entry_path(fixture.bucket.storage_bucket_id().as_str(), &Namespace::parse("indexes").unwrap());
+    drop(fixture.guard);
+    let backend = VectorDeleteProbeBackend {
+        inner: fixture.backend,
+        state: Arc::default(),
+    };
+    let catalog = ObjectTableCatalogStore::for_vector_scope(backend.clone(), fixture.bucket.clone())
+        .await
+        .unwrap();
+    (
+        NativeVectorDeleteFixture {
+            bucket: fixture.bucket,
+            request: fixture.request,
+            access: fixture.access,
+            storage: fixture.storage,
+            backend,
+            catalog,
+            parent,
+            namespace,
+        },
+        reset,
+    )
+}
+
+impl NativeVectorDeleteFixture {
+    async fn prepare(&self) -> TableCatalogStoreResult<()> {
+        self.prepare_for(self.catalog.clone(), self.bucket.clone()).await
+    }
+
+    async fn prepare_for(
+        &self,
+        catalog: ObjectTableCatalogStore<VectorDeleteProbeBackend>,
+        bucket: BucketHandle,
+    ) -> TableCatalogStoreResult<()> {
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let output = observed.clone();
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(15),
+            self.storage
+                .delete_managed_bucket_with_preparation(&self.bucket, move |writer| async move {
+                    let result = catalog.prepare_empty_vector_bucket_delete(&bucket, writer).await;
+                    *output.lock().unwrap() = Some(result);
+                    // Preserve the physical bucket for Catalog recovery assertions.
+                    Err(crate::storage_api::table::StorageError::other(std::io::Error::other(
+                        "stop after Catalog callback",
+                    )))
+                }),
+        )
+        .await
+        .expect("native Catalog deletion preparation must complete without lock reentry");
+        assert!(result.is_err());
+        observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("ECStore invoked the callback under its actual lifecycle writer")
+    }
+
+    async fn bytes(&self) -> (Option<TableCatalogObject>, Option<TableCatalogObject>) {
+        (
+            self.backend
+                .inner
+                .read_object(RUSTFS_META_BUCKET, &self.parent)
+                .await
+                .unwrap(),
+            self.backend
+                .inner
+                .read_object(RUSTFS_META_BUCKET, &self.namespace)
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn catalog_bytes(&self) -> BTreeMap<String, TableCatalogObject> {
+        let prefix = self
+            .catalog
+            .paths
+            .table_bucket_root_prefix(self.bucket.storage_bucket_id().as_str());
+        let keys = self.backend.inner.list_objects(RUSTFS_META_BUCKET, &prefix).await.unwrap();
+        let mut records = BTreeMap::new();
+        for key in keys {
+            let record = self
+                .backend
+                .inner
+                .read_object(RUSTFS_META_BUCKET, &key)
+                .await
+                .unwrap()
+                .unwrap();
+            records.insert(key, record);
+        }
+        records
+    }
+
+    async fn recover(&self) {
+        let guard = self.backend.inner.acquire_bucket_lifecycle_read(&self.bucket).await.unwrap();
+        let store = ObjectTableCatalogStore::for_vector_scope(self.backend.inner.clone(), self.bucket.clone())
+            .await
+            .unwrap();
+        store.ensure_vector_catalog_parent_guarded(&self.bucket, guard).await.unwrap();
+    }
+}
+
+// Match the debug service worker allocation for these native storage futures.
+// Construct the test future on its execution thread and propagate its failure.
+fn run_native_vector_delete_test<F, Fut>(name: &'static str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("native Catalog test runtime should build");
+            runtime.block_on(test());
+        })
+        .expect("native Catalog test thread should spawn")
+        .join()
+        .expect("native Catalog test thread should finish");
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_vector_empty_delete_accepts_only_recoverable_registration_states() {
+    run_native_vector_delete_test("catalog-vector-delete-states", || async {
+        for state in ["none", "parent", "both"] {
+            let (fixture, _reset) = native_vector_delete_fixture().await;
+            if state != "both" {
+                fixture
+                    .backend
+                    .inner
+                    .delete_object(RUSTFS_META_BUCKET, &fixture.namespace)
+                    .await
+                    .unwrap();
+            }
+            if state == "none" {
+                fixture
+                    .backend
+                    .inner
+                    .delete_object(RUSTFS_META_BUCKET, &fixture.parent)
+                    .await
+                    .unwrap();
+            }
+            fixture.prepare().await.unwrap();
+            assert_eq!(fixture.bytes().await, (None, None));
+            {
+                let observed = fixture.backend.state.lock().unwrap();
+                let expected = match state {
+                    "none" => vec![],
+                    "parent" => vec![fixture.parent.clone()],
+                    _ => vec![fixture.namespace.clone(), fixture.parent.clone()],
+                };
+                assert_eq!(observed.deleted, expected);
+                assert_eq!(observed.pages, expected.len() + 1);
+                assert_eq!(
+                    observed.writes,
+                    [format!(
+                        "{}publication.lock",
+                        fixture
+                            .catalog
+                            .paths
+                            .table_bucket_root_prefix(fixture.bucket.storage_bucket_id().as_str())
+                    )]
+                );
+                assert_eq!(observed.native_delete_acquisitions, vec![1; expected.len()]);
+            }
+            fixture.recover().await;
+            let (parent, namespace) = fixture.bytes().await;
+            let parent: TableBucketEntry = serde_json::from_slice(&parent.unwrap().data).unwrap();
+            assert_eq!(parent.vector_bucket_binding.unwrap().to_handle().unwrap(), fixture.bucket);
+            assert_eq!(parent.state, TableCatalogEntryState::Active);
+            let namespace: NamespaceEntry = serde_json::from_slice(&namespace.unwrap().data).unwrap();
+            assert_eq!(namespace.namespace, "indexes");
+            assert_eq!(namespace.state, TableCatalogEntryState::Active);
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_vector_empty_delete_recovers_after_each_native_registration_removal() {
+    run_native_vector_delete_test("catalog-vector-delete-recovery", || async {
+        for deleted in [1, 2] {
+            let (fixture, _reset) = native_vector_delete_fixture().await;
+            fixture.backend.state.lock().unwrap().fail_after_delete = Some(deleted);
+            assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Internal(message)) if message.contains("response loss"));
+            let (parent, namespace) = fixture.bytes().await;
+            assert!(namespace.is_none());
+            assert_eq!(parent.is_some(), deleted == 1);
+            assert_eq!(fixture.backend.state.lock().unwrap().deleted.len(), deleted);
+            fixture.recover().await;
+            let (parent, namespace) = fixture.bytes().await;
+            let parent: TableBucketEntry = serde_json::from_slice(&parent.unwrap().data).unwrap();
+            assert_eq!(parent.vector_bucket_binding.unwrap().to_handle().unwrap(), fixture.bucket);
+            assert!(namespace.is_some());
+            fixture.backend.state.lock().unwrap().fail_after_delete = None;
+            fixture.prepare().await.unwrap();
+            assert_eq!(fixture.bytes().await, (None, None));
+        }
+    });
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_native_conditional_mismatch() {
+    let (fixture, _reset) = native_vector_delete_fixture().await;
+    let before = fixture.bytes().await;
+    fixture.backend.state.lock().unwrap().replace_delete_etag = true;
+    assert!(fixture.prepare().await.is_err());
+    assert_eq!(fixture.bytes().await, before);
+    assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_namespace_without_parent() {
+    let (fixture, _reset) = native_vector_delete_fixture().await;
+    fixture
+        .backend
+        .inner
+        .delete_object(RUSTFS_META_BUCKET, &fixture.parent)
+        .await
+        .unwrap();
+    let before = fixture.bytes().await;
+    assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Invalid(_)));
+    assert_eq!(fixture.bytes().await, before);
+    assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+}
+
+async fn assert_oversized_vector_registration_rejected(parent: bool) {
+    let (fixture, _reset) = native_vector_delete_fixture().await;
+    let path = if parent { &fixture.parent } else { &fixture.namespace };
+    let mut bytes = fixture
+        .backend
+        .inner
+        .read_object(RUSTFS_META_BUCKET, path)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert!(bytes.len() < 4 * 1024);
+    bytes.resize(8 * 1024 + 1, b' ');
+    // Whitespace preserves the canonical value and isolates the byte limit.
+    let _: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    fixture
+        .backend
+        .inner
+        .put_object(RUSTFS_META_BUCKET, path, bytes, TableCatalogPutPrecondition::Any)
+        .await
+        .unwrap();
+    let before = fixture.catalog_bytes().await;
+    assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Invalid(message)) if message.contains("exceeds the maximum size of 8192 bytes"));
+    assert_eq!(fixture.catalog_bytes().await, before);
+    let state = fixture.backend.state.lock().unwrap();
+    assert!(state.deleted.is_empty());
+    assert!(state.limited_reads.contains(&(path.clone(), 8 * 1024)));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_oversized_parent_without_changes() {
+    assert_oversized_vector_registration_rejected(true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_oversized_namespace_without_changes() {
+    assert_oversized_vector_registration_rejected(false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_incomplete_authoritative_pages() {
+    for fault in [
+        "listing-error",
+        "empty-truncated",
+        "out-of-prefix",
+        "missing-etag",
+        "delete-marker",
+        "version",
+        "no-progress",
+        "too-many",
+    ] {
+        let (fixture, _reset) = native_vector_delete_fixture().await;
+        let before = fixture.bytes().await;
+        let parent_etag = before.0.as_ref().unwrap().etag.clone();
+        let record = || TableCatalogCleanupObject {
+            key: fixture.parent.clone(),
+            version_id: None,
+            etag: parent_etag.clone(),
+            delete_marker: false,
+        };
+        {
+            let mut state = fixture.backend.state.lock().unwrap();
+            match fault {
+                "listing-error" => state.fail_listing = true,
+                "empty-truncated" => state.override_pages.push_back(TableCatalogCleanupPage {
+                    objects: vec![],
+                    is_truncated: true,
+                }),
+                "no-progress" => {
+                    state.override_pages.push_back(TableCatalogCleanupPage {
+                        objects: vec![record()],
+                        is_truncated: true,
+                    });
+                    state.override_pages.push_back(TableCatalogCleanupPage {
+                        objects: vec![record()],
+                        is_truncated: false,
+                    });
+                }
+                "too-many" => state.override_pages.push_back(TableCatalogCleanupPage {
+                    objects: vec![record(), record()],
+                    is_truncated: false,
+                }),
+                _ => {
+                    let mut object = record();
+                    match fault {
+                        "out-of-prefix" => object.key = "s3vectors/catalog/unrelated.json".into(),
+                        "missing-etag" => object.etag = None,
+                        "delete-marker" => object.delete_marker = true,
+                        "version" => object.version_id = Some(Uuid::new_v4().to_string()),
+                        _ => unreachable!(),
+                    }
+                    state.override_pages.push_back(TableCatalogCleanupPage {
+                        objects: vec![object],
+                        is_truncated: false,
+                    });
+                }
+            }
+        }
+        assert!(fixture.prepare().await.is_err(), "{fault}");
+        assert_eq!(fixture.bytes().await, before, "{fault}");
+        assert!(fixture.backend.state.lock().unwrap().deleted.is_empty(), "{fault}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_noncanonical_native_registrations() {
+    for (target, field, value) in [
+        ("parent", "version", serde_json::json!(9)),
+        ("parent", "state", serde_json::json!("DELETED")),
+        ("parent", "warehouse_root", serde_json::json!("s3://another/")),
+        ("parent", "properties", serde_json::json!({"retained":"value"})),
+        ("parent", "active_rename_id", serde_json::json!("retained")),
+        ("parent", "vector_bucket_binding", serde_json::Value::Null),
+        ("namespace", "version", serde_json::json!(9)),
+        ("namespace", "state", serde_json::json!("DELETED")),
+        ("namespace", "namespace_id", serde_json::json!("different")),
+        ("namespace", "properties", serde_json::json!({"retained":"value"})),
+        ("namespace", "unknown", serde_json::json!(true)),
+    ] {
+        let (fixture, _reset) = native_vector_delete_fixture().await;
+        let path = if target == "parent" {
+            &fixture.parent
+        } else {
+            &fixture.namespace
+        };
+        let current = fixture
+            .backend
+            .inner
+            .read_object(RUSTFS_META_BUCKET, path)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&current.data).unwrap();
+        record[field] = value;
+        fixture
+            .backend
+            .inner
+            .put_object(
+                RUSTFS_META_BUCKET,
+                path,
+                serde_json::to_vec(&record).unwrap(),
+                TableCatalogPutPrecondition::Any,
+            )
+            .await
+            .unwrap();
+        let before = fixture.bytes().await;
+        assert!(fixture.prepare().await.is_err(), "{target}:{field}");
+        assert_eq!(fixture.bytes().await, before, "{target}:{field}");
+        assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_vector_empty_delete_checks_late_records_and_preserves_other_scopes() {
+    run_native_vector_delete_test("catalog-vector-delete-late-records", || async {
+        for suffix in [
+            "zz/active/table-entry.json",
+            "zz/deleted/table-entry.json",
+            "zz/create-intent.json",
+            "zz/delete-intent.json",
+            "zz/commits/history.json",
+            "zz/tasks/queued.json",
+            "zz/unknown.bin",
+        ] {
+            let (fixture, _reset) = native_vector_delete_fixture().await;
+            let path = format!(
+                "{}{suffix}",
+                fixture
+                    .catalog
+                    .paths
+                    .table_bucket_root_prefix(fixture.bucket.storage_bucket_id().as_str())
+            );
+            fixture
+                .backend
+                .inner
+                .put_object(
+                    RUSTFS_META_BUCKET,
+                    &path,
+                    b"retained record".to_vec(),
+                    TableCatalogPutPrecondition::IfAbsent,
+                )
+                .await
+                .unwrap();
+            let before = fixture.bytes().await;
+            let retained = fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &path).await.unwrap();
+            assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Conflict(_)));
+            assert_eq!(fixture.bytes().await, before);
+            assert_eq!(fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &path).await.unwrap(), retained);
+            assert!(fixture.backend.state.lock().unwrap().pages >= 3);
+            assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+        }
+        let (fixture, _reset) = native_vector_delete_fixture().await;
+        let table = ObjectTableCatalogStore::new(fixture.backend.inner.clone());
+        let foreign = table
+            .paths
+            .table_bucket_entry_path(fixture.bucket.storage_bucket_id().as_str());
+        fixture
+            .backend
+            .inner
+            .put_object(
+                RUSTFS_META_BUCKET,
+                &foreign,
+                b"Table scope preserved".to_vec(),
+                TableCatalogPutPrecondition::IfAbsent,
+            )
+            .await
+            .unwrap();
+        let before = fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &foreign).await.unwrap();
+        fixture.prepare().await.unwrap();
+        assert_eq!(fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &foreign).await.unwrap(), before);
+    });
+}
+
+async fn native_vector_delete_child(
+    fixture: &NativeVectorDeleteFixture,
+) -> (
+    ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<NativeVectorParentStorage>>,
+    TableEntry,
+) {
+    use crate::vector::lance::ManagedManifestObjects;
+    let resource =
+        CatalogResourceIdentity::try_new(fixture.bucket.clone(), fixture.access.table_id().clone(), CatalogFormat::Lance)
+            .unwrap();
+    let key = format!("{}_versions/{}/1.manifest", resource.dataset_prefix(), Uuid::new_v4());
+    let objects = crate::startup_services::managed_lance_objects(
+        fixture.access.clone(),
+        fixture.request.clone(),
+        crate::app::object::ManagedEncryption::Unencrypted,
+        crate::vector::lance::ManifestIoLimits {
+            max_manifest_bytes: std::num::NonZeroU64::new(8192).unwrap(),
+            max_concurrent_reads: NonZeroUsize::new(1).unwrap(),
+        },
+    )
+    .unwrap();
+    let object_key = CatalogObjectKey::try_new(key.clone()).unwrap();
+    let created = objects
+        .create_only(&fixture.access, &object_key, bytes::Bytes::from_static(b"opaque fixture manifest"))
+        .await
+        .unwrap();
+    let content = objects
+        .get(&fixture.access, &object_key, None, created.body_revision)
+        .await
+        .unwrap();
+    assert!(created.body_revision.is_some());
+    assert_eq!(content.body_revision, created.body_revision);
+    let metadata = CatalogMetadataRef::from_read(object_key, &content).unwrap();
+    let descriptor =
+        CatalogFormatDescriptor::try_new(1, CatalogFormat::Lance, 1, metadata.clone(), b"opaque fixture descriptor".to_vec())
+            .unwrap();
+    let entry = TableEntry {
+        version: 3,
+        table_bucket: fixture.bucket.storage_bucket_id().as_str().into(),
+        namespace: "indexes".into(),
+        table: "retained.index".into(),
+        table_id: resource.table_id().as_str().into(),
+        table_uuid: resource.table_id().as_str().into(),
+        format: "lance".into(),
+        format_version: 1,
+        warehouse_location: format!(
+            "s3://{}/{}",
+            fixture.bucket.storage_bucket_id().as_str(),
+            resource.dataset_prefix().trim_end_matches('/')
+        ),
+        metadata_location: key,
+        version_token: "initial".into(),
+        generation: 1,
+        state: TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+        vector_index_definition: Some(VectorIndexDefinitionV1 {
+            version: 1,
+            effective_encryption: VectorEffectiveEncryptionV1::Unencrypted,
+            tags: BTreeMap::new(),
+        }),
+        vector_head_binding: Some(VectorHeadBindingV1::try_new(&resource, &metadata, &descriptor).unwrap()),
+    };
+    let backend = EcStoreTableCatalogObjectBackend::new_with_managed_candidate_reader(fixture.storage.clone(), objects);
+    let store = ObjectTableCatalogStore::for_vector_scope(backend, fixture.bucket.clone())
+        .await
+        .unwrap();
+    store.create_table(entry.clone()).await.unwrap();
+    let current = store
+        .read_table_with_etag(
+            fixture.bucket.storage_bucket_id().as_str(),
+            &Namespace::parse(&entry.namespace).unwrap(),
+            &CatalogName::parse(&entry.table).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.0, entry);
+    assert!(!current.1.is_empty());
+    (store, entry)
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_vector_empty_delete_preserves_actual_child_registration_states() {
+    run_native_vector_delete_test("catalog-vector-delete-child-states", || async {
+        for state in ["active", "deleted", "delete-intent"] {
+            let (fixture, _reset) = native_vector_delete_fixture().await;
+            let (store, mut entry) = native_vector_delete_child(&fixture).await;
+            let namespace = Namespace::parse("indexes").unwrap();
+            let name = CatalogName::parse(&entry.table).unwrap();
+            let path = store
+                .paths
+                .table_entry_path(fixture.bucket.storage_bucket_id().as_str(), &namespace, &name);
+            if state == "deleted" {
+                entry.state = TableCatalogEntryState::Deleted;
+                CatalogHead::from_vector_entry(&entry).unwrap();
+                fixture
+                    .backend
+                    .inner
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        &path,
+                        serde_json::to_vec(&entry).unwrap(),
+                        TableCatalogPutPrecondition::Any,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if state == "delete-intent" {
+                let (operation, current) = store
+                    .begin_vector_operation(&fixture.bucket, &namespace, &name)
+                    .await
+                    .unwrap();
+                let result = store
+                    .delete_vector_index_with_guard(
+                        &operation,
+                        &current,
+                        CatalogCommitId::try_new(Uuid::new_v4().to_string()).unwrap(),
+                    )
+                    .await;
+                let intent_path = store
+                    .paths
+                    .vector_delete_intent_path(fixture.bucket.storage_bucket_id().as_str(), &entry.table_id);
+                let intent = fixture
+                    .backend
+                    .inner
+                    .read_object(RUSTFS_META_BUCKET, &intent_path)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("deletion must persist its actual intent: {result:?}"));
+                let _: VectorIndexDeleteIntentV1 = serde_json::from_slice(&intent.data).unwrap();
+                drop(operation);
+            }
+            // Keep the real registration while clearing only this fixture's temporary payload.
+            fixture
+                .backend
+                .inner
+                .delete_object(fixture.bucket.storage_bucket_id().as_str(), &entry.metadata_location)
+                .await
+                .unwrap();
+            assert!(
+                fixture
+                    .backend
+                    .inner
+                    .read_object(fixture.bucket.storage_bucket_id().as_str(), &entry.metadata_location)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let all_records = fixture.catalog_bytes().await;
+            let before = fixture.bytes().await;
+            let retained = fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &path).await.unwrap();
+            assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Conflict(_)));
+            assert_eq!(fixture.bytes().await, before);
+            assert_eq!(fixture.catalog_bytes().await, all_records);
+            assert_eq!(fixture.backend.inner.read_object(RUSTFS_META_BUCKET, &path).await.unwrap(), retained);
+            assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+        }
+        let (fixture, _reset) = native_vector_delete_fixture().await;
+        let source = prepared_fixture().await;
+        let mut request = vector_creation_request(&source, &Uuid::new_v4().to_string(), &Uuid::new_v4().to_string());
+        request.resource_identity = CatalogResourceIdentity::try_new(
+            fixture.bucket.clone(),
+            request.resource_identity.table_id().clone(),
+            CatalogFormat::Lance,
+        )
+        .unwrap();
+        let store = ObjectTableCatalogStore::for_vector_scope(fixture.backend.inner.clone(), fixture.bucket.clone())
+            .await
+            .unwrap();
+        let (_, operation) = store.reserve_vector_index(&fixture.bucket, request.clone()).await.unwrap();
+        drop(operation);
+        let table_path =
+            store
+                .paths
+                .table_entry_path(fixture.bucket.storage_bucket_id().as_str(), &request.namespace, &request.name);
+        let intent_path = format!("{}create-intent.json", table_path.strip_suffix("table-entry.json").unwrap());
+        let retained = fixture
+            .backend
+            .inner
+            .read_object(RUSTFS_META_BUCKET, &intent_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let _: VectorIndexCreateIntentV1 = serde_json::from_slice(&retained.data).unwrap();
+        let before = fixture.bytes().await;
+        assert_matches!(fixture.prepare().await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_eq!(fixture.bytes().await, before);
+        assert_eq!(
+            fixture
+                .backend
+                .inner
+                .read_object(RUSTFS_META_BUCKET, &intent_path)
+                .await
+                .unwrap()
+                .unwrap(),
+            retained
+        );
+    });
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_empty_delete_rejects_table_scope_and_foreign_native_writer() {
+    let (fixture, _reset) = native_vector_delete_fixture().await;
+    let before = fixture.bytes().await;
+    let table = ObjectTableCatalogStore::new(fixture.backend.clone());
+    assert_matches!(
+        fixture.prepare_for(table, fixture.bucket.clone()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    );
+    assert_eq!(fixture.bytes().await, before);
+    let (other, _other_reset) = native_vector_delete_fixture().await;
+    assert!(
+        other
+            .prepare_for(fixture.catalog.clone(), fixture.bucket.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.bytes().await, before);
+    assert!(fixture.backend.state.lock().unwrap().deleted.is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn catalog_vector_empty_delete_holds_real_writer_across_registration_cleanup() {
+    run_native_vector_delete_test("catalog-vector-delete-writer", || async {
+        let (fixture, _reset) = native_vector_delete_fixture().await;
+        let fixture = Arc::new(fixture);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        fixture.backend.state.lock().unwrap().pause_listing = Some((started.clone(), release.clone()));
+        let owner = fixture.clone();
+        let deleting = tokio::spawn(async move { owner.prepare().await });
+        tokio::time::timeout(StdDuration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let manager = crate::app::storage_api::test::bootstrap_instance_ctx()
+            .lock_manager()
+            .as_fast_lock_manager()
+            .unwrap();
+        let before = manager.current_lock_counts().1;
+        let backend = fixture.backend.inner.clone();
+        let bucket = fixture.bucket.clone();
+        let reader = tokio::spawn(async move { backend.acquire_bucket_lifecycle_read(&bucket).await });
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while manager.current_lock_counts().1 <= before {
+                assert!(!reader.is_finished());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!reader.is_finished());
+        release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(5), deleting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reader = tokio::time::timeout(StdDuration::from_secs(5), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.bytes().await, (None, None));
+        assert!(!reader.is_lock_lost());
+    });
 }

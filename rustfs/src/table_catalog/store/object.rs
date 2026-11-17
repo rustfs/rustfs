@@ -5541,7 +5541,7 @@ where
         {
             Some((current, etag)) => {
                 validate_namespace_entry_object(&self.paths, &object, &current)?;
-                if current.state == TableCatalogEntryState::Active {
+                if self.paths.scope == CatalogScope::Vector || current.state == TableCatalogEntryState::Active {
                     return Err(TableCatalogStoreError::Conflict(format!(
                         "catalog object already exists: namespace {}/{}",
                         entry.table_bucket, entry.namespace
@@ -5611,9 +5611,10 @@ where
             if let Some(entry) = exact.as_ref() {
                 validate_namespace_entry_object(&self.paths, &namespace_path, entry)?;
             }
-            if exact
-                .as_ref()
-                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            if self.paths.scope == CatalogScope::Vector
+                || exact
+                    .as_ref()
+                    .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
             {
                 return Ok(exact);
             }
@@ -8578,6 +8579,183 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
 
 #[cfg(test)]
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
+    /// Remove only canonical empty Vector registration under ECStore's deletion writer.
+    /// The owned application callback must supply the writer acquired by
+    /// `delete_managed_bucket_with_preparation` and retain it through physical cleanup.
+    pub(crate) async fn prepare_empty_vector_bucket_delete(
+        &self,
+        bucket: &BucketHandle,
+        lifecycle: Arc<BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<()> {
+        // BucketHandle caps names at 63 bytes and region at 255 bytes. Canonical
+        // empty records fit below 4 KiB even with six-byte JSON escaping.
+        const MAX_EMPTY_REGISTRATION_BYTES: usize = 8 * 1024;
+        if self.paths.scope != CatalogScope::Vector || self.vector_bucket_for(bucket.storage_bucket_id().as_str())? != bucket {
+            return Err(TableCatalogStoreError::Conflict(
+                "Vector deletion identity differs from its Catalog store".into(),
+            ));
+        }
+        let lifecycle = self.backend.reuse_bucket_lifecycle_read(bucket, lifecycle).await?;
+        let registry = self.acquire_table_bucket_registry_write_permit().await?;
+        let publication = TableCommitLockPublication::new(&self.backend, &self.paths);
+        let owner_signals = [lifecycle.lock_lost_signal(), registry.lock_lost_signal()];
+        publication_preparation(&publication, async {
+            let storage_name = bucket.storage_bucket_id().as_str();
+            publication.begin_table_bucket(storage_name).await?;
+            let _completion = TableCommitPublicationCompletion::new(&publication);
+            retain_publication_preparation_fence(&publication);
+            let mut fence = publication
+                .object_mutation_fence()
+                .ok_or_else(|| TableCatalogStoreError::Unavailable("Vector deletion publication fence is unavailable".into()))?;
+            fence.extend_signals(owner_signals);
+            fence.ensure_held()?;
+            let prefix = self.paths.table_bucket_root_prefix(storage_name);
+            let parent_path = self.paths.table_bucket_entry_path(storage_name);
+            let namespace = Namespace::parse("indexes").map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+            let namespace_path = self.paths.namespace_entry_path(storage_name, &namespace);
+            let expected_parent = TableBucketEntry {
+                vector_bucket_binding: Some(VectorBucketBindingV1::from_handle(bucket)?),
+                version: 2,
+                table_bucket: storage_name.into(),
+                catalog_type: "s3vectors".into(),
+                warehouse_root: format!("s3://{storage_name}/"),
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                active_rename_id: None,
+                created_at: None,
+                updated_at: None,
+            };
+            let expected_namespace = NamespaceEntry {
+                version: 1,
+                table_bucket: storage_name.into(),
+                namespace: namespace.public_name(),
+                namespace_id: namespace.storage_id(),
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            };
+            let mut parent_etag = None;
+            let mut namespace_etag = None;
+            let mut cursor: Option<String> = None;
+            loop {
+                fence.ensure_held()?;
+                let page = self
+                    .backend
+                    .list_catalog_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), NonZeroUsize::MIN)
+                    .await?;
+                if page.objects.len() > 1 || (page.is_truncated && page.objects.is_empty()) {
+                    return Err(TableCatalogStoreError::Unavailable(
+                        "Vector deletion received an invalid Catalog page".into(),
+                    ));
+                }
+                for object in page.objects {
+                    if !object.key.starts_with(&prefix) || cursor.as_ref().is_some_and(|previous| object.key <= *previous) {
+                        return Err(TableCatalogStoreError::Invalid(
+                            "Vector deletion Catalog scan did not advance within its prefix".into(),
+                        ));
+                    }
+                    if object.delete_marker || object.version_id.is_some() {
+                        return Err(TableCatalogStoreError::Invalid(
+                            "Vector deletion encountered versioned or deleted Catalog metadata".into(),
+                        ));
+                    }
+                    let etag = object
+                        .etag
+                        .filter(|etag| !etag.is_empty())
+                        .ok_or_else(|| TableCatalogStoreError::Invalid("Vector deletion Catalog record has no ETag".into()))?;
+                    if object.key == parent_path {
+                        let (parent, current_etag) = self
+                            .read_entry_with::<TableBucketEntry, _>(
+                                self.catalog_bucket(),
+                                &parent_path,
+                                |backend, bucket, object| {
+                                    Box::pin(async move {
+                                        backend
+                                            .read_object_unlocked_limited(bucket, object, MAX_EMPTY_REGISTRATION_BYTES)
+                                            .await
+                                    })
+                                },
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                TableCatalogStoreError::Conflict("Vector parent disappeared during deletion preparation".into())
+                            })?;
+                        validate_table_bucket_entry_object(&self.paths, &parent_path, &parent)?;
+                        self.validate_store_bucket_entry(&parent)?;
+                        let current_etag = current_etag.ok_or_else(|| {
+                            TableCatalogStoreError::Internal(format!("catalog table bucket entry has no etag: {parent_path}"))
+                        })?;
+                        if parent != expected_parent || current_etag != etag {
+                            return Err(TableCatalogStoreError::Conflict(
+                                "Vector parent differs from canonical empty registration".into(),
+                            ));
+                        }
+                        parent_etag = Some(etag);
+                    } else if object.key == namespace_path {
+                        let (entry, current_etag) = self
+                            .read_entry_with::<NamespaceEntry, _>(
+                                self.catalog_bucket(),
+                                &namespace_path,
+                                |backend, bucket, object| {
+                                    Box::pin(async move {
+                                        backend
+                                            .read_object_unlocked_limited(bucket, object, MAX_EMPTY_REGISTRATION_BYTES)
+                                            .await
+                                    })
+                                },
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                TableCatalogStoreError::Conflict(
+                                    "Vector namespace disappeared during deletion preparation".into(),
+                                )
+                            })?;
+                        validate_namespace_entry_object(&self.paths, &namespace_path, &entry)?;
+                        if entry != expected_namespace || current_etag.as_deref() != Some(etag.as_str()) {
+                            return Err(TableCatalogStoreError::Conflict(
+                                "Vector namespace differs from canonical empty registration".into(),
+                            ));
+                        }
+                        namespace_etag = Some(etag);
+                    } else {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "Vector bucket retains Catalog resources or history".into(),
+                        ));
+                    }
+                    cursor = Some(object.key);
+                }
+                if !page.is_truncated {
+                    break;
+                }
+            }
+            if namespace_etag.is_some() && parent_etag.is_none() {
+                return Err(TableCatalogStoreError::Invalid("Vector namespace has no parent registration".into()));
+            }
+            self.backend.revalidate_bucket_handle(bucket).await?;
+            fence.ensure_held()?;
+            // Native conditional deletion acquires each exact object writer once.
+            // Keep the namespace-to-parent order recoverable for the same identity.
+            if let Some(etag) = namespace_etag {
+                begin_publication_mutation()?;
+                self.backend
+                    .delete_object_if_match_fenced(self.catalog_bucket(), &namespace_path, &etag, &fence)
+                    .await?;
+            }
+            self.backend.revalidate_bucket_handle(bucket).await?;
+            fence.ensure_held()?;
+            if let Some(etag) = parent_etag {
+                begin_publication_mutation()?;
+                self.backend
+                    .delete_object_if_match_fenced(self.catalog_bucket(), &parent_path, &etag, &fence)
+                    .await?;
+            }
+            self.backend.revalidate_bucket_handle(bucket).await?;
+            fence.ensure_held()
+        })
+        .await
+    }
+
     pub(crate) async fn ensure_vector_catalog_parent(
         &self,
         bucket: &BucketHandle,

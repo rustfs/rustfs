@@ -2639,7 +2639,12 @@ impl crate::vector::service::VectorRequestAccess for ServiceRequestFixture {
         request: &crate::vector::protocol::Request,
         resource: &crate::table_catalog::CatalogResourceIdentity,
         definition: &crate::table_catalog::VectorIndexDefinitionV1,
+        operation: Option<&crate::table_catalog::VectorCatalogOperationGuard>,
     ) -> Result<(), crate::vector::service::VectorServiceError> {
+        if let Some(operation) = operation {
+            operation.check_held()?;
+            assert_eq!(operation.resource_identity(), resource);
+        }
         assert_eq!(request, &self.request);
         assert_eq!(resource.vector_bucket(), Some(&self.bucket));
         definition.validate()?;
@@ -2854,6 +2859,148 @@ async fn service_crud_and_prefilter_use_published_catalog_data() {
 }
 
 #[tokio::test]
+async fn service_list_vectors_projects_current_catalog_rows_and_partitions_segments() {
+    use crate::vector::{
+        protocol::{Request, Response, dto},
+        service::VectorExecution,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: (0..20)
+            .map(|index| dto::PutInputVector {
+                key: format!("key-{index:02}"),
+                data: dto::VectorData {
+                    float32: vec![1.0, 0.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"genre": "drama"})),
+            })
+            .collect(),
+    });
+    service.execute(&context).await.unwrap();
+    let mut input = dto::ListVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        max_results: Some(20),
+        next_token: None,
+        segment_count: None,
+        segment_index: None,
+        return_data: None,
+        return_metadata: None,
+    };
+    context.request = Request::ListVectors(input.clone());
+    let VectorExecution::Complete(Response::ListVectors(output)) = service.execute(&context).await.unwrap() else {
+        panic!("expected listed vectors");
+    };
+    assert!(output.next_token.is_none());
+    assert_eq!(output.vectors.len(), 20);
+    assert!(output.vectors.iter().all(|row| row.data.is_none() && row.metadata.is_none()));
+    let all_keys: std::collections::BTreeSet<_> = output.vectors.into_iter().map(|row| row.key).collect();
+    let mut segmented_keys = std::collections::BTreeSet::new();
+    for segment in 0..3 {
+        input.segment_count = Some(3);
+        input.segment_index = Some(segment);
+        input.return_data = Some(true);
+        input.return_metadata = Some(true);
+        context.request = Request::ListVectors(input.clone());
+        let VectorExecution::Complete(Response::ListVectors(output)) = service.execute(&context).await.unwrap() else {
+            panic!("expected segment output");
+        };
+        assert!(output.next_token.is_none());
+        assert!(!output.vectors.is_empty());
+        for row in output.vectors {
+            assert!(segmented_keys.insert(row.key), "segments must be disjoint");
+            assert_eq!(row.data.unwrap().float32, vec![1.0, 0.0, 0.0]);
+            assert_eq!(row.metadata.unwrap(), serde_json::json!({"genre":"drama"}));
+        }
+    }
+    assert_eq!(segmented_keys, all_keys);
+}
+
+#[tokio::test]
+async fn service_list_vectors_does_not_return_incomplete_success_without_a_token() {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::VectorServiceError,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    context.request = Request::PutVectors(dto::PutVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        vectors: (0..34)
+            .map(|index| dto::PutInputVector {
+                key: format!("large-{index:02}"),
+                data: dto::VectorData {
+                    float32: vec![1.0, 0.0, 0.0],
+                },
+                metadata: Some(serde_json::json!({"private": "x".repeat(32 * 1024)})),
+            })
+            .collect(),
+    });
+    service.execute(&context).await.unwrap();
+    let mut input = dto::ListVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        max_results: Some(1),
+        next_token: None,
+        segment_count: None,
+        segment_index: None,
+        return_data: Some(false),
+        return_metadata: Some(false),
+    };
+    context.request = Request::ListVectors(input.clone());
+    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))));
+    input.max_results = Some(1000);
+    context.request = Request::ListVectors(input.clone());
+    assert!(
+        matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))),
+        "processed data over 1 MiB needs pagination even when fields are not returned"
+    );
+    input.next_token = Some("unverified-token".into());
+    context.request = Request::ListVectors(input);
+    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))));
+}
+
+#[tokio::test]
+async fn service_list_vectors_denial_prevents_managed_object_access() {
+    use crate::vector::{
+        protocol::{Request, dto},
+        service::VectorServiceError,
+    };
+    let fixture = catalog_fixture().await;
+    let mut context = service_request(&fixture);
+    let service = index_service(&fixture);
+    service.execute(&context).await.unwrap();
+    let calls = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
+    context.deny = true;
+    context.request = Request::ListVectors(dto::ListVectorsInput {
+        vector_bucket_name: Some("vectors".into()),
+        index_name: Some("service-index".into()),
+        index_arn: None,
+        max_results: None,
+        next_token: None,
+        segment_count: None,
+        segment_index: None,
+        return_data: None,
+        return_metadata: None,
+    });
+    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::Protocol(error))
+        if error.code() == crate::vector::protocol::ErrorCode::AccessDenied));
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
 async fn service_denial_prevents_managed_object_access() {
     use crate::vector::protocol::{Request, dto};
     let fixture = catalog_fixture().await;
@@ -2964,6 +3111,33 @@ async fn service_index_tags_merge_remove_and_preserve_dataset_identity() {
     let identity = guard.resource_identity().clone();
     drop(guard);
     let managed_calls = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
+    let storage_bucket = context.bucket.storage_bucket_id().as_str().to_owned();
+    let managed_state = |state: &crate::table_catalog::test_support::TestCatalogObjectState| {
+        (
+            state
+                .objects
+                .iter()
+                .filter(|((bucket, _), _)| bucket == &storage_bucket)
+                .map(|(key, object)| (key.clone(), object.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            state
+                .put_attempts
+                .iter()
+                .filter(|((bucket, _), _)| bucket == &storage_bucket)
+                .map(|(_, count)| count)
+                .sum::<usize>(),
+            state
+                .delete_attempts
+                .iter()
+                .filter(|((bucket, _), _)| bucket == &storage_bucket)
+                .map(|(_, count)| count)
+                .sum::<usize>(),
+        )
+    };
+    let managed_before = {
+        let state = fixture.backend.state.lock().await;
+        managed_state(&state)
+    };
     let resource_arn = "arn:aws:s3vectors:us-east-1::bucket/vectors/index/service-index".to_owned();
     context.request = Request::TagResource(dto::TagResourceInput {
         resource_arn: resource_arn.clone(),
@@ -2973,6 +3147,7 @@ async fn service_index_tags_merge_remove_and_preserve_dataset_identity() {
         service.execute(&context).await.unwrap(),
         VectorExecution::Complete(Response::TagResource(_))
     ));
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), managed_calls + 1);
     context.request = Request::UntagResource(dto::UntagResourceInput {
         resource_arn: resource_arn.clone(),
         tag_keys: vec!["owner".into(), "missing".into()],
@@ -2995,7 +3170,9 @@ async fn service_index_tags_merge_remove_and_preserve_dataset_identity() {
     assert_eq!(after.head().metadata(), before.head().metadata());
     assert_eq!(after.head().generation().get(), before.head().generation().get() + 2);
     assert_eq!(after.definition().effective_encryption, before.definition().effective_encryption);
-    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), managed_calls);
+    assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), managed_calls + 2);
+    let state = fixture.backend.state.lock().await;
+    assert_eq!(managed_state(&state), managed_before);
 }
 
 #[tokio::test]
@@ -3407,8 +3584,10 @@ impl crate::vector::service::VectorRequestAccess for ServiceRetryRequestFixture 
         request: &crate::vector::protocol::Request,
         resource: &crate::table_catalog::CatalogResourceIdentity,
         definition: &crate::table_catalog::VectorIndexDefinitionV1,
+        operation: Option<&crate::table_catalog::VectorCatalogOperationGuard>,
     ) -> Result<(), crate::vector::service::VectorServiceError> {
-        crate::vector::service::VectorRequestAccess::authorize_index(&self.inner, request, resource, definition).await?;
+        crate::vector::service::VectorRequestAccess::authorize_index(&self.inner, request, resource, definition, operation)
+            .await?;
         self.authorized_resources
             .lock()
             .expect("record retry authorization")

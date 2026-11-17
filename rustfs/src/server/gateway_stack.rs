@@ -53,6 +53,8 @@
 compile_error!("gateway-stack is restricted to debug builds");
 
 mod admin;
+#[cfg(test)]
+pub(crate) mod vector;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

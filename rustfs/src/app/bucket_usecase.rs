@@ -595,6 +595,69 @@ impl DefaultBucketUsecase {
         Ok(guard)
     }
 
+    #[cfg(test)]
+    /// Update one authorized Vector bucket configuration through its exact store.
+    ///
+    /// The caller owns the accepted operation through storage and Vector audit completion.
+    /// It must not retain a lifecycle guard for this bucket.
+    ///
+    /// # Errors
+    /// Rejects a different kind, region, storage identity, or unavailable instance.
+    /// The storage boundary validates the full persisted identity under its write guards.
+    pub(crate) async fn mutate_managed_bucket_config(
+        &self,
+        identity: &BucketHandle,
+        mutation: managed::ManagedBucketConfigMutation,
+    ) -> Result<time::OffsetDateTime, BucketResolveError> {
+        if identity.kind() != BucketKind::Vector {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let expected_storage = self.checked_storage_bucket_id(
+            identity.kind(),
+            identity.account_namespace_id(),
+            identity.region(),
+            identity.public_name(),
+        )?;
+        if &expected_storage != identity.storage_bucket_id() {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        Ok(managed::mutate_managed_bucket_config(&store, identity, mutation).await?)
+    }
+
+    /// The owned Vector execution authorizes deletion before releasing its read guard.
+    #[cfg(all(test, feature = "gateway-stack"))]
+    pub(crate) async fn delete_managed_bucket(&self, identity: &BucketHandle) -> Result<(), BucketResolveError> {
+        if identity.kind() != BucketKind::Vector {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let expected_storage = self.checked_storage_bucket_id(
+            identity.kind(),
+            identity.account_namespace_id(),
+            identity.region(),
+            identity.public_name(),
+        )?;
+        if &expected_storage != identity.storage_bucket_id() {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        let catalog = crate::table_catalog::ObjectTableCatalogStore::for_vector_scope(
+            crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store.clone()),
+            identity.clone(),
+        )
+        .await
+        .map_err(StorageError::other)?;
+        let prepared_identity = identity.clone();
+        managed::delete_managed_bucket_with_preparation(&store, identity, move |guard| async move {
+            catalog
+                .prepare_empty_vector_bucket_delete(&prepared_identity, guard)
+                .await
+                .map_err(StorageError::other)
+        })
+        .await?;
+        Ok(())
+    }
+
     /// The service retains its admitted lifecycle guard and owns Vector authorization and audit.
     #[cfg(test)]
     pub(crate) async fn read_managed_bucket_metadata(
@@ -779,6 +842,166 @@ impl DefaultBucketUsecase {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_bucket_config_mutation_retains_locks_after_caller_cancellation() {
+        use crate::app::object::ManagedEncryption;
+        use crate::app::storage_api::bucket_usecase::helper::run_owned_mutation;
+        use crate::app::storage_api::object_usecase::contract::namespace::NamespaceLocking as _;
+        use crate::app::storage_api::test::{
+            RUSTFS_META_BUCKET,
+            metadata_sys::ConfigWriteLockProbe,
+            set_disk::{PutObjectCommitBarrier, PutObjectCommitPause},
+        };
+
+        let (request, access, store, _reset) =
+            crate::app::object::managed_request_fixture_with_encryption(ManagedEncryption::Unencrypted).await;
+        let context = request
+            .server_context()
+            .expect("server")
+            .installed_app_context()
+            .expect("context");
+        let usecase = DefaultBucketUsecase::with_context(Some(context.clone()));
+        let identity = access.bucket().clone();
+        let bucket = identity.storage_bucket_id().as_str();
+        let original = managed::get_bucket_metadata(&store, bucket).await.expect("original metadata");
+        let barrier = PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &original.save_file_path(),
+            PutObjectCommitPause::AfterRenameQuorum,
+        );
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let mutation_identity = identity.clone();
+        let mutation_policy = policy.clone();
+        let mutation_usecase = DefaultBucketUsecase::with_context(Some(context.clone()));
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let mut caller = tokio::spawn(async move {
+            run_owned_mutation(async move {
+                let result = mutation_usecase
+                    .mutate_managed_bucket_config(
+                        &mutation_identity,
+                        managed::ManagedBucketConfigMutation::PutPolicy {
+                            policy_json: mutation_policy,
+                        },
+                    )
+                    .await
+                    .map_err(to_internal_error);
+                completed.send(result.is_ok()).expect("storage completion observer");
+                result
+            })
+            .await
+        });
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut caller => panic!("owned mutation must reach persistence: {result:?}"),
+        }
+        caller.abort();
+        assert!(caller.await.expect_err("cancel HTTP waiter").is_cancelled());
+        // Prove the owner's lifecycle coverage before another config reader can mask its loss.
+        // Cancel this probe before starting that reader because queued writers take precedence.
+        {
+            let manager = crate::app::storage_api::test::bootstrap_instance_ctx().lock_manager();
+            let manager = manager.as_fast_lock_manager().expect("fixture lock manager");
+            let waiters_before = manager.current_lock_counts().1;
+            let lock = store.new_ns_lock(bucket, "").await.expect("owner lifecycle probe");
+            let acquire = lock.get_write_lock(Duration::from_secs(5));
+            tokio::pin!(acquire);
+            std::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => panic!("the detached owner must still hold its lifecycle fence: {result:?}"),
+            })
+            .await;
+            assert!(
+                manager.current_lock_counts().1 > waiters_before,
+                "the lifecycle writer entered the actual wait queue"
+            );
+        }
+        let probe = ConfigWriteLockProbe::install(bucket);
+        let tag_identity = identity.clone();
+        let tag_usecase = DefaultBucketUsecase::with_context(Some(context));
+        let mut tag_writer = tokio::spawn(async move {
+            tag_usecase
+                .mutate_managed_bucket_config(
+                    &tag_identity,
+                    managed::ManagedBucketConfigMutation::Tag {
+                        tags: std::collections::BTreeMap::from([("queued".to_owned(), "tag".to_owned())]),
+                    },
+                )
+                .await
+        });
+        tokio::select! {
+            () = probe.wait_until_attempted() => {}
+            result = &mut tag_writer => panic!("metadata writer must remain queued after caller cancellation: {result:?}"),
+        }
+        let lifecycle_lock = store.new_ns_lock(bucket, "").await.expect("lifecycle lock");
+        let (pending, queued) = tokio::sync::oneshot::channel();
+        let (acquired, acquisition) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let lifecycle_writer = tokio::spawn(async move {
+            let acquire = lifecycle_lock.get_write_lock(Duration::from_secs(5));
+            tokio::pin!(acquire);
+            let mut pending = Some(pending);
+            let guard = std::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+                std::task::Poll::Pending => {
+                    if let Some(pending) = pending.take() {
+                        pending.send(()).expect("record lifecycle wait");
+                    }
+                    std::task::Poll::Pending
+                }
+                ready => ready,
+            })
+            .await
+            .expect("lifecycle writer eventually acquires");
+            acquired.send(()).expect("record lifecycle acquisition");
+            released.await.expect("release lifecycle writer");
+            drop(guard);
+        });
+        tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .expect("lifecycle writer reaches Pending")
+            .expect("pending observer");
+        assert!(!tag_writer.is_finished(), "the detached owner retains the metadata transaction");
+        assert!(!lifecycle_writer.is_finished(), "the detached owner retains the lifecycle fence");
+        drop(barrier);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), completion)
+                .await
+                .expect("detached storage completes")
+                .expect("storage completion result")
+        );
+        tokio::time::timeout(Duration::from_secs(5), tag_writer)
+            .await
+            .expect("queued tag writer resumes")
+            .expect("tag task")
+            .expect("tag write");
+        tokio::time::timeout(Duration::from_secs(5), acquisition)
+            .await
+            .expect("lifecycle writer resumes")
+            .expect("acquisition observer");
+        let final_metadata = managed::get_bucket_metadata(&store, bucket)
+            .await
+            .expect("committed metadata");
+        assert_eq!(final_metadata.policy_config_json, policy);
+        assert_eq!(final_metadata.bucket_identity_config_json, original.bucket_identity_config_json);
+        assert_eq!(final_metadata.encryption_config_xml, original.encryption_config_xml);
+        assert_eq!(
+            final_metadata
+                .tagging_config
+                .as_ref()
+                .expect("tag configuration")
+                .tag_set
+                .len(),
+            1
+        );
+        release.send(()).expect("release writer");
+        lifecycle_writer.await.expect("lifecycle writer completes");
+        let guard = tokio::time::timeout(Duration::from_secs(5), usecase.acquire_bucket_handle_guard(&identity))
+            .await
+            .expect("all fences released")
+            .expect("same committed identity");
+        drop(guard);
+    }
+
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
     use crate::app::storage_api::s3::dto::CreateBucketInput;

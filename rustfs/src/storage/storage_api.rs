@@ -2090,7 +2090,9 @@ pub(crate) mod managed {
         AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedTableId, StorageBucketId,
     };
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::bucket::{BucketIdentityError, ManagedObjectAccess, ManagedObjectOperation};
+    pub(crate) use super::storage_contracts::bucket::{
+        BucketIdentityError, ManagedBucketConfigMutation, ManagedObjectAccess, ManagedObjectOperation,
+    };
     use super::{Arc, ECStore, Result, ecstore_bucket};
 
     pub(crate) type BucketIncarnationFenceGuard = ecstore_bucket::BucketIncarnationFenceGuard;
@@ -2153,6 +2155,28 @@ pub(crate) mod managed {
         store
             .make_managed_bucket(identity, encryption_config_xml, tagging_config_xml, opts)
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mutate_managed_bucket_config(
+        store: &ECStore,
+        identity: &BucketHandle,
+        mutation: ManagedBucketConfigMutation,
+    ) -> Result<time::OffsetDateTime> {
+        store.mutate_managed_bucket_config(identity, mutation).await
+    }
+
+    #[cfg(all(test, feature = "gateway-stack"))]
+    pub(crate) async fn delete_managed_bucket_with_preparation<F, Fut>(
+        store: &Arc<ECStore>,
+        identity: &BucketHandle,
+        prepare: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Arc<BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        store.delete_managed_bucket_with_preparation(identity, prepare).await
     }
 }
 

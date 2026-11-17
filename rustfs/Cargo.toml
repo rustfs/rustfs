@@ -432,6 +432,8 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
+aws-sdk-s3vectors = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-http-client = { workspace = true, features = ["default-client", "rt-tokio"] }
 lance = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }

@@ -16,6 +16,10 @@
 
 pub(crate) mod dto;
 mod error;
+#[cfg(feature = "gateway-stack")]
+pub(crate) mod gateway;
+#[cfg(feature = "gateway-stack")]
+pub(crate) mod gateway_error_bridge;
 mod route;
 mod validation;
 

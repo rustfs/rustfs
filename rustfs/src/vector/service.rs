@@ -96,6 +96,7 @@ pub(crate) trait VectorRequestAccess: Send + Sync {
         request: &Request,
         resource: &CatalogResourceIdentity,
         definition: &VectorIndexDefinitionV1,
+        operation: Option<&VectorCatalogOperationGuard>,
     ) -> Result<(), VectorServiceError>;
 
     /// Resolve approved inheritance and explicit encryption using the actual bucket configuration.
@@ -214,6 +215,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
                 Response::DeleteVectors(dto::DeleteVectorsOutput {})
             }
             Request::GetVectors(input) => return Ok(VectorExecution::GetVectors(self.get_vectors(context, input).await?)),
+            Request::ListVectors(input) => Response::ListVectors(self.list_vectors(context, input).await?),
             Request::QueryVectors(input) => return Ok(VectorExecution::QueryVectors(self.query_vectors(context, input).await?)),
             Request::ListTagsForResource(_) => {
                 let (guard, entry) = self.begin_index(context, None).await?;
@@ -267,7 +269,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             .into());
         }
         context
-            .authorize_index(context.request(), guard.resource_identity(), entry.definition())
+            .authorize_index(context.request(), guard.resource_identity(), entry.definition(), Some(&guard))
             .await?;
         guard.check_held()?;
         Ok((Arc::new(guard), entry))
@@ -279,9 +281,12 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         update: crate::table_catalog::VectorTagUpdate,
     ) -> Result<(), VectorServiceError> {
         let (guard, entry) = self.begin_index(context, None).await?;
+        // Catalog metadata commits validate the referenced manifest through this owner.
+        let managed = context.managed_dataset(guard.clone(), entry.definition()).await?;
         self.catalog
             .update_vector_tags_with_guard(&guard, &entry, update, new_commit_id()?)
             .await?;
+        drop(managed);
         guard.check_held()?;
         Ok(())
     }
@@ -336,7 +341,9 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             })?,
             CatalogFormat::Lance,
         )?;
-        context.authorize_index(context.request(), &resource, &definition).await?;
+        context
+            .authorize_index(context.request(), &resource, &definition, None)
+            .await?;
         let index = create_index_spec(input, &definition.effective_encryption)?;
         let create_id = new_commit_id()?;
         let plan = plan_initial_manifest(&resource, &index, &create_id).await?;
@@ -366,7 +373,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             .resume_vector_index_creation(context.bucket(), &index_namespace()?, context.index_name())
             .await?;
         context
-            .authorize_index(context.request(), reservation.resource_identity(), reservation.definition())
+            .authorize_index(context.request(), reservation.resource_identity(), reservation.definition(), Some(&guard))
             .await?;
         self.publish_reserved_index(context, &reservation, Arc::new(guard)).await?;
         Ok(dto::CreateIndexOutput {
@@ -453,9 +460,11 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
 
     async fn delete_index(&self, context: &dyn VectorRequestAccess) -> Result<(), VectorServiceError> {
         let (guard, entry) = self.begin_index(context, None).await?;
+        let managed = context.managed_dataset(guard.clone(), entry.definition()).await?;
         self.catalog
             .delete_vector_index_with_guard(&guard, &entry, new_commit_id()?)
             .await?;
+        drop(managed);
         Ok(())
     }
 
@@ -509,6 +518,88 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             }
         }
         Err(VectorServiceError::InvalidContext("write attempt budget must be positive"))
+    }
+
+    async fn list_vectors(
+        &self,
+        context: &dyn VectorRequestAccess,
+        input: &dto::ListVectorsInput,
+    ) -> Result<dto::ListVectorsOutput, VectorServiceError> {
+        let bound = self.bind_index(context, None).await?;
+        if input.next_token.is_some() {
+            return Err(VectorServiceError::PendingIntegration("ListVectors pagination verification"));
+        }
+        let max_results = usize::try_from(input.max_results.unwrap_or(500))
+            .ok()
+            .filter(|count| (1..=1000).contains(count))
+            .ok_or_else(|| ProtocolError::validation("maxResults", "must be between 1 and 1000"))?;
+        let (segments, segment) = match (input.segment_count, input.segment_index) {
+            (None, None) => (1_u64, 0_u64),
+            (Some(count), Some(index)) if (1..=16).contains(&count) && (0..count).contains(&index) => (
+                u64::try_from(count).map_err(|_| VectorServiceError::InvalidContext("invalid segment count"))?,
+                u64::try_from(index).map_err(|_| VectorServiceError::InvalidContext("invalid segment index"))?,
+            ),
+            _ => {
+                return Err(
+                    ProtocolError::validation("segmentIndex", "segmentCount and segmentIndex must form a valid pair").into(),
+                );
+            }
+        };
+        let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
+        let batch_size = NonZeroUsize::new(64).ok_or(VectorServiceError::InvalidContext("invalid scan batch size"))?;
+        let mut offset = 0_u64;
+        let mut processed_bytes = 0_usize;
+        let mut vectors = Vec::with_capacity(max_results);
+        loop {
+            // The processing limit includes fields omitted from the response.
+            let batch = snapshot
+                .list_batch(
+                    offset,
+                    batch_size,
+                    VectorProjection {
+                        data: true,
+                        metadata: true,
+                    },
+                )
+                .await?;
+            let exhausted = batch.len() < batch_size.get();
+            for row in batch {
+                let selected = offset % segments == segment;
+                offset = offset.checked_add(1).ok_or(DatasetError::InvalidOffset)?;
+                let mut vector = dto::ListOutputVector {
+                    key: row.key,
+                    data: row.data.map(|float32| dto::VectorData { float32 }),
+                    metadata: row.metadata.map(Value::Object),
+                };
+                let row_bytes = serde_json::to_vec(&vector)
+                    .map_err(|source| VectorServiceError::Bridge {
+                        operation: "measure ListVectors processed data",
+                        source: Box::new(source),
+                    })?
+                    .len();
+                processed_bytes = processed_bytes.checked_add(row_bytes).ok_or(DatasetError::InvalidOffset)?;
+                if processed_bytes > 1024 * 1024 || (selected && vectors.len() == max_results) {
+                    return Err(VectorServiceError::PendingIntegration("ListVectors snapshot pagination"));
+                }
+                if selected {
+                    if !input.return_data.unwrap_or(false) {
+                        vector.data = None;
+                    }
+                    if !input.return_metadata.unwrap_or(false) {
+                        vector.metadata = None;
+                    }
+                    vectors.push(vector);
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        bound.guard.check_held()?;
+        Ok(dto::ListVectorsOutput {
+            vectors,
+            next_token: None,
+        })
     }
 
     async fn get_vectors(

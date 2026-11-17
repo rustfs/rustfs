@@ -39,6 +39,8 @@ pub(crate) mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
 pub(crate) mod trailer_adapter;
+#[cfg(all(test, feature = "gateway-stack"))]
+pub(crate) mod vector_usecase;
 
 // Request-scoped facts are not AppContext resolution, so consumers import them
 // from here rather than through `app::context`.

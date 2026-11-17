@@ -19,7 +19,7 @@ mod event;
 #[cfg(feature = "gateway-stack")]
 mod gateway_handlers;
 #[cfg(feature = "gateway-stack")]
-mod gateway_stack;
+pub(crate) mod gateway_stack;
 mod health;
 mod http;
 mod hybrid;
@@ -54,6 +54,8 @@ pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_mo
 pub use http::start_http_server;
 #[cfg(test)]
 pub(crate) use http::test_retire_http12_scope;
+#[cfg(all(test, feature = "gateway-stack"))]
+pub(crate) use layer::ExternalRequestContextLayer;
 pub use prefix::LOGO;
 pub use runtime::build_tokio_runtime;
 pub use service_state::SHUTDOWN_TIMEOUT;

@@ -45,7 +45,7 @@ jobs:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
         run: |
-          make -j4 -f - <<'MAKE'
+          env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKEFILES -u MAKEOVERRIDES -u BASH_ENV -u ENV make -j4 -f - <<'MAKE'
           .PHONY: catalog-worker
           catalog-worker: ; python3 scripts/e2e_catalog_worker.py build
           MAKE
@@ -56,9 +56,9 @@ jobs:
           CARGO_INCREMENTAL: "0"
           RUSTFS_CATALOG_FAULT_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-catalog-fault
         run: |
-          make -j4 -f - <<'MAKE'
+          env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKEFILES -u MAKEOVERRIDES -u BASH_ENV -u ENV make -j4 -f - <<'MAKE'
           .PHONY: catalog-fault
-          catalog-fault: ; python3 scripts/e2e_catalog_worker.py run -- cargo nextest run --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --test-threads 1 --retries 0 --no-tests fail
+          catalog-fault: ; rm -f target/nextest/e2e-distributed/junit.xml && cargo nextest list --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --message-format json > target/catalog-fault-listing.json && python3 scripts/check_test_wiring.py --check-catalog-fault target/catalog-fault-listing.json && python3 scripts/e2e_catalog_worker.py run -- cargo nextest run --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --test-threads 1 --retries 0 --no-tests fail && python3 scripts/check_test_wiring.py --check-catalog-fault target/catalog-fault-listing.json target/nextest/e2e-distributed/junit.xml
           MAKE
 
       - name: Upload Catalog fault evidence
@@ -68,6 +68,7 @@ jobs:
           name: catalog-fault-${{ github.run_number }}
           path: |
             ${{ runner.temp }}/rustfs-catalog-fault/
+            target/catalog-fault-listing.json
             target/nextest/e2e-distributed/junit.xml
             target/debug/rustfs-catalog-worker.json
           retention-days: 7
