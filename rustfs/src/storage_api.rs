@@ -391,8 +391,9 @@ pub(crate) mod site_replication {
 
     pub(crate) mod metadata_sys {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            BucketMetadataMutationGuard, acquire_bucket_metadata_transaction_lock_for_incarnation,
             capture_bucket_metadata_incarnation, get, get_replication_config, get_versioning_config, list_bucket_targets,
-            update_if_incarnation,
+            update_if_incarnation, update_under_transaction_lock,
         };
     }
 

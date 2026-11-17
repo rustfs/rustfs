@@ -828,6 +828,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/remove-v2",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/remove-v2/capabilities",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/remove-v2",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/site-replication/info",
         SITE_REPLICATION_INFO,

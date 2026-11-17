@@ -224,7 +224,7 @@ impl DefaultBucketUsecase {
         &self,
         envelope: RequestEnvelope,
         bucket: &str,
-        prepare: impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send,
+        prepare: impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + 'static,
     ) -> S3Result<()> {
         // Preserve the success status recorded by the legacy audit for an empty response.
         RequestEnvelope::audit_only_operation(
@@ -232,8 +232,23 @@ impl DefaultBucketUsecase {
             S3Operation::DeleteBucketReplication,
             StatusCode::OK,
             |envelope| async move {
-                let (site_peers, contract) = prepare.await?;
-                self.delete_bucket_replication(envelope, bucket, site_peers, contract).await
+                let store = self
+                    .object_store()
+                    .ok_or_else(|| s3_error!(InternalError, "object store is unavailable"))?;
+                let usecase = self.clone();
+                let bucket = bucket.to_string();
+                crate::storage_api::site_replication::with_config_object_read_lock(
+                    store,
+                    crate::site_replication::SITE_REMOVE_V2_ADMISSION_LOCK.to_string(),
+                    move || async move {
+                        let (site_peers, contract) = prepare.await?;
+                        usecase
+                            .delete_bucket_replication(envelope, &bucket, site_peers, contract)
+                            .await
+                    },
+                )
+                .await
+                .map_err(|err| S3Error::from(ApiError::from(err)))?
             },
         )
         .await
@@ -364,16 +379,32 @@ impl DefaultBucketUsecase {
         &self,
         envelope: RequestEnvelope,
         bucket: &str,
-        prepare: impl Future<Output = S3Result<(PersistedReplicationConfiguration, HashSet<String>, OperatorRuleContract)>> + Send,
+        prepare: impl Future<Output = S3Result<(PersistedReplicationConfiguration, HashSet<String>, OperatorRuleContract)>>
+        + Send
+        + 'static,
     ) -> S3Result<()> {
         RequestEnvelope::audit_only_operation(
             envelope,
             S3Operation::PutBucketReplication,
             StatusCode::OK,
             |envelope| async move {
-                let (replication_configuration, site_peers, contract) = prepare.await?;
-                self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract)
-                    .await
+                let store = self
+                    .object_store()
+                    .ok_or_else(|| s3_error!(InternalError, "object store is unavailable"))?;
+                let usecase = self.clone();
+                let bucket = bucket.to_string();
+                crate::storage_api::site_replication::with_config_object_read_lock(
+                    store,
+                    crate::site_replication::SITE_REMOVE_V2_ADMISSION_LOCK.to_string(),
+                    move || async move {
+                        let (replication_configuration, site_peers, contract) = prepare.await?;
+                        usecase
+                            .put_bucket_replication(envelope, &bucket, replication_configuration, site_peers, contract)
+                            .await
+                    },
+                )
+                .await
+                .map_err(|err| S3Error::from(ApiError::from(err)))?
             },
         )
         .await

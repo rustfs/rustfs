@@ -2251,6 +2251,228 @@ async fn site_replication_remove(
     Ok(serde_json::from_slice(&response.bytes().await?)?)
 }
 
+async fn decommission_site_v2(
+    env: &RustFSTestEnvironment,
+    request: &rustfs_madmin::SRRemoveV2Req,
+) -> Result<rustfs_madmin::SRRemoveV2Status, Box<dyn Error + Send + Sync>> {
+    let response = signed_request(
+        http::Method::PUT,
+        &format!("{}/rustfs/admin/v3/site-replication/remove-v2", env.url),
+        &env.access_key,
+        &env.secret_key,
+        Some(serde_json::to_vec(request)?),
+        Some("application/json"),
+    )
+    .await?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("decommission failed: {} {}", response.status(), response.text().await?).into());
+    }
+    Ok(response.json().await?)
+}
+
+#[tokio::test]
+async fn test_site_decommission_dead_peer_recovers_pending_remove_and_bucket_delete() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    init_logging();
+    let mut source = RustFSTestEnvironment::new().await?;
+    let mut target = RustFSTestEnvironment::new().await?;
+    let mut env = replication_fast_env();
+    env.extend_from_slice(FAST_SCANNER_ENV);
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source.start_rustfs_server_with_env(vec![], &env).await?;
+    target.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    let added = site_replication_add(
+        &source,
+        &[
+            PeerSite {
+                name: "survivor".to_string(),
+                endpoint: source.url.clone(),
+                access_key: source.access_key.clone(),
+                secret_key: source.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "retired".to_string(),
+                endpoint: target.url.clone(),
+                access_key: target.access_key.clone(),
+                secret_key: target.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(added.success, "{added:?}");
+    let source_client = source.create_s3_client();
+    let target_client = target.create_s3_client();
+    let bucket = "decommission-pending-delete";
+    source_client.create_bucket().bucket(bucket).send().await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    let version = source_client
+        .put_object()
+        .bucket(bucket)
+        .key("data")
+        .body(ByteStream::from_static(b"decommission data survives until purge"))
+        .send()
+        .await?
+        .version_id
+        .ok_or("site bucket must be versioned")?;
+    wait_for_object_on_target(&target_client, bucket, "data").await?;
+    target.stop_server();
+    source_client
+        .delete_object()
+        .bucket(bucket)
+        .key("data")
+        .version_id(&version)
+        .send()
+        .await?;
+    let blocked = source_client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect_err("pending version must block delete");
+    assert_eq!(blocked.code(), Some("BucketNotEmpty"));
+    let legacy = site_replication_remove(
+        &source,
+        &SRRemoveReq {
+            site_names: vec!["retired".to_string()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(legacy.status, "Partial");
+    assert!(site_replication_info(&source).await?.pending_operation.is_some());
+    let mut request = rustfs_madmin::SRRemoveV2Req {
+        mode: "dry-run".to_string(),
+        sites: vec!["retired".to_string()],
+        ..Default::default()
+    };
+    let preview = decommission_site_v2(&source, &request).await?;
+    assert_eq!(preview.status, "planned");
+    request.mode = "execute".to_string();
+    request.operation_id = Some(preview.operation_id.clone());
+    request.preflight_token = Some(preview.preflight_token);
+    let removed = decommission_site_v2(&source, &request).await?;
+    assert_eq!(removed.status, "success", "{removed:?}");
+    assert_site_replication_bucket_detached(&source, bucket).await?;
+    assert!(site_replication_info(&source).await?.pending_operation.is_none());
+    source.restart_server_preserving_data(vec![], &env).await?;
+    let replay = decommission_site_v2(&source, &request).await?;
+    assert_eq!(replay.status, "success");
+    assert_eq!(replay.operation_id, removed.operation_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match source_client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => break,
+            Err(err) if err.code() == Some("BucketNotEmpty") && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    assert!(source_client.head_bucket().bucket(bucket).send().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_replication()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let mut a = RustFSTestEnvironment::new().await?;
+    let mut b = RustFSTestEnvironment::new().await?;
+    let mut c = RustFSTestEnvironment::new().await?;
+    let mut env = replication_fast_env();
+    env.extend_from_slice(FAST_SCANNER_ENV);
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    a.start_rustfs_server_with_env(vec![], &env).await?;
+    b.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    c.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    let added = site_replication_add(
+        &a,
+        &[
+            PeerSite {
+                name: "a".to_string(),
+                endpoint: a.url.clone(),
+                access_key: a.access_key.clone(),
+                secret_key: a.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "b".to_string(),
+                endpoint: b.url.clone(),
+                access_key: b.access_key.clone(),
+                secret_key: b.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "c".to_string(),
+                endpoint: c.url.clone(),
+                access_key: c.access_key.clone(),
+                secret_key: c.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(added.success, "{added:?}");
+    let ca = a.create_s3_client();
+    let cb = b.create_s3_client();
+    let cc = c.create_s3_client();
+    let bucket = "decommission-preserve-live-peers";
+    ca.create_bucket().bucket(bucket).send().await?;
+    wait_for_bucket_on_target(&cb, bucket).await?;
+    wait_for_bucket_on_target(&cc, bucket).await?;
+    ca.put_object()
+        .bucket(bucket)
+        .key("baseline")
+        .body(ByteStream::from_static(b"baseline"))
+        .send()
+        .await?;
+    wait_for_object_on_target(&cc, bucket, "baseline").await?;
+    b.stop_server();
+    let mut request = rustfs_madmin::SRRemoveV2Req {
+        mode: "dry-run".to_string(),
+        sites: vec!["b".to_string()],
+        ..Default::default()
+    };
+    let preview = decommission_site_v2(&a, &request).await?;
+    request.mode = "execute".to_string();
+    request.operation_id = Some(preview.operation_id);
+    request.preflight_token = Some(preview.preflight_token);
+    let result = decommission_site_v2(&a, &request).await?;
+    assert_eq!(result.status, "success", "{result:?}");
+    let ia = site_replication_info(&a).await?;
+    let ic = site_replication_info(&c).await?;
+    assert!(ia.enabled && ic.enabled);
+    assert!(ia.pending_operation.is_none() && ic.pending_operation.is_none());
+    assert_eq!(
+        ia.sites
+            .iter()
+            .map(|peer| peer.deployment_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ic.sites.iter().map(|peer| peer.deployment_id.clone()).collect()
+    );
+    assert!(!ia.sites.iter().any(|peer| peer.name == "b"));
+    ca.put_object()
+        .bucket(bucket)
+        .key("a-to-c")
+        .body(ByteStream::from_static(b"a to c survives"))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&cc, bucket, "a-to-c").await?, b"a to c survives");
+    cc.put_object()
+        .bucket(bucket)
+        .key("c-to-a")
+        .body(ByteStream::from_static(b"c to a survives"))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&ca, bucket, "c-to-a").await?, b"c to a survives");
+    c.restart_server_preserving_data(vec![], &env).await?;
+    assert!(site_replication_info(&c).await?.pending_operation.is_none());
+    assert_eq!(decommission_site_v2(&a, &request).await?.status, "success");
+    Ok(())
+}
+
 async fn site_replication_state_edit(
     env: &RustFSTestEnvironment,
     body: &rustfs_madmin::SRStateEditReq,
