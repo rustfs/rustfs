@@ -15,43 +15,42 @@
 //! Bucket policy and policy status use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketPolicyInput, DeleteBucketPolicyOutput, PutBucketPolicyInput, PutBucketPolicyOutput,
-};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use rustfs_policy::policy::Validator;
+use rustfs_s3_types::s3_error;
 
 impl DefaultBucketUsecase {
-    pub async fn execute_delete_bucket_policy(
+    pub(crate) async fn execute_delete_bucket_policy(
         &self,
-        req: S3Request<DeleteBucketPolicyInput>,
-    ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        record_s3_op(S3Operation::DeleteBucketPolicy);
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketPolicyInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::DeleteBucketPolicy, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+            let Some(store) = self.object_store() else {
+                return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
+            };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            delete_bucket_config_for_incarnation(bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false).await;
+            notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket policy", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "policy");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
-        }
+            let item = sr_bucket_meta_item(bucket.to_owned(), "policy");
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket policy delete hook failed");
+            }
 
-        Ok(S3Response::new(DeleteBucketPolicyOutput {}))
+            Ok(())
+        })
+        .await
     }
 
     /// The stored policy document, verbatim.
@@ -166,75 +165,78 @@ impl DefaultBucketUsecase {
         })
     }
 
-    pub async fn execute_put_bucket_policy(
+    pub(crate) async fn execute_put_bucket_policy(
         &self,
-        req: S3Request<PutBucketPolicyInput>,
-    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        record_s3_op(S3Operation::PutBucketPolicy);
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketPolicyInput { bucket, policy, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+        policy: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketPolicy, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+            let Some(store) = self.object_store() else {
+                return Err(s3_error!(InternalError, "Not init"));
+            };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
 
-        let cfg: BucketPolicy =
-            serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
+            let cfg: BucketPolicy =
+                serde_json::from_str(policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
 
-        if let Err(err) = cfg.is_valid() {
-            warn!("put_bucket_policy err input {:?}, {:?}", &policy, err);
-            return Err(s3_error!(MalformedPolicy));
-        }
+            if cfg.is_valid().is_err() {
+                return Err(s3_error!(MalformedPolicy));
+            }
 
-        let is_public_policy = cfg
-            .statements
-            .iter()
-            .any(|statement| matches!(statement.effect, Effect::Allow) && statement.principal.is_match("*"));
+            let is_public_policy = cfg
+                .statements
+                .iter()
+                .any(|statement| matches!(statement.effect, Effect::Allow) && statement.principal.is_match("*"));
 
-        if is_public_policy {
-            match metadata_sys::get_public_access_block_config(&bucket).await {
-                Ok((config, _)) => {
-                    if config.block_public_policy.unwrap_or(false) {
-                        return Err(s3_error!(AccessDenied, "Access Denied"));
+            if is_public_policy {
+                match metadata_sys::get_public_access_block_config(bucket).await {
+                    Ok((config, _)) => {
+                        if config.block_public_policy.unwrap_or(false) {
+                            return Err(s3_error!(AccessDenied, "Access Denied"));
+                        }
                     }
-                }
-                Err(err) => {
-                    if err != StorageError::ConfigNotFound {
-                        warn!(
-                            component = LOG_COMPONENT_APP,
-                            subsystem = LOG_SUBSYSTEM_BUCKET,
-                            event = "bucket_public_access_block_load_failed",
-                            bucket = %bucket,
-                            error = ?err,
-                            "Failed to load bucket public access block configuration"
-                        );
-                        return Err(ApiError::from(err).into());
+                    Err(err) => {
+                        if err != StorageError::ConfigNotFound {
+                            warn!(
+                                component = LOG_COMPONENT_APP,
+                                subsystem = LOG_SUBSYSTEM_BUCKET,
+                                event = "bucket_public_access_block_load_failed",
+                                bucket = %bucket,
+                                error = ?err,
+                                "Failed to load bucket public access block configuration"
+                            );
+                            return Err(ApiError::from(err).into());
+                        }
                     }
                 }
             }
-        }
 
-        let data = policy.as_bytes().to_vec();
+            let data = policy.as_bytes().to_vec();
 
-        update_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+            update_bucket_config_for_incarnation(bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false).await;
+            notify_bucket_metadata_reload(bucket.to_owned(), "put bucket policy", request_context, false).await;
 
-        let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
-        item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
-        }
+            let mut item = sr_bucket_meta_item(bucket.to_owned(), "policy");
+            item.policy =
+                Some(serde_json::from_str(policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
+            }
 
-        Ok(S3Response::new(PutBucketPolicyOutput {}))
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -242,6 +244,8 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::{build_request, s3_op_total};
+    use crate::app::storage_api::s3::S3ErrorCode;
+    use crate::app::storage_api::s3::dto::{DeleteBucketPolicyInput, PutBucketPolicyInput};
     use http::Method;
 
     #[tokio::test]
@@ -252,10 +256,12 @@ mod tests {
             .unwrap();
 
         let req = build_request(input, Method::DELETE);
-        let usecase = DefaultBucketUsecase::without_context();
+        let fs = crate::storage::ecfs::FS::new();
         let before = s3_op_total(S3Operation::DeleteBucketPolicy);
 
-        let err = usecase.execute_delete_bucket_policy(req).await.unwrap_err();
+        let err = crate::app::storage_api::s3::S3::delete_bucket_policy(&fs, req)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(s3_op_total(S3Operation::DeleteBucketPolicy), before + 1);
     }
@@ -301,10 +307,12 @@ mod tests {
             .unwrap();
 
         let req = build_request(input, Method::PUT);
-        let usecase = DefaultBucketUsecase::without_context();
+        let fs = crate::storage::ecfs::FS::new();
         let before = s3_op_total(S3Operation::PutBucketPolicy);
 
-        let err = usecase.execute_put_bucket_policy(req).await.unwrap_err();
+        let err = crate::app::storage_api::s3::S3::put_bucket_policy(&fs, req)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(s3_op_total(S3Operation::PutBucketPolicy), before + 1);
     }

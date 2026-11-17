@@ -433,6 +433,7 @@ pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR: &str = "lock_error";
 
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
+pub const PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED: &str = "grouped";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER: &str = "follower";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT: &str = "follower_timeout";
@@ -4520,6 +4521,7 @@ mod tests {
 
             set_put_stage_metrics_enabled(true);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
+            record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED, 4);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER_TIMEOUT, 3.0);
             record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER, 2.0);
@@ -4535,7 +4537,10 @@ mod tests {
         });
 
         let rows = snapshotter.snapshot().into_vec();
-        assert_eq!(histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"), vec![9.0]);
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"),
+            vec![4.0, 9.0]
+        );
         let batch_modes = rows
             .iter()
             .filter(|(composite, _, _, _)| {
@@ -4551,7 +4556,13 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<HashSet<_>>();
-        assert_eq!(batch_modes, HashSet::from([PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string()]));
+        assert_eq!(
+            batch_modes,
+            HashSet::from([
+                PUT_RENAME_FDATASYNC_BATCH_MODE_GROUPED.to_string(),
+                PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string(),
+            ])
+        );
 
         let quorum_samples = histogram_samples(&rows, "rustfs_s3_put_object_rename_quorum_wait_fanout_disks");
         assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);

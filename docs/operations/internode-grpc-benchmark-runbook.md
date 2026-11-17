@@ -60,6 +60,7 @@ Run **before** at the baseline column and **after** at the enabled column, every
 | P1 isolation | `RUSTFS_INTERNODE_CHANNEL_ISOLATION` | `false` (default) | `true` |
 | P1 bulk pool | `RUSTFS_INTERNODE_BULK_CHANNELS` | unset | `2` |
 | P2 msgpack-only | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` | both `false` (default) | per the convergence runbook |
+| P2 per-peer msgpack | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY` | both `false` (default) | both `true`, fleet confirmation `false`, stable direct/affine peer connections only |
 | P3 prewarm | `RUSTFS_INTERNODE_PREWARM` | `false` (default) | `true` |
 | P3 offline bypass | `RUSTFS_INTERNODE_OFFLINE_BYPASS` | `false` (default) | `true` |
 | P3 reprobe / threshold | `RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS` / `RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD` | defaults | defaults (`DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS`, `DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD`) |
@@ -226,6 +227,27 @@ For aligned observation windows, supply distinct, initially absent `start_marker
 Every offered Ping is recorded, including schedule drops, deadlines and errors. Compute offered-load latency from `completed_ns - scheduled_ns`, RPC/acquisition time from `completed_ns - dispatched_ns` when dispatched, and dispatch lag from their difference. These are monotonic offsets from `start_unix_ns`. Record the control count, `errors`, `bulk_coverage_verified` and exit status before calculating quantiles. Any failure, payload mismatch, schedule drop or absent validated bulk coverage prevents attribution; selecting only successful samples would hide overload. Bulk payload bytes count only validated replies completed within the offering interval, with one response payload per RPC, not TCP/TLS wire bytes. The production remote-disk path retains its existing idempotent-read retry policy, so preserve per-attempt server/error counters too; zero final method errors alone does not prove no underlying retry occurred.
 
 Use identical probe source and settings on the two frozen library revisions, in separate Cargo targets, and record the harness overlay and binary identity independently from the already-built clean server binaries. Qualify repeated A cells and then A1/B1/B2/A2 before expanding to coalescing, isolation, pool or window experiments. A successful local mock regression verifies the probe's calling and accounting boundaries; acceptance against the actual authenticated four-node services is still required.
+
+### Timeout-boundary evidence
+
+Use `scripts/check_internode_rpc_timeout_boundary.py` after a task-owned fault injector has recorded three independent probe reports: a stall whose measured duration remains below the declared RPC timeout, a stall whose requested and measured durations both exceed it, and a no-fault recovery run. The gate does not inject faults, deploy services or infer a timeout from wall-clock labels; the manifest references separate measured fault receipts and the raw reports.
+
+```json
+{
+  "schema": 1,
+  "scope": "internode-rpc-timeout-boundary",
+  "rpc_timeout_ms": 10000,
+  "under_budget": {"fault_receipt": "under-fault.json", "report": "under.json"},
+  "over_budget": {"fault_receipt": "over-fault.json", "report": "over.json"},
+  "recovery": {"report": "recovery.json"}
+}
+```
+
+```bash
+python3 scripts/check_internode_rpc_timeout_boundary.py --manifest /path/to/manifest.json --out /path/to/verification.json
+```
+
+Each fault receipt is a bounded JSON object containing a non-empty `target`, `requested_stall_ms` and `actual_stall_ms`. Exit 0 requires complete bulk coverage, exact offered-control coverage, no errors below the timeout, at least one `deadline` above it, and a zero-error recovery report. `schedule_drop` and `rpc_error` never substitute for the expected deadline. Exit 1 means structurally complete evidence did not satisfy the boundary; exit 2 means the evidence is invalid. The verifier binds all reports and fault receipts by SHA-256, rejects path escape/reuse and refuses to overwrite or alias raw evidence. Deployment ownership, actual fault delivery, phase-scoped telemetry and performance attribution remain separate gates.
 
 ## Acceptance gates
 

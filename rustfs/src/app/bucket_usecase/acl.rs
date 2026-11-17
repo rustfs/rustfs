@@ -17,6 +17,25 @@
 use super::*;
 
 impl DefaultBucketUsecase {
+    pub(crate) async fn execute_put_bucket_acl(
+        &self,
+        envelope: RequestEnvelope,
+        bucket: &str,
+        has_xml_policy: bool,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketAcl, StatusCode::OK, |_| async move {
+            self.ensure_config_bucket(bucket).await?;
+            if has_xml_policy {
+                return Err(rustfs_s3_types::s3_error!(
+                    NotImplemented,
+                    "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// RustFS has one owner and no ACL storage: every bucket answers that owner with full control.
     pub async fn execute_get_bucket_acl(
         &self,

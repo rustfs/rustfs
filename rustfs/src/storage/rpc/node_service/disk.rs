@@ -253,6 +253,34 @@ fn decode_msgpack_or_json_with_source<T: DeserializeOwned>(
     }
 }
 
+fn decode_delete_versions_request_versions(
+    request: &DeleteVersionsRequest,
+) -> std::result::Result<Vec<FileInfoVersions>, DiskError> {
+    if request.versions_bin.is_empty() {
+        let mut versions = Vec::with_capacity(request.versions.len());
+        for version in &request.versions {
+            versions.push(decode_msgpack_or_json(&[], version, "FileInfoVersions")?);
+        }
+        return Ok(versions);
+    }
+
+    // The binary list owns both the batch length and its entries. A legacy
+    // JSON list may be absent or stale, so it cannot repair a malformed item.
+    let mut versions = Vec::with_capacity(request.versions_bin.len());
+    for version in &request.versions_bin {
+        if version.is_empty() {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                "FileInfoVersions",
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            return Err(DiskError::other("empty FileInfoVersions msgpack item"));
+        }
+        versions.push(decode_msgpack_or_json(version, "", "FileInfoVersions")?);
+    }
+    Ok(versions)
+}
+
 fn encode_msgpack_with_capacity<T: serde::Serialize>(
     value: &T,
     value_name: &str,
@@ -987,21 +1015,17 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
-            let mut versions = Vec::with_capacity(request.versions.len());
-            for (index, version) in request.versions.iter().enumerate() {
-                let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
-                match decode_msgpack_or_json::<FileInfoVersions>(version_bin, version, "FileInfoVersions") {
-                    Ok(version) => versions.push(version),
-                    Err(err) => {
-                        return Ok(Response::new(DeleteVersionsResponse {
-                            success: false,
-                            errors: Vec::new(),
-                            error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
-                            item_errors: Vec::new(),
-                        }));
-                    }
-                };
-            }
+            let versions = match decode_delete_versions_request_versions(&request) {
+                Ok(versions) => versions,
+                Err(err) => {
+                    return Ok(Response::new(DeleteVersionsResponse {
+                        success: false,
+                        errors: Vec::new(),
+                        error: Some(err.into()),
+                        item_errors: Vec::new(),
+                    }));
+                }
+            };
             let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
                 Ok(opts) => opts,
                 Err(err) => {
@@ -3054,19 +3078,20 @@ impl NodeService {
 mod tests {
     use super::{
         DeleteOptions, INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-        InternodeRpcDurationGuard, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
-        decode_rename_data_request_file_info, encode_batch_read_version_response_payloads, encode_delete_versions_errors,
-        encode_file_info_msgpack, encode_msgpack, encode_msgpack_named, encode_read_multiple_response_payloads,
-        encode_rename_data_response_payloads, rejects_legacy_delete_transaction,
+        InternodeRpcDurationGuard, compat_response_json, decode_delete_versions_request_versions, decode_msgpack_or_json,
+        decode_multipart_rename_request_file_info, decode_rename_data_request_file_info,
+        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
-    use rustfs_filemeta::FileInfo;
+    use rustfs_filemeta::{FileInfo, FileInfoVersions};
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-    use rustfs_protos::proto_gen::node_service::ReadVersionRequest;
+    use rustfs_protos::proto_gen::node_service::{DeleteVersionsRequest, ReadVersionRequest};
     use serde::{Deserialize, Serialize};
     use serial_test::serial;
     use tonic::Request;
@@ -3076,6 +3101,118 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    fn delete_versions_group(name: &str) -> FileInfoVersions {
+        FileInfoVersions {
+            volume: "bucket".to_string(),
+            name: name.to_string(),
+            versions: vec![FileInfo {
+                name: name.to_string(),
+                version_id: Some(Uuid::from_u128(1)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_only_decodes_every_binary_item() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions_bin: groups
+                .iter()
+                .map(|group| {
+                    encode_msgpack_named(group, "FileInfoVersions")
+                        .expect("encode delete group")
+                        .into()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode msgpack-only batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_msgpack_list_controls_length_and_values_with_legacy_json_present() {
+        for json_count in [0, 1, 2, 3] {
+            let request = DeleteVersionsRequest {
+                versions: vec!["invalid legacy JSON".to_string(); json_count],
+                versions_bin: ["first", "second"]
+                    .iter()
+                    .map(|name| {
+                        encode_msgpack_named(&delete_versions_group(name), "FileInfoVersions")
+                            .expect("encode binary delete group")
+                            .into()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+
+            let decoded = decode_delete_versions_request_versions(&request).expect("binary batch must take precedence");
+            assert_eq!(decoded.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        }
+    }
+
+    #[test]
+    fn delete_versions_json_only_preserves_legacy_batch() {
+        let groups = [delete_versions_group("first"), delete_versions_group("second")];
+        let request = DeleteVersionsRequest {
+            versions: groups
+                .iter()
+                .map(|group| serde_json::to_string(group).expect("encode legacy delete group"))
+                .collect(),
+            ..Default::default()
+        };
+
+        let decoded = decode_delete_versions_request_versions(&request).expect("decode legacy JSON batch");
+        assert_eq!(decoded.len(), groups.len());
+        for (actual, expected) in decoded.iter().zip(&groups) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.versions, expected.versions);
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_binary_item_never_uses_valid_json() {
+        let json = serde_json::to_string(&delete_versions_group("legacy")).expect("encode legacy group");
+        for invalid in [bytes::Bytes::new(), bytes::Bytes::from_static(b"invalid-msgpack")] {
+            let request = DeleteVersionsRequest {
+                versions: vec![json.clone(), json.clone()],
+                versions_bin: vec![
+                    encode_msgpack_named(&delete_versions_group("first"), "FileInfoVersions")
+                        .expect("encode valid first group")
+                        .into(),
+                    invalid,
+                ],
+                ..Default::default()
+            };
+
+            assert!(
+                decode_delete_versions_request_versions(&request).is_err(),
+                "malformed binary batch must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_versions_invalid_json_only_batch_fails_and_empty_batch_stays_empty() {
+        let invalid = DeleteVersionsRequest {
+            versions: vec!["invalid JSON".to_string()],
+            ..Default::default()
+        };
+        assert!(decode_delete_versions_request_versions(&invalid).is_err());
+        assert!(
+            decode_delete_versions_request_versions(&DeleteVersionsRequest::default())
+                .expect("empty legacy batch")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -56,8 +56,8 @@ const MATRIX_BUCKET: &str = "gateway-stack-matrix";
 const ENV_S3_STACK: &str = "RUSTFS_S3_STACK";
 const ENV_KEYSTONE_ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
 const ENV_KEYSTONE_AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
-/// A Keystone endpoint nothing listens on: these tests are about start-up, not about tokens.
-const UNREACHABLE_KEYSTONE: &str = "http://127.0.0.1:1/v3";
+/// A configuration-valid endpoint: these tests start up without sending token requests.
+const UNREACHABLE_KEYSTONE: &str = "https://keystone.example.test";
 const GATEWAY: Option<&str> = Some("gateway");
 const LEGACY: Option<&str> = None;
 
@@ -356,8 +356,12 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
     create_bucket_in_the_store(bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
     bucket_configs::store_read_configs(MATRIX_BUCKET, bucket_configs::ENCRYPTION_MATRIX_BUCKET).await;
     bucket_core::seed_website(MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::REPLICATION_MATRIX_BUCKET).await;
+    create_bucket_in_the_store(bucket_replication_lifecycle::LOCK_CONFIGURATION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
+    object_misc::seed_restore_object(object_misc::MATRIX_BUCKET, false).await;
+    object_misc::seed_select_matrix().await;
     create_bucket_in_the_store(object_read::MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_commit::COPY_MATRIX_BUCKET).await;
     put_object_in_the_store(object_commit::COPY_MATRIX_BUCKET, object_commit::COPY_MATRIX_SOURCE).await;
@@ -396,6 +400,19 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                 S3Operation::GetBucketAccelerateConfiguration
                     | S3Operation::GetBucketRequestPayment
                     | S3Operation::GetBucketWebsite
+                    | S3Operation::PutBucketAccelerateConfiguration
+                    | S3Operation::PutBucketRequestPayment
+                    | S3Operation::PutBucketWebsite
+                    | S3Operation::DeleteBucketWebsite
+                    | S3Operation::PutBucketReplication
+                    | S3Operation::DeleteBucketReplication
+                    | S3Operation::PutObjectLockConfiguration
+                    | S3Operation::PutBucketEncryption
+                    | S3Operation::PutBucketTagging
+                    | S3Operation::DeleteBucketEncryption
+                    | S3Operation::DeleteBucketTagging
+                    | S3Operation::SelectObjectContent
+                    | S3Operation::RestoreObject
             ) {
             "unknown"
         } else {
@@ -420,7 +437,8 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
                 Err(refusal) => refusal,
             };
             let context = format!("{} as the {caller} caller: {refusal:?}", row.operation);
-            assert_eq!(refusal.status, Some(403), "{context}");
+            let per_key = row.metric == S3Operation::DeleteObjects && !by_authentication;
+            assert_eq!(refusal.status, Some(if per_key { 200 } else { 403 }), "{context}");
             if row.has_error_body {
                 assert_eq!(refusal.code.as_deref(), Some(*code), "{context}");
             }
@@ -431,7 +449,17 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
             );
             let counted = counted_since(&before);
             assert_eq!(counted.values().sum::<u64>(), 1, "counted once: {context} {counted:?}");
-            assert!(counted.keys().all(|(_, _, outcome)| *outcome == "4xx"), "{context} {counted:?}");
+            let expected_outcome = if per_key { "2xx" } else { "4xx" };
+            assert!(
+                counted.keys().all(|(_, _, outcome)| *outcome == expected_outcome),
+                "{context} {counted:?}"
+            );
+            if per_key {
+                assert!(
+                    counted.keys().all(|(_, label, _)| *label == row.metric.as_str()),
+                    "under the batch operation: {context} {counted:?}"
+                );
+            }
             if *by_authentication {
                 assert!(
                     counted.keys().all(|(_, label, _)| *label == "unknown"),
@@ -568,29 +596,21 @@ fn the_legacy_stack_refuses_a_misplaced_capability_query() {
     with_stack(LEGACY, a_misplaced_capability_query_is_refused);
 }
 
-/// The pinned gateway admits a request that carries only `X-Auth-Token` as anonymous, while the
-/// RustFS code behind it reads the Keystone identity. Until the gateway authenticates the token
-/// (rustfs/gateway#1586) the two settings together refuse to start, and nothing is served.
 #[test]
-fn the_gateway_stack_refuses_to_start_with_keystone_enabled() {
-    let environment = [
+fn the_gateway_stack_starts_with_keystone_enabled() {
+    let environment = vec![
         (ENV_S3_STACK, GATEWAY),
         (ENV_KEYSTONE_ENABLE, Some("true")),
         (ENV_KEYSTONE_AUTH_URL, Some(UNREACHABLE_KEYSTONE)),
     ];
-    temp_env::with_vars(environment, || {
-        common::run_embedded_test(|| async {
-            let refusal = match start_server().await {
-                Ok(server) => {
-                    server.shutdown().await;
-                    panic!("the gateway stack started with Keystone enabled");
-                }
-                Err(refusal) => refusal,
-            };
-            for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE", "rustfs/gateway#1586"] {
-                assert!(refusal.contains(named), "{named} is missing from: {refusal}");
-            }
-        });
+    with_environment(environment, |server| async move {
+        let listing = s3_client(&server.endpoint(), server.access_key(), server.secret_key())
+            .list_buckets()
+            .send()
+            .await
+            .expect("signed ListBuckets with the Keystone bridge enabled");
+        assert!(listing.buckets().is_empty());
+        server.shutdown().await;
     });
 }
 

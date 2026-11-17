@@ -15,7 +15,7 @@
 use self::access_owned::listing_multipart::{
     authorize_bucket_listing, authorize_list_multipart_uploads, authorize_list_objects_v2, authorize_list_parts,
 };
-use self::access_owned::object_misc::authorize_delete_object;
+use self::access_owned::object_misc::{authorize_delete_object, authorize_delete_objects};
 use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
@@ -25,7 +25,7 @@ use crate::auth::facts::{
 use crate::auth::{
     AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
     RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
-    check_key_valid_with_context, get_condition_values_with_client_info, get_request_auth_type_with_query, get_session_token,
+    check_key_valid_with_context, get_request_auth_type_with_query, get_session_token,
     parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
     reject_unsigned_amz_headers_on_sigv4_request,
 };
@@ -33,7 +33,7 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::denial_audit::DenialAuditor;
-use crate::storage::helper::DenialScope;
+use crate::storage::helper::{AuditRequestView, DenialScope};
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, BucketOptions};
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
@@ -103,6 +103,8 @@ const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 pub(crate) struct ReqInfo {
     pub cred: Option<rustfs_credentials::Credentials>,
     pub is_owner: bool,
+    /// Original session presence of a host-verified Keystone identity; its token bytes were erased.
+    pub keystone_session_present: Option<bool>,
     pub bucket: Option<String>,
     pub object: Option<String>,
     pub version_id: Option<String>,
@@ -573,6 +575,21 @@ pub(crate) async fn authorize_bucket_config_mutation<R: AuthorizationRequest + ?
     Ok(())
 }
 
+/// Authorizes tag deletion under the IAM repair scope for unreadable stored tags.
+pub(crate) async fn authorize_bucket_tag_deletion<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+) -> S3Result<()> {
+    rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
+        server_ctx,
+        req,
+        bucket,
+        Action::S3Action(S3Action::PutBucketTaggingAction),
+    ))
+    .await
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CopySourceBucketGenerationGuard {
     bucket: String,
@@ -933,12 +950,6 @@ pub(crate) mod envelope_payloads {
     pub(crate) fn object_tag_conditions(bucket: &str) -> ObjectTagConditions {
         ObjectTagConditions::new(bucket, "object", None, HashMap::new())
     }
-}
-
-/// Local tag evidence cannot authorize an object that only exists on a replica.
-/// Keep the local miss whenever authorization needed existing-object tags.
-pub(crate) fn replication_proxy_allowed(extensions: &http::Extensions) -> bool {
-    extensions.get::<ObjectTagConditions>().is_none()
 }
 
 const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
@@ -1319,6 +1330,14 @@ fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut target: Au
     })
 }
 
+fn request_principal<'a, R: AuthorizationRequest + ?Sized>(
+    req: &R,
+    cred: &'a rustfs_credentials::Credentials,
+    root: &str,
+) -> AuthzPrincipal<'a> {
+    AuthzPrincipal::with_session_presence(cred, root, req.req_info().and_then(|info| info.keystone_session_present))
+}
+
 /// The root access key a principal is compared against to be the `Account`.
 fn root_access_key() -> String {
     runtime_sources::current_action_credentials()
@@ -1471,6 +1490,7 @@ fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<Str
         .map(str::to_owned)
 }
 
+#[cfg(test)]
 fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
     let retention = req
         .input
@@ -1614,7 +1634,26 @@ pub(crate) fn resource_free_condition_values<R: AuthorizationRequest + ?Sized>(
     req: &R,
     cred: &rustfs_credentials::Credentials,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_client_info(req.headers(), cred, None, None, req.remote_addr(), req.client_info())
+    let root = root_access_key();
+    let principal = request_principal(req, cred, &root);
+    let target = AuthzTarget {
+        action: Action::None,
+        bucket: "",
+        object: "",
+        version_id: None,
+        location_constraint: None,
+    };
+    let facts = AuthzFacts::from_request_parts(
+        req.headers(),
+        None,
+        req.remote_addr(),
+        req.client_info(),
+        target,
+        OffsetDateTime::now_utc(),
+    );
+    let mut conditions = build_conditions(&principal, &facts);
+    forward_secret_headers(req.headers(), &mut conditions);
+    conditions
 }
 
 fn request_object_store<R: AuthorizationRequest + ?Sized>(req: &R) -> S3Result<Arc<ECStore>> {
@@ -1927,7 +1966,7 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<R: AuthorizationReque
     let claims = cred.claims.clone().unwrap_or_default();
     let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
     let root_access_key = root_access_key();
-    let principal = AuthzPrincipal::new(cred, &root_access_key);
+    let principal = request_principal(req, cred, &root_access_key);
     let facts = request_authz_facts(
         req,
         AuthzTarget {
@@ -2162,15 +2201,15 @@ fn audit_request_denial<R: AuthorizationRequest + ?Sized>(
 
 /// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
 ///
-/// `start` marks the request so per-key denials are logged but not audited; `finish` clears the
+/// `start_owned` marks the request so per-key denials are logged but not audited; `finish_owned` clears the
 /// mark and emits one entry per denied action with the number of keys refused for it.
 pub(crate) struct BulkDenialAudit {
     denied: Vec<(Action, u64)>,
 }
 
 impl BulkDenialAudit {
-    pub(crate) fn start<T>(req: &mut S3Request<T>) -> S3Result<Self> {
-        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = true;
+    pub(crate) fn start_owned<R: AuthorizationRequest + ?Sized>(request: &mut R) -> S3Result<Self> {
+        req_info_mut(request)?.suppress_denial_audit = true;
         Ok(Self { denied: Vec::new() })
     }
 
@@ -2182,14 +2221,24 @@ impl BulkDenialAudit {
         }
     }
 
-    pub(crate) fn finish<T>(self, req: &mut S3Request<T>) -> S3Result<()> {
-        self.finish_with(req, DenialAuditor::global())
+    pub(crate) fn finish_owned<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+    ) -> S3Result<()> {
+        self.finish_owned_with(request, audit_view, DenialAuditor::global())
     }
 
-    fn finish_with<T>(self, req: &mut S3Request<T>, auditor: &DenialAuditor) -> S3Result<()> {
-        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = false;
+    fn finish_owned_with<R: AuthorizationRequest + ?Sized>(
+        self,
+        request: &mut R,
+        audit_view: impl FnOnce(&R) -> AuditRequestView<'_>,
+        auditor: &DenialAuditor,
+    ) -> S3Result<()> {
+        req_info_mut(request)?.suppress_denial_audit = false;
+        let view = audit_view(request);
         for (action, keys) in self.denied {
-            auditor.audit(req, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
+            auditor.audit_owned(&view, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
         }
         Ok(())
     }
@@ -2220,7 +2269,7 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
         .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
     let bucket = info.bucket.as_deref().unwrap_or_default();
     let root = root_access_key();
-    let principal = AuthzPrincipal::new(cred, &root).with_owner(info.is_owner);
+    let principal = request_principal(req, cred, &root).with_owner(info.is_owner);
     let facts = request_authz_facts(
         req,
         AuthzTarget {
@@ -2413,7 +2462,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
         let iam_store = request_iam_store(req)?;
 
         let root_access_key = root_access_key();
-        let principal = AuthzPrincipal::new(cred, &root_access_key).with_owner(is_owner);
+        let principal = request_principal(req, cred, &root_access_key).with_owner(is_owner);
         let facts = request_authz_facts(
             req,
             AuthzTarget {
@@ -2717,7 +2766,7 @@ pub(crate) async fn authorize_request_core<R: AuthorizationRequest + ?Sized>(
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
         let root_access_key = root_access_key();
-        let principal = AuthzPrincipal::new(&default_cred, &root_access_key);
+        let principal = request_principal(req, &default_cred, &root_access_key);
         let facts = request_authz_facts(
             req,
             AuthzTarget {
@@ -3525,13 +3574,7 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn delete_bucket_tagging(&self, req: &mut S3Request<DeleteBucketTaggingInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
-            self.server_ctx(),
-            req,
-            &bucket,
-            Action::S3Action(S3Action::PutBucketTaggingAction),
-        ))
-        .await
+        authorize_bucket_tag_deletion(self.server_ctx(), req, &bucket).await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
@@ -3569,12 +3612,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = None;
-        req_info.version_id = None;
-
-        Ok(())
+        let bucket = req.input.bucket.clone();
+        authorize_delete_objects(req, &bucket)
     }
 
     /// Checks whether the DeletePublicAccessBlock request has accesses to the resources.
@@ -3852,10 +3891,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn get_public_access_block(&self, req: &mut S3Request<GetPublicAccessBlockInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetBucketPublicAccessBlockAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::GetBucketPublicAccessBlockAction)).await
     }
 
     /// Checks whether the HeadBucket request has accesses to the resources.
@@ -3999,10 +4036,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_bucket_acl(&self, req: &mut S3Request<PutBucketAclInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::PutBucketAclAction)).await
+        let bucket = req.input.bucket.clone();
+        authorize_bucket_request(req, &bucket, Action::S3Action(S3Action::PutBucketAclAction)).await
     }
 
     /// Checks whether the PutBucketAnalyticsConfiguration request has accesses to the resources.
@@ -4189,23 +4224,22 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
-        req.install_requested_legal_hold(
-            req.input
-                .legal_hold
-                .as_ref()
-                .map(RequestedObjectLegalHold::from)
-                .unwrap_or_default(),
-        );
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let input = &req.input;
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        let legal_hold = input
+            .legal_hold
+            .as_ref()
+            .map(RequestedObjectLegalHold::from)
+            .unwrap_or_default();
+        access_owned::object_meta::authorize_put_object_legal_hold(
+            req,
+            self.server_ctx(),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            legal_hold,
+        )
+        .await
     }
 
     /// Checks whether the PutObjectLockConfiguration request has accesses to the resources.
@@ -4224,40 +4258,32 @@ impl S3Access for FS {
 
     /// Checks whether the PutObjectRetention request has accesses to the resources.
     async fn put_object_retention(&self, req: &mut S3Request<PutObjectRetentionInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        set_requested_object_lock_retention(req);
-        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-
-        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
-        if has_bypass_governance_header(&req.headers) {
-            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
-        }
-
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let input = &req.input;
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        let retention = input
+            .retention
+            .as_ref()
+            .map(RequestedObjectLockRetention::from)
+            .unwrap_or_default();
+        access_owned::object_meta::authorize_put_object_retention(
+            req,
+            self.server_ctx(),
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            retention,
+        )
+        .await
     }
 
     /// Checks whether the PutObjectTagging request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
-        req.install_requested_object_tags(RequestedObjectTags::from(&req.input.tagging));
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(
-            req,
-            versioned_tagging_action(S3Action::PutObjectTaggingAction, req.input.version_id.as_deref()),
-        )
-        .await
+        let input = &req.input;
+        let tags = RequestedObjectTags::from(&input.tagging);
+        let (bucket, key, version_id) = (input.bucket.clone(), input.key.clone(), input.version_id.clone());
+        access_owned::object_meta::authorize_put_object_tagging(req, &bucket, &key, version_id.as_deref(), tags).await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -4279,28 +4305,18 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
-        #[cfg(test)]
-        wait_for_object_generation_test_hook(&bucket).await;
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
-
-        authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        access_owned::object_misc::authorize_restore_object(self.server_ctx(), req, &bucket, &key, version_id.as_deref()).await
     }
 
     /// Checks whether the SelectObjectContent request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn select_object_content(&self, req: &mut S3Request<SelectObjectContentInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        access_owned::object_misc::authorize_select_object_content(req, &bucket, &key).await
     }
 
     /// Checks whether the UploadPart request has accesses to the resources.
@@ -4317,21 +4333,12 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
-        let bucket_generation = load_bucket_generation(self.server_ctx(), req, &bucket).await;
+        let key = req.input.key.clone();
         let source = legacy_copy_source(&req.input.copy_source);
         let source = source
             .as_ref()
             .map(|(bucket, key, version_id)| copy_source_object(bucket, key, version_id.as_deref()));
-        access_owned::object_commit::authorize_copy_source(req, self.server_ctx(), source).await?;
-
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = None;
-
-        authorize_staged_multipart_part(req).await?;
-        req.install_bucket_generation(bucket_generation?);
-        Ok(())
+        access_owned::object_commit::authorize_upload_part_copy(req, self.server_ctx(), &bucket, &key, source).await
     }
 
     /// Checks whether the WriteGetObjectResponse request has accesses to the resources.
@@ -6468,21 +6475,28 @@ mod tests {
         assert!(!conditions.contains_key("RequestObjectTagKeys"));
     }
 
+    fn tagging_proxy_allowed<T>(request: &S3Request<T>) -> bool {
+        let envelope = crate::app::RequestEnvelope::from_s3s(request);
+        crate::app::object_meta::tagging::proxy_allowed(&envelope)
+    }
+
     #[test]
     fn replication_proxy_requires_authorization_independent_of_local_tags() {
-        let mut extensions = http::Extensions::new();
-        assert!(super::replication_proxy_allowed(&extensions));
+        let mut request = build_request((), Method::PUT);
+        assert!(tagging_proxy_allowed(&request));
         // A local miss produces an empty tag map, but still establishes that the
         // policy needs tags. Neither anonymous nor authenticated callers may proxy.
-        extensions.insert(ObjectTagConditions::new("bucket", "missing", None, HashMap::new()));
-        assert!(!super::replication_proxy_allowed(&extensions));
-        extensions.insert(ObjectTagConditions::new(
+        request
+            .extensions
+            .insert(ObjectTagConditions::new("bucket", "missing", None, HashMap::new()));
+        assert!(!tagging_proxy_allowed(&request));
+        request.extensions.insert(ObjectTagConditions::new(
             "bucket",
             "missing",
             Some("version"),
             HashMap::from([("ExistingObjectTag/protected".to_string(), vec!["yes".to_string()])]),
         ));
-        assert!(!super::replication_proxy_allowed(&extensions));
+        assert!(!tagging_proxy_allowed(&request));
     }
 
     #[tokio::test]
@@ -6517,7 +6531,7 @@ mod tests {
         .expect("merge required existing object tags into authorization conditions");
 
         assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["restricted".to_string()]));
-        assert!(!super::replication_proxy_allowed(&request.extensions));
+        assert!(!tagging_proxy_allowed(&request));
         assert_eq!(conditions.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
@@ -6896,21 +6910,25 @@ mod tests {
     #[test]
     fn bulk_denial_is_one_entry_per_denied_action_with_the_key_count() {
         let (auditor, captured) = test_auditor(true, 10, 10);
-        let mut req = denial_request("denial-bulk", true);
+        let req = denial_request("denial-bulk", true);
+        let mut envelope = crate::app::RequestEnvelope::from_s3s(&req);
 
-        let nothing_denied = BulkDenialAudit::start(&mut req).unwrap();
-        assert!(req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
-        nothing_denied.finish_with(&mut req, &auditor).unwrap();
-        assert!(!req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        let nothing_denied = BulkDenialAudit::start_owned(&mut envelope).unwrap();
+        assert!(envelope.req_info().unwrap().suppress_denial_audit);
+        nothing_denied
+            .finish_owned_with(&mut envelope, crate::app::RequestEnvelope::audit_view, &auditor)
+            .unwrap();
+        assert!(!envelope.req_info().unwrap().suppress_denial_audit);
         assert!(captured.lock().unwrap().is_empty());
 
-        let mut bulk = BulkDenialAudit::start(&mut req).unwrap();
+        let mut bulk = BulkDenialAudit::start_owned(&mut envelope).unwrap();
         let delete = Action::S3Action(S3Action::DeleteObjectAction);
         let bypass = Action::S3Action(S3Action::BypassGovernanceRetentionAction);
         for action in [delete, delete, bypass, delete] {
             bulk.denied(action);
         }
-        bulk.finish_with(&mut req, &auditor).unwrap();
+        bulk.finish_owned_with(&mut envelope, crate::app::RequestEnvelope::audit_view, &auditor)
+            .unwrap();
 
         let entries = captured.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -7463,10 +7481,7 @@ mod tests {
                     .get::<ObjectTagConditions>()
                     .expect("authorization must retain tag dependency");
                 assert!(evidence.values.is_empty(), "missing local object has no tags");
-                assert!(
-                    !super::replication_proxy_allowed(&req.extensions),
-                    "local absence cannot authorize a tagged replica"
-                );
+                assert!(!tagging_proxy_allowed(&req), "local absence cannot authorize a tagged replica");
             }};
         }
         check_hook!(
@@ -8464,6 +8479,16 @@ mod tests {
             .await
             .expect("read the recreated bucket incarnation");
         assert_ne!(authorized_incarnation_id, recreated_incarnation_id);
+        let replacement = b"recreated bucket object";
+        store
+            .put_object(
+                &bucket,
+                "object",
+                &mut crate::storage::PutObjReader::from_vec(replacement.to_vec()),
+                &crate::storage::ObjectOptions::default(),
+            )
+            .await
+            .expect("write the recreated bucket's object");
         resume_tx
             .send(())
             .expect("RestoreObject access should still be waiting at the test hook");
@@ -8472,20 +8497,46 @@ mod tests {
         result.expect("the equivalent policy should authorize RestoreObject without refreshing its snapshot");
         let mut opts = crate::storage::ObjectOptions::default();
         apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("apply the RestoreObject authorization guard");
-        assert_eq!(opts.expected_bucket_incarnation_id, Some(authorized_incarnation_id));
 
         // The RestoreObject usecase future is large enough that heap-pinning a
         // single future was not enough on Linux: the whole scenario runs on a
         // dedicated large stack (see the `#[test]` wrapper above) so unrelated
         // growth in bucket metadata futures cannot tip the test over.
-        let err = Box::pin(
+        let result = Box::pin(
             crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context)).execute_restore_object(req),
         )
-        .await
-        .expect_err("the old RestoreObject authorization must not reach the recreated bucket");
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
+        .await;
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = store
+            .get_object_reader(&bucket, "object", None, HeaderMap::new(), &crate::storage::ObjectOptions::default())
+            .await
+            .expect("read the recreated bucket's object");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("read replacement bytes");
+        assert_eq!(
+            (
+                opts.expected_bucket_incarnation_id,
+                result.as_ref().err().map(|error| error.code()),
+                bytes.as_slice(),
+                reader.object_info.restore_ongoing
+            ),
+            (
+                Some(authorized_incarnation_id),
+                Some(&S3ErrorCode::NoSuchBucket),
+                replacement.as_slice(),
+                false
+            ),
+            "stale RestoreObject must refuse and preserve the recreated bucket's object"
+        );
+        drop(reader);
         store
-            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("clean up the recreated bucket");
     }
@@ -8575,6 +8626,9 @@ mod tests {
         let mut req = build_request(input, Method::POST);
         req.extensions.insert(ReqInfo {
             cred: Some(rustfs_credentials::Credentials::default()),
+            bucket: Some("previous-bucket".to_string()),
+            object: Some("previous-key".to_string()),
+            version_id: Some("previous-version".to_string()),
             ..ReqInfo::default()
         });
 

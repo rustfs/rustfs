@@ -207,6 +207,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
         Self {
             cred: snapshot.cred,
             is_owner: snapshot.is_owner,
+            keystone_session_present: None,
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
@@ -1690,6 +1691,7 @@ mod tests {
         ReqInfo {
             cred: Some(credentials),
             is_owner: false,
+            keystone_session_present: None,
             bucket: Some("photos".to_string()),
             object: None,
             version_id: None,

@@ -671,6 +671,7 @@ fn batch_diagnostics_preserve_typed_no_grant_and_ambiguity() {
         BatchAcquireOutcome::Granted {
             lock_info: None,
             wait_time: Duration::ZERO,
+            cache_fence_stamp: None,
         },
         BatchAcquireOutcome::RetryableNoGrant {
             error: LockError::internal("explicit"),

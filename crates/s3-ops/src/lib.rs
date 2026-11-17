@@ -86,6 +86,10 @@ pub enum S3Operation {
     GetBucketAccelerateConfiguration,
     GetBucketRequestPayment,
     GetBucketWebsite,
+    PutBucketAccelerateConfiguration,
+    PutBucketRequestPayment,
+    PutBucketWebsite,
+    DeleteBucketWebsite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +133,7 @@ impl EventMapping {
 }
 
 impl S3Operation {
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 73] = [
         Self::AbortMultipartUpload,
         Self::CompleteMultipartUpload,
         Self::CopyObject,
@@ -199,6 +203,10 @@ impl S3Operation {
         Self::GetBucketAccelerateConfiguration,
         Self::GetBucketRequestPayment,
         Self::GetBucketWebsite,
+        Self::PutBucketAccelerateConfiguration,
+        Self::PutBucketRequestPayment,
+        Self::PutBucketWebsite,
+        Self::DeleteBucketWebsite,
     ];
 
     #[inline]
@@ -220,6 +228,7 @@ impl S3Operation {
             Self::DeleteBucketPolicy => "s3:DeleteBucketPolicy",
             Self::DeleteBucketReplication => "s3:DeleteBucketReplication",
             Self::DeleteBucketTagging => "s3:DeleteBucketTagging",
+            Self::DeleteBucketWebsite => "s3:DeleteBucketWebsite",
             Self::DeleteObject => "s3:DeleteObject",
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
             Self::DeleteObjects => "s3:DeleteObjects",
@@ -256,6 +265,7 @@ impl S3Operation {
             Self::ListObjects => "s3:ListObjects",
             Self::ListObjectsV2 => "s3:ListObjectsV2",
             Self::ListParts => "s3:ListParts",
+            Self::PutBucketAccelerateConfiguration => "s3:PutBucketAccelerateConfiguration",
             Self::PutBucketAcl => "s3:PutBucketAcl",
             Self::PutBucketCors => "s3:PutBucketCors",
             Self::PutBucketEncryption => "s3:PutBucketEncryption",
@@ -264,8 +274,10 @@ impl S3Operation {
             Self::PutBucketNotificationConfiguration => "s3:PutBucketNotificationConfiguration",
             Self::PutBucketPolicy => "s3:PutBucketPolicy",
             Self::PutBucketReplication => "s3:PutBucketReplication",
+            Self::PutBucketRequestPayment => "s3:PutBucketRequestPayment",
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::PutBucketVersioning => "s3:PutBucketVersioning",
+            Self::PutBucketWebsite => "s3:PutBucketWebsite",
             Self::PutObject => "s3:PutObject",
             Self::PutObjectAcl => "s3:PutObjectAcl",
             Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
@@ -310,6 +322,7 @@ impl S3Operation {
             | Self::DeleteBucketPolicy
             | Self::DeleteBucketReplication
             | Self::DeleteBucketTagging
+            | Self::DeleteBucketWebsite
             | Self::DeletePublicAccessBlock
             | Self::GetBucketAccelerateConfiguration
             | Self::GetBucketAcl
@@ -338,6 +351,7 @@ impl S3Operation {
             | Self::ListObjects
             | Self::ListObjectsV2
             | Self::ListParts
+            | Self::PutBucketAccelerateConfiguration
             | Self::PutBucketAcl
             | Self::PutBucketCors
             | Self::PutBucketEncryption
@@ -346,8 +360,10 @@ impl S3Operation {
             | Self::PutBucketNotificationConfiguration
             | Self::PutBucketPolicy
             | Self::PutBucketReplication
+            | Self::PutBucketRequestPayment
             | Self::PutBucketTagging
             | Self::PutBucketVersioning
+            | Self::PutBucketWebsite
             | Self::PutObjectLockConfiguration
             | Self::PutPublicAccessBlock
             | Self::UploadPart
@@ -541,12 +557,16 @@ mod tests {
     #[test]
     fn test_operations_without_event_mapping_remain_unmapped() {
         let unmapped = [
+            S3Operation::DeleteBucketWebsite,
             S3Operation::GetBucketAccelerateConfiguration,
             S3Operation::GetBucketAcl,
             S3Operation::GetBucketRequestPayment,
             S3Operation::GetBucketWebsite,
             S3Operation::ListObjectsV2,
+            S3Operation::PutBucketAccelerateConfiguration,
             S3Operation::PutBucketNotificationConfiguration,
+            S3Operation::PutBucketRequestPayment,
+            S3Operation::PutBucketWebsite,
             S3Operation::UploadPart,
         ];
         for op in unmapped {

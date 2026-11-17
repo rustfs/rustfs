@@ -27,7 +27,8 @@
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
 use crate::storage_api::server::http::access::{
-    VerifiedSignature, admit_operation, authorize_bucket_config_mutation as authorize_config_mutation, resolve_req_info,
+    VerifiedSignature, admit_operation, authorize_bucket_config_mutation as authorize_config_mutation,
+    authorize_bucket_tag_deletion as authorize_tag_deletion, resolve_req_info,
 };
 use rustfs_gateway::sig::{SigFamily, SigLocation};
 use rustfs_gateway::{RequestContextView, RequestPrincipal};
@@ -51,8 +52,16 @@ pub(super) async fn admit(server_ctx: &Arc<ServerContextSlot>, context: &Request
         .and_then(|credentials| credentials.session_token())
         .unwrap_or_default()
         .to_owned();
-    let req_info =
-        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?;
+    let req_info = if context.header_token_principal().is_some() {
+        let identity = super::envelope::keystone_identity(context)?;
+        let mut info = resolve_req_info(server_ctx, None, "", envelope.request_context().cloned()).await?;
+        info.is_owner = crate::auth::keystone_is_owner(identity.credentials());
+        info.cred = Some(identity.credentials().clone());
+        info.keystone_session_present = Some(identity.had_session_token());
+        info
+    } else {
+        resolve_req_info(server_ctx, access_key.as_deref(), &session_token, envelope.request_context().cloned()).await?
+    };
     envelope.install_req_info(req_info);
     admit_operation(envelope.headers(), envelope.uri().query(), context.operation(), signature)?;
     Ok(envelope)
@@ -70,16 +79,25 @@ pub(super) async fn authorize_bucket_config_mutation(
     bucket: &str,
     action: Action,
 ) -> S3Result<()> {
-    let server_ctx = envelope
+    let server_ctx = require_server_context(envelope)?;
+    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+}
+
+pub(super) async fn authorize_bucket_tag_deletion(envelope: &mut RequestEnvelope, bucket: &str) -> S3Result<()> {
+    let server_ctx = require_server_context(envelope)?;
+    Ok(authorize_tag_deletion(&server_ctx, envelope, bucket).await?)
+}
+
+fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerContextSlot>> {
+    envelope
         .server_context()
         .cloned()
-        .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "the request carries no server context"))?;
-    Ok(authorize_config_mutation(&server_ctx, envelope, bucket, action).await?)
+        .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "the request carries no server context"))
 }
 
 /// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
 /// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
-pub(super) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
+pub(in crate::server) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
     match context.principal().map(RequestPrincipal::scheme) {
         Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
             sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),

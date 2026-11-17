@@ -15,14 +15,17 @@
 //! The gateway operations of migration batch A4 (rustfs/backlog#2765): bucket create, delete,
 //! head and location, website, accelerate, logging and request payment; and ListBuckets.
 
-use super::{OpRow, Served, row};
+use super::{OpRow, Served, access::authorize_bucket_config_mutation, row};
 use crate::app::bucket_usecase::{DefaultBucketUsecase, requested_location_constraint};
 use crate::app::{RequestEnvelope, dto_values};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
-use rustfs_gateway_types::persistence::{parse_bucket_logging_dto, parse_website_dto};
+use rustfs_gateway_types::persistence::{
+    parse_accelerate, parse_bucket_logging_dto, parse_request_payment, parse_website, parse_website_dto,
+    serialize_accelerate_dto, serialize_bucket_logging_dto, serialize_request_payment_dto, serialize_website_dto,
+};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -38,6 +41,11 @@ pub(super) const ROWS: &[OpRow] = &[
     row::<dto::GetBucketRequestPayment>(),
     row::<dto::GetBucketWebsite>(),
     row::<dto::GetBucketLogging>(),
+    row::<dto::PutBucketLogging>(),
+    row::<dto::PutBucketAccelerateConfiguration>(),
+    row::<dto::PutBucketRequestPayment>(),
+    row::<dto::PutBucketWebsite>(),
+    row::<dto::DeleteBucketWebsite>(),
 ];
 
 impl Served for dto::ListBuckets {
@@ -196,5 +204,102 @@ impl Served for dto::GetBucketLogging {
         Ok(Resp::new(dto::GetBucketLoggingOutput {
             logging_enabled: config.logging_enabled,
         }))
+    }
+}
+
+impl Served for dto::PutBucketLogging {
+    const METRIC: S3Operation = S3Operation::PutBucketLogging;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketLoggingAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_logging(envelope, input.bucket.as_str(), || {
+                serialize_bucket_logging_dto(&input.bucket_logging_status)
+                    .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(Resp::new(dto::PutBucketLoggingOutput::default()))
+    }
+}
+
+impl Served for dto::PutBucketAccelerateConfiguration {
+    const METRIC: S3Operation = S3Operation::PutBucketAccelerateConfiguration;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPolicyAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_accelerate_configuration(envelope, input.bucket.as_str(), || {
+                parse_accelerate(&serialize_accelerate_dto(&input.accelerate_configuration))
+                    .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(Resp::new(dto::PutBucketAccelerateConfigurationOutput::default()))
+    }
+}
+
+impl Served for dto::PutBucketRequestPayment {
+    const METRIC: S3Operation = S3Operation::PutBucketRequestPayment;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPolicyAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_request_payment(envelope, input.bucket.as_str(), || {
+                parse_request_payment(&serialize_request_payment_dto(&input.request_payment_configuration))
+                    .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(Resp::new(dto::PutBucketRequestPaymentOutput::default()))
+    }
+}
+
+impl Served for dto::PutBucketWebsite {
+    const METRIC: S3Operation = S3Operation::PutBucketWebsite;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPolicyAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_put_bucket_website(envelope, input.bucket.as_str(), || {
+                parse_website(&serialize_website_dto(&input.website_configuration))
+                    .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
+            })
+            .await?;
+        Ok(Resp::new(dto::PutBucketWebsiteOutput::default()))
+    }
+}
+
+impl Served for dto::DeleteBucketWebsite {
+    const METRIC: S3Operation = S3Operation::DeleteBucketWebsite;
+
+    async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
+        let action = Action::S3Action(S3Action::PutBucketPolicyAction);
+        authorize_bucket_config_mutation(envelope, request.input().bucket.as_str(), action).await
+    }
+
+    async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
+        let input = request.into_input();
+        DefaultBucketUsecase::with_context(context)
+            .execute_delete_bucket_website(envelope, input.bucket.as_str())
+            .await?;
+        Ok(Resp::new(dto::DeleteBucketWebsiteOutput::default()))
     }
 }

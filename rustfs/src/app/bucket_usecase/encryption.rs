@@ -15,17 +15,11 @@
 //! Bucket default-encryption use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::dto::{
-    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
-    ServerSideEncryption,
-};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 /// Refuse a default-encryption configuration the write path could not honour
-/// as written. `bucket_default_write_sse` falls back to AES256 for any
-/// algorithm it does not know, so storing one would make GetBucketEncryption
-/// advertise a scheme no object is encrypted under. s3s parses `SSEAlgorithm`
-/// as an open string, so the schema check has to happen here.
+/// as written. `bucket_default_write_sse` falls back to AES256 for an unknown algorithm,
+/// which would make GetBucketEncryption advertise a scheme the write path cannot use.
 fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionConfiguration) -> S3Result<()> {
     if config.rules.is_empty() {
         return Err(S3Error::with_message(
@@ -42,14 +36,14 @@ fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionCo
         };
         let names_kms_key = by_default.kms_master_key_id.as_deref().is_some_and(|id| !id.is_empty());
         match by_default.sse_algorithm.as_str() {
-            ServerSideEncryption::AWS_KMS => {}
-            ServerSideEncryption::AES256 if names_kms_key => {
+            "aws:kms" => {}
+            "AES256" if names_kms_key => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::InvalidArgument,
                     "KMSMasterKeyID can only be specified when SSEAlgorithm is aws:kms".to_string(),
                 ));
             }
-            ServerSideEncryption::AES256 => {}
+            "AES256" => {}
             other => {
                 return Err(S3Error::with_message(
                     S3ErrorCode::MalformedXML,
@@ -62,35 +56,43 @@ fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionCo
 }
 
 impl DefaultBucketUsecase {
-    pub async fn execute_delete_bucket_encryption(
+    pub(crate) async fn execute_delete_bucket_encryption(
         &self,
-        req: S3Request<DeleteBucketEncryptionInput>,
-    ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let DeleteBucketEncryptionInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::DeleteBucketEncryption,
+            StatusCode::NO_CONTENT,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                let request_context = envelope.request_context().cloned();
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+                let Some(store) = self.object_store() else {
+                    return Err(rustfs_s3_types::s3_error!(InternalError, "Not init"));
+                };
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+                delete_bucket_config_for_incarnation(bucket, BUCKET_SSECONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false).await;
+                notify_bucket_metadata_reload(bucket.to_owned(), "delete bucket encryption", request_context, false).await;
 
-        let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
-        }
+                let item = sr_bucket_meta_item(bucket.to_owned(), "sse-config");
+                if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                    warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
+                }
 
-        Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Returns the stored bucket encryption configuration after checking the bucket exists.
@@ -136,64 +138,65 @@ impl DefaultBucketUsecase {
         Ok(server_side_encryption_configuration)
     }
 
-    pub async fn execute_put_bucket_encryption(
+    pub(crate) async fn execute_put_bucket_encryption(
         &self,
-        req: S3Request<PutBucketEncryptionInput>,
-        prepared: S3Result<PersistedBucketEncryptionConfiguration>,
-    ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketEncryptionInput { bucket, .. } = req.input;
+        envelope: RequestEnvelope,
+        bucket: &str,
+        prepared: rustfs_s3_types::S3Result<PersistedBucketEncryptionConfiguration>,
+    ) -> rustfs_s3_types::S3Result<()> {
+        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketEncryption, StatusCode::OK, |envelope| async move {
+            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+            let request_context = envelope.request_context().cloned();
 
-        let mut server_side_encryption_configuration = prepared?;
-        validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
+            let mut server_side_encryption_configuration = prepared?;
+            validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
 
-        // When SSE-KMS is set without a specific key ID, populate the default
-        // KMS key so that GetBucketEncryption responses include it. Clients like
-        // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
-        // SSE-S3 in their display logic.
-        if let Some(rule) = server_side_encryption_configuration.rules.first_mut()
-            && let Some(ref mut by_default) = rule.apply_server_side_encryption_by_default
-            && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
-            && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
-        {
-            let service = current_encryption_service()
+            // When SSE-KMS is set without a specific key ID, populate the default
+            // KMS key so that GetBucketEncryption responses include it. Clients like
+            // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
+            // SSE-S3 in their display logic.
+            if let Some(rule) = server_side_encryption_configuration.rules.first_mut()
+                && let Some(ref mut by_default) = rule.apply_server_side_encryption_by_default
+                && by_default.sse_algorithm.as_str() == "aws:kms"
+                && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
+            {
+                let service = current_encryption_service()
+                    .await
+                    .ok_or_else(|| s3_error!(InternalError, "KMS service not initialized"))?;
+                let default_key = service
+                    .get_default_key_id()
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(|| s3_error!(InternalError, "KMS default key not configured"))?;
+                by_default.kms_master_key_id = Some(default_key.clone());
+            }
+
+            let Some(store) = self.object_store() else {
+                return Err(s3_error!(InternalError, "Not init"));
+            };
+
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
                 .await
-                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
-            let default_key = service
-                .get_default_key_id()
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS default key not configured".to_string()))?;
-            by_default.kms_master_key_id = Some(default_key.clone());
-        }
+                .map_err(ApiError::from)?;
 
-        info!("sse_config {:?}", &server_side_encryption_configuration);
+            let data = serialize_config(&server_side_encryption_configuration)?;
+            update_bucket_config_for_incarnation(bucket, BUCKET_SSECONFIG, data, expected_incarnation_id)
+                .await
+                .map_err(ApiError::from)?;
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
+            notify_bucket_metadata_reload(bucket.to_owned(), "put bucket encryption", request_context, false).await;
 
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        let data = serialize_config(&server_side_encryption_configuration)?;
-        update_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
-
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false).await;
-
-        let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
-        item.sse_config = Some(
-            serialize_config(&server_side_encryption_configuration)
-                .and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
-        );
-        if let Err(err) = site_replication_bucket_meta_hook(item).await {
-            warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
-        }
-        Ok(S3Response::new(PutBucketEncryptionOutput::default()))
+            let mut item = sr_bucket_meta_item(bucket.to_owned(), "sse-config");
+            item.sse_config = Some(
+                serialize_config(&server_side_encryption_configuration)
+                    .and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
+            );
+            if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                warn!(bucket = %bucket, error = ?err, "site replication bucket encryption hook failed");
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -201,7 +204,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::build_request;
-    use crate::app::storage_api::s3::dto;
+    use crate::app::storage_api::s3::dto::{self, PutBucketEncryptionInput, ServerSideEncryption};
     use http::Method;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
@@ -293,7 +296,20 @@ mod tests {
         let prepared = crate::storage::persisted_from_s3s(&req.input.server_side_encryption_configuration);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_encryption(req, prepared).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_encryption(RequestEnvelope::from_s3s(&req), &req.input.bucket, prepared.map_err(Into::into))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+
+        let err = usecase
+            .execute_put_bucket_encryption(
+                RequestEnvelope::from_s3s(&req),
+                &req.input.bucket,
+                Ok(PersistedBucketEncryptionConfiguration { rules: vec![] }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
     }
 }

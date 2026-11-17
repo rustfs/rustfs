@@ -922,6 +922,44 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
         || is_control_plane_route(method, uri, headers)
 }
 
+/// Signed system-status and catalog-configuration reads, after object-lambda routing.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
+    method == Method::GET
+        && matches!(
+            uri.path(),
+            "/rustfs/admin/v3/info"
+                | "/minio/admin/v3/info"
+                | "/rustfs/admin/v3/storageinfo"
+                | "/minio/admin/v3/storageinfo"
+                | "/rustfs/admin/v4/runtime/capabilities"
+                | "/minio/admin/v4/runtime/capabilities"
+                | "/rustfs/admin/v3/object-data-cache/stats"
+                | "/minio/admin/v3/object-data-cache/stats"
+                | "/rustfs/admin/v3/datausageinfo"
+                | "/minio/admin/v3/datausageinfo"
+                | "/rustfs/admin/v4/plugins/catalog"
+                | "/minio/admin/v4/plugins/catalog"
+                | "/rustfs/admin/v4/cluster/snapshot"
+                | "/minio/admin/v4/cluster/snapshot"
+                | "/rustfs/admin/v4/extensions/catalog"
+                | "/minio/admin/v4/extensions/catalog"
+                | "/rustfs/admin/v3/module-switches"
+                | "/minio/admin/v3/module-switches"
+                | "/iceberg/v1/config"
+                | "/_iceberg/v1/config"
+        )
+        && parse_object_lambda_request(method, uri).is_none()
+}
+
+/// Console paths whose requests do not belong to an earlier extension route.
+#[cfg(feature = "gateway-stack")]
+pub(crate) fn claims_native_console_route(method: &Method, uri: &Uri) -> bool {
+    is_console_path(uri.path())
+        && parse_object_lambda_request(method, uri).is_none()
+        && s3_extension::route_key(method, uri).is_none()
+}
+
 fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }

@@ -31,12 +31,42 @@ use crate::storage::access::{
     AuthorizationRequest, BucketGenerationGuard, PendingDeleteBucketGenerationGuard, S3Error, S3ErrorCode, S3Result,
     ServerContextSlot, audit_request_denial, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
     invalid_force_delete_header, load_bucket_generation, missing_req_info_error, recursive_force_delete_has_authenticated_caller,
-    s3_error,
+    req_info_mut, s3_error,
 };
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::options::destination_version_id;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, force_delete_header};
+
+/// The bulk engine authorizes each entry after this request-level target setup.
+pub(crate) fn authorize_delete_objects<R: AuthorizationRequest + ?Sized>(req: &mut R, bucket: &str) -> S3Result<()> {
+    let info = req_info_mut(req)?;
+    info.bucket = Some(bucket.to_owned());
+    info.object = None;
+    info.version_id = None;
+    Ok(())
+}
+
+/// Both RestoreObject edges retain the bucket generation read before policy evaluation.
+pub(crate) async fn authorize_restore_object<R: AuthorizationRequest + ?Sized>(
+    server_ctx: &ServerContextSlot,
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> S3Result<()> {
+    let bucket_generation = load_bucket_generation(server_ctx, req, bucket).await;
+    #[cfg(test)]
+    wait_for_object_generation_test_hook(bucket).await;
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+    req_info.version_id = version_id.map(str::to_owned);
+
+    authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
+    req.install_bucket_generation(bucket_generation?);
+    Ok(())
+}
 
 /// DeleteObject's authorization on either edge: the bucket generation is loaded before the
 /// decision, and the guard it becomes is installed for the use case after an allow.
@@ -121,6 +151,18 @@ async fn decide_delete_object<R: AuthorizationRequest + ?Sized>(
     }
 
     Ok(PendingDeleteBucketGenerationGuard::from_result(bucket_generation))
+}
+
+/// Select reads the current object and needs the same GetObject permission on either edge.
+pub(crate) async fn authorize_select_object_content<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    let req_info = req_info_mut(req)?;
+    req_info.bucket = Some(bucket.to_owned());
+    req_info.object = Some(key.to_owned());
+    authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
 }
 
 #[cfg(test)]

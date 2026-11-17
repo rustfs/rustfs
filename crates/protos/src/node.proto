@@ -606,8 +606,9 @@ message DeleteVersionsRequest {
   string volume = 2;
   repeated string versions = 3;
   string opts = 4;
-  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
-  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  // Senders dual-write for legacy peers. A nonempty versions_bin list determines
+  // the batch length and values. Malformed binary items reject the batch.
+  // An empty binary list selects the legacy versions list. Options decode independently.
   repeated bytes versions_bin = 5;
   bytes opts_bin = 6;
 }
@@ -685,6 +686,7 @@ message GenerallyLockResponse {
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Only populated by unlock RPCs.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockRequest {
@@ -704,6 +706,7 @@ message GenerallyLockResult {
   optional string lock_info = 3; // JSON serialized LockInfo
   LockReleaseStatus release_status = 4; // Per-ID result for unlock batches.
   LockAcquireStatus acquire_status = 5; // Only populated by lock batches.
+  optional bytes cache_fence_stamp = 6; // Fixed-width optional namespace mutation proof.
 }
 
 message BatchGenerallyLockResponse {

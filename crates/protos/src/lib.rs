@@ -153,6 +153,7 @@ impl Drop for DialLock {
 }
 
 static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
+static INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -3497,9 +3498,35 @@ pub fn internode_rpc_msgpack_only() -> bool {
     enabled
 }
 
+/// Whether msgpack-only was requested and the default-off per-peer capability gate is enabled.
+pub fn internode_rpc_msgpack_peer_capability_enabled() -> bool {
+    match INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY,
+    );
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
 #[doc(hidden)]
 pub fn reset_internode_rpc_msgpack_only_cache() {
     INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
+    INTERNODE_RPC_MSGPACK_PEER_CAPABILITY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
 }
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
@@ -3704,6 +3731,11 @@ fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bo
 
 // Limits transport response futures; client RPC metrics separately cover unary body decoding.
 pub const INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT: usize = 64;
+
+// Quorum reads cancel surplus metadata RPCs in bursts. Keep bounded reset state
+// for their in-flight replies without spending the connection's protocol-error
+// budget (h2 remembers only 50 resets by default).
+const INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS: usize = 4096;
 
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
@@ -4158,6 +4190,7 @@ async fn dial_channel(
     let conn_window = checked_rpc_window(conn_window)?;
     let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
         .concurrency_limit(concurrency_limit)
+        .http2_max_concurrent_reset_streams(INTERNODE_RPC_MAX_CONCURRENT_RESET_STREAMS)
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -4313,6 +4346,9 @@ pub async fn evict_failed_connection_with_reason(
         }
     }
 }
+
+#[cfg(test)]
+mod reset_stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4708,8 +4744,8 @@ mod tests {
                 ),
                 ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
                 ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
-                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
-                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
                 ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
@@ -5832,6 +5868,33 @@ mod tests {
         reset_internode_rpc_msgpack_only_cache();
     }
 
+    #[test]
+    fn internode_rpc_msgpack_peer_capability_requires_request_and_peer_gate() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (requested, peer_capability, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_PEER_CAPABILITY, peer_capability),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_peer_capability_enabled(), expected);
+                },
+            );
+        }
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
     #[tokio::test]
     async fn get_channel_for_class_bulk_reuses_control_cache_when_isolation_disabled() {
         let _test_guard = TLS02_TEST_LOCK.lock().await;
@@ -5892,6 +5955,7 @@ mod lock_release_tests {
                 error_info: error.clone(),
                 lock_info: None,
                 release_status: status.into(),
+                cache_fence_stamp: None,
             };
             let result = GenerallyLockResult {
                 success,
@@ -5946,5 +6010,43 @@ mod lock_release_tests {
         let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
         assert_eq!(decoded.acquire_status, 99);
         assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
+    }
+
+    #[test]
+    fn cache_fence_stamp_is_additive_for_single_and_batch_lock_responses() {
+        let stamp = prost::bytes::Bytes::from_static(b"fixed-width-cache-fence-proof");
+        let response = GenerallyLockResponse {
+            success: true,
+            cache_fence_stamp: Some(stamp.clone()),
+            ..Default::default()
+        };
+        let result = GenerallyLockResult {
+            success: true,
+            cache_fence_stamp: Some(stamp),
+            ..Default::default()
+        };
+        for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+            let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive cache proof");
+            assert!(legacy.success);
+        }
+
+        let legacy = LegacyReleaseResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        }
+        .encode_to_vec();
+        assert!(
+            GenerallyLockResponse::decode(legacy.as_slice())
+                .expect("new single response decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
+        assert!(
+            GenerallyLockResult::decode(legacy.as_slice())
+                .expect("new batch result decodes legacy peer")
+                .cache_fence_stamp
+                .is_none()
+        );
     }
 }

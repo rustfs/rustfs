@@ -16,7 +16,7 @@ use crate::{
     ObjectKey,
     client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient},
     error::{LockError, Result},
-    types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
+    types::{CacheFenceProof, CacheFenceStamp, LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 use futures::{
     future::join_all,
@@ -358,6 +358,7 @@ struct HeldLockEntry {
     lock_id: LockId,
     client: Arc<dyn LockClient>,
     valid_until: Instant,
+    cache_fence_stamp: Option<CacheFenceStamp>,
 }
 
 impl HeldLockEntry {
@@ -453,6 +454,7 @@ pub struct DistributedLockGuard {
     refresh_task: Option<JoinHandle<()>>,
     /// Lock-loss signal, shared with the heartbeat task.
     lock_lost: Arc<LockLostSignal>,
+    cache_fence_proof: Option<CacheFenceProof>,
 }
 
 impl DistributedLockGuard {
@@ -464,6 +466,15 @@ impl DistributedLockGuard {
     /// - `heartbeat`: lease TTL, optional renewal cadence, quorum, and diagnostics.
     fn new(lock_id: LockId, entries: Vec<HeldLockEntry>, lock_type: LockType, heartbeat: LockHeartbeatConfig) -> Self {
         record_lock_held_acquire(lock_type);
+        let cache_fence_proof = (lock_type == LockType::Shared)
+            .then(|| {
+                CacheFenceProof::from_grants(
+                    &heartbeat.resource,
+                    entries.iter().filter_map(|entry| entry.cache_fence_stamp),
+                    heartbeat.refresh_quorum,
+                )
+            })
+            .flatten();
         let lock_lost = Arc::new(LockLostSignal::default());
         match Self::quorum_valid_until(&entries, heartbeat.refresh_quorum) {
             Some(valid_until) => lock_lost.set_valid_until(valid_until),
@@ -484,6 +495,7 @@ impl DistributedLockGuard {
             disarmed: false,
             refresh_task,
             lock_lost,
+            cache_fence_proof,
         }
     }
 
@@ -605,6 +617,12 @@ impl DistributedLockGuard {
     /// Actual granted peer identities, which may differ from the logical guard ID.
     pub fn granted_lock_ids(&self) -> impl Iterator<Item = &LockId> {
         self.entries.iter().map(|entry| &entry.lock_id)
+    }
+
+    /// Read-quorum cache-fence proof carried by this guard, when every required
+    /// voter supplied one valid, distinct stamp.
+    pub fn cache_fence_proof(&self) -> Option<&CacheFenceProof> {
+        self.cache_fence_proof.as_ref()
     }
 
     /// Whether the guard's heartbeat has observed a refresh-quorum loss.
@@ -911,6 +929,22 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
+    /// Acquire a shared guard and request cache-fence stamps from capable voters.
+    #[hotpath::measure]
+    pub async fn rlock_guard_with_cache_fence(
+        &self,
+        resource: ObjectKey,
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Result<Option<DistributedLockGuard>> {
+        let req = LockRequest::new(resource, LockType::Shared, owner)
+            .with_acquire_timeout(timeout)
+            .with_ttl(ttl)
+            .request_cache_fence_stamp();
+        self.acquire_guard(&req).await
+    }
+
     /// Acquire independent exclusive locks with one sub-batch per peer and round.
     /// A successful key starts its heartbeat immediately. Only completed, explicitly
     /// retryable attempts whose grants have been cleaned may enter another round.
@@ -1113,11 +1147,12 @@ impl DistributedLock {
                     pending_by_key[key][reply.peer_index] = false;
                     let outcome = normalized_batch_outcome(request, outcomes.next());
                     match outcome {
-                        BatchAcquireOutcome::Granted { .. } => {
+                        BatchAcquireOutcome::Granted { cache_fence_stamp, .. } => {
                             let entry = HeldLockEntry {
                                 lock_id: request.lock_id.clone(),
                                 client: client.clone(),
                                 valid_until,
+                                cache_fence_stamp,
                             };
                             if results[key].is_some() {
                                 redundant.push(entry.release_entry());
@@ -1477,6 +1512,7 @@ impl DistributedLock {
                             lock_id: request.lock_id.clone(),
                             client: client.clone(),
                             valid_until: reply.started,
+                            cache_fence_stamp: None,
                         };
                         let completed = completed.clone();
                         // Each task owns its grant before the drain next awaits.
@@ -2049,6 +2085,7 @@ impl DistributedLock {
             match join_result {
                 Ok((idx, Ok(resp))) => {
                     if resp.success {
+                        let cache_fence_stamp = resp.cache_fence_stamp;
                         let lock_id = resp
                             .lock_info
                             .as_ref()
@@ -2060,6 +2097,7 @@ impl DistributedLock {
                                 lock_id,
                                 client: client.clone(),
                                 valid_until: grant_valid_until,
+                                cache_fence_stamp,
                             });
                         } else {
                             tracing::warn!("Missing lock client at index {} while recording success", idx);
@@ -2350,6 +2388,118 @@ mod tests {
         SlowAlive(Duration), // Ok(true)  after a delayed response
         NotFound,            // Ok(false) remote already lost the lock (reclaimed / never held)
         RpcError,            // Err        RPC jitter
+    }
+
+    #[derive(Debug)]
+    struct LegacyProofClient {
+        inner: LocalClient,
+    }
+
+    impl LegacyProofClient {
+        fn new() -> Self {
+            Self {
+                inner: LocalClient::with_manager(Arc::new(GlobalLockManager::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for LegacyProofClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            let mut response = self.inner.acquire_lock(request).await?;
+            response.cache_fence_stamp = None;
+            Ok(response)
+        }
+
+        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.release(lock_id).await
+        }
+
+        async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.refresh(lock_id).await
+        }
+
+        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.inner.force_release(lock_id).await
+        }
+
+        async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            self.inner.check_status(lock_id).await
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            self.inner.get_stats().await
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            self.inner.close().await
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            true
+        }
+    }
+
+    fn stamped_voters(count: usize) -> Vec<Arc<dyn LockClient>> {
+        (0..count)
+            .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn LockClient>)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shared_guard_exposes_complete_cache_fence_quorum_proof() {
+        let lock = DistributedLock::new("cache-proof".to_owned(), stamped_voters(3), 2);
+        let resource = ObjectKey::new("bucket", "object");
+        let read = LockRequest::new(resource.clone(), LockType::Shared, "reader").request_cache_fence_stamp();
+        let mut first = lock
+            .acquire_guard(&read)
+            .await
+            .expect("read quorum acquisition")
+            .expect("read quorum guard");
+        let before = first.cache_fence_proof().expect("all new voters provide proof").clone();
+        assert_eq!(before.stamps().len(), 2);
+        assert!(first.release());
+
+        let write = LockRequest::new(resource.clone(), LockType::Exclusive, "writer");
+        let mut writer = lock
+            .acquire_guard(&write)
+            .await
+            .expect("write quorum acquisition")
+            .expect("write quorum guard");
+        assert!(writer.cache_fence_proof().is_none(), "write guards never authorize cache hits");
+        assert!(writer.release());
+
+        let mut second = lock
+            .acquire_guard(&read)
+            .await
+            .expect("second read quorum acquisition")
+            .expect("second read quorum guard");
+        let after = second.cache_fence_proof().expect("second read proof");
+        assert_ne!(&before, after, "an intervening write quorum must change every later read proof");
+        assert!(second.release());
+    }
+
+    #[tokio::test]
+    async fn shared_guard_with_legacy_quorum_keeps_lock_but_withholds_proof() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(LegacyProofClient::new()),
+            Arc::new(LegacyProofClient::new()),
+            Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))),
+        ];
+        let lock = DistributedLock::new("mixed-cache-proof".to_owned(), clients, 2);
+        let read = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Shared, "reader").request_cache_fence_stamp();
+        let mut guard = lock
+            .acquire_guard(&read)
+            .await
+            .expect("mixed read quorum acquisition")
+            .expect("mixed read quorum guard remains available");
+        assert!(guard.cache_fence_proof().is_none(), "legacy voters fail closed only for cache proof");
+        assert!(!guard.is_lock_lost(), "missing proof must not weaken the acquired lock");
+        assert!(guard.release());
     }
 
     struct ConstantRng(u64);
@@ -4730,6 +4880,7 @@ mod tests {
             error: None,
             wait_time: Duration::ZERO,
             position_in_queue: None,
+            cache_fence_stamp: None,
         };
         let responses = Ok(vec![
             success.clone(),
