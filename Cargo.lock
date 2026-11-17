@@ -11015,7 +11015,6 @@ dependencies = [
  "async-trait",
  "base64-simd",
  "futures",
- "hotpath",
  "ipnetwork",
  "jiff 1.0.0",
  "jsonwebtoken 12.0.0",
@@ -11271,7 +11270,6 @@ dependencies = [
 name = "rustfs-s3-ops"
 version = "1.0.5"
 dependencies = [
- "hotpath",
  "rustfs-s3-types",
 ]
 
@@ -11436,7 +11434,6 @@ version = "1.0.5"
 dependencies = [
  "base64-simd",
  "bytes",
- "hotpath",
  "http 1.5.0",
  "http-body",
  "hyper",
@@ -11539,7 +11536,6 @@ name = "rustfs-tls-runtime"
 version = "1.0.5"
 dependencies = [
  "arc-swap",
- "hotpath",
  "metrics",
  "rcgen",
  "rustfs-common",
