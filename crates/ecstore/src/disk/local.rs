@@ -22,6 +22,7 @@ use self::commit::lock_rename_commit_directories;
 
 mod commit;
 pub(super) mod delete_recovery;
+mod delete_reserve;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
@@ -8251,6 +8252,7 @@ pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
     publication_history: Option<os::NativePublicationRegistration>,
+    delete_reserve: Arc<delete_reserve::DeleteReserve>,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
     pub(crate) usage_watch_binding: Arc<super::usage_watch::DiskUsageWatchBinding>,
     multipart_index: Arc<multipart_index::IndexOwner>,
@@ -8666,6 +8668,16 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
+        // A persisted reserve can also make a full disk writable after restart.
+        let reserve_root = io_root.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        let delete_reserve = os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            let reserve = delete_reserve::DeleteReserve::acquire(&reserve_root)?;
+            let _ = reserve.release_if_low();
+            Ok(reserve)
+        })
+        .await
+        .map_err(DiskError::from)?;
         Self::check_startup_writable(&publication_root, &root).await?;
         multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
         multipart_source_state::invalidate_active_multipart_sources_under(&root);
@@ -8681,6 +8693,16 @@ impl LocalDisk {
             .inspect_err(|err| {
                 log_startup_disk_error("ensure_data_usage_layout", &root, err);
             })?;
+
+        let reserve = delete_reserve.clone();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&io_root, None).await;
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+            // Reservation is best effort: a legacy full disk must remain readable.
+            let _ = reserve.initialize();
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?;
 
         let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
         let startup_cleanup_notify = Arc::new(Notify::new());
@@ -8813,6 +8835,7 @@ impl LocalDisk {
         let multipart_index = multipart_index::IndexOwner::acquire(&publication_root, &root, &io_root)?;
         let blocking_queue = multipart_index.attach_blocking_queue(&root, &io_root);
         let mut disk = Self {
+            delete_reserve,
             multipart_index,
             root: root.clone(),
             publication_root,
