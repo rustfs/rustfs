@@ -1130,26 +1130,35 @@ impl RenameAdmissionGrant {
 struct RenameBatchCallGuard {
     admission: Option<RenameAdmissionGrant>,
     deadline: tokio::time::Instant,
-    quarantine_on_drop: bool,
+    dispatch_state: RenameAdmissionDispatchState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameAdmissionDispatchState {
+    NotDispatched,
+    MayHavePublished,
 }
 
 impl RenameBatchCallGuard {
+    fn mark_dispatched(&mut self) {
+        self.dispatch_state = RenameAdmissionDispatchState::MayHavePublished;
+    }
+
     fn complete(mut self) {
-        self.quarantine_on_drop = false;
+        debug_assert_eq!(self.dispatch_state, RenameAdmissionDispatchState::MayHavePublished);
         if let Some(admission) = self.admission.take() {
             admission.release_all();
         }
     }
 
-    fn release_before_dispatch(mut self) {
-        self.quarantine_on_drop = false;
+    fn release_without_quarantine(mut self) {
         if let Some(admission) = self.admission.take() {
             admission.release_all();
         }
     }
 
     fn into_stream(mut self, inner: Streaming<RenameDataBatchResult>, expected_mask: u16) -> RemoteRenameBatchStream {
-        self.quarantine_on_drop = false;
+        debug_assert_eq!(self.dispatch_state, RenameAdmissionDispatchState::MayHavePublished);
         RemoteRenameBatchStream {
             inner,
             expected_mask,
@@ -1163,7 +1172,7 @@ impl RenameBatchCallGuard {
 
 impl Drop for RenameBatchCallGuard {
     fn drop(&mut self) {
-        if self.quarantine_on_drop
+        if self.dispatch_state == RenameAdmissionDispatchState::MayHavePublished
             && let Some(admission) = self.admission.take()
         {
             admission.quarantine_until(self.deadline);
@@ -3183,13 +3192,15 @@ impl RemoteDisk {
         let guard = RenameBatchCallGuard {
             admission,
             deadline,
-            quarantine_on_drop: true,
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
         };
         let call_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         if call_timeout == Duration::ZERO {
-            guard.release_before_dispatch();
+            guard.release_without_quarantine();
             return Err(RenameBatchStartError::NotDispatched(DiskError::Timeout));
         }
+        let mut guard = guard;
+        guard.mark_dispatched();
         let response = match self
             .execute_peer_batch_with_timeout(
                 "rename_data_batch",
@@ -3205,7 +3216,7 @@ impl RemoteDisk {
             .await
         {
             Err(DiskError::UnsupportedDisk) => {
-                guard.release_before_dispatch();
+                guard.release_without_quarantine();
                 return Err(RenameBatchStartError::UnsupportedBeforeStream);
             }
             Err(error) => return Err(RenameBatchStartError::MayHavePublished(error)),
@@ -3287,10 +3298,10 @@ impl RemoteDisk {
                     .unwrap_or_default();
                 let rename_deadline = tokio::time::Instant::now() + get_max_timeout_duration();
                 let rename_admission = self.acquire_rename_admission_until(1, rename_deadline).await?;
-                let rename_admission_guard = RenameBatchCallGuard {
+                let mut rename_admission_guard = RenameBatchCallGuard {
                     admission: rename_admission,
                     deadline: rename_deadline,
-                    quarantine_on_drop: true,
+                    dispatch_state: RenameAdmissionDispatchState::NotDispatched,
                 };
                 let rpc_kind = if multipart_rename {
                     rustfs_io_metrics::ECSTORE_RENAME_RPC_KIND_MULTIPART
@@ -3362,6 +3373,7 @@ impl RemoteDisk {
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_PREPARE,
                         attempt_prepare_started,
                     );
+                    rename_admission_guard.mark_dispatched();
                     let result = rustfs_io_metrics::observe_put_stage_future(
                         async {
                             if multipart_rename {
@@ -13431,6 +13443,45 @@ mod tests {
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_call_guard_quarantines_only_after_dispatch() {
+        let gate = peer_rename_admission("http://rename-call-guard-peer", true).expect("enabled rename gate");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("pre-dispatch permits");
+        drop(RenameBatchCallGuard {
+            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            deadline,
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
+        });
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("dispatched permits");
+        let mut guard = RenameBatchCallGuard {
+            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            deadline,
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
+        };
+        guard.mark_dispatched();
+        drop(guard);
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+
+        let permit = Arc::clone(&gate)
+            .acquire_many_owned(4)
+            .await
+            .expect("proven pre-mutation permits");
+        let mut guard = RenameBatchCallGuard {
+            admission: Some(RenameAdmissionGrant { permit: Some(permit) }),
+            deadline,
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
+        };
+        guard.mark_dispatched();
+        guard.release_without_quarantine();
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
     }
 
