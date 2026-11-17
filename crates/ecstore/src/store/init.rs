@@ -3791,7 +3791,7 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn committed_startup_pool_metadata_uses_shared_fence_without_disk_writes() {
         use crate::disk::{FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET};
-        use rustfs_storage_api::NamespaceLocking;
+        use crate::storage_api_contracts::namespace::NamespaceLocking;
 
         for reopen in [false, true] {
             let directory = tempfile::tempdir().expect("create committed metadata deployment");
