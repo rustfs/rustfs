@@ -15,9 +15,13 @@
 //! Method/subresource validation shared by both S3 edges at request admission.
 
 use http::Method;
-use s3s::{S3Result, s3_error};
 
-pub(super) fn validate_method_subresource(method: &Method, raw_query: Option<&str>) -> S3Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RequestViolation {
+    DeleteAcl,
+}
+
+pub(super) fn validate_method_subresource(method: &Method, raw_query: Option<&str>) -> Result<(), RequestViolation> {
     // S3 exposes Get/PutBucketAcl and Get/PutObjectAcl, but no ACL deletion.
     // Routers may ignore acl for DELETE and select object or bucket deletion.
     // Check decoded keys before authorization/dispatch, including duplicates;
@@ -25,11 +29,7 @@ pub(super) fn validate_method_subresource(method: &Method, raw_query: Option<&st
     if method == Method::DELETE
         && raw_query.is_some_and(|query| url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "acl"))
     {
-        return Err(s3_error!(MethodNotAllowed));
+        return Err(RequestViolation::DeleteAcl);
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "access_request_validation_test.rs"]
-mod tests;

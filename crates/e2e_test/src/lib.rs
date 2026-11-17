@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #[cfg(test)]
+mod access_request_validation_test;
+
+#[cfg(test)]
 mod storage_metric_ownership_test;
 
 mod reliant;

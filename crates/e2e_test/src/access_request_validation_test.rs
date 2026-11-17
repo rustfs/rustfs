@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::validate_method_subresource;
+// Exercise the production validator at the protocol boundary without importing the server crate.
+#[path = "../../../rustfs/src/storage/access_request_validation.rs"]
+mod request_validation;
+
 use async_trait::async_trait;
 use http::{Extensions, HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::BodyExt;
+use request_validation::{RequestViolation, validate_method_subresource};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
@@ -138,7 +142,9 @@ struct MethodValidation;
 #[async_trait]
 impl S3Access for MethodValidation {
     async fn check(&self, context: &mut S3AccessContext<'_>) -> S3Result<()> {
-        validate_method_subresource(context.method(), context.uri().query())
+        validate_method_subresource(context.method(), context.uri().query()).map_err(|violation| match violation {
+            RequestViolation::DeleteAcl => s3_error!(MethodNotAllowed),
+        })
     }
 }
 
@@ -187,11 +193,15 @@ fn service(virtual_host: bool) -> (S3Service, ProbeS3) {
 }
 
 fn signed_request(method: Method, uri: &str, presigned: bool, secret: &str) -> Request<Body> {
+    signed_request_with_credentials(method, uri, presigned, "test-key", secret)
+}
+
+fn signed_request_with_credentials(method: Method, uri: &str, presigned: bool, access_key: &str, secret: &str) -> Request<Body> {
     let uri: Uri = uri.parse().expect("test URI");
     let host = uri.authority().expect("test authority").as_str();
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let date = AmzDate::parse(&timestamp).expect("test date");
-    let credential = format!("test-key/{}/us-east-1/s3/aws4_request", date.fmt_date());
+    let credential = format!("{access_key}/{}/us-east-1/s3/aws4_request", date.fmt_date());
     let mut query: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
         .into_owned()
         .collect();
@@ -401,4 +411,168 @@ async fn delete_acl_preserves_sigv2_header_and_query_authentication() {
             }
         }
     }
+}
+
+async fn live_delete(
+    env: &crate::common::RustFSTestEnvironment,
+    path: &str,
+    presigned: bool,
+    secret: &str,
+) -> (StatusCode, String) {
+    let request =
+        signed_request_with_credentials(Method::DELETE, &format!("{}{path}", env.url), presigned, &env.access_key, secret);
+    let response = crate::common::local_http_client()
+        .delete(request.uri().to_string())
+        .headers(request.headers().clone())
+        .send()
+        .await
+        .expect("send signed DELETE to RustFS");
+    let status = response.status();
+    (status, response.text().await.expect("read DELETE response"))
+}
+
+async fn check_live_admission(stack: &str) {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{BucketVersioningStatus, Tag, Tagging, VersioningConfiguration};
+
+    let mut env = crate::common::RustFSTestEnvironment::new()
+        .await
+        .expect("isolated S3 environment");
+    env.start_rustfs_server_without_cleanup_with_env(&[("RUSTFS_S3_STACK", stack), ("RUSTFS_REGION", "us-east-1")])
+        .await
+        .expect("start the requested S3 edge");
+    let client = env.create_s3_client();
+    let bucket = "acl-admission";
+    let empty_bucket = "acl-admission-empty";
+    env.create_test_bucket(bucket).await.expect("create object bucket");
+    env.create_test_bucket(empty_bucket).await.expect("create empty bucket");
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable versioning");
+    let object = client
+        .put_object()
+        .bucket(bucket)
+        .key("key")
+        .body(ByteStream::from_static(b"original object"))
+        .send()
+        .await
+        .expect("create preserved object");
+    let version = object.version_id().expect("versioned object ID");
+    let version_query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("versionId", version)
+        .finish();
+    for presigned in [false, true] {
+        for path in [
+            format!("/{empty_bucket}?acl"),
+            format!("/{bucket}/key?%61cl&{version_query}"),
+            format!("/{bucket}/key?acl&acl=&tagging"),
+            format!("/{bucket}/key?acl&uploadId=upload-1"),
+        ] {
+            let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{stack} {path}: {body}");
+            assert!(body.contains("<Code>MethodNotAllowed</Code>"), "{body}");
+            let (status, body) = live_delete(&env, &path, presigned, "wrong-secret").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{stack} {path}: {body}");
+            assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"), "{body}");
+        }
+        client
+            .head_bucket()
+            .bucket(empty_bucket)
+            .send()
+            .await
+            .expect("refused DELETE preserves empty bucket");
+        let body = client
+            .get_object()
+            .bucket(bucket)
+            .key("key")
+            .version_id(version)
+            .send()
+            .await
+            .expect("refused DELETE preserves object version")
+            .body
+            .collect()
+            .await
+            .expect("read preserved object")
+            .into_bytes();
+        assert_eq!(body.as_ref(), b"original object");
+
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key("key")
+            .version_id(version)
+            .tagging(
+                Tagging::builder()
+                    .tag_set(Tag::builder().key("test").value("acl").build().expect("tag"))
+                    .build()
+                    .expect("tagging"),
+            )
+            .send()
+            .await
+            .expect("set object tags");
+        let path = format!("/{bucket}/key?tagging&{version_query}");
+        let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
+        assert!(status.is_success(), "{stack} {path}: {body}");
+        let tags = client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key("key")
+            .version_id(version)
+            .send()
+            .await
+            .expect("read cleared tags");
+        assert!(tags.tag_set().is_empty());
+
+        let upload = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("upload")
+            .send()
+            .await
+            .expect("start multipart upload");
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("uploadId", upload.upload_id().expect("upload ID"))
+            .finish();
+        let path = format!("/{bucket}/upload?{query}");
+        let (status, body) = live_delete(&env, &path, presigned, &env.secret_key).await;
+        assert!(status.is_success(), "{stack} {path}: {body}");
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("list remaining uploads");
+        assert!(uploads.uploads().is_empty());
+    }
+    let path = format!("/{bucket}/key?{version_query}");
+    let (status, body) = live_delete(&env, &path, false, &env.secret_key).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{stack} {path}: {body}");
+    let versions = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list remaining versions");
+    assert!(versions.versions().is_empty());
+    let (status, body) = live_delete(&env, &format!("/{empty_bucket}"), false, &env.secret_key).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{stack}: {body}");
+    env.stop_server();
+}
+
+#[tokio::test]
+async fn delete_acl_admission_through_legacy_edge() {
+    check_live_admission("legacy").await;
+}
+
+#[tokio::test]
+async fn delete_acl_admission_through_gateway_edge() {
+    check_live_admission("gateway").await;
 }

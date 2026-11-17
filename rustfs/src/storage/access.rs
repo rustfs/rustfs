@@ -1793,7 +1793,9 @@ pub(crate) fn admit_operation(
     operation: &str,
     signature: VerifiedSignature,
 ) -> S3Result<()> {
-    request_validation::validate_method_subresource(method, raw_query)?;
+    request_validation::validate_method_subresource(method, raw_query).map_err(|violation| match violation {
+        request_validation::RequestViolation::DeleteAcl => S3Error::new(S3ErrorCode::MethodNotAllowed),
+    })?;
     // The size capability is intentionally scoped to the single-object
     // PutObject operation. Validate this at the operation-aware access
     // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently

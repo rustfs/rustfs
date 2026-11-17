@@ -139,6 +139,8 @@ rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", 
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+s3s-sigv4.workspace = true
+url.workspace = true
 async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
 aws-config = { workspace = true }
 opentelemetry-proto = { workspace = true }
