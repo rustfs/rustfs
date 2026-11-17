@@ -4288,6 +4288,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_rejects_invalid_storage_component() {
+        let iam = test_iam_sys().await;
+        let args = AddOrUpdateUserReq {
+            secret_key: "exampleSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+        for key in ["bad\0key", "not/a/component", "not\\a\\component"] {
+            assert!(matches!(iam.create_user(key, &args).await, Err(Error::InvalidArgument)));
+        }
+        iam.create_user("valid-key", &args).await.expect("ordinary key");
+    }
+
+    #[tokio::test]
     async fn add_user_secret_rotation_revokes_sessions_but_identical_secret_does_not() {
         let iam = test_iam_sys().await;
         let parent = "rotation-parent";
